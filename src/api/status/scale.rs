@@ -464,7 +464,9 @@ mod tests {
             .await
             .unwrap();
         let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
-        let state = crate::api::test_support::build_test_app_state_with_db(db_handle).await;
+        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
+        let state =
+            crate::api::test_support::build_test_app_state_with_db(db_handle, passive_reads).await;
         let app = crate::api::build_router(state);
         db.create_resource(
             "apps/v1",
@@ -543,7 +545,9 @@ mod tests {
             .await
             .unwrap();
         let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
-        let state = crate::api::test_support::build_test_app_state_with_db(db_handle).await;
+        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
+        let state =
+            crate::api::test_support::build_test_app_state_with_db(db_handle, passive_reads).await;
         let app = crate::api::build_router(state);
         db.create_resource(
             "apps/v1",
@@ -621,7 +625,9 @@ mod tests {
             .await
             .unwrap();
         let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
-        let state = crate::api::test_support::build_test_app_state_with_db(db_handle).await;
+        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
+        let state =
+            crate::api::test_support::build_test_app_state_with_db(db_handle, passive_reads).await;
         let app = crate::api::build_router(state);
         db.create_resource(
             "apps/v1",
@@ -798,7 +804,9 @@ mod tests {
             .await
             .unwrap();
         let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
-        let state = crate::api::test_support::build_test_app_state_with_db(db_handle).await;
+        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
+        let state =
+            crate::api::test_support::build_test_app_state_with_db(db_handle, passive_reads).await;
         let app = crate::api::build_router(state);
         db.create_resource(
             "v1",

@@ -1465,11 +1465,6 @@ impl DatastoreBackendWatchStore {
     pub fn new(db: DatastoreHandle) -> Self {
         Self { db }
     }
-
-    #[cfg(test)]
-    pub(crate) fn db(&self) -> DatastoreHandle {
-        self.db.clone()
-    }
 }
 
 #[cfg(test)]

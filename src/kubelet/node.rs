@@ -1930,11 +1930,13 @@ mod tests {
         // client (worker -> leader RPC / leader-local tracker) and must never
         // write a Lease row to cluster.db.
         let db = crate::datastore::test_support::in_memory().await;
+        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
+        let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
         let client = std::sync::Arc::new(RecordingLeaseRenewClient::new());
         let cancel = tokio_util::sync::CancellationToken::new();
         let watch_source = std::sync::Arc::new(
             crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(std::sync::Arc::new(
-                crate::datastore::DatastoreBackendWatchStore::new(std::sync::Arc::new(db.clone())),
+                crate::positioned_watch_adapter::for_test(&passive_reads, db_handle),
             )),
         );
         let handle = tokio::spawn(run_heartbeat_with_interval(

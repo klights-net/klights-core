@@ -19,7 +19,18 @@ pub(crate) mod snapshot_export;
 pub mod sqlite;
 pub mod types;
 
-pub use backend::*;
+pub use backend::{
+    AppliedOutboxStore, BackendLifecycleStore, ClusterResourceQueryStore, CommittedOutboxApply,
+    CurrentResourceVersionStore, DatastoreBackend, DatastoreBackendMetaStore,
+    DatastoreBackendWatchStore, DatastoreHandle, DurableRecoveryStore, LeaderResourceMutationStore,
+    MetaStore, NamespaceContentStore, NamespaceStore, NetworkMetadataStore, OwnershipStore,
+    PodCleanupStore, RawWatchReplayStore, ReplicationStore, ResourceListStore, ResourceStore,
+    SnapshotExclusiveFence, SnapshotMutationFence, StatusStore, WatchBroadcastMode,
+    WatchHistoryStore, WatchMaintenanceStore, WatchReplayAnchorStore, WatchStore,
+};
+#[cfg(test)]
+pub use backend::{CommitObservationSink, TestWatchStore};
+pub(crate) use backend::{DatastoreBackendLifecyclePort, DatastoreDurableRecoveryPort};
 pub use klights_cluster_core::{
     PatchKind, PositionedWatchEvent, Resource, ResourceBatchOperation, ResourceBatchPutMode,
     ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
@@ -27,7 +38,14 @@ pub use klights_cluster_core::{
 pub use klights_cluster_store::StagedPostCommit;
 #[cfg(test)]
 pub(crate) use klights_watch::WatchTopic;
-pub use types::*;
+#[cfg(test)]
+pub use types::ReplicatedCreateOptions;
+pub use types::{
+    CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation, ListPageRequest,
+    POD_CLEANUP_REASON_NODE_LOST, PositionedWatchReplay, PositionedWatchReplayRead,
+    ReplicatedMembershipState, ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery,
+    SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget, WatchTargetScope,
+};
 
 #[cfg(test)]
 pub use sqlite::test_support;

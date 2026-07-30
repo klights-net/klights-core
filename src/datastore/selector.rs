@@ -57,20 +57,6 @@ impl PassiveReadPorts {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test(db: DatastoreHandle) -> Self {
-        use crate::datastore::cluster_store_adapter::{
-            LegacyTestClusterResourceRead, LegacyTestDurableAllocatorRead,
-            LegacyTestDurableWatchHistory,
-        };
-
-        Self::new(
-            Arc::new(LegacyTestClusterResourceRead::new(db.clone())),
-            Arc::new(LegacyTestDurableWatchHistory::new(db.clone())),
-            Arc::new(LegacyTestDurableAllocatorRead::new(db)),
-        )
-    }
-
     pub(crate) fn resource_reads(&self) -> Arc<dyn klights_cluster_store::ClusterResourceRead> {
         self.resource_reads.clone()
     }

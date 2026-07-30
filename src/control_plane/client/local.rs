@@ -135,9 +135,11 @@ impl LocalApiPersistencePorts {
     #[cfg(test)]
     pub(crate) fn new(
         db: DatastoreHandle,
+        passive_reads: crate::datastore::selector::PassiveReadPorts,
         _watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     ) -> Self {
-        let positioned_watch = crate::positioned_watch_adapter::for_test(db.clone());
+        let positioned_watch =
+            crate::positioned_watch_adapter::for_test(&passive_reads, db.clone());
         Self {
             db,
             positioned_watch,
@@ -340,6 +342,24 @@ impl LocalApiClient {
     }
 
     #[cfg(test)]
+    pub(crate) fn new_with_passive_reads(
+        db: DatastoreHandle,
+        passive_reads: crate::datastore::selector::PassiveReadPorts,
+        authoring_node: String,
+        is_leader_rx: watch::Receiver<bool>,
+    ) -> Self {
+        Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process_with_reads(
+            db,
+            passive_reads,
+            authoring_node,
+            std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string()),
+            Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
+            is_leader_rx,
+            crate::kubelet::file_blocking::test_file_process_executor(),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_with_file_process(
         db: DatastoreHandle,
         authoring_node: String,
@@ -373,6 +393,25 @@ impl LocalApiClient {
     }
 
     #[cfg(test)]
+    pub(crate) fn new_with_node_lease_tracker_and_passive_reads(
+        db: DatastoreHandle,
+        passive_reads: crate::datastore::selector::PassiveReadPorts,
+        authoring_node: String,
+        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+        is_leader_rx: watch::Receiver<bool>,
+    ) -> Self {
+        Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process_with_reads(
+            db,
+            passive_reads,
+            authoring_node,
+            std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string()),
+            node_lease_tracker,
+            is_leader_rx,
+            crate::kubelet::file_blocking::test_file_process_executor(),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_with_node_lease_tracker_and_file_process(
         db: DatastoreHandle,
         authoring_node: String,
@@ -399,10 +438,31 @@ impl LocalApiClient {
         is_leader_rx: watch::Receiver<bool>,
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
+        Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process_with_reads(
+            db,
+            crate::datastore::test_support::unused_fail_closed_passive_read_ports(),
+            authoring_node,
+            containerd_namespace,
+            node_lease_tracker,
+            is_leader_rx,
+            file_process,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_with_node_lease_tracker_and_containerd_namespace_and_file_process_with_reads(
+        db: DatastoreHandle,
+        passive_reads: crate::datastore::selector::PassiveReadPorts,
+        authoring_node: String,
+        containerd_namespace: String,
+        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+        is_leader_rx: watch::Receiver<bool>,
+        file_process: klights_supervisor::FileProcessExecutor,
+    ) -> Self {
         let signing_key_path =
             crate::paths::service_account_signing_key_path(&containerd_namespace);
         Self::new_with_node_lease_tracker_namespace_signing_key_and_file_process(
-            LocalApiPersistencePorts::new(db.clone(), test_watch_signals(&db)),
+            LocalApiPersistencePorts::new(db.clone(), passive_reads, test_watch_signals(&db)),
             authoring_node,
             containerd_namespace,
             signing_key_path,
@@ -1993,7 +2053,9 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn local_selector_watch_synthesizes_deleted_when_pod_leaves_node() {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let concrete_db = crate::datastore::test_support::in_memory().await;
+        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&concrete_db);
+        let db: DatastoreHandle = Arc::new(concrete_db);
         let pod = db
             .create_resource(
                 "v1",
@@ -2010,7 +2072,8 @@ mod inner_gate_tests {
             .await
             .unwrap();
         let (_tx, rx) = watch::channel(true);
-        let client = LocalApiClient::new(db.clone(), "node-a".to_string(), rx);
+        let client =
+            LocalApiClient::new_with_passive_reads(db.clone(), passive_reads, "node-a".into(), rx);
         let mut stream = client
             .watch_resources(
                 WatchRequest::try_new(
@@ -2079,10 +2142,13 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn local_positioned_watch_resolves_namespaced_crd_for_all_namespaces_delivery() {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let concrete_db = crate::datastore::test_support::in_memory().await;
+        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&concrete_db);
+        let db: DatastoreHandle = Arc::new(concrete_db);
         register_watch_scope_crd(&db, "example.com", "Widget", "widgets", true).await;
         let (_tx, rx) = watch::channel(true);
-        let client = LocalApiClient::new(db.clone(), "node-a".to_string(), rx);
+        let client =
+            LocalApiClient::new_with_passive_reads(db.clone(), passive_reads, "node-a".into(), rx);
         let mut stream = client
             .watch_resources(
                 WatchRequest::try_new("example.com/v1", "Widget", None, None, None, None, None)
@@ -2115,7 +2181,9 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn local_positioned_watch_resolves_cluster_scoped_crd_delivery() {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let concrete_db = crate::datastore::test_support::in_memory().await;
+        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&concrete_db);
+        let db: DatastoreHandle = Arc::new(concrete_db);
         register_watch_scope_crd(
             &db,
             "cluster.example.com",
@@ -2125,7 +2193,8 @@ mod inner_gate_tests {
         )
         .await;
         let (_tx, rx) = watch::channel(true);
-        let client = LocalApiClient::new(db.clone(), "node-a".to_string(), rx);
+        let client =
+            LocalApiClient::new_with_passive_reads(db.clone(), passive_reads, "node-a".into(), rx);
         let mut stream = client
             .watch_resources(
                 WatchRequest::try_new(
@@ -2243,9 +2312,10 @@ mod inner_gate_tests {
         .await
         .unwrap();
 
+        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
         let db: DatastoreHandle = Arc::new(db);
         let (_tx, rx) = watch::channel(true);
-        let client = LocalApiClient::new(db, "node-a".to_string(), rx);
+        let client = LocalApiClient::new_with_passive_reads(db, passive_reads, "node-a".into(), rx);
         let mut stream = client
             .watch_resources(
                 WatchRequest::try_new(
@@ -2279,7 +2349,9 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn local_omitted_rv_watch_starts_after_existing_objects() {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let concrete_db = crate::datastore::test_support::in_memory().await;
+        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&concrete_db);
+        let db: DatastoreHandle = Arc::new(concrete_db);
         db.create_resource(
             "v1",
             "ConfigMap",
@@ -2294,7 +2366,8 @@ mod inner_gate_tests {
         .await
         .unwrap();
         let (_tx, rx) = watch::channel(true);
-        let client = LocalApiClient::new(db.clone(), "node-a".to_string(), rx);
+        let client =
+            LocalApiClient::new_with_passive_reads(db.clone(), passive_reads, "node-a".into(), rx);
         let mut stream = client
             .watch_resources(
                 WatchRequest::try_new(
@@ -2615,7 +2688,11 @@ mod inner_gate_tests {
             let sign_probe = install_projected_token_issue_test_probe(namespace.clone(), reader);
             let client = Arc::new(
                 LocalApiClient::new_with_node_lease_tracker_namespace_signing_key_and_file_process(
-                    LocalApiPersistencePorts::new(db.clone(), test_watch_signals(&db)),
+                    LocalApiPersistencePorts::new(
+                        db.clone(),
+                        crate::datastore::test_support::unused_fail_closed_passive_read_ports(),
+                        test_watch_signals(&db),
+                    ),
                     "node-a".to_string(),
                     namespace,
                     signing_key_path,
@@ -2727,7 +2804,11 @@ mod inner_gate_tests {
         std::fs::write(&signing_key_path, &signing_key).unwrap();
         let local = Arc::new(
             LocalApiClient::new_with_node_lease_tracker_namespace_signing_key_and_file_process(
-                LocalApiPersistencePorts::new(db.clone(), test_watch_signals(&db)),
+                LocalApiPersistencePorts::new(
+                    db.clone(),
+                    crate::datastore::test_support::unused_fail_closed_passive_read_ports(),
+                    test_watch_signals(&db),
+                ),
                 "leader-cp1".to_string(),
                 namespace,
                 signing_key_path,

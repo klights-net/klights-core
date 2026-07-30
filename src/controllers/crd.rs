@@ -445,13 +445,14 @@ mod tests {
             .await
             .unwrap();
         let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
+        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
         let registry = CrdRegistry::new();
         let cancel = CancellationToken::new();
 
         let watcher = tokio::spawn(run_crd_registry_watch_with_components(
             crate::crd_registry_adapter::new_runtime(
                 db_handle.clone(),
-                crate::positioned_watch_adapter::for_test(db_handle.clone()),
+                crate::positioned_watch_adapter::for_test(&passive_reads, db_handle.clone()),
             ),
             registry.clone(),
             cancel.clone(),

@@ -86,7 +86,7 @@ pub struct SqliteRaftStateMachine {
 impl SqliteRaftStateMachine {
     #[cfg(test)]
     pub fn new(
-        backend: Arc<dyn super::super::DatastoreBackend>,
+        backend: Arc<super::super::sqlite::Datastore>,
         applied_state: Arc<dyn RaftAppliedStateDurability>,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
@@ -429,7 +429,7 @@ mod tests {
         let node_local = Arc::new(
             SqliteNodeLocalDb::from_executor(node_executor).expect("create node-local db"),
         );
-        let backend: Arc<dyn DatastoreBackend> =
+        let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         SqliteRaftStateMachine::new(backend, node_local, supervisor)
     }
@@ -512,7 +512,9 @@ mod tests {
         assert_eq!(last.unwrap().leader_id.term, 7);
     }
 
-    async fn build_sm_with_backend(backend: Arc<dyn DatastoreBackend>) -> SqliteRaftStateMachine {
+    async fn build_sm_with_backend(
+        backend: Arc<crate::datastore::sqlite::Datastore>,
+    ) -> SqliteRaftStateMachine {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let node_executor = klights_node_datastore::open::open_with_opts(
             klights_node_datastore::open::in_memory_opts(),
@@ -544,7 +546,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_round_trip_replays_namespaces_and_resources() {
         // Populate a "leader" backend with one namespace + one Pod.
-        let backend_src: Arc<dyn DatastoreBackend> =
+        let backend_src: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let leader_membership = klights_cluster_core::ClusterMembership {
             cluster_id: "leader-snapshot-cluster".into(),
@@ -608,7 +610,7 @@ mod tests {
         );
 
         // Install on a fresh "follower" backend that starts empty.
-        let backend_dst: Arc<dyn DatastoreBackend> =
+        let backend_dst: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         backend_dst
             .replace_replicated_resource_state(
@@ -692,7 +694,7 @@ mod tests {
 
     #[tokio::test]
     async fn install_snapshot_restores_empty_watch_history_allocator_exactly() {
-        let backend_src: Arc<dyn DatastoreBackend> =
+        let backend_src: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         seed_snapshot_identity(backend_src.as_ref()).await;
         backend_src
@@ -714,7 +716,7 @@ mod tests {
         let mut builder = sm_src.get_snapshot_builder().await;
         let snapshot = builder.build_snapshot().await.unwrap();
 
-        let backend_dst: Arc<dyn DatastoreBackend> =
+        let backend_dst: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         for index in 0..8 {
             backend_dst
@@ -796,7 +798,7 @@ mod tests {
             .await
             .unwrap();
 
-        let backend: Arc<dyn DatastoreBackend> = Arc::new(backend);
+        let backend: Arc<crate::datastore::sqlite::Datastore> = Arc::new(backend);
         let mut state_machine = build_sm_with_backend(backend).await;
         let mut builder = state_machine.get_snapshot_builder().await;
         let pause = crate::datastore::sqlite::install_snapshot_capture_page_pause();
@@ -884,7 +886,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_fence_blocks_concurrent_authoritative_install() {
         let _pause_guard = snapshot_watch_page_pause_test_lock().lock().await;
-        let source_backend: Arc<dyn DatastoreBackend> =
+        let source_backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         seed_snapshot_identity(source_backend.as_ref()).await;
         let mut source_sm = build_sm_with_backend(source_backend).await;
@@ -921,7 +923,7 @@ mod tests {
             .replace_replicated_resource_state(entries, 512, Some(512), Some(Vec::new()), None)
             .await
             .unwrap();
-        let destination: Arc<dyn DatastoreBackend> = Arc::new(destination);
+        let destination: Arc<crate::datastore::sqlite::Datastore> = Arc::new(destination);
         let mut destination_sm = build_sm_with_backend(destination).await;
         let mut builder = destination_sm.get_snapshot_builder().await;
         let pause = crate::datastore::sqlite::install_snapshot_capture_page_pause();
@@ -947,7 +949,7 @@ mod tests {
 
     #[tokio::test]
     async fn install_snapshot_replaces_divergent_watch_replay_floors() {
-        let backend_src: Arc<dyn DatastoreBackend> =
+        let backend_src: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         seed_snapshot_identity(backend_src.as_ref()).await;
         for index in 0..5 {
@@ -994,7 +996,7 @@ mod tests {
         let mut builder = sm_src.get_snapshot_builder().await;
         let snapshot = builder.build_snapshot().await.unwrap();
 
-        let backend_dst: Arc<dyn DatastoreBackend> =
+        let backend_dst: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         for index in 0..10 {
             backend_dst
@@ -1046,7 +1048,7 @@ mod tests {
     #[tokio::test]
     async fn install_snapshot_replaces_local_state_and_removes_stale_rows() {
         // Leader: namespace snap-ns + ConfigMap `live`.
-        let backend_src: Arc<dyn DatastoreBackend> =
+        let backend_src: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         seed_snapshot_identity(backend_src.as_ref()).await;
         backend_src
@@ -1085,7 +1087,7 @@ mod tests {
 
         // Follower: same namespace + `live`, PLUS a stale `stale` ConfigMap
         // that the leader has already deleted. This is the divergent member.
-        let backend_dst: Arc<dyn DatastoreBackend> =
+        let backend_dst: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         backend_dst
             .create_namespace(
@@ -1171,7 +1173,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_round_trip_preserves_resources_and_rv_counter() {
-        let backend_src: Arc<dyn DatastoreBackend> =
+        let backend_src: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         seed_snapshot_identity(backend_src.as_ref()).await;
         backend_src
@@ -1254,7 +1256,7 @@ mod tests {
         let snapshot = builder.build_snapshot().await.expect("build snapshot");
         let snapshot_bytes = snapshot.snapshot.into_inner();
 
-        let backend_dst: Arc<dyn DatastoreBackend> =
+        let backend_dst: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let mut sm_dst = build_sm_with_backend(backend_dst.clone()).await;
         sm_dst
@@ -1290,7 +1292,7 @@ mod tests {
     /// runs cooperatively at each of the builder's await points.
     #[tokio::test]
     async fn build_snapshot_current_rv_not_behind_commits_applied_during_build() {
-        let backend: Arc<dyn DatastoreBackend> =
+        let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         seed_snapshot_identity(backend.as_ref()).await;
         backend
@@ -1384,7 +1386,7 @@ mod tests {
 
         // The snapshot must install cleanly on a fresh follower: a follower
         // applying replace_replicated_resource_state must not reject it.
-        let backend_dst: Arc<dyn DatastoreBackend> =
+        let backend_dst: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let mut sm_dst = build_sm_with_backend(backend_dst).await;
         sm_dst
@@ -1497,7 +1499,7 @@ mod tests {
         // `backend.apply_log_apply_commit`. After apply, the cluster.db
         // row produced by the PutResource mutation must be visible to a
         // `get_resource` read on the same backend.
-        let backend: Arc<dyn DatastoreBackend> =
+        let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let mut sm = build_sm_with_backend(backend.clone()).await;
 
@@ -1560,7 +1562,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_normal_entry_stamps_provisional_rv_after_current_store_rv() {
-        let backend: Arc<dyn DatastoreBackend> =
+        let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let snapshot_rv = backend
             .advance_resource_version_after(100)
@@ -1627,7 +1629,7 @@ mod tests {
 
     #[tokio::test]
     async fn follower_selector_list_positive_watch_receives_v1_ready_transition() {
-        let backend: Arc<dyn DatastoreBackend> =
+        let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         backend
             .create_resource(

@@ -798,7 +798,10 @@ mod cases {
             let namespace = format!("grpc-tls-leader-{}", unique_suffix());
             let (ca_cert_path, wrong_ca_cert_path, node_cert_pem, node_key_pem) =
                 write_leader_tls_files(&namespace);
-            let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+            let concrete_db = crate::datastore::test_support::in_memory().await;
+            let passive_reads =
+                crate::datastore::test_support::sqlite_passive_read_ports(&concrete_db);
+            let db: DatastoreHandle = Arc::new(concrete_db);
             crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
                 .await
                 .unwrap();
@@ -807,10 +810,11 @@ mod cases {
                 .unwrap();
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
             let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
-            let app = crate::replication::grpc::server::mount_service(
+            let app = crate::replication::grpc::server::mount_service_with_passive_reads(
                 axum::Router::new(),
                 service,
                 db,
+                passive_reads,
                 default_transport_policy(),
             );
             let addr = reserve_loopback_addr();
@@ -1006,29 +1010,24 @@ mod cases {
         tokio::sync::watch::Sender<bool>,
         tokio::task::JoinHandle<()>,
     ) {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let concrete_db = crate::datastore::test_support::in_memory().await;
+        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&concrete_db);
+        let db: DatastoreHandle = Arc::new(concrete_db);
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
         let (leader_tx, leader_rx) = tokio::sync::watch::channel(is_leader);
-        let app = crate::replication::grpc::server::mount_service_full(
-            axum::Router::new(),
-            service,
-            db.clone(),
-            None,
-            None,
-            None,
-            None,
-            "",
-            Some(leader_rx),
-            None,
-            None,
-            None,
-            None,
-            policy,
-        );
+        let app =
+            crate::replication::grpc::server::mount_service_with_passive_reads_and_leader_gate(
+                axum::Router::new(),
+                service,
+                db.clone(),
+                passive_reads,
+                leader_rx,
+                policy,
+            );
         let app = mount_test_service_with_node_cert(app, "worker-1");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -2777,8 +2776,12 @@ mod cases {
         tokio::fs::create_dir_all(&log_dir).await.unwrap();
 
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let pod_event_db: crate::datastore::DatastoreHandle =
-            Arc::new(crate::datastore::test_support::in_memory().await);
+        let concrete_pod_event_db = crate::datastore::test_support::in_memory().await;
+        let passive_reads =
+            crate::datastore::test_support::sqlite_passive_read_ports(&concrete_pod_event_db);
+        let pod_event_db: crate::datastore::DatastoreHandle = Arc::new(concrete_pod_event_db);
+        let positioned_watch =
+            crate::positioned_watch_adapter::for_test(&passive_reads, pod_event_db.clone());
         pod_event_db.seed_namespace_for_test("sonobuoy").await;
         pod_event_db
             .create_resource(
@@ -2807,7 +2810,7 @@ mod cases {
             Arc::new(crate::auth::clock::SystemClock),
             crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
                 crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
-                    crate::datastore::DatastoreBackendWatchStore::new(pod_event_db.clone()),
+                    positioned_watch,
                 )),
             )),
         );

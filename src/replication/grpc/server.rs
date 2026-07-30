@@ -612,6 +612,22 @@ impl GrpcReplicationServer {
             db,
             Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
             None,
+            crate::datastore::test_support::unused_fail_closed_passive_read_ports(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_passive_reads(
+        service: Arc<ReplicationService>,
+        db: DatastoreHandle,
+        passive_reads: crate::datastore::selector::PassiveReadPorts,
+    ) -> Self {
+        Self::new_test(
+            service,
+            db,
+            Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
+            None,
+            passive_reads,
         )
     }
 
@@ -626,6 +642,7 @@ impl GrpcReplicationServer {
             db,
             Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
             Some(controller_dispatcher),
+            crate::datastore::test_support::unused_fail_closed_passive_read_ports(),
         )
     }
 
@@ -635,7 +652,13 @@ impl GrpcReplicationServer {
         db: DatastoreHandle,
         node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
     ) -> Self {
-        Self::new_test(service, db, node_lease_tracker, None)
+        Self::new_test(
+            service,
+            db,
+            node_lease_tracker,
+            None,
+            crate::datastore::test_support::unused_fail_closed_passive_read_ports(),
+        )
     }
 
     #[cfg(test)]
@@ -645,7 +668,13 @@ impl GrpcReplicationServer {
         controller_dispatcher: Arc<ControllerDispatcher>,
         node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
     ) -> Self {
-        Self::new_test(service, db, node_lease_tracker, Some(controller_dispatcher))
+        Self::new_test(
+            service,
+            db,
+            node_lease_tracker,
+            Some(controller_dispatcher),
+            crate::datastore::test_support::unused_fail_closed_passive_read_ports(),
+        )
     }
 
     #[cfg(test)]
@@ -654,10 +683,12 @@ impl GrpcReplicationServer {
         db: DatastoreHandle,
         node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
         controller_dispatcher: Option<Arc<ControllerDispatcher>>,
+        passive_reads: crate::datastore::selector::PassiveReadPorts,
     ) -> Self {
         let local = Arc::new(
-            crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker(
+            crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_and_passive_reads(
                 db.clone(),
+                passive_reads,
                 "grpc-test".to_string(),
                 node_lease_tracker,
                 crate::control_plane::client::local::always_leader_watch(),
@@ -1103,6 +1134,34 @@ pub fn mount_service(
 }
 
 #[cfg(test)]
+pub(crate) fn mount_service_with_passive_reads(
+    app: axum::Router,
+    service: Arc<ReplicationService>,
+    db: DatastoreHandle,
+    passive_reads: crate::datastore::selector::PassiveReadPorts,
+    transport_policy: Arc<crate::replication::grpc::transport_policy::GrpcTransportPolicy>,
+) -> axum::Router {
+    let grpc = GrpcReplicationServer::new_with_passive_reads(service, db, passive_reads)
+        .with_watch_heartbeat_interval(transport_policy.watch_heartbeat_interval);
+    mount_configured_test_service(app, grpc, transport_policy)
+}
+
+#[cfg(test)]
+pub(crate) fn mount_service_with_passive_reads_and_leader_gate(
+    app: axum::Router,
+    service: Arc<ReplicationService>,
+    db: DatastoreHandle,
+    passive_reads: crate::datastore::selector::PassiveReadPorts,
+    is_leader_rx: tokio::sync::watch::Receiver<bool>,
+    transport_policy: Arc<crate::replication::grpc::transport_policy::GrpcTransportPolicy>,
+) -> axum::Router {
+    let grpc = GrpcReplicationServer::new_with_passive_reads(service, db, passive_reads)
+        .with_leader_gate(is_leader_rx)
+        .with_watch_heartbeat_interval(transport_policy.watch_heartbeat_interval);
+    mount_configured_test_service(app, grpc, transport_policy)
+}
+
+#[cfg(test)]
 pub fn mount_service_with_controller_dispatcher(
     app: axum::Router,
     service: Arc<ReplicationService>,
@@ -1238,6 +1297,15 @@ pub fn mount_service_full_with_policy(
     if let Some(handler) = controlplane_join_handler {
         grpc = grpc.with_controlplane_join_handler(handler);
     }
+    mount_configured_test_service(app, grpc, transport_policy)
+}
+
+#[cfg(test)]
+fn mount_configured_test_service(
+    app: axum::Router,
+    grpc: GrpcReplicationServer,
+    transport_policy: Arc<crate::replication::grpc::transport_policy::GrpcTransportPolicy>,
+) -> axum::Router {
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(klights_internal_protobuf::FILE_DESCRIPTOR_SET)
         .build_v1()
@@ -3693,32 +3761,21 @@ mod tests {
     /// require steady-state auth (e.g. `watch_resources`) accept the request;
     /// `None` leaves auth to fail (the decode-size check fires first regardless).
     async fn grpc_test_server_with_policy(
-        db: DatastoreHandle,
+        db: crate::datastore::sqlite::Datastore,
         policy: Arc<crate::replication::grpc::transport_policy::GrpcTransportPolicy>,
         injected_node_cert: Option<&str>,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let injected_node_cert = injected_node_cert.map(str::to_string);
-        crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
+        crate::bootstrap::cluster_meta::ensure_cluster_metadata(&db)
             .await
             .unwrap();
+        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
+        let db: DatastoreHandle = Arc::new(db);
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
-        let app = super::mount_service_full_with_policy(
-            axum::Router::new(),
-            service,
-            db,
-            None,
-            None,
-            None,
-            None,
-            "",
-            None,
-            None,
-            None,
-            None,
-            None,
-            policy,
-        );
+        let grpc = super::GrpcReplicationServer::new_with_passive_reads(service, db, passive_reads)
+            .with_watch_heartbeat_interval(policy.watch_heartbeat_interval);
+        let app = super::mount_configured_test_service(axum::Router::new(), grpc, policy);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let handle = tokio::spawn(async move {
@@ -3765,7 +3822,7 @@ mod tests {
     /// before the handler runs.
     #[tokio::test]
     async fn server_rejects_request_over_policy_message_limit() {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db = crate::datastore::test_support::in_memory().await;
         let policy = crate::replication::grpc::transport_policy::GrpcTransportPolicy {
             max_message_bytes: 1024,
             ..Default::default()
@@ -3826,7 +3883,7 @@ mod tests {
     /// the bookmark and the worker idle-reconnected every window.
     #[tokio::test]
     async fn fresh_idle_watch_heartbeat_carries_the_sampled_anchor() {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db = crate::datastore::test_support::in_memory().await;
         db.create_namespace(
             "anchor",
             serde_json::json!({"metadata": {"name": "anchor"}}),
@@ -3884,7 +3941,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_stream_emits_bookmark_during_stream_local_silence_under_nonmatching_traffic() {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db = crate::datastore::test_support::in_memory().await;
         db.create_namespace("hb", serde_json::json!({"metadata": {"name": "hb"}}))
             .await
             .unwrap();
@@ -3970,8 +4027,8 @@ mod tests {
     /// non-matching high-water mark.
     #[tokio::test]
     async fn watch_stream_replays_lower_matching_pod_on_nonmatching_high_rv_signal() {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
-        crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
+        let db = crate::datastore::test_support::in_memory().await;
+        crate::bootstrap::cluster_meta::ensure_cluster_metadata(&db)
             .await
             .unwrap();
         db.create_namespace(
@@ -4097,24 +4154,27 @@ mod tests {
         super::GrpcReplicationServer,
         tokio::sync::watch::Sender<bool>,
     ) {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db = crate::datastore::test_support::in_memory().await;
         grpc_leader_server_with_db(db, is_leader).await
     }
 
     async fn grpc_leader_server_with_db(
-        db: DatastoreHandle,
+        db: crate::datastore::sqlite::Datastore,
         is_leader: bool,
     ) -> (
         super::GrpcReplicationServer,
         tokio::sync::watch::Sender<bool>,
     ) {
-        crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
+        crate::bootstrap::cluster_meta::ensure_cluster_metadata(&db)
             .await
             .unwrap();
+        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
+        let db: DatastoreHandle = Arc::new(db);
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
         let (leader_tx, is_leader_rx) = tokio::sync::watch::channel(is_leader);
-        let grpc = super::GrpcReplicationServer::new(service, db).with_leader_gate(is_leader_rx);
+        let grpc = super::GrpcReplicationServer::new_with_passive_reads(service, db, passive_reads)
+            .with_leader_gate(is_leader_rx);
         (grpc, leader_tx)
     }
 
@@ -4156,9 +4216,9 @@ mod tests {
         })
     }
 
-    async fn configmap_replay_db() -> (DatastoreHandle, i64) {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
-        crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
+    async fn configmap_replay_db() -> (crate::datastore::sqlite::Datastore, i64) {
+        let db = crate::datastore::test_support::in_memory().await;
+        crate::bootstrap::cluster_meta::ensure_cluster_metadata(&db)
             .await
             .unwrap();
         db.create_namespace(
@@ -4195,7 +4255,7 @@ mod tests {
     }
 
     async fn register_grpc_watch_scope_crd(
-        db: &DatastoreHandle,
+        db: &dyn DatastoreBackend,
         group: &str,
         kind: &str,
         plural: &str,
@@ -4241,7 +4301,7 @@ mod tests {
     async fn grpc_watch_resolves_namespaced_crd_for_all_namespaces_delivery() {
         use futures::StreamExt;
 
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db = crate::datastore::test_support::in_memory().await;
         register_grpc_watch_scope_crd(&db, "example.com", "Widget", "widgets", true).await;
         let (grpc, _leader_tx) = grpc_leader_server_with_db(db.clone(), true).await;
         let mut stream = grpc
@@ -4282,7 +4342,7 @@ mod tests {
     async fn grpc_watch_resolves_cluster_scoped_crd_delivery() {
         use futures::StreamExt;
 
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db = crate::datastore::test_support::in_memory().await;
         register_grpc_watch_scope_crd(
             &db,
             "cluster.example.com",

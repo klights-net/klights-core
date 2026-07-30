@@ -1653,7 +1653,7 @@ mod tests {
     use crate::datastore::node_local::SqliteNodeLocalDb;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
-    fn raft_store_ports(backend: Arc<dyn DatastoreBackend>) -> RaftStorePorts {
+    fn raft_store_ports(backend: Arc<crate::datastore::sqlite::Datastore>) -> RaftStorePorts {
         crate::datastore::cluster_store_adapter::raft_store_ports_for_test(backend)
     }
 
@@ -1967,7 +1967,7 @@ mod tests {
         }
     }
 
-    async fn fresh_node(node_id: NodeId) -> (RaftNode, Arc<dyn DatastoreBackend>) {
+    async fn fresh_node(node_id: NodeId) -> (RaftNode, Arc<crate::datastore::sqlite::Datastore>) {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let node_executor = klights_node_datastore::open::open_with_opts(
             klights_node_datastore::open::in_memory_opts(),
@@ -1979,7 +1979,7 @@ mod tests {
         let node_local = Arc::new(
             SqliteNodeLocalDb::from_executor(node_executor).expect("create node-local db"),
         );
-        let backend: Arc<dyn DatastoreBackend> =
+        let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let backend_for_caller = backend.clone();
         let raft_node = RaftNode::start(
@@ -2086,7 +2086,7 @@ mod tests {
     /// the shared registry so the test can hold and shut them down cleanly.
     async fn fresh_three_voter_cluster() -> (
         Vec<RaftNode>,
-        Vec<Arc<dyn DatastoreBackend>>,
+        Vec<Arc<crate::datastore::sqlite::Datastore>>,
         crate::datastore::raft::network::LoopbackRegistry,
     ) {
         use crate::datastore::raft::network::{LoopbackRaftNetworkFactory, LoopbackRegistry};
@@ -2104,7 +2104,7 @@ mod tests {
             .expect("open node-local executor");
             let node_local =
                 Arc::new(SqliteNodeLocalDb::from_executor(exec).expect("create node-local db"));
-            let backend: Arc<dyn DatastoreBackend> =
+            let backend: Arc<crate::datastore::sqlite::Datastore> =
                 Arc::new(crate::datastore::test_support::in_memory().await);
             let factory = LoopbackRaftNetworkFactory::new(registry.clone());
             let n = RaftNode::start_with_network(
@@ -2292,7 +2292,7 @@ mod tests {
             .expect("open node-local executor");
             let node_local =
                 Arc::new(SqliteNodeLocalDb::from_executor(exec).expect("create node-local db"));
-            let backend: Arc<dyn DatastoreBackend> =
+            let backend: Arc<crate::datastore::sqlite::Datastore> =
                 Arc::new(crate::datastore::test_support::in_memory().await);
             let factory = LoopbackRaftNetworkFactory::new(registry.clone());
             let mock = Arc::new(CapturingForwarder::default());
@@ -2383,7 +2383,7 @@ mod tests {
             .expect("open node-local executor");
             let node_local =
                 Arc::new(SqliteNodeLocalDb::from_executor(exec).expect("create node-local db"));
-            let backend: Arc<dyn DatastoreBackend> =
+            let backend: Arc<crate::datastore::sqlite::Datastore> =
                 Arc::new(crate::datastore::test_support::in_memory().await);
             let factory = LoopbackRaftNetworkFactory::new(registry.clone());
             let node = RaftNode::start_with_network(
@@ -2496,7 +2496,7 @@ mod tests {
         .expect("open node-local executor");
         let node_local =
             Arc::new(SqliteNodeLocalDb::from_executor(exec).expect("create node-local db"));
-        let backend: Arc<dyn DatastoreBackend> =
+        let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let node = RaftNode::start(
             10,
@@ -2620,7 +2620,7 @@ mod tests {
     async fn fresh_voter_in_registry_with_backend(
         id: NodeId,
         registry: &crate::datastore::raft::network::LoopbackRegistry,
-    ) -> (RaftNode, Arc<dyn DatastoreBackend>) {
+    ) -> (RaftNode, Arc<crate::datastore::sqlite::Datastore>) {
         use crate::datastore::raft::network::LoopbackRaftNetworkFactory;
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let exec = klights_node_datastore::open::open_with_opts(
@@ -2632,7 +2632,7 @@ mod tests {
         .expect("open node-local executor");
         let node_local =
             Arc::new(SqliteNodeLocalDb::from_executor(exec).expect("create node-local db"));
-        let backend: Arc<dyn DatastoreBackend> =
+        let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let factory = LoopbackRaftNetworkFactory::new(registry.clone());
         let node = RaftNode::start_with_network(
@@ -3587,7 +3587,7 @@ mod tests {
         .await
         .unwrap();
         let node_local = Arc::new(SqliteNodeLocalDb::from_executor(executor).unwrap());
-        let backend: Arc<dyn DatastoreBackend> =
+        let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let client = Arc::new(AdmissionFenceClient {
             ready: std::sync::atomic::AtomicBool::new(false),
@@ -4081,7 +4081,7 @@ mod tests {
         .await
         .unwrap();
         let nl1 = Arc::new(SqliteNodeLocalDb::from_executor(exec1).unwrap());
-        let be1: Arc<dyn DatastoreBackend> =
+        let be1: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let leader_network = LoopbackRaftNetworkFactory::new(registry.clone());
         let leader = RaftNode::start_with_network(
@@ -4115,7 +4115,7 @@ mod tests {
         .await
         .unwrap();
         let nl2 = Arc::new(SqliteNodeLocalDb::from_executor(exec2).unwrap());
-        let be2: Arc<dyn DatastoreBackend> =
+        let be2: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let voter_network = LoopbackRaftNetworkFactory::new(registry.clone());
         let voter_node = RaftNode::start_with_network(

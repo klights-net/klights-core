@@ -9234,12 +9234,13 @@ async fn test_crd_live_replay_failure_emits_terminal_error() {
 
     // Redb has a deterministic close boundary used to inject the replay read
     // failure; the default SQLite test handle remains callable after close.
-    let db: crate::datastore::DatastoreHandle = std::sync::Arc::new(
-        crate::datastore::redb::RedbDatastore::new_in_memory()
-            .await
-            .unwrap(),
-    );
-    let state = crate::api::test_support::build_test_app_state_with_db(db.clone()).await;
+    let concrete_db = crate::datastore::redb::RedbDatastore::new_in_memory()
+        .await
+        .unwrap();
+    let passive_reads = concrete_db.passive_read_ports_for_test();
+    let db: crate::datastore::DatastoreHandle = std::sync::Arc::new(concrete_db);
+    let state =
+        crate::api::test_support::build_test_app_state_with_db(db.clone(), passive_reads).await;
     let app = crate::api::build_router(state);
     register_selw_crd(&app).await;
     let create = |name: &str| {

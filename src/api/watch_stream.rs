@@ -949,6 +949,18 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn datastore_watch_source(
+        db: &crate::datastore::sqlite::Datastore,
+        handle: &crate::datastore::DatastoreHandle,
+    ) -> crate::watch_stream_adapter::DatastoreWatchStreamAdapter {
+        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(db);
+        crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
+            handle.clone(),
+            crate::watch_commit_observation_adapter::test_signal_source(handle),
+            crate::positioned_watch_adapter::for_test(&passive_reads, handle.clone()),
+        )
+    }
+
     #[derive(Clone)]
     struct FiniteWatchSource {
         events: Vec<klights_leader_api::ResourceEvent>,
@@ -2158,13 +2170,14 @@ mod tests {
             .unwrap();
         }
         let collection_rv = handle.get_current_resource_version().await.unwrap();
+        let watch_source = datastore_watch_source(&ds, &handle);
         assert!(
             collection_rv > 1,
             "test fixture: global RV must be non-trivial, got {collection_rv}"
         );
 
         let rv = resolve_periodic_bookmark_rv(PeriodicBookmarkContext {
-            db: &handle,
+            db: &watch_source,
             api_version: "v1",
             kind: "ConfigMap",
             watch_namespace: Some("watched"),
@@ -2201,9 +2214,10 @@ mod tests {
         .await
         .unwrap();
         let snapshot_rv = handle.get_current_resource_version().await.unwrap();
+        let watch_source = datastore_watch_source(&ds, &handle);
 
         let rv = resolve_periodic_bookmark_rv(PeriodicBookmarkContext {
-            db: &handle,
+            db: &watch_source,
             api_version: "v1",
             kind: "ConfigMap",
             watch_namespace: Some("default"),
@@ -2227,8 +2241,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_periodic_bookmark_rv_selector_free_uses_cursor_high_water() {
         let (ds, handle) = crate::datastore::sqlite::test_support::in_memory_with_handle().await;
+        let watch_source = datastore_watch_source(&ds, &handle);
         let rv = resolve_periodic_bookmark_rv(PeriodicBookmarkContext {
-            db: &handle,
+            db: &watch_source,
             api_version: "v1",
             kind: "ConfigMap",
             watch_namespace: None,
@@ -2264,11 +2279,12 @@ mod tests {
         .await
         .unwrap();
         let collection_rv = handle.get_current_resource_version().await.unwrap();
+        let watch_source = datastore_watch_source(&ds, &handle);
 
         // A selector-free watch that has observed nothing yet (quiet,
         // freshly established) must still emit a valid, advancing resume point.
         let rv = resolve_periodic_bookmark_rv(PeriodicBookmarkContext {
-            db: &handle,
+            db: &watch_source,
             api_version: "v1",
             kind: "ConfigMap",
             watch_namespace: None,
@@ -2289,12 +2305,13 @@ mod tests {
     #[tokio::test]
     async fn read_freshness_wait_is_noop_when_zero_or_already_fresh() {
         let (ds, handle) = crate::datastore::sqlite::test_support::in_memory_with_handle().await;
+        let watch_source = datastore_watch_source(&ds, &handle);
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
 
         // resourceVersion 0 / unset: nothing to wait for.
         tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            wait_until_datastore_fresh(&handle, 0, "v1", "Pod", &supervisor),
+            wait_until_datastore_fresh(&watch_source, 0, "v1", "Pod", &supervisor),
         )
         .await
         .expect("zero target must return immediately");
@@ -2303,7 +2320,7 @@ mod tests {
         let cur = handle.get_current_resource_version().await.unwrap();
         tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            wait_until_datastore_fresh(&handle, cur, "v1", "Pod", &supervisor),
+            wait_until_datastore_fresh(&watch_source, cur, "v1", "Pod", &supervisor),
         )
         .await
         .expect("already-fresh target must return immediately");
@@ -2313,11 +2330,13 @@ mod tests {
     #[tokio::test]
     async fn read_freshness_wait_wakes_on_applied_write() {
         let (ds, handle) = crate::datastore::sqlite::test_support::in_memory_with_handle().await;
+        let watch_source = datastore_watch_source(&ds, &handle);
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let base = handle.get_current_resource_version().await.unwrap();
         let target = base + 1;
 
-        let waiter = wait_until_datastore_fresh(&handle, target, "v1", "ConfigMap", &supervisor);
+        let waiter =
+            wait_until_datastore_fresh(&watch_source, target, "v1", "ConfigMap", &supervisor);
         let writer = async {
             // Let the waiter subscribe and run its initial check first so
             // we exercise the event-driven wakeup, not the fast path.

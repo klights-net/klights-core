@@ -54,6 +54,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
         klights_supervisor::TaskCategoryConfig::default(),
     ));
     let metrics = crate::side_effects::SideEffectMetrics::new();
+    let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     let local_api = std::sync::Arc::new(crate::control_plane::client::local::LocalApiClient::new(
         db_handle.clone(),
@@ -94,10 +95,12 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
         db_handle.clone(),
         pod_repository.clone(),
     );
+    let positioned_watch =
+        crate::positioned_watch_adapter::for_test(&passive_reads, db_handle.clone());
     let generated_handler_adapter = crate::generated_handler_adapter::GeneratedHandlerAdapter::new(
         db_handle.clone(),
         crate::watch_commit_observation_adapter::test_signal_source(&db_handle),
-        crate::positioned_watch_adapter::for_test(db_handle.clone()),
+        positioned_watch.clone(),
         klights_supervisor::FileProcessExecutor::new(task_supervisor.clone()),
         task_supervisor.clone(),
         crate::KlightsConfig::test_default()
@@ -130,7 +133,13 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
         ),
         crate::api::ApiResourceMutationServices {
             db: db_handle.clone(),
-            watch_stream: std::sync::Arc::new(db_handle.clone()),
+            watch_stream: std::sync::Arc::new(
+                crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
+                    db_handle.clone(),
+                    crate::watch_commit_observation_adapter::test_signal_source(&db_handle),
+                    positioned_watch.clone(),
+                ),
+            ),
             namespace_termination:
                 crate::api_state_adapter_test_owner::RootNamespaceTerminationStore::new(
                     db_handle.clone(),
@@ -154,7 +163,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
                 crate::custom_resource_read_adapter::CustomResourceReadAdapter::new(
                     db_handle.clone(),
                     crate::watch_commit_observation_adapter::test_signal_source(&db_handle),
-                    crate::positioned_watch_adapter::for_test(db_handle.clone()),
+                    positioned_watch.clone(),
                     task_supervisor.clone(),
                 ),
             builtin_admission_defaults: generated_handler_adapter.clone(),
@@ -189,7 +198,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
             ),
             crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(std::sync::Arc::new(
                 crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(std::sync::Arc::new(
-                    crate::datastore::DatastoreBackendWatchStore::new(db_handle.clone()),
+                    positioned_watch,
                 )),
             )),
             None,

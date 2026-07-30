@@ -20,10 +20,12 @@ pub(crate) fn datastore_positioned_watch_service(
 }
 
 #[cfg(test)]
-pub(crate) fn for_test(db: DatastoreHandle) -> klights_watch::PositionedWatchService {
-    let passive_reads = PassiveReadPorts::for_test(db.clone());
+pub(crate) fn for_test(
+    passive_reads: &PassiveReadPorts,
+    db: DatastoreHandle,
+) -> klights_watch::PositionedWatchService {
     datastore_positioned_watch_service(
-        &passive_reads,
+        passive_reads,
         db.clone(),
         crate::watch_commit_observation_adapter::test_signal_source(&db),
     )

@@ -81,62 +81,6 @@ impl WatchStreamSource for DatastoreWatchStreamAdapter {
     }
 }
 
-#[cfg(test)]
-impl WatchStreamSource for DatastoreHandle {
-    fn wait_until_fresh<'a>(
-        &'a self,
-        target_rv: i64,
-        api_version: &'a str,
-        kind: &'a str,
-        task_supervisor: &'a klights_supervisor::TaskSupervisor,
-    ) -> WatchSourceWaitFuture<'a> {
-        let db = self.clone();
-        let signals = crate::watch_commit_observation_adapter::test_signal_source(self);
-        let topic = klights_watch::WatchTopic::new(api_version, kind);
-        Box::pin(async move {
-            wait_until_fresh(&db, signals.as_ref(), target_rv, topic, task_supervisor).await
-        })
-    }
-
-    fn list_watch_resources<'a>(
-        &'a self,
-        api_version: &'a str,
-        kind: &'a str,
-        namespace: Option<&'a str>,
-        label_selector: Option<&'a str>,
-        field_selector: Option<&'a str>,
-        limit: Option<i64>,
-    ) -> WatchSourceListFuture<'a> {
-        let adapter = DatastoreWatchStreamAdapter::new(
-            self.clone(),
-            crate::watch_commit_observation_adapter::test_signal_source(self),
-            crate::positioned_watch_adapter::for_test(self.clone()),
-        );
-        Box::pin(async move {
-            adapter
-                .list_watch_resources(
-                    api_version,
-                    kind,
-                    namespace,
-                    label_selector,
-                    field_selector,
-                    limit,
-                )
-                .await
-        })
-    }
-
-    fn watch_resources(
-        &self,
-        request: klights_leader_api::WatchRequest,
-    ) -> klights_leader_api::LeaderWatchFuture<'_> {
-        let positioned = crate::positioned_watch_adapter::for_test(self.clone());
-        Box::pin(async move {
-            klights_leader_api::LeaderWatch::watch_resources(&positioned, request).await
-        })
-    }
-}
-
 async fn wait_until_fresh(
     db: &DatastoreHandle,
     signals: &dyn klights_watch::WatchSignalSubscribe,

@@ -14,12 +14,14 @@ pub(crate) fn resource_query_for_test_datastore(
 pub(crate) async fn build_test_app_state() -> crate::api::ApiState {
     // `test_support::in_memory()` already seeds the standard system namespaces.
     let db = crate::datastore::test_support::in_memory().await;
-    build_test_app_state_with_db(std::sync::Arc::new(db)).await
+    let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
+    build_test_app_state_with_db(std::sync::Arc::new(db), passive_reads).await
 }
 
 #[cfg(test)]
 pub(crate) async fn build_test_app_state_with_db(
     db_handle: crate::datastore::DatastoreHandle,
+    passive_reads: crate::datastore::selector::PassiveReadPorts,
 ) -> crate::api::ApiState {
     use std::sync::Arc;
 
@@ -94,10 +96,12 @@ pub(crate) async fn build_test_app_state_with_db(
         db_handle.clone(),
         pod_repository.clone(),
     );
+    let positioned_watch =
+        crate::positioned_watch_adapter::for_test(&passive_reads, db_handle.clone());
     let generated_handler_adapter = crate::generated_handler_adapter::GeneratedHandlerAdapter::new(
         db_handle.clone(),
         crate::watch_commit_observation_adapter::test_signal_source(&db_handle),
-        crate::positioned_watch_adapter::for_test(db_handle.clone()),
+        positioned_watch.clone(),
         klights_supervisor::FileProcessExecutor::new(task_supervisor.clone()),
         task_supervisor.clone(),
         config.data_root.join("etc").join("ca.crt"),
@@ -127,7 +131,13 @@ pub(crate) async fn build_test_app_state_with_db(
         ),
         crate::api::ApiResourceMutationServices {
             db: db_handle.clone(),
-            watch_stream: Arc::new(db_handle.clone()),
+            watch_stream: Arc::new(
+                crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
+                    db_handle.clone(),
+                    crate::watch_commit_observation_adapter::test_signal_source(&db_handle),
+                    positioned_watch.clone(),
+                ),
+            ),
             namespace_termination:
                 crate::api_state_adapter_test_owner::RootNamespaceTerminationStore::new(
                     db_handle.clone(),
@@ -151,7 +161,7 @@ pub(crate) async fn build_test_app_state_with_db(
                 crate::custom_resource_read_adapter::CustomResourceReadAdapter::new(
                     db_handle.clone(),
                     crate::watch_commit_observation_adapter::test_signal_source(&db_handle),
-                    crate::positioned_watch_adapter::for_test(db_handle.clone()),
+                    positioned_watch.clone(),
                     task_supervisor.clone(),
                 ),
             builtin_admission_defaults: generated_handler_adapter.clone(),
@@ -186,7 +196,7 @@ pub(crate) async fn build_test_app_state_with_db(
             ),
             crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
                 crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
-                    crate::datastore::DatastoreBackendWatchStore::new(db_handle.clone()),
+                    positioned_watch,
                 )),
             )),
             None,

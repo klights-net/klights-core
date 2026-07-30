@@ -204,6 +204,18 @@ impl RedbDatastore {
         self.read_store.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn passive_read_ports_for_test(
+        &self,
+    ) -> crate::datastore::selector::PassiveReadPorts {
+        let focused_reads = self.focused_read_store();
+        crate::datastore::selector::PassiveReadPorts::new(
+            focused_reads.clone(),
+            focused_reads.clone(),
+            focused_reads,
+        )
+    }
+
     pub(crate) fn focused_committed_apply(
         &self,
     ) -> Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply> {

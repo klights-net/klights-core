@@ -772,7 +772,9 @@ mod tests {
         DatastoreHandle,
         tokio::task::JoinHandle<()>,
     ) {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let concrete_db = crate::datastore::test_support::in_memory().await;
+        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&concrete_db);
+        let db: DatastoreHandle = Arc::new(concrete_db);
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
@@ -781,10 +783,11 @@ mod tests {
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
-        let app = crate::replication::grpc::server::mount_service(
+        let app = crate::replication::grpc::server::mount_service_with_passive_reads(
             axum::Router::new(),
             service,
             db.clone(),
+            passive_reads,
             crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
         );
         // Simulate the mTLS edge: in production the TLS layer injects the

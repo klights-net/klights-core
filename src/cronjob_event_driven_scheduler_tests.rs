@@ -19,6 +19,7 @@ async fn make_scheduler() -> (
     Arc<CronJobScheduler>,
 ) {
     let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+    let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
@@ -33,7 +34,7 @@ async fn make_scheduler() -> (
     );
     let scheduler = crate::cronjob_scheduler_adapter::new_leader_scheduler(
         db_handle.clone(),
-        crate::positioned_watch_adapter::for_test(db_handle.clone()),
+        crate::positioned_watch_adapter::for_test(&passive_reads, db_handle.clone()),
         dispatcher.clone(),
         supervisor.clone(),
     );

@@ -392,9 +392,16 @@ impl ReplicationService {
     /// No background tasks are spawned at creation time.
     #[cfg(test)]
     pub fn new(db: Arc<dyn DatastoreBackend>, supervisor: Arc<TaskSupervisor>) -> Self {
-        let metadata = Arc::new(
-            crate::datastore::cluster_store_adapter::LegacyTestClusterMetadataRead::new(db.clone()),
-        );
+        let metadata = Arc::new(TestClusterMetadataRead);
+        Self::new_with_test_metadata(db, metadata, supervisor)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_test_metadata(
+        db: Arc<dyn DatastoreBackend>,
+        metadata: Arc<dyn klights_cluster_store::ClusterMetadataRead>,
+        supervisor: Arc<TaskSupervisor>,
+    ) -> Self {
         let bootstrap_tokens = Arc::new(
             crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new(db.clone()),
         );
@@ -409,16 +416,8 @@ impl ReplicationService {
         supervisor: Arc<TaskSupervisor>,
         containerd_namespace: String,
     ) -> Self {
-        let metadata = Arc::new(
-            crate::datastore::cluster_store_adapter::LegacyTestClusterMetadataRead::new(db.clone()),
-        );
-        let bootstrap_tokens = Arc::new(
-            crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new(db.clone()),
-        );
         let _ = containerd_namespace;
-        let mut service = Self::new_with_ports(metadata, bootstrap_tokens, supervisor);
-        service.db = Some(db);
-        service
+        Self::new(db, supervisor)
     }
 
     pub(crate) fn new_with_ports(
@@ -1437,6 +1436,30 @@ impl ReplicationService {
     }
 }
 
+#[cfg(test)]
+struct TestClusterMetadataRead;
+
+#[cfg(test)]
+impl klights_cluster_store::ClusterMetadataRead for TestClusterMetadataRead {
+    fn read_cluster_metadata(
+        &self,
+    ) -> klights_cluster_store::ClusterMetadataFuture<
+        '_,
+        klights_cluster_store::PersistedClusterMetadata,
+    > {
+        Box::pin(async {
+            Ok(klights_cluster_store::PersistedClusterMetadata::new(
+                klights_cluster_core::ClusterMetadata {
+                    cluster_id: "klights-test-cluster".to_string(),
+                    leader_epoch: 0,
+                    current_rv: 0,
+                },
+                klights_cluster_store::SnapshotMembership::LegacyOmitted,
+            ))
+        })
+    }
+}
+
 impl NodeExec for ReplicationService {
     fn exec_sync(&self, request: NodeExecSyncRequest) -> NodeExecFuture<'_, NodeExecSyncResult> {
         Box::pin(async move {
@@ -1505,7 +1528,11 @@ mod tests {
             .await
             .unwrap();
 
-        ReplicationService::new(db, supervisor)
+        ReplicationService::new_with_test_metadata(
+            db.clone(),
+            db.focused_recovery_store(),
+            supervisor,
+        )
     }
 
     async fn create_scoped_token_for_test(
@@ -1852,7 +1879,11 @@ mod tests {
         crate::signing_key_state_adapter::persist(&signing_key_path, &signing_key, &supervisor)
             .await
             .unwrap();
-        let service = ReplicationService::new_with_containerd_namespace(db, supervisor, namespace);
+        let service = ReplicationService::new_with_test_metadata(
+            db.clone(),
+            db.focused_recovery_store(),
+            supervisor,
+        );
 
         let worker_resp = service
             .handle_authenticated_join(JoinRequest {
@@ -1953,6 +1984,56 @@ mod tests {
         assert!(!resp.cluster_id.is_empty());
         assert_eq!(resp.leader_epoch, 0);
         assert_eq!(resp.current_log_index, 0);
+    }
+
+    struct FailingMetadataRead;
+
+    impl klights_cluster_store::ClusterMetadataRead for FailingMetadataRead {
+        fn read_cluster_metadata(
+            &self,
+        ) -> klights_cluster_store::ClusterMetadataFuture<
+            '_,
+            klights_cluster_store::PersistedClusterMetadata,
+        > {
+            Box::pin(async {
+                Err(
+                    klights_cluster_store::ClusterMetadataStoreError::persistence_failed(
+                        "injected metadata failure",
+                    ),
+                )
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_read_failure_preserves_rpc_and_join_error_semantics() {
+        let db: Arc<dyn crate::datastore::DatastoreBackend> =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        let service = ReplicationService::new_with_test_metadata(
+            db,
+            Arc::new(FailingMetadataRead),
+            Arc::new(TaskSupervisor::new(TaskCategoryConfig::default())),
+        );
+
+        let metadata = service.handle_metadata().await;
+        assert!(metadata.cluster_id.is_empty());
+        assert_eq!(metadata.leader_epoch, 0);
+        assert_eq!(metadata.current_rv, 0);
+        assert_eq!(metadata.current_log_index, 0);
+
+        let join = service
+            .handle_authenticated_join(JoinRequest {
+                token: String::new(),
+                node_name: "worker-1".into(),
+                role: crate::replication::protocol::JoinRole::Worker,
+            })
+            .await;
+        assert_eq!(
+            join,
+            JoinResponse::Rejected {
+                reason: "leader metadata error".into(),
+            }
+        );
     }
 
     #[tokio::test]
