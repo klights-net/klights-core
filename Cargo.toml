@@ -300,6 +300,7 @@ debug = 1
 klights-cluster-datastore = { workspace = true, features = ["test-support"] }
 klights-cluster-store = { workspace = true, features = ["test-support"] }
 klights-networking = { workspace = true, features = ["test-support"] }
+klights-replication = { workspace = true, features = ["test-support"] }
 rtnetlink = { workspace = true }
 tempfile = { workspace = true }
 rstest = { workspace = true }

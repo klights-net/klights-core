@@ -1777,9 +1777,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         // this server.
         let (raft_rpc_router, controlplane_join_handler) = match raft_node.as_ref() {
             Some(rn) => {
-                let router: Arc<dyn klights_leader_rpc::raft_rpc::RaftRpcRouter> = Arc::new(
-                    crate::datastore::raft::node::RaftNodeRpcRouter::from_node(rn.as_ref()),
-                );
+                let router: Arc<dyn klights_leader_rpc::raft_rpc::RaftRpcRouter> =
+                    Arc::new(rn.rpc_router());
                 let handler =
                     crate::bootstrap::controlplane_join_adapters::build_controlplane_join_handler(
                         rn.clone(),

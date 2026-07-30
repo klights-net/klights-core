@@ -2,89 +2,14 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use klights_leader_api::{
-    ControlplaneJoinAdmission, ControlplaneJoinAdmissionFuture, ControlplaneJoinAdmissionOutcome,
-    ControlplaneJoinAuthority, ControlplaneJoinError, ControlplaneJoinHandler,
-    ControlplaneJoinMetadata, ControlplaneJoinMetadataFuture, ControlplaneJoinRegistration,
-    ControlplaneJoinRegistrationFuture, ControlplaneJoinRequest, ControlplaneJoinRoute,
-    ControlplaneMemberQuery, ControlplaneMemberQueryFuture, RemoteNodeMode,
+    ControlplaneJoinError, ControlplaneJoinHandler, ControlplaneJoinMetadata,
+    ControlplaneJoinMetadataFuture, ControlplaneJoinRegistration,
+    ControlplaneJoinRegistrationFuture, ControlplaneJoinRequest, RemoteNodeMode,
 };
 
 use crate::datastore::DatastoreHandle;
-use crate::datastore::raft::node::{RaftMemberAdmissionResult, RaftNode};
-use klights_replication::types::{RaftShape, raft_node_id_for_node_name};
-
-struct RaftControlplaneJoinAuthority {
-    node: Arc<RaftNode>,
-}
-
-impl ControlplaneJoinAuthority for RaftControlplaneJoinAuthority {
-    fn route(&self) -> ControlplaneJoinRoute {
-        if self.node.is_leader() {
-            ControlplaneJoinRoute::Local
-        } else {
-            match self.node.current_leader_info() {
-                Some((leader_id, leader_addr)) => ControlplaneJoinRoute::Redirect {
-                    leader_id,
-                    leader_addr,
-                },
-                None => ControlplaneJoinRoute::Unavailable,
-            }
-        }
-    }
-}
-
-struct RaftControlplaneJoinAdmission {
-    node: Arc<RaftNode>,
-}
-
-impl ControlplaneJoinAdmission for RaftControlplaneJoinAdmission {
-    fn admit<'a>(
-        &'a self,
-        request: &'a ControlplaneJoinRequest,
-    ) -> ControlplaneJoinAdmissionFuture<'a> {
-        Box::pin(async move {
-            let result = self
-                .node
-                .admit_controlplane_member_with_limit(
-                    request.node_id,
-                    request.addr.clone(),
-                    request.as_learner,
-                    request.storage_incarnation.clone(),
-                    request.storage_log_attestation.clone(),
-                    crate::bootstrap::node_role::controlplane_limit(),
-                )
-                .await
-                .map_err(|error| ControlplaneJoinError::new(error.to_string()))?;
-            Ok(ControlplaneJoinAdmissionOutcome {
-                changed: result == RaftMemberAdmissionResult::Changed,
-                voter_count_after: self.node.current_shape().voter_count,
-            })
-        })
-    }
-}
-
-struct RaftControlplaneMemberQuery {
-    node: Arc<RaftNode>,
-}
-
-impl ControlplaneMemberQuery for RaftControlplaneMemberQuery {
-    fn is_controlplane_member<'a>(
-        &'a self,
-        node_name: &'a str,
-    ) -> ControlplaneMemberQueryFuture<'a> {
-        Box::pin(async move {
-            let target = raft_node_id_for_node_name(node_name);
-            self.node
-                .raft
-                .metrics()
-                .borrow()
-                .membership_config
-                .membership()
-                .nodes()
-                .any(|(id, _)| *id == target)
-        })
-    }
-}
+use crate::datastore::raft::node::RaftNode;
+use klights_replication::types::RaftShape;
 
 struct ClusterControlplaneJoinRegistration {
     db: DatastoreHandle,
@@ -280,17 +205,23 @@ pub(crate) fn build_controlplane_join_handler(
     node: Arc<RaftNode>,
     db: DatastoreHandle,
 ) -> Arc<dyn ControlplaneJoinHandler> {
-    Arc::new(
-        crate::bootstrap::controlplane_join_handler::ControlplaneJoinCoordinator::new(
-            Arc::new(RaftControlplaneJoinAuthority { node: node.clone() }),
-            Arc::new(RaftControlplaneJoinAdmission { node: node.clone() }),
-            Arc::new(RaftControlplaneMemberQuery { node: node.clone() }),
-            Arc::new(ClusterControlplaneJoinRegistration { db: db.clone() }),
-            Arc::new(ClusterControlplaneJoinMetadata {
-                node,
-                db,
-                mutex: tokio::sync::Mutex::new(()),
-            }),
+    let membership = node.membership();
+    Arc::new(klights_replication::join::ControlplaneJoinCoordinator::new(
+        Arc::new(klights_replication::join::RaftControlplaneJoinAuthority::new(membership.clone())),
+        Arc::new(
+            klights_replication::join::RaftControlplaneJoinAdmission::new(
+                membership.clone(),
+                crate::bootstrap::node_role::controlplane_limit(),
+            ),
         ),
-    )
+        Arc::new(klights_replication::join::RaftControlplaneMemberQuery::new(
+            membership,
+        )),
+        Arc::new(ClusterControlplaneJoinRegistration { db: db.clone() }),
+        Arc::new(ClusterControlplaneJoinMetadata {
+            node,
+            db,
+            mutex: tokio::sync::Mutex::new(()),
+        }),
+    ))
 }

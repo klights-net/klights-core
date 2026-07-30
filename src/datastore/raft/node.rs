@@ -10,10 +10,12 @@
 //! a single-voter cluster, so manual promotion shares the no-op-log-
 //! entry-at-new-term path with auto-election.
 
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+#[cfg(test)]
 use async_trait::async_trait;
 #[cfg(test)]
 use klights_cluster_core::OutboxOperation;
@@ -21,7 +23,7 @@ use klights_cluster_core::{OutboxApplyError, OutboxApplyOutcome, StorageCommand}
 use klights_node_store::{RaftAppliedStateDurability, RaftLogDurability};
 #[cfg(test)]
 use openraft::error::{ClientWriteError, RaftError};
-use openraft::{ChangeMembers, Config, Raft};
+use openraft::{Config, Raft};
 
 use openraft::network::RaftNetworkFactory;
 
@@ -29,100 +31,13 @@ use super::network::LeaderForwarder;
 #[cfg(test)]
 use super::network::StubRaftNetwork;
 use klights_cluster_store::BackendLifecycleStore;
-use klights_replication::activation::{
-    COMMAND_CODEC_ACTIVATION_VALUE, CommandCodecV3Activation, KEY_COMMAND_CODEC_ACTIVATION_VERSION,
-};
+use klights_replication::activation::CommandCodecV3Activation;
 use klights_replication::log_storage::SqliteRaftLogStorage;
 use klights_replication::materializer::RaftCommitMaterializer;
 use klights_replication::state_machine::{RaftStateMachineStorePorts, SqliteRaftStateMachine};
-use klights_replication::types::{
-    NodeId, RaftMemberLogId, RaftMemberNode, RaftShape, StorageCommandPayload, TypeConfig,
-};
-const RAFT_MEMBER_ADMISSION_META_PREFIX: &str = "raft_member_admission/";
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-struct RaftMemberAdmission {
-    storage_incarnation: String,
-    addr: String,
-    as_learner: bool,
-    proven_log: Option<klights_leader_api::RaftStorageLogAttestation>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RaftMemberAdmissionResult {
-    Changed,
-    Unchanged,
-}
-
-/// One-shot metadata RPC port used by the exact codec-v3 activation
-/// preflight. The caller supplies the existing replication gRPC client; this
-/// keeps Raft membership ownership independent of transport construction.
-#[async_trait]
-pub trait MemberFeatureProbe: Send + Sync {
-    async fn metadata_for_member(
-        &self,
-        node_id: NodeId,
-        addr: &str,
-    ) -> Result<klights_leader_api::MetadataResponse>;
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum CommandCodecV3PreflightError {
-    #[error("command codec v3 preflight is not ready: {0}")]
-    NotReady(String),
-    #[error("command codec v3 is unsupported by member {node_id}")]
-    Unsupported { node_id: NodeId },
-    #[error("command codec v3 metadata probe for member {node_id} is unavailable: {message}")]
-    Unavailable { node_id: NodeId, message: String },
-}
-
-/// Held only after membership has been frozen and every proposal lane drained.
-/// Dropping it reopens both gates.
-pub struct CommandCodecV3Preflight<'a> {
-    _membership_guard: tokio::sync::MutexGuard<'a, ()>,
-    _proposal_drain: klights_replication::flow_control::RaftCommitFlowControlDrain,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum CommandCodecV3ActivationError {
-    #[error("command codec v3 activation requires the current Raft leader")]
-    NotLeader,
-    #[error(transparent)]
-    Preflight(#[from] CommandCodecV3PreflightError),
-    #[error("command codec v3 activation apply failed: {0}")]
-    Apply(String),
-}
-
-impl CommandCodecV3ActivationError {
-    pub fn retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::NotLeader
-                | Self::Preflight(CommandCodecV3PreflightError::NotReady(_))
-                | Self::Preflight(CommandCodecV3PreflightError::Unavailable { .. })
-                | Self::Apply(_)
-        )
-    }
-}
-
-async fn verify_command_codec_v3_members(
-    members: Vec<(NodeId, String)>,
-    probe: &dyn MemberFeatureProbe,
-) -> std::result::Result<(), CommandCodecV3PreflightError> {
-    for (node_id, addr) in members {
-        let metadata = probe
-            .metadata_for_member(node_id, &addr)
-            .await
-            .map_err(|err| CommandCodecV3PreflightError::Unavailable {
-                node_id,
-                message: err.to_string(),
-            })?;
-        if metadata.command_codec_version != klights_cluster_core::COMMAND_CODEC_VERSION {
-            return Err(CommandCodecV3PreflightError::Unsupported { node_id });
-        }
-    }
-    Ok(())
-}
+use klights_replication::types::{NodeId, RaftShape, TypeConfig};
+#[cfg(test)]
+use klights_replication::types::{RaftMemberNode, StorageCommandPayload};
 
 /// Lossy-link transport sizing (finding.md H3). `max_payload_entries` keeps each
 /// AppendEntries retry small (it bounds **retransmit cost**: leader→follower).
@@ -167,9 +82,7 @@ pub struct RaftNode {
     pub raft: Raft<TypeConfig>,
     storage_incarnation: String,
     forwarder: Option<Arc<dyn LeaderForwarder>>,
-    /// T2: Serializes add_voter/remove_voter calls so concurrent
-    /// joiners don't race and exhaust their retry budgets.
-    membership_mutex: tokio::sync::Mutex<()>,
+    membership: Arc<klights_replication::membership::EmbeddedRaftMembership>,
     materializer: Arc<dyn RaftCommitMaterializer>,
     /// T1.4: node name used by `build_log_apply_commit_for_command` to
     /// stamp the authoring node on the resulting commit.
@@ -309,19 +222,31 @@ impl RaftNode {
         let raft = Raft::new(node_id, config, network, log_store, state_machine)
             .await
             .context("Raft::new")?;
+        let flow_control = Arc::new(
+            klights_replication::flow_control::RaftCommitFlowControl::new(
+                RAFT_MAX_INFLIGHT_PROPOSALS,
+            ),
+        );
+        let membership = Arc::new(
+            klights_replication::membership::EmbeddedRaftMembership::new(
+                node_id,
+                raft.clone(),
+                storage_incarnation.clone(),
+                stores.materializer.clone(),
+                flow_control.clone(),
+                command_codec_v3_activation.clone(),
+                node_name.clone(),
+            ),
+        );
         Ok(Self {
             node_id,
             raft,
             storage_incarnation,
             forwarder: None,
-            membership_mutex: tokio::sync::Mutex::new(()),
+            membership,
             materializer: stores.materializer,
             authoring_node: node_name,
-            flow_control: Arc::new(
-                klights_replication::flow_control::RaftCommitFlowControl::new(
-                    RAFT_MAX_INFLIGHT_PROPOSALS,
-                ),
-            ),
+            flow_control,
             command_codec_v3_activation,
         })
     }
@@ -403,18 +328,7 @@ impl RaftNode {
     /// Idempotent: returns `Ok(())` if the cluster is already
     /// initialized (matches openraft's `NotAllowed` no-op).
     pub async fn bootstrap_single_voter(&self, advertise_addr: String) -> Result<()> {
-        let mut members = BTreeMap::new();
-        members.insert(
-            self.node_id,
-            RaftMemberNode::new(advertise_addr, self.storage_incarnation.clone(), None),
-        );
-        match self.raft.initialize(members).await {
-            Ok(()) => Ok(()),
-            Err(openraft::error::RaftError::APIError(
-                openraft::error::InitializeError::NotAllowed { .. },
-            )) => Ok(()),
-            Err(e) => Err(anyhow::anyhow!("Raft::initialize: {e}")),
-        }
+        self.membership.bootstrap_single_voter(advertise_addr).await
     }
 
     /// Propose a mutating write through Raft. The payload is the
@@ -447,13 +361,6 @@ impl RaftNode {
         }
     }
 
-    async fn propose_materialized_commit(
-        &self,
-        payload: StorageCommandPayload,
-    ) -> Result<klights_replication::types::StorageCommandResult> {
-        self.proposal().propose_materialized_commit(payload).await
-    }
-
     /// Add a new voter to the running cluster. Wraps openraft's two-step
     /// dance: first promote the target to a learner so the leader starts
     /// replicating its log to it, then issue `change_membership` to fold
@@ -465,47 +372,7 @@ impl RaftNode {
     /// T2: Holds `membership_mutex` to serialize concurrent joiners so
     /// they don't race and exhaust their retry budgets.
     pub async fn add_voter(&self, node_id: NodeId, addr: String) -> Result<()> {
-        #[cfg(not(test))]
-        {
-            let _ = (node_id, addr);
-            anyhow::bail!(
-                "add_voter without exact-v3 receiver admission is disabled; use authenticated control-plane Join"
-            );
-        }
-        #[cfg(test)]
-        {
-            let _guard = self.membership_mutex.lock().await;
-            if node_id == self.node_id {
-                anyhow::bail!("add_voter: node id {node_id} is this node and is already a voter");
-            }
-            let current = self.raft.metrics().borrow().clone();
-            let voters_now: std::collections::BTreeSet<NodeId> =
-                current.membership_config.membership().voter_ids().collect();
-            if voters_now.contains(&node_id) {
-                return Ok(());
-            }
-            if voters_now.len() >= crate::bootstrap::node_role::controlplane_limit() {
-                let limit = crate::bootstrap::node_role::controlplane_limit();
-                anyhow::bail!(
-                    "add_voter: cluster already at controlplane limit ({limit}); refusing to add voter {node_id}"
-                );
-            }
-            self.raft
-                .add_learner(
-                    node_id,
-                    crate::datastore::raft::test_unproven_member(addr),
-                    true,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("Raft::add_learner({node_id}): {e}"))?;
-            let mut new_voters = voters_now.clone();
-            new_voters.insert(node_id);
-            self.raft
-                .change_membership(new_voters, true)
-                .await
-                .map_err(|e| anyhow::anyhow!("Raft::change_membership({node_id}): {e}"))?;
-            Ok(())
-        }
+        self.membership.add_voter(node_id, addr).await
     }
 
     /// Freeze current membership, prove every voter/learner advertises the
@@ -515,32 +382,12 @@ impl RaftNode {
     /// transaction; no polling or background coordinator is introduced.
     pub async fn preflight_command_codec_v3<'a>(
         &'a self,
-        probe: &dyn MemberFeatureProbe,
-    ) -> std::result::Result<CommandCodecV3Preflight<'a>, CommandCodecV3PreflightError> {
-        let membership_guard = self.membership_mutex.lock().await;
-        let metrics = self.raft.metrics().borrow().clone();
-        if metrics.current_leader != Some(self.node_id) {
-            return Err(CommandCodecV3PreflightError::NotReady(
-                "local Raft node is not the current leader".to_string(),
-            ));
-        }
-        let members: Vec<(NodeId, String)> = metrics
-            .membership_config
-            .nodes()
-            .filter(|(node_id, _)| **node_id != self.node_id)
-            .map(|(node_id, node)| (*node_id, node.addr.clone()))
-            .collect();
-        if metrics.membership_config.nodes().next().is_none() {
-            return Err(CommandCodecV3PreflightError::NotReady(
-                "Raft membership has no voters or learners".to_string(),
-            ));
-        }
-        verify_command_codec_v3_members(members, probe).await?;
-        let proposal_drain = self.flow_control.acquire_exclusive_drain().await;
-        Ok(CommandCodecV3Preflight {
-            _membership_guard: membership_guard,
-            _proposal_drain: proposal_drain,
-        })
+        probe: &dyn klights_replication::membership::MemberFeatureProbe,
+    ) -> std::result::Result<
+        klights_replication::membership::CommandCodecV3Preflight<'a>,
+        klights_replication::membership::CommandCodecV3PreflightError,
+    > {
+        self.membership.preflight_command_codec_v3(probe).await
     }
 
     /// Enable the production proposal gate, then validate restored membership.
@@ -554,74 +401,20 @@ impl RaftNode {
     /// command capability.
     pub async fn verify_startup_command_codec_v3(
         &self,
-        probe: &dyn MemberFeatureProbe,
-    ) -> std::result::Result<(), CommandCodecV3PreflightError> {
-        self.command_codec_v3_activation.enforce_startup_gate();
-        if self.command_codec_v3_activation.is_activated() {
-            return Ok(());
-        }
-        let _membership_guard = self.membership_mutex.lock().await;
-        let metrics = self.raft.metrics().borrow().clone();
-        let members: Vec<(NodeId, String)> = metrics
-            .membership_config
-            .nodes()
-            .filter(|(node_id, _)| **node_id != self.node_id)
-            .map(|(node_id, node)| (*node_id, node.addr.clone()))
-            .collect();
-        verify_command_codec_v3_members(members, probe).await
+        probe: &dyn klights_replication::membership::MemberFeatureProbe,
+    ) -> std::result::Result<(), klights_replication::membership::CommandCodecV3PreflightError>
+    {
+        self.membership.verify_startup_command_codec_v3(probe).await
     }
 
     /// Commit the exact-v3 activation marker after proving every current voter
     /// and learner reports the same exact codec.
     pub async fn activate_command_codec_v3(
         &self,
-        probe: &dyn MemberFeatureProbe,
-    ) -> std::result::Result<(), CommandCodecV3ActivationError> {
-        if !self.is_leader() {
-            return Err(CommandCodecV3ActivationError::NotLeader);
-        }
-        let codec_activated = self
-            .materializer
-            .read_raft_metadata(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
-            .await
-            .map_err(|err| CommandCodecV3ActivationError::Apply(err.to_string()))?
-            .as_deref()
-            == Some(COMMAND_CODEC_ACTIVATION_VALUE);
-        if codec_activated {
-            return Ok(());
-        }
-        let _preflight = self.preflight_command_codec_v3(probe).await?;
-        // Re-read while membership and proposal lanes are frozen. A second
-        // activation caller sees the committed marker and emits no extra entry.
-        let codec_activated = self
-            .materializer
-            .read_raft_metadata(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
-            .await
-            .map_err(|err| CommandCodecV3ActivationError::Apply(err.to_string()))?
-            .as_deref()
-            == Some(COMMAND_CODEC_ACTIVATION_VALUE);
-        if codec_activated {
-            return Ok(());
-        }
-        let commit = klights_cluster_core::LogApplyCommit::try_from_cluster_mutations(vec![
-            klights_cluster_core::ClusterMutation::ClusterMeta(
-                klights_cluster_core::ClusterMetaMutation::PutKlightsMeta {
-                    key: KEY_COMMAND_CODEC_ACTIVATION_VERSION.to_string(),
-                    value: COMMAND_CODEC_ACTIVATION_VALUE.to_string(),
-                },
-            ),
-        ])
-        .map_err(|err| CommandCodecV3ActivationError::Apply(err.to_string()))?;
-        let bytes = klights_replication::log_apply_wire::encode_commit_protobuf(&commit)
-            .map_err(|err| CommandCodecV3ActivationError::Apply(err.to_string()))?;
-        let result = self
-            .propose_materialized_commit(StorageCommandPayload::from_bytes(bytes))
-            .await
-            .map_err(|err| CommandCodecV3ActivationError::Apply(err.to_string()))?;
-        if let Some(error) = result.error_message {
-            return Err(CommandCodecV3ActivationError::Apply(error));
-        }
-        Ok(())
+        probe: &dyn klights_replication::membership::MemberFeatureProbe,
+    ) -> std::result::Result<(), klights_replication::membership::CommandCodecV3ActivationError>
+    {
+        self.membership.activate_command_codec_v3(probe).await
     }
 
     /// T1.5 / T4: add a new node to the cluster as a **learner** —
@@ -641,223 +434,9 @@ impl RaftNode {
     /// the voter set only. Holds `membership_mutex` to serialize with
     /// concurrent add_voter / remove_voter / add_learner_only calls.
     pub async fn add_learner_only(&self, node_id: NodeId, addr: String) -> Result<()> {
-        #[cfg(not(test))]
-        {
-            let _ = (node_id, addr);
-            anyhow::bail!(
-                "add_learner without exact-v3 receiver admission is disabled; use authenticated control-plane Join"
-            );
-        }
-        #[cfg(test)]
-        {
-            let _guard = self.membership_mutex.lock().await;
-            if node_id == self.node_id {
-                anyhow::bail!("add_learner_only: node id {node_id} is this node");
-            }
-            let current = self.raft.metrics().borrow().clone();
-            let voters_now: std::collections::BTreeSet<NodeId> =
-                current.membership_config.membership().voter_ids().collect();
-            if voters_now.contains(&node_id) {
-                // T4: demote voter → learner. The node restarted as a
-                // replica; remove it from the voter set while retaining
-                // it as a learner (`retain=true`). This preserves other
-                // learners in the cluster. Guard against dropping below
-                // quorum (removing the last voter).
-                if voters_now.len() <= 1 {
-                    anyhow::bail!(
-                        "add_learner_only: refusing to demote last voter {node_id} (would break quorum)"
-                    );
-                }
-                let mut new_voters = voters_now.clone();
-                new_voters.remove(&node_id);
-                tracing::info!(
-                    node_id,
-                    voters_before = ?voters_now,
-                    voters_after = ?new_voters,
-                    "add_learner_only: demoting voter to learner (retain=true)"
-                );
-                // `retain=true`: nodes not in new_voters remain as learners.
-                // The demoted node stays in the cluster as a learner; other
-                // learners are unaffected.
-                return self
-                    .raft
-                    .change_membership(new_voters, true)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Raft::change_membership(demote {node_id}): {e}"))
-                    .map(|_| ());
-            }
-            let is_existing_learner = current
-                .membership_config
-                .membership()
-                .nodes()
-                .any(|(id, _)| *id == node_id);
-            if is_existing_learner {
-                return Ok(());
-            }
-            // Adding after the targeted removal creates a fresh replication
-            // stream and blocks until the learner has installed/replayed the
-            // authoritative leader state.
-            self.raft
-                .add_learner(
-                    node_id,
-                    crate::datastore::raft::test_unproven_member(addr),
-                    true,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("Raft::add_learner({node_id}): {e}"))?;
-            Ok(())
-        }
+        self.membership.add_learner_only(node_id, addr).await
     }
 
-    fn member_admission_meta_key(node_id: NodeId) -> String {
-        format!("{RAFT_MEMBER_ADMISSION_META_PREFIX}{node_id}")
-    }
-
-    async fn read_member_admission(&self, node_id: NodeId) -> Result<Option<RaftMemberAdmission>> {
-        self.materializer
-            .read_raft_metadata(&Self::member_admission_meta_key(node_id))
-            .await?
-            .map(|raw| serde_json::from_str(&raw).context("decode Raft member admission marker"))
-            .transpose()
-    }
-
-    async fn persist_member_admission(
-        &self,
-        node_id: NodeId,
-        admission: &RaftMemberAdmission,
-    ) -> Result<()> {
-        let mutation = klights_cluster_core::ClusterMutation::ClusterMeta(
-            klights_cluster_core::ClusterMetaMutation::PutKlightsMeta {
-                key: Self::member_admission_meta_key(node_id),
-                value: serde_json::to_string(admission)?,
-            },
-        );
-        let commit =
-            klights_cluster_core::LogApplyCommit::try_from_cluster_mutations(vec![mutation])?;
-        let bytes = klights_replication::log_apply_wire::encode_commit_protobuf(&commit)?;
-        let result = self
-            .propose_materialized_commit(StorageCommandPayload::from_bytes(bytes))
-            .await?;
-        if let Some(error) = result.error_message {
-            anyhow::bail!("persist Raft member admission marker: {error}");
-        }
-        Ok(())
-    }
-
-    async fn wait_for_uniform_membership(&self, operation: &str) -> Result<()> {
-        self.raft
-            .wait(Some(std::time::Duration::from_secs(5)))
-            .metrics(
-                |metrics| {
-                    metrics
-                        .membership_config
-                        .membership()
-                        .get_joint_config()
-                        .len()
-                        == 1
-                },
-                operation,
-            )
-            .await
-            .map(|_| ())
-            .map_err(|error| anyhow::anyhow!("{operation}: {error}"))
-    }
-
-    async fn wait_for_member_absent(&self, node_id: NodeId, operation: &str) -> Result<()> {
-        self.raft
-            .wait(Some(std::time::Duration::from_secs(5)))
-            .metrics(
-                |metrics| {
-                    let membership_absent = !metrics
-                        .membership_config
-                        .membership()
-                        .nodes()
-                        .any(|(id, _)| *id == node_id);
-                    let replication_absent = metrics
-                        .replication
-                        .as_ref()
-                        .is_none_or(|replication| !replication.contains_key(&node_id));
-                    membership_absent && replication_absent
-                },
-                operation,
-            )
-            .await
-            .map(|_| ())
-            .map_err(|error| anyhow::anyhow!("{operation}: {error}"))
-    }
-
-    fn target_replication_match(
-        &self,
-        node_id: NodeId,
-    ) -> Option<klights_leader_api::RaftStorageLogAttestation> {
-        self.raft
-            .metrics()
-            .borrow()
-            .replication
-            .as_ref()
-            .and_then(|replication| replication.get(&node_id))
-            .and_then(|matched| matched.as_ref())
-            .map(|matched| klights_leader_api::RaftStorageLogAttestation {
-                term: matched.leader_id.term,
-                leader_node_id: matched.leader_id.node_id,
-                index: matched.index,
-            })
-    }
-
-    async fn wait_for_target_replication_match(
-        &self,
-        node_id: NodeId,
-    ) -> Result<klights_leader_api::RaftStorageLogAttestation> {
-        let metrics = self
-            .raft
-            .wait(Some(std::time::Duration::from_secs(5)))
-            .metrics(
-                |metrics| {
-                    metrics
-                        .replication
-                        .as_ref()
-                        .and_then(|replication| replication.get(&node_id))
-                        .and_then(|matched| matched.as_ref())
-                        .is_some()
-                },
-                format!("wait for target {node_id} replication match proof"),
-            )
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!("wait for target {node_id} replication match proof: {error}")
-            })?;
-        let matched = metrics
-            .replication
-            .as_ref()
-            .and_then(|replication| replication.get(&node_id))
-            .and_then(|matched| matched.as_ref())
-            .ok_or_else(|| anyhow::anyhow!("target {node_id} match proof disappeared"))?;
-        Ok(klights_leader_api::RaftStorageLogAttestation {
-            term: matched.leader_id.term,
-            leader_node_id: matched.leader_id.node_id,
-            index: matched.index,
-        })
-    }
-
-    fn attestation_is_behind(
-        reported: Option<&klights_leader_api::RaftStorageLogAttestation>,
-        required: Option<&klights_leader_api::RaftStorageLogAttestation>,
-    ) -> bool {
-        match (reported, required) {
-            (_, None) => false,
-            (None, Some(_)) => true,
-            (Some(reported), Some(required)) if reported.index < required.index => true,
-            (Some(reported), Some(required)) if reported.index == required.index => {
-                reported.term != required.term || reported.leader_node_id != required.leader_node_id
-            }
-            (Some(_), Some(_)) => false,
-        }
-    }
-
-    /// Authenticate a control-plane Join against the durable incarnation of
-    /// its node-local Raft store. Duplicate healthy joins are strict no-ops.
-    /// A changed incarnation performs a targeted membership-session reset
-    /// before catch-up, then records the admitted incarnation through Raft.
     #[cfg(test)]
     pub async fn admit_controlplane_member(
         &self,
@@ -866,254 +445,41 @@ impl RaftNode {
         as_learner: bool,
         storage_incarnation: String,
         storage_log_attestation: klights_leader_api::RaftStorageAttestation,
-    ) -> Result<RaftMemberAdmissionResult> {
-        self.admit_controlplane_member_with_limit(
-            node_id,
-            addr,
-            as_learner,
-            storage_incarnation,
-            storage_log_attestation,
-            crate::bootstrap::node_role::controlplane_limit(),
-        )
-        .await
-    }
-
-    pub async fn admit_controlplane_member_with_limit(
-        &self,
-        node_id: NodeId,
-        addr: String,
-        as_learner: bool,
-        storage_incarnation: String,
-        storage_log_attestation: klights_leader_api::RaftStorageAttestation,
-        controlplane_limit: usize,
-    ) -> Result<RaftMemberAdmissionResult> {
-        let _guard = self.membership_mutex.lock().await;
-        if node_id == self.node_id {
-            anyhow::bail!("control-plane Join node id {node_id} is this leader");
-        }
-        anyhow::ensure!(
-            uuid::Uuid::parse_str(&storage_incarnation).is_ok(),
-            "control-plane Join has invalid storage incarnation"
-        );
-
-        let previous = self.read_member_admission(node_id).await?;
-        let current = self.raft.metrics().borrow().clone();
-        let membership = current.membership_config.membership();
-        let voters_now: BTreeSet<NodeId> = membership.voter_ids().collect();
-        let is_voter = voters_now.contains(&node_id);
-        let is_member = membership.nodes().any(|(id, _)| *id == node_id);
-        if is_member && previous.is_none() {
-            anyhow::bail!(
-                "existing Raft member {node_id} has no proven v3 storage admission marker; refusing unsafe baseline migration—recreate this member or cluster"
-            );
-        }
-        let incarnation_matches = previous.as_ref().is_some_and(|admitted| {
-            admitted.storage_incarnation == storage_incarnation && admitted.addr == addr
-        });
-        let behind_admitted = previous.as_ref().is_some_and(|admitted| {
-            Self::attestation_is_behind(
-                storage_log_attestation.high_watermark.as_ref(),
-                admitted.proven_log.as_ref(),
+    ) -> Result<klights_replication::membership::RaftMemberAdmissionResult> {
+        self.membership
+            .admit_controlplane_member(
+                node_id,
+                addr,
+                as_learner,
+                storage_incarnation,
+                storage_log_attestation,
             )
-        });
-        let live_match = self.target_replication_match(node_id);
-        let behind_live = Self::attestation_is_behind(
-            storage_log_attestation.current_boundary.as_ref(),
-            live_match.as_ref(),
-        );
-        let requested_role_matches = is_member && (is_voter != as_learner);
-        if incarnation_matches && !behind_admitted && !behind_live && requested_role_matches {
-            return Ok(RaftMemberAdmissionResult::Unchanged);
-        }
-
-        let session_changed = is_member && (!incarnation_matches || behind_admitted || behind_live);
-        if !is_voter && !as_learner && voters_now.len() >= controlplane_limit {
-            anyhow::bail!(
-                "cluster already at controlplane limit ({controlplane_limit}); refusing to promote voter {node_id}"
-            );
-        }
-
-        let mut voters_after = voters_now.clone();
-        if session_changed && is_voter {
-            if voters_now.len() <= 2 {
-                anyhow::bail!(
-                    "cannot replace wiped voter {node_id} in a {}-voter cluster: the surviving membership cannot commit the required joint-consensus removal; restore the old node.db or recover quorum",
-                    voters_now.len()
-                );
-            }
-            voters_after.remove(&node_id);
-            self.raft
-                .change_membership(ChangeMembers::RemoveVoters(BTreeSet::from([node_id])), true)
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "Raft::change_membership(demote replaced voter {node_id}): {error}"
-                    )
-                })?;
-            self.wait_for_uniform_membership("wait for replaced voter demotion")
-                .await?;
-            self.raft
-                .change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([node_id])), true)
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "Raft::change_membership(reset voter {node_id} session): {error}"
-                    )
-                })?;
-            self.wait_for_member_absent(node_id, "wait for replaced voter session removal")
-                .await?;
-        } else if session_changed {
-            self.raft
-                .change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([node_id])), true)
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "Raft::change_membership(reset learner {node_id} session): {error}"
-                    )
-                })?;
-            self.wait_for_member_absent(node_id, "wait for replaced learner session removal")
-                .await?;
-        } else if is_voter && as_learner {
-            if voters_now.len() <= 1 {
-                anyhow::bail!("refusing to demote last voter {node_id}");
-            }
-            voters_after.remove(&node_id);
-            self.raft
-                .change_membership(voters_after.clone(), true)
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!("Raft::change_membership(demote {node_id}): {error}")
-                })?;
-        }
-
-        let needs_learner_add = !is_member || session_changed;
-        let needs_catchup = needs_learner_add || (!is_voter && !as_learner);
-        if needs_catchup {
-            self.raft
-                .add_learner(
-                    node_id,
-                    RaftMemberNode::new(addr.clone(), storage_incarnation.clone(), None),
-                    true,
-                )
-                .await
-                .map_err(|error| anyhow::anyhow!("Raft::add_learner({node_id}): {error}"))?;
-        }
-        let caught_up_match = if needs_catchup {
-            Some(self.wait_for_target_replication_match(node_id).await?)
-        } else {
-            None
-        };
-        if let Some(proven) = caught_up_match.as_ref() {
-            let receiver = RaftMemberNode::new(
-                addr.clone(),
-                storage_incarnation.clone(),
-                Some(RaftMemberLogId {
-                    term: proven.term,
-                    leader_node_id: proven.leader_node_id,
-                    index: proven.index,
-                }),
-            );
-            self.raft
-                .change_membership(
-                    ChangeMembers::SetNodes(BTreeMap::from([(node_id, receiver)])),
-                    true,
-                )
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "Raft::change_membership(bind receiver proof for {node_id}): {error}"
-                    )
-                })?;
-        }
-        if !as_learner && (!is_voter || session_changed) {
-            voters_after.insert(node_id);
-            self.raft
-                .change_membership(voters_after, true)
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!("Raft::change_membership(promote {node_id}): {error}")
-                })?;
-        }
-
-        let proven_log = if needs_catchup {
-            caught_up_match.or(storage_log_attestation.high_watermark)
-        } else {
-            previous
-                .as_ref()
-                .and_then(|admitted| admitted.proven_log.clone())
-                .or(storage_log_attestation.high_watermark)
-        };
-        let requested = RaftMemberAdmission {
-            storage_incarnation,
-            addr,
-            as_learner,
-            proven_log,
-        };
-        self.persist_member_admission(node_id, &requested).await?;
-        Ok(RaftMemberAdmissionResult::Changed)
-    }
-
-    /// Remove a voter from the running cluster. Refuses to shrink below
-    /// a single voter and refuses to remove this node from its own
-    /// membership (use leadership transfer first).
-    ///
-    /// T2: Holds `membership_mutex` to serialize with add_voter calls.
-    pub async fn remove_voter(&self, node_id: NodeId) -> Result<()> {
-        let _guard = self.membership_mutex.lock().await;
-        let current = self.raft.metrics().borrow().clone();
-        let voters_now: std::collections::BTreeSet<NodeId> =
-            current.membership_config.membership().voter_ids().collect();
-        if !voters_now.contains(&node_id) {
-            return Ok(());
-        }
-        if voters_now.len() <= 1 {
-            anyhow::bail!(
-                "remove_voter: refusing to remove last voter {node_id} (would leave cluster without quorum)"
-            );
-        }
-        if node_id == self.node_id {
-            anyhow::bail!(
-                "remove_voter: refusing to remove this node ({node_id}) from its own membership; transfer leadership first"
-            );
-        }
-        let mut new_voters = voters_now.clone();
-        new_voters.remove(&node_id);
-        self.raft
-            .change_membership(new_voters, false)
             .await
-            .map_err(|e| anyhow::anyhow!("Raft::change_membership(remove {node_id}): {e}"))?;
-        Ok(())
     }
 
-    /// Snapshot of the cluster shape this node currently observes. Used
-    /// by the kubelet's shape-driven role-label task: voter_count==1 with
-    /// is_leader=true emits the `leader` label (solo N=1 cluster);
-    /// voter_count>=2 emits `controlplane` (plus `leader` on the current
-    /// leader voter). See `multinode.md`.
+    pub(crate) fn membership(
+        &self,
+    ) -> Arc<klights_replication::membership::EmbeddedRaftMembership> {
+        self.membership.clone()
+    }
+
+    pub fn rpc_router(&self) -> klights_replication::rpc_router::RaftNodeRpcRouter {
+        klights_replication::rpc_router::RaftNodeRpcRouter::new(
+            self.raft.clone(),
+            self.storage_incarnation.clone(),
+        )
+    }
+
+    pub async fn remove_voter(&self, node_id: NodeId) -> Result<()> {
+        self.membership.remove_voter(node_id).await
+    }
+
     pub fn is_leader(&self) -> bool {
-        self.raft.metrics().borrow().current_leader == Some(self.node_id)
+        self.membership.is_leader()
     }
 
     pub fn current_shape(&self) -> RaftShape {
-        let m = self.raft.metrics().borrow().clone();
-        let voter_ids: std::collections::BTreeSet<NodeId> =
-            m.membership_config.membership().voter_ids().collect();
-        let voter_count = voter_ids.len() as u32;
-        let is_leader = m.current_leader == Some(self.node_id);
-        // T1.7: this node is a learner if it's part of the membership
-        // node set but not a voter. openraft exposes the full node set
-        // (voters + learners) via `nodes()`.
-        let in_membership = m
-            .membership_config
-            .membership()
-            .nodes()
-            .any(|(id, _)| *id == self.node_id);
-        let is_learner = in_membership && !voter_ids.contains(&self.node_id);
-        RaftShape {
-            voter_count,
-            is_leader,
-            is_learner,
-        }
+        self.membership.current_shape()
     }
 
     pub(crate) fn authoring_node(&self) -> &str {
@@ -1129,7 +495,7 @@ impl RaftNode {
     ) -> tokio::sync::watch::Receiver<
         openraft::RaftMetrics<NodeId, klights_replication::types::RaftMemberNode>,
     > {
-        self.raft.metrics()
+        self.membership.metrics_watch()
     }
 
     /// Subscribe to openraft's *deduped* server-metrics watch.
@@ -1148,7 +514,7 @@ impl RaftNode {
     ) -> tokio::sync::watch::Receiver<
         openraft::metrics::RaftServerMetrics<NodeId, klights_replication::types::RaftMemberNode>,
     > {
-        self.raft.server_metrics()
+        self.membership.server_metrics_watch()
     }
 
     /// Return the (id, address) of the voter currently elected as Raft
@@ -1156,14 +522,7 @@ impl RaftNode {
     /// when this node is a follower and the joiner needs to retry
     /// against the actual leader.
     pub fn current_leader_info(&self) -> Option<(NodeId, String)> {
-        let m = self.raft.metrics().borrow().clone();
-        let leader_id = m.current_leader?;
-        let addr = m
-            .membership_config
-            .nodes()
-            .find(|(id, _)| **id == leader_id)
-            .map(|(_, node)| node.addr.clone())?;
-        Some((leader_id, addr))
+        self.membership.current_leader_info()
     }
 
     pub(crate) fn local_commit_materialization_ready(&self) -> bool {
@@ -1206,173 +565,6 @@ fn outbox_operation_waits_for_permit(operation: &str) -> bool {
     klights_replication::proposal::outbox_operation_waits_for_permit(operation)
 }
 
-/// Adapter that wraps a `RaftNode` so the gRPC layer can dispatch
-/// `RaftAppendEntries` / `RaftVote` / `RaftInstallSnapshot` envelopes
-/// into the local `Raft<TypeConfig>` engine. The envelopes carry
-/// serde-encoded openraft RPC payloads; this adapter deserializes,
-/// calls the matching `Raft` method, serializes the response, and
-/// returns the bytes to the gRPC server.
-#[derive(Clone)]
-pub struct RaftNodeRpcRouter {
-    raft: Raft<TypeConfig>,
-    storage_incarnation: String,
-}
-
-impl RaftNodeRpcRouter {
-    pub fn new(raft: Raft<TypeConfig>, storage_incarnation: String) -> Self {
-        Self {
-            raft,
-            storage_incarnation,
-        }
-    }
-
-    pub fn from_node(node: &RaftNode) -> Self {
-        Self::new(node.raft.clone(), node.storage_incarnation.clone())
-    }
-
-    fn validate_receiver_admission(
-        &self,
-        receiver: &klights_leader_rpc::raft_rpc::RaftReceiverAdmission,
-    ) -> std::result::Result<(), klights_leader_rpc::raft_rpc::RaftRpcRouterError> {
-        use klights_leader_rpc::raft_rpc::RaftRpcRouterError;
-        if receiver.storage_incarnation != self.storage_incarnation {
-            return Err(RaftRpcRouterError::Retryable(format!(
-                "stale Raft receiver incarnation: membership admits {}, local node.db is {}",
-                receiver.storage_incarnation, self.storage_incarnation
-            )));
-        }
-        let Some(required) = receiver.admitted_log.as_ref() else {
-            return Ok(());
-        };
-        let metrics = self.raft.metrics().borrow().clone();
-        let local_index = [
-            metrics.last_log_index,
-            metrics.last_applied.as_ref().map(|log| log.index),
-            metrics.snapshot.as_ref().map(|log| log.index),
-            metrics.purged.as_ref().map(|log| log.index),
-        ]
-        .into_iter()
-        .flatten()
-        .max();
-        if local_index.is_none_or(|index| index < required.index) {
-            return Err(RaftRpcRouterError::Retryable(format!(
-                "Raft receiver durable boundary is behind admitted index {}",
-                required.index
-            )));
-        }
-        let equal_anchor_mismatch = [
-            metrics.last_applied.as_ref(),
-            metrics.snapshot.as_ref(),
-            metrics.purged.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|log| log.index == required.index)
-        .any(|log| {
-            log.leader_id.term != required.term || log.leader_id.node_id != required.leader_node_id
-        });
-        if equal_anchor_mismatch {
-            return Err(RaftRpcRouterError::Retryable(
-                "Raft receiver durable boundary identity differs from admitted LogId".to_string(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn append_entries_starts_unanchored_nonzero_suffix(
-    request: &openraft::raft::AppendEntriesRequest<TypeConfig>,
-) -> bool {
-    request.prev_log_id.is_none()
-        && request
-            .entries
-            .first()
-            .is_some_and(|entry| entry.log_id.index > 0)
-}
-
-#[async_trait]
-impl klights_leader_rpc::raft_rpc::RaftRpcRouter for RaftNodeRpcRouter {
-    async fn append_entries(
-        &self,
-        receiver: klights_leader_rpc::raft_rpc::RaftReceiverAdmission,
-        payload: Vec<u8>,
-    ) -> std::result::Result<Vec<u8>, klights_leader_rpc::raft_rpc::RaftRpcRouterError> {
-        use klights_leader_rpc::raft_rpc::RaftRpcRouterError;
-        self.validate_receiver_admission(&receiver)?;
-        let req: openraft::raft::AppendEntriesRequest<TypeConfig> =
-            serde_json::from_slice(&payload)
-                .map_err(|e| RaftRpcRouterError::Dispatch(format!("decode AE: {e}")))?;
-        // A leader-side replication cursor can outlive a wiped member that
-        // rejoins with the same deterministic node ID. OpenRaft 0.9 accepts
-        // `prev_log_id=None` as the start of local history, so forwarding a
-        // non-zero first entry would persist an unreplayable gap. It also
-        // assumes `Conflict` is impossible when prev is None and panics on
-        // that response. Fence the stale session as a retryable transport
-        // condition: authenticated JoinAsControlplane resets the leader-side
-        // membership session before a new stream retries from authoritative
-        // history.
-        if append_entries_starts_unanchored_nonzero_suffix(&req) {
-            return Err(RaftRpcRouterError::Retryable(
-                "AppendEntries starts an unanchored nonzero suffix; Raft member session reset required"
-                    .to_string(),
-            ));
-        }
-        let resp =
-            self.raft.append_entries(req).await.map_err(|e| {
-                RaftRpcRouterError::RemoteFatal(format!("raft.append_entries: {e}"))
-            })?;
-        serde_json::to_vec(&resp)
-            .map_err(|e| RaftRpcRouterError::Dispatch(format!("encode AE resp: {e}")))
-    }
-
-    async fn vote(
-        &self,
-        receiver: klights_leader_rpc::raft_rpc::RaftReceiverAdmission,
-        payload: Vec<u8>,
-    ) -> std::result::Result<Vec<u8>, klights_leader_rpc::raft_rpc::RaftRpcRouterError> {
-        use klights_leader_rpc::raft_rpc::RaftRpcRouterError;
-        self.validate_receiver_admission(&receiver)?;
-        let req: openraft::raft::VoteRequest<NodeId> = serde_json::from_slice(&payload)
-            .map_err(|e| RaftRpcRouterError::Dispatch(format!("decode Vote: {e}")))?;
-        let resp = self
-            .raft
-            .vote(req)
-            .await
-            .map_err(|e| RaftRpcRouterError::RemoteFatal(format!("raft.vote: {e}")))?;
-        serde_json::to_vec(&resp)
-            .map_err(|e| RaftRpcRouterError::Dispatch(format!("encode Vote resp: {e}")))
-    }
-
-    async fn install_snapshot(
-        &self,
-        receiver: klights_leader_rpc::raft_rpc::RaftReceiverAdmission,
-        payload: Vec<u8>,
-    ) -> std::result::Result<Vec<u8>, klights_leader_rpc::raft_rpc::RaftRpcRouterError> {
-        use klights_leader_rpc::raft_rpc::RaftRpcRouterError;
-        self.validate_receiver_admission(&receiver)?;
-        let req: openraft::raft::InstallSnapshotRequest<TypeConfig> =
-            serde_json::from_slice(&payload)
-                .map_err(|e| RaftRpcRouterError::Dispatch(format!("decode IS: {e}")))?;
-        let resp = match self.raft.install_snapshot(req).await {
-            Ok(response) => response,
-            Err(openraft::error::RaftError::APIError(
-                openraft::error::InstallSnapshotError::SnapshotMismatch(mismatch),
-            )) => {
-                let encoded = serde_json::to_string(&mismatch)
-                    .unwrap_or_else(|error| format!("invalid:{error}"));
-                return Err(RaftRpcRouterError::snapshot_mismatch(encoded));
-            }
-            Err(openraft::error::RaftError::Fatal(error)) => {
-                return Err(RaftRpcRouterError::RemoteFatal(format!(
-                    "raft.install_snapshot: {error}"
-                )));
-            }
-        };
-        serde_json::to_vec(&resp)
-            .map_err(|e| RaftRpcRouterError::Dispatch(format!("encode IS resp: {e}")))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     // Test assertions briefly lock a mock's recorded-call log to inspect it
@@ -1381,7 +573,6 @@ mod tests {
     #![allow(clippy::await_holding_lock)]
     use super::*;
     use crate::bootstrap::controlplane_join_adapters::build_controlplane_join_handler;
-    use crate::bootstrap::controlplane_join_handler::validate_command_codec_v3_join;
     use crate::datastore::DatastoreBackend;
     use crate::datastore::node_local::NodeLocalStores;
     use klights_leader_api::{
@@ -1389,6 +580,15 @@ mod tests {
         ResourceGetRequest, ResourceListRequest, ResourceListResult, ResourceQueryError,
         ResourceQueryFuture,
     };
+    use klights_replication::activation::{
+        COMMAND_CODEC_ACTIVATION_VALUE, KEY_COMMAND_CODEC_ACTIVATION_VERSION,
+    };
+    use klights_replication::join::validate_command_codec_v3_join;
+    use klights_replication::membership::{
+        CommandCodecV3ActivationError, CommandCodecV3PreflightError, MemberFeatureProbe,
+        RaftMemberAdmissionResult,
+    };
+    use klights_replication::types::RaftMemberLogId;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     struct BackendResourceQuery {
@@ -1542,84 +742,6 @@ mod tests {
             })
         }
     }
-
-    #[tokio::test]
-    async fn codec_v3_preflight_member_probe_requires_every_member() {
-        let members = vec![
-            (1, "https://node-1".to_string()),
-            (2, "https://node-2".to_string()),
-        ];
-        let all_capable = FeatureProbe {
-            replies: [
-                (1, Ok(klights_cluster_core::COMMAND_CODEC_VERSION)),
-                (2, Ok(klights_cluster_core::COMMAND_CODEC_VERSION)),
-            ]
-            .into_iter()
-            .collect(),
-        };
-        verify_command_codec_v3_members(members.clone(), &all_capable)
-            .await
-            .expect("all current members support exact codec v3");
-
-        let missing = FeatureProbe {
-            replies: [
-                (1, Ok(klights_cluster_core::COMMAND_CODEC_VERSION)),
-                (2, Ok(2)),
-            ]
-            .into_iter()
-            .collect(),
-        };
-        assert!(matches!(
-            verify_command_codec_v3_members(members.clone(), &missing).await,
-            Err(CommandCodecV3PreflightError::Unsupported { node_id: 2 })
-        ));
-
-        let unavailable = FeatureProbe {
-            replies: [
-                (1, Ok(klights_cluster_core::COMMAND_CODEC_VERSION)),
-                (2, Err(anyhow::anyhow!("transport unavailable"))),
-            ]
-            .into_iter()
-            .collect(),
-        };
-        assert!(matches!(
-            verify_command_codec_v3_members(members, &unavailable).await,
-            Err(CommandCodecV3PreflightError::Unavailable { node_id: 2, .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn startup_codec_probe_rejects_any_voter_or_learner_without_v3() {
-        let members = vec![
-            (1, "https://voter".to_string()),
-            (2, "https://learner".to_string()),
-        ];
-        let compatible = FeatureProbe {
-            replies: [
-                (1, Ok(klights_cluster_core::COMMAND_CODEC_VERSION)),
-                (2, Ok(klights_cluster_core::COMMAND_CODEC_VERSION)),
-            ]
-            .into_iter()
-            .collect(),
-        };
-        verify_command_codec_v3_members(members.clone(), &compatible)
-            .await
-            .expect("all restored members advertise codec v3");
-
-        let old_learner = FeatureProbe {
-            replies: [
-                (1, Ok(klights_cluster_core::COMMAND_CODEC_VERSION)),
-                (2, Ok(2)),
-            ]
-            .into_iter()
-            .collect(),
-        };
-        assert!(matches!(
-            verify_command_codec_v3_members(members, &old_learner).await,
-            Err(CommandCodecV3PreflightError::Unsupported { node_id: 2 })
-        ));
-    }
-
     #[tokio::test]
     async fn codec_v3_activation_is_leader_gated_idempotent_and_persisted() {
         let (node, backend) = fresh_node(701).await;
@@ -3235,7 +2357,7 @@ mod tests {
         wait_for_leader(&node, std::time::Duration::from_secs(5))
             .await
             .unwrap();
-        let router = RaftNodeRpcRouter::from_node(&node);
+        let router = node.rpc_router();
         let rpc = openraft::raft::VoteRequest::new(
             openraft::Vote::new(100, 70),
             Some(openraft::LogId::new(openraft::LeaderId::new(100, 70), 0)),
@@ -3261,7 +2383,7 @@ mod tests {
     async fn raft_router_fences_stale_nonzero_suffix_for_fresh_same_id_node() {
         use klights_leader_rpc::raft_rpc::RaftRpcRouter;
         let (node, _) = fresh_node(71).await;
-        let router = RaftNodeRpcRouter::from_node(&node);
+        let router = node.rpc_router();
         let receiver =
             RaftMemberNode::new("loopback".into(), node.storage_incarnation.clone(), None);
         let wrong_receiver =
@@ -3596,11 +2718,15 @@ mod tests {
         );
         assert!(
             leader
-                .read_member_admission(76)
+                .materializer
+                .read_raft_metadata("raft_member_admission/76")
                 .await
                 .unwrap()
-                .and_then(|admission| admission.proven_log)
-                .is_some(),
+                .and_then(|admission| {
+                    serde_json::from_str::<serde_json::Value>(&admission).ok()
+                })
+                .and_then(|admission| admission.get("proven_log").cloned())
+                .is_some_and(|proof| !proof.is_null()),
             "replacement admission must persist a leader-observed target replication match"
         );
         replacement.shutdown().await.unwrap();
@@ -3699,32 +2825,6 @@ mod tests {
         leader.shutdown().await.unwrap();
         learner.shutdown().await.unwrap();
     }
-
-    #[test]
-    fn current_boundary_detects_truncation_even_when_monotonic_highwater_stays_proven() {
-        use klights_leader_api::RaftStorageLogAttestation;
-        let admitted = RaftStorageLogAttestation {
-            term: 3,
-            leader_node_id: 80,
-            index: 100,
-        };
-        let monotonic = admitted.clone();
-        let truncated_boundary = RaftStorageLogAttestation {
-            term: 3,
-            leader_node_id: 80,
-            index: 50,
-        };
-
-        assert!(!RaftNode::attestation_is_behind(
-            Some(&monotonic),
-            Some(&admitted)
-        ));
-        assert!(RaftNode::attestation_is_behind(
-            Some(&truncated_boundary),
-            Some(&admitted)
-        ));
-    }
-
     #[tokio::test]
     async fn existing_member_without_v3_admission_marker_fails_closed_without_mutation() {
         use crate::datastore::raft::network::LoopbackRegistry;

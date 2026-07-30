@@ -2,7 +2,6 @@ mod authority;
 pub(crate) use authority::snapshot_install;
 pub mod compressed;
 pub mod grpc_network;
-pub mod membership_client;
 
 pub(crate) use authority::SnapshotInstallAuthority;
 pub mod network;

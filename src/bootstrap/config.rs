@@ -130,6 +130,12 @@ impl DbEncryption {
     }
 }
 
+fn parse_pod_subnet(raw: &str) -> anyhow::Result<String> {
+    klights_types::PodSubnet::parse(raw)
+        .map(|subnet| subnet.to_string())
+        .map_err(|error| anyhow::anyhow!("invalid KLIGHTS_POD_SUBNET '{}': {}", raw, error))
+}
+
 impl KlightsConfig {
     pub fn from_env() -> anyhow::Result<Self> {
         Self::from_env_with_namespace_override(None)
@@ -140,7 +146,7 @@ impl KlightsConfig {
     ) -> anyhow::Result<Self> {
         use crate::networking::BridgeName;
         use anyhow::anyhow;
-        use klights_types::{ClusterCidr, NodeName, PodSubnet};
+        use klights_types::{ClusterCidr, NodeName};
 
         let containerd_namespace = namespace_override.map(str::to_string).unwrap_or_else(|| {
             std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string())
@@ -164,9 +170,7 @@ impl KlightsConfig {
             std::env::var("KLIGHTS_POD_SUBNET").unwrap_or_else(|_| "10.43.0.0/17".to_string());
         // Validate via the typed parser; we keep the canonical String form
         // here so consumers that take &str interop without re-parsing.
-        let pod_subnet = PodSubnet::parse(&pod_subnet_raw)
-            .map_err(|e| anyhow!("invalid KLIGHTS_POD_SUBNET '{}': {}", pod_subnet_raw, e))?
-            .to_string();
+        let pod_subnet = parse_pod_subnet(&pod_subnet_raw)?;
 
         let cluster_raw =
             std::env::var("KLIGHTS_CLUSTER_CIDR").unwrap_or_else(|_| pod_subnet.clone());
@@ -980,12 +984,8 @@ mod tests {
     }
 
     #[test]
-    fn test_from_env_rejects_invalid_pod_subnet() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("KLIGHTS_POD_SUBNET", "not-a-cidr") };
-        let err = KlightsConfig::from_env().expect_err("must reject invalid CIDR");
+    fn test_rejects_invalid_pod_subnet() {
+        let err = parse_pod_subnet("not-a-cidr").expect_err("must reject invalid CIDR");
         assert!(
             format!("{:#}", err).contains("KLIGHTS_POD_SUBNET"),
             "error should name the bad var, got: {:#}",

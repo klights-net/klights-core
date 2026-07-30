@@ -252,7 +252,7 @@ impl ReplicationGrpcMemberFeatureProbe {
 }
 
 #[async_trait::async_trait]
-impl crate::datastore::raft::node::MemberFeatureProbe for ReplicationGrpcMemberFeatureProbe {
+impl klights_replication::membership::MemberFeatureProbe for ReplicationGrpcMemberFeatureProbe {
     async fn metadata_for_member(
         &self,
         node_id: klights_replication::types::NodeId,

@@ -1,11 +1,99 @@
 use std::sync::Arc;
 
 use klights_leader_api::{
-    ControlplaneJoinAdmission, ControlplaneJoinAuthority, ControlplaneJoinError,
-    ControlplaneJoinFuture, ControlplaneJoinHandler, ControlplaneJoinMetadata,
-    ControlplaneJoinOutcome, ControlplaneJoinRegistration, ControlplaneJoinRequest,
-    ControlplaneJoinRoute, ControlplaneMemberQuery, ControlplaneMemberQueryFuture,
+    ControlplaneJoinAdmission, ControlplaneJoinAdmissionFuture, ControlplaneJoinAdmissionOutcome,
+    ControlplaneJoinAuthority, ControlplaneJoinError, ControlplaneJoinFuture,
+    ControlplaneJoinHandler, ControlplaneJoinMetadata, ControlplaneJoinOutcome,
+    ControlplaneJoinRegistration, ControlplaneJoinRequest, ControlplaneJoinRoute,
+    ControlplaneMemberQuery, ControlplaneMemberQueryFuture,
 };
+
+use crate::membership::{EmbeddedRaftMembership, RaftMemberAdmissionResult};
+
+pub struct RaftControlplaneJoinAuthority {
+    membership: Arc<EmbeddedRaftMembership>,
+}
+
+impl RaftControlplaneJoinAuthority {
+    pub fn new(membership: Arc<EmbeddedRaftMembership>) -> Self {
+        Self { membership }
+    }
+}
+
+impl ControlplaneJoinAuthority for RaftControlplaneJoinAuthority {
+    fn route(&self) -> ControlplaneJoinRoute {
+        if self.membership.is_leader() {
+            ControlplaneJoinRoute::Local
+        } else {
+            match self.membership.current_leader_info() {
+                Some((leader_id, leader_addr)) => ControlplaneJoinRoute::Redirect {
+                    leader_id,
+                    leader_addr,
+                },
+                None => ControlplaneJoinRoute::Unavailable,
+            }
+        }
+    }
+}
+
+pub struct RaftControlplaneJoinAdmission {
+    membership: Arc<EmbeddedRaftMembership>,
+    controlplane_limit: usize,
+}
+
+impl RaftControlplaneJoinAdmission {
+    pub fn new(membership: Arc<EmbeddedRaftMembership>, controlplane_limit: usize) -> Self {
+        Self {
+            membership,
+            controlplane_limit,
+        }
+    }
+}
+
+impl ControlplaneJoinAdmission for RaftControlplaneJoinAdmission {
+    fn admit<'a>(
+        &'a self,
+        request: &'a ControlplaneJoinRequest,
+    ) -> ControlplaneJoinAdmissionFuture<'a> {
+        Box::pin(async move {
+            let result = self
+                .membership
+                .admit_controlplane_member_with_limit(
+                    request.node_id,
+                    request.addr.clone(),
+                    request.as_learner,
+                    request.storage_incarnation.clone(),
+                    request.storage_log_attestation.clone(),
+                    self.controlplane_limit,
+                )
+                .await
+                .map_err(|error| ControlplaneJoinError::new(error.to_string()))?;
+            Ok(ControlplaneJoinAdmissionOutcome {
+                changed: result == RaftMemberAdmissionResult::Changed,
+                voter_count_after: self.membership.current_shape().voter_count,
+            })
+        })
+    }
+}
+
+pub struct RaftControlplaneMemberQuery {
+    membership: Arc<EmbeddedRaftMembership>,
+}
+
+impl RaftControlplaneMemberQuery {
+    pub fn new(membership: Arc<EmbeddedRaftMembership>) -> Self {
+        Self { membership }
+    }
+}
+
+impl ControlplaneMemberQuery for RaftControlplaneMemberQuery {
+    fn is_controlplane_member<'a>(
+        &'a self,
+        node_name: &'a str,
+    ) -> ControlplaneMemberQueryFuture<'a> {
+        Box::pin(async move { self.membership.is_controlplane_member(node_name) })
+    }
+}
 
 /// Neutral coordinator for authenticated control-plane joins.
 ///
@@ -38,7 +126,7 @@ impl ControlplaneJoinCoordinator {
     }
 }
 
-pub(crate) fn validate_command_codec_v3_join(command_codec_version: u32) -> Result<(), String> {
+pub fn validate_command_codec_v3_join(command_codec_version: u32) -> Result<(), String> {
     if command_codec_version != klights_cluster_core::COMMAND_CODEC_VERSION {
         return Err(
             "joining voters and learners must advertise exact command codec version 3".to_string(),

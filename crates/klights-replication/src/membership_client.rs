@@ -3,8 +3,7 @@
 //! `remove_voter`). Higher-level join orchestration depends on this
 //! trait rather than reaching into a concrete `RaftNode`, so:
 //!
-//! - The production adapter (`RaftNodeMembershipClient`) delegates to
-//!   `RaftNode::{add_learner_only, add_voter, remove_voter}`.
+//! - The production adapter delegates to the embedded membership owner.
 //! - Tests use `MockMembershipClient` to drive learner-join and
 //!   leader-change-retry paths without a real openraft cluster or
 //!   socket.
@@ -13,7 +12,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use klights_replication::types::NodeId;
+use crate::types::NodeId;
 
 /// Object-safe membership-change client. Implementations may live on a
 /// raft leader (mutating the local engine) or on a follower that
@@ -38,27 +37,27 @@ pub trait MembershipClient: Send + Sync {
 /// Only useful on a node that is the current raft leader; non-leader
 /// callers should use a forwarding client (added in a later sub-task).
 pub struct RaftNodeMembershipClient {
-    node: Arc<super::node::RaftNode>,
+    membership: Arc<crate::membership::EmbeddedRaftMembership>,
 }
 
 impl RaftNodeMembershipClient {
-    pub fn new(node: Arc<super::node::RaftNode>) -> Self {
-        Self { node }
+    pub fn new(membership: Arc<crate::membership::EmbeddedRaftMembership>) -> Self {
+        Self { membership }
     }
 }
 
 #[async_trait]
 impl MembershipClient for RaftNodeMembershipClient {
     async fn add_learner(&self, node_id: NodeId, addr: String) -> Result<()> {
-        self.node.add_learner_only(node_id, addr).await
+        self.membership.add_learner_only(node_id, addr).await
     }
 
     async fn add_voter(&self, node_id: NodeId, addr: String) -> Result<()> {
-        self.node.add_voter(node_id, addr).await
+        self.membership.add_voter(node_id, addr).await
     }
 
     async fn remove_voter(&self, node_id: NodeId) -> Result<()> {
-        self.node.remove_voter(node_id).await
+        self.membership.remove_voter(node_id).await
     }
 }
 
