@@ -3,7 +3,9 @@
 //! Tests use mock implementations of `OidcDiscovery` and `OidcValidator`
 //! to verify all code paths without network access.
 
-use crate::auth::oidc::*;
+use crate::AuthenticationError;
+use crate::clock::FixedClock;
+use crate::oidc::*;
 use base64::Engine;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use rsa::{RsaPrivateKey, pkcs8::EncodePrivateKey, traits::PublicKeyParts};
@@ -14,14 +16,14 @@ use time::OffsetDateTime;
 
 /// Mock discovery that returns pre-configured metadata and JWKS.
 struct MockOidcDiscovery {
-    metadata: Result<OidcProviderMetadata, klights_auth::AuthenticationError>,
-    jwks: Result<JwkSet, klights_auth::AuthenticationError>,
+    metadata: Result<OidcProviderMetadata, AuthenticationError>,
+    jwks: Result<JwkSet, AuthenticationError>,
 }
 
 impl MockOidcDiscovery {
     fn new(
-        metadata: Result<OidcProviderMetadata, klights_auth::AuthenticationError>,
-        jwks: Result<JwkSet, klights_auth::AuthenticationError>,
+        metadata: Result<OidcProviderMetadata, AuthenticationError>,
+        jwks: Result<JwkSet, AuthenticationError>,
     ) -> Self {
         Self { metadata, jwks }
     }
@@ -32,24 +34,21 @@ impl OidcDiscovery for MockOidcDiscovery {
     async fn fetch_discovery(
         &self,
         _issuer_url: &str,
-    ) -> Result<OidcProviderMetadata, klights_auth::AuthenticationError> {
+    ) -> Result<OidcProviderMetadata, AuthenticationError> {
         self.metadata.clone()
     }
-    async fn fetch_jwks(
-        &self,
-        _jwks_uri: &str,
-    ) -> Result<JwkSet, klights_auth::AuthenticationError> {
+    async fn fetch_jwks(&self, _jwks_uri: &str) -> Result<JwkSet, AuthenticationError> {
         self.jwks.clone()
     }
 }
 
 /// Mock validator that returns a pre-configured result.
 struct MockOidcValidator {
-    result: Result<OidcClaims, klights_auth::AuthenticationError>,
+    result: Result<OidcClaims, AuthenticationError>,
 }
 
 impl MockOidcValidator {
-    fn new(result: Result<OidcClaims, klights_auth::AuthenticationError>) -> Self {
+    fn new(result: Result<OidcClaims, AuthenticationError>) -> Self {
         Self { result }
     }
 }
@@ -60,7 +59,7 @@ impl OidcValidator for MockOidcValidator {
         &self,
         _token: &str,
         _now: OffsetDateTime,
-    ) -> Result<OidcClaims, klights_auth::AuthenticationError> {
+    ) -> Result<OidcClaims, AuthenticationError> {
         self.result.clone()
     }
 }
@@ -73,8 +72,8 @@ impl OidcValidator for DependencyFailingOidcValidator {
         &self,
         _token: &str,
         _now: OffsetDateTime,
-    ) -> Result<OidcClaims, klights_auth::AuthenticationError> {
-        Err(klights_auth::AuthenticationError::dependency_failure(
+    ) -> Result<OidcClaims, AuthenticationError> {
+        Err(AuthenticationError::dependency_failure(
             "OIDC discovery unavailable",
         ))
     }
@@ -167,7 +166,7 @@ fn valid_claims() -> serde_json::Value {
 
 #[tokio::test]
 async fn oidc_dependency_failure_is_not_a_credential_rejection() {
-    let clock = klights_auth::clock::FixedClock {
+    let clock = FixedClock {
         now: OffsetDateTime::UNIX_EPOCH,
     };
     let error = try_oidc_auth(
@@ -180,7 +179,7 @@ async fn oidc_dependency_failure_is_not_a_credential_rejection() {
     .expect_err("dependency outage must fail authentication");
     assert!(matches!(
         error,
-        klights_auth::AuthenticationError::DependencyFailure { .. }
+        AuthenticationError::DependencyFailure { .. }
     ));
 }
 
@@ -254,9 +253,7 @@ async fn test_mock_validator_returns_success() {
 
 #[tokio::test]
 async fn test_mock_validator_returns_failure() {
-    let validator = MockOidcValidator::new(Err(
-        klights_auth::AuthenticationError::unauthenticated("bad token"),
-    ));
+    let validator = MockOidcValidator::new(Err(AuthenticationError::unauthenticated("bad token")));
     let result = validator
         .validate_token("bad-token", OffsetDateTime::now_utc())
         .await;
@@ -278,9 +275,7 @@ async fn test_mock_discovery_returns_metadata() {
 #[tokio::test]
 async fn test_mock_discovery_returns_error() {
     let discovery = MockOidcDiscovery::new(
-        Err(klights_auth::AuthenticationError::dependency_failure(
-            "unreachable",
-        )),
+        Err(AuthenticationError::dependency_failure("unreachable")),
         Ok(JwkSet { keys: vec![] }),
     );
     let result = discovery
@@ -306,7 +301,7 @@ fn test_oidc_claims_groups_prefix_applied() {
 async fn test_jwt_oidc_validator_rejects_expired_token_via_mock() {
     // When a mock validator returns an expiration error,
     // the caller should receive that error.
-    let mock = MockOidcValidator::new(Err(klights_auth::AuthenticationError::unauthenticated(
+    let mock = MockOidcValidator::new(Err(AuthenticationError::unauthenticated(
         "token has expired",
     )));
     let now = OffsetDateTime::now_utc();
@@ -444,7 +439,7 @@ fn test_prepare_oidc_config_rejects_missing_client_id() {
 
 #[tokio::test]
 async fn test_try_oidc_auth_no_authenticator_returns_none() {
-    let clock = klights_auth::clock::FixedClock {
+    let clock = FixedClock {
         now: OffsetDateTime::UNIX_EPOCH,
     };
     let result = try_oidc_auth(None, "some-token", &clock).await;
@@ -459,7 +454,7 @@ async fn test_try_oidc_auth_success_returns_identity() {
         uid: Some("uid-42".to_string()),
         audiences: vec!["client-id".to_string()],
     })));
-    let clock = klights_auth::clock::FixedClock {
+    let clock = FixedClock {
         now: OffsetDateTime::UNIX_EPOCH,
     };
     let result = try_oidc_auth(Some(validator.as_ref()), "valid-oidc-token", &clock).await;
@@ -478,9 +473,9 @@ async fn test_try_oidc_auth_success_returns_identity() {
 #[tokio::test]
 async fn test_try_oidc_auth_failure_returns_error() {
     let validator: Arc<dyn OidcValidator> = Arc::new(MockOidcValidator::new(Err(
-        klights_auth::AuthenticationError::unauthenticated("invalid signature"),
+        AuthenticationError::unauthenticated("invalid signature"),
     )));
-    let clock = klights_auth::clock::FixedClock {
+    let clock = FixedClock {
         now: OffsetDateTime::UNIX_EPOCH,
     };
     let result = try_oidc_auth(Some(validator.as_ref()), "bad-token", &clock).await;

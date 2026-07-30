@@ -14,7 +14,7 @@ pub(crate) fn test_admin(username: impl Into<String>) -> klights_auth::Authentic
     )
 }
 pub(crate) use self::kubeconfig::{KubeconfigParams, generate_kubeconfig};
-pub use self::middleware::{BoundTokenSubjectLookup, validate_sa_token_bindings};
+pub use self::middleware::validate_sa_token_bindings;
 #[cfg(test)]
 use klights_auth::{
     BoundServiceAccountToken, SaTokenClaims, ServiceAccountTokenRequest,
@@ -79,12 +79,6 @@ pub fn generate_sa_token_with_bound_pod(
 
 mod kubeconfig;
 pub(crate) mod middleware;
-pub mod oidc;
-#[cfg(test)]
-mod oidc_tests;
-pub mod webhook_auth;
-#[cfg(test)]
-mod webhook_auth_tests;
 
 #[cfg(test)]
 mod object_safety_tests {
@@ -96,15 +90,16 @@ mod object_safety_tests {
         assert_object_safe::<dyn klights_auth::clock::Clock>();
         assert_object_safe::<dyn klights_auth::clock::MonotonicClock>();
         assert_object_safe::<dyn klights_auth::csr_signer::CsrSigner>();
-        assert_object_safe::<dyn super::middleware::BootstrapTokenAuthenticator>();
-        assert_object_safe::<dyn super::middleware::BoundTokenSubjectLookup>();
-        assert_object_safe::<dyn super::middleware::ServiceAccountSigningKeyProvider>();
+        assert_object_safe::<dyn klights_auth::cluster_identity::BootstrapTokenAuthenticator>();
+        assert_object_safe::<dyn klights_auth::cluster_identity::BoundTokenSubjectLookup>();
+        assert_object_safe::<dyn klights_auth::cluster_identity::ServiceAccountSigningKeyProvider>(
+        );
         assert_object_safe::<dyn klights_auth::node_policy_store::NodePolicyStore>();
-        assert_object_safe::<dyn super::oidc::OidcDiscovery>();
-        assert_object_safe::<dyn super::oidc::OidcValidator>();
+        assert_object_safe::<dyn klights_auth::oidc::OidcDiscovery>();
+        assert_object_safe::<dyn klights_auth::oidc::OidcValidator>();
         assert_object_safe::<dyn klights_auth::rbac_policy_store::RbacPolicyStore>();
         assert_object_safe::<dyn klights_auth::rbac_policy_store::RbacResourceReader>();
-        assert_object_safe::<dyn super::webhook_auth::WebhookAuthenticator>();
-        assert_object_safe::<dyn super::webhook_auth::WebhookTokenReviewer>();
+        assert_object_safe::<dyn klights_auth::webhook_auth::WebhookAuthenticator>();
+        assert_object_safe::<dyn klights_auth::webhook_auth::WebhookTokenReviewer>();
     }
 }

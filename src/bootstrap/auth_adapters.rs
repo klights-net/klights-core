@@ -31,7 +31,9 @@ impl DatastoreBootstrapTokenAuthenticator {
 }
 
 #[async_trait]
-impl crate::auth::middleware::BootstrapTokenAuthenticator for DatastoreBootstrapTokenAuthenticator {
+impl klights_auth::cluster_identity::BootstrapTokenAuthenticator
+    for DatastoreBootstrapTokenAuthenticator
+{
     async fn authenticate_bootstrap_token(
         &self,
         token: &str,

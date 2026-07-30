@@ -195,7 +195,7 @@ async fn read_optional_auth_pem(
 async fn compose_oidc_authenticator(
     config: &KlightsConfig,
     supervisor: &TaskSupervisor,
-) -> Result<Option<Arc<dyn crate::auth::oidc::OidcValidator>>> {
+) -> Result<Option<Arc<dyn klights_auth::oidc::OidcValidator>>> {
     let Some(issuer_url) = config.oidc_issuer_url.as_ref() else {
         return Ok(None);
     };
@@ -211,28 +211,29 @@ async fn compose_oidc_authenticator(
         config.oidc_ca_bundle.as_deref(),
     )
     .await?;
-    let oidc_config = crate::auth::oidc::prepare_oidc_config(Some(crate::auth::oidc::OidcConfig {
-        issuer_url: issuer_url.clone(),
-        client_id: client_id.to_string(),
-        username_claim: config.oidc_username_claim.clone(),
-        username_prefix: None,
-        groups_claim: config.oidc_groups_claim.clone(),
-        groups_prefix: config.oidc_groups_prefix.clone(),
-        ca_bundle,
-        signing_algs: crate::auth::oidc::default_signing_algs(),
-    }))
-    .ok_or_else(|| anyhow::anyhow!("invalid OIDC authenticator configuration"))?;
+    let oidc_config =
+        klights_auth::oidc::prepare_oidc_config(Some(klights_auth::oidc::OidcConfig {
+            issuer_url: issuer_url.clone(),
+            client_id: client_id.to_string(),
+            username_claim: config.oidc_username_claim.clone(),
+            username_prefix: None,
+            groups_claim: config.oidc_groups_claim.clone(),
+            groups_prefix: config.oidc_groups_prefix.clone(),
+            ca_bundle,
+            signing_algs: klights_auth::oidc::default_signing_algs(),
+        }))
+        .ok_or_else(|| anyhow::anyhow!("invalid OIDC authenticator configuration"))?;
     let discovery_ca_bundle = oidc_config.ca_bundle.clone();
     let crypto = klights_supervisor::CryptoExecutor::from_supervisor(supervisor);
     let discovery = crypto
         .run_blocking("oidc-http-discovery-client-construction", move || {
-            crate::auth::oidc::HttpOidcDiscovery::new(discovery_ca_bundle)
+            klights_auth::oidc::HttpOidcDiscovery::new(discovery_ca_bundle)
         })
         .await
         .map_err(|error| anyhow::anyhow!("OIDC client construction failed: {error}"))?
         .map_err(|error| anyhow::anyhow!("invalid OIDC authenticator configuration: {error}"))?;
-    let authenticator: Arc<dyn crate::auth::oidc::OidcValidator> =
-        Arc::new(crate::auth::oidc::JwtOidcValidator::new(
+    let authenticator: Arc<dyn klights_auth::oidc::OidcValidator> =
+        Arc::new(klights_auth::oidc::JwtOidcValidator::new(
             oidc_config,
             Box::new(discovery),
             Arc::new(supervisor.clone()),
@@ -243,7 +244,7 @@ async fn compose_oidc_authenticator(
 async fn compose_webhook_authenticator(
     config: &KlightsConfig,
     supervisor: &TaskSupervisor,
-) -> Result<Option<Arc<dyn crate::auth::webhook_auth::WebhookAuthenticator>>> {
+) -> Result<Option<Arc<dyn klights_auth::webhook_auth::WebhookAuthenticator>>> {
     let Some(url) = config.webhook_auth_url.as_ref() else {
         return Ok(None);
     };
@@ -268,8 +269,8 @@ async fn compose_webhook_authenticator(
         config.webhook_auth_client_key.as_deref(),
     )
     .await?;
-    let webhook_config = crate::auth::webhook_auth::prepare_webhook_auth_config(Some(
-        crate::auth::webhook_auth::WebhookAuthConfig {
+    let webhook_config = klights_auth::webhook_auth::prepare_webhook_auth_config(Some(
+        klights_auth::webhook_auth::WebhookAuthConfig {
             url: url.clone(),
             ca_bundle,
             client_cert,
@@ -290,16 +291,16 @@ async fn compose_webhook_authenticator(
     };
     let reviewer_config = webhook_config.clone();
     let crypto = klights_supervisor::CryptoExecutor::from_supervisor(supervisor);
-    let reviewer: Arc<dyn crate::auth::webhook_auth::WebhookTokenReviewer> = Arc::new(
+    let reviewer: Arc<dyn klights_auth::webhook_auth::WebhookTokenReviewer> = Arc::new(
         crypto
             .run_blocking("webhook-http-reviewer-client-construction", move || {
-                crate::auth::webhook_auth::HttpWebhookTokenReviewer::new(reviewer_config)
+                klights_auth::webhook_auth::HttpWebhookTokenReviewer::new(reviewer_config)
             })
             .await
             .map_err(|error| anyhow::anyhow!("webhook client construction failed: {error}"))??,
     );
-    let authenticator: Arc<dyn crate::auth::webhook_auth::WebhookAuthenticator> =
-        Arc::new(crate::auth::webhook_auth::WebhookAuth::new(
+    let authenticator: Arc<dyn klights_auth::webhook_auth::WebhookAuthenticator> =
+        Arc::new(klights_auth::webhook_auth::WebhookAuth::new(
             reviewer,
             std::time::Duration::from_secs(webhook_config.cache_authorized_ttl_secs),
             std::time::Duration::from_secs(webhook_config.cache_unauthorized_ttl_secs),

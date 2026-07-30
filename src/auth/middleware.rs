@@ -5,49 +5,19 @@
 
 use klights_auth::AuthenticatedIdentity;
 use klights_auth::clock::Clock;
+use klights_auth::cluster_identity::{
+    BootstrapTokenAuthenticator, BoundTokenSubjectLookup, ServiceAccountSigningKeyProvider,
+};
 use klights_auth::{AuthenticationError, validate_bound_object_uid};
 use klights_supervisor::{TaskCategory, TaskSupervisor};
 use klights_types::TlsClientCertificate;
-
-#[async_trait::async_trait]
-pub(crate) trait BootstrapTokenAuthenticator: Send + Sync {
-    async fn authenticate_bootstrap_token(
-        &self,
-        token: &str,
-    ) -> Result<AuthenticatedIdentity, AuthenticationError>;
-}
-
-#[async_trait::async_trait]
-pub(crate) trait ServiceAccountSigningKeyProvider: Send + Sync {
-    async fn service_account_signing_key_pem(&self) -> Result<String, AuthenticationError>;
-}
-
-#[async_trait::async_trait]
-pub trait BoundTokenSubjectLookup: Send + Sync {
-    async fn service_account_uid(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> Result<Option<String>, AuthenticationError>;
-    async fn pod_uid(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> Result<Option<String>, AuthenticationError>;
-    async fn node_uid(&self, name: &str) -> Result<Option<String>, AuthenticationError>;
-    async fn secret_uid(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> Result<Option<String>, AuthenticationError>;
-}
 
 pub(crate) struct AuthnRuntime<'a> {
     bootstrap_tokens: &'a dyn BootstrapTokenAuthenticator,
     service_account_signing_keys: &'a dyn ServiceAccountSigningKeyProvider,
     bound_token_subjects: &'a dyn BoundTokenSubjectLookup,
-    oidc_authenticator: Option<&'a dyn crate::auth::oidc::OidcValidator>,
-    webhook_authenticator: Option<&'a dyn crate::auth::webhook_auth::WebhookAuthenticator>,
+    oidc_authenticator: Option<&'a dyn klights_auth::oidc::OidcValidator>,
+    webhook_authenticator: Option<&'a dyn klights_auth::webhook_auth::WebhookAuthenticator>,
     clock: &'a dyn Clock,
     task_supervisor: &'a TaskSupervisor,
     anonymous_auth: bool,
@@ -59,8 +29,8 @@ impl<'a> AuthnRuntime<'a> {
         bootstrap_tokens: &'a dyn BootstrapTokenAuthenticator,
         service_account_signing_keys: &'a dyn ServiceAccountSigningKeyProvider,
         bound_token_subjects: &'a dyn BoundTokenSubjectLookup,
-        oidc_authenticator: Option<&'a dyn crate::auth::oidc::OidcValidator>,
-        webhook_authenticator: Option<&'a dyn crate::auth::webhook_auth::WebhookAuthenticator>,
+        oidc_authenticator: Option<&'a dyn klights_auth::oidc::OidcValidator>,
+        webhook_authenticator: Option<&'a dyn klights_auth::webhook_auth::WebhookAuthenticator>,
         clock: &'a dyn Clock,
         task_supervisor: &'a TaskSupervisor,
         anonymous_auth: bool,
@@ -148,7 +118,7 @@ async fn authenticate_bearer_token(
         {
             Ok(identity) => Ok(identity),
             Err(bootstrap_error) => {
-                if let Some(result) = crate::auth::webhook_auth::try_webhook_auth(
+                if let Some(result) = klights_auth::webhook_auth::try_webhook_auth(
                     runtime.webhook_authenticator,
                     token,
                 )
@@ -163,7 +133,7 @@ async fn authenticate_bearer_token(
         3 => match validate_sa_token(runtime, token).await {
             Ok(identity) => Ok(identity),
             Err(service_account_error) => {
-                if let Some(result) = crate::auth::oidc::try_oidc_auth(
+                if let Some(result) = klights_auth::oidc::try_oidc_auth(
                     runtime.oidc_authenticator,
                     token,
                     runtime.clock,
@@ -175,7 +145,7 @@ async fn authenticate_bearer_token(
                         Err(error) => {
                             let selected =
                                 preferred_authentication_error(service_account_error, error);
-                            if let Some(result) = crate::auth::webhook_auth::try_webhook_auth(
+                            if let Some(result) = klights_auth::webhook_auth::try_webhook_auth(
                                 runtime.webhook_authenticator,
                                 token,
                             )
@@ -189,7 +159,7 @@ async fn authenticate_bearer_token(
                         }
                     }
                 }
-                if let Some(result) = crate::auth::webhook_auth::try_webhook_auth(
+                if let Some(result) = klights_auth::webhook_auth::try_webhook_auth(
                     runtime.webhook_authenticator,
                     token,
                 )
@@ -204,7 +174,7 @@ async fn authenticate_bearer_token(
         },
         _ => {
             if let Some(result) =
-                crate::auth::webhook_auth::try_webhook_auth(runtime.webhook_authenticator, token)
+                klights_auth::webhook_auth::try_webhook_auth(runtime.webhook_authenticator, token)
                     .await
             {
                 return result;
@@ -363,7 +333,7 @@ pub(crate) async fn authenticate_token_for_review(
             match bootstrap_result {
                 Ok(reviewed) => Ok(reviewed),
                 Err(bootstrap_error) => {
-                    if let Some(result) = crate::auth::webhook_auth::try_webhook_auth_for_review(
+                    if let Some(result) = klights_auth::webhook_auth::try_webhook_auth_for_review(
                         runtime.webhook_authenticator,
                         token,
                         audiences,
@@ -400,7 +370,7 @@ pub(crate) async fn authenticate_token_for_review(
             }
             Err(service_account_error) => {
                 let mut selected = service_account_error;
-                if let Some(result) = crate::auth::oidc::try_oidc_auth_for_review(
+                if let Some(result) = klights_auth::oidc::try_oidc_auth_for_review(
                     runtime.oidc_authenticator,
                     token,
                     runtime.clock,
@@ -424,7 +394,7 @@ pub(crate) async fn authenticate_token_for_review(
                         }
                     }
                 }
-                if let Some(result) = crate::auth::webhook_auth::try_webhook_auth_for_review(
+                if let Some(result) = klights_auth::webhook_auth::try_webhook_auth_for_review(
                     runtime.webhook_authenticator,
                     token,
                     audiences,
@@ -448,7 +418,7 @@ pub(crate) async fn authenticate_token_for_review(
             }
         },
         _ => {
-            if let Some(result) = crate::auth::webhook_auth::try_webhook_auth_for_review(
+            if let Some(result) = klights_auth::webhook_auth::try_webhook_auth_for_review(
                 runtime.webhook_authenticator,
                 token,
                 audiences,
@@ -615,10 +585,10 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::auth::webhook_auth::{
+    use klights_auth::clock::{FixedClock, SystemMonotonicClock};
+    use klights_auth::webhook_auth::{
         TokenReviewStatus, TokenReviewUser, WebhookAuth, WebhookTokenReviewer,
     };
-    use klights_auth::clock::{FixedClock, SystemMonotonicClock};
 
     struct RejectBootstrap;
     struct AcceptBootstrap;

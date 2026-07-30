@@ -12,8 +12,8 @@
 //!
 //! The middleware only depends on `OidcValidator`, so tests inject a mock.
 
+use crate::AuthenticationError;
 use jsonwebtoken::Algorithm;
-use klights_auth::AuthenticationError;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -258,8 +258,8 @@ fn defaulted_config(mut config: OidcConfig) -> Option<OidcConfig> {
 pub async fn try_oidc_auth(
     authenticator: Option<&dyn OidcValidator>,
     token: &str,
-    clock: &dyn klights_auth::clock::Clock,
-) -> Option<Result<klights_auth::AuthenticatedIdentity, AuthenticationError>> {
+    clock: &dyn crate::clock::Clock,
+) -> Option<Result<crate::AuthenticatedIdentity, AuthenticationError>> {
     try_oidc_auth_with_audiences(authenticator, token, clock)
         .await
         .map(|result| result.map(|(identity, _audiences)| identity))
@@ -268,17 +268,14 @@ pub async fn try_oidc_auth(
 async fn try_oidc_auth_with_audiences(
     authenticator: Option<&dyn OidcValidator>,
     token: &str,
-    clock: &dyn klights_auth::clock::Clock,
-) -> Option<Result<(klights_auth::AuthenticatedIdentity, Vec<String>), AuthenticationError>> {
+    clock: &dyn crate::clock::Clock,
+) -> Option<Result<(crate::AuthenticatedIdentity, Vec<String>), AuthenticationError>> {
     let authenticator = authenticator?;
     let now = clock.now();
     match authenticator.validate_token(token, now).await {
         Ok(claims) => {
-            let identity = klights_auth::AuthenticatedIdentity::oidc(
-                claims.username,
-                claims.groups,
-                claims.uid,
-            );
+            let identity =
+                crate::AuthenticatedIdentity::oidc(claims.username, claims.groups, claims.uid);
             Some(Ok((identity, claims.audiences)))
         }
         Err(error) => Some(Err(match error {
@@ -302,9 +299,9 @@ async fn try_oidc_auth_with_audiences(
 pub async fn try_oidc_auth_for_review(
     authenticator: Option<&dyn OidcValidator>,
     token: &str,
-    clock: &dyn klights_auth::clock::Clock,
+    clock: &dyn crate::clock::Clock,
     requested_audiences: &[String],
-) -> Option<Result<(klights_auth::AuthenticatedIdentity, Vec<String>), AuthenticationError>> {
+) -> Option<Result<(crate::AuthenticatedIdentity, Vec<String>), AuthenticationError>> {
     const DEFAULT_API_AUDIENCE: &str = "https://kubernetes.default.svc.cluster.local";
     let result = try_oidc_auth_with_audiences(authenticator, token, clock).await?;
     Some(result.and_then(|(identity, _client_id_audiences)| {

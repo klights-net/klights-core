@@ -33,16 +33,17 @@ pub(crate) struct ApiResourceMutationServices {
 
 #[derive(Clone)]
 pub(crate) struct ApiAuthenticators {
-    pub(crate) bootstrap_token: Arc<dyn crate::auth::middleware::BootstrapTokenAuthenticator>,
-    pub(crate) oidc: Option<Arc<dyn crate::auth::oidc::OidcValidator>>,
-    pub(crate) webhook: Option<Arc<dyn crate::auth::webhook_auth::WebhookAuthenticator>>,
+    pub(crate) bootstrap_token:
+        Arc<dyn klights_auth::cluster_identity::BootstrapTokenAuthenticator>,
+    pub(crate) oidc: Option<Arc<dyn klights_auth::oidc::OidcValidator>>,
+    pub(crate) webhook: Option<Arc<dyn klights_auth::webhook_auth::WebhookAuthenticator>>,
 }
 
 impl ApiAuthenticators {
     pub(crate) fn new(
-        bootstrap_token: Arc<dyn crate::auth::middleware::BootstrapTokenAuthenticator>,
-        oidc: Option<Arc<dyn crate::auth::oidc::OidcValidator>>,
-        webhook: Option<Arc<dyn crate::auth::webhook_auth::WebhookAuthenticator>>,
+        bootstrap_token: Arc<dyn klights_auth::cluster_identity::BootstrapTokenAuthenticator>,
+        oidc: Option<Arc<dyn klights_auth::oidc::OidcValidator>>,
+        webhook: Option<Arc<dyn klights_auth::webhook_auth::WebhookAuthenticator>>,
     ) -> Self {
         Self {
             bootstrap_token,
@@ -59,10 +60,10 @@ pub(crate) struct ApiAuthPolicy {
     pub(crate) api_priority_fairness: Arc<crate::api::priority_fairness::ApiPriorityFairness>,
     pub(crate) rbac_policy_store: Arc<dyn klights_auth::rbac_policy_store::RbacPolicyStore>,
     pub(crate) bootstrap_token_authenticator:
-        Arc<dyn crate::auth::middleware::BootstrapTokenAuthenticator>,
-    pub(crate) oidc_authenticator: Option<Arc<dyn crate::auth::oidc::OidcValidator>>,
+        Arc<dyn klights_auth::cluster_identity::BootstrapTokenAuthenticator>,
+    pub(crate) oidc_authenticator: Option<Arc<dyn klights_auth::oidc::OidcValidator>>,
     pub(crate) webhook_authenticator:
-        Option<Arc<dyn crate::auth::webhook_auth::WebhookAuthenticator>>,
+        Option<Arc<dyn klights_auth::webhook_auth::WebhookAuthenticator>>,
     pub(crate) cluster_ca_pem: Option<Arc<String>>,
 }
 
@@ -366,7 +367,8 @@ pub(crate) struct ApiOperationalServices {
     pub(crate) cluster_status: Arc<dyn klights_leader_api::LeaderClusterStatusMetadata>,
     pub(crate) task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub(crate) file_process: klights_supervisor::FileProcessExecutor,
-    pub(crate) signing_keys: Arc<dyn crate::auth::middleware::ServiceAccountSigningKeyProvider>,
+    pub(crate) signing_keys:
+        Arc<dyn klights_auth::cluster_identity::ServiceAccountSigningKeyProvider>,
     pub(crate) authority: Option<Arc<dyn klights_leader_api::LeaderAuthority>>,
 }
 
@@ -380,7 +382,7 @@ impl ApiOperationalServices {
         cluster_status: Arc<dyn klights_leader_api::LeaderClusterStatusMetadata>,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
         file_process: klights_supervisor::FileProcessExecutor,
-        signing_keys: Arc<dyn crate::auth::middleware::ServiceAccountSigningKeyProvider>,
+        signing_keys: Arc<dyn klights_auth::cluster_identity::ServiceAccountSigningKeyProvider>,
         authority: Option<Arc<dyn klights_leader_api::LeaderAuthority>>,
     ) -> Self {
         Self {
@@ -423,9 +425,9 @@ pub(crate) type RootApiRemoteNodeServices = (
 pub(crate) fn build_router_from_root(
     authorizer: Arc<dyn klights_auth::authorizer::Authorizer>,
     rbac_policy_store: Arc<dyn klights_auth::rbac_policy_store::RbacPolicyStore>,
-    bootstrap_token: Arc<dyn crate::auth::middleware::BootstrapTokenAuthenticator>,
-    oidc: Option<Arc<dyn crate::auth::oidc::OidcValidator>>,
-    webhook: Option<Arc<dyn crate::auth::webhook_auth::WebhookAuthenticator>>,
+    bootstrap_token: Arc<dyn klights_auth::cluster_identity::BootstrapTokenAuthenticator>,
+    oidc: Option<Arc<dyn klights_auth::oidc::OidcValidator>>,
+    webhook: Option<Arc<dyn klights_auth::webhook_auth::WebhookAuthenticator>>,
     cluster_ca_pem: Option<Arc<String>>,
     watch_stream: Arc<dyn crate::api::watch_stream::WatchStreamSource>,
     namespace_termination: Arc<dyn klights_reconcile_api::NamespaceLifecycleStore>,
@@ -469,7 +471,7 @@ pub(crate) fn build_router_from_root(
     clock: Arc<dyn klights_auth::clock::Clock>,
     cluster_status: Arc<dyn klights_leader_api::LeaderClusterStatusMetadata>,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    signing_keys: Arc<dyn crate::auth::middleware::ServiceAccountSigningKeyProvider>,
+    signing_keys: Arc<dyn klights_auth::cluster_identity::ServiceAccountSigningKeyProvider>,
     authority: Option<Arc<dyn klights_leader_api::LeaderAuthority>>,
 ) -> (axum::Router, crate::api::routes::NativeApiOuterLayers) {
     let role = match role {

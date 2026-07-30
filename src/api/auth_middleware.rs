@@ -12,12 +12,12 @@ use klights_types::TlsClientCertificate;
 
 use super::{ApiState, AppError};
 use crate::auth::middleware::{
-    AuthnRuntime, BoundTokenSubjectLookup, ServiceAccountSigningKeyProvider,
-    authenticate_forwarded_client_cert, authenticate_parts, client_cert_is_trusted_proxy,
-    resolve_request_identity,
+    AuthnRuntime, authenticate_forwarded_client_cert, authenticate_parts,
+    client_cert_is_trusted_proxy, resolve_request_identity,
 };
 use klights_auth::AuthenticatedIdentity;
 use klights_auth::clock::SnapshotClock;
+use klights_auth::cluster_identity::{BoundTokenSubjectLookup, ServiceAccountSigningKeyProvider};
 use klights_auth::impersonation::ImpersonationRequest;
 
 pub const FORWARDED_CLIENT_CERT_HEADER: &str = "x-remote-client-certificate";

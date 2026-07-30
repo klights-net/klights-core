@@ -4681,13 +4681,13 @@ async fn test_tokenreview_uses_webhook_authenticator_for_opaque_tokens() {
     struct StaticReviewer;
 
     #[async_trait::async_trait]
-    impl crate::auth::webhook_auth::WebhookTokenReviewer for StaticReviewer {
+    impl klights_auth::webhook_auth::WebhookTokenReviewer for StaticReviewer {
         async fn review_token(
             &self,
             token: &str,
             audiences: &[String],
         ) -> Result<
-            Option<crate::auth::webhook_auth::TokenReviewStatus>,
+            Option<klights_auth::webhook_auth::TokenReviewStatus>,
             klights_auth::AuthenticationError,
         > {
             assert_eq!(token, "opaque-tokenreview-token");
@@ -4698,9 +4698,9 @@ async fn test_tokenreview_uses_webhook_authenticator_for_opaque_tokens() {
                     "https://untrusted.example.test",
                 ]
             );
-            Ok(Some(crate::auth::webhook_auth::TokenReviewStatus {
+            Ok(Some(klights_auth::webhook_auth::TokenReviewStatus {
                 authenticated: true,
-                user: Some(crate::auth::webhook_auth::TokenReviewUser {
+                user: Some(klights_auth::webhook_auth::TokenReviewUser {
                     username: "webhook-tokenreview-user".to_string(),
                     uid: Some("webhook-tokenreview-uid".to_string()),
                     groups: vec!["webhook-group".to_string()],
@@ -4716,7 +4716,7 @@ async fn test_tokenreview_uses_webhook_authenticator_for_opaque_tokens() {
     }
 
     let mut state = build_test_app_state().await;
-    state.webhook_authenticator = Some(Arc::new(crate::auth::webhook_auth::WebhookAuth::new(
+    state.webhook_authenticator = Some(Arc::new(klights_auth::webhook_auth::WebhookAuth::new(
         Arc::new(StaticReviewer),
         Duration::from_secs(60),
         Duration::from_secs(10),
@@ -4793,7 +4793,7 @@ async fn test_tokenreview_omitted_audiences_validate_webhook_default_without_ech
     }
 
     #[async_trait::async_trait]
-    impl crate::auth::webhook_auth::WebhookAuthenticator for RecordingWebhook {
+    impl klights_auth::webhook_auth::WebhookAuthenticator for RecordingWebhook {
         async fn authenticate(
             &self,
             _token: &str,
@@ -4900,14 +4900,14 @@ async fn test_tokenreview_uses_oidc_authenticator_for_jwt_tokens() {
     struct StaticOidcValidator;
 
     #[async_trait::async_trait]
-    impl crate::auth::oidc::OidcValidator for StaticOidcValidator {
+    impl klights_auth::oidc::OidcValidator for StaticOidcValidator {
         async fn validate_token(
             &self,
             token: &str,
             _now: OffsetDateTime,
-        ) -> Result<crate::auth::oidc::OidcClaims, klights_auth::AuthenticationError> {
+        ) -> Result<klights_auth::oidc::OidcClaims, klights_auth::AuthenticationError> {
             assert_eq!(token, "header.payload.signature");
-            Ok(crate::auth::oidc::OidcClaims {
+            Ok(klights_auth::oidc::OidcClaims {
                 username: "oidc-tokenreview-user".to_string(),
                 groups: vec!["oidc-group".to_string()],
                 uid: Some("oidc-tokenreview-uid".to_string()),
@@ -5050,12 +5050,12 @@ async fn test_tokenreview_reports_signing_key_dependency_failure_in_status() {
 
     struct RejectingOidc;
     #[async_trait::async_trait]
-    impl crate::auth::oidc::OidcValidator for RejectingOidc {
+    impl klights_auth::oidc::OidcValidator for RejectingOidc {
         async fn validate_token(
             &self,
             _token: &str,
             _now: OffsetDateTime,
-        ) -> Result<crate::auth::oidc::OidcClaims, klights_auth::AuthenticationError> {
+        ) -> Result<klights_auth::oidc::OidcClaims, klights_auth::AuthenticationError> {
             Err(klights_auth::AuthenticationError::unauthenticated(
                 "not an OIDC token",
             ))
@@ -5063,7 +5063,7 @@ async fn test_tokenreview_reports_signing_key_dependency_failure_in_status() {
     }
     struct RejectingWebhook;
     #[async_trait::async_trait]
-    impl crate::auth::webhook_auth::WebhookAuthenticator for RejectingWebhook {
+    impl klights_auth::webhook_auth::WebhookAuthenticator for RejectingWebhook {
         async fn authenticate(
             &self,
             _token: &str,
@@ -5076,7 +5076,7 @@ async fn test_tokenreview_reports_signing_key_dependency_failure_in_status() {
     }
     struct MissingSigningKey;
     #[async_trait::async_trait]
-    impl crate::auth::middleware::ServiceAccountSigningKeyProvider for MissingSigningKey {
+    impl klights_auth::cluster_identity::ServiceAccountSigningKeyProvider for MissingSigningKey {
         async fn service_account_signing_key_pem(
             &self,
         ) -> Result<String, klights_auth::AuthenticationError> {
@@ -5194,7 +5194,7 @@ async fn test_tokenreview_reports_webhook_dependency_failure_in_status() {
 
     struct FailingWebhook;
     #[async_trait::async_trait]
-    impl crate::auth::webhook_auth::WebhookAuthenticator for FailingWebhook {
+    impl klights_auth::webhook_auth::WebhookAuthenticator for FailingWebhook {
         async fn authenticate(
             &self,
             _token: &str,
@@ -5228,12 +5228,12 @@ async fn test_tokenreview_reports_oidc_internal_failure_in_status() {
 
     struct FailingOidc;
     #[async_trait::async_trait]
-    impl crate::auth::oidc::OidcValidator for FailingOidc {
+    impl klights_auth::oidc::OidcValidator for FailingOidc {
         async fn validate_token(
             &self,
             _token: &str,
             _now: OffsetDateTime,
-        ) -> Result<crate::auth::oidc::OidcClaims, klights_auth::AuthenticationError> {
+        ) -> Result<klights_auth::oidc::OidcClaims, klights_auth::AuthenticationError> {
             Err(klights_auth::AuthenticationError::internal_failure(
                 "OIDC validator invariant failed",
             ))
@@ -5276,7 +5276,7 @@ async fn test_tokenreview_reports_bootstrap_store_failure_in_status() {
 
     struct FailingBootstrapStore;
     #[async_trait::async_trait]
-    impl crate::auth::middleware::BootstrapTokenAuthenticator for FailingBootstrapStore {
+    impl klights_auth::cluster_identity::BootstrapTokenAuthenticator for FailingBootstrapStore {
         async fn authenticate_bootstrap_token(
             &self,
             _token: &str,

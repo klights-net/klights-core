@@ -53,7 +53,7 @@ impl RootServiceAccountSigningKeyState {
 }
 
 #[async_trait::async_trait]
-impl crate::auth::middleware::ServiceAccountSigningKeyProvider
+impl klights_auth::cluster_identity::ServiceAccountSigningKeyProvider
     for RootServiceAccountSigningKeyState
 {
     async fn service_account_signing_key_pem(

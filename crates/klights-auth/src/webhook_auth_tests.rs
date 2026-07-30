@@ -6,22 +6,22 @@
 //! Wire format tests (TokenReview JSON round-trip) are in
 //! `src/auth/webhook_auth.rs` `#[cfg(test)] mod tests`.
 
-use crate::auth::webhook_auth::*;
-use klights_auth::AuthenticatedIdentity;
-use klights_auth::clock::{MonotonicClock, SystemMonotonicClock};
+use crate::clock::{MonotonicClock, SystemMonotonicClock};
+use crate::webhook_auth::*;
+use crate::{AuthenticatedIdentity, AuthenticationError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // ─── Mock implementation ───────────────────────────────────────────────────
 
 struct MockWebhookReviewer {
-    result: Result<Option<TokenReviewStatus>, klights_auth::AuthenticationError>,
+    result: Result<Option<TokenReviewStatus>, AuthenticationError>,
     call_count: std::sync::Mutex<usize>,
     seen_audiences: std::sync::Mutex<Vec<Vec<String>>>,
 }
 
 impl MockWebhookReviewer {
-    fn new(result: Result<Option<TokenReviewStatus>, klights_auth::AuthenticationError>) -> Self {
+    fn new(result: Result<Option<TokenReviewStatus>, AuthenticationError>) -> Self {
         Self {
             result,
             call_count: std::sync::Mutex::new(0),
@@ -67,7 +67,7 @@ impl WebhookTokenReviewer for MockWebhookReviewer {
         &self,
         _token: &str,
         audiences: &[String],
-    ) -> Result<Option<TokenReviewStatus>, klights_auth::AuthenticationError> {
+    ) -> Result<Option<TokenReviewStatus>, AuthenticationError> {
         *self.call_count.lock().unwrap() += 1;
         self.seen_audiences.lock().unwrap().push(audiences.to_vec());
         self.result.clone()
@@ -85,7 +85,7 @@ impl WebhookTokenReviewer for ClockAdvancingReviewer {
         &self,
         _token: &str,
         _audiences: &[String],
-    ) -> Result<Option<TokenReviewStatus>, klights_auth::AuthenticationError> {
+    ) -> Result<Option<TokenReviewStatus>, AuthenticationError> {
         *self.call_count.lock().unwrap() += 1;
         self.clock.advance(Duration::from_secs(59));
         Ok(Some(auth_status(test_user("slow-review"))))
@@ -93,7 +93,7 @@ impl WebhookTokenReviewer for ClockAdvancingReviewer {
 }
 
 fn reviewer_arc(
-    result: Result<Option<TokenReviewStatus>, klights_auth::AuthenticationError>,
+    result: Result<Option<TokenReviewStatus>, AuthenticationError>,
 ) -> Arc<MockWebhookReviewer> {
     Arc::new(MockWebhookReviewer::new(result))
 }
@@ -291,9 +291,7 @@ async fn test_cache_authorized_and_unauthorized_different_ttls() {
 
 #[tokio::test]
 async fn test_cache_transport_error_is_not_cached() {
-    let reviewer = reviewer_arc(Err(klights_auth::AuthenticationError::dependency_failure(
-        "timeout",
-    )));
+    let reviewer = reviewer_arc(Err(AuthenticationError::dependency_failure("timeout")));
     let auth = make_cached_auth(
         reviewer.clone(),
         Duration::from_secs(60),
@@ -386,7 +384,7 @@ async fn test_authenticate_no_status_returns_error() {
 
 #[tokio::test]
 async fn test_authenticate_webhook_error_returns_error() {
-    let reviewer = reviewer_arc(Err(klights_auth::AuthenticationError::dependency_failure(
+    let reviewer = reviewer_arc(Err(AuthenticationError::dependency_failure(
         "connection refused",
     )));
     let auth = make_cached_auth(reviewer, Duration::from_secs(60), Duration::from_secs(10));
@@ -557,17 +555,12 @@ async fn test_try_webhook_auth_unauthorized_returns_error() {
     let result = try_webhook_auth(Some(auth.as_ref()), "bad-token").await;
     assert!(result.is_some());
     let error = result.unwrap().expect_err("rejected token must fail");
-    assert!(matches!(
-        error,
-        klights_auth::AuthenticationError::Unauthenticated { .. }
-    ));
+    assert!(matches!(error, AuthenticationError::Unauthenticated { .. }));
 }
 
 #[tokio::test]
 async fn test_try_webhook_auth_request_error_returns_error() {
-    let reviewer = reviewer_arc(Err(klights_auth::AuthenticationError::dependency_failure(
-        "timeout",
-    )));
+    let reviewer = reviewer_arc(Err(AuthenticationError::dependency_failure("timeout")));
     let auth = Arc::new(make_cached_auth(
         reviewer,
         Duration::from_secs(60),
@@ -579,7 +572,7 @@ async fn test_try_webhook_auth_request_error_returns_error() {
     let error = result.unwrap().expect_err("transport failure must fail");
     assert!(matches!(
         error,
-        klights_auth::AuthenticationError::DependencyFailure { .. }
+        AuthenticationError::DependencyFailure { .. }
     ));
     assert!(error.to_string().contains("timeout"));
 }
