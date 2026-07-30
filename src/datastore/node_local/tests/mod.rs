@@ -5,11 +5,11 @@ use crate::datastore::node_local::{
     LegacyDeliveryTestStore as _, NodeLocalBackend, NodeLocalDb, NodeLocalHandle,
     OutboxFailureDisposition, OutboxInsert, SqliteNodeLocalDb, selector,
 };
-use crate::datastore::node_local::{
-    PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotClearResult,
-    PodSlotMutationResult,
+use klights_node_store::{
+    NodeIdentity, PodRuntimeAdmission, PodRuntimeStore, PodSlotAdmissionEvent,
+    PodSlotAdmissionEventSource, PodSlotAdmissionRequest, PodSlotAdmissionResult,
+    PodSlotAdmissionState, PodSlotAdmissionStore, PodSlotClearResult, PodSlotMutationResult,
 };
-use klights_node_store::NodeIdentity;
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
 fn pod_status_classification() -> klights_node_store::OutboxClassification {
@@ -825,15 +825,27 @@ async fn node_meta_mismatch_refuses_boot() {
 async fn pod_runtime_is_uid_keyed_and_same_name_replacements_are_distinct() {
     let db = open_node_local_in_memory().await;
 
-    db.admit_pod_runtime("uid-old", "default", "web", "worker-a")
-        .await
-        .expect("admit old uid");
-    db.admit_pod_runtime("uid-new", "default", "web", "worker-a")
-        .await
-        .expect("admit new uid");
+    db.admit_pod_runtime(
+        PodRuntimeAdmission::try_new(
+            klights_types::PodIdentity::new("default", "web", "uid-old"),
+            "worker-a",
+        )
+        .unwrap(),
+    )
+    .await
+    .expect("admit old uid");
+    db.admit_pod_runtime(
+        PodRuntimeAdmission::try_new(
+            klights_types::PodIdentity::new("default", "web", "uid-new"),
+            "worker-a",
+        )
+        .unwrap(),
+    )
+    .await
+    .expect("admit new uid");
 
     let rows = db.list_pod_runtime().await.expect("list runtime");
-    let uids: Vec<_> = rows.into_iter().map(|row| row.pod_uid).collect();
+    let uids: Vec<_> = rows.into_iter().map(|row| row.pod().uid.clone()).collect();
 
     assert_eq!(uids, vec!["uid-new".to_string(), "uid-old".to_string()]);
 }
@@ -841,73 +853,80 @@ async fn pod_runtime_is_uid_keyed_and_same_name_replacements_are_distinct() {
 #[tokio::test]
 async fn pod_slot_persistence_preserves_uid_cas_outcomes_and_monotonic_versions() {
     let db = open_node_local_in_memory().await;
-    let mut events = db.subscribe_pod_slot_admissions();
+    let mut events = db.subscribe();
+    let request = |uid: &str| {
+        PodSlotAdmissionRequest::try_new(
+            klights_types::PodIdentity::new("default", "web", uid),
+            "worker-a",
+        )
+        .unwrap()
+    };
 
-    let admitted = db
-        .pod_slot_try_admit("default", "web", "uid-old", "worker-a")
-        .await
-        .expect("admit old uid");
-    assert_eq!(
-        admitted,
-        PodSlotAdmissionResult::Admitted {
-            resource_version: 1
-        }
-    );
     assert!(matches!(
-        events.recv().await.expect("admit event"),
-        PodSlotAdmissionEvent::Changed {
-            pod_uid,
+        db.try_admit(request("uid-old"))
+            .await
+            .expect("admit old uid"),
+        PodSlotAdmissionResult::Admitted {
+            observed_pod_version
+        } if observed_pod_version.get() == 1
+    ));
+    assert!(matches!(
+        events.next_event().await.expect("admit event"),
+        Some(PodSlotAdmissionEvent::Changed {
+            pod,
             state: PodSlotAdmissionState::Admitted,
-            resource_version: 1,
+            observed_pod_version,
             ..
-        } if pod_uid == "uid-old"
+        }) if pod.uid == "uid-old" && observed_pod_version.get() == 1
     ));
 
-    assert_eq!(
-        db.pod_slot_try_admit("default", "web", "uid-new", "worker-a")
+    assert!(matches!(
+        db.try_admit(request("uid-new"))
             .await
             .expect("replacement must be blocked"),
         PodSlotAdmissionResult::Blocked {
-            blocking_uid: "uid-old".to_string(),
-            blocking_node: "worker-a".to_string(),
+            blocking_uid,
+            blocking_node,
             state: PodSlotAdmissionState::Admitted,
-            resource_version: 1,
-        }
-    );
-    assert_eq!(
-        db.pod_slot_mark_terminating("default", "web", "uid-old", "worker-a")
+            observed_pod_version,
+        } if blocking_uid == "uid-old"
+            && blocking_node == "worker-a"
+            && observed_pod_version.get() == 1
+    ));
+    assert!(matches!(
+        db.mark_terminating(request("uid-old"))
             .await
             .expect("mark old uid terminating"),
         PodSlotMutationResult::Changed {
-            resource_version: 2
-        }
-    );
+            observed_pod_version
+        } if observed_pod_version.get() == 2
+    ));
     assert!(matches!(
-        db.pod_slot_clear_if_uid("default", "web", "uid-new")
+        db.clear_if_uid(request("uid-new"))
             .await
             .expect("wrong uid is a typed no-op"),
         PodSlotClearResult::UidMismatch {
             blocking_uid,
-            resource_version: 2,
+            observed_pod_version,
             ..
-        } if blocking_uid == "uid-old"
+        } if blocking_uid == "uid-old" && observed_pod_version.get() == 2
     ));
-    assert_eq!(
-        db.pod_slot_clear_if_uid("default", "web", "uid-old")
+    assert!(matches!(
+        db.clear_if_uid(request("uid-old"))
             .await
             .expect("clear old uid"),
         PodSlotClearResult::Cleared {
-            resource_version: 3
-        }
-    );
-    assert_eq!(
-        db.pod_slot_try_admit("default", "web", "uid-new", "worker-a")
+            observed_pod_version
+        } if observed_pod_version.get() == 3
+    ));
+    assert!(matches!(
+        db.try_admit(request("uid-new"))
             .await
             .expect("admit replacement after clear"),
         PodSlotAdmissionResult::Admitted {
-            resource_version: 4
-        }
-    );
+            observed_pod_version
+        } if observed_pod_version.get() == 4
+    ));
 }
 
 #[tokio::test]

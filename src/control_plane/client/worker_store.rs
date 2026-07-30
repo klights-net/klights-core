@@ -3115,15 +3115,23 @@ mod tests {
         assert_eq!(pod.uid, "uid-1");
 
         node_local
-            .record_owned_sandbox("uid-1", "default", "web", "worker-a", "sandbox-1", 0)
+            .record_owned_sandbox(
+                klights_node_store::OwnedPodSandbox::try_new(
+                    klights_types::PodIdentity::new("default", "web", "uid-1"),
+                    "worker-a",
+                    "sandbox-1",
+                    0,
+                )
+                .unwrap(),
+            )
             .await
             .expect("record sandbox in node-local store");
         assert_eq!(
             node_local
-                .get_pod_runtime("uid-1")
+                .get_pod_runtime(klights_node_store::RuntimePodUid::try_new("uid-1").unwrap())
                 .await
                 .expect("read worker sandbox")
-                .and_then(|row| row.sandbox_id),
+                .and_then(|row| row.sandbox_id().map(str::to_string)),
             Some("sandbox-1".to_string())
         );
     }

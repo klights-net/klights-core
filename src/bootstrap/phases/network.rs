@@ -101,7 +101,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
             network_topology.clone(),
             node_network.clone(),
             node_network.clone(),
-            node_network.clone(),
+            node_local.clone(),
             assignment_publisher,
         ),
         shutdown_token.clone(),
@@ -320,7 +320,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         cni_readiness,
         dataplane_health: network_boot.health().clone(),
         pod_network_cache: node_network.clone(),
-        pod_runtime_store: node_network.clone(),
+        pod_runtime_store: node_local,
         pod_endpoint_store: node_network,
         assignment_waiter,
     })

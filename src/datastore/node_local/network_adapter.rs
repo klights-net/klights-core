@@ -1,12 +1,10 @@
 use std::sync::Arc;
 
 use klights_node_store::{
-    CacheNetworkFuture, EndpointDeleteOutcome, EndpointUpsertOutcome, NodeKey, OwnedPodSandbox,
-    PodEndpointRecord, PodEndpointStore, PodEndpointStoreEventSource, PodEndpointStoreEventStream,
-    PodIpamStore, PodNetworkAllocation, PodNetworkAllocationRequest, PodNetworkAssignmentSnapshot,
-    PodNetworkCache, PodNetworkEndpoint, PodRuntimeAdmission, PodRuntimeCgroup, PodRuntimeRecord,
-    PodRuntimeStore, PodUidKey, RuntimeNamespace, RuntimePodUid, RuntimeWorkError,
-    RuntimeWorkFuture, SandboxKey,
+    CacheNetworkFuture, EndpointDeleteOutcome, EndpointUpsertOutcome, NodeKey, PodEndpointRecord,
+    PodEndpointStore, PodEndpointStoreEventSource, PodEndpointStoreEventStream, PodIpamStore,
+    PodNetworkAllocation, PodNetworkAllocationRequest, PodNetworkAssignmentSnapshot,
+    PodNetworkCache, PodNetworkEndpoint, PodUidKey, SandboxKey,
 };
 
 use super::NodeLocalHandle;
@@ -21,22 +19,6 @@ impl NodeLocalNetworkAdapter {
     pub(crate) fn new(backend: NodeLocalHandle) -> Arc<Self> {
         Arc::new(Self { backend })
     }
-}
-
-fn runtime_error(error: anyhow::Error) -> RuntimeWorkError {
-    RuntimeWorkError::persistence_failed(error.to_string())
-}
-
-fn runtime_record(row: super::PodRuntimeRow) -> Result<PodRuntimeRecord, RuntimeWorkError> {
-    PodRuntimeRecord::try_new(
-        klights_types::PodIdentity::new(&row.namespace, &row.pod_name, &row.pod_uid),
-        row.node_name,
-        row.sandbox_id,
-        row.cgroup_path,
-        row.created_ms,
-        row.started_ms,
-    )
-    .map_err(|error| RuntimeWorkError::corrupt_data(error.to_string()))
 }
 
 impl PodNetworkCache for NodeLocalNetworkAdapter {
@@ -136,109 +118,55 @@ impl PodEndpointStoreEventSource for NodeLocalNetworkAdapter {
     }
 }
 
-impl PodRuntimeStore for NodeLocalNetworkAdapter {
-    fn admit_pod_runtime(&self, admission: PodRuntimeAdmission) -> RuntimeWorkFuture<'_, ()> {
-        Box::pin(async move {
-            let (pod, node_name) = admission.into_parts();
-            self.backend
-                .admit_pod_runtime(&pod.uid, &pod.namespace, &pod.name, &node_name)
-                .await
-                .map_err(runtime_error)
-        })
+#[cfg(test)]
+impl klights_node_store::PodRuntimeStore for NodeLocalNetworkAdapter {
+    fn admit_pod_runtime(
+        &self,
+        admission: klights_node_store::PodRuntimeAdmission,
+    ) -> klights_node_store::RuntimeWorkFuture<'_, ()> {
+        self.backend.admit_pod_runtime(admission)
     }
 
-    fn record_owned_sandbox(&self, sandbox: OwnedPodSandbox) -> RuntimeWorkFuture<'_, ()> {
-        Box::pin(async move {
-            let (pod, node_name, sandbox_id, created_ms) = sandbox.into_parts();
-            self.backend
-                .record_owned_sandbox(
-                    &pod.uid,
-                    &pod.namespace,
-                    &pod.name,
-                    &node_name,
-                    &sandbox_id,
-                    created_ms,
-                )
-                .await
-                .map_err(|error| match error {
-                    super::PodRuntimeOwnershipError::Conflict {
-                        pod_uid,
-                        existing_namespace,
-                        existing_pod_name,
-                        existing_node_name,
-                        existing_sandbox_id,
-                    } => RuntimeWorkError::ownership_conflict(
-                        pod_uid,
-                        existing_namespace,
-                        existing_pod_name,
-                        existing_node_name,
-                        existing_sandbox_id,
-                    ),
-                    super::PodRuntimeOwnershipError::Persistence { message } => {
-                        RuntimeWorkError::persistence_failed(message)
-                    }
-                })
-        })
+    fn record_owned_sandbox(
+        &self,
+        sandbox: klights_node_store::OwnedPodSandbox,
+    ) -> klights_node_store::RuntimeWorkFuture<'_, ()> {
+        self.backend.record_owned_sandbox(sandbox)
     }
 
-    fn record_cgroup(&self, cgroup: PodRuntimeCgroup) -> RuntimeWorkFuture<'_, ()> {
-        Box::pin(async move {
-            let (pod_uid, cgroup_path) = cgroup.into_parts();
-            self.backend
-                .record_cgroup(&pod_uid, &cgroup_path)
-                .await
-                .map_err(runtime_error)
-        })
+    fn record_cgroup(
+        &self,
+        cgroup: klights_node_store::PodRuntimeCgroup,
+    ) -> klights_node_store::RuntimeWorkFuture<'_, ()> {
+        self.backend.record_cgroup(cgroup)
     }
 
-    fn delete_pod_runtime_for_uid(&self, pod_uid: RuntimePodUid) -> RuntimeWorkFuture<'_, ()> {
-        Box::pin(async move {
-            self.backend
-                .delete_pod_runtime_for_uid(pod_uid.as_str())
-                .await
-                .map_err(runtime_error)
-        })
+    fn delete_pod_runtime_for_uid(
+        &self,
+        pod_uid: klights_node_store::RuntimePodUid,
+    ) -> klights_node_store::RuntimeWorkFuture<'_, ()> {
+        self.backend.delete_pod_runtime_for_uid(pod_uid)
     }
 
     fn get_pod_runtime(
         &self,
-        pod_uid: RuntimePodUid,
-    ) -> RuntimeWorkFuture<'_, Option<PodRuntimeRecord>> {
-        Box::pin(async move {
-            self.backend
-                .get_pod_runtime(pod_uid.as_str())
-                .await
-                .map_err(runtime_error)?
-                .map(runtime_record)
-                .transpose()
-        })
+        pod_uid: klights_node_store::RuntimePodUid,
+    ) -> klights_node_store::RuntimeWorkFuture<'_, Option<klights_node_store::PodRuntimeRecord>>
+    {
+        self.backend.get_pod_runtime(pod_uid)
     }
 
-    fn list_pod_runtime(&self) -> RuntimeWorkFuture<'_, Vec<PodRuntimeRecord>> {
-        Box::pin(async move {
-            self.backend
-                .list_pod_runtime()
-                .await
-                .map_err(runtime_error)?
-                .into_iter()
-                .map(runtime_record)
-                .collect()
-        })
+    fn list_pod_runtime(
+        &self,
+    ) -> klights_node_store::RuntimeWorkFuture<'_, Vec<klights_node_store::PodRuntimeRecord>> {
+        self.backend.list_pod_runtime()
     }
 
     fn list_pod_runtime_by_namespace(
         &self,
-        namespace: RuntimeNamespace,
-    ) -> RuntimeWorkFuture<'_, Vec<PodRuntimeRecord>> {
-        Box::pin(async move {
-            self.backend
-                .list_pod_runtime_by_namespace(namespace.as_str())
-                .await
-                .map_err(runtime_error)?
-                .into_iter()
-                .map(runtime_record)
-                .collect()
-        })
+        namespace: klights_node_store::RuntimeNamespace,
+    ) -> klights_node_store::RuntimeWorkFuture<'_, Vec<klights_node_store::PodRuntimeRecord>> {
+        self.backend.list_pod_runtime_by_namespace(namespace)
     }
 }
 
@@ -246,8 +174,7 @@ impl PodRuntimeStore for NodeLocalNetworkAdapter {
 mod tests {
     use klights_node_store::{
         CacheNetworkError, OwnedPodSandbox, PodIpamStore, PodNetworkAllocationRequest,
-        PodNetworkCache, PodRuntimeRecord, PodRuntimeStore, PodUidKey, RuntimePodUid,
-        RuntimeWorkError, SandboxKey,
+        PodNetworkCache, PodRuntimeRecord, PodUidKey, RuntimePodUid, RuntimeWorkError, SandboxKey,
     };
 
     use super::NodeLocalNetworkAdapter;
@@ -266,14 +193,15 @@ mod tests {
         )
         .await
         .unwrap();
+        let runtime = backend.clone();
         let adapter = NodeLocalNetworkAdapter::new(backend);
         let pod = klights_types::PodIdentity::new("default", "pod-a", "uid-a");
-        adapter
-            .record_owned_sandbox(
-                OwnedPodSandbox::try_new(pod.clone(), "node-a", "sandbox-a", 123).unwrap(),
-            )
-            .await
-            .unwrap();
+        klights_node_store::PodRuntimeStore::record_owned_sandbox(
+            runtime.as_ref(),
+            OwnedPodSandbox::try_new(pod.clone(), "node-a", "sandbox-a", 123).unwrap(),
+        )
+        .await
+        .unwrap();
 
         let allocation = adapter
             .reserve_ip_and_insert_network(
@@ -303,7 +231,9 @@ mod tests {
             .unwrap();
         assert_eq!(by_sandbox, by_uid);
         assert_eq!(by_uid.veth_host(), "veth-a");
-        let runtime_rows = adapter.list_pod_runtime().await.unwrap();
+        let runtime_rows = klights_node_store::PodRuntimeStore::list_pod_runtime(runtime.as_ref())
+            .await
+            .unwrap();
         assert_eq!(
             runtime_rows.first().and_then(|record| record.sandbox_id()),
             Some("sandbox-a")
@@ -316,12 +246,14 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_owned_sandbox_records_preserve_one_immutable_winner() {
-        let adapter = adapter_for_identity_test("sqlite:owned-sandbox-cas-test").await;
+        let runtime = runtime_store_for_identity_test("sqlite:owned-sandbox-cas-test").await;
         let pod = klights_types::PodIdentity::new("default", "pod-cas", "uid-cas");
-        let first = adapter.record_owned_sandbox(
+        let first = klights_node_store::PodRuntimeStore::record_owned_sandbox(
+            runtime.as_ref(),
             OwnedPodSandbox::try_new(pod.clone(), "node-a", "sandbox-a", 101).unwrap(),
         );
-        let second = adapter.record_owned_sandbox(
+        let second = klights_node_store::PodRuntimeStore::record_owned_sandbox(
+            runtime.as_ref(),
             OwnedPodSandbox::try_new(pod, "node-a", "sandbox-b", 102).unwrap(),
         );
         let (first, second) = tokio::join!(first, second);
@@ -340,24 +272,26 @@ mod tests {
                 ..
             } if pod_uid == "uid-cas"
         ));
-        let persisted = adapter
-            .get_pod_runtime(RuntimePodUid::try_new("uid-cas").unwrap())
-            .await
-            .unwrap()
-            .unwrap();
+        let persisted = klights_node_store::PodRuntimeStore::get_pod_runtime(
+            runtime.as_ref(),
+            RuntimePodUid::try_new("uid-cas").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(matches!(
             persisted.sandbox_id(),
             Some("sandbox-a" | "sandbox-b")
         ));
     }
 
-    async fn adapter_for_identity_test(
+    async fn runtime_store_for_identity_test(
         diagnostic_name: &'static str,
-    ) -> std::sync::Arc<NodeLocalNetworkAdapter> {
+    ) -> crate::datastore::node_local::NodeLocalHandle {
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let backend = crate::datastore::node_local::selector::open_node_local(
+        crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -365,8 +299,7 @@ mod tests {
             diagnostic_name,
         )
         .await
-        .unwrap();
-        NodeLocalNetworkAdapter::new(backend)
+        .unwrap()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -481,7 +414,8 @@ mod tests {
 
     #[tokio::test]
     async fn real_adapter_preserves_typed_exhaustion_and_exact_allocation_identity() {
-        let adapter = adapter_for_identity_test("sqlite:focused-network-identity").await;
+        let backend = runtime_store_for_identity_test("sqlite:focused-network-identity").await;
+        let adapter = NodeLocalNetworkAdapter::new(backend);
         let base = u32::from(std::net::Ipv4Addr::new(10, 42, 90, 0));
         let original = allocation_request(
             "sandbox-a",
@@ -606,7 +540,8 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_conflicting_reservations_cannot_accept_or_delete_the_winner() {
-        let adapter = adapter_for_identity_test("sqlite:focused-network-race").await;
+        let backend = runtime_store_for_identity_test("sqlite:focused-network-race").await;
+        let adapter = NodeLocalNetworkAdapter::new(backend);
         let base = u32::from(std::net::Ipv4Addr::new(10, 42, 92, 0));
         let request_a = allocation_request(
             "sandbox-race",

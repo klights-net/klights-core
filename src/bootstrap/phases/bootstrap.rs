@@ -555,8 +555,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             )),
         )
     };
-    let pod_slot_adapter =
-        crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(node_local.clone());
+    let pod_slot_store: Arc<dyn klights_node_store::PodSlotAdmissionStore> = node_local.clone();
+    let pod_slot_events: Arc<dyn klights_node_store::PodSlotAdmissionEventSource> =
+        node_local.clone();
     let kubelet_file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
     let registration_profile =
         crate::bootstrap::node_registration_profile::build(node_mode, &cli.role);
@@ -616,8 +617,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             wall_clock: Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
             slot_admission: Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
-                    pod_slot_adapter.clone(),
-                    pod_slot_adapter,
+                    pod_slot_store,
+                    pod_slot_events,
                     config.node_name.clone(),
                 ),
             ),

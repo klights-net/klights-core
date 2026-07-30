@@ -1,23 +1,18 @@
-use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::Value;
 
-use super::types::{
-    PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotClearResult, PodSlotMutationResult,
-    PodWorkqueueEntry, PodWorkqueueKind,
-};
+use super::SqliteNodeLocalDb;
 use klights_node_store::{
     CacheNetworkFuture, DeadLetterStore, EndpointDeleteOutcome, EndpointUpsertOutcome,
     NodeIdentity, NodeKey, OutboxDispatcherStore, OutboxProducerStore, OutboxStatusStampStore,
     PodEndpointRecord, PodEndpointStore, PodEndpointStoreEventSource, PodEndpointStoreEventStream,
     PodIpamStore, PodNetworkAllocation,
     PodNetworkAllocationRequest as StorePodNetworkAllocationRequest, PodNetworkAssignmentSnapshot,
-    PodNetworkCache, PodNetworkEndpoint as StorePodNetworkEndpoint, PodStatusCheckpointStore,
-    PodUidKey, ReplicationCheckpointStore, RuntimeObservationCheckpointStore, SandboxKey,
+    PodNetworkCache, PodNetworkEndpoint as StorePodNetworkEndpoint, PodRuntimeStore,
+    PodSlotAdmissionEventSource, PodSlotAdmissionStore, PodStatusCheckpointStore, PodUidKey,
+    PodWorkqueueStore, ProbeStateStore, ReplicationCheckpointStore,
+    RuntimeObservationCheckpointStore, SandboxKey,
 };
 use klights_types::PodIdentity;
-
-use super::{PodRuntimeRow, ProbeStateRow, SqliteNodeLocalDb};
 
 #[async_trait]
 pub trait NodeLocalBackend:
@@ -33,82 +28,81 @@ pub trait NodeLocalBackend:
     + PodIpamStore
     + PodEndpointStore
     + PodEndpointStoreEventSource
+    + PodRuntimeStore
+    + ProbeStateStore
+    + PodWorkqueueStore
+    + PodSlotAdmissionStore
+    + PodSlotAdmissionEventSource
     + Send
     + Sync
 {
-    fn subscribe_pod_slot_admissions(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<PodSlotAdmissionEvent>;
-    async fn pod_slot_try_admit(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        node_name: &str,
-    ) -> Result<PodSlotAdmissionResult>;
-    async fn pod_slot_mark_terminating(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        node_name: &str,
-    ) -> Result<PodSlotMutationResult>;
-    async fn pod_slot_clear_if_uid(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-    ) -> Result<PodSlotClearResult>;
-
-    async fn admit_pod_runtime(
-        &self,
-        pod_uid: &str,
-        namespace: &str,
-        pod_name: &str,
-        node_name: &str,
-    ) -> Result<()>;
-    async fn record_owned_sandbox(
-        &self,
-        pod_uid: &str,
-        namespace: &str,
-        pod_name: &str,
-        node_name: &str,
-        sandbox_id: &str,
-        created_ms: i64,
-    ) -> std::result::Result<(), super::PodRuntimeOwnershipError>;
-    async fn record_cgroup(&self, pod_uid: &str, cgroup_path: &str) -> Result<()>;
-    async fn delete_pod_runtime_for_uid(&self, pod_uid: &str) -> Result<()>;
-    async fn get_pod_runtime(&self, pod_uid: &str) -> Result<Option<PodRuntimeRow>>;
-    async fn list_pod_runtime(&self) -> Result<Vec<PodRuntimeRow>>;
-    async fn list_pod_runtime_by_namespace(&self, namespace: &str) -> Result<Vec<PodRuntimeRow>>;
-
+    #[cfg(test)]
     async fn enqueue_workqueue(
         &self,
-        kind: PodWorkqueueKind,
+        kind: super::PodWorkqueueKind,
         pod: &PodIdentity,
-        payload: Value,
+        payload: serde_json::Value,
         attempt_count: i64,
         min_delay_ms: i64,
         last_error: Option<&str>,
-    ) -> Result<()>;
-    async fn peek_workqueue_next_due(&self) -> Result<Option<i64>>;
-    async fn claim_workqueue_due(&self, now_ms: i64) -> Result<Option<PodWorkqueueEntry>>;
-    async fn complete_workqueue(&self, id: i64) -> Result<()>;
+    ) -> anyhow::Result<()> {
+        let identity = match kind {
+            super::PodWorkqueueKind::Pod => {
+                klights_node_store::PodWorkIdentity::try_pod(pod.clone())?
+            }
+            super::PodWorkqueueKind::Namespace => {
+                klights_node_store::PodWorkIdentity::try_namespace(&pod.name, &pod.uid)?
+            }
+        };
+        let entry = klights_node_store::PodWorkqueueEnqueue::try_new(
+            identity,
+            serde_json::to_vec(&payload)?,
+            attempt_count,
+            min_delay_ms,
+            last_error.map(str::to_string),
+        )?;
+        self.enqueue_work(entry).await.map_err(anyhow::Error::from)
+    }
 
-    async fn record_probe_result(
+    #[cfg(test)]
+    async fn peek_workqueue_next_due(&self) -> anyhow::Result<Option<i64>> {
+        self.peek_next_due_ms().await.map_err(anyhow::Error::from)
+    }
+
+    #[cfg(test)]
+    async fn claim_workqueue_due(
         &self,
-        pod_uid: &str,
-        container_name: &str,
-        probe_kind: &str,
-        success: bool,
-        ts_ms: i64,
-    ) -> Result<()>;
-    async fn get_probe_state(
-        &self,
-        pod_uid: &str,
-        container_name: &str,
-        probe_kind: &str,
-    ) -> Result<Option<ProbeStateRow>>;
+        now_ms: i64,
+    ) -> anyhow::Result<Option<super::PodWorkqueueEntry>> {
+        let row = self
+            .claim_due_work(klights_node_store::DueTimeMs::try_new(now_ms)?)
+            .await?;
+        row.map(|row| {
+            let (id, identity, payload, attempt_count, next_due_ms) = row.into_parts();
+            let (kind, pod) = identity.into_persisted();
+            Ok(super::PodWorkqueueEntry {
+                id: id.get(),
+                kind: match kind {
+                    klights_node_store::PodWorkqueueKind::Pod => super::PodWorkqueueKind::Pod,
+                    klights_node_store::PodWorkqueueKind::Namespace => {
+                        super::PodWorkqueueKind::Namespace
+                    }
+                },
+                namespace: pod.namespace,
+                name: pod.name,
+                uid: pod.uid,
+                payload: serde_json::from_slice(&payload)?,
+                attempt_count,
+                next_attempt_at_ms: next_due_ms.get(),
+            })
+        })
+        .transpose()
+    }
+
+    #[cfg(test)]
+    async fn complete_workqueue(&self, _id: i64) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 impl PodNetworkCache for SqliteNodeLocalDb {
@@ -212,146 +206,4 @@ impl PodEndpointStoreEventSource for SqliteNodeLocalDb {
 }
 
 #[async_trait]
-impl NodeLocalBackend for SqliteNodeLocalDb {
-    fn subscribe_pod_slot_admissions(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<PodSlotAdmissionEvent> {
-        SqliteNodeLocalDb::subscribe_pod_slot_admissions(self)
-    }
-
-    async fn pod_slot_try_admit(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        node_name: &str,
-    ) -> Result<PodSlotAdmissionResult> {
-        SqliteNodeLocalDb::pod_slot_try_admit(self, namespace, pod_name, pod_uid, node_name).await
-    }
-
-    async fn pod_slot_mark_terminating(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        node_name: &str,
-    ) -> Result<PodSlotMutationResult> {
-        SqliteNodeLocalDb::pod_slot_mark_terminating(self, namespace, pod_name, pod_uid, node_name)
-            .await
-    }
-
-    async fn pod_slot_clear_if_uid(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-    ) -> Result<PodSlotClearResult> {
-        SqliteNodeLocalDb::pod_slot_clear_if_uid(self, namespace, pod_name, pod_uid).await
-    }
-
-    async fn admit_pod_runtime(
-        &self,
-        pod_uid: &str,
-        namespace: &str,
-        pod_name: &str,
-        node_name: &str,
-    ) -> Result<()> {
-        SqliteNodeLocalDb::admit_pod_runtime(self, pod_uid, namespace, pod_name, node_name).await
-    }
-
-    async fn record_owned_sandbox(
-        &self,
-        pod_uid: &str,
-        namespace: &str,
-        pod_name: &str,
-        node_name: &str,
-        sandbox_id: &str,
-        created_ms: i64,
-    ) -> std::result::Result<(), super::PodRuntimeOwnershipError> {
-        SqliteNodeLocalDb::record_owned_sandbox(
-            self, pod_uid, namespace, pod_name, node_name, sandbox_id, created_ms,
-        )
-        .await
-    }
-
-    async fn record_cgroup(&self, pod_uid: &str, cgroup_path: &str) -> Result<()> {
-        SqliteNodeLocalDb::record_cgroup(self, pod_uid, cgroup_path).await
-    }
-
-    async fn delete_pod_runtime_for_uid(&self, pod_uid: &str) -> Result<()> {
-        SqliteNodeLocalDb::delete_pod_runtime_for_uid(self, pod_uid).await
-    }
-
-    async fn get_pod_runtime(&self, pod_uid: &str) -> Result<Option<PodRuntimeRow>> {
-        SqliteNodeLocalDb::get_pod_runtime(self, pod_uid).await
-    }
-
-    async fn list_pod_runtime(&self) -> Result<Vec<PodRuntimeRow>> {
-        SqliteNodeLocalDb::list_pod_runtime(self).await
-    }
-
-    async fn list_pod_runtime_by_namespace(&self, namespace: &str) -> Result<Vec<PodRuntimeRow>> {
-        SqliteNodeLocalDb::list_pod_runtime_by_namespace(self, namespace).await
-    }
-
-    async fn enqueue_workqueue(
-        &self,
-        kind: PodWorkqueueKind,
-        pod: &PodIdentity,
-        payload: Value,
-        attempt_count: i64,
-        min_delay_ms: i64,
-        last_error: Option<&str>,
-    ) -> Result<()> {
-        SqliteNodeLocalDb::enqueue_workqueue(
-            self,
-            kind,
-            pod,
-            payload,
-            attempt_count,
-            min_delay_ms,
-            last_error,
-        )
-        .await
-    }
-
-    async fn peek_workqueue_next_due(&self) -> Result<Option<i64>> {
-        SqliteNodeLocalDb::peek_workqueue_next_due(self).await
-    }
-
-    async fn claim_workqueue_due(&self, now_ms: i64) -> Result<Option<PodWorkqueueEntry>> {
-        SqliteNodeLocalDb::claim_workqueue_due(self, now_ms).await
-    }
-
-    async fn complete_workqueue(&self, id: i64) -> Result<()> {
-        SqliteNodeLocalDb::complete_workqueue(self, id).await
-    }
-
-    async fn record_probe_result(
-        &self,
-        pod_uid: &str,
-        container_name: &str,
-        probe_kind: &str,
-        success: bool,
-        ts_ms: i64,
-    ) -> Result<()> {
-        SqliteNodeLocalDb::record_probe_result(
-            self,
-            pod_uid,
-            container_name,
-            probe_kind,
-            success,
-            ts_ms,
-        )
-        .await
-    }
-
-    async fn get_probe_state(
-        &self,
-        pod_uid: &str,
-        container_name: &str,
-        probe_kind: &str,
-    ) -> Result<Option<ProbeStateRow>> {
-        SqliteNodeLocalDb::get_probe_state(self, pod_uid, container_name, probe_kind).await
-    }
-}
+impl NodeLocalBackend for SqliteNodeLocalDb {}

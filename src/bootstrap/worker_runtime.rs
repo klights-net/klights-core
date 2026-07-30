@@ -478,8 +478,10 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         leader_ports.projected_tokens.clone(),
         outbox.clone(),
     );
-    let pod_slot_adapter =
-        crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(node_local.clone());
+    let pod_slot_store: std::sync::Arc<dyn klights_node_store::PodSlotAdmissionStore> =
+        node_local.clone();
+    let pod_slot_events: std::sync::Arc<dyn klights_node_store::PodSlotAdmissionEventSource> =
+        node_local.clone();
     let pod_subsystem = crate::kubelet::pod_subsystem::PodSubsystem::new(
         crate::kubelet::pod_subsystem::PodSubsystemConfig {
             repository_parts: pod_repository_parts,
@@ -518,8 +520,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             ),
             slot_admission: std::sync::Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
-                    pod_slot_adapter.clone(),
-                    pod_slot_adapter,
+                    pod_slot_store,
+                    pod_slot_events,
                     config.node_name.clone(),
                 ),
             ),

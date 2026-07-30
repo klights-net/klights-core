@@ -113,9 +113,12 @@ pub(crate) struct RootPodRepositoryParts {
 
 #[derive(Clone)]
 struct RootPodWorkqueuePersistence {
-    node_local: Option<crate::datastore::node_local::NodeLocalHandle>,
+    node_local: Option<Arc<dyn klights_node_store::PodWorkqueueStore>>,
+    #[cfg(test)]
     wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    #[cfg(test)]
     test_rows: Arc<std::sync::Mutex<Vec<crate::datastore::node_local::PodWorkqueueEntry>>>,
+    #[cfg(test)]
     test_next_id: Arc<std::sync::atomic::AtomicI64>,
 }
 
@@ -691,52 +694,42 @@ impl crate::kubelet::pod_repository::store::PodPersistence for RootPodPersistenc
 
 fn legacy_workqueue_kind(
     kind: crate::kubelet::pod_repository::workqueue::PodWorkqueueKind,
-) -> crate::datastore::node_local::PodWorkqueueKind {
+) -> klights_node_store::PodWorkqueueKind {
     match kind {
         crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Pod => {
-            crate::datastore::node_local::PodWorkqueueKind::Pod
+            klights_node_store::PodWorkqueueKind::Pod
         }
         crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Namespace => {
-            crate::datastore::node_local::PodWorkqueueKind::Namespace
+            klights_node_store::PodWorkqueueKind::Namespace
         }
     }
 }
 
 fn focused_workqueue_entry(
-    row: crate::datastore::node_local::PodWorkqueueEntry,
-) -> crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry {
-    crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry {
-        id: row.id,
-        kind: match row.kind {
-            crate::datastore::node_local::PodWorkqueueKind::Pod => {
-                crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Pod
-            }
-            crate::datastore::node_local::PodWorkqueueKind::Namespace => {
-                crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Namespace
-            }
+    row: klights_node_store::PodWorkqueueEntry,
+) -> anyhow::Result<crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry> {
+    let (id, identity, payload, attempt_count, _next_due_ms) = row.into_parts();
+    let (kind, pod) = identity.into_persisted();
+    Ok(
+        crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry {
+            id: id.get(),
+            kind: match kind {
+                klights_node_store::PodWorkqueueKind::Pod => {
+                    crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Pod
+                }
+                klights_node_store::PodWorkqueueKind::Namespace => {
+                    crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Namespace
+                }
+            },
+            namespace: pod.namespace,
+            name: pod.name,
+            uid: pod.uid,
+            payload: serde_json::from_slice(&payload)?,
+            attempt_count,
+            #[cfg(test)]
+            next_attempt_at_ms: _next_due_ms.get(),
         },
-        namespace: row.namespace,
-        name: row.name,
-        uid: row.uid,
-        payload: row.payload,
-        attempt_count: row.attempt_count,
-        next_attempt_at_ms: row.next_attempt_at_ms,
-    }
-}
-
-fn legacy_workqueue_entry(
-    row: crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry,
-) -> crate::datastore::node_local::PodWorkqueueEntry {
-    crate::datastore::node_local::PodWorkqueueEntry {
-        id: row.id,
-        kind: legacy_workqueue_kind(row.kind),
-        namespace: row.namespace,
-        name: row.name,
-        uid: row.uid,
-        payload: row.payload,
-        attempt_count: row.attempt_count,
-        next_attempt_at_ms: row.next_attempt_at_ms,
-    }
+    )
 }
 
 #[async_trait::async_trait]
@@ -753,49 +746,82 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
         last_error: Option<&str>,
     ) -> anyhow::Result<()> {
         if let Some(node_local) = &self.node_local {
+            let identity = match legacy_workqueue_kind(kind) {
+                klights_node_store::PodWorkqueueKind::Pod => {
+                    klights_node_store::PodWorkIdentity::try_pod(pod.clone())?
+                }
+                klights_node_store::PodWorkqueueKind::Namespace => {
+                    klights_node_store::PodWorkIdentity::try_namespace(&pod.name, &pod.uid)?
+                }
+            };
+            let entry = klights_node_store::PodWorkqueueEnqueue::try_new(
+                identity,
+                serde_json::to_vec(&payload)?,
+                attempt_count,
+                min_delay_ms,
+                last_error.map(str::to_string),
+            )?;
             return node_local
-                .enqueue_workqueue(
-                    legacy_workqueue_kind(kind),
-                    pod,
+                .enqueue_work(entry)
+                .await
+                .map_err(anyhow::Error::from);
+        }
+        #[cfg(not(test))]
+        return Err(anyhow::anyhow!(
+            "production Pod workqueue persistence requires node-local storage"
+        ));
+        #[cfg(test)]
+        {
+            let id = self
+                .test_next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let now_ms = self.wall_clock.now_ms();
+            self.test_rows
+                .lock()
+                .unwrap()
+                .push(crate::datastore::node_local::PodWorkqueueEntry {
+                    id,
+                    kind: match legacy_workqueue_kind(kind) {
+                        klights_node_store::PodWorkqueueKind::Pod => {
+                            crate::datastore::node_local::PodWorkqueueKind::Pod
+                        }
+                        klights_node_store::PodWorkqueueKind::Namespace => {
+                            crate::datastore::node_local::PodWorkqueueKind::Namespace
+                        }
+                    },
+                    namespace: pod.namespace.clone(),
+                    name: pod.name.clone(),
+                    uid: pod.uid.clone(),
                     payload,
                     attempt_count,
-                    min_delay_ms,
-                    last_error,
-                )
-                .await;
+                    next_attempt_at_ms: now_ms.saturating_add(min_delay_ms),
+                });
+            let _ = last_error;
+            Ok(())
         }
-        let id = self
-            .test_next_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let now_ms = self.wall_clock.now_ms();
-        self.test_rows
-            .lock()
-            .unwrap()
-            .push(crate::datastore::node_local::PodWorkqueueEntry {
-                id,
-                kind: legacy_workqueue_kind(kind),
-                namespace: pod.namespace.clone(),
-                name: pod.name.clone(),
-                uid: pod.uid.clone(),
-                payload,
-                attempt_count,
-                next_attempt_at_ms: now_ms.saturating_add(min_delay_ms),
-            });
-        let _ = last_error;
-        Ok(())
     }
 
     async fn peek_next_due(&self) -> anyhow::Result<Option<i64>> {
         if let Some(node_local) = &self.node_local {
-            return node_local.peek_workqueue_next_due().await;
+            return node_local
+                .peek_next_due_ms()
+                .await
+                .map_err(anyhow::Error::from);
         }
-        Ok(self
-            .test_rows
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|row| row.next_attempt_at_ms)
-            .min())
+        #[cfg(not(test))]
+        return Err(anyhow::anyhow!(
+            "production Pod workqueue persistence requires node-local storage"
+        ));
+        #[cfg(test)]
+        {
+            Ok(self
+                .test_rows
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|row| row.next_attempt_at_ms)
+                .min())
+        }
     }
 
     async fn claim_due(
@@ -803,27 +829,63 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
         now_ms: i64,
     ) -> anyhow::Result<Option<crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry>> {
         if let Some(node_local) = &self.node_local {
-            return Ok(node_local
-                .claim_workqueue_due(now_ms)
+            return node_local
+                .claim_due_work(klights_node_store::DueTimeMs::try_new(now_ms)?)
                 .await?
-                .map(focused_workqueue_entry));
+                .map(focused_workqueue_entry)
+                .transpose();
         }
-        let mut rows = self.test_rows.lock().unwrap();
-        let candidate = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| row.next_attempt_at_ms <= now_ms)
-            .min_by_key(|(_, row)| (row.next_attempt_at_ms, row.id))
-            .map(|(index, _)| index);
-        Ok(candidate.map(|index| focused_workqueue_entry(rows.remove(index))))
+        #[cfg(not(test))]
+        return Err(anyhow::anyhow!(
+            "production Pod workqueue persistence requires node-local storage"
+        ));
+        #[cfg(test)]
+        {
+            let mut rows = self.test_rows.lock().unwrap();
+            let candidate = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.next_attempt_at_ms <= now_ms)
+                .min_by_key(|(_, row)| (row.next_attempt_at_ms, row.id))
+                .map(|(index, _)| index);
+            Ok(candidate.map(|index| {
+                let row = rows.remove(index);
+                crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry {
+                    id: row.id,
+                    kind: match row.kind {
+                        crate::datastore::node_local::PodWorkqueueKind::Pod => {
+                            crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Pod
+                        }
+                        crate::datastore::node_local::PodWorkqueueKind::Namespace => {
+                            crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Namespace
+                        }
+                    },
+                    namespace: row.namespace,
+                    name: row.name,
+                    uid: row.uid,
+                    payload: row.payload,
+                    attempt_count: row.attempt_count,
+                    next_attempt_at_ms: row.next_attempt_at_ms,
+                }
+            }))
+        }
     }
 
-    async fn complete(&self, id: i64) -> anyhow::Result<()> {
-        if let Some(node_local) = &self.node_local {
-            return node_local.complete_workqueue(id).await;
+    async fn complete(&self, _id: i64) -> anyhow::Result<()> {
+        if self.node_local.is_some() {
+            // The durable port atomically removes the row when it is claimed,
+            // preserving the existing node.db claim semantics.
+            return Ok(());
         }
-        self.test_rows.lock().unwrap().retain(|row| row.id != id);
-        Ok(())
+        #[cfg(not(test))]
+        return Err(anyhow::anyhow!(
+            "production Pod workqueue persistence requires node-local storage"
+        ));
+        #[cfg(test)]
+        {
+            self.test_rows.lock().unwrap().retain(|row| row.id != _id);
+            Ok(())
+        }
     }
 
     async fn record_failure(
@@ -832,17 +894,9 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
         min_delay_ms: i64,
         error: &str,
     ) -> anyhow::Result<()> {
-        let row = legacy_workqueue_entry(row);
         let pod = PodIdentity::new(&row.namespace, &row.name, &row.uid);
         self.enqueue(
-            match row.kind {
-                crate::datastore::node_local::PodWorkqueueKind::Pod => {
-                    crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Pod
-                }
-                crate::datastore::node_local::PodWorkqueueKind::Namespace => {
-                    crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Namespace
-                }
-            },
+            row.kind,
             &pod,
             row.payload,
             row.attempt_count.saturating_add(1),
@@ -1002,10 +1056,15 @@ pub(crate) fn build_pod_repository_parts(
         Arc::new(RootPodPersistence { db: db.clone() }),
         wall_clock.clone(),
     ));
+    let node_local =
+        node_local.map(|store| -> Arc<dyn klights_node_store::PodWorkqueueStore> { store });
     let workqueue_persistence = RootPodWorkqueuePersistence {
         node_local,
+        #[cfg(test)]
         wall_clock: wall_clock.clone(),
+        #[cfg(test)]
         test_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
+        #[cfg(test)]
         test_next_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
     };
     let workqueue = if let Some(leader_coordination) = leader_coordination {
@@ -1103,8 +1162,11 @@ pub(crate) fn build_worker_pod_repository_parts(
         store.clone(),
         RootPodWorkqueuePersistence {
             node_local: Some(config.node_local),
+            #[cfg(test)]
             wall_clock: wall_clock.clone(),
+            #[cfg(test)]
             test_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
             test_next_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
         },
         config.supervisor.clone(),

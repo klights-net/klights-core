@@ -117,187 +117,46 @@ impl crate::kubelet::pod_watch_handlers::PersistentVolumeEventHandler
     }
 }
 
+#[cfg(test)]
 pub struct DatastorePodSlotAdapter {
     store: crate::datastore::node_local::NodeLocalHandle,
 }
 
+#[cfg(test)]
 impl DatastorePodSlotAdapter {
     pub fn new(store: crate::datastore::node_local::NodeLocalHandle) -> Arc<Self> {
         Arc::new(Self { store })
     }
 }
 
-fn slot_state(
-    state: crate::datastore::node_local::PodSlotAdmissionState,
-) -> klights_node_store::PodSlotAdmissionState {
-    match state {
-        crate::datastore::node_local::PodSlotAdmissionState::Admitted => {
-            klights_node_store::PodSlotAdmissionState::Admitted
-        }
-        crate::datastore::node_local::PodSlotAdmissionState::Terminating => {
-            klights_node_store::PodSlotAdmissionState::Terminating
-        }
-    }
-}
-
-fn observed_pod_version(
-    value: i64,
-) -> Result<klights_node_store::ObservedPodVersion, klights_node_store::RuntimeWorkError> {
-    klights_node_store::ObservedPodVersion::try_new(value)
-        .map_err(|error| klights_node_store::RuntimeWorkError::corrupt_data(error.to_string()))
-}
-
+#[cfg(test)]
 impl klights_node_store::PodSlotAdmissionStore for DatastorePodSlotAdapter {
     fn try_admit(
         &self,
         request: klights_node_store::PodSlotAdmissionRequest,
     ) -> klights_node_store::RuntimeWorkFuture<'_, klights_node_store::PodSlotAdmissionResult> {
-        Box::pin(async move {
-            let (pod, node_name) = request.into_parts();
-            match self
-                .store
-                .pod_slot_try_admit(&pod.namespace, &pod.name, &pod.uid, &node_name)
-                .await
-                .map_err(|error| {
-                    klights_node_store::RuntimeWorkError::persistence_failed(error.to_string())
-                })? {
-                crate::datastore::node_local::PodSlotAdmissionResult::Admitted {
-                    resource_version,
-                } => Ok(klights_node_store::PodSlotAdmissionResult::Admitted {
-                    observed_pod_version: observed_pod_version(resource_version)?,
-                }),
-                crate::datastore::node_local::PodSlotAdmissionResult::Blocked {
-                    blocking_uid,
-                    blocking_node,
-                    state,
-                    resource_version,
-                } => Ok(klights_node_store::PodSlotAdmissionResult::Blocked {
-                    blocking_uid,
-                    blocking_node,
-                    state: slot_state(state),
-                    observed_pod_version: observed_pod_version(resource_version)?,
-                }),
-            }
-        })
+        self.store.try_admit(request)
     }
 
     fn mark_terminating(
         &self,
         request: klights_node_store::PodSlotAdmissionRequest,
     ) -> klights_node_store::RuntimeWorkFuture<'_, klights_node_store::PodSlotMutationResult> {
-        Box::pin(async move {
-            let (pod, node_name) = request.into_parts();
-            let result = self
-                .store
-                .pod_slot_mark_terminating(&pod.namespace, &pod.name, &pod.uid, &node_name)
-                .await
-                .map_err(|error| {
-                    klights_node_store::RuntimeWorkError::persistence_failed(error.to_string())
-                })?;
-            match result {
-                crate::datastore::node_local::PodSlotMutationResult::Changed {
-                    resource_version,
-                } => Ok(klights_node_store::PodSlotMutationResult::Changed {
-                    observed_pod_version: observed_pod_version(resource_version)?,
-                }),
-                crate::datastore::node_local::PodSlotMutationResult::Unchanged {
-                    resource_version,
-                } => Ok(klights_node_store::PodSlotMutationResult::Unchanged {
-                    observed_pod_version: observed_pod_version(resource_version)?,
-                }),
-            }
-        })
+        self.store.mark_terminating(request)
     }
 
     fn clear_if_uid(
         &self,
         request: klights_node_store::PodSlotAdmissionRequest,
     ) -> klights_node_store::RuntimeWorkFuture<'_, klights_node_store::PodSlotClearResult> {
-        Box::pin(async move {
-            let (pod, _node_name) = request.into_parts();
-            let result = self
-                .store
-                .pod_slot_clear_if_uid(&pod.namespace, &pod.name, &pod.uid)
-                .await
-                .map_err(|error| {
-                    klights_node_store::RuntimeWorkError::persistence_failed(error.to_string())
-                })?;
-            match result {
-                crate::datastore::node_local::PodSlotClearResult::Cleared { resource_version } => {
-                    Ok(klights_node_store::PodSlotClearResult::Cleared {
-                        observed_pod_version: observed_pod_version(resource_version)?,
-                    })
-                }
-                crate::datastore::node_local::PodSlotClearResult::NotFound => {
-                    Ok(klights_node_store::PodSlotClearResult::NotFound)
-                }
-                crate::datastore::node_local::PodSlotClearResult::UidMismatch {
-                    blocking_uid,
-                    blocking_node,
-                    state,
-                    resource_version,
-                } => Ok(klights_node_store::PodSlotClearResult::UidMismatch {
-                    blocking_uid,
-                    blocking_node,
-                    state: slot_state(state),
-                    observed_pod_version: observed_pod_version(resource_version)?,
-                }),
-            }
-        })
+        self.store.clear_if_uid(request)
     }
 }
 
-struct DatastorePodSlotSubscription {
-    receiver: tokio::sync::broadcast::Receiver<crate::datastore::node_local::PodSlotAdmissionEvent>,
-}
-
-impl klights_node_store::PodSlotEventSubscription for DatastorePodSlotSubscription {
-    fn next_event(
-        &mut self,
-    ) -> klights_node_store::RuntimeWorkFuture<'_, Option<klights_node_store::PodSlotAdmissionEvent>>
-    {
-        Box::pin(async move {
-            let event = match self.receiver.recv().await {
-                Ok(event) => event,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(None),
-                Err(error) => {
-                    return Err(klights_node_store::RuntimeWorkError::retryable(
-                        error.to_string(),
-                    ));
-                }
-            };
-            let event = match event {
-                crate::datastore::node_local::PodSlotAdmissionEvent::Changed {
-                    namespace,
-                    pod_name,
-                    pod_uid,
-                    state,
-                    resource_version,
-                } => klights_node_store::PodSlotAdmissionEvent::Changed {
-                    pod: klights_types::PodIdentity::new(&namespace, &pod_name, &pod_uid),
-                    state: slot_state(state),
-                    observed_pod_version: observed_pod_version(resource_version)?,
-                },
-                crate::datastore::node_local::PodSlotAdmissionEvent::Cleared {
-                    namespace,
-                    pod_name,
-                    pod_uid,
-                    resource_version,
-                } => klights_node_store::PodSlotAdmissionEvent::Cleared {
-                    pod: klights_types::PodIdentity::new(&namespace, &pod_name, &pod_uid),
-                    observed_pod_version: observed_pod_version(resource_version)?,
-                },
-            };
-            Ok(Some(event))
-        })
-    }
-}
-
+#[cfg(test)]
 impl klights_node_store::PodSlotAdmissionEventSource for DatastorePodSlotAdapter {
     fn subscribe(&self) -> Box<dyn klights_node_store::PodSlotEventSubscription> {
-        Box::new(DatastorePodSlotSubscription {
-            receiver: self.store.subscribe_pod_slot_admissions(),
-        })
+        self.store.subscribe()
     }
 }
 

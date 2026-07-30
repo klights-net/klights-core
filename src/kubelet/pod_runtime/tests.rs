@@ -24,8 +24,7 @@ use crate::kubelet::pod_runtime::volumes::PodVolumeRuntime;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-async fn node_local_runtime_store()
--> Arc<crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter> {
+async fn node_local_runtime_store() -> Arc<crate::datastore::node_local::SqliteNodeLocalDb> {
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
@@ -38,11 +37,11 @@ async fn node_local_runtime_store()
     .expect("open node-local runtime store");
     let backend = crate::datastore::node_local::SqliteNodeLocalDb::from_executor(executor)
         .expect("create node-local runtime store");
-    crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(Arc::new(backend))
+    Arc::new(backend)
 }
 
 async fn admit_runtime_key(
-    store: &crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter,
+    store: &crate::datastore::node_local::SqliteNodeLocalDb,
     key: &PodRuntimeKey,
 ) {
     klights_node_store::PodRuntimeStore::admit_pod_runtime(

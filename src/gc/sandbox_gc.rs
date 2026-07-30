@@ -214,14 +214,14 @@ impl SandboxGc {
         match self.node_local.list_pod_runtime().await {
             Ok(rows) => {
                 for sb in rows {
-                    let Some(sandbox_id) = sb.sandbox_id else {
+                    let Some(sandbox_id) = sb.sandbox_id().map(str::to_string) else {
                         continue;
                     };
                     if !live_sandbox_ids.contains(&sandbox_id) {
                         if !cleanup_pod_cgroup_for_gc(
                             &self.file_process,
                             &self.containerd_ns,
-                            &sb.pod_uid,
+                            &sb.pod().uid,
                             &sandbox_id,
                             "stale sandbox row",
                         )
@@ -231,12 +231,12 @@ impl SandboxGc {
                         }
                         stale_sandbox_row_ids.insert(sandbox_id.clone());
                         if let Err(e) = self
-                            .delete_runtime_for_match(&sb.pod_uid, &sandbox_id)
+                            .delete_runtime_for_match(&sb.pod().uid, &sandbox_id)
                             .await
                         {
                             tracing::debug!(
-                                ns = %sb.namespace,
-                                pod = %sb.pod_name,
+                                ns = %sb.pod().namespace,
+                                pod = %sb.pod().name,
                                 error = %e,
                                 "sandbox_gc: failed to drop stale pod_sandboxes row"
                             );
@@ -292,11 +292,14 @@ impl SandboxGc {
     }
 
     async fn delete_runtime_for_match(&self, pod_uid: &str, sandbox_id: &str) -> Result<()> {
-        let Some(row) = self.node_local.get_pod_runtime(pod_uid).await? else {
+        let key = klights_node_store::RuntimePodUid::try_new(pod_uid)?;
+        let Some(row) = self.node_local.get_pod_runtime(key).await? else {
             return Ok(());
         };
-        if row.sandbox_id.as_deref() == Some(sandbox_id) {
-            self.node_local.delete_pod_runtime_for_uid(pod_uid).await?;
+        if row.sandbox_id() == Some(sandbox_id) {
+            self.node_local
+                .delete_pod_runtime_for_uid(klights_node_store::RuntimePodUid::try_new(pod_uid)?)
+                .await?;
         }
         Ok(())
     }

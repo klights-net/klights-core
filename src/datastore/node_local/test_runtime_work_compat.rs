@@ -1,3 +1,5 @@
+//! Test-only compatibility DTOs retained for legacy root regression coverage.
+
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
@@ -122,8 +124,6 @@ pub use super::sqlite::{
     DeadLetterRow, OutboxInsert, OutboxRow, OutboxStats, PodStatusCheckpoint,
     ReplicationCheckpoint, RuntimeObservationCheckpoint,
 };
-pub use super::sqlite::{PodRuntimeRow, ProbeStateRow};
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PodRuntimeOwnershipError {
     Conflict {

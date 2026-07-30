@@ -47,6 +47,7 @@ pub(crate) struct PodWorkqueueEntry {
     pub uid: String,
     pub payload: Value,
     pub attempt_count: i64,
+    #[cfg(test)]
     pub next_attempt_at_ms: i64,
 }
 

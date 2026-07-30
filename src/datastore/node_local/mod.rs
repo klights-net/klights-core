@@ -5,11 +5,13 @@ mod identity_adapter;
 pub(crate) mod network_adapter;
 pub(crate) mod raft_adapter;
 pub mod redb;
+mod runtime_work_composition;
 pub mod selector;
 pub mod sqlite;
 #[cfg(test)]
 mod test_delivery_compat;
-pub mod types;
+#[cfg(test)]
+pub mod test_runtime_work_compat;
 
 pub use backend::NodeLocalBackend;
 pub use handle::NodeLocalHandle;
@@ -19,14 +21,11 @@ pub use test_delivery_compat::LegacyDeliveryTestStore;
 pub type KubeletTestStoreHandle = NodeLocalHandle;
 pub use sqlite::SqliteNodeLocalDb;
 #[cfg(test)]
-pub use types::{
+pub use test_runtime_work_compat::{
     DeadLetterRow, DeadLetterTestInsert, OutboxFailureDisposition, OutboxInsert, OutboxRow,
-    OutboxStats, PodStatusCheckpoint, ReplicationCheckpoint,
-};
-pub use types::{
-    PodRuntimeOwnershipError, PodRuntimeRow, PodSlotAdmissionEvent, PodSlotAdmissionResult,
-    PodSlotAdmissionState, PodSlotClearResult, PodSlotMutationResult, PodWorkqueueEntry,
-    PodWorkqueueKind, ProbeStateRow, SandboxRef,
+    OutboxStats, PodRuntimeOwnershipError, PodSlotAdmissionEvent, PodSlotAdmissionResult,
+    PodSlotAdmissionState, PodSlotClearResult, PodSlotMutationResult, PodStatusCheckpoint,
+    PodWorkqueueEntry, PodWorkqueueKind, ReplicationCheckpoint, SandboxRef,
 };
 
 #[cfg(test)]

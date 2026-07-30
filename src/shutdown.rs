@@ -51,7 +51,7 @@ pub async fn cleanup_pod_sandboxes(
     tracing::info!("Stopping {} recorded pod sandboxes", sandboxes.len());
 
     for sb in sandboxes {
-        let Some(sandbox_id) = sb.sandbox_id.as_deref() else {
+        let Some(sandbox_id) = sb.sandbox_id() else {
             continue;
         };
         sandbox_ids.insert(sandbox_id.to_string());
@@ -62,7 +62,7 @@ pub async fn cleanup_pod_sandboxes(
             network,
             containerd_ns,
             sandbox_id,
-            Some((&sb.namespace, &sb.pod_name, &sb.pod_uid)),
+            Some((&sb.pod().namespace, &sb.pod().name, &sb.pod().uid)),
         )
         .await;
     }
@@ -169,11 +169,16 @@ async fn delete_shutdown_sandbox_row(
     if pod_uid.trim().is_empty() {
         return Ok(());
     }
-    let Some(runtime) = node_local.get_pod_runtime(pod_uid).await? else {
+    let Some(runtime) = node_local
+        .get_pod_runtime(klights_node_store::RuntimePodUid::try_new(pod_uid)?)
+        .await?
+    else {
         return Ok(());
     };
-    if runtime.sandbox_id.as_deref() == Some(sandbox_id) {
-        node_local.delete_pod_runtime_for_uid(pod_uid).await?;
+    if runtime.sandbox_id() == Some(sandbox_id) {
+        node_local
+            .delete_pod_runtime_for_uid(klights_node_store::RuntimePodUid::try_new(pod_uid)?)
+            .await?;
     }
     Ok(())
 }
@@ -1053,11 +1058,27 @@ tmpfs on /data/klights/pods/pod-a/volumes/empty-dir/cache type tmpfs (rw,relatim
         .await
         .unwrap();
         node_local
-            .record_owned_sandbox("uid-a", "default", "same-name", "node-a", "sandbox-a", 1)
+            .record_owned_sandbox(
+                klights_node_store::OwnedPodSandbox::try_new(
+                    klights_types::PodIdentity::new("default", "same-name", "uid-a"),
+                    "node-a",
+                    "sandbox-a",
+                    1,
+                )
+                .unwrap(),
+            )
             .await
             .unwrap();
         node_local
-            .record_owned_sandbox("uid-b", "default", "same-name", "node-a", "sandbox-b", 2)
+            .record_owned_sandbox(
+                klights_node_store::OwnedPodSandbox::try_new(
+                    klights_types::PodIdentity::new("default", "same-name", "uid-b"),
+                    "node-a",
+                    "sandbox-b",
+                    2,
+                )
+                .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -1071,19 +1092,23 @@ tmpfs on /data/klights/pods/pod-a/volumes/empty-dir/cache type tmpfs (rw,relatim
         .await
         .unwrap();
 
-        assert!(node_local.get_pod_runtime("uid-a").await.unwrap().is_none());
-        assert_eq!(
-            node_local.get_pod_runtime("uid-b").await.unwrap(),
-            Some(crate::datastore::node_local::PodRuntimeRow {
-                pod_uid: "uid-b".to_string(),
-                namespace: "default".to_string(),
-                pod_name: "same-name".to_string(),
-                node_name: "node-a".to_string(),
-                sandbox_id: Some("sandbox-b".to_string()),
-                cgroup_path: None,
-                created_ms: 2,
-                started_ms: None,
-            })
+        assert!(
+            node_local
+                .get_pod_runtime(klights_node_store::RuntimePodUid::try_new("uid-a").unwrap())
+                .await
+                .unwrap()
+                .is_none()
         );
+        let replacement = node_local
+            .get_pod_runtime(klights_node_store::RuntimePodUid::try_new("uid-b").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.pod().namespace, "default");
+        assert_eq!(replacement.pod().name, "same-name");
+        assert_eq!(replacement.pod().uid, "uid-b");
+        assert_eq!(replacement.node_name(), "node-a");
+        assert_eq!(replacement.sandbox_id(), Some("sandbox-b"));
+        assert_eq!(replacement.created_ms(), 2);
     }
 }
