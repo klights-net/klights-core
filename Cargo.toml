@@ -283,7 +283,6 @@ h2 = { workspace = true }
 rust-cel-parser = { workspace = true }
 cel = { workspace = true }
 cron = { workspace = true }
-openraft = { workspace = true }
 aes-gcm = { workspace = true }
 # memory: jemalloc global allocator. Replaces glibc malloc, whose per-thread
 # arenas retain freed memory under churn and never return it to the OS
@@ -296,10 +295,11 @@ tikv-jemalloc-ctl = { workspace = true }
 debug = 1
 
 [dev-dependencies]
+klights-replication = { workspace = true, features = ["test-support"] }
 klights-cluster-datastore = { workspace = true, features = ["test-support"] }
 klights-cluster-store = { workspace = true, features = ["test-support"] }
 klights-networking = { workspace = true, features = ["test-support"] }
-klights-replication = { workspace = true, features = ["test-support"] }
+openraft = { workspace = true }
 rtnetlink = { workspace = true }
 tempfile = { workspace = true }
 rstest = { workspace = true }

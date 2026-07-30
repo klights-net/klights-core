@@ -19,6 +19,7 @@ klights-types = { workspace = true }
 klights-cluster-core = { workspace = true }
 klights-cluster-store = { workspace = true }
 klights-node-store = { workspace = true }
+klights-node-api = { workspace = true }
 klights-leader-api = { workspace = true }
 klights-leader-rpc = { workspace = true }
 klights-internal-protobuf = { workspace = true }
@@ -32,5 +33,6 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
+tonic = { workspace = true }
 zstd = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["std", "v4"] }

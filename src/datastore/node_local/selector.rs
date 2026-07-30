@@ -39,7 +39,7 @@ pub(crate) async fn open_leader_node_local(
         BackendKind::Sqlite => {
             let node = open_sqlite(path, supervisor, key_file, connection_key).await?;
             let raft = Arc::new(
-                crate::datastore::node_local::raft_adapter::OpenRaftNodeDurabilityAdapter::new(
+                klights_replication::node_durability::OpenRaftNodeDurabilityAdapter::new(
                     node.raft_log_persistence(),
                     node.raft_applied_state_persistence(),
                 ),

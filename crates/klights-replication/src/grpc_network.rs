@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use crate::types::RaftMemberNode;
 use async_trait::async_trait;
-use klights_replication::types::RaftMemberNode;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
@@ -23,7 +23,7 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 
-use klights_replication::types::{NodeId, TypeConfig};
+use crate::types::{NodeId, TypeConfig};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PeerRaftRpcMetricsSnapshot {
@@ -849,7 +849,7 @@ mod tests {
         });
         let mut network = GrpcRaftNetwork::new(factory);
         let mut peer = network
-            .new_client(20u64, &crate::datastore::raft::test_unproven_member("down"))
+            .new_client(20u64, &crate::test_unproven_member("down"))
             .await;
 
         // First RPC uses the initially-built (wedged) client → Unreachable.
@@ -918,10 +918,7 @@ mod tests {
         });
         let mut network = GrpcRaftNetwork::new(factory);
         let mut peer = network
-            .new_client(
-                20u64,
-                &crate::datastore::raft::test_unproven_member("fatal"),
-            )
+            .new_client(20u64, &crate::test_unproven_member("fatal"))
             .await;
 
         for _ in 0..2 {
@@ -966,10 +963,7 @@ mod tests {
         });
         let mut network = GrpcRaftNetwork::new(factory);
         let mut peer = network
-            .new_client(
-                20u64,
-                &crate::datastore::raft::test_unproven_member("same-id"),
-            )
+            .new_client(20u64, &crate::test_unproven_member("same-id"))
             .await;
 
         let error = peer
@@ -1010,10 +1004,7 @@ mod tests {
         });
         let mut network = GrpcRaftNetwork::new(factory);
         let mut peer = network
-            .new_client(
-                20u64,
-                &crate::datastore::raft::test_unproven_member("snapshot"),
-            )
+            .new_client(20u64, &crate::test_unproven_member("snapshot"))
             .await;
 
         let error = peer
@@ -1052,7 +1043,7 @@ mod tests {
         });
         let mut network = GrpcRaftNetwork::new(factory);
         let mut peer = network
-            .new_client(20u64, &crate::datastore::raft::test_unproven_member("x"))
+            .new_client(20u64, &crate::test_unproven_member("x"))
             .await;
         let response = peer
             .vote(
@@ -1098,7 +1089,7 @@ mod tests {
         });
         let mut network = GrpcRaftNetwork::new(factory);
         let mut peer = network
-            .new_client(20u64, &crate::datastore::raft::test_unproven_member("x"))
+            .new_client(20u64, &crate::test_unproven_member("x"))
             .await;
         let response = peer
             .install_snapshot(
@@ -1129,7 +1120,7 @@ mod tests {
         });
         let mut network = GrpcRaftNetwork::new(factory);
         let mut peer = network
-            .new_client(20u64, &crate::datastore::raft::test_unproven_member("down"))
+            .new_client(20u64, &crate::test_unproven_member("down"))
             .await;
         let err = peer
             .vote(
@@ -1169,15 +1160,15 @@ mod tests {
         });
         let mut network = GrpcRaftNetwork::new(factory);
         let _peer1 = network
-            .new_client(20u64, &crate::datastore::raft::test_unproven_member("x"))
+            .new_client(20u64, &crate::test_unproven_member("x"))
             .await;
         let _peer1_again = network
-            .new_client(20u64, &crate::datastore::raft::test_unproven_member("x"))
+            .new_client(20u64, &crate::test_unproven_member("x"))
             .await;
         // Both new_client calls for the same target reuse one entry.
         assert_eq!(network.clients.read().unwrap().len(), 1);
         let _peer2 = network
-            .new_client(30u64, &crate::datastore::raft::test_unproven_member("y"))
+            .new_client(30u64, &crate::test_unproven_member("y"))
             .await;
         assert_eq!(network.clients.read().unwrap().len(), 2);
     }

@@ -7,6 +7,8 @@ pub mod controlplane_discovery;
 pub(crate) mod controlplane_join_adapters;
 pub mod credential_store;
 pub(crate) mod finalizer_lifecycle_adapter;
+pub(crate) mod grpc_raft_transport_adapter;
+pub(crate) mod grpc_runtime_adapter;
 pub mod init;
 pub mod kubelet_ports;
 pub mod leader_reconnect;
@@ -21,7 +23,6 @@ pub(crate) mod operational_adapters;
 #[cfg(test)]
 pub(crate) mod outbox_apply_adapter;
 pub mod phases;
-pub mod raft_transport;
 pub mod runtime;
 pub(crate) mod runtime_inputs;
 pub(crate) mod scheduler_adapter;

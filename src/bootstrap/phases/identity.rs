@@ -688,7 +688,7 @@ mod tests {
         let leader_supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let service = std::sync::Arc::new(crate::replication::service::ReplicationService::new(
+        let service = std::sync::Arc::new(crate::grpc_test_support::replication_service(
             db.clone(),
             leader_supervisor.clone(),
         ));

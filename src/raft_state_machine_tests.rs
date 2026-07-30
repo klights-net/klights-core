@@ -16,9 +16,20 @@ mod tests {
     type TestRaftStateMachine =
         SqliteRaftStateMachine<klights_replication::snapshot::SqliteRaftSnapshotBuilder>;
 
+    fn applied_durability(
+        stores: &NodeLocalStores,
+    ) -> Arc<dyn klights_node_store::RaftAppliedStateDurability> {
+        Arc::new(
+            klights_replication::node_durability::OpenRaftNodeDurabilityAdapter::new(
+                stores.raft_log_persistence(),
+                stores.raft_applied_state_persistence(),
+            ),
+        )
+    }
+
     async fn state_machine(
         backend: Arc<crate::datastore::sqlite::Datastore>,
-        applied_state: Arc<NodeLocalStores>,
+        applied_state: Arc<dyn klights_node_store::RaftAppliedStateDurability>,
         supervisor: Arc<TaskSupervisor>,
     ) -> TestRaftStateMachine {
         state_machine_with_activation(backend, applied_state, supervisor)
@@ -28,7 +39,7 @@ mod tests {
 
     async fn state_machine_with_activation(
         backend: Arc<crate::datastore::sqlite::Datastore>,
-        applied_state: Arc<NodeLocalStores>,
+        applied_state: Arc<dyn klights_node_store::RaftAppliedStateDurability>,
         supervisor: Arc<TaskSupervisor>,
     ) -> (TestRaftStateMachine, Arc<CommandCodecV3Activation>) {
         let materializer =
@@ -70,13 +81,13 @@ mod tests {
     }
 
     struct PausedAppliedState {
-        inner: Arc<NodeLocalStores>,
+        inner: Arc<dyn klights_node_store::RaftAppliedStateDurability>,
         reached: tokio::sync::Notify,
         resume: tokio::sync::Notify,
     }
 
     impl PausedAppliedState {
-        fn new(inner: Arc<NodeLocalStores>) -> Self {
+        fn new(inner: Arc<dyn klights_node_store::RaftAppliedStateDurability>) -> Self {
             Self {
                 inner,
                 reached: tokio::sync::Notify::new(),
@@ -93,10 +104,7 @@ mod tests {
             Box::pin(async move {
                 self.reached.notify_one();
                 self.resume.notified().await;
-                klights_node_store::RaftAppliedStateDurability::load_applied_state(
-                    self.inner.as_ref(),
-                )
-                .await
+                self.inner.load_applied_state().await
             })
         }
 
@@ -104,10 +112,7 @@ mod tests {
             &self,
             state: klights_node_store::RaftAppliedStateWrite,
         ) -> klights_node_store::RaftDurabilityFuture<'_, ()> {
-            klights_node_store::RaftAppliedStateDurability::store_applied_state(
-                self.inner.as_ref(),
-                state,
-            )
+            self.inner.store_applied_state(state)
         }
     }
 
@@ -124,7 +129,7 @@ mod tests {
             Arc::new(NodeLocalStores::from_executor(node_executor).expect("create node-local db"));
         let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
-        state_machine(backend, node_local, supervisor).await
+        state_machine(backend, applied_durability(&node_local), supervisor).await
     }
 
     #[tokio::test]
@@ -224,7 +229,7 @@ mod tests {
         .expect("open node-local executor");
         let node_local =
             Arc::new(NodeLocalStores::from_executor(node_executor).expect("create node-local db"));
-        state_machine_with_activation(backend, node_local, supervisor).await
+        state_machine_with_activation(backend, applied_durability(&node_local), supervisor).await
     }
 
     async fn seed_snapshot_identity(backend: &dyn DatastoreBackend) {
@@ -616,7 +621,8 @@ mod tests {
         .expect("open node-local snapshot fixture");
         let node_local =
             Arc::new(NodeLocalStores::from_executor(node_executor).expect("create node-local db"));
-        let paused_applied_state = Arc::new(PausedAppliedState::new(node_local.clone()));
+        let applied_state = applied_durability(&node_local);
+        let paused_applied_state = Arc::new(PausedAppliedState::new(applied_state.clone()));
         let materializer =
             crate::datastore::cluster_store_adapter::DatastoreRaftCommitMaterializer::new(
                 backend.clone(),
@@ -641,7 +647,7 @@ mod tests {
         );
         let mut state_machine = SqliteRaftStateMachine::new_with_command_codec_activation(
             stores,
-            node_local,
+            applied_state,
             snapshot_builder,
             activation,
         );

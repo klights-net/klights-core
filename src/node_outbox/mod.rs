@@ -488,7 +488,7 @@ impl Outbox {
     ) -> Self {
         Self::compose(
             OutboxStores::from_node_db(node_db.borrow()),
-            crate::replication::outbox_payload_codec::new_codec(),
+            crate::outbox_payload_codec_adapter::new_codec(),
             notify,
             Arc::new(klights_supervisor::SystemWallClock),
         )
@@ -1167,7 +1167,7 @@ impl OutboxDispatcher {
     ) -> Self {
         Self::new(
             OutboxStores::from_node_db(node_db.borrow()),
-            crate::replication::outbox_payload_codec::new_codec(),
+            crate::outbox_payload_codec_adapter::new_codec(),
             client,
             Arc::new(Notify::new()),
             Arc::new(klights_supervisor::SystemWallClock),
@@ -1182,7 +1182,7 @@ impl OutboxDispatcher {
     ) -> Self {
         Self::new_with_rtt_estimator(
             OutboxStores::from_node_db(node_db.borrow()),
-            crate::replication::outbox_payload_codec::new_codec(),
+            crate::outbox_payload_codec_adapter::new_codec(),
             client,
             Arc::new(Notify::new()),
             rtt,
@@ -1220,7 +1220,7 @@ impl OutboxDispatcher {
     ) -> Self {
         Self::new(
             OutboxStores::from_node_db(node_db.borrow()),
-            crate::replication::outbox_payload_codec::new_codec(),
+            crate::outbox_payload_codec_adapter::new_codec(),
             client,
             notify,
             Arc::new(klights_supervisor::SystemWallClock),

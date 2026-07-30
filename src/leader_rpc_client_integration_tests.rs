@@ -11,7 +11,7 @@ mod cases {
 
     use crate::datastore::backend::DatastoreHandle;
 
-    use crate::replication::service::ReplicationService;
+    use klights_replication::service::ReplicationService;
 
     use futures::StreamExt as _;
 
@@ -155,7 +155,10 @@ mod cases {
                 .await
                 .unwrap();
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-            let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
+            let service = Arc::new(crate::grpc_test_support::replication_service(
+                db.clone(),
+                supervisor.clone(),
+            ));
             let app = crate::grpc_test_support::mount_service_with_passive_reads(
                 axum::Router::new(),
                 service,
@@ -363,7 +366,10 @@ mod cases {
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+        let service = Arc::new(crate::grpc_test_support::replication_service(
+            db.clone(),
+            supervisor,
+        ));
         let (leader_tx, leader_rx) = tokio::sync::watch::channel(is_leader);
         let app = crate::grpc_test_support::mount_service_with_passive_reads_and_leader_gate(
             axum::Router::new(),
@@ -394,7 +400,10 @@ mod cases {
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+        let service = Arc::new(crate::grpc_test_support::replication_service(
+            db.clone(),
+            supervisor,
+        ));
         let (_leader_tx, leader_rx) = tokio::sync::watch::channel(true);
         let app = crate::grpc_test_support::mount_service_full(
             axum::Router::new(),
@@ -476,7 +485,10 @@ mod cases {
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
+        let service = Arc::new(crate::grpc_test_support::replication_service(
+            db.clone(),
+            supervisor.clone(),
+        ));
         let app = crate::grpc_test_support::mount_service(
             axum::Router::new(),
             service,
@@ -1062,7 +1074,10 @@ mod cases {
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
+        let service = Arc::new(crate::grpc_test_support::replication_service(
+            db.clone(),
+            supervisor.clone(),
+        ));
         let controller_dispatcher = Arc::new(crate::controllers::ControllerDispatcher::default());
         let app = crate::grpc_test_support::mount_service_with_controller_dispatcher(
             axum::Router::new(),
@@ -1423,7 +1438,10 @@ mod cases {
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
+        let service = Arc::new(crate::grpc_test_support::replication_service(
+            db.clone(),
+            supervisor.clone(),
+        ));
         let app = crate::grpc_test_support::mount_service(
             axum::Router::new(),
             service,
@@ -1506,7 +1524,10 @@ mod cases {
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
+        let service = Arc::new(crate::grpc_test_support::replication_service(
+            db.clone(),
+            supervisor.clone(),
+        ));
         let app = crate::grpc_test_support::mount_service(
             axum::Router::new(),
             service,
@@ -1592,7 +1613,10 @@ mod cases {
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
+        let service = Arc::new(crate::grpc_test_support::replication_service(
+            db.clone(),
+            supervisor.clone(),
+        ));
         let app = crate::grpc_test_support::mount_service(
             axum::Router::new(),
             service,
@@ -1821,7 +1845,10 @@ mod cases {
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
+        let service = Arc::new(crate::grpc_test_support::replication_service(
+            db.clone(),
+            supervisor.clone(),
+        ));
         let app = crate::grpc_test_support::mount_service(
             axum::Router::new(),
             service,
@@ -1937,10 +1964,9 @@ mod cases {
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(ReplicationService::new_with_containerd_namespace(
+        let service = Arc::new(crate::grpc_test_support::replication_service(
             db.clone(),
             supervisor.clone(),
-            leader_ns.clone(),
         ));
         let app = crate::grpc_test_support::mount_service(
             axum::Router::new(),
@@ -2174,7 +2200,10 @@ mod cases {
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
+        let service = Arc::new(crate::grpc_test_support::replication_service(
+            db.clone(),
+            supervisor.clone(),
+        ));
         let app = crate::grpc_test_support::mount_service(
             axum::Router::new(),
             service.clone(),
@@ -2241,7 +2270,10 @@ mod cases {
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
+        let service = Arc::new(crate::grpc_test_support::replication_service(
+            db.clone(),
+            supervisor.clone(),
+        ));
         let app = crate::grpc_test_support::mount_service(
             axum::Router::new(),
             service.clone(),
@@ -2348,7 +2380,10 @@ mod cases {
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
+        let service = Arc::new(crate::grpc_test_support::replication_service(
+            db.clone(),
+            supervisor.clone(),
+        ));
         let app = crate::grpc_test_support::mount_service(
             axum::Router::new(),
             service.clone(),
@@ -2539,7 +2574,10 @@ mod cases {
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
+        let service = Arc::new(crate::grpc_test_support::replication_service(
+            db.clone(),
+            supervisor.clone(),
+        ));
         let app = crate::grpc_test_support::mount_service(
             axum::Router::new(),
             service,
@@ -2656,7 +2694,10 @@ mod cases {
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
+        let service = Arc::new(crate::grpc_test_support::replication_service(
+            db.clone(),
+            supervisor.clone(),
+        ));
         let app = crate::grpc_test_support::mount_service(
             axum::Router::new(),
             service,

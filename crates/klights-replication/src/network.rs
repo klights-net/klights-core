@@ -14,8 +14,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::types::RaftMemberNode;
 use async_trait::async_trait;
-use klights_replication::types::RaftMemberNode;
 use openraft::Raft;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
@@ -24,7 +24,7 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 
-use klights_replication::types::{NodeId, StorageCommandPayload, TypeConfig};
+use crate::types::{NodeId, StorageCommandPayload, TypeConfig};
 
 /// Trait used by `RaftNode::propose` to forward a write to the current
 /// Raft leader when this node is a follower. Implementations are
@@ -293,9 +293,7 @@ mod tests {
     #[tokio::test]
     async fn factory_returns_stub() {
         let mut f = StubRaftNetwork;
-        let _net = f
-            .new_client(42u64, &crate::datastore::raft::test_unproven_member("x"))
-            .await;
+        let _net = f.new_client(42u64, &crate::test_unproven_member("x")).await;
     }
 
     #[tokio::test]

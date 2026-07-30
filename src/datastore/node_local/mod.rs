@@ -2,7 +2,6 @@
 mod delivery_composition;
 #[cfg(test)]
 mod identity_adapter;
-pub(crate) mod raft_adapter;
 pub mod redb;
 #[cfg(test)]
 mod runtime_work_composition;

@@ -142,7 +142,7 @@ pub(crate) fn raft_state_machine_store_ports_for_test(
 #[cfg(test)]
 pub(crate) fn raft_store_ports_for_test(
     db: std::sync::Arc<super::sqlite::Datastore>,
-) -> crate::datastore::raft::node::RaftStorePorts {
+) -> klights_replication::node::RaftStorePorts {
     let db_handle: DatastoreHandle = db.clone();
     let materializer = std::sync::Arc::new(DatastoreRaftCommitMaterializer::new(db_handle));
     let snapshot_capture = db.focused_recovery_store();
@@ -150,7 +150,7 @@ pub(crate) fn raft_store_ports_for_test(
     let lifecycle = std::sync::Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(
         db.clone(),
     ));
-    crate::datastore::raft::node::RaftStorePorts::new(
+    klights_replication::node::RaftStorePorts::new(
         materializer,
         raft_state_machine_store_ports_for_test(db),
         snapshot_capture,

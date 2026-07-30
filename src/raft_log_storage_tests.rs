@@ -28,8 +28,13 @@ mod tests {
         )
         .await
         .expect("open node-local executor");
-        let nl: Arc<dyn RaftLogDurability> =
-            Arc::new(NodeLocalStores::from_executor(executor).expect("create node-local db"));
+        let node_local = NodeLocalStores::from_executor(executor).expect("create node-local db");
+        let nl: Arc<dyn RaftLogDurability> = Arc::new(
+            klights_replication::node_durability::OpenRaftNodeDurabilityAdapter::new(
+                node_local.raft_log_persistence(),
+                node_local.raft_applied_state_persistence(),
+            ),
+        );
         (SqliteRaftLogStorage::new(nl.clone(), supervisor), nl)
     }
 

@@ -15,15 +15,15 @@ use klights_node_store::{
 };
 use openraft::LogId;
 
-use klights_replication::types::NodeId;
+use crate::types::NodeId;
 
-pub(crate) struct OpenRaftNodeDurabilityAdapter {
+pub struct OpenRaftNodeDurabilityAdapter {
     log: Arc<dyn RaftLogPersistence>,
     applied: Arc<dyn RaftAppliedStatePersistence>,
 }
 
 impl OpenRaftNodeDurabilityAdapter {
-    pub(crate) fn new(
+    pub fn new(
         log: Arc<dyn RaftLogPersistence>,
         applied: Arc<dyn RaftAppliedStatePersistence>,
     ) -> Self {
@@ -163,87 +163,6 @@ impl RaftAppliedStateDurability for OpenRaftNodeDurabilityAdapter {
 
     fn store_applied_state(&self, state: RaftAppliedStateWrite) -> RaftDurabilityFuture<'_, ()> {
         store_applied(self.applied.as_ref(), state)
-    }
-}
-
-#[cfg(test)]
-impl RaftLogPersistence for crate::datastore::node_local::NodeLocalStores {
-    fn read_log_range(
-        &self,
-        range: RaftLogRange,
-    ) -> RaftDurabilityFuture<'_, Vec<EncodedRaftLogEntry>> {
-        self.raft_persistence_ref().read_log_range(range)
-    }
-
-    fn load_log_state(&self) -> RaftDurabilityFuture<'_, EncodedRaftLogState> {
-        self.raft_persistence_ref().load_log_state()
-    }
-
-    fn append_log_entries(&self, entries: RaftLogBatch) -> RaftDurabilityFuture<'_, ()> {
-        self.raft_persistence_ref().append_log_entries(entries)
-    }
-
-    fn truncate_log_from(&self, from_inclusive: u64) -> RaftDurabilityFuture<'_, ()> {
-        self.raft_persistence_ref()
-            .truncate_log_from(from_inclusive)
-    }
-
-    fn purge_log_through(&self, request: RaftPurgeRequest) -> RaftDurabilityFuture<'_, ()> {
-        self.raft_persistence_ref().purge_log_through(request)
-    }
-
-    fn load_vote(&self) -> RaftDurabilityFuture<'_, Option<OpaqueRaftBytes>> {
-        self.raft_persistence_ref().load_vote()
-    }
-
-    fn store_vote(&self, encoded_vote: OpaqueRaftBytes) -> RaftDurabilityFuture<'_, ()> {
-        self.raft_persistence_ref().store_vote(encoded_vote)
-    }
-
-    fn load_committed(&self) -> RaftDurabilityFuture<'_, Option<OpaqueRaftBytes>> {
-        self.raft_persistence_ref().load_committed()
-    }
-
-    fn store_committed(&self, encoded_committed: OpaqueRaftBytes) -> RaftDurabilityFuture<'_, ()> {
-        self.raft_persistence_ref()
-            .store_committed(encoded_committed)
-    }
-
-    fn load_or_create_storage_incarnation(&self) -> RaftDurabilityFuture<'_, String> {
-        self.raft_persistence_ref()
-            .load_or_create_storage_incarnation()
-    }
-
-    fn load_storage_log_attestation(&self) -> RaftDurabilityFuture<'_, Option<RaftLogCoordinate>> {
-        self.raft_persistence_ref().load_storage_log_attestation()
-    }
-
-    fn load_storage_boundary_state(
-        &self,
-    ) -> RaftDurabilityFuture<'_, klights_node_store::EncodedRaftStorageBoundary> {
-        self.raft_persistence_ref().load_storage_boundary_state()
-    }
-
-    fn reset_orphaned_learner_log(&self) -> RaftDurabilityFuture<'_, bool> {
-        self.raft_persistence_ref().reset_orphaned_learner_log()
-    }
-}
-
-#[cfg(test)]
-impl RaftLogDurability for crate::datastore::node_local::NodeLocalStores {
-    fn load_storage_current_boundary(&self) -> RaftDurabilityFuture<'_, Option<RaftLogCoordinate>> {
-        load_current_boundary(self.raft_persistence_ref())
-    }
-}
-
-#[cfg(test)]
-impl RaftAppliedStateDurability for crate::datastore::node_local::NodeLocalStores {
-    fn load_applied_state(&self) -> RaftDurabilityFuture<'_, EncodedRaftAppliedState> {
-        self.raft_persistence_ref().load_applied_state()
-    }
-
-    fn store_applied_state(&self, state: RaftAppliedStateWrite) -> RaftDurabilityFuture<'_, ()> {
-        store_applied(self.raft_persistence_ref(), state)
     }
 }
 

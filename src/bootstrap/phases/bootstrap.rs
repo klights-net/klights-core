@@ -81,7 +81,8 @@ pub struct BootstrapRunArgs<'a> {
     pub pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
     pub pod_endpoint_store: Arc<dyn klights_node_store::PodEndpointStore>,
     pub assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
-    pub replication_service_for_router: Option<Arc<crate::replication::ReplicationService>>,
+    pub replication_service_for_router:
+        Option<Arc<klights_replication::service::ReplicationService>>,
     pub outbox_runtime: Arc<crate::node_outbox::Outbox>,
     pub node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
     pub node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
@@ -104,11 +105,12 @@ pub struct BootstrapRunArgs<'a> {
     /// join handler onto the replication gRPC server so peer voters
     /// can drive `RaftAppendEntries` / `RaftVote` / `RaftInstallSnapshot`
     /// and a joining controlplane can call `JoinAsControlplane`.
-    pub raft_node: Option<Arc<crate::datastore::raft::node::RaftNode>>,
+    pub raft_node: Option<Arc<klights_replication::node::RaftNode>>,
     /// Probes each Raft member's replication protocol capabilities before a
     /// leader activates the committed-apply resource-version V1 mode.
-    pub member_feature_probe:
-        Option<Arc<crate::bootstrap::raft_transport::ReplicationGrpcMemberFeatureProbe>>,
+    pub member_feature_probe: Option<
+        Arc<crate::bootstrap::grpc_raft_transport_adapter::ReplicationGrpcMemberFeatureProbe>,
+    >,
     /// T6 step 4: leadership watch sender, created in runtime.rs before
     /// `open_leader`. The shape watcher inside this phase updates it on
     /// every `Raft::metrics()` change so `LocalApiClient`'s inner gate
@@ -150,8 +152,10 @@ impl crate::kubelet::node_leader_labels::NodeLeaderLabelStore for BootstrapNodeL
 }
 
 async fn activate_committed_apply_rv_v1_if_possible(
-    raft: &crate::datastore::raft::node::RaftNode,
-    probe: Option<&Arc<crate::bootstrap::raft_transport::ReplicationGrpcMemberFeatureProbe>>,
+    raft: &klights_replication::node::RaftNode,
+    probe: Option<
+        &Arc<crate::bootstrap::grpc_raft_transport_adapter::ReplicationGrpcMemberFeatureProbe>,
+    >,
 ) -> bool {
     let Some(probe) = probe else {
         return false;
@@ -1825,9 +1829,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             klights_leader_rpc::server::mount_service_full_production(
                 api_router,
                 klights_leader_rpc::server::GrpcReplicationRuntimePorts::from_shared(
-                    crate::replication::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(
-                        rs,
-                    ),
+                    crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(rs),
                 ),
                 grpc_ports,
                 Arc::new(

@@ -67,7 +67,7 @@ pub struct DatastorePhase {
     pub local_api_client: Arc<crate::control_plane::client::local::LocalApiClient>,
     pub authenticated_outbox_delivery:
         Arc<dyn klights_leader_api::LeaderAuthenticatedOutboxDelivery>,
-    pub replication_service: Option<Arc<crate::replication::ReplicationService>>,
+    pub replication_service: Option<Arc<klights_replication::service::ReplicationService>>,
     pub node_local: crate::datastore::node_local::NodeLocalStores,
     pub outbox: Arc<crate::node_outbox::Outbox>,
     pub node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
@@ -77,9 +77,10 @@ pub struct DatastorePhase {
     /// label task — Step D — and the gRPC server's RaftRpcRouter /
     /// ControlplaneJoinHandler — Step E) can subscribe to its state.
     /// `None` for non-raft leader topology boots or workers.
-    pub raft_node: Option<Arc<crate::datastore::raft::node::RaftNode>>,
-    pub member_feature_probe:
-        Option<Arc<crate::bootstrap::raft_transport::ReplicationGrpcMemberFeatureProbe>>,
+    pub raft_node: Option<Arc<klights_replication::node::RaftNode>>,
+    pub member_feature_probe: Option<
+        Arc<crate::bootstrap::grpc_raft_transport_adapter::ReplicationGrpcMemberFeatureProbe>,
+    >,
     /// True when this leader-class boot is a joining Raft controlplane.
     /// Later phases use this to skip seed-only bootstrap writes (default
     /// namespaces, RBAC, node registration) because raft delivers that
@@ -291,7 +292,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 );
             }
             let raft_template =
-                crate::bootstrap::raft_transport::ReplicationGrpcRaftClientTemplate {
+                crate::bootstrap::grpc_raft_transport_adapter::ReplicationGrpcRaftClientTemplate {
                     node_name: config.node_name.clone(),
                     token: String::new(),
                     ca_cert_path,
@@ -302,13 +303,13 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     transport_policy: grpc_transport_policy.clone(),
                 };
             let raft_factory = Arc::new(
-                crate::bootstrap::raft_transport::ReplicationGrpcRaftClientFactory::new(
+                crate::bootstrap::grpc_raft_transport_adapter::ReplicationGrpcRaftClientFactory::new(
                     supervisor.clone(),
                     raft_template.clone(),
                 ),
             );
             member_feature_probe = Some(Arc::new(
-                crate::bootstrap::raft_transport::ReplicationGrpcMemberFeatureProbe::new(
+                crate::bootstrap::grpc_raft_transport_adapter::ReplicationGrpcMemberFeatureProbe::new(
                     supervisor.clone(),
                     raft_template,
                 ),
@@ -319,7 +320,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     if !leader_endpoints.is_empty()
             );
             let raft_network =
-                crate::datastore::raft::grpc_network::GrpcRaftNetwork::new(raft_factory);
+                klights_replication::grpc_network::GrpcRaftNetwork::new(raft_factory);
             let materializer = Arc::new(
                 crate::datastore::cluster_store_adapter::DatastoreRaftCommitMaterializer::new(
                     passive_backend.clone(),
@@ -346,7 +347,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     lifecycle.clone(),
                     materializer.clone(),
                 );
-            let raft_stores = crate::datastore::raft::node::RaftStorePorts::new(
+            let raft_stores = klights_replication::node::RaftStorePorts::new(
                 materializer,
                 state_machine_stores,
                 sqlite_recovery.clone(),
@@ -354,7 +355,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 lifecycle,
             );
             let raft = Arc::new(
-                crate::datastore::raft::node::RaftNode::start_with_network(
+                klights_replication::node::RaftNode::start_with_network(
                     node_id,
                     config.node_name.clone(),
                     raft_stores,
@@ -429,7 +430,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 crate::control_plane::client::local::RootCommittedOutboxDelivery::new(
                     embedded_outbox_delivery,
                     local_api_client.outbox_side_effect_state(),
-                    crate::replication::outbox_payload_codec::new_codec(),
+                    crate::outbox_payload_codec_adapter::new_codec(),
                     config.node_name.clone(),
                 ),
             );
@@ -886,7 +887,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         ),
     );
     let replication_service = Some(Arc::new(
-        crate::replication::ReplicationService::new_with_ports(
+        klights_replication::service::ReplicationService::new_with_ports(
             replication_metadata,
             replication_bootstrap_tokens,
             supervisor.clone(),
@@ -902,7 +903,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             node_local.runtime_observation_checkpoints(),
             node_local.outbox_status_stamps(),
         );
-        let outbox_codec = crate::replication::outbox_payload_codec::new_codec();
+        let outbox_codec = crate::outbox_payload_codec_adapter::new_codec();
         let outbox_wall_clock: Arc<dyn klights_supervisor::WallClock> =
             Arc::new(klights_supervisor::SystemWallClock);
         let ob = Arc::new(crate::node_outbox::Outbox::compose(
@@ -1164,7 +1165,7 @@ async fn controlplane_remote_client_identity_for_role(
 }
 
 async fn wait_for_seed_raft_local_commit_ready(
-    raft: &crate::datastore::raft::node::RaftNode,
+    raft: &klights_replication::node::RaftNode,
     supervisor: &TaskSupervisor,
 ) -> Result<()> {
     if raft.local_commit_materialization_ready() {

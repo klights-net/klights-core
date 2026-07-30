@@ -8,7 +8,7 @@ use klights_leader_api::{
 };
 
 use crate::datastore::DatastoreHandle;
-use crate::datastore::raft::node::RaftNode;
+use klights_replication::node::RaftNode;
 use klights_replication::types::RaftShape;
 
 struct ClusterControlplaneJoinRegistration {

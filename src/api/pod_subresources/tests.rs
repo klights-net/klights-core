@@ -305,7 +305,7 @@ async fn test_remote_websocket_exec_rejects_spdy_upgrade() {
     let mut state = crate::api::test_support::build_test_app_state().await;
     let remote_node = format!("{}-worker", state.operational().config.node_name);
     state.operational_mut().replication = Some(crate::api::ApiRemoteNodeServices::from_test(
-        Arc::new(crate::replication::ReplicationService::new(
+        Arc::new(crate::grpc_test_support::replication_service(
             state.resource_mutation().db.clone(),
             state.operational().task_supervisor.clone(),
         )),
@@ -366,7 +366,7 @@ async fn test_remote_websocket_exec_accepts_upgrade_instead_of_bad_request() {
     let mut state = crate::api::test_support::build_test_app_state().await;
     let remote_node = format!("{}-worker", state.operational().config.node_name);
     state.operational_mut().replication = Some(crate::api::ApiRemoteNodeServices::from_test(
-        Arc::new(crate::replication::ReplicationService::new(
+        Arc::new(crate::grpc_test_support::replication_service(
             state.resource_mutation().db.clone(),
             state.operational().task_supervisor.clone(),
         )),
@@ -435,7 +435,7 @@ async fn test_remote_websocket_attach_accepts_upgrade_instead_of_not_implemented
     let mut state = crate::api::test_support::build_test_app_state().await;
     let remote_node = format!("{}-worker", state.operational().config.node_name);
     state.operational_mut().replication = Some(crate::api::ApiRemoteNodeServices::from_test(
-        Arc::new(crate::replication::ReplicationService::new(
+        Arc::new(crate::grpc_test_support::replication_service(
             state.resource_mutation().db.clone(),
             state.operational().task_supervisor.clone(),
         )),
@@ -504,7 +504,7 @@ async fn test_remote_pod_log_websocket_accepts_upgrade_before_proxying() {
     let mut state = crate::api::test_support::build_test_app_state().await;
     let remote_node = format!("{}-worker", state.operational().config.node_name);
     state.operational_mut().replication = Some(crate::api::ApiRemoteNodeServices::from_test(
-        Arc::new(crate::replication::ReplicationService::new(
+        Arc::new(crate::grpc_test_support::replication_service(
             state.resource_mutation().db.clone(),
             state.operational().task_supervisor.clone(),
         )),
@@ -566,7 +566,7 @@ async fn test_remote_pod_log_follow_keeps_http_body_open_until_terminal_frame() 
 
     let mut state = crate::api::test_support::build_test_app_state().await;
     let remote_node = format!("{}-worker", state.operational().config.node_name);
-    let replication = Arc::new(crate::replication::ReplicationService::new(
+    let replication = Arc::new(crate::grpc_test_support::replication_service(
         state.resource_mutation().db.clone(),
         state.operational().task_supervisor.clone(),
     ));
@@ -632,10 +632,10 @@ async fn test_remote_pod_log_follow_keeps_http_body_open_until_terminal_frame() 
     let mut body_task = tokio::spawn(async move { to_bytes(resp.into_body(), usize::MAX).await });
     replication
         .complete_node_log_event(
-            crate::replication::service::FollowerCompletionContext::new(
+            klights_node_api::FollowerCompletionContext::new(
                 &remote_node,
                 follower_session,
-                crate::replication::service::NodeOperationKind::Log,
+                klights_node_api::NodeOperationKind::Log,
             ),
             klights_node_api::RoutedNodeLogEvent {
                 request_id: request.request_id.clone(),
@@ -646,10 +646,10 @@ async fn test_remote_pod_log_follow_keeps_http_body_open_until_terminal_frame() 
         .unwrap();
     replication
         .complete_node_log_event(
-            crate::replication::service::FollowerCompletionContext::new(
+            klights_node_api::FollowerCompletionContext::new(
                 &remote_node,
                 follower_session,
-                crate::replication::service::NodeOperationKind::Log,
+                klights_node_api::NodeOperationKind::Log,
             ),
             klights_node_api::RoutedNodeLogEvent {
                 request_id: request.request_id.clone(),
@@ -667,10 +667,10 @@ async fn test_remote_pod_log_follow_keeps_http_body_open_until_terminal_frame() 
 
     replication
         .complete_node_log_event(
-            crate::replication::service::FollowerCompletionContext::new(
+            klights_node_api::FollowerCompletionContext::new(
                 &remote_node,
                 follower_session,
-                crate::replication::service::NodeOperationKind::Log,
+                klights_node_api::NodeOperationKind::Log,
             ),
             klights_node_api::RoutedNodeLogEvent {
                 request_id: request.request_id,
@@ -1883,7 +1883,7 @@ async fn test_remote_exec_sync_websocket_closes_after_terminal_status_without_cl
     let db: Arc<dyn crate::datastore::backend::DatastoreBackend> =
         Arc::new(crate::datastore::test_support::in_memory().await);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let replication = Arc::new(crate::replication::ReplicationService::new(
+    let replication = Arc::new(crate::grpc_test_support::replication_service(
         db,
         supervisor.clone(),
     ));
@@ -1908,10 +1908,10 @@ async fn test_remote_exec_sync_websocket_closes_after_terminal_status_without_cl
         };
         replication_for_follower
             .complete_node_exec_sync(
-                crate::replication::service::FollowerCompletionContext::new(
+                klights_node_api::FollowerCompletionContext::new(
                     "worker-1",
                     follower_session,
-                    crate::replication::service::NodeOperationKind::ExecSync,
+                    klights_node_api::NodeOperationKind::ExecSync,
                 ),
                 RoutedNodeExecSyncResponse {
                     request_id: request.request_id,
@@ -1998,7 +1998,7 @@ async fn test_remote_exec_sync_websocket_waits_for_peer_close_reply() {
     let db: Arc<dyn crate::datastore::backend::DatastoreBackend> =
         Arc::new(crate::datastore::test_support::in_memory().await);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let replication = Arc::new(crate::replication::ReplicationService::new(
+    let replication = Arc::new(crate::grpc_test_support::replication_service(
         db,
         supervisor.clone(),
     ));
@@ -2023,10 +2023,10 @@ async fn test_remote_exec_sync_websocket_waits_for_peer_close_reply() {
         };
         replication_for_follower
             .complete_node_exec_sync(
-                crate::replication::service::FollowerCompletionContext::new(
+                klights_node_api::FollowerCompletionContext::new(
                     "worker-1",
                     follower_session,
-                    crate::replication::service::NodeOperationKind::ExecSync,
+                    klights_node_api::NodeOperationKind::ExecSync,
                 ),
                 RoutedNodeExecSyncResponse {
                     request_id: request.request_id,

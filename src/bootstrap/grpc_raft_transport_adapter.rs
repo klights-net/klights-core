@@ -3,7 +3,7 @@
 //! Lives outside `datastore/` so it can reference `TaskSupervisor`
 //! directly (forbidden inside the datastore module by
 //! `scripts/check_supervisor_spawn.sh`). Implements
-//! `datastore::raft::grpc_network::GrpcRaftClientFactory` against the
+//! `klights_replication::grpc_network::GrpcRaftClientFactory` against the
 //! existing `ReplicationGrpcClient` so each Raft peer reuses the same
 //! mTLS / token / connection-pool path as worker→leader joins.
 
@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::datastore::raft::grpc_network::{
+use klights_replication::grpc_network::{
     GrpcRaftClientFactory, GrpcRaftRpcClient, GrpcRaftRpcError, RaftPeerTransportError,
 };
 use klights_supervisor::TaskSupervisor;
@@ -283,8 +283,8 @@ impl klights_replication::membership::MemberFeatureProbe for ReplicationGrpcMemb
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::raft::grpc_network::GrpcRaftRpcError;
     use klights_leader_rpc::client::UnaryRpcError;
+    use klights_replication::grpc_network::GrpcRaftRpcError;
 
     #[test]
     fn local_member_feature_probe_shortcuts_to_local_capabilities() {

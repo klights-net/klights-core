@@ -55,6 +55,7 @@ pub mod node_outbox;
 pub(crate) mod node_routing_metadata;
 mod node_subnet_controller_adapter;
 mod node_taint_manager_side_effect_adapter;
+mod outbox_payload_codec_adapter;
 mod outbox_response_codec_adapter;
 pub mod paths;
 mod pdb_side_effect_adapter;
@@ -73,7 +74,6 @@ pub mod portforward;
 mod positioned_watch_adapter;
 mod remote_informer_cache_adapter;
 mod replicaset_store_adapter;
-pub mod replication;
 mod replicationcontroller_store_adapter;
 mod resource_admission_adapter;
 mod resource_mutation_effects_adapter;
@@ -115,9 +115,21 @@ mod bound_pod_finalization_adapter;
 mod deployment_replicaset_error_test;
 mod deployment_store_adapter;
 #[cfg(test)]
+mod grpc_test_proto_channel_sink;
+#[cfg(test)]
+mod leader_rpc_client_integration_tests;
+#[cfg(test)]
 mod leader_rpc_server_tests;
 #[cfg(test)]
 mod node_conditions_tests;
+#[cfg(test)]
+mod raft_log_storage_tests;
+#[cfg(test)]
+mod raft_node_integration_tests;
+#[cfg(test)]
+mod raft_state_machine_tests;
+#[cfg(test)]
+mod replication_service_integration_tests;
 #[cfg(test)]
 mod resource_quota_event_driven_tests;
 #[cfg(test)]
@@ -135,8 +147,6 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 pub(crate) use grpc_test_support::{
     GrpcReplicationServer, mount_configured_test_service, mount_service, mount_service_full,
 };
-#[cfg(test)]
-pub(crate) use klights_leader_rpc::server::insert_tonic_tcp_connect_info;
 
 fn cli_flags_for_runtime(cli: cli::Cli) -> Result<Option<bootstrap::CliFlags>, String> {
     let role = match cli.node_role()? {

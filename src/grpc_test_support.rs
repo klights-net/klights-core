@@ -9,9 +9,50 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::datastore::backend::DatastoreHandle;
-use crate::replication::service::ReplicationService;
+use klights_replication::service::ReplicationService;
 
 pub(crate) type GrpcReplicationServer = klights_leader_rpc::server::GrpcReplicationServer;
+
+struct TestClusterMetadataRead;
+
+impl klights_cluster_store::ClusterMetadataRead for TestClusterMetadataRead {
+    fn read_cluster_metadata(
+        &self,
+    ) -> klights_cluster_store::ClusterMetadataFuture<
+        '_,
+        klights_cluster_store::PersistedClusterMetadata,
+    > {
+        Box::pin(async {
+            Ok(klights_cluster_store::PersistedClusterMetadata::new(
+                klights_cluster_core::ClusterMetadata {
+                    cluster_id: "klights-test-cluster".to_string(),
+                    leader_epoch: 0,
+                    current_rv: 0,
+                },
+                klights_cluster_store::SnapshotMembership::LegacyOmitted,
+            ))
+        })
+    }
+}
+
+pub(crate) fn replication_service(
+    db: DatastoreHandle,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
+) -> ReplicationService {
+    replication_service_with_metadata(db, Arc::new(TestClusterMetadataRead), supervisor)
+}
+
+pub(crate) fn replication_service_with_metadata(
+    db: DatastoreHandle,
+    metadata: Arc<dyn klights_cluster_store::ClusterMetadataRead>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
+) -> ReplicationService {
+    ReplicationService::new_with_ports(
+        metadata,
+        Arc::new(crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new(db)),
+        supervisor,
+    )
+}
 
 /// Serve one root-composed integration-test router over the same TLS-only
 /// scheme required by the production leader client.
@@ -185,7 +226,7 @@ fn build_test_server(
     let supervisor = service.task_supervisor();
     klights_leader_rpc::server::GrpcReplicationServer::new_with_ports(
         klights_leader_rpc::server::GrpcReplicationRuntimePorts::from_shared(
-            crate::replication::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(service),
+            crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(service),
         ),
         ports,
         Arc::new(
@@ -390,7 +431,7 @@ fn mount_service_full_with_passive_reads(
     klights_leader_rpc::server::mount_service_full_production(
         app,
         klights_leader_rpc::server::GrpcReplicationRuntimePorts::from_shared(
-            crate::replication::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(service),
+            crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(service),
         ),
         ports,
         Arc::new(

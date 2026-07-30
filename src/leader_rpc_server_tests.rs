@@ -22,7 +22,7 @@ use klights_internal_protobuf::{JoinRequest, JoinRole};
 
 use klights_leader_api::{ControlplaneJoinHandler, ControlplaneJoinOutcome};
 
-use crate::replication::service::ReplicationService;
+use klights_replication::service::ReplicationService;
 
 use klights_cluster_core::ReplicationEntry;
 
@@ -115,7 +115,10 @@ async fn grpc_test_server_with_signing_ca(
     drop((ca_cert, ca_key));
 
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     super::GrpcReplicationServer::new(service, db).with_namespace(namespace)
 }
 
@@ -175,7 +178,10 @@ async fn grpc_test_server_full_with_node_cert(
         .await
         .unwrap();
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let node_status = Arc::new(crate::control_plane::client::local::LocalApiClient::new(
         db.clone(),
         "test-leader".to_string(),
@@ -220,7 +226,11 @@ async fn grpc_test_server_full_with_node_cert(
                                 &["system:nodes"],
                             )));
                     }
-                    super::insert_tonic_tcp_connect_info(&mut req, local_addr, Some(remote_addr));
+                    klights_leader_rpc::server::insert_tonic_tcp_connect_info(
+                        &mut req,
+                        local_addr,
+                        Some(remote_addr),
+                    );
                     app.clone().oneshot(req)
                 });
                 let _ = hyper_util::server::conn::auto::Builder::new(
@@ -253,7 +263,10 @@ async fn grpc_test_server_with_policy(
     let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
     let db: DatastoreHandle = Arc::new(db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc = super::GrpcReplicationServer::new_with_passive_reads(service, db, passive_reads)
         .with_watch_heartbeat_interval(policy.watch_heartbeat_interval);
     let app = super::mount_configured_test_service(axum::Router::new(), grpc, policy);
@@ -279,7 +292,11 @@ async fn grpc_test_server_with_policy(
                                 &["system:nodes"],
                             )));
                     }
-                    super::insert_tonic_tcp_connect_info(&mut req, local_addr, Some(remote_addr));
+                    klights_leader_rpc::server::insert_tonic_tcp_connect_info(
+                        &mut req,
+                        local_addr,
+                        Some(remote_addr),
+                    );
                     app.clone().oneshot(req)
                 });
                 let _ = hyper_util::server::conn::auto::Builder::new(
@@ -651,7 +668,10 @@ async fn grpc_leader_server_with_db(
     let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
     let db: DatastoreHandle = Arc::new(db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let (leader_tx, is_leader_rx) = tokio::sync::watch::channel(is_leader);
     let grpc = super::GrpcReplicationServer::new_with_passive_reads(service, db, passive_reads)
         .with_leader_gate(is_leader_rx);
@@ -1427,7 +1447,10 @@ fn request_with_admin_cert<T>(message: T) -> tonic::Request<T> {
 async fn raft_test_server() -> super::GrpcReplicationServer {
     let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     super::GrpcReplicationServer::new(service, db)
 }
 
@@ -1577,7 +1600,10 @@ async fn raft_append_entries_rejects_bootstrap_token() {
         .await
         .unwrap();
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc = super::GrpcReplicationServer::new(service, db);
 
     let status = grpc
@@ -1756,7 +1782,10 @@ async fn renew_node_lease_rejects_mismatched_node() {
             .with_timezone(&chrono::Utc),
     ));
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc = super::GrpcReplicationServer::new_with_node_lease_tracker(
         service,
         db.clone(),
@@ -1785,7 +1814,10 @@ async fn node_effect_rpc_rejects_nonpositive_lease_duration_before_tracker_mutat
     let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
     let tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc =
         super::GrpcReplicationServer::new_with_node_lease_tracker(service, db, tracker.clone());
 
@@ -1824,7 +1856,10 @@ async fn outbox_terminal_decision_rpc_rejects_smuggling_and_malformed_rows_in_or
         .await
         .expect("create worker Node");
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc = super::GrpcReplicationServer::new(service, db.clone());
     let command = StorageCommand::PatchResource {
         api_version: "v1".to_string(),
@@ -1973,7 +2008,10 @@ async fn node_effect_rpc_rejects_wrong_uid_before_committed_apply() {
         .await
         .expect("create worker Node");
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc = super::GrpcReplicationServer::new(service, db.clone());
     let command = StorageCommand::UpdateStatus {
         api_version: "v1".to_string(),
@@ -2053,7 +2091,10 @@ async fn grpc_apply_outbox_accepts_joining_controlplane_node_status() {
         .await
         .expect("create joining controlplane Node");
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc = super::GrpcReplicationServer::new(service, db.clone());
     let payload =
         crate::node_outbox::payload::OutboxPayload::from_command(StorageCommand::UpdateStatus {
@@ -2125,7 +2166,10 @@ async fn grpc_apply_outbox_accepts_joining_controlplane_node_status() {
 async fn outbox_transport_contract_rpc_rejects_unvalidated_stream_identity() {
     let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc = super::GrpcReplicationServer::new(service, db.clone());
     let command = StorageCommand::UpdateNodeDataplane {
         node_name: "worker-1".to_string(),
@@ -2166,7 +2210,10 @@ async fn outbox_transport_contract_rpc_rejects_unvalidated_stream_identity() {
 async fn cleanup_intent_list_requires_current_leader_and_same_node_authority() {
     let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let (_leader_tx, follower_rx) = tokio::sync::watch::channel(false);
     let follower = super::GrpcReplicationServer::new(service.clone(), db.clone())
         .with_leader_gate(follower_rx);
@@ -2200,7 +2247,10 @@ async fn cleanup_intent_list_requires_current_leader_and_same_node_authority() {
 async fn cleanup_intent_ack_requires_current_leader_before_mutation() {
     let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let (_leader_tx, follower_rx) = tokio::sync::watch::channel(false);
     let follower = super::GrpcReplicationServer::new(service, db).with_leader_gate(follower_rx);
 
@@ -2349,7 +2399,10 @@ async fn renew_node_lease_rejects_renew_time_skew_over_100_seconds() {
         wall_time,
     ));
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc = super::GrpcReplicationServer::new_with_node_lease_tracker(
         service,
         db.clone(),
@@ -2383,7 +2436,10 @@ async fn apply_outbox_rejects_node_dataplane_for_mismatched_author() {
     let db = crate::datastore::test_support::in_memory().await;
     let db: DatastoreHandle = Arc::new(db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc = super::GrpcReplicationServer::new(service, db.clone());
     let command = StorageCommand::UpdateNodeDataplane {
         node_name: "worker-2".to_string(),
@@ -2433,7 +2489,10 @@ async fn get_metadata_rpc_returns_cluster_metadata_for_node_cert() {
     // T3: `append_log_apply_entry` removed. `current_log_index`
     // always returns 0; the raft `last_applied` is authoritative.
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc = super::GrpcReplicationServer::new(service, db);
 
     let response = grpc
@@ -2453,7 +2512,10 @@ async fn get_metadata_rpc_returns_cluster_metadata_for_node_cert() {
 async fn observe_peer_endpoint_records_authenticated_node_remote_ip() {
     let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc = super::GrpcReplicationServer::new(service.clone(), db);
     let mut request = request_with_node_client_cert(
         klights_internal_protobuf::ObservePeerEndpointRequest {
@@ -2697,7 +2759,10 @@ async fn get_metadata_rpc_rejects_missing_node_client_certificate() {
         .await
         .unwrap();
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc = super::GrpcReplicationServer::new(service, db);
 
     let status = grpc
@@ -2717,7 +2782,10 @@ async fn get_metadata_rpc_rejects_bootstrap_token_after_join_bootstrap() {
         .await
         .unwrap();
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc = super::GrpcReplicationServer::new(service, db);
 
     let status = grpc
@@ -2734,7 +2802,10 @@ async fn get_metadata_rpc_accepts_node_client_cert_without_bootstrap_token() {
         .await
         .unwrap();
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc = super::GrpcReplicationServer::new(service, db);
 
     let response = grpc
@@ -2764,7 +2835,10 @@ async fn renew_node_lease_rpc_rejects_bootstrap_token_on_leader() {
             .with_timezone(&chrono::Utc),
     ));
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc =
         super::GrpcReplicationServer::new_with_node_lease_tracker(service, db, tracker.clone());
 
@@ -2797,7 +2871,10 @@ async fn renew_node_lease_rpc_updates_memory_without_cluster_db_write() {
         wall_time,
     ));
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc = super::GrpcReplicationServer::new_with_node_lease_tracker(
         service,
         db.clone(),
@@ -2851,7 +2928,10 @@ async fn renew_node_lease_rpc_rejects_follower_local_heartbeat_write() {
             .with_timezone(&chrono::Utc),
     ));
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let (_is_leader_tx, is_leader_rx) = tokio::sync::watch::channel(false);
     let grpc =
         super::GrpcReplicationServer::new_with_node_lease_tracker(service, db, tracker.clone())
@@ -2998,7 +3078,10 @@ async fn join_as_controlplane_rejects_worker_node_cert_without_controlplane_toke
         .await
         .unwrap();
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let (_is_leader_tx, is_leader_rx) = tokio::sync::watch::channel(true);
     let grpc = super::GrpcReplicationServer::new(service, db)
         .with_controlplane_join_handler(Arc::new(NonMemberControlplaneJoinHandler))
@@ -3049,7 +3132,10 @@ async fn join_as_controlplane_accepts_valid_controlplane_token_for_first_join() 
     )
     .await;
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let (_is_leader_tx, is_leader_rx) = tokio::sync::watch::channel(true);
     let grpc = super::GrpcReplicationServer::new(service, db)
         .with_controlplane_join_handler(Arc::new(NonMemberControlplaneJoinHandler))
@@ -3127,7 +3213,10 @@ async fn mount_service_accepts_replication_router_prefix() {
         .await
         .unwrap();
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let _router = super::mount_service(
         axum::Router::new(),
         service,
@@ -3147,7 +3236,10 @@ async fn mounted_router_does_not_send_plain_rest_unknown_paths_to_grpc() {
         .await
         .unwrap();
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let app = super::mount_service(
         axum::Router::new(),
         service,
@@ -3584,7 +3676,10 @@ async fn apply_outbox_pod_status_enqueues_matching_service() {
         crate::controllers::service::ServiceIpam::new("10.43.128.0/17"),
     )));
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+    let service = Arc::new(crate::grpc_test_support::replication_service(
+        db.clone(),
+        supervisor,
+    ));
     let grpc = super::GrpcReplicationServer::new_with_controller_dispatcher(
         service,
         db.clone(),
@@ -3699,7 +3794,7 @@ async fn apply_outbox_pod_status_enqueues_matching_service() {
 #[tokio::test]
 async fn channel_snapshot_sink_forwards_typed_restore_operations() {
     use crate::datastore::snapshot_export::stream_snapshot_commits;
-    use crate::replication::test_proto_channel_sink::TestProtoChannelSink;
+    use crate::grpc_test_proto_channel_sink::TestProtoChannelSink;
 
     // Build a fixture cluster with a couple of resources so the snapshot
     // emitter has real commits to stream.

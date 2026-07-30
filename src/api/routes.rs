@@ -1098,7 +1098,7 @@ mod status_tests {
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let replication = std::sync::Arc::new(crate::replication::ReplicationService::new(
+        let replication = std::sync::Arc::new(crate::grpc_test_support::replication_service(
             state.resource_mutation().db.clone(),
             supervisor,
         ));

@@ -738,7 +738,7 @@ impl LocalApiClient {
             let committed_outbox = Arc::new(RootCommittedOutboxDelivery::new(
                 embedded_outbox,
                 outbox_side_effects.clone(),
-                crate::replication::outbox_payload_codec::new_codec(),
+                crate::outbox_payload_codec_adapter::new_codec(),
                 authoring_node.clone(),
             ));
             LocalApiTestServices {

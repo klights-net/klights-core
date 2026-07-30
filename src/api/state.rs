@@ -349,7 +349,9 @@ impl ApiRemoteNodeServices {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_test(replication: Arc<crate::replication::ReplicationService>) -> Self {
+    pub(crate) fn from_test(
+        replication: Arc<klights_replication::service::ReplicationService>,
+    ) -> Self {
         Self::new(replication.clone(), replication.clone(), replication)
     }
 }

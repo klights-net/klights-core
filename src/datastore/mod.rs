@@ -11,7 +11,6 @@ pub mod diagnostics;
 pub mod domain;
 pub mod node_local;
 pub mod pod_serviceaccount;
-pub mod raft;
 pub mod redb;
 pub(crate) mod selector;
 pub mod snapshot;
@@ -50,6 +49,5 @@ pub use types::{
 #[cfg(test)]
 pub use sqlite::test_support;
 
-pub(crate) use klights_replication::types::{AppliedMutation, StorageCommandResult};
 #[cfg(test)]
 pub use sqlite::{create_staged_post_commit, staged_post_commit_from_event, staged_test_event};

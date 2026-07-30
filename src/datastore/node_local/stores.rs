@@ -149,11 +149,6 @@ impl NodeLocalStores {
     }
 
     #[cfg(test)]
-    pub(crate) fn raft_persistence_ref(&self) -> &SqliteRaftDurability {
-        &self.raft_persistence
-    }
-
-    #[cfg(test)]
     pub(crate) fn executor_for_test(&self) -> DbExecutor {
         self.executor.clone()
     }

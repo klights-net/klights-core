@@ -704,7 +704,6 @@ mod tests {
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::backend::DatastoreHandle;
     use crate::node_outbox::payload::OutboxPayload;
-    use crate::replication::service::ReplicationService;
     use klights_cluster_core::command::StorageCommand;
     use klights_leader_api::JoinRole;
     use klights_leader_api::OutboxDeliveryError as OutboxApplyError;
@@ -782,7 +781,10 @@ mod tests {
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
+        let service = Arc::new(crate::grpc_test_support::replication_service(
+            db.clone(),
+            supervisor.clone(),
+        ));
         let app = crate::grpc_test_support::mount_service_with_passive_reads(
             axum::Router::new(),
             service,
