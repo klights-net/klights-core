@@ -583,7 +583,7 @@ impl ServiceRouter for NftServiceRouter {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ServiceRoutingWatchTarget {
     api_version: &'static str,
     kind: &'static str,
@@ -827,9 +827,12 @@ async fn run_service_routing_watch_worker(
 
     tracing::info!("nft service routing watch worker started");
 
-    // Consecutive failed reconnects; reset to 0 once a watch event is received.
-    // Drives the shared exponential reconnect backoff (500ms→60s).
-    let mut reconnect_attempt: u32 = 0;
+    // Each watch target owns its own reconnect history. A healthy Service
+    // event must not erase a flapping Pod watch's backoff, and a Pod closure
+    // must not delay the first reconnect for an independently closed
+    // EndpointSlice watch after a real leader transition.
+    let mut reconnect_attempts = std::collections::HashMap::<ServiceRoutingWatchTarget, u32>::new();
+    let mut watch_set_reconnect_attempt: u32 = 0;
     loop {
         let mut streams = match open_service_routing_watch_set(&leader_watch).await {
             Ok(streams) => streams,
@@ -843,16 +846,17 @@ async fn run_service_routing_watch_worker(
                 if !service_routing_watch_reconnect_delay(
                     &task_supervisor,
                     &cancel,
-                    reconnect_attempt,
+                    watch_set_reconnect_attempt,
                 )
                 .await
                 {
                     break;
                 }
-                reconnect_attempt = reconnect_attempt.saturating_add(1);
+                watch_set_reconnect_attempt = watch_set_reconnect_attempt.saturating_add(1);
                 continue;
             }
         };
+        watch_set_reconnect_attempt = 0;
 
         // The watches above only deliver events observed after each stream is
         // opened. A full sync after the watch set is established closes the
@@ -873,14 +877,14 @@ async fn run_service_routing_watch_worker(
                         Some(ServiceRoutingWatchItem::Event { target, event: Ok(event) }) => {
                             match apply_service_routing_watch_event_to_inventory(table.as_ref(), target, event) {
                                 Ok(Some(super::inventory::InventoryApply::Applied | super::inventory::InventoryApply::Removed)) => {
-                                    reconnect_attempt = 0;
+                                    reconnect_attempts.insert(target, 0);
                                     if service_inventory_watch_target_requires_full_sync(target) {
                                         force_full_sync.store(true, Ordering::Release);
                                     }
                                     notify.notify_one();
                                 }
                                 Ok(Some(super::inventory::InventoryApply::NoChange)) => {
-                                    reconnect_attempt = 0;
+                                    reconnect_attempts.insert(target, 0);
                                 }
                                 Ok(None) => {
                                     force_full_sync.store(true, Ordering::Release);
@@ -934,10 +938,12 @@ async fn run_service_routing_watch_worker(
                             // (500ms -> 60s) to avoid a tight reconnect loop
                             // that would starve the async runtime — the same
                             // backoff the old full-reopen path applied via this
-                            // loop's outer arm. reconnect_attempt is reset to 0
-                            // once a healthy event arrives (see the Ok arm above).
-                            let attempt = reconnect_attempt;
-                            reconnect_attempt = reconnect_attempt.saturating_add(1);
+                            // loop's outer arm. The attempt is target-local and
+                            // resets only when this target delivers a healthy
+                            // event (see the Ok arm above).
+                            let attempt = reconnect_attempts.get(&target).copied().unwrap_or(0);
+                            reconnect_attempts
+                                .insert(target, attempt.saturating_add(1));
                             let backoff_cancelled = attempt > 0
                                 && !service_routing_watch_reconnect_delay(
                                     &task_supervisor,
@@ -989,12 +995,16 @@ async fn run_service_routing_watch_worker(
             }
         }
 
-        if !service_routing_watch_reconnect_delay(&task_supervisor, &cancel, reconnect_attempt)
-            .await
+        if !service_routing_watch_reconnect_delay(
+            &task_supervisor,
+            &cancel,
+            watch_set_reconnect_attempt,
+        )
+        .await
         {
             break;
         }
-        reconnect_attempt = reconnect_attempt.saturating_add(1);
+        watch_set_reconnect_attempt = watch_set_reconnect_attempt.saturating_add(1);
     }
     tracing::info!("nft service routing watch worker exited");
 }
@@ -1266,6 +1276,13 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct ClosingOnceAllLeaderApiClient {
+        watches_opened: AtomicUsize,
+        opened_notify: Notify,
+        opens_by_target: Mutex<std::collections::HashMap<(String, String), usize>>,
+    }
+
+    #[derive(Default)]
     struct ReopeningEndpointSource {
         subscriptions: AtomicUsize,
     }
@@ -1383,6 +1400,17 @@ mod tests {
         }
     }
 
+    impl ClosingOnceAllLeaderApiClient {
+        async fn wait_for_opened(&self, expected: usize) {
+            loop {
+                if self.watches_opened.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                self.opened_notify.notified().await;
+            }
+        }
+    }
+
     fn expected_service_routing_watch_targets() -> Vec<(String, String)> {
         SERVICE_ROUTING_WATCH_TARGETS
             .iter()
@@ -1438,6 +1466,34 @@ mod tests {
                 && !self
                     .closed_endpoints_once
                     .swap(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if close {
+                    Ok(WatchStream::unpositioned_test_stream(
+                        futures::stream::empty(),
+                    ))
+                } else {
+                    Ok(WatchStream::unpositioned_test_stream(
+                        futures::stream::pending(),
+                    ))
+                }
+            })
+        }
+    }
+
+    impl LeaderWatch for ClosingOnceAllLeaderApiClient {
+        fn watch_resources(&self, req: WatchRequest) -> LeaderWatchFuture<'_> {
+            self.watches_opened.fetch_add(1, Ordering::SeqCst);
+            self.opened_notify.notify_waiters();
+            let key = (req.api_version().to_string(), req.kind().to_string());
+            let close = {
+                let mut opens = self
+                    .opens_by_target
+                    .lock()
+                    .expect("watch target count lock not poisoned");
+                let count = opens.entry(key).or_default();
+                *count += 1;
+                *count == 1
+            };
             Box::pin(async move {
                 if close {
                     Ok(WatchStream::unpositioned_test_stream(
@@ -1640,6 +1696,49 @@ mod tests {
         )
         .await
         .expect("watch worker must reconnect the closed watch without reopening all watches");
+
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), worker.join())
+            .await
+            .expect("watch worker must exit after cancellation")
+            .expect("watch worker task must not panic");
+    }
+
+    #[tokio::test]
+    async fn independent_watch_closures_reopen_without_cross_target_backoff() {
+        let client = Arc::new(ClosingOnceAllLeaderApiClient::default());
+        let notify = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let table = test_service_table(supervisor.clone());
+        let force_full_sync = Arc::new(AtomicBool::new(false));
+
+        let worker = supervisor
+            .spawn_async(
+                klights_supervisor::TaskCategory::Network,
+                "test_service_routing_independent_watch_reopen",
+                run_service_routing_watch_worker(
+                    client.clone(),
+                    table,
+                    notify,
+                    cancel.clone(),
+                    supervisor.clone(),
+                    force_full_sync,
+                ),
+            )
+            .await
+            .expect("spawn watch worker under task supervisor");
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            client.wait_for_opened(SERVICE_ROUTING_WATCH_TARGETS.len() * 2),
+        )
+        .await
+        .expect(
+            "each independently closed watch must get its first reconnect without waiting for another target's backoff",
+        );
 
         cancel.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(1), worker.join())

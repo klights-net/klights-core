@@ -1268,15 +1268,14 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                             );
                             return;
                         }
-                        // Always update the authority capability on
-                        // every metrics change — RaftShape only tracks
-                        // (voter_count, is_leader, is_learner) and does
-                        // NOT capture current_leader identity. When the
-                        // leader changes from node A to node C, followers
-                        // (node B) see is_leader=false both before and
-                        // after, so the shape comparison would skip the
-                        // proxy update, leaving the follower's API proxy
-                        // pinned to the dead leader's address.
+                        // Observe authority on every metrics change —
+                        // RaftShape only tracks (voter_count, is_leader,
+                        // is_learner) and does NOT capture current_leader
+                        // identity. AuthorityPublisher suppresses an exact
+                        // duplicate (local, endpoint) observation so ordinary
+                        // Raft progress cannot revoke healthy watch permits.
+                        // A real leader change still publishes even when this
+                        // follower remains non-leader before and after it.
                         let is_leader = raft_task.is_leader();
                         publish_leadership_if_changed(&is_leader_tx_task, is_leader);
                         if !is_leader {

@@ -25,11 +25,14 @@ pub struct AuthorityPublisher {
 
 impl AuthorityPublisher {
     pub fn publish(&self, local: bool, endpoint: Option<String>) {
-        let generation = self.sender.borrow().generation.checked_add(1).unwrap_or(1);
-        self.sender.send_replace(AuthorityState {
-            generation,
-            local,
-            endpoint,
+        self.sender.send_if_modified(|state| {
+            if state.local == local && state.endpoint == endpoint {
+                return false;
+            }
+            state.generation = state.generation.checked_add(1).unwrap_or(1);
+            state.local = local;
+            state.endpoint = endpoint;
+            true
         });
     }
 }
@@ -242,6 +245,50 @@ mod tests {
         assert_eq!(
             authority.validate(&permit),
             Err(AuthorityError::NotAuthoritative)
+        );
+    }
+
+    #[test]
+    fn identical_authority_publication_preserves_live_permit() {
+        let endpoint = Some("https://leader.example".to_string());
+        let (authority, publisher) = WatchLeaderAuthority::channel(true, endpoint.clone());
+        let AuthorityRoute::Local(permit) = authority.route() else {
+            panic!("expected local permit");
+        };
+        let mut revocation = authority.wait_for_revocation(&permit);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+
+        publisher.publish(true, endpoint);
+
+        assert!(
+            authority.validate(&permit).is_ok(),
+            "an unchanged authority observation must not revoke active watch permits"
+        );
+        assert!(
+            std::future::Future::poll(revocation.as_mut(), &mut context).is_pending(),
+            "the long-lived watch permit must remain active after an identical observation"
+        );
+
+        publisher.publish(true, Some("https://new-leader.example".to_string()));
+        assert!(
+            std::future::Future::poll(revocation.as_mut(), &mut context).is_ready(),
+            "a real authority change must promptly revoke the old watch permit"
+        );
+    }
+
+    #[test]
+    fn changed_authority_endpoint_revokes_live_permit() {
+        let (authority, publisher) =
+            WatchLeaderAuthority::channel(true, Some("https://leader-a.example".to_string()));
+        let AuthorityRoute::Local(permit) = authority.route() else {
+            panic!("expected local permit");
+        };
+
+        publisher.publish(true, Some("https://leader-b.example".to_string()));
+
+        assert_eq!(
+            authority.validate(&permit),
+            Err(AuthorityError::StalePermit)
         );
     }
 }
