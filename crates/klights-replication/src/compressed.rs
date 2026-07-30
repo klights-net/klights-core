@@ -41,6 +41,7 @@ pub fn encode(raw: &[u8]) -> Result<Vec<u8>> {
 /// Decode a framed payload produced by [`encode`]. The leading tag selects
 /// zstd-decompression or a raw passthrough. An unrecognized tag is an error
 /// rather than a silent misinterpretation.
+#[cfg(test)]
 pub fn decode(framed: &[u8]) -> Result<Vec<u8>> {
     let Some((&tag, rest)) = framed.split_first() else {
         anyhow::bail!("compressed payload missing framing tag");

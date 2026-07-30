@@ -1,12 +1,7 @@
-mod authority;
-pub(crate) use authority::snapshot_install;
-pub mod compressed;
 pub mod grpc_network;
 
-pub(crate) use authority::SnapshotInstallAuthority;
 pub mod network;
 pub mod node;
-pub(crate) mod snapshot;
 
 #[cfg(test)]
 pub(crate) fn test_unproven_member(

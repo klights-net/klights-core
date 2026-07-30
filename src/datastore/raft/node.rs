@@ -57,7 +57,8 @@ pub(crate) use klights_replication::proposal::RAFT_MAX_INFLIGHT_PROPOSALS;
 pub struct RaftStorePorts {
     materializer: Arc<dyn RaftCommitMaterializer>,
     state_machine: RaftStateMachineStorePorts,
-    recovery: Arc<dyn crate::datastore::DurableRecoveryStore>,
+    snapshot_capture: Arc<dyn klights_cluster_store::AuthoritativeSnapshotCapture>,
+    allocator: Arc<dyn klights_cluster_store::DurableAllocatorRead>,
     lifecycle: Arc<dyn BackendLifecycleStore>,
 }
 
@@ -65,13 +66,15 @@ impl RaftStorePorts {
     pub(crate) fn new(
         materializer: Arc<dyn RaftCommitMaterializer>,
         state_machine: RaftStateMachineStorePorts,
-        recovery: Arc<dyn crate::datastore::DurableRecoveryStore>,
+        snapshot_capture: Arc<dyn klights_cluster_store::AuthoritativeSnapshotCapture>,
+        allocator: Arc<dyn klights_cluster_store::DurableAllocatorRead>,
         lifecycle: Arc<dyn BackendLifecycleStore>,
     ) -> Self {
         Self {
             materializer,
             state_machine,
-            recovery,
+            snapshot_capture,
+            allocator,
             lifecycle,
         }
     }
@@ -207,12 +210,13 @@ impl RaftNode {
         let log_store = SqliteRaftLogStorage::new(log_durability, supervisor.clone());
         let command_codec_v3_activation =
             Arc::new(CommandCodecV3Activation::load(stores.materializer.as_ref()).await?);
-        let snapshot_builder = super::snapshot::SqliteRaftSnapshotBuilder {
-            recovery: stores.recovery,
-            lifecycle: stores.lifecycle,
-            applied_state: applied_state_durability.clone(),
+        let snapshot_builder = klights_replication::snapshot::SqliteRaftSnapshotBuilder::new(
+            stores.snapshot_capture,
+            stores.allocator,
+            stores.lifecycle,
+            applied_state_durability.clone(),
             supervisor,
-        };
+        );
         let state_machine = SqliteRaftStateMachine::new_with_command_codec_activation(
             stores.state_machine,
             applied_state_durability,

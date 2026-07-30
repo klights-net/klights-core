@@ -5,7 +5,6 @@ mod tests {
 
     use crate::datastore::DatastoreBackend;
     use crate::datastore::node_local::NodeLocalStores;
-    use crate::datastore::raft::snapshot::RaftSnapshotData;
     use klights_replication::activation::CommandCodecV3Activation;
     use klights_replication::state_machine::SqliteRaftStateMachine;
     use klights_replication::types::{NodeId, RaftMemberNode, TypeConfig};
@@ -15,7 +14,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     type TestRaftStateMachine =
-        SqliteRaftStateMachine<crate::datastore::raft::snapshot::SqliteRaftSnapshotBuilder>;
+        SqliteRaftStateMachine<klights_replication::snapshot::SqliteRaftSnapshotBuilder>;
 
     async fn state_machine(
         backend: Arc<crate::datastore::sqlite::Datastore>,
@@ -45,16 +44,15 @@ mod tests {
             crate::datastore::cluster_store_adapter::raft_state_machine_store_ports_for_test(
                 backend.clone(),
             );
-        let snapshot_builder = crate::datastore::raft::snapshot::SqliteRaftSnapshotBuilder {
-            recovery: Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(
-                backend.clone(),
-            )),
-            lifecycle: Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(
+        let snapshot_builder = klights_replication::snapshot::SqliteRaftSnapshotBuilder::new(
+            backend.focused_recovery_store(),
+            backend.focused_read_store(),
+            Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(
                 backend,
             )),
-            applied_state: applied_state.clone(),
+            applied_state.clone(),
             supervisor,
-        };
+        );
         (
             SqliteRaftStateMachine::new_with_command_codec_activation(
                 stores,
@@ -69,6 +67,48 @@ mod tests {
     fn snapshot_watch_page_pause_test_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    struct PausedAppliedState {
+        inner: Arc<NodeLocalStores>,
+        reached: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    impl PausedAppliedState {
+        fn new(inner: Arc<NodeLocalStores>) -> Self {
+            Self {
+                inner,
+                reached: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    impl klights_node_store::RaftAppliedStateDurability for PausedAppliedState {
+        fn load_applied_state(
+            &self,
+        ) -> klights_node_store::RaftDurabilityFuture<'_, klights_node_store::EncodedRaftAppliedState>
+        {
+            Box::pin(async move {
+                self.reached.notify_one();
+                self.resume.notified().await;
+                klights_node_store::RaftAppliedStateDurability::load_applied_state(
+                    self.inner.as_ref(),
+                )
+                .await
+            })
+        }
+
+        fn store_applied_state(
+            &self,
+            state: klights_node_store::RaftAppliedStateWrite,
+        ) -> klights_node_store::RaftDurabilityFuture<'_, ()> {
+            klights_node_store::RaftAppliedStateDurability::store_applied_state(
+                self.inner.as_ref(),
+                state,
+            )
+        }
     }
 
     async fn fresh_sm() -> TestRaftStateMachine {
@@ -523,23 +563,145 @@ mod tests {
 
         let snapshot = snapshot_task.await.unwrap().unwrap();
         apply_task.await.unwrap().unwrap();
-        let decoded =
-            RaftSnapshotData::deserialize_from_bytes(snapshot.snapshot.get_ref()).unwrap();
-        assert_eq!(decoded.watch_event_high_water, Some(512));
+        let destination: Arc<crate::datastore::sqlite::Datastore> =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        let mut destination_state_machine = build_sm_with_backend(destination.clone()).await;
+        destination_state_machine
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            destination
+                .current_watch_replay_position()
+                .await
+                .unwrap()
+                .event_id,
+            512
+        );
         assert!(
-            !decoded.operations.iter().any(|operation| {
-                operation.mutations().iter().any(|mutation| match mutation {
-                    klights_cluster_core::LogApplyMutation::PutResource(row) => {
-                        row.name == "late-resource"
-                    }
-                    klights_cluster_core::LogApplyMutation::PutWatchEvent(row) => {
-                        row.name == "late-resource"
-                    }
-                    _ => false,
-                })
-            }),
+            destination
+                .get_resource("v1", "ConfigMap", Some("default"), "late-resource")
+                .await
+                .unwrap()
+                .is_none(),
             "post-anchor materialized state and its event must both remain outside the snapshot"
         );
+    }
+
+    #[tokio::test]
+    async fn disk_snapshot_fence_covers_applied_state_anchor_and_capture_pin() {
+        let directory = tempfile::tempdir().expect("create disk snapshot fixture");
+        std::fs::set_permissions(
+            directory.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("secure disk snapshot fixture");
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let backend = Arc::new(
+            crate::datastore::sqlite::Datastore::new_persistent_paths(
+                &directory.path().join("cluster.db"),
+                supervisor.clone(),
+                None,
+            )
+            .await
+            .expect("open persistent snapshot fixture"),
+        );
+        seed_snapshot_identity(backend.as_ref()).await;
+        let node_executor = klights_node_datastore::open::open_with_opts(
+            klights_node_datastore::open::in_memory_opts(),
+            supervisor.clone(),
+            "sqlite:raft-snapshot-anchor-node",
+        )
+        .await
+        .expect("open node-local snapshot fixture");
+        let node_local =
+            Arc::new(NodeLocalStores::from_executor(node_executor).expect("create node-local db"));
+        let paused_applied_state = Arc::new(PausedAppliedState::new(node_local.clone()));
+        let materializer =
+            crate::datastore::cluster_store_adapter::DatastoreRaftCommitMaterializer::new(
+                backend.clone(),
+            );
+        let activation = Arc::new(
+            CommandCodecV3Activation::load(&materializer)
+                .await
+                .expect("load command codec activation"),
+        );
+        let stores =
+            crate::datastore::cluster_store_adapter::raft_state_machine_store_ports_for_test(
+                backend.clone(),
+            );
+        let snapshot_builder = klights_replication::snapshot::SqliteRaftSnapshotBuilder::new(
+            backend.focused_recovery_store(),
+            backend.focused_read_store(),
+            Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(
+                backend,
+            )),
+            paused_applied_state.clone(),
+            supervisor,
+        );
+        let mut state_machine = SqliteRaftStateMachine::new_with_command_codec_activation(
+            stores,
+            node_local,
+            snapshot_builder,
+            activation,
+        );
+        let mut builder = state_machine.get_snapshot_builder().await;
+        let snapshot_task = tokio::spawn(async move { builder.build_snapshot().await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            paused_applied_state.reached.notified(),
+        )
+        .await
+        .expect("snapshot must pause while reading its applied-state anchor");
+
+        let commit = crate::datastore::test_support::test_live_commit(
+            1,
+            vec![klights_cluster_core::LogApplyMutation::PutResource(
+                klights_cluster_core::LogApplyResourceRow {
+                    api_version: "v1".to_string(),
+                    kind: "ConfigMap".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "post-anchor".to_string(),
+                    uid: "post-anchor-uid".to_string(),
+                    resource_version: 0,
+                    data: serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": "post-anchor",
+                            "namespace": "default",
+                            "uid": "post-anchor-uid"
+                        }
+                    }),
+                    require_absent: false,
+                    require_existing: false,
+                    precondition_uid: None,
+                    precondition_resource_version: None,
+                    status_only: false,
+                },
+            )],
+        );
+        let payload = klights_replication::log_apply_wire::encode_commit_protobuf(&commit).unwrap();
+        let mut apply_task = tokio::spawn(async move {
+            state_machine
+                .apply(vec![Entry::<TypeConfig> {
+                    log_id: LogId::new(LeaderId::new(1, 1), 1),
+                    payload: EntryPayload::Normal(
+                        klights_replication::types::StorageCommandPayload::from_bytes(payload),
+                    ),
+                }])
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut apply_task)
+                .await
+                .is_err(),
+            "committed apply must remain fenced until applied state and datastore snapshot share one anchor"
+        );
+
+        paused_applied_state.resume.notify_one();
+        snapshot_task.await.unwrap().unwrap();
+        apply_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -1026,22 +1188,6 @@ mod tests {
         let snapshot = builder.build_snapshot().await.expect("build snapshot");
         race.await.expect("concurrent applier finished");
         let snapshot_bytes = snapshot.snapshot.into_inner();
-
-        let data = RaftSnapshotData::deserialize_from_bytes(&snapshot_bytes)
-            .expect("deserialize snapshot");
-        let max_emitted_rv = data
-            .operations
-            .iter()
-            .map(klights_cluster_core::SnapshotRestoreOperation::resource_version)
-            .max()
-            .unwrap_or(0);
-        assert!(
-            data.current_rv >= max_emitted_rv,
-            "snapshot current_rv ({}) must be >= every emitted commit's resourceVersion (max {}); \
-             otherwise install_snapshot rejects the snapshot for being ahead of current_rv",
-            data.current_rv,
-            max_emitted_rv,
-        );
 
         // The snapshot must install cleanly on a fresh follower: a follower
         // applying replace_replicated_resource_state must not reject it.

@@ -215,14 +215,139 @@ fn snapshot_from_capture(
             floors.extend_from_slice(rows);
         }
     }
-    AuthoritativeSnapshot::try_new(
+    AuthoritativeSnapshot::try_new_restore_envelope(
         operations,
+        current_rv,
         Some(header.position()),
         Some(floors),
-        header.metadata().clone(),
+        Some(header.metadata().clone()),
         header.membership().clone(),
+        header.command_codec_activation_version(),
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn canonical_snapshot_restore_preserves_exact_v3_activation() {
+    let executor = sqlite::open_in_memory(supervisor(), "phase12e:canonical-v3")
+        .await
+        .unwrap();
+    let recovery = SqliteRecoveryStore::new(
+        executor.clone(),
+        executor.read_lane_clone(),
+        None,
+        Arc::new(tokio::sync::RwLock::new(())),
+        Arc::new(JsonCodec),
+    );
+    let snapshot = AuthoritativeSnapshot::try_new_restore_envelope(
+        Vec::new(),
+        0,
+        Some(WatchReplayPosition {
+            resource_version: 0,
+            event_id: 0,
+            resource_version_filter_through_event_id: 0,
+        }),
+        Some(Vec::new()),
+        Some(ClusterMetadata {
+            cluster_id: "phase12e-v3".to_string(),
+            leader_epoch: 1,
+            current_rv: 0,
+        }),
+        CanonicalMembership::AuthoritativeAbsent,
+        Some(3),
+    )
+    .unwrap();
+
+    recovery
+        .restore_authoritative_snapshot(snapshot)
+        .await
+        .unwrap();
+
+    let activation = executor
+        .call_raw("phase12e_read_activation", |connection| {
+            connection
+                .query_row(
+                    "SELECT value FROM _klights_meta
+                     WHERE key = 'command_codec_activation_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(tokio_rusqlite::Error::from)
+        })
+        .await
+        .unwrap();
+    assert_eq!(activation, COMMAND_CODEC_V3_ACTIVATION_VALUE);
+}
+
+#[tokio::test]
+async fn canonical_snapshot_restore_preserves_legacy_metadata_omission_and_current_rv() {
+    let executor = sqlite::open_in_memory(supervisor(), "phase12e:canonical-legacy")
+        .await
+        .unwrap();
+    let recovery = SqliteRecoveryStore::new(
+        executor.clone(),
+        executor.read_lane_clone(),
+        None,
+        Arc::new(tokio::sync::RwLock::new(())),
+        Arc::new(JsonCodec),
+    );
+    let membership = ClusterMembership {
+        cluster_id: "phase12e-legacy".to_string(),
+        voters: vec!["cp-1".to_string()],
+        term: 4,
+        leader_hint: Some("cp-1".to_string()),
+    };
+    recovery
+        .restore_snapshot_parts(
+            Vec::new(),
+            1,
+            Some(0),
+            Some(Vec::new()),
+            Some(SnapshotMetadata {
+                cluster_id: membership.cluster_id.clone(),
+                leader_epoch: 3,
+                membership: SnapshotMembership::Present(membership.clone()),
+                command_codec_activation_version: Some(3),
+            }),
+        )
+        .await
+        .unwrap();
+
+    let legacy = AuthoritativeSnapshot::try_new_restore_envelope(
+        Vec::new(),
+        7,
+        None,
+        None,
+        None,
+        CanonicalMembership::LegacyOmitted,
+        None,
+    )
+    .unwrap();
+    recovery
+        .restore_authoritative_snapshot(legacy)
+        .await
+        .unwrap();
+
+    let observed = recovery.read_cluster_metadata().await.unwrap();
+    assert_eq!(observed.metadata().cluster_id, membership.cluster_id);
+    assert_eq!(observed.metadata().leader_epoch, 3);
+    assert_eq!(
+        observed.membership(),
+        &CanonicalMembership::Present(membership)
+    );
+    let current_rv = executor
+        .call_raw("phase12e_read_current_rv", |connection| {
+            connection
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'resource_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(tokio_rusqlite::Error::from)
+        })
+        .await
+        .unwrap();
+    assert_eq!(current_rv, "7");
 }
 
 #[tokio::test]
@@ -1386,10 +1511,7 @@ async fn sqlite_capture_certifies_bounded_durable_families() {
         .await
         .unwrap();
     destination_recovery
-        .restore_authoritative_snapshot_with_codec(
-            snapshot_from_capture(&header, &pages),
-            header.command_codec_activation_version(),
-        )
+        .restore_authoritative_snapshot(snapshot_from_capture(&header, &pages))
         .await
         .unwrap();
 

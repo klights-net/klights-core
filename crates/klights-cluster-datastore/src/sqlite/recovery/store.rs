@@ -48,19 +48,17 @@ impl SqliteRecoveryStore {
         }
     }
 
-    /// Restore one canonical snapshot while preserving its exact command-codec
-    /// activation marker when the enclosing snapshot envelope carries it.
-    pub async fn restore_authoritative_snapshot_with_codec(
+    async fn restore_canonical_snapshot(
         &self,
         snapshot: AuthoritativeSnapshot,
-        command_codec_activation_version: Option<u32>,
     ) -> Result<(), SnapshotPersistenceError> {
         let mut parts = snapshot.into_parts();
+        let current_rv = parts.current_rv();
         let position = parts.position();
+        let command_codec_activation_version = parts.command_codec_activation_version();
         let operations = parts.take_operations();
         let replay_floors = parts.take_replay_floors();
         let (metadata, membership) = parts.into_metadata_and_membership();
-        let current_rv = metadata.current_rv;
         let watch_event_high_water = position.map(|position| position.event_id);
         let replay_floors = replay_floors.map(|floors| {
             floors
@@ -93,8 +91,13 @@ impl SqliteRecoveryStore {
                 .collect()
         });
         let metadata = SnapshotMetadata {
-            cluster_id: metadata.cluster_id,
-            leader_epoch: metadata.leader_epoch,
+            cluster_id: metadata
+                .as_ref()
+                .map(|metadata| metadata.cluster_id.clone())
+                .unwrap_or_default(),
+            leader_epoch: metadata
+                .as_ref()
+                .map_or(0, |metadata| metadata.leader_epoch),
             membership: match membership {
                 CanonicalSnapshotMembership::LegacyOmitted => SnapshotMembership::LegacyOmitted,
                 CanonicalSnapshotMembership::AuthoritativeAbsent => {
@@ -151,7 +154,7 @@ impl AuthoritativeSnapshotPersistence for SqliteRecoveryStore {
         &self,
         snapshot: AuthoritativeSnapshot,
     ) -> SnapshotPersistenceFuture<'_> {
-        Box::pin(self.restore_authoritative_snapshot_with_codec(snapshot, None))
+        Box::pin(self.restore_canonical_snapshot(snapshot))
     }
 }
 
@@ -161,14 +164,24 @@ impl AuthoritativeSnapshotCapture for SqliteRecoveryStore {
         request: SnapshotCaptureRequest,
     ) -> SnapshotPersistenceFuture<'_, Box<dyn SnapshotCaptureSession>> {
         Box::pin(async move {
+            let fence = klights_cluster_store::SnapshotExclusiveFence::new(
+                self.snapshot_fence.clone().write_owned().await,
+            );
+            self.begin_capture_with_fence(request, fence).await
+        })
+    }
+
+    fn begin_capture_with_fence(
+        &self,
+        request: SnapshotCaptureRequest,
+        fence: klights_cluster_store::SnapshotExclusiveFence,
+    ) -> SnapshotPersistenceFuture<'_, Box<dyn SnapshotCaptureSession>> {
+        Box::pin(async move {
             let factory = self.snapshot_factory.as_ref().ok_or_else(|| {
                 SnapshotPersistenceError::UnsupportedMode {
                     message: "pinned SQLite capture requires a snapshot-only disk lane".to_string(),
                 }
             })?;
-            let fence = klights_cluster_store::SnapshotExclusiveFence::new(
-                self.snapshot_fence.clone().write_owned().await,
-            );
             let session = factory
                 .begin_snapshot(request, fence)
                 .await

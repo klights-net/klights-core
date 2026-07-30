@@ -140,6 +140,16 @@ impl AuthoritativeSnapshotCapture for RedbRecoveryStore {
             let fence = klights_cluster_store::SnapshotExclusiveFence::new(
                 self.accessor.acquire_snapshot_exclusive().await,
             );
+            self.begin_capture_with_fence(request, fence).await
+        })
+    }
+
+    fn begin_capture_with_fence(
+        &self,
+        request: SnapshotCaptureRequest,
+        fence: klights_cluster_store::SnapshotExclusiveFence,
+    ) -> SnapshotPersistenceFuture<'_, Box<dyn SnapshotCaptureSession>> {
+        Box::pin(async move {
             self.begin_snapshot(request, fence)
                 .await
                 .map_err(map_snapshot_persistence_error)

@@ -1822,39 +1822,6 @@ impl<T: DurableRecoveryStore + ?Sized> DurableRecoveryStore for std::sync::Arc<T
     }
 }
 
-/// Transitional focused-port view over the legacy umbrella handle.
-///
-/// REMOVE(Phase 10): selectors return independently typed focused ports once
-/// concrete backends are fully extracted from `DatastoreBackend`.
-pub(crate) struct DatastoreDurableRecoveryPort {
-    db: std::sync::Arc<dyn DatastoreBackend>,
-}
-
-impl DatastoreDurableRecoveryPort {
-    pub(crate) fn new(db: std::sync::Arc<dyn DatastoreBackend>) -> Self {
-        Self { db }
-    }
-}
-
-#[async_trait]
-impl DurableRecoveryStore for DatastoreDurableRecoveryPort {
-    async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {
-        DatastoreBackend::read_durable_allocator_observation(self.db.as_ref()).await
-    }
-
-    async fn read_cluster_metadata_observation(&self) -> Result<ClusterMetadataObservation> {
-        DatastoreBackend::read_cluster_metadata_observation(self.db.as_ref()).await
-    }
-
-    async fn begin_pinned_snapshot_capture(
-        &self,
-        request: klights_cluster_store::SnapshotCaptureRequest,
-        fence: SnapshotExclusiveFence,
-    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
-        DatastoreBackend::begin_pinned_snapshot_capture(self.db.as_ref(), request, fence).await
-    }
-}
-
 pub(crate) struct DatastoreBackendLifecyclePort {
     db: std::sync::Arc<dyn DatastoreBackend>,
 }

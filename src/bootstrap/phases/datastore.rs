@@ -325,9 +325,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     passive_backend.clone(),
                 ),
             );
-            let recovery = Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(
-                passive_backend.clone(),
-            ));
+            let allocator = passive_read_ports.allocator_reads();
             let lifecycle = Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(
                 passive_backend.clone(),
             ));
@@ -340,9 +338,8 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                         ),
                     ),
                     Arc::new(
-                        crate::datastore::cluster_store_adapter::SqliteRaftSnapshotRestore::new(
+                        klights_replication::snapshot::RaftSnapshotRestoreAdapter::new(
                             sqlite_recovery.clone(),
-                            crate::datastore::raft::snapshot_install(),
                             supervisor.clone(),
                         ),
                     ),
@@ -352,7 +349,8 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             let raft_stores = crate::datastore::raft::node::RaftStorePorts::new(
                 materializer,
                 state_machine_stores,
-                recovery,
+                sqlite_recovery.clone(),
+                allocator,
                 lifecycle,
             );
             let raft = Arc::new(

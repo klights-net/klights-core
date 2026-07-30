@@ -761,10 +761,12 @@ impl std::error::Error for SnapshotPersistenceError {}
 #[derive(Clone, Debug)]
 pub struct AuthoritativeSnapshot {
     operations: Vec<SnapshotRestoreOperation>,
+    current_rv: i64,
     position: Option<WatchReplayPosition>,
     replay_floors: Option<Vec<DurableReplayFloor>>,
-    metadata: ClusterMetadata,
+    metadata: Option<ClusterMetadata>,
     membership: SnapshotMembership,
+    command_codec_activation_version: Option<u32>,
 }
 
 /// Snapshot membership presence has three meanings: an old envelope omitted
@@ -781,15 +783,20 @@ pub enum SnapshotMembership {
 #[derive(Clone, Debug)]
 pub struct AuthoritativeSnapshotParts {
     operations: Vec<SnapshotRestoreOperation>,
+    current_rv: i64,
     position: Option<WatchReplayPosition>,
     replay_floors: Option<Vec<DurableReplayFloor>>,
-    metadata: ClusterMetadata,
+    metadata: Option<ClusterMetadata>,
     membership: SnapshotMembership,
+    command_codec_activation_version: Option<u32>,
 }
 
 impl AuthoritativeSnapshotParts {
     pub fn take_operations(&mut self) -> Vec<SnapshotRestoreOperation> {
         std::mem::take(&mut self.operations)
+    }
+    pub const fn current_rv(&self) -> i64 {
+        self.current_rv
     }
     pub const fn position(&self) -> Option<WatchReplayPosition> {
         self.position
@@ -797,13 +804,16 @@ impl AuthoritativeSnapshotParts {
     pub fn take_replay_floors(&mut self) -> Option<Vec<DurableReplayFloor>> {
         self.replay_floors.take()
     }
-    pub const fn metadata(&self) -> &ClusterMetadata {
-        &self.metadata
+    pub const fn metadata(&self) -> Option<&ClusterMetadata> {
+        self.metadata.as_ref()
     }
     pub const fn membership(&self) -> &SnapshotMembership {
         &self.membership
     }
-    pub fn into_metadata_and_membership(self) -> (ClusterMetadata, SnapshotMembership) {
+    pub const fn command_codec_activation_version(&self) -> Option<u32> {
+        self.command_codec_activation_version
+    }
+    pub fn into_metadata_and_membership(self) -> (Option<ClusterMetadata>, SnapshotMembership) {
         (self.metadata, self.membership)
     }
 }
@@ -816,24 +826,59 @@ impl AuthoritativeSnapshot {
         metadata: ClusterMetadata,
         membership: SnapshotMembership,
     ) -> Result<Self, SnapshotPersistenceError> {
+        let current_rv = metadata.current_rv;
+        Self::try_new_restore_envelope(
+            operations,
+            current_rv,
+            position,
+            replay_floors,
+            Some(metadata),
+            membership,
+            None,
+        )
+    }
+
+    /// Build the canonical persistence payload decoded from an existing
+    /// consensus snapshot envelope.
+    ///
+    /// Older envelopes may omit cluster metadata while retaining a standalone
+    /// resourceVersion. Modern capture remains strict through [`Self::try_new`]
+    /// and [`SnapshotCaptureHeader::try_new`].
+    pub fn try_new_restore_envelope(
+        operations: Vec<SnapshotRestoreOperation>,
+        current_rv: i64,
+        position: Option<WatchReplayPosition>,
+        replay_floors: Option<Vec<DurableReplayFloor>>,
+        metadata: Option<ClusterMetadata>,
+        membership: SnapshotMembership,
+        command_codec_activation_version: Option<u32>,
+    ) -> Result<Self, SnapshotPersistenceError> {
         validate_snapshot(
             &operations,
+            current_rv,
             position,
             replay_floors.as_deref(),
-            &metadata,
+            metadata.as_ref(),
             &membership,
+            command_codec_activation_version,
         )?;
         Ok(Self {
             operations,
+            current_rv,
             position,
             replay_floors,
             metadata,
             membership,
+            command_codec_activation_version,
         })
     }
 
     pub fn operations(&self) -> &[SnapshotRestoreOperation] {
         &self.operations
+    }
+
+    pub const fn current_rv(&self) -> i64 {
+        self.current_rv
     }
 
     pub const fn position(&self) -> Option<WatchReplayPosition> {
@@ -844,33 +889,63 @@ impl AuthoritativeSnapshot {
         self.replay_floors.as_deref()
     }
 
-    pub const fn metadata(&self) -> &ClusterMetadata {
-        &self.metadata
+    pub const fn metadata(&self) -> Option<&ClusterMetadata> {
+        self.metadata.as_ref()
     }
 
     pub const fn membership(&self) -> &SnapshotMembership {
         &self.membership
     }
 
+    pub const fn command_codec_activation_version(&self) -> Option<u32> {
+        self.command_codec_activation_version
+    }
+
     pub fn into_parts(self) -> AuthoritativeSnapshotParts {
         AuthoritativeSnapshotParts {
             operations: self.operations,
+            current_rv: self.current_rv,
             position: self.position,
             replay_floors: self.replay_floors,
             metadata: self.metadata,
             membership: self.membership,
+            command_codec_activation_version: self.command_codec_activation_version,
         }
     }
 }
 
 fn validate_snapshot(
     operations: &[SnapshotRestoreOperation],
+    current_rv: i64,
     position: Option<WatchReplayPosition>,
     replay_floors: Option<&[DurableReplayFloor]>,
-    metadata: &ClusterMetadata,
+    metadata: Option<&ClusterMetadata>,
     membership: &SnapshotMembership,
+    command_codec_activation_version: Option<u32>,
 ) -> Result<(), SnapshotPersistenceError> {
-    validate_snapshot_metadata(metadata, membership)?;
+    if current_rv < 0 {
+        return Err(SnapshotPersistenceError::invalid(
+            "authoritative snapshot resourceVersion must be non-negative",
+        ));
+    }
+    if command_codec_activation_version.is_some_and(|version| version != 3) {
+        return Err(SnapshotPersistenceError::invalid(
+            "snapshot command codec activation version must be exact v3",
+        ));
+    }
+    if let Some(metadata) = metadata {
+        validate_snapshot_metadata(metadata, membership)?;
+        if metadata.current_rv != current_rv {
+            return Err(SnapshotPersistenceError::invalid(format!(
+                "snapshot metadata resourceVersion {} does not match standalone resourceVersion {current_rv}",
+                metadata.current_rv
+            )));
+        }
+    } else if !matches!(membership, SnapshotMembership::LegacyOmitted) {
+        return Err(SnapshotPersistenceError::invalid(
+            "snapshot without cluster metadata must use legacy-omitted membership",
+        ));
+    }
     if let Some(position) = position {
         if position.resource_version < 0
             || position.event_id < 0
@@ -880,20 +955,20 @@ fn validate_snapshot(
                 "authoritative snapshot position must be an exact non-negative allocator boundary: {position:?}"
             )));
         }
-        if metadata.current_rv != position.resource_version {
+        if current_rv != position.resource_version {
             return Err(SnapshotPersistenceError::invalid(format!(
-                "snapshot metadata resourceVersion {} does not match allocator position {}",
-                metadata.current_rv, position.resource_version
+                "snapshot resourceVersion {current_rv} does not match allocator position {}",
+                position.resource_version
             )));
         }
     }
     let mut event_ids = HashSet::new();
     for operation in operations {
-        if operation.resource_version() <= 0 || operation.resource_version() > metadata.current_rv {
+        if operation.resource_version() <= 0 || operation.resource_version() > current_rv {
             return Err(SnapshotPersistenceError::invalid(format!(
                 "snapshot commit resourceVersion {} is outside 1..={}",
                 operation.resource_version(),
-                metadata.current_rv
+                current_rv
             )));
         }
         for mutation in operation.mutations() {
@@ -927,11 +1002,11 @@ fn validate_snapshot(
                 "snapshot contains duplicate replay-floor target",
             ));
         }
-        if floor.resource_version() > metadata.current_rv {
+        if floor.resource_version() > current_rv {
             return Err(SnapshotPersistenceError::invalid(format!(
                 "snapshot replay-floor resourceVersion {} exceeds current resourceVersion {}",
                 floor.resource_version(),
-                metadata.current_rv
+                current_rv
             )));
         }
         if floor.position_is_exact() {
@@ -1345,6 +1420,17 @@ pub trait AuthoritativeSnapshotCapture: Send + Sync {
     fn begin_capture(
         &self,
         request: SnapshotCaptureRequest,
+    ) -> SnapshotPersistenceFuture<'_, Box<dyn SnapshotCaptureSession>>;
+
+    /// Pin a capture while consuming an exclusive fence already acquired by
+    /// the orchestration layer.
+    ///
+    /// This keeps non-datastore state, such as a Raft applied-state anchor,
+    /// in the same mutation-free interval as the datastore snapshot pin.
+    fn begin_capture_with_fence(
+        &self,
+        request: SnapshotCaptureRequest,
+        fence: crate::backend_snapshot::SnapshotExclusiveFence,
     ) -> SnapshotPersistenceFuture<'_, Box<dyn SnapshotCaptureSession>>;
 }
 

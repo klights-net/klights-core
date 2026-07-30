@@ -32,4 +32,5 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
+zstd = { workspace = true }
 uuid = { workspace = true }

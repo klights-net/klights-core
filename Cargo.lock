@@ -2100,7 +2100,6 @@ dependencies = [
  "vergen",
  "walkdir",
  "x509-parser",
- "zstd",
 ]
 
 [[package]]
@@ -2361,6 +2360,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

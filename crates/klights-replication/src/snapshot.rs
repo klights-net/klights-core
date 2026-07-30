@@ -7,10 +7,9 @@
 //! and atomically replays them, then resumes the log from the snapshot's
 //! `last_log_id`.
 //!
-//! The on-the-wire payload reuses the existing
-//! `datastore::snapshot_export::generate_snapshot` helper that already powers
-//! the Phase 2 replica join path, so leader and follower share one
-//! source of truth for "what makes up a cluster snapshot".
+//! Persistence is injected through the canonical cluster-store capture and
+//! authoritative-restore capabilities. The private envelope remains the
+//! embedded OpenRaft wire owner.
 
 use std::io::Cursor;
 use std::io::Write;
@@ -18,7 +17,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use klights_cluster_store::{
-    DurableReplayTarget, SnapshotCaptureHeader, SnapshotCapturePage, SnapshotCapturePageKind,
+    AuthoritativeSnapshot, AuthoritativeSnapshotCapture, AuthoritativeSnapshotPersistence,
+    BackendLifecycleStore, DurableAllocatorRead, DurableReplayFloor, DurableReplayTarget,
+    SnapshotCaptureHeader, SnapshotCapturePage, SnapshotCapturePageKind, SnapshotMembership,
     SnapshotPersistenceError,
 };
 use klights_node_store::RaftAppliedStateDurability;
@@ -28,11 +29,7 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 
-#[cfg(test)]
-use super::super::DatastoreHandle;
-use super::super::DurableRecoveryStore;
-use klights_cluster_store::BackendLifecycleStore;
-use klights_replication::types::{NodeId, TypeConfig};
+use crate::types::{NodeId, RaftMemberNode, TypeConfig};
 
 /// Self-describing snapshot envelope. Carries the `last_applied`
 /// log-id, the membership configuration, and an ordered list of
@@ -42,7 +39,7 @@ use klights_replication::types::{NodeId, TypeConfig};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RaftSnapshotData {
     pub last_applied: Option<LogId<NodeId>>,
-    pub membership: StoredMembership<NodeId, klights_replication::types::RaftMemberNode>,
+    pub membership: StoredMembership<NodeId, RaftMemberNode>,
     #[serde(default)]
     pub current_rv: i64,
     /// Exact-v3 activation proof captured from the same immutable backend
@@ -55,13 +52,24 @@ pub(crate) struct RaftSnapshotData {
     pub watch_event_high_water: Option<i64>,
     /// Authoritative watch-compaction boundaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub watch_replay_floors: Option<Vec<super::super::WatchReplayFloor>>,
+    pub watch_replay_floors: Option<Vec<RaftSnapshotReplayFloor>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_metadata: Option<klights_cluster_core::ClusterMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_membership: Option<RaftSnapshotMembership>,
     #[serde(default, alias = "commits", with = "snapshot_operations_serde")]
     pub operations: Vec<klights_cluster_core::SnapshotRestoreOperation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct RaftSnapshotReplayFloor {
+    pub api_version: String,
+    pub kind: String,
+    pub namespace_key: String,
+    pub floor_resource_version: i64,
+    pub floor_event_id: i64,
+    #[serde(default)]
+    pub position_is_exact: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -123,40 +131,79 @@ pub(crate) enum RaftSnapshotMembership {
 
 impl RaftSnapshotData {
     pub(crate) fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self> {
-        super::compressed::decode_json(bytes)
+        crate::compressed::decode_json(bytes)
     }
 
-    #[cfg(test)]
-    pub async fn serialize_from_backend_to_cursor(
-        db: DatastoreHandle,
-        last_applied: Option<LogId<NodeId>>,
-        membership: &StoredMembership<NodeId, klights_replication::types::RaftMemberNode>,
-    ) -> Result<Cursor<Vec<u8>>> {
-        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()));
-        let recovery = Arc::new(super::super::DatastoreDurableRecoveryPort::new(db.clone()));
-        let lifecycle = Arc::new(super::super::DatastoreBackendLifecyclePort::new(db));
-        let (snapshot, _, _) = Self::serialize_from_backend_to_cursor_inner(
-            recovery,
-            lifecycle,
-            RaftSnapshotAppliedStateSource::Fixed {
-                last_applied,
-                membership: membership.clone(),
-            },
-            supervisor,
+    fn into_authoritative_snapshot(self) -> Result<AuthoritativeSnapshot> {
+        let position =
+            self.watch_event_high_water
+                .map(|event_id| klights_cluster_core::WatchReplayPosition {
+                    resource_version: self.current_rv,
+                    event_id,
+                    resource_version_filter_through_event_id: 0,
+                });
+        let floors = self
+            .watch_replay_floors
+            .map(|floors| {
+                floors
+                    .into_iter()
+                    .map(|floor| {
+                        let target = match (
+                            floor.api_version.as_str(),
+                            floor.kind.as_str(),
+                            floor.namespace_key.as_str(),
+                        ) {
+                            ("*", "*", "*") => DurableReplayTarget::All,
+                            (_, _, "#cluster") => DurableReplayTarget::Cluster {
+                                api_version: floor.api_version,
+                                kind: floor.kind,
+                            },
+                            _ => DurableReplayTarget::Namespaced {
+                                api_version: floor.api_version,
+                                kind: floor.kind,
+                                namespace: floor.namespace_key,
+                            },
+                        };
+                        DurableReplayFloor::new(
+                            target,
+                            floor.floor_resource_version,
+                            floor.floor_event_id,
+                            floor.position_is_exact,
+                        )
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
+        let membership = match self.cluster_membership {
+            None => SnapshotMembership::LegacyOmitted,
+            Some(RaftSnapshotMembership::AuthoritativeAbsent) => {
+                SnapshotMembership::AuthoritativeAbsent
+            }
+            Some(RaftSnapshotMembership::Present(value)) => SnapshotMembership::Present(value),
+        };
+        AuthoritativeSnapshot::try_new_restore_envelope(
+            self.operations,
+            self.current_rv,
+            position,
+            floors,
+            self.cluster_metadata,
+            membership,
+            self.command_codec_activation_version,
         )
-        .await?;
-        Ok(snapshot)
+        .map_err(anyhow::Error::new)
     }
 
     async fn serialize_from_backend_to_cursor_inner(
-        recovery: Arc<dyn DurableRecoveryStore>,
+        capture: Arc<dyn AuthoritativeSnapshotCapture>,
+        allocator: Arc<dyn DurableAllocatorRead>,
         lifecycle: Arc<dyn BackendLifecycleStore>,
         applied_state_source: RaftSnapshotAppliedStateSource,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Result<(
         Cursor<Vec<u8>>,
         Option<LogId<NodeId>>,
-        StoredMembership<NodeId, klights_replication::types::RaftMemberNode>,
+        StoredMembership<NodeId, RaftMemberNode>,
     )> {
         let request = klights_cluster_store::SnapshotCaptureRequest::try_new(
             klights_cluster_store::SnapshotPageLimit::try_new(
@@ -169,20 +216,28 @@ impl RaftSnapshotData {
             .await?
             .ok_or_else(|| anyhow::anyhow!("backend does not provide a snapshot capture fence"))?;
         let captured = applied_state_source.load().await?;
-        let session = recovery.begin_pinned_snapshot_capture(request, fence).await;
+        let session = capture.begin_capture_with_fence(request, fence).await;
         let (mut session, captured) = match session {
             Ok(session) => (session, captured),
             Err(error) => {
+                let _fence = lifecycle
+                    .acquire_snapshot_exclusive_fence()
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("backend does not provide a snapshot capture fence")
+                    })?;
+                let captured = applied_state_source.load().await?;
                 if !is_pristine_raft_state(&captured) || !is_missing_cluster_identity_error(&error)
                 {
-                    return Err(error);
+                    return Err(anyhow::Error::new(error));
                 }
-                let allocator = recovery.read_durable_allocator_observation().await?;
-                if allocator.position.resource_version != 0
-                    || allocator.position.event_id != 0
-                    || allocator.position.resource_version_filter_through_event_id != 0
+                let allocator = allocator.read_allocator_state().await?;
+                let position = allocator.position();
+                if position.resource_version != 0
+                    || position.event_id != 0
+                    || position.resource_version_filter_through_event_id != 0
                 {
-                    return Err(error);
+                    return Err(anyhow::Error::new(error));
                 }
                 let snapshot =
                     encode_pristine_bootstrap_snapshot(captured.clone(), supervisor.clone())
@@ -240,10 +295,8 @@ fn is_pristine_raft_state(captured: &CapturedRaftAppliedState) -> bool {
     captured.0.is_none() && captured.1 == StoredMembership::default()
 }
 
-fn is_missing_cluster_identity_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string() == "cluster_id is missing")
+fn is_missing_cluster_identity_error(error: &SnapshotPersistenceError) -> bool {
+    error.to_string() == "cluster_id is missing"
 }
 
 async fn encode_pristine_bootstrap_snapshot(
@@ -266,7 +319,7 @@ async fn encode_pristine_bootstrap_snapshot(
                     cluster_membership: None,
                     operations: Vec::new(),
                 };
-                super::compressed::encode(&serde_json::to_vec(&data)?)
+                crate::compressed::encode(&serde_json::to_vec(&data)?)
             },
         )
         .await
@@ -278,7 +331,7 @@ fn encode_snapshot_pages(
     captured: CapturedRaftAppliedState,
     pages: &mut tokio::sync::mpsc::Receiver<SnapshotCapturePage>,
 ) -> Result<Vec<u8>> {
-    let mut framed = vec![super::compressed::TAG_ZSTD];
+    let mut framed = vec![crate::compressed::TAG_ZSTD];
     let mut encoder = zstd::Encoder::new(&mut framed, 3)?;
     let mut writer = RaftJsonSnapshotEncoder::new(&mut encoder);
     writer.begin_capture(&header, captured)?;
@@ -292,27 +345,17 @@ fn encode_snapshot_pages(
 }
 
 enum RaftSnapshotAppliedStateSource {
-    #[cfg(test)]
-    Fixed {
-        last_applied: Option<LogId<NodeId>>,
-        membership: StoredMembership<NodeId, klights_replication::types::RaftMemberNode>,
-    },
     Durable(Arc<dyn RaftAppliedStateDurability>),
 }
 
 type CapturedRaftAppliedState = (
     Option<LogId<NodeId>>,
-    StoredMembership<NodeId, klights_replication::types::RaftMemberNode>,
+    StoredMembership<NodeId, RaftMemberNode>,
 );
 
 impl RaftSnapshotAppliedStateSource {
     async fn load(&self) -> Result<CapturedRaftAppliedState, SnapshotPersistenceError> {
         let (last_applied, membership) = match self {
-            #[cfg(test)]
-            Self::Fixed {
-                last_applied,
-                membership,
-            } => return Ok((*last_applied, membership.clone())),
             Self::Durable(applied_state) => applied_state
                 .load_applied_state()
                 .await
@@ -453,7 +496,7 @@ impl<'a, W: Write + Send> RaftJsonSnapshotEncoder<'a, W> {
                 namespace,
             } => (api_version, kind, namespace),
         };
-        self.write_json(&super::super::WatchReplayFloor {
+        self.write_json(&RaftSnapshotReplayFloor {
             api_version,
             kind,
             namespace_key,
@@ -587,10 +630,29 @@ fn snapshot_write_err<E: std::fmt::Display>(e: E) -> StorageError<NodeId> {
 /// `SnapshotMeta` is consistent with the bytes it carries.
 #[derive(Clone)]
 pub struct SqliteRaftSnapshotBuilder {
-    pub(crate) recovery: Arc<dyn DurableRecoveryStore>,
-    pub(crate) lifecycle: Arc<dyn BackendLifecycleStore>,
-    pub(crate) applied_state: Arc<dyn RaftAppliedStateDurability>,
-    pub(crate) supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    capture: Arc<dyn AuthoritativeSnapshotCapture>,
+    allocator: Arc<dyn DurableAllocatorRead>,
+    lifecycle: Arc<dyn BackendLifecycleStore>,
+    applied_state: Arc<dyn RaftAppliedStateDurability>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
+}
+
+impl SqliteRaftSnapshotBuilder {
+    pub fn new(
+        capture: Arc<dyn AuthoritativeSnapshotCapture>,
+        allocator: Arc<dyn DurableAllocatorRead>,
+        lifecycle: Arc<dyn BackendLifecycleStore>,
+        applied_state: Arc<dyn RaftAppliedStateDurability>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    ) -> Self {
+        Self {
+            capture,
+            allocator,
+            lifecycle,
+            applied_state,
+            supervisor,
+        }
+    }
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for SqliteRaftSnapshotBuilder {
@@ -599,7 +661,8 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteRaftSnapshotBuilder {
     ) -> std::result::Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         let (snapshot, last_applied, membership) =
             RaftSnapshotData::serialize_from_backend_to_cursor_inner(
-                self.recovery.clone(),
+                self.capture.clone(),
+                self.allocator.clone(),
                 self.lifecycle.clone(),
                 RaftSnapshotAppliedStateSource::Durable(self.applied_state.clone()),
                 self.supervisor.clone(),
@@ -618,29 +681,192 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteRaftSnapshotBuilder {
     }
 }
 
+pub struct RaftSnapshotRestoreAdapter {
+    persistence: Arc<dyn AuthoritativeSnapshotPersistence>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
+}
+
+impl RaftSnapshotRestoreAdapter {
+    pub fn new(
+        persistence: Arc<dyn AuthoritativeSnapshotPersistence>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    ) -> Self {
+        Self {
+            persistence,
+            supervisor,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::state_machine::RaftSnapshotRestore for RaftSnapshotRestoreAdapter {
+    async fn restore_snapshot(
+        &self,
+        snapshot_bytes: Vec<u8>,
+    ) -> Result<(), SnapshotPersistenceError> {
+        let snapshot =
+            self.supervisor
+                .run_blocking(
+                    klights_supervisor::TaskCategory::Others,
+                    "raft-snapshot-json-zstd-decode",
+                    move || {
+                        let data = RaftSnapshotData::deserialize_from_bytes(&snapshot_bytes)
+                            .map_err(|error| SnapshotPersistenceError::PersistenceFailed {
+                                message: error.to_string(),
+                            })?;
+                        data.into_authoritative_snapshot().map_err(|error| {
+                            SnapshotPersistenceError::CorruptData {
+                                message: error.to_string(),
+                            }
+                        })
+                    },
+                )
+                .await
+                .map_err(|error| SnapshotPersistenceError::PersistenceFailed {
+                    message: error.to_string(),
+                })?;
+        let snapshot = snapshot?;
+        self.persistence
+            .restore_authoritative_snapshot(snapshot)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::DatastoreBackend;
-    use crate::datastore::test_support;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use klights_cluster_store::{
+        AllocatorStateFuture, DurableAllocatorState, SnapshotCaptureRequest,
+        SnapshotCaptureSession, SnapshotPersistenceFuture,
+    };
     use klights_node_store::{
         EncodedRaftAppliedState, RaftAppliedStateWrite, RaftDurabilityFuture,
     };
+    use openraft::storage::RaftSnapshotBuilder;
 
-    struct BlockingAppliedState {
-        reached: Arc<tokio::sync::Notify>,
-        resume: Arc<tokio::sync::Notify>,
+    struct FakeCapture {
+        result: Mutex<
+            Option<std::result::Result<Box<dyn SnapshotCaptureSession>, SnapshotPersistenceError>>,
+        >,
     }
 
-    impl RaftAppliedStateDurability for BlockingAppliedState {
+    impl FakeCapture {
+        fn success(header: SnapshotCaptureHeader, pages: Vec<SnapshotCapturePage>) -> Self {
+            Self {
+                result: Mutex::new(Some(Ok(Box::new(FakeSession {
+                    header,
+                    pages: pages.into(),
+                })))),
+            }
+        }
+
+        fn missing_identity() -> Self {
+            Self {
+                result: Mutex::new(Some(Err(SnapshotPersistenceError::CorruptData {
+                    message: "cluster_id is missing".to_string(),
+                }))),
+            }
+        }
+
+        fn take_result(
+            &self,
+        ) -> std::result::Result<Box<dyn SnapshotCaptureSession>, SnapshotPersistenceError>
+        {
+            self.result.lock().unwrap().take().unwrap()
+        }
+    }
+
+    impl AuthoritativeSnapshotCapture for FakeCapture {
+        fn begin_capture(
+            &self,
+            _request: SnapshotCaptureRequest,
+        ) -> SnapshotPersistenceFuture<'_, Box<dyn SnapshotCaptureSession>> {
+            let result = self.take_result();
+            Box::pin(async move { result })
+        }
+
+        fn begin_capture_with_fence(
+            &self,
+            _request: SnapshotCaptureRequest,
+            _fence: klights_cluster_store::SnapshotExclusiveFence,
+        ) -> SnapshotPersistenceFuture<'_, Box<dyn SnapshotCaptureSession>> {
+            let result = self.take_result();
+            Box::pin(async move { result })
+        }
+    }
+
+    struct FakeSession {
+        header: SnapshotCaptureHeader,
+        pages: VecDeque<SnapshotCapturePage>,
+    }
+
+    impl SnapshotCaptureSession for FakeSession {
+        fn header(&self) -> &SnapshotCaptureHeader {
+            &self.header
+        }
+
+        fn next_page(&mut self) -> SnapshotPersistenceFuture<'_, Option<SnapshotCapturePage>> {
+            let page = self.pages.pop_front();
+            Box::pin(async move { Ok(page) })
+        }
+
+        fn cancel(&mut self) -> SnapshotPersistenceFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct FakeAllocator(DurableAllocatorState);
+
+    impl FakeAllocator {
+        fn at(resource_version: i64, event_id: i64) -> Self {
+            Self(
+                DurableAllocatorState::try_new(klights_cluster_core::WatchReplayPosition {
+                    resource_version,
+                    event_id,
+                    resource_version_filter_through_event_id: 0,
+                })
+                .unwrap(),
+            )
+        }
+    }
+
+    impl DurableAllocatorRead for FakeAllocator {
+        fn read_allocator_state(&self) -> AllocatorStateFuture<'_, DurableAllocatorState> {
+            let state = self.0;
+            Box::pin(async move { Ok(state) })
+        }
+    }
+
+    struct FakeLifecycle;
+
+    #[async_trait::async_trait]
+    impl BackendLifecycleStore for FakeLifecycle {
+        async fn acquire_snapshot_exclusive_fence(
+            &self,
+        ) -> Result<Option<klights_cluster_store::SnapshotExclusiveFence>> {
+            Ok(Some(klights_cluster_store::SnapshotExclusiveFence::new(())))
+        }
+
+        async fn acquire_snapshot_mutation_fence(
+            &self,
+        ) -> Result<Option<klights_cluster_store::SnapshotMutationFence>> {
+            Ok(Some(klights_cluster_store::SnapshotMutationFence::new(())))
+        }
+
+        fn close(&self) {}
+    }
+
+    struct FixedAppliedState {
+        state: EncodedRaftAppliedState,
+    }
+
+    impl RaftAppliedStateDurability for FixedAppliedState {
         fn load_applied_state(&self) -> RaftDurabilityFuture<'_, EncodedRaftAppliedState> {
-            let reached = self.reached.clone();
-            let resume = self.resume.clone();
-            Box::pin(async move {
-                reached.notify_one();
-                resume.notified().await;
-                Ok(EncodedRaftAppliedState::new(None, None))
-            })
+            let state = self.state.clone();
+            Box::pin(async move { Ok(state) })
         }
 
         fn store_applied_state(
@@ -651,317 +877,193 @@ mod tests {
         }
     }
 
-    async fn seed_cluster_metadata(db: &dyn DatastoreBackend) {
-        db.set_klights_meta(
-            klights_cluster_store::CLUSTER_ID_META_KEY,
-            "snapshot-test-cluster",
-        )
-        .await
-        .unwrap();
-        db.set_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY, "1")
-            .await
-            .unwrap();
+    #[derive(Default)]
+    struct RecordingPersistence {
+        snapshot: Mutex<Option<AuthoritativeSnapshot>>,
     }
 
-    #[tokio::test]
-    async fn pristine_pre_cluster_snapshot_is_canonical_and_identity_free() {
-        let db = test_support::in_memory().await;
-        let snapshot = RaftSnapshotData::serialize_from_backend_to_cursor(
-            Arc::new(db),
-            None,
-            &StoredMembership::default(),
-        )
-        .await
-        .expect("OpenRaft must be able to persist its initial Snapshot(None)");
-        let decoded = RaftSnapshotData::deserialize_from_bytes(&snapshot.into_inner()).unwrap();
-
-        assert_eq!(decoded.last_applied, None);
-        assert_eq!(decoded.membership, StoredMembership::default());
-        assert_eq!(decoded.current_rv, 0);
-        assert_eq!(decoded.watch_event_high_water, Some(0));
-        assert_eq!(decoded.watch_replay_floors, Some(Vec::new()));
-        assert_eq!(decoded.cluster_metadata, None);
-        assert_eq!(decoded.cluster_membership, None);
-        assert!(decoded.operations.is_empty());
-    }
-
-    #[tokio::test]
-    async fn missing_cluster_identity_is_rejected_after_raft_state_exists() {
-        let log_id = LogId::new(openraft::LeaderId::new(3, 7), 11);
-        let membership =
-            StoredMembership::new(
-                Some(log_id),
-                openraft::Membership::new(
-                    vec![std::collections::BTreeSet::from([7])],
-                    std::collections::BTreeMap::<
-                        NodeId,
-                        klights_replication::types::RaftMemberNode,
-                    >::new(),
-                ),
-            );
-        let cases = [
-            (
-                "applied log",
-                Some(log_id),
-                StoredMembership::default(),
-                false,
-            ),
-            ("membership", None, membership, false),
-            (
-                "non-empty allocator",
-                None,
-                StoredMembership::default(),
-                true,
-            ),
-        ];
-
-        for (case, last_applied, membership, seed_resource) in cases {
-            let db = test_support::in_memory().await;
-            if seed_resource {
-                db.create_resource(
-                    "v1",
-                    "ConfigMap",
-                    Some("default"),
-                    "preexisting",
-                    serde_json::json!({"metadata": {"name": "preexisting"}}),
-                )
-                .await
-                .unwrap();
-            }
-            let error = RaftSnapshotData::serialize_from_backend_to_cursor(
-                Arc::new(db),
-                last_applied,
-                &membership,
-            )
-            .await
-            .expect_err(case);
-            assert!(
-                error.to_string().contains("cluster_id is missing"),
-                "{case} must retain authoritative identity validation: {error:#}"
-            );
+    impl AuthoritativeSnapshotPersistence for RecordingPersistence {
+        fn restore_authoritative_snapshot(
+            &self,
+            snapshot: AuthoritativeSnapshot,
+        ) -> SnapshotPersistenceFuture<'_> {
+            *self.snapshot.lock().unwrap() = Some(snapshot);
+            Box::pin(async { Ok(()) })
         }
     }
 
-    #[tokio::test]
-    async fn builder_reads_applied_state_inside_authoritative_capture_fence() {
-        let db = test_support::in_memory().await;
-        seed_cluster_metadata(&db).await;
-        let handle: DatastoreHandle = Arc::new(db.clone());
-        let reached = Arc::new(tokio::sync::Notify::new());
-        let resume = Arc::new(tokio::sync::Notify::new());
-        let reached_wait = reached.notified();
-        tokio::pin!(reached_wait);
-        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()));
-
-        let capture_task = tokio::spawn({
-            let reached = reached.clone();
-            let resume = resume.clone();
-            async move {
-                let recovery = Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(
-                    handle.clone(),
-                ));
-                let lifecycle =
-                    Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(handle));
-                RaftSnapshotData::serialize_from_backend_to_cursor_inner(
-                    recovery,
-                    lifecycle,
-                    RaftSnapshotAppliedStateSource::Durable(Arc::new(BlockingAppliedState {
-                        reached,
-                        resume,
-                    })),
-                    supervisor,
-                )
-                .await
-            }
-        });
-        reached_wait.await;
-
-        let mutation_task = tokio::spawn(async move {
-            crate::datastore::DatastoreBackend::acquire_snapshot_mutation_fence(&db)
-                .await
-                .unwrap()
-                .expect("sqlite supplies a mutation fence")
-        });
-        tokio::task::yield_now().await;
-        assert!(
-            !mutation_task.is_finished(),
-            "committed apply must not cross the applied-state read in begin_capture"
-        );
-
-        resume.notify_one();
-        let (_, last_applied, membership) = capture_task.await.unwrap().unwrap();
-        assert_eq!(last_applied, None);
-        assert_eq!(membership, StoredMembership::default());
-        mutation_task.await.unwrap();
+    fn supervisor() -> Arc<klights_supervisor::TaskSupervisor> {
+        Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()))
     }
 
-    /// P2 (memory): serialize_from_backend_to_cursor must produce a valid
-    /// zstd-framed payload that round-trips through deserialize_from_bytes.
-    /// The streaming path always emits TAG_ZSTD (no RAW fallback), because
-    /// the streaming encoder can't know the final size to decide fallback.
+    fn captured_header() -> SnapshotCaptureHeader {
+        SnapshotCaptureHeader::try_new(
+            Some(3),
+            klights_cluster_core::WatchReplayPosition {
+                resource_version: 1,
+                event_id: 2,
+                resource_version_filter_through_event_id: 0,
+            },
+            klights_cluster_core::ClusterMetadata {
+                cluster_id: "snapshot-cluster".to_string(),
+                leader_epoch: 4,
+                current_rv: 1,
+            },
+            SnapshotMembership::AuthoritativeAbsent,
+        )
+        .unwrap()
+    }
+
+    fn captured_pages() -> Vec<SnapshotCapturePage> {
+        vec![
+            SnapshotCapturePage::try_operations(vec![
+                klights_cluster_core::SnapshotRestoreOperation::new(
+                    1,
+                    None,
+                    vec![klights_cluster_core::LogApplyMutation::PutNamespace(
+                        klights_cluster_core::LogApplyNamespaceRow {
+                            name: "captured".to_string(),
+                            uid: "captured-uid".to_string(),
+                            resource_version: 1,
+                            data: serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "Namespace",
+                                "metadata": {"name": "captured", "uid": "captured-uid"}
+                            }),
+                        },
+                    )],
+                ),
+            ])
+            .unwrap(),
+            SnapshotCapturePage::try_replay_floors(vec![
+                DurableReplayFloor::all(1, 2, true).unwrap(),
+            ])
+            .unwrap(),
+        ]
+    }
+
     #[tokio::test]
-    async fn streaming_snapshot_round_trips_and_is_zstd_framed() {
-        let db = test_support::in_memory().await;
-        seed_cluster_metadata(&db).await;
-        crate::controllers::namespace::init_default_namespaces(
-            &crate::kubelet::file_blocking::test_file_process_executor(),
-            &db,
-        )
-        .await
-        .unwrap();
-        db.create_resource(
-            "v1",
-            "ConfigMap",
-            Some("default"),
-            "cm-stream-test",
-            serde_json::json!({"metadata": {"name": "cm-stream-test"}}),
-        )
-        .await
-        .unwrap();
-
-        let membership =
-            StoredMembership::<NodeId, klights_replication::types::RaftMemberNode>::default();
-        let cursor = RaftSnapshotData::serialize_from_backend_to_cursor(
-            Arc::new(db.clone()),
-            None,
-            &membership,
-        )
-        .await
-        .unwrap();
-
-        let framed = cursor.into_inner();
-        assert_eq!(
-            framed[0],
-            crate::datastore::raft::compressed::TAG_ZSTD,
-            "streaming snapshot must be zstd-framed (P2)"
+    async fn builder_serializes_canonical_capture_without_changing_positions() {
+        let mut builder = SqliteRaftSnapshotBuilder::new(
+            Arc::new(FakeCapture::success(captured_header(), captured_pages())),
+            Arc::new(FakeAllocator::at(1, 2)),
+            Arc::new(FakeLifecycle),
+            Arc::new(FixedAppliedState {
+                state: EncodedRaftAppliedState::new(None, None),
+            }),
+            supervisor(),
         );
 
-        let decoded = RaftSnapshotData::deserialize_from_bytes(&framed).unwrap();
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let decoded =
+            RaftSnapshotData::deserialize_from_bytes(snapshot.snapshot.get_ref()).unwrap();
+        assert_eq!(decoded.current_rv, 1);
+        assert_eq!(decoded.watch_event_high_water, Some(2));
+        assert_eq!(decoded.command_codec_activation_version, Some(3));
         assert_eq!(
-            decoded.current_rv,
-            db.get_current_resource_version().await.unwrap()
-        );
-        assert_eq!(
-            decoded.watch_event_high_water,
-            Some(db.current_watch_replay_position().await.unwrap().event_id)
-        );
-        assert!(
-            !decoded.operations.is_empty(),
-            "snapshot must contain restore operations"
-        );
-        assert!(
             decoded
-                .operations
-                .iter()
-                .any(|operation| operation.mutations().iter().any(|m| {
-                    matches!(m, klights_cluster_core::LogApplyMutation::PutResource(row)
-                    if row.name == "cm-stream-test")
-                })),
-            "snapshot must contain the ConfigMap"
+                .cluster_metadata
+                .as_ref()
+                .map(|metadata| metadata.cluster_id.as_str()),
+            Some("snapshot-cluster")
         );
+        assert_eq!(decoded.operations.len(), 1);
+        assert_eq!(decoded.watch_replay_floors.as_ref().unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn authoritative_stream_preserves_rv_event_floor_and_outbox_families() {
-        let db = test_support::in_memory().await;
-        let outbox = klights_cluster_core::LogApplyAppliedOutboxRow {
-            idempotency_key: "snapshot-ledger".into(),
-            subject_key: "v1/ConfigMap/default/item/uid".into(),
-            operation: "Update".into(),
-            first_seen_ms: 10,
-            applied_rv: Some(7),
-            result_proto: vec![1, 2, 3],
-            status_stamp: None,
-        };
-        let watermark = klights_cluster_core::OutboxStreamWatermark {
-            client_id: "worker-a".into(),
-            stream_id: 4,
-            stream_seq: 1,
-        };
-        db.replace_replicated_resource_state(
-            vec![klights_cluster_core::SnapshotRestoreOperation::new(
-                7,
-                Some(watermark.clone()),
-                vec![klights_cluster_core::LogApplyMutation::PutAppliedOutbox(
-                    outbox.clone(),
-                )],
-            )],
-            7,
-            Some(11),
-            Some(vec![crate::datastore::WatchReplayFloor {
-                api_version: "v1".into(),
-                kind: "ConfigMap".into(),
-                namespace_key: "default".into(),
-                floor_resource_version: 6,
-                floor_event_id: 10,
+    async fn pristine_snapshot_is_identity_free_only_at_zero_allocators() {
+        let mut builder = SqliteRaftSnapshotBuilder::new(
+            Arc::new(FakeCapture::missing_identity()),
+            Arc::new(FakeAllocator::at(0, 0)),
+            Arc::new(FakeLifecycle),
+            Arc::new(FixedAppliedState {
+                state: EncodedRaftAppliedState::new(None, None),
+            }),
+            supervisor(),
+        );
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let decoded =
+            RaftSnapshotData::deserialize_from_bytes(snapshot.snapshot.get_ref()).unwrap();
+        assert_eq!(decoded.current_rv, 0);
+        assert_eq!(decoded.watch_event_high_water, Some(0));
+        assert_eq!(decoded.cluster_metadata, None);
+        assert_eq!(decoded.cluster_membership, None);
+        assert!(decoded.operations.is_empty());
+
+        let mut non_pristine = SqliteRaftSnapshotBuilder::new(
+            Arc::new(FakeCapture::missing_identity()),
+            Arc::new(FakeAllocator::at(1, 0)),
+            Arc::new(FakeLifecycle),
+            Arc::new(FixedAppliedState {
+                state: EncodedRaftAppliedState::new(None, None),
+            }),
+            supervisor(),
+        );
+        assert!(non_pristine.build_snapshot().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn restore_adapter_maps_private_wire_to_canonical_persistence() {
+        let persistence = Arc::new(RecordingPersistence::default());
+        let adapter = RaftSnapshotRestoreAdapter::new(persistence.clone(), supervisor());
+        let data = RaftSnapshotData {
+            last_applied: None,
+            membership: StoredMembership::default(),
+            current_rv: 1,
+            command_codec_activation_version: Some(3),
+            watch_event_high_water: Some(2),
+            watch_replay_floors: Some(vec![RaftSnapshotReplayFloor {
+                api_version: "*".to_string(),
+                kind: "*".to_string(),
+                namespace_key: "*".to_string(),
+                floor_resource_version: 1,
+                floor_event_id: 2,
                 position_is_exact: true,
             }]),
-            Some(crate::datastore::ReplicatedSnapshotMetadata {
-                cluster_id: "snapshot-exact-cluster".into(),
-                leader_epoch: 3,
-                membership: crate::datastore::ReplicatedMembershipState::AuthoritativeAbsent,
-                command_codec_activation_version: None,
+            cluster_metadata: Some(klights_cluster_core::ClusterMetadata {
+                cluster_id: "snapshot-cluster".to_string(),
+                leader_epoch: 4,
+                current_rv: 1,
             }),
-        )
-        .await
-        .unwrap();
+            cluster_membership: Some(RaftSnapshotMembership::AuthoritativeAbsent),
+            operations: captured_pages()
+                .into_iter()
+                .next()
+                .unwrap()
+                .into_operations()
+                .unwrap(),
+        };
+        let encoded = crate::compressed::encode(&serde_json::to_vec(&data).unwrap()).unwrap();
 
-        let encoded = RaftSnapshotData::serialize_from_backend_to_cursor(
-            Arc::new(db),
-            None,
-            &StoredMembership::default(),
-        )
-        .await
-        .unwrap();
-        let decoded = RaftSnapshotData::deserialize_from_bytes(&encoded.into_inner()).unwrap();
+        crate::state_machine::RaftSnapshotRestore::restore_snapshot(&adapter, encoded)
+            .await
+            .unwrap();
 
-        assert_eq!(decoded.current_rv, 7);
-        assert_eq!(decoded.watch_event_high_water, Some(11));
+        let restored = persistence.snapshot.lock().unwrap().take().unwrap();
+        assert_eq!(restored.current_rv(), 1);
+        assert_eq!(restored.command_codec_activation_version(), Some(3));
         assert_eq!(
-            decoded.cluster_metadata,
-            Some(klights_cluster_core::ClusterMetadata {
-                cluster_id: "snapshot-exact-cluster".into(),
-                leader_epoch: 3,
-                current_rv: 7,
-            })
+            restored
+                .metadata()
+                .map(|metadata| metadata.cluster_id.as_str()),
+            Some("snapshot-cluster")
         );
-        assert_eq!(
-            decoded.cluster_membership,
-            Some(RaftSnapshotMembership::AuthoritativeAbsent)
-        );
-        let floors = decoded.watch_replay_floors.unwrap();
-        assert_eq!(floors.len(), 1);
-        assert_eq!(floors[0].floor_resource_version, 6);
-        assert_eq!(floors[0].floor_event_id, 10);
-        assert!(
-            decoded
-                .operations
-                .iter()
-                .any(|operation| { operation.outbox_watermark() == Some(&watermark) })
-        );
-        assert!(decoded.operations.iter().any(|operation| {
-            operation.mutations().iter().any(|mutation| {
-                matches!(
-                    mutation,
-                    klights_cluster_core::LogApplyMutation::PutAppliedOutbox(row)
-                        if row == &outbox
-                )
-            })
-        }));
+        assert!(matches!(
+            restored.membership(),
+            SnapshotMembership::AuthoritativeAbsent
+        ));
     }
 
     #[test]
-    fn legacy_snapshot_without_watch_allocator_remains_decodable() {
+    fn legacy_snapshot_alias_and_missing_allocator_fields_remain_decodable() {
         let legacy = serde_json::json!({
             "last_applied": null,
-            "membership": StoredMembership::<NodeId, klights_replication::types::RaftMemberNode>::default(),
+            "membership": StoredMembership::<NodeId, RaftMemberNode>::default(),
             "current_rv": 7,
             "commits": []
         });
-        let framed = crate::datastore::raft::compressed::encode(
-            serde_json::to_vec(&legacy).unwrap().as_slice(),
-        )
-        .unwrap();
+        let framed = crate::compressed::encode(&serde_json::to_vec(&legacy).unwrap()).unwrap();
 
         let decoded = RaftSnapshotData::deserialize_from_bytes(&framed).unwrap();
         assert_eq!(decoded.current_rv, 7);

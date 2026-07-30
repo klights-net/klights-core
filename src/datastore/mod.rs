@@ -19,6 +19,7 @@ pub(crate) mod snapshot_export;
 pub mod sqlite;
 pub mod types;
 
+pub(crate) use backend::DatastoreBackendLifecyclePort;
 pub use backend::{
     AppliedOutboxStore, ClusterResourceQueryStore, CommittedOutboxApply,
     CurrentResourceVersionStore, DatastoreBackend, DatastoreBackendMetaStore,
@@ -30,7 +31,6 @@ pub use backend::{
 };
 #[cfg(test)]
 pub use backend::{CommitObservationSink, TestWatchStore};
-pub(crate) use backend::{DatastoreBackendLifecyclePort, DatastoreDurableRecoveryPort};
 pub use klights_cluster_core::{
     PatchKind, PositionedWatchEvent, Resource, ResourceBatchOperation, ResourceBatchPutMode,
     ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,

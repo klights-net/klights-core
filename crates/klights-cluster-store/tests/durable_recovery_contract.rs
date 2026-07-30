@@ -9,9 +9,9 @@ use klights_cluster_store::{
     DurableReplayTarget, DurableWatchHistoryRead, DurableWatchScope, DurableWatchTarget,
     MAX_SNAPSHOT_CAPTURE_PAGE, MAX_WATCH_HISTORY_PAGE, PersistedClusterMetadata,
     SnapshotCaptureHeader, SnapshotCapturePage, SnapshotCaptureRequest, SnapshotCaptureSession,
-    SnapshotMembership, SnapshotOutboxWatermarkCursor, SnapshotPersistenceError,
-    SnapshotPersistenceFuture, SnapshotReplayFloorCursor, WatchHistoryError, WatchHistoryFuture,
-    WatchHistoryPage, WatchHistoryRead, WatchHistoryRequest,
+    SnapshotExclusiveFence, SnapshotMembership, SnapshotOutboxWatermarkCursor,
+    SnapshotPersistenceError, SnapshotPersistenceFuture, SnapshotReplayFloorCursor,
+    WatchHistoryError, WatchHistoryFuture, WatchHistoryPage, WatchHistoryRead, WatchHistoryRequest,
 };
 
 #[test]
@@ -95,6 +95,14 @@ impl AuthoritativeSnapshotCapture for FakeRecoveryStore {
                 message: "fake store does not capture snapshots".to_string(),
             })
         })
+    }
+
+    fn begin_capture_with_fence(
+        &self,
+        request: SnapshotCaptureRequest,
+        _fence: SnapshotExclusiveFence,
+    ) -> SnapshotPersistenceFuture<'_, Box<dyn SnapshotCaptureSession>> {
+        self.begin_capture(request)
     }
 }
 
@@ -258,7 +266,7 @@ fn authoritative_snapshot_preserves_canonical_state_without_shadow_values() {
     assert_eq!(snapshot.operations(), operations.as_slice());
     assert_eq!(snapshot.position(), Some(position));
     assert_eq!(snapshot.replay_floors(), Some(floors.as_slice()));
-    assert_eq!(snapshot.metadata(), &metadata(17));
+    assert_eq!(snapshot.metadata(), Some(&metadata(17)));
     assert_eq!(
         snapshot.membership(),
         &SnapshotMembership::Present(membership())
@@ -579,7 +587,7 @@ fn snapshot_parts_expose_consuming_accessors_not_public_fields() {
     )
     .unwrap()
     .into_parts();
-    assert_eq!(parts.metadata(), &metadata(0));
+    assert_eq!(parts.metadata(), Some(&metadata(0)));
     assert_eq!(parts.membership(), &SnapshotMembership::LegacyOmitted);
     let operations = parts.take_operations();
     let (_, membership) = parts.into_metadata_and_membership();

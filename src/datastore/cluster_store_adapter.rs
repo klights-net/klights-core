@@ -1,7 +1,6 @@
 //! Temporary root adapters from the legacy datastore to cluster-store ports.
 
 use klights_cluster_core::LogApplyCommit;
-use klights_cluster_store::SnapshotPersistenceError;
 
 use super::DatastoreHandle;
 
@@ -127,11 +126,12 @@ pub(crate) fn raft_state_machine_store_ports_for_test(
                 std::sync::Arc::new(TestNoopPostCommitWakeup),
             ),
         ),
-        std::sync::Arc::new(SqliteRaftSnapshotRestore::new(
-            db.focused_recovery_store(),
-            crate::datastore::raft::snapshot_install(),
-            std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(Default::default())),
-        )),
+        std::sync::Arc::new(
+            klights_replication::snapshot::RaftSnapshotRestoreAdapter::new(
+                db.focused_recovery_store(),
+                std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(Default::default())),
+            ),
+        ),
         std::sync::Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(
             db_handle,
         )),
@@ -145,16 +145,16 @@ pub(crate) fn raft_store_ports_for_test(
 ) -> crate::datastore::raft::node::RaftStorePorts {
     let db_handle: DatastoreHandle = db.clone();
     let materializer = std::sync::Arc::new(DatastoreRaftCommitMaterializer::new(db_handle));
-    let recovery = std::sync::Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(
-        db.clone(),
-    ));
+    let snapshot_capture = db.focused_recovery_store();
+    let allocator = db.focused_read_store();
     let lifecycle = std::sync::Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(
         db.clone(),
     ));
     crate::datastore::raft::node::RaftStorePorts::new(
         materializer,
         raft_state_machine_store_ports_for_test(db),
-        recovery,
+        snapshot_capture,
+        allocator,
         lifecycle,
     )
 }
@@ -170,96 +170,5 @@ impl super::sqlite::Datastore {
                 &receipt,
             ),
         )
-    }
-}
-
-/// Root-only OpenRaft envelope adapter over the SQLite recovery port.
-pub(crate) struct SqliteRaftSnapshotRestore {
-    recovery: std::sync::Arc<klights_cluster_datastore::sqlite::recovery::SqliteRecoveryStore>,
-    supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
-}
-
-impl SqliteRaftSnapshotRestore {
-    pub(crate) fn new(
-        recovery: std::sync::Arc<klights_cluster_datastore::sqlite::recovery::SqliteRecoveryStore>,
-        _authority: crate::datastore::raft::SnapshotInstallAuthority,
-        supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
-    ) -> Self {
-        Self {
-            recovery,
-            supervisor,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl klights_replication::state_machine::RaftSnapshotRestore for SqliteRaftSnapshotRestore {
-    async fn restore_snapshot(
-        &self,
-        snapshot_bytes: Vec<u8>,
-    ) -> Result<(), SnapshotPersistenceError> {
-        let data = self
-            .supervisor
-            .run_blocking(
-                klights_supervisor::TaskCategory::Others,
-                "raft-snapshot-json-zstd-decode",
-                move || {
-                    crate::datastore::raft::snapshot::RaftSnapshotData::deserialize_from_bytes(
-                        &snapshot_bytes,
-                    )
-                },
-            )
-            .await
-            .map_err(|error| SnapshotPersistenceError::PersistenceFailed {
-                message: error.to_string(),
-            })?
-            .map_err(|error| SnapshotPersistenceError::PersistenceFailed {
-                message: error.to_string(),
-            })?;
-        let metadata = data.cluster_metadata;
-        let membership = match data.cluster_membership {
-            None => klights_cluster_datastore::sqlite::recovery::SnapshotMembership::LegacyOmitted,
-            Some(crate::datastore::raft::snapshot::RaftSnapshotMembership::AuthoritativeAbsent) => {
-                klights_cluster_datastore::sqlite::recovery::SnapshotMembership::AuthoritativeAbsent
-            }
-            Some(crate::datastore::raft::snapshot::RaftSnapshotMembership::Present(value)) => {
-                klights_cluster_datastore::sqlite::recovery::SnapshotMembership::Present(value)
-            }
-        };
-        self.recovery
-            .restore_snapshot_parts(
-                data.operations,
-                data.current_rv,
-                data.watch_event_high_water,
-                data.watch_replay_floors.map(|floors| {
-                    floors
-                        .into_iter()
-                        .map(|floor| {
-                            klights_cluster_datastore::sqlite::recovery::SnapshotReplayFloor {
-                                api_version: floor.api_version,
-                                kind: floor.kind,
-                                namespace_key: floor.namespace_key,
-                                floor_resource_version: floor.floor_resource_version,
-                                floor_event_id: floor.floor_event_id,
-                                position_is_exact: floor.position_is_exact,
-                            }
-                        })
-                        .collect()
-                }),
-                Some(
-                    klights_cluster_datastore::sqlite::recovery::SnapshotMetadata {
-                        cluster_id: metadata
-                            .as_ref()
-                            .map(|metadata| metadata.cluster_id.clone())
-                            .unwrap_or_default(),
-                        leader_epoch: metadata
-                            .as_ref()
-                            .map_or(0, |metadata| metadata.leader_epoch),
-                        membership,
-                        command_codec_activation_version: data.command_codec_activation_version,
-                    },
-                ),
-            )
-            .await
     }
 }
