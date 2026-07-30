@@ -3,13 +3,19 @@ use serde_json::Value;
 pub fn normalize_image_name(image: &str) -> String {
     let normalized = if !image.contains('/') {
         format!("docker.io/library/{image}")
-    } else if !image.contains('.') && image.split('/').count() == 2 {
+    } else if image
+        .split_once('/')
+        .is_some_and(|(first, _)| first != "localhost" && !first.contains(['.', ':']))
+    {
         format!("docker.io/{image}")
     } else {
         image.to_string()
     };
 
-    if !normalized.contains(':') && !normalized.contains('@') {
+    let final_component_has_tag = normalized
+        .rsplit_once('/')
+        .map_or_else(|| normalized.contains(':'), |(_, name)| name.contains(':'));
+    if !final_component_has_tag && !normalized.contains('@') {
         format!("{normalized}:latest")
     } else {
         normalized
@@ -58,6 +64,10 @@ mod tests {
             normalize_image_name("library/nginx"),
             "docker.io/library/nginx:latest"
         );
+        assert_eq!(
+            normalize_image_name("coredns/coredns:1.11.1"),
+            "docker.io/coredns/coredns:1.11.1"
+        );
     }
 
     #[test]
@@ -65,6 +75,10 @@ mod tests {
         assert_eq!(
             normalize_image_name("registry.k8s.io/pause:3.10"),
             "registry.k8s.io/pause:3.10"
+        );
+        assert_eq!(
+            normalize_image_name("localhost:5000/team/image"),
+            "localhost:5000/team/image:latest"
         );
         assert_eq!(
             normalize_image_name("registry.k8s.io/pause@sha256:abcdef"),
