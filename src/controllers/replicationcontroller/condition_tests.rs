@@ -216,6 +216,10 @@ async fn test_replicationcontroller_scale_subresource() {
             log_file: None,
             containerd_namespace: ns.to_string(),
             containerd_socket: None,
+            registry_proxy: crate::kubelet::registry_proxy::RegistryProxyConfig::from_inputs(
+                false, None, false,
+            )
+            .unwrap(),
             node_name: "test-node".to_string(),
             node_ip: None,
             anonymous_auth: true,

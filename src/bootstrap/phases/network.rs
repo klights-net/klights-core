@@ -243,6 +243,11 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         grpc_transport_policy.connect_timeout,
         grpc_transport_policy.max_message_bytes,
     );
+    config
+        .registry_proxy
+        .verify_ready(&supervisor)
+        .await
+        .context("registry proxy preflight")?;
     let executable_path = std::env::current_exe().context("resolve klights executable path")?;
     let containerd_manager = if let Some(ref sock) = config.containerd_socket {
         tracing::info!("Using external containerd at {}", sock);
@@ -261,6 +266,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
                 paths: runtime_paths,
                 task_supervisor: supervisor.clone(),
                 cri_transport_policy,
+                registry_proxy: &config.registry_proxy,
             },
         )
         .await

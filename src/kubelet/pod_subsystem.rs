@@ -40,6 +40,7 @@ pub struct PodSubsystemConfig {
     pub lifecycle_route_mode: PodLifecycleRouteMode,
     // Task 19: runtime dependencies for RealPodRuntimeService construction (Task 24).
     pub cri: Option<crate::kubelet::cri::SharedCriClient>,
+    pub registry_proxy: Option<crate::kubelet::registry_proxy::ContainerdRegistryProxyConfigurator>,
     pub containerd_ns: String,
     pub lifecycle_tx: tokio::sync::mpsc::Sender<crate::kubelet::lifecycle::LifecycleCommand>,
     pub probe_manager: Option<Arc<ProbeManager>>,
@@ -78,6 +79,7 @@ struct RuntimeServiceBuildRequest {
     supervisor: Arc<TaskSupervisor>,
     repository: Arc<PodRepository>,
     cri: Option<crate::kubelet::cri::SharedCriClient>,
+    registry_proxy: Option<crate::kubelet::registry_proxy::ContainerdRegistryProxyConfigurator>,
     containerd_ns: String,
     probe_manager: Arc<ProbeManager>,
     datapath: Option<Arc<dyn klights_network_api::Datapath>>,
@@ -106,6 +108,7 @@ impl PodSubsystem {
         let node_name = config.node_name.clone();
         let service_cidr = config.service_cidr.clone();
         let cri = config.cri.clone();
+        let registry_proxy = config.registry_proxy.clone();
         let containerd_ns = config.containerd_ns.clone();
         let lifecycle_tx = config.lifecycle_tx.clone();
         let datapath = config.datapath.clone();
@@ -147,8 +150,12 @@ impl PodSubsystem {
         let lifecycle_service = PodLifecycleService::new(lifecycle_router.clone());
         let repository = Arc::new(repository);
         let probe_cri_runtime = config.cri.clone().map(|cri| {
-            Arc::new(crate::kubelet::pod_runtime::cri::SharedCriRuntime::new(cri))
-                as Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>
+            Arc::new(
+                crate::kubelet::pod_runtime::cri::SharedCriRuntime::new_with_registry_proxy(
+                    cri,
+                    registry_proxy.clone(),
+                ),
+            ) as Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>
         });
         let probe_manager = config.probe_manager.unwrap_or_else(|| {
             Arc::new(ProbeManager::new_with_lifecycle(
@@ -165,6 +172,7 @@ impl PodSubsystem {
                 supervisor: supervisor.clone(),
                 repository: repository.clone(),
                 cri: cri.clone(),
+                registry_proxy: registry_proxy.clone(),
                 containerd_ns: containerd_ns.clone(),
                 probe_manager: probe_manager.clone(),
                 datapath: datapath.clone(),
@@ -210,6 +218,7 @@ impl PodSubsystem {
             supervisor,
             repository,
             cri,
+            registry_proxy,
             containerd_ns,
             probe_manager,
             datapath,
@@ -241,9 +250,12 @@ impl PodSubsystem {
         let volume_projected_tokens = projected_tokens.ok_or_else(|| {
             anyhow::anyhow!("missing PodRuntimeService dependencies: projected_tokens")
         })?;
-        let cri_runtime = Arc::new(crate::kubelet::pod_runtime::cri::SharedCriRuntime::new(
-            cri.clone(),
-        ));
+        let cri_runtime = Arc::new(
+            crate::kubelet::pod_runtime::cri::SharedCriRuntime::new_with_registry_proxy(
+                cri.clone(),
+                registry_proxy,
+            ),
+        );
         let pod_reader: Arc<dyn crate::kubelet::pod_repository::PodReader> = repository.clone();
         let hostports: Arc<dyn crate::kubelet::pod_runtime::hostports::HostPortRuntime> = Arc::new(
             crate::kubelet::pod_runtime::hostports::RealHostPortRuntime::new(
@@ -422,6 +434,7 @@ mod tests {
             )
             .unwrap(),
             cri: None,
+            registry_proxy: None,
             containerd_ns: "klights".to_string(),
             lifecycle_tx,
             probe_manager: None,

@@ -53,6 +53,7 @@ pub mod probe_manager;
 pub mod probes;
 pub mod projected_sa_token_refresh;
 pub mod reconciler;
+pub mod registry_proxy;
 pub(crate) mod remote_runtime;
 pub mod rootless_runc_wrapper;
 pub mod runtime_paths;

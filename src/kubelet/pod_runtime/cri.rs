@@ -203,11 +203,25 @@ use crate::kubelet::cri_events::{KubeletEvent, KubeletEventKind};
 /// existing concrete CRI method. No Mutex.
 pub struct SharedCriRuntime {
     shared: SharedCriClient,
+    registry_proxy: Option<crate::kubelet::registry_proxy::ContainerdRegistryProxyConfigurator>,
 }
 
 impl SharedCriRuntime {
     pub fn new(shared: SharedCriClient) -> Self {
-        Self { shared }
+        Self {
+            shared,
+            registry_proxy: None,
+        }
+    }
+
+    pub fn new_with_registry_proxy(
+        shared: SharedCriClient,
+        registry_proxy: Option<crate::kubelet::registry_proxy::ContainerdRegistryProxyConfigurator>,
+    ) -> Self {
+        Self {
+            shared,
+            registry_proxy,
+        }
     }
 }
 
@@ -242,10 +256,16 @@ impl CriRuntimeContainerEventStream for SharedCriRuntimeEventStream {
 #[async_trait::async_trait]
 impl CriRuntime for SharedCriRuntime {
     async fn image_status(&self, image: &str) -> anyhow::Result<bool> {
+        if let Some(registry_proxy) = &self.registry_proxy {
+            registry_proxy.ensure_for_normalized_image(image).await?;
+        }
         self.shared.client().image_status(image).await
     }
 
     async fn pull_image(&self, image: &str) -> anyhow::Result<String> {
+        if let Some(registry_proxy) = &self.registry_proxy {
+            registry_proxy.ensure_for_normalized_image(image).await?;
+        }
         self.shared.client().pull_image(image).await
     }
 

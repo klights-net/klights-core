@@ -1,6 +1,6 @@
 [Unit]
 Description=K8s Runtime Services (klights)
-After=network-online.target containerd.service
+After=network-online.target containerd.service klights-proxy.service
 Wants=network-online.target
 
 [Service]

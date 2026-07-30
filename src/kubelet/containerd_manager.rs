@@ -180,11 +180,27 @@ pub struct ContainerdStartConfig<'a> {
     pub paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
     pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub cri_transport_policy: klights_node_api::CriTransportPolicy,
+    pub registry_proxy: &'a crate::kubelet::registry_proxy::RegistryProxyConfig,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ContainerdConfigOptions<'a> {
+    rootless: bool,
+    isolated_mount_namespace: bool,
+    registry_hosts_path: Option<&'a Path>,
 }
 
 enum ContainerdProcess {
     Spawned(klights_supervisor::SupervisedChild),
     Reused,
+}
+
+fn registry_proxy_config_requires_restart(
+    proxy_enabled: bool,
+    existing_config: Option<&str>,
+    expected_config: &str,
+) -> bool {
+    proxy_enabled && existing_config != Some(expected_config)
 }
 
 impl ContainerdManager {
@@ -356,9 +372,13 @@ impl ContainerdManager {
         state_dir: &str,
         cni_bin_dir: &str,
         cni_conf_dir: &str,
-        rootless: bool,
-        isolated_mount_namespace: bool,
+        options: ContainerdConfigOptions<'_>,
     ) -> String {
+        let ContainerdConfigOptions {
+            rootless,
+            isolated_mount_namespace,
+            registry_hosts_path,
+        } = options;
         // In rootless mode containerd runs inside a user namespace where
         // /var/run/netns is owned by root and not writable.  Telling the CRI
         // plugin to place network namespace mounts under the state directory
@@ -402,6 +422,12 @@ impl ContainerdManager {
         } else {
             String::new()
         };
+        let registry_section = registry_hosts_path.map_or_else(String::new, |path| {
+            format!(
+                "\n    [plugins.'io.containerd.cri.v1.images'.registry]\n      config_path = \"{}\"\n",
+                path.display()
+            )
+        });
         format!(
             r#"version = 3
 
@@ -419,6 +445,7 @@ state = "{state_dir}"
   [plugins.'io.containerd.cri.v1.images']
     snapshotter = "overlayfs"
     disable_snapshot_annotations = true
+{registry_section}
 
   [plugins.'io.containerd.cri.v1.runtime']
     netns_mounts_under_state_dir = {netns_mounts_under_state_dir}
@@ -452,6 +479,7 @@ state = "{state_dir}"
             paths,
             task_supervisor,
             cri_transport_policy,
+            registry_proxy,
         } = config;
         let file_process = klights_supervisor::FileProcessExecutor::new(task_supervisor.clone());
         // Ensure inotify limits are sufficient before starting containerd
@@ -470,6 +498,7 @@ state = "{state_dir}"
         let data_dir = paths.containerd_data_dir().to_string_lossy().into_owned();
         let state_dir = paths.containerd_state_dir().to_string_lossy().into_owned();
         let config_path = format!("{}/config.toml", data_dir);
+        let registry_hosts_path = Path::new(&data_dir).join("certs.d");
         let cni_bin_dir = paths.cni_bin_dir().to_string_lossy().into_owned();
         let cni_conf_dir = paths.cni_conf_dir(namespace).to_string_lossy().into_owned();
 
@@ -504,6 +533,13 @@ state = "{state_dir}"
             pod_link_mtu,
         )
         .await?;
+        crate::kubelet::registry_proxy::ContainerdRegistryProxyConfigurator::new(
+            registry_proxy.clone(),
+            registry_hosts_path.clone(),
+            file_process.clone(),
+        )
+        .reconcile_root()
+        .await?;
 
         // Generate and write config file
         let config_content = Self::generate_config(
@@ -512,9 +548,32 @@ state = "{state_dir}"
             &state_dir,
             &cni_bin_dir,
             &cni_conf_dir,
-            rootless,
-            is_isolated_mount_namespace(),
+            ContainerdConfigOptions {
+                rootless,
+                isolated_mount_namespace: is_isolated_mount_namespace(),
+                registry_hosts_path: registry_proxy
+                    .enabled()
+                    .then_some(registry_hosts_path.as_path()),
+            },
         );
+        let existing_config =
+            klights_supervisor::runtime_fs::read_utf8_async(&file_process, &config_path)
+                .await
+                .ok();
+        if registry_proxy_config_requires_restart(
+            registry_proxy.enabled(),
+            existing_config.as_deref(),
+            &config_content,
+        ) && klights_supervisor::runtime_fs::exists_async(&file_process, &socket_path).await?
+        {
+            tracing::info!(
+                namespace = %namespace,
+                "Restarting klights-managed containerd to activate registry proxy configuration"
+            );
+            Self::stop_namespace_containerd(namespace, &task_supervisor, &file_process, paths)
+                .await
+                .context("stop containerd with stale registry proxy configuration")?;
+        }
         let config_key = config_path.clone();
         let config_path_for_write = config_path.clone();
         file_process
@@ -1464,8 +1523,7 @@ mod tests {
             &state,
             &cni_bin,
             &cni_conf_dir,
-            false,
-            false,
+            ContainerdConfigOptions::default(),
         );
 
         let parsed: toml::Value =
@@ -1489,6 +1547,54 @@ mod tests {
     }
 
     #[test]
+    fn proxy_enabled_config_sets_exact_per_node_registry_hosts_path() {
+        let root = test_root("proxy-config");
+        let cni_conf_dir = test_cni_conf_dir("proxy-config");
+        let certs_dir = format!("{root}/containerd/data/certs.d");
+        let config = ContainerdManager::generate_config(
+            &format!("{root}/containerd.sock"),
+            &format!("{root}/containerd/data"),
+            &format!("{root}/containerd/state"),
+            &format!("{root}/cni/bin"),
+            &cni_conf_dir,
+            ContainerdConfigOptions {
+                registry_hosts_path: Some(Path::new(&certs_dir)),
+                ..ContainerdConfigOptions::default()
+            },
+        );
+        let parsed: toml::Value = toml::from_str(&config).unwrap();
+
+        let registry = parsed["plugins"]["io.containerd.cri.v1.images"]["registry"]
+            .as_table()
+            .expect("proxy mode must configure the CRI image registry host directory");
+        assert_eq!(
+            registry.get("config_path").and_then(toml::Value::as_str),
+            Some(certs_dir.as_str())
+        );
+    }
+
+    #[test]
+    fn reused_containerd_restarts_only_when_proxy_top_level_config_is_stale() {
+        let expected = "version = 3\nproxy-config";
+        assert!(!registry_proxy_config_requires_restart(
+            false,
+            Some("old config"),
+            expected,
+        ));
+        assert!(!registry_proxy_config_requires_restart(
+            true,
+            Some(expected),
+            expected,
+        ));
+        assert!(registry_proxy_config_requires_restart(
+            true,
+            Some("version = 3\nwithout proxy"),
+            expected,
+        ));
+        assert!(registry_proxy_config_requires_restart(true, None, expected,));
+    }
+
+    #[test]
     fn test_generate_config_sets_grpc_message_size_limits() {
         let root = test_root("klights");
         let cni_conf_dir = test_cni_conf_dir("klights");
@@ -1502,8 +1608,7 @@ mod tests {
             &state,
             &cni_bin,
             &cni_conf_dir,
-            false,
-            false,
+            ContainerdConfigOptions::default(),
         );
 
         let parsed: toml::Value =
@@ -1536,8 +1641,7 @@ mod tests {
             &state,
             &cni_bin,
             &cni_conf_dir,
-            false,
-            false,
+            ContainerdConfigOptions::default(),
         );
 
         let parsed: toml::Value =
@@ -1572,8 +1676,7 @@ mod tests {
             &state,
             &cni_bin,
             &cni_conf_dir,
-            false,
-            false,
+            ContainerdConfigOptions::default(),
         );
 
         let parsed: toml::Value =
@@ -1625,8 +1728,7 @@ mod tests {
             &state,
             &cni_bin,
             &cni_conf_dir,
-            false,
-            false,
+            ContainerdConfigOptions::default(),
         );
 
         let parsed: toml::Value =
@@ -1671,8 +1773,7 @@ mod tests {
             &state,
             &cni_bin,
             &cni_conf_dir,
-            false,
-            false,
+            ContainerdConfigOptions::default(),
         );
 
         let parsed: toml::Value =
@@ -1714,8 +1815,10 @@ mod tests {
             &state,
             &cni_bin,
             &cni_conf_dir,
-            true,
-            false,
+            ContainerdConfigOptions {
+                rootless: true,
+                ..ContainerdConfigOptions::default()
+            },
         );
 
         let parsed: toml::Value =
@@ -1756,8 +1859,10 @@ mod tests {
             &state,
             &cni_bin,
             &cni_conf_dir,
-            false,
-            true,
+            ContainerdConfigOptions {
+                isolated_mount_namespace: true,
+                ..ContainerdConfigOptions::default()
+            },
         );
 
         let parsed: toml::Value =
@@ -1790,8 +1895,7 @@ mod tests {
             &state,
             &cni_bin,
             &cni_conf_dir,
-            false,
-            false,
+            ContainerdConfigOptions::default(),
         );
 
         let parsed: toml::Value =
@@ -1824,8 +1928,7 @@ mod tests {
             &state,
             &cni_bin,
             &cni_conf_dir,
-            false,
-            false,
+            ContainerdConfigOptions::default(),
         );
 
         let parsed: toml::Value =

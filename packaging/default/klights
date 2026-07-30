@@ -10,6 +10,11 @@ KLIGHTS_DATA_ROOT=/var/lib/klights
 # Pass command arguments to /usr/bin/klights.
 KLIGHTS_ARGS=start
 
+# Optional standalone registry proxy. The endpoint defaults to the value below
+# when enabled. Only absolute plain-HTTP root endpoints are accepted.
+# KLIGHTS_REGISTRY_PROXY_ENABLED=1
+# KLIGHTS_REGISTRY_PROXY_ENDPOINT=http://127.0.0.1:16797
+
 # Root mode example:
 # KLIGHTS_ARGS="--data-dir /var/lib/klights"
 

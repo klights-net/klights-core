@@ -500,6 +500,13 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             paths: runtime_paths.clone(),
             lifecycle_route_mode: crate::kubelet::pod_lifecycle_router::PodLifecycleRouteMode::Actor,
             cri: cri_for_pod_watcher.clone().map(crate::kubelet::cri::SharedCriClient::new),
+            registry_proxy: config.registry_proxy.enabled().then(|| {
+                crate::kubelet::registry_proxy::ContainerdRegistryProxyConfigurator::new(
+                    config.registry_proxy.clone(),
+                    runtime_paths.containerd_data_dir().join("certs.d"),
+                    klights_supervisor::FileProcessExecutor::new(task_supervisor.clone()),
+                )
+            }),
             containerd_ns: config.containerd_namespace.clone(),
             lifecycle_tx: pod_lifecycle_tx,
             probe_manager: None,

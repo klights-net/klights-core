@@ -18,6 +18,8 @@ pub struct KlightsConfig {
     pub log_file: Option<String>,
     pub containerd_namespace: String,
     pub containerd_socket: Option<String>,
+    /// Immutable registry-proxy settings captured once at bootstrap.
+    pub registry_proxy: crate::kubelet::registry_proxy::RegistryProxyConfig,
     pub node_name: String,
     /// Node-local IP override for the Kubernetes Node InternalIP and local
     /// endpoint fallback. When unset, startup discovers the host IP.
@@ -207,6 +209,13 @@ impl KlightsConfig {
         let db_key_file = std::env::var("KLIGHTS_DB_KEY_FILE")
             .ok()
             .map(std::path::PathBuf::from);
+        let containerd_socket = std::env::var("KLIGHTS_CONTAINERD_SOCKET").ok();
+        let registry_proxy_endpoint = std::env::var("KLIGHTS_REGISTRY_PROXY_ENDPOINT").ok();
+        let registry_proxy = crate::kubelet::registry_proxy::RegistryProxyConfig::from_inputs(
+            parse_bool_env("KLIGHTS_REGISTRY_PROXY_ENABLED", false)?,
+            registry_proxy_endpoint.as_deref(),
+            containerd_socket.is_some(),
+        )?;
 
         Ok(Self {
             bridge_name,
@@ -217,7 +226,8 @@ impl KlightsConfig {
             api_fqdn: parse_optional_trimmed_env("KLIGHTS_API_FQDN"),
             log_file: std::env::var("KLIGHTS_LOG_FILE").ok(),
             containerd_namespace,
-            containerd_socket: std::env::var("KLIGHTS_CONTAINERD_SOCKET").ok(),
+            containerd_socket,
+            registry_proxy,
             node_name,
             node_ip: parse_optional_ipv4_env("KLIGHTS_NODE_IP")?,
             anonymous_auth: parse_bool_env("KLIGHTS_ANONYMOUS_AUTH", true)?,
@@ -334,6 +344,10 @@ impl KlightsConfig {
             log_file: None,
             containerd_namespace: ns.into(),
             containerd_socket: None,
+            registry_proxy: crate::kubelet::registry_proxy::RegistryProxyConfig::from_inputs(
+                false, None, false,
+            )
+            .expect("default registry proxy configuration must be valid"),
             node_name: "test-node".into(),
             node_ip: None,
             anonymous_auth: true,

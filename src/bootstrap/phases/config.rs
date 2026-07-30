@@ -32,6 +32,11 @@ pub async fn load(cli: &CliFlags) -> Result<ConfigPhase> {
     if let Some(anonymous_auth) = cli.anonymous_auth {
         config.anonymous_auth = anonymous_auth;
     }
+    tracing::info!(
+        enabled = config.registry_proxy.enabled(),
+        endpoint = config.registry_proxy.endpoint(),
+        "registry proxy configuration captured"
+    );
     let config = Arc::new(config);
     let node_mode =
         NodeMode::detect(cli.rootless).context("failed to detect klights operating mode")?;
