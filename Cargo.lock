@@ -2041,6 +2041,7 @@ dependencies = [
  "klights-node-store",
  "klights-pod-api",
  "klights-reconcile-api",
+ "klights-replication",
  "klights-supervisor",
  "klights-types",
  "klights-watch",
@@ -2317,6 +2318,23 @@ dependencies = [
 [[package]]
 name = "klights-replication"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "klights-cluster-core",
+ "klights-cluster-store",
+ "klights-internal-protobuf",
+ "klights-leader-api",
+ "klights-leader-rpc",
+ "klights-node-store",
+ "klights-supervisor",
+ "openraft",
+ "prost",
+ "serde",
+ "serde_json",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "klights-supervisor"

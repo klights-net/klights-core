@@ -100,7 +100,7 @@ impl SequencedDatastore {
     async fn propose_command(
         &self,
         command: StorageCommand,
-    ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
+    ) -> Result<klights_replication::types::StorageCommandResult> {
         self.proposal.propose_command(command).await
     }
 }

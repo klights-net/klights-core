@@ -543,7 +543,7 @@ impl crate::datastore::ReplicationStore for Datastore {
     async fn apply_raft_log_apply_commit(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
-    ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
+    ) -> anyhow::Result<crate::datastore::StorageCommandResult> {
         crate::datastore::DatastoreBackend::apply_raft_log_apply_commit(self, commit).await
     }
 
@@ -602,7 +602,7 @@ impl crate::datastore::DurableRecoveryStore for Datastore {
 }
 
 #[async_trait::async_trait]
-impl crate::datastore::BackendLifecycleStore for Datastore {
+impl klights_cluster_store::BackendLifecycleStore for Datastore {
     async fn acquire_snapshot_exclusive_fence(
         &self,
     ) -> anyhow::Result<Option<crate::datastore::backend::SnapshotExclusiveFence>> {

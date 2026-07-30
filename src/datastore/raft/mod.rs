@@ -3,7 +3,6 @@ pub(crate) use authority::snapshot_install;
 pub mod compressed;
 pub mod flow_control;
 pub mod grpc_network;
-pub mod log_storage;
 pub mod membership_client;
 
 pub(crate) use authority::SnapshotInstallAuthority;
@@ -11,8 +10,22 @@ pub mod network;
 pub mod node;
 pub(crate) mod proposal;
 pub(crate) mod snapshot;
-pub mod state_machine_impl;
-pub mod types;
+
+#[cfg(test)]
+pub(crate) fn test_unproven_member(
+    addr: impl Into<String>,
+) -> klights_replication::types::RaftMemberNode {
+    klights_replication::types::RaftMemberNode::new(
+        addr.into(),
+        uuid::Uuid::nil().to_string(),
+        None,
+    )
+}
+
+#[cfg(test)]
+mod log_storage_tests;
+#[cfg(test)]
+mod state_machine_tests;
 
 #[cfg(test)]
 mod tests {

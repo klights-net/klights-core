@@ -39,6 +39,14 @@ impl SnapshotMutationFence {
     }
 }
 
+/// Focused backend lifecycle and snapshot-fence port.
+#[async_trait]
+pub trait BackendLifecycleStore: Send + Sync {
+    async fn acquire_snapshot_exclusive_fence(&self) -> Result<Option<SnapshotExclusiveFence>>;
+    async fn acquire_snapshot_mutation_fence(&self) -> Result<Option<SnapshotMutationFence>>;
+    fn close(&self);
+}
+
 /// Versioned snapshot of cluster-replicated backend state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotEnvelope {

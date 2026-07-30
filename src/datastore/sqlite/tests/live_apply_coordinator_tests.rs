@@ -3711,9 +3711,9 @@ async fn committed_apply_json_and_protobuf_paths_produce_identical_rows() {
     );
 
     // JSON path
-    let json_bytes = crate::replication::log_apply_wire::encode_commit_json(&commit).unwrap();
+    let json_bytes = klights_replication::log_apply_wire::encode_commit_json(&commit).unwrap();
     let commit_from_json =
-        crate::replication::log_apply_wire::decode_commit_json(&json_bytes).unwrap();
+        klights_replication::log_apply_wire::decode_commit_json(&json_bytes).unwrap();
     let db_json = crate::datastore::test_support::in_memory().await;
     db_json
         .apply_raft_log_apply_commit(commit_from_json)
@@ -3726,9 +3726,9 @@ async fn committed_apply_json_and_protobuf_paths_produce_identical_rows() {
         .expect("json path must materialise row");
 
     // Protobuf path
-    let proto_bytes = crate::replication::log_apply_wire::encode_commit_protobuf(&commit).unwrap();
+    let proto_bytes = klights_replication::log_apply_wire::encode_commit_protobuf(&commit).unwrap();
     let commit_from_proto =
-        crate::replication::log_apply_wire::decode_commit_protobuf(&proto_bytes).unwrap();
+        klights_replication::log_apply_wire::decode_commit_protobuf(&proto_bytes).unwrap();
     let db_proto = crate::datastore::test_support::in_memory().await;
     db_proto
         .apply_raft_log_apply_commit(commit_from_proto)

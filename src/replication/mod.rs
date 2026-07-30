@@ -14,7 +14,6 @@ pub mod fanout;
 #[path = "grpc/client/tests.rs"]
 mod grpc_client_tests;
 pub(crate) mod grpc_runtime_adapter;
-pub mod log_apply_wire;
 pub(crate) mod outbox_payload_codec;
 pub(crate) mod outbox_response_wire;
 pub mod service;

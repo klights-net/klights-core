@@ -395,7 +395,7 @@ mod tests {
             async fn propose_command(
                 &self,
                 command: StorageCommand,
-            ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
+            ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
                 let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()?;
                 let key = format!("csr-signer-test-{}", uuid::Uuid::new_v4());
@@ -408,14 +408,14 @@ mod tests {
                 )
                 .await
                 .map_err(|err| anyhow::anyhow!("inline raft propose failed: {err}"))?;
-                Ok(crate::datastore::raft::types::StorageCommandResult {
-                    applied_rv: outcome.applied_resource_version(),
-                    error_message: None,
-                    rejection_code: None,
-                    public_resource_changed: false,
-                    applied_mutation: None,
-                    pod_endpoint_effect: Default::default(),
-                })
+                Ok(klights_replication::types::StorageCommandResult::new(
+                    outcome.applied_resource_version(),
+                    None,
+                    None,
+                    false,
+                    None,
+                    Default::default(),
+                ))
             }
 
             async fn propose_outbox_command(

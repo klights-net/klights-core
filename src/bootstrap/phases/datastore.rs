@@ -239,8 +239,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         leader_node_local.as_ref(),
     ) {
         (r, Some(stores)) if uses_leader_runtime(r) => {
-            let node_id =
-                crate::datastore::raft::types::raft_node_id_for_node_name(&config.node_name);
+            let node_id = klights_replication::types::raft_node_id_for_node_name(&config.node_name);
             if r.is_learner_join() && stores.raft_log.reset_orphaned_learner_log().await? {
                 tracing::warn!(
                     node_id,
@@ -330,9 +329,9 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 passive_backend.clone(),
             ));
             let state_machine_stores =
-                crate::datastore::raft::state_machine_impl::RaftStateMachineStorePorts::new(
+                klights_replication::state_machine::RaftStateMachineStorePorts::new(
                     Arc::new(
-                        crate::datastore::cluster_store_adapter::ObservedCommittedRaftApply::new(
+                        klights_replication::committed_apply::ObservedCommittedRaftApply::new(
                             committed_apply,
                             watch_commit_wiring.wakeups.clone(),
                         ),
@@ -341,15 +340,17 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                         crate::datastore::cluster_store_adapter::SqliteRaftSnapshotRestore::new(
                             sqlite_recovery.clone(),
                             crate::datastore::raft::snapshot_install(),
+                            supervisor.clone(),
                         ),
                     ),
-                    recovery,
-                    lifecycle,
+                    lifecycle.clone(),
                     materializer.clone(),
                 );
             let raft_stores = crate::datastore::raft::node::RaftStorePorts::new(
                 materializer,
                 state_machine_stores,
+                recovery,
+                lifecycle,
             );
             let raft = Arc::new(
                 crate::datastore::raft::node::RaftNode::start_with_network(

@@ -26,7 +26,7 @@ use openraft::declare_raft_types;
 use openraft::impls::OneshotResponder;
 use serde::{Deserialize, Serialize};
 
-use super::super::Resource;
+use klights_cluster_core::Resource;
 
 pub use klights_cluster_core::{NodeId, RaftShape, raft_node_id_for_node_name};
 
@@ -126,6 +126,30 @@ pub struct StorageCommandResult {
     /// side-effect dispatcher. It is never serialized into a Raft response.
     #[serde(skip)]
     pub(crate) pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
+}
+
+impl StorageCommandResult {
+    pub fn new(
+        applied_rv: Option<i64>,
+        error_message: Option<String>,
+        rejection_code: Option<klights_cluster_core::StorageCommandRejectionCode>,
+        public_resource_changed: bool,
+        applied_mutation: Option<AppliedMutation>,
+        pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
+    ) -> Self {
+        Self {
+            applied_rv,
+            error_message,
+            rejection_code,
+            public_resource_changed,
+            applied_mutation,
+            pod_endpoint_effect,
+        }
+    }
+
+    pub fn pod_endpoint_effect(&self) -> klights_cluster_core::PodEndpointEffect {
+        self.pod_endpoint_effect
+    }
 }
 
 const fn is_false(value: &bool) -> bool {

@@ -33,7 +33,7 @@ mod cases {
             async fn propose_command(
                 &self,
                 command: StorageCommand,
-            ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
+            ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
                 self.calls
                     .lock()
                     .unwrap()
@@ -61,14 +61,14 @@ mod cases {
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("inline propose: {e}"))?;
-                Ok(crate::datastore::raft::types::StorageCommandResult {
-                    applied_rv: outcome.applied_resource_version(),
-                    error_message: None,
-                    rejection_code: None,
-                    public_resource_changed: false,
-                    applied_mutation: None,
-                    pod_endpoint_effect: Default::default(),
-                })
+                Ok(klights_replication::types::StorageCommandResult::new(
+                    outcome.applied_resource_version(),
+                    None,
+                    None,
+                    false,
+                    None,
+                    Default::default(),
+                ))
             }
 
             async fn propose_outbox_command(
@@ -120,7 +120,7 @@ mod cases {
         async fn propose_command(
             &self,
             _command: StorageCommand,
-        ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
+        ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
             panic!("this operation must not submit a raft proposal")
         }
 
@@ -177,7 +177,7 @@ mod cases {
         assert_application_apply_rejected(
             DatastoreBackend::apply_log_apply_commit(
                 &ds,
-                crate::replication::log_apply_wire::test_live_commit(1, Vec::new()),
+                crate::datastore::test_support::test_live_commit(1, Vec::new()),
             )
             .await
             .expect_err("application facade must reject legacy committed apply"),
@@ -186,7 +186,7 @@ mod cases {
         assert_application_apply_rejected(
             DatastoreBackend::apply_raft_log_apply_commit(
                 &ds,
-                crate::replication::log_apply_wire::test_live_commit(2, Vec::new()),
+                crate::datastore::test_support::test_live_commit(2, Vec::new()),
             )
             .await
             .expect_err("application facade must reject Raft committed apply"),
@@ -195,7 +195,7 @@ mod cases {
         assert_application_apply_rejected(
             DatastoreBackend::apply_raft_log_apply_commit_receipt(
                 &ds,
-                crate::replication::log_apply_wire::test_live_commit(3, Vec::new()),
+                crate::datastore::test_support::test_live_commit(3, Vec::new()),
             )
             .await
             .expect_err("application facade must reject Raft committed apply outcomes"),
@@ -218,7 +218,7 @@ mod cases {
         assert_application_apply_rejected(
             crate::datastore::ReplicationStore::apply_log_apply_commit(
                 &ds,
-                crate::replication::log_apply_wire::test_live_commit(4, Vec::new()),
+                crate::datastore::test_support::test_live_commit(4, Vec::new()),
             )
             .await
             .expect_err("replication compatibility facade must reject legacy committed apply"),
@@ -227,7 +227,7 @@ mod cases {
         assert_application_apply_rejected(
             crate::datastore::ReplicationStore::apply_raft_log_apply_commit(
                 &ds,
-                crate::replication::log_apply_wire::test_live_commit(5, Vec::new()),
+                crate::datastore::test_support::test_live_commit(5, Vec::new()),
             )
             .await
             .expect_err("replication compatibility facade must reject Raft committed apply"),
@@ -236,7 +236,7 @@ mod cases {
         assert_application_apply_rejected(
             crate::datastore::ReplicationStore::apply_raft_log_apply_commit_receipt(
                 &ds,
-                crate::replication::log_apply_wire::test_live_commit(6, Vec::new()),
+                crate::datastore::test_support::test_live_commit(6, Vec::new()),
             )
             .await
             .expect_err(
@@ -516,7 +516,7 @@ mod cases {
             .await
             .expect("seed existing resource");
         let ds = inner;
-        let commit = crate::replication::log_apply_wire::test_live_commit(
+        let commit = crate::datastore::test_support::test_live_commit(
             0,
             vec![klights_cluster_core::LogApplyMutation::PutResource(
                 klights_cluster_core::LogApplyResourceRow {
@@ -2206,7 +2206,7 @@ mod cases {
             async fn propose_command(
                 &self,
                 command: StorageCommand,
-            ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
+            ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
                 self.calls.lock().unwrap().push(command.clone());
                 let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()?;
@@ -2220,14 +2220,14 @@ mod cases {
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("inline propose apply: {e}"))?;
-                Ok(crate::datastore::raft::types::StorageCommandResult {
-                    applied_rv: outcome.applied_resource_version(),
-                    error_message: None,
-                    rejection_code: None,
-                    public_resource_changed: false,
-                    applied_mutation: None,
-                    pod_endpoint_effect: Default::default(),
-                })
+                Ok(klights_replication::types::StorageCommandResult::new(
+                    outcome.applied_resource_version(),
+                    None,
+                    None,
+                    false,
+                    None,
+                    Default::default(),
+                ))
             }
 
             async fn propose_outbox_command(
@@ -2308,9 +2308,9 @@ mod cases {
             async fn propose_command(
                 &self,
                 command: StorageCommand,
-            ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
+            ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
                 self.calls.lock().unwrap().push(command);
-                Ok(crate::datastore::raft::types::StorageCommandResult::default())
+                Ok(klights_replication::types::StorageCommandResult::default())
             }
 
             async fn propose_outbox_command(
@@ -2390,7 +2390,7 @@ mod cases {
             async fn propose_command(
                 &self,
                 _command: StorageCommand,
-            ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
+            ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
                 unreachable!("outbox routing test should use propose_outbox_command")
             }
 
@@ -2488,7 +2488,7 @@ mod cases {
             async fn propose_command(
                 &self,
                 command: StorageCommand,
-            ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
+            ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
                 let sequence = {
                     let mut calls = self.calls.lock().unwrap();
                     calls.push(command.variant_name());
@@ -2507,7 +2507,7 @@ mod cases {
                     },
                 )
                 .await?;
-                Ok(crate::datastore::raft::types::StorageCommandResult::default())
+                Ok(klights_replication::types::StorageCommandResult::default())
             }
 
             async fn propose_outbox_command(
@@ -2859,7 +2859,7 @@ mod cases {
             async fn propose_command(
                 &self,
                 _command: klights_cluster_core::command::StorageCommand,
-            ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
+            ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
                 Err(anyhow::anyhow!(
                     "not the leader; forward to current raft leader"
                 ))

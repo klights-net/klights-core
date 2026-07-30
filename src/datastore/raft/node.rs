@@ -25,18 +25,18 @@ use openraft::{ChangeMembers, Config, Raft};
 
 use openraft::network::RaftNetworkFactory;
 
-use super::log_storage::SqliteRaftLogStorage;
 use super::network::LeaderForwarder;
 #[cfg(test)]
 use super::network::StubRaftNetwork;
-use super::state_machine_impl::SqliteRaftStateMachine;
-use super::types::{
-    NodeId, RaftMemberLogId, RaftMemberNode, RaftShape, StorageCommandPayload, TypeConfig,
+use klights_cluster_store::BackendLifecycleStore;
+use klights_replication::activation::{
+    COMMAND_CODEC_ACTIVATION_VALUE, CommandCodecV3Activation, KEY_COMMAND_CODEC_ACTIVATION_VERSION,
 };
-
-pub(crate) use klights_cluster_store::{
-    COMMAND_CODEC_ACTIVATION_VERSION_META_KEY as KEY_COMMAND_CODEC_ACTIVATION_VERSION,
-    COMMAND_CODEC_V3_ACTIVATION_VALUE as COMMAND_CODEC_ACTIVATION_VALUE,
+use klights_replication::log_storage::SqliteRaftLogStorage;
+use klights_replication::materializer::RaftCommitMaterializer;
+use klights_replication::state_machine::{RaftStateMachineStorePorts, SqliteRaftStateMachine};
+use klights_replication::types::{
+    NodeId, RaftMemberLogId, RaftMemberNode, RaftShape, StorageCommandPayload, TypeConfig,
 };
 const RAFT_MEMBER_ADMISSION_META_PREFIX: &str = "raft_member_admission/";
 
@@ -52,80 +52,6 @@ struct RaftMemberAdmission {
 pub enum RaftMemberAdmissionResult {
     Changed,
     Unchanged,
-}
-
-/// Process-local mirror of the Raft-committed exact-v3 activation marker.
-///
-/// The startup gate is enabled only by the production bootstrap path. Tests
-/// that exercise Raft mechanics directly remain independent of bootstrap
-/// policy, while every production proposal capability is fail-closed until
-/// the authoritative cluster marker has applied locally.
-pub(crate) struct CommandCodecV3Activation {
-    activated: std::sync::atomic::AtomicBool,
-    startup_gate_enforced: std::sync::atomic::AtomicBool,
-}
-
-impl CommandCodecV3Activation {
-    async fn load(materializer: &dyn RaftCommitMaterializer) -> Result<Self> {
-        let value = materializer
-            .read_raft_metadata(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
-            .await
-            .context("read command codec activation marker")?;
-        let activated = match value.as_deref() {
-            None => false,
-            Some(COMMAND_CODEC_ACTIVATION_VALUE) => true,
-            Some(other) => {
-                anyhow::bail!(
-                    "unsupported persisted command codec activation version {other:?}; required exact version {COMMAND_CODEC_ACTIVATION_VALUE}"
-                )
-            }
-        };
-        Ok(Self {
-            activated: std::sync::atomic::AtomicBool::new(activated),
-            startup_gate_enforced: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-
-    #[cfg(test)]
-    pub(super) fn inactive_for_state_machine_test() -> Self {
-        Self {
-            activated: std::sync::atomic::AtomicBool::new(false),
-            startup_gate_enforced: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
-    fn enforce_startup_gate(&self) {
-        self.startup_gate_enforced
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    pub(crate) fn mark_command_codec_v3_activated(&self) {
-        self.activated
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    pub(crate) fn clear_command_codec_v3_activation(&self) {
-        self.activated
-            .store(false, std::sync::atomic::Ordering::Release);
-    }
-
-    pub(crate) fn is_activated(&self) -> bool {
-        self.activated.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    fn ensure_command_codec_v3_activated(&self) -> Result<()> {
-        if !self
-            .startup_gate_enforced
-            .load(std::sync::atomic::Ordering::Acquire)
-            || self.is_activated()
-        {
-            Ok(())
-        } else {
-            anyhow::bail!(
-                "command proposal capability is unavailable until the Raft-committed exact-v3 codec activation marker applies"
-            )
-        }
-    }
 }
 
 /// One-shot metadata RPC port used by the exact codec-v3 activation
@@ -213,40 +139,25 @@ pub(crate) const RAFT_MAX_PAYLOAD_ENTRIES: u64 = 16;
 /// safe range 8..=32.
 pub(crate) const RAFT_MAX_INFLIGHT_PROPOSALS: usize = 32;
 
-#[async_trait]
-pub(crate) trait RaftCommitMaterializer: Send + Sync {
-    async fn read_raft_metadata(&self, key: &str) -> Result<Option<String>, StorageMutationError>;
-
-    async fn build_command(
-        &self,
-        command: StorageCommand,
-        operation: &str,
-        authoring_node: &str,
-    ) -> std::result::Result<klights_cluster_core::LogApplyCommit, StorageMutationError>;
-
-    async fn build_outbox(
-        &self,
-        idempotency_key: &str,
-        operation: &str,
-        command: StorageCommand,
-        authoring_node: &str,
-        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
-    ) -> std::result::Result<klights_cluster_core::BuildOutboxOutcome, OutboxApplyError>;
-}
-
 pub struct RaftStorePorts {
     materializer: Arc<dyn RaftCommitMaterializer>,
-    state_machine: super::state_machine_impl::RaftStateMachineStorePorts,
+    state_machine: RaftStateMachineStorePorts,
+    recovery: Arc<dyn crate::datastore::DurableRecoveryStore>,
+    lifecycle: Arc<dyn BackendLifecycleStore>,
 }
 
 impl RaftStorePorts {
     pub(crate) fn new(
         materializer: Arc<dyn RaftCommitMaterializer>,
-        state_machine: super::state_machine_impl::RaftStateMachineStorePorts,
+        state_machine: RaftStateMachineStorePorts,
+        recovery: Arc<dyn crate::datastore::DurableRecoveryStore>,
+        lifecycle: Arc<dyn BackendLifecycleStore>,
     ) -> Self {
         Self {
             materializer,
             state_machine,
+            recovery,
+            lifecycle,
         }
     }
 }
@@ -383,10 +294,16 @@ impl RaftNode {
         let log_store = SqliteRaftLogStorage::new(log_durability, supervisor.clone());
         let command_codec_v3_activation =
             Arc::new(CommandCodecV3Activation::load(stores.materializer.as_ref()).await?);
+        let snapshot_builder = super::snapshot::SqliteRaftSnapshotBuilder {
+            recovery: stores.recovery,
+            lifecycle: stores.lifecycle,
+            applied_state: applied_state_durability.clone(),
+            supervisor,
+        };
         let state_machine = SqliteRaftStateMachine::new_with_command_codec_activation(
             stores.state_machine,
             applied_state_durability,
-            supervisor,
+            snapshot_builder,
             command_codec_v3_activation.clone(),
         );
         let raft = Raft::new(node_id, config, network, log_store, state_machine)
@@ -469,7 +386,7 @@ impl RaftNode {
     async fn propose_materialized_commit(
         &self,
         payload: StorageCommandPayload,
-    ) -> Result<super::types::StorageCommandResult> {
+    ) -> Result<klights_replication::types::StorageCommandResult> {
         match self.raft.client_write(payload).await {
             Ok(response) => Ok(response.data),
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
@@ -522,7 +439,11 @@ impl RaftNode {
                 );
             }
             self.raft
-                .add_learner(node_id, RaftMemberNode::without_admission(addr), true)
+                .add_learner(
+                    node_id,
+                    crate::datastore::raft::test_unproven_member(addr),
+                    true,
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("Raft::add_learner({node_id}): {e}"))?;
             let mut new_voters = voters_now.clone();
@@ -639,7 +560,7 @@ impl RaftNode {
             ),
         ])
         .map_err(|err| CommandCodecV3ActivationError::Apply(err.to_string()))?;
-        let bytes = crate::replication::log_apply_wire::encode_commit_protobuf(&commit)
+        let bytes = klights_replication::log_apply_wire::encode_commit_protobuf(&commit)
             .map_err(|err| CommandCodecV3ActivationError::Apply(err.to_string()))?;
         let result = self
             .propose_materialized_commit(StorageCommandPayload::from_bytes(bytes))
@@ -725,7 +646,11 @@ impl RaftNode {
             // stream and blocks until the learner has installed/replayed the
             // authoritative leader state.
             self.raft
-                .add_learner(node_id, RaftMemberNode::without_admission(addr), true)
+                .add_learner(
+                    node_id,
+                    crate::datastore::raft::test_unproven_member(addr),
+                    true,
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("Raft::add_learner({node_id}): {e}"))?;
             Ok(())
@@ -757,7 +682,7 @@ impl RaftNode {
         );
         let commit =
             klights_cluster_core::LogApplyCommit::try_from_cluster_mutations(vec![mutation])?;
-        let bytes = crate::replication::log_apply_wire::encode_commit_protobuf(&commit)?;
+        let bytes = klights_replication::log_apply_wire::encode_commit_protobuf(&commit)?;
         let result = self
             .propose_materialized_commit(StorageCommandPayload::from_bytes(bytes))
             .await?;
@@ -1149,8 +1074,9 @@ impl RaftNode {
     /// change, leadership transfer, etc.).
     pub fn metrics_watch(
         &self,
-    ) -> tokio::sync::watch::Receiver<openraft::RaftMetrics<NodeId, super::types::RaftMemberNode>>
-    {
+    ) -> tokio::sync::watch::Receiver<
+        openraft::RaftMetrics<NodeId, klights_replication::types::RaftMemberNode>,
+    > {
         self.raft.metrics()
     }
 
@@ -1168,7 +1094,7 @@ impl RaftNode {
     pub fn server_metrics_watch(
         &self,
     ) -> tokio::sync::watch::Receiver<
-        openraft::metrics::RaftServerMetrics<NodeId, super::types::RaftMemberNode>,
+        openraft::metrics::RaftServerMetrics<NodeId, klights_replication::types::RaftMemberNode>,
     > {
         self.raft.server_metrics()
     }
@@ -1236,7 +1162,7 @@ impl super::proposal::RaftProposal for RaftNode {
     async fn propose_command(
         &self,
         command: klights_cluster_core::command::StorageCommand,
-    ) -> Result<super::types::StorageCommandResult> {
+    ) -> Result<klights_replication::types::StorageCommandResult> {
         self.command_codec_v3_activation
             .ensure_command_codec_v3_activated()?;
         self.ensure_local_leader_for_commit_materialization()?;
@@ -1251,7 +1177,7 @@ impl super::proposal::RaftProposal for RaftNode {
             .build_command(command, operation.as_str(), &self.authoring_node)
             .await
             .map_err(map_commit_materialization_error)?;
-        let entry_bytes = crate::replication::log_apply_wire::encode_commit_protobuf(&commit)
+        let entry_bytes = klights_replication::log_apply_wire::encode_commit_protobuf(&commit)
             .context("encode LogApplyCommit for raft propose")?;
         let apply_result = match self
             .propose_materialized_commit(StorageCommandPayload::from_bytes(entry_bytes))
@@ -1382,7 +1308,7 @@ impl super::proposal::RaftProposal for RaftNode {
                 .with_committed_resource(committed_resource));
             }
         };
-        let entry_bytes = crate::replication::log_apply_wire::encode_commit_protobuf(&commit)
+        let entry_bytes = klights_replication::log_apply_wire::encode_commit_protobuf(&commit)
             .map_err(|err| {
                 OutboxApplyError::Retryable(format!(
                     "encode LogApplyCommit for raft outbox propose: {err}"
@@ -1402,13 +1328,15 @@ impl super::proposal::RaftProposal for RaftNode {
         } else {
             klights_cluster_core::ResourceMutationEffect::Unchanged
         };
-        let pod_endpoint_effect = apply_result.pod_endpoint_effect;
+        let pod_endpoint_effect = apply_result.pod_endpoint_effect();
         let committed_resource =
             apply_result
                 .applied_mutation
                 .as_ref()
                 .map(|mutation| match mutation {
-                    super::types::AppliedMutation::Resource(resource) => resource.clone(),
+                    klights_replication::types::AppliedMutation::Resource(resource) => {
+                        resource.clone()
+                    }
                 });
         if let Some(message) = apply_result.error_message {
             return Err(OutboxApplyError::ConflictTerminal(message));
@@ -2132,7 +2060,10 @@ mod tests {
         for n in &nodes {
             members.insert(
                 n.node_id,
-                RaftMemberNode::unproven(format!("https://localhost:{}", 7679 + n.node_id)),
+                crate::datastore::raft::test_unproven_member(format!(
+                    "https://localhost:{}",
+                    7679 + n.node_id
+                )),
             );
         }
         nodes[0]
@@ -2174,7 +2105,10 @@ mod tests {
         for node in &nodes {
             members.insert(
                 node.node_id,
-                RaftMemberNode::unproven(format!("https://localhost:{}", 7679 + node.node_id)),
+                crate::datastore::raft::test_unproven_member(format!(
+                    "https://localhost:{}",
+                    7679 + node.node_id
+                )),
             );
         }
         nodes[0]
@@ -2315,7 +2249,10 @@ mod tests {
         for n in &nodes {
             members.insert(
                 n.node_id,
-                RaftMemberNode::unproven(format!("https://localhost:{}", 7679 + n.node_id)),
+                crate::datastore::raft::test_unproven_member(format!(
+                    "https://localhost:{}",
+                    7679 + n.node_id
+                )),
             );
         }
         nodes[0]
@@ -2404,7 +2341,10 @@ mod tests {
         for node in &nodes {
             members.insert(
                 node.node_id,
-                RaftMemberNode::unproven(format!("https://localhost:{}", 7679 + node.node_id)),
+                crate::datastore::raft::test_unproven_member(format!(
+                    "https://localhost:{}",
+                    7679 + node.node_id
+                )),
             );
         }
         nodes[0]

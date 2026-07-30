@@ -1,4 +1,4 @@
-//! Replication wire adapter for the canonical ordered log-apply domain.
+//! Embedded replication wire adapter for the canonical ordered log-apply domain.
 //!
 //! The core is deliberately port-based: sources provide durable ordered
 //! entries, targets install snapshots and apply entries, and the follower
@@ -61,53 +61,6 @@ where
 
 // T3: `KEY_LAST_APPLIED_INDEX`, `KEY_LAST_APPLIED_RV` removed —
 // the `log_apply_entries` table and its checkpoint are gone.
-
-#[cfg(test)]
-pub(crate) fn test_live_commit(
-    candidate_resource_version: i64,
-    mut mutations: Vec<LogApplyMutation>,
-) -> LogApplyCommit {
-    fn clear_nested_resource_version(data: &mut serde_json::Value) {
-        if let Some(metadata) = data
-            .get_mut("metadata")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            metadata.remove("resourceVersion");
-        }
-    }
-
-    for mutation in &mut mutations {
-        match mutation {
-            LogApplyMutation::PutResource(row) => {
-                row.resource_version = 0;
-                clear_nested_resource_version(&mut row.data);
-            }
-            LogApplyMutation::PatchResourceLatest(row) => {
-                row.resource_version = 0;
-                clear_nested_resource_version(&mut row.patch);
-            }
-            LogApplyMutation::PutNamespace(row) => {
-                row.resource_version = 0;
-                clear_nested_resource_version(&mut row.data);
-            }
-            LogApplyMutation::PutWatchEvent(row) => {
-                row.resource_version = 0;
-                clear_nested_resource_version(&mut row.data);
-                if let Some(object) = row.data.get_mut("object") {
-                    clear_nested_resource_version(object);
-                }
-            }
-            LogApplyMutation::PutPodCleanupIntent(row) => row.resource_version = 0,
-            LogApplyMutation::PutAppliedOutbox(row) => row.applied_rv = None,
-            LogApplyMutation::AdvanceResourceVersion { resource_version } => {
-                *resource_version = 0;
-            }
-            _ => {}
-        }
-    }
-    let _ = candidate_resource_version;
-    LogApplyCommit::try_new(mutations).expect("test live commit must be an RV-zero template")
-}
 
 pub fn encode_commit_json(commit: &LogApplyCommit) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(commit)?)

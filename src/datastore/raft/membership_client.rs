@@ -13,7 +13,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use super::types::NodeId;
+use klights_replication::types::NodeId;
 
 /// Object-safe membership-change client. Implementations may live on a
 /// raft leader (mutating the local engine) or on a follower that

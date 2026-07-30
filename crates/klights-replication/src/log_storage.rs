@@ -1,4 +1,4 @@
-//! Phase 3 Raft log storage backed by the node-local SQLite database.
+//! OpenRaft log storage backed by the focused node-local durability port.
 //!
 //! Implements openraft 0.9 `RaftLogStorage` + `RaftLogReader` (storage-v2).
 //! Each log entry is serialized (serde_json) into the `raft_log_entries`
@@ -23,7 +23,7 @@ use openraft::AnyError;
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage};
 use openraft::{LogId, RaftLogReader, StorageError, StorageIOError, Vote};
 
-use super::types::{NodeId, TypeConfig};
+use crate::types::{NodeId, TypeConfig};
 
 #[derive(Clone)]
 pub struct SqliteRaftLogStorage {
@@ -265,119 +265,11 @@ impl RaftLogStorage<TypeConfig> for SqliteRaftLogStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::node_local::NodeLocalStores;
-    use crate::datastore::raft::types::{NodeId, StorageCommandPayload};
-    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
-    use openraft::{Entry, EntryPayload, LeaderId};
-
-    fn entry_for(index: u64, term: u64, leader_node: NodeId, payload: &[u8]) -> Entry<TypeConfig> {
-        Entry {
-            log_id: LogId::new(LeaderId::new(term, leader_node), index),
-            payload: EntryPayload::Normal(StorageCommandPayload::from_bytes(payload.to_vec())),
-        }
-    }
-
-    async fn fresh_storage() -> SqliteRaftLogStorage {
-        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let executor = klights_node_datastore::open::open_with_opts(
-            klights_node_datastore::open::in_memory_opts(),
-            supervisor.clone(),
-            "sqlite:raft-log-test",
-        )
-        .await
-        .expect("open node-local executor");
-        let nl: Arc<dyn RaftLogDurability> =
-            Arc::new(NodeLocalStores::from_executor(executor).expect("create node-local db"));
-        SqliteRaftLogStorage::new(nl, supervisor)
-    }
-
-    async fn append_one(s: &SqliteRaftLogStorage, e: &Entry<TypeConfig>) {
-        let encoded = EncodedRaftLogEntry::new(
-            RaftLogCoordinate::new(
-                e.log_id.index,
-                e.log_id.leader_id.term,
-                e.log_id.leader_id.voted_for().unwrap_or_default(),
-            ),
-            OpaqueRaftBytes::new(serde_json::to_vec(e).unwrap()),
-        );
-        s.durability
-            .append_log_entries(RaftLogBatch::new(vec![encoded]).unwrap())
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn append_then_read_back_roundtrip() {
-        let mut s = fresh_storage().await;
-        let entries = vec![
-            entry_for(1, 1, 10, b"a"),
-            entry_for(2, 1, 10, b"b"),
-            entry_for(3, 1, 10, b"c"),
-        ];
-        for e in &entries {
-            append_one(&s, e).await;
-        }
-        let state = s.get_log_state().await.unwrap();
-        assert_eq!(state.last_log_id.unwrap().index, 3);
-        assert!(state.last_purged_log_id.is_none());
-        let got = s.try_get_log_entries(1..4).await.unwrap();
-        assert_eq!(got.len(), 3);
-        assert_eq!(got[0].log_id.index, 1);
-        assert_eq!(got[2].log_id.index, 3);
-    }
 
     #[test]
     fn range_after_max_is_empty_instead_of_becoming_unbounded() {
         let range = range_bounds((Bound::Excluded(u64::MAX), Bound::Unbounded)).unwrap();
         assert_eq!(range.start_inclusive(), u64::MAX);
         assert_eq!(range.end_exclusive(), Some(u64::MAX));
-    }
-
-    #[tokio::test]
-    async fn truncate_removes_divergent_tail() {
-        let mut s = fresh_storage().await;
-        for i in 1..=5 {
-            append_one(&s, &entry_for(i, 1, 10, b"x")).await;
-        }
-        s.truncate(LogId::new(LeaderId::new(1, 10), 3))
-            .await
-            .unwrap();
-        let got = s.try_get_log_entries(0..10).await.unwrap();
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].log_id.index, 1);
-        assert_eq!(got[1].log_id.index, 2);
-    }
-
-    #[tokio::test]
-    async fn purge_removes_prefix_and_updates_last_purged() {
-        let mut s = fresh_storage().await;
-        for i in 1..=5 {
-            append_one(&s, &entry_for(i, 1, 10, b"x")).await;
-        }
-        s.purge(LogId::new(LeaderId::new(1, 10), 3)).await.unwrap();
-        let state = s.get_log_state().await.unwrap();
-        assert_eq!(state.last_purged_log_id.unwrap().index, 3);
-        assert_eq!(state.last_log_id.unwrap().index, 5);
-        let got = s.try_get_log_entries(0..10).await.unwrap();
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].log_id.index, 4);
-    }
-
-    #[tokio::test]
-    async fn vote_round_trips() {
-        let mut s = fresh_storage().await;
-        assert!(s.read_vote().await.unwrap().is_none());
-        let v = Vote::new(7, 10);
-        s.save_vote(&v).await.unwrap();
-        assert_eq!(s.read_vote().await.unwrap().unwrap(), v);
-    }
-
-    #[tokio::test]
-    async fn committed_round_trips() {
-        let mut s = fresh_storage().await;
-        assert!(s.read_committed().await.unwrap().is_none());
-        let id = LogId::new(LeaderId::new(2, 10), 42);
-        s.save_committed(Some(id)).await.unwrap();
-        assert_eq!(s.read_committed().await.unwrap().unwrap(), id);
     }
 }

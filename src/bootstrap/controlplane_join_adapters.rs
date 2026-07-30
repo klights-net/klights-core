@@ -11,7 +11,7 @@ use klights_leader_api::{
 
 use crate::datastore::DatastoreHandle;
 use crate::datastore::raft::node::{RaftMemberAdmissionResult, RaftNode};
-use crate::datastore::raft::types::{RaftShape, raft_node_id_for_node_name};
+use klights_replication::types::{RaftShape, raft_node_id_for_node_name};
 
 struct RaftControlplaneJoinAuthority {
     node: Arc<RaftNode>,

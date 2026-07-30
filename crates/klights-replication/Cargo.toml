@@ -12,3 +12,20 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+klights-cluster-core = { workspace = true }
+klights-cluster-store = { workspace = true }
+klights-node-store = { workspace = true }
+klights-leader-api = { workspace = true }
+klights-leader-rpc = { workspace = true }
+klights-internal-protobuf = { workspace = true }
+klights-supervisor = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+openraft = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

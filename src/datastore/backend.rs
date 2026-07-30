@@ -272,7 +272,7 @@ pub trait DatastoreBackend: Send + Sync {
     async fn apply_raft_log_apply_commit(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<crate::datastore::raft::types::StorageCommandResult>;
+    ) -> Result<klights_replication::types::StorageCommandResult>;
 
     /// Apply one committed Raft entry and return the canonical outcome derived
     /// inside the same datastore transaction. Backends must fail before
@@ -1703,7 +1703,7 @@ pub trait ReplicationStore: Send + Sync {
     async fn apply_raft_log_apply_commit(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<crate::datastore::raft::types::StorageCommandResult>;
+    ) -> Result<klights_replication::types::StorageCommandResult>;
     async fn apply_raft_log_apply_commit_receipt(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
@@ -1760,7 +1760,7 @@ impl<T: ReplicationStore + ?Sized> ReplicationStore for std::sync::Arc<T> {
     async fn apply_raft_log_apply_commit(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
+    ) -> Result<klights_replication::types::StorageCommandResult> {
         self.as_ref().apply_raft_log_apply_commit(commit).await
     }
 
@@ -1822,14 +1822,6 @@ impl<T: DurableRecoveryStore + ?Sized> DurableRecoveryStore for std::sync::Arc<T
     }
 }
 
-/// Backend lifecycle hooks owned by bootstrap and replication composition roots.
-#[async_trait]
-pub trait BackendLifecycleStore: Send + Sync {
-    async fn acquire_snapshot_exclusive_fence(&self) -> Result<Option<SnapshotExclusiveFence>>;
-    async fn acquire_snapshot_mutation_fence(&self) -> Result<Option<SnapshotMutationFence>>;
-    fn close(&self);
-}
-
 /// Transitional focused-port view over the legacy umbrella handle.
 ///
 /// REMOVE(Phase 10): selectors return independently typed focused ports once
@@ -1874,7 +1866,7 @@ impl DatastoreBackendLifecyclePort {
 }
 
 #[async_trait]
-impl BackendLifecycleStore for DatastoreBackendLifecyclePort {
+impl klights_cluster_store::BackendLifecycleStore for DatastoreBackendLifecyclePort {
     async fn acquire_snapshot_exclusive_fence(&self) -> Result<Option<SnapshotExclusiveFence>> {
         DatastoreBackend::acquire_snapshot_exclusive_fence(self.db.as_ref()).await
     }

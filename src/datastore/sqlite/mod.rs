@@ -3123,7 +3123,7 @@ impl Datastore {
                         .applied_mutation
                         .as_ref()
                         .map(|mutation| match mutation {
-                            crate::datastore::raft::types::AppliedMutation::Resource(resource) => {
+                            crate::datastore::AppliedMutation::Resource(resource) => {
                                 resource.clone()
                             }
                         });
@@ -3136,7 +3136,7 @@ impl Datastore {
                     } else {
                         klights_cluster_core::ResourceMutationEffect::Unchanged
                     },
-                    result.pod_endpoint_effect,
+                    result.pod_endpoint_effect(),
                 )
                 .with_committed_resource(committed_resource))
             }
@@ -3974,7 +3974,7 @@ impl DatastoreBackend for Datastore {
     async fn apply_raft_log_apply_commit(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
+    ) -> Result<crate::datastore::StorageCommandResult> {
         Datastore::apply_raft_log_apply_commit(self, commit).await
     }
 

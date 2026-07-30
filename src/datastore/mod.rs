@@ -20,7 +20,7 @@ pub mod sqlite;
 pub mod types;
 
 pub use backend::{
-    AppliedOutboxStore, BackendLifecycleStore, ClusterResourceQueryStore, CommittedOutboxApply,
+    AppliedOutboxStore, ClusterResourceQueryStore, CommittedOutboxApply,
     CurrentResourceVersionStore, DatastoreBackend, DatastoreBackendMetaStore,
     DatastoreBackendWatchStore, DatastoreHandle, DurableRecoveryStore, LeaderResourceMutationStore,
     MetaStore, NamespaceContentStore, NamespaceStore, NetworkMetadataStore, OwnershipStore,
@@ -50,5 +50,6 @@ pub use types::{
 #[cfg(test)]
 pub use sqlite::test_support;
 
+pub(crate) use klights_replication::types::{AppliedMutation, StorageCommandResult};
 #[cfg(test)]
 pub use sqlite::{create_staged_post_commit, staged_post_commit_from_event, staged_test_event};

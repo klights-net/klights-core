@@ -1,423 +1,77 @@
-//! Raft state machine wrapping the cluster `DatastoreBackend`.
-//!
-//! Implements openraft 0.9 storage-v2 `RaftStateMachine`. T1.3 unified
-//! the apply path so every committed `EntryPayload::Normal` carries a
-//! `LogApplyCommit` protobuf (built by the leader's proposer via
-//! `backend.build_log_apply_commit_for_outbox`). The state machine decodes
-//! the commit and calls `backend.apply_log_apply_commit` — the same code
-//! every voter follower and learner runs — so cluster.db is byte-identical
-//! across the cluster.
-//!
-//! Snapshot APIs are wired via `snapshot::SqliteRaftSnapshotBuilder`,
-//! which consumes the authoritative cluster-store snapshot session.
-//! `install_snapshot` replays the bundled `LogApplyCommit` entries through
-//! `apply_log_apply_commit` and `get_current_snapshot` rebuilds the snapshot
-//! when openraft asks for an outbound transfer.
-
-use std::io::Cursor;
-use std::sync::Arc;
-
-use async_trait::async_trait;
-use klights_node_store::{OpaqueRaftBytes, RaftAppliedStateDurability, RaftAppliedStateWrite};
-use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
-use openraft::{
-    AnyError, EntryPayload, LogId, Snapshot, SnapshotMeta, StorageError, StorageIOError,
-    StoredMembership,
-};
-
-use super::super::{BackendLifecycleStore, DurableRecoveryStore};
-use super::snapshot::{RaftSnapshotData, SqliteRaftSnapshotBuilder};
-use super::types::{NodeId, StorageCommandResult, TypeConfig};
-
-#[async_trait]
-pub(crate) trait RaftCommittedApply: Send + Sync {
-    async fn apply_committed(
-        &self,
-        request: klights_cluster_store::CommittedRaftApplyRequest,
-    ) -> Result<StorageCommandResult, klights_cluster_store::CommittedApplyError>;
-}
-
-#[async_trait]
-pub(crate) trait RaftSnapshotRestore: Send + Sync {
-    async fn restore_snapshot(
-        &self,
-        data: RaftSnapshotData,
-    ) -> Result<(), klights_cluster_store::SnapshotPersistenceError>;
-}
-
-pub struct RaftStateMachineStorePorts {
-    committed_apply: Arc<dyn RaftCommittedApply>,
-    snapshot_restore: Arc<dyn RaftSnapshotRestore>,
-    recovery: Arc<dyn DurableRecoveryStore>,
-    lifecycle: Arc<dyn BackendLifecycleStore>,
-    metadata: Arc<dyn super::node::RaftCommitMaterializer>,
-}
-
-impl RaftStateMachineStorePorts {
-    pub(crate) fn new(
-        committed_apply: Arc<dyn RaftCommittedApply>,
-        snapshot_restore: Arc<dyn RaftSnapshotRestore>,
-        recovery: Arc<dyn DurableRecoveryStore>,
-        lifecycle: Arc<dyn BackendLifecycleStore>,
-        metadata: Arc<dyn super::node::RaftCommitMaterializer>,
-    ) -> Self {
-        Self {
-            committed_apply,
-            snapshot_restore,
-            recovery,
-            lifecycle,
-            metadata,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct SqliteRaftStateMachine {
-    committed_apply: Arc<dyn RaftCommittedApply>,
-    snapshot_restore: Arc<dyn RaftSnapshotRestore>,
-    recovery: Arc<dyn DurableRecoveryStore>,
-    lifecycle: Arc<dyn BackendLifecycleStore>,
-    metadata: Arc<dyn super::node::RaftCommitMaterializer>,
-    applied_state: Arc<dyn RaftAppliedStateDurability>,
-    supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    command_codec_v3_activation: Arc<super::node::CommandCodecV3Activation>,
-}
-
-impl SqliteRaftStateMachine {
-    #[cfg(test)]
-    pub fn new(
-        backend: Arc<super::super::sqlite::Datastore>,
-        applied_state: Arc<dyn RaftAppliedStateDurability>,
-        supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    ) -> Self {
-        let stores =
-            super::super::cluster_store_adapter::raft_state_machine_store_ports_for_test(backend);
-        Self::new_with_command_codec_activation(
-            stores,
-            applied_state,
-            supervisor,
-            Arc::new(super::node::CommandCodecV3Activation::inactive_for_state_machine_test()),
-        )
-    }
-
-    pub(crate) fn new_with_command_codec_activation(
-        stores: RaftStateMachineStorePorts,
-        applied_state: Arc<dyn RaftAppliedStateDurability>,
-        supervisor: Arc<klights_supervisor::TaskSupervisor>,
-        command_codec_v3_activation: Arc<super::node::CommandCodecV3Activation>,
-    ) -> Self {
-        Self {
-            committed_apply: stores.committed_apply,
-            snapshot_restore: stores.snapshot_restore,
-            recovery: stores.recovery,
-            lifecycle: stores.lifecycle,
-            metadata: stores.metadata,
-            applied_state,
-            supervisor,
-            command_codec_v3_activation,
-        }
-    }
-}
-
-fn commit_activates_command_codec_v3(commit: &klights_cluster_core::LogApplyCommit) -> bool {
-    commit.mutations().iter().any(|mutation| {
-        matches!(
-            mutation,
-            klights_cluster_core::LogApplyMutation::PutKlightsMeta { key, value }
-                if key == super::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION
-                    && value == super::node::COMMAND_CODEC_ACTIVATION_VALUE
-        )
-    })
-}
-
-fn ioerr_read(e: impl std::fmt::Display) -> StorageError<NodeId> {
-    StorageError::IO {
-        source: StorageIOError::read_state_machine(AnyError::error(e.to_string())),
-    }
-}
-
-fn ioerr_write(e: impl std::fmt::Display) -> StorageError<NodeId> {
-    StorageError::IO {
-        source: StorageIOError::write_state_machine(AnyError::error(e.to_string())),
-    }
-}
-
-fn apply_err(log_id: LogId<NodeId>, e: impl std::fmt::Display) -> StorageError<NodeId> {
-    StorageError::IO {
-        source: StorageIOError::apply(log_id, AnyError::error(e.to_string())),
-    }
-}
-
-impl SqliteRaftStateMachine {
-    async fn load_applied_state(
-        &self,
-    ) -> Result<
-        (
-            Option<LogId<NodeId>>,
-            StoredMembership<NodeId, super::types::RaftMemberNode>,
-        ),
-        StorageError<NodeId>,
-    > {
-        let (last, membership) = self
-            .applied_state
-            .load_applied_state()
-            .await
-            .map_err(ioerr_read)?
-            .into_parts();
-        let last = last
-            .map(|bytes| serde_json::from_slice(bytes.as_slice()))
-            .transpose()
-            .map_err(ioerr_read)?
-            .flatten();
-        let membership = membership
-            .map(|bytes| serde_json::from_slice(bytes.as_slice()))
-            .transpose()
-            .map_err(ioerr_read)?
-            .unwrap_or_default();
-        Ok((last, membership))
-    }
-
-    async fn read_last_applied(&self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
-        Ok(self.load_applied_state().await?.0)
-    }
-
-    async fn write_applied_state(
-        &self,
-        id: Option<LogId<NodeId>>,
-        membership: Option<&StoredMembership<NodeId, super::types::RaftMemberNode>>,
-    ) -> Result<(), StorageError<NodeId>> {
-        let last = id
-            .map(|value| serde_json::to_vec(&Some(value)))
-            .transpose()
-            .map_err(ioerr_write)?
-            .map(OpaqueRaftBytes::new);
-        let membership = membership
-            .map(serde_json::to_vec)
-            .transpose()
-            .map_err(ioerr_write)?
-            .map(OpaqueRaftBytes::new);
-        self.applied_state
-            .store_applied_state(RaftAppliedStateWrite::new(last, membership))
-            .await
-            .map_err(ioerr_write)
-    }
-
-    async fn build_current_snapshot(
-        &mut self,
-    ) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let mut builder = self.get_snapshot_builder().await;
-        builder.build_snapshot().await
-    }
-}
-
-impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
-    type SnapshotBuilder = SqliteRaftSnapshotBuilder;
-
-    async fn applied_state(
-        &mut self,
-    ) -> Result<
-        (
-            Option<LogId<NodeId>>,
-            StoredMembership<NodeId, super::types::RaftMemberNode>,
-        ),
-        StorageError<NodeId>,
-    > {
-        self.load_applied_state().await
-    }
-
-    async fn apply<I>(
-        &mut self,
-        entries: I,
-    ) -> Result<Vec<StorageCommandResult>, StorageError<NodeId>>
-    where
-        I: IntoIterator<Item = openraft::Entry<TypeConfig>> + Send,
-        I::IntoIter: Send,
-    {
-        let _snapshot_mutation = self
-            .lifecycle
-            .acquire_snapshot_mutation_fence()
-            .await
-            .map_err(ioerr_write)?;
-        let mut out = Vec::new();
-        // P3-8: defensive fence against stale-leader writes. openraft
-        // already refuses to dispatch an entry whose term is below the
-        // current term at the consensus layer, but the state machine
-        // double-checks against `last_applied` so a buggy lower layer
-        // (or a manual `Raft::initialize` from an operator) cannot
-        // silently apply commits at an older term and rewrite history.
-        let mut last_applied_term = self.read_last_applied().await?.map(|id| id.leader_id.term);
-        for entry in entries {
-            let log_id = entry.log_id;
-            if let Some(prev_term) = last_applied_term
-                && log_id.leader_id.term < prev_term
-            {
-                return Err(apply_err(
-                    log_id,
-                    format!(
-                        "stale-term apply rejected: entry term {} < last_applied term {}",
-                        log_id.leader_id.term, prev_term
-                    ),
-                ));
-            }
-            last_applied_term = Some(log_id.leader_id.term);
-            let membership_entry = matches!(&entry.payload, EntryPayload::Membership(_));
-            match entry.payload {
-                EntryPayload::Blank => {
-                    out.push(StorageCommandResult::default());
-                }
-                EntryPayload::Membership(m) => {
-                    let stored = StoredMembership::new(Some(log_id), m);
-                    self.write_applied_state(Some(log_id), Some(&stored))
-                        .await?;
-                    out.push(StorageCommandResult::default());
-                }
-                EntryPayload::Normal(payload) => {
-                    // T1.3: raft entry payloads carry a `LogApplyCommit`
-                    // protobuf (built by the leader's proposer via
-                    // `backend.build_log_apply_commit_for_outbox`). Every
-                    // node — leader, voter follower, learner — applies
-                    // through the same `apply_log_apply_commit` →
-                    // `apply_commit_in_tx` path so cluster.db state is
-                    // byte-identical across the cluster.
-                    let commit = crate::replication::log_apply_wire::decode_commit_protobuf(
-                        payload.as_slice(),
-                    )
-                    .map_err(|e| apply_err(log_id, e))?;
-                    let activates_command_codec_v3 = commit_activates_command_codec_v3(&commit);
-                    let result = self
-                        .committed_apply
-                        .apply_committed(klights_cluster_store::CommittedRaftApplyRequest::new(
-                            commit,
-                        ))
-                        .await
-                        .map_err(|e| apply_err(log_id, e))?;
-                    if activates_command_codec_v3 {
-                        let persisted = self
-                            .metadata
-                            .read_raft_metadata(super::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION)
-                            .await
-                            .map_err(|error| apply_err(log_id, error))?;
-                        if persisted.as_deref() != Some(super::node::COMMAND_CODEC_ACTIVATION_VALUE)
-                        {
-                            return Err(apply_err(
-                                log_id,
-                                "exact-v3 activation mutation did not persist its marker",
-                            ));
-                        }
-                        self.command_codec_v3_activation
-                            .mark_command_codec_v3_activated();
-                    }
-                    out.push(result);
-                }
-            }
-            if !membership_entry {
-                self.write_applied_state(Some(log_id), None).await?;
-            }
-        }
-        Ok(out)
-    }
-
-    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        SqliteRaftSnapshotBuilder {
-            recovery: self.recovery.clone(),
-            lifecycle: self.lifecycle.clone(),
-            applied_state: self.applied_state.clone(),
-            supervisor: self.supervisor.clone(),
-        }
-    }
-
-    async fn begin_receiving_snapshot(
-        &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        meta: &SnapshotMeta<NodeId, super::types::RaftMemberNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
-    ) -> Result<(), StorageError<NodeId>> {
-        let bytes = snapshot.into_inner();
-        let data = self
-            .supervisor
-            .run_blocking(
-                klights_supervisor::TaskCategory::Others,
-                "raft-snapshot-json-zstd-decode",
-                move || RaftSnapshotData::deserialize_from_bytes(&bytes),
-            )
-            .await
-            .map_err(ioerr_write)?
-            .map_err(ioerr_write)?;
-        let _snapshot_mutation = self
-            .lifecycle
-            .acquire_snapshot_mutation_fence()
-            .await
-            .map_err(ioerr_write)?;
-        // Raft snapshot install semantics: the destination state machine
-        // must become byte/key-identical to the leader snapshot at the
-        // snapshot index. Applying snapshot commits over the existing local
-        // store (merge) is a correctness bug — rows the leader has deleted
-        // but a lagging follower/learner still holds are never removed, so
-        // the member silently diverges (observed after lossy Sonobuoy:
-        // followers/learner carry more rows than the leader). Use the
-        // authoritative replace primitive, which deletes all replicated
-        // tables first, then replays the snapshot commits and restores the
-        // leader RV. (finding.md H1 / P0 cluster.db divergence.)
-        self.snapshot_restore
-            .restore_snapshot(data)
-            .await
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::write_state_machine(AnyError::error(e.to_string())),
-            })?;
-        match self
-            .metadata
-            .read_raft_metadata(super::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION)
-            .await
-            .map_err(ioerr_read)?
-            .as_deref()
-        {
-            Some(super::node::COMMAND_CODEC_ACTIVATION_VALUE) => self
-                .command_codec_v3_activation
-                .mark_command_codec_v3_activated(),
-            None => self
-                .command_codec_v3_activation
-                .clear_command_codec_v3_activation(),
-            Some(other) => {
-                return Err(ioerr_read(format!(
-                    "snapshot restored unsupported command codec activation version {other:?}"
-                )));
-            }
-        }
-        let stored =
-            StoredMembership::new(meta.last_log_id, meta.last_membership.membership().clone());
-        self.write_applied_state(meta.last_log_id, Some(&stored))
-            .await?;
-        Ok(())
-    }
-
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
-        Ok(Some(self.build_current_snapshot().await?))
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::io::Cursor;
+    use std::sync::Arc;
+
     use crate::datastore::DatastoreBackend;
     use crate::datastore::node_local::NodeLocalStores;
+    use crate::datastore::raft::snapshot::RaftSnapshotData;
+    use klights_replication::activation::CommandCodecV3Activation;
+    use klights_replication::state_machine::SqliteRaftStateMachine;
+    use klights_replication::types::{NodeId, RaftMemberNode, TypeConfig};
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
-    use openraft::storage::RaftSnapshotBuilder;
-    use openraft::{Entry, EntryPayload, LeaderId, Membership};
+    use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+    use openraft::{Entry, EntryPayload, LeaderId, LogId, Membership};
     use std::collections::BTreeSet;
+
+    type TestRaftStateMachine =
+        SqliteRaftStateMachine<crate::datastore::raft::snapshot::SqliteRaftSnapshotBuilder>;
+
+    async fn state_machine(
+        backend: Arc<crate::datastore::sqlite::Datastore>,
+        applied_state: Arc<NodeLocalStores>,
+        supervisor: Arc<TaskSupervisor>,
+    ) -> TestRaftStateMachine {
+        state_machine_with_activation(backend, applied_state, supervisor)
+            .await
+            .0
+    }
+
+    async fn state_machine_with_activation(
+        backend: Arc<crate::datastore::sqlite::Datastore>,
+        applied_state: Arc<NodeLocalStores>,
+        supervisor: Arc<TaskSupervisor>,
+    ) -> (TestRaftStateMachine, Arc<CommandCodecV3Activation>) {
+        let materializer =
+            crate::datastore::cluster_store_adapter::DatastoreRaftCommitMaterializer::new(
+                backend.clone(),
+            );
+        let activation = Arc::new(
+            CommandCodecV3Activation::load(&materializer)
+                .await
+                .expect("load command codec activation"),
+        );
+        let stores =
+            crate::datastore::cluster_store_adapter::raft_state_machine_store_ports_for_test(
+                backend.clone(),
+            );
+        let snapshot_builder = crate::datastore::raft::snapshot::SqliteRaftSnapshotBuilder {
+            recovery: Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(
+                backend.clone(),
+            )),
+            lifecycle: Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(
+                backend,
+            )),
+            applied_state: applied_state.clone(),
+            supervisor,
+        };
+        (
+            SqliteRaftStateMachine::new_with_command_codec_activation(
+                stores,
+                applied_state,
+                snapshot_builder,
+                activation.clone(),
+            ),
+            activation,
+        )
+    }
 
     fn snapshot_watch_page_pause_test_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
-    async fn fresh_sm() -> SqliteRaftStateMachine {
+    async fn fresh_sm() -> TestRaftStateMachine {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let node_executor = klights_node_datastore::open::open_with_opts(
             klights_node_datastore::open::in_memory_opts(),
@@ -430,7 +84,7 @@ mod tests {
             Arc::new(NodeLocalStores::from_executor(node_executor).expect("create node-local db"));
         let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
-        SqliteRaftStateMachine::new(backend, node_local, supervisor)
+        state_machine(backend, node_local, supervisor).await
     }
 
     #[tokio::test]
@@ -513,7 +167,13 @@ mod tests {
 
     async fn build_sm_with_backend(
         backend: Arc<crate::datastore::sqlite::Datastore>,
-    ) -> SqliteRaftStateMachine {
+    ) -> TestRaftStateMachine {
+        build_sm_with_backend_and_activation(backend).await.0
+    }
+
+    async fn build_sm_with_backend_and_activation(
+        backend: Arc<crate::datastore::sqlite::Datastore>,
+    ) -> (TestRaftStateMachine, Arc<CommandCodecV3Activation>) {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let node_executor = klights_node_datastore::open::open_with_opts(
             klights_node_datastore::open::in_memory_opts(),
@@ -524,7 +184,7 @@ mod tests {
         .expect("open node-local executor");
         let node_local =
             Arc::new(NodeLocalStores::from_executor(node_executor).expect("create node-local db"));
-        SqliteRaftStateMachine::new(backend, node_local, supervisor)
+        state_machine_with_activation(backend, node_local, supervisor).await
     }
 
     async fn seed_snapshot_identity(backend: &dyn DatastoreBackend) {
@@ -632,7 +292,8 @@ mod tests {
             )
             .await
             .expect("seed divergent follower cluster identity");
-        let mut sm_dst = build_sm_with_backend(backend_dst.clone()).await;
+        let (mut sm_dst, dst_activation) =
+            build_sm_with_backend_and_activation(backend_dst.clone()).await;
         sm_dst
             .install_snapshot(&snapshot.meta, Box::new(Cursor::new(snapshot_bytes)))
             .await
@@ -640,7 +301,7 @@ mod tests {
         assert_eq!(
             backend_dst
                 .get_klights_meta(
-                    crate::datastore::raft::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION,
+                    klights_replication::activation::KEY_COMMAND_CODEC_ACTIVATION_VERSION,
                 )
                 .await
                 .expect("read restored codec activation marker")
@@ -648,7 +309,7 @@ mod tests {
             Some("3")
         );
         assert!(
-            sm_dst.command_codec_v3_activation.is_activated(),
+            dst_activation.is_activated(),
             "snapshot install must atomically restore the persisted marker and reopen the shared gate"
         );
 
@@ -845,13 +506,13 @@ mod tests {
             ),
         ])
         .expect("post-anchor live commit must be an RV-zero template");
-        let payload = crate::replication::log_apply_wire::encode_commit_protobuf(&commit).unwrap();
+        let payload = klights_replication::log_apply_wire::encode_commit_protobuf(&commit).unwrap();
         let apply_task = tokio::spawn(async move {
             state_machine
                 .apply(vec![Entry::<TypeConfig> {
                     log_id: LogId::new(LeaderId::new(1, 1), 1),
                     payload: EntryPayload::Normal(
-                        crate::datastore::raft::types::StorageCommandPayload::from_bytes(payload),
+                        klights_replication::types::StorageCommandPayload::from_bytes(payload),
                     ),
                 }])
                 .await
@@ -1501,7 +1162,7 @@ mod tests {
             Arc::new(crate::datastore::test_support::in_memory().await);
         let mut sm = build_sm_with_backend(backend.clone()).await;
 
-        let commit = crate::replication::log_apply_wire::test_live_commit(
+        let commit = crate::datastore::test_support::test_live_commit(
             1,
             vec![klights_cluster_core::LogApplyMutation::PutResource(
                 klights_cluster_core::LogApplyResourceRow {
@@ -1530,13 +1191,13 @@ mod tests {
                 },
             )],
         );
-        let payload_bytes = crate::replication::log_apply_wire::encode_commit_protobuf(&commit)
+        let payload_bytes = klights_replication::log_apply_wire::encode_commit_protobuf(&commit)
             .expect("encode LogApplyCommit");
 
         let entry = Entry::<TypeConfig> {
             log_id: LogId::new(LeaderId::new(3, 10), 1),
             payload: EntryPayload::Normal(
-                crate::datastore::raft::types::StorageCommandPayload::from_bytes(payload_bytes),
+                klights_replication::types::StorageCommandPayload::from_bytes(payload_bytes),
             ),
         };
         let results = sm
@@ -1567,7 +1228,7 @@ mod tests {
             .await
             .expect("establish a list snapshot rv above the raft log index");
 
-        let commit = crate::replication::log_apply_wire::test_live_commit(
+        let commit = crate::datastore::test_support::test_live_commit(
             0,
             vec![klights_cluster_core::LogApplyMutation::PutResource(
                 klights_cluster_core::LogApplyResourceRow {
@@ -1595,12 +1256,12 @@ mod tests {
                 },
             )],
         );
-        let payload_bytes = crate::replication::log_apply_wire::encode_commit_protobuf(&commit)
+        let payload_bytes = klights_replication::log_apply_wire::encode_commit_protobuf(&commit)
             .expect("encode LogApplyCommit");
         let entry = Entry::<TypeConfig> {
             log_id: LogId::new(LeaderId::new(3, 10), 42),
             payload: EntryPayload::Normal(
-                crate::datastore::raft::types::StorageCommandPayload::from_bytes(payload_bytes),
+                klights_replication::types::StorageCommandPayload::from_bytes(payload_bytes),
             ),
         };
 
@@ -1657,7 +1318,7 @@ mod tests {
             Some("Pending")
         );
 
-        let commit = crate::replication::log_apply_wire::test_live_commit(
+        let commit = crate::datastore::test_support::test_live_commit(
             0,
             vec![klights_cluster_core::LogApplyMutation::PutResource(
                 klights_cluster_core::LogApplyResourceRow {
@@ -1676,13 +1337,13 @@ mod tests {
                 },
             )],
         );
-        let payload = crate::replication::log_apply_wire::encode_commit_protobuf(&commit).unwrap();
+        let payload = klights_replication::log_apply_wire::encode_commit_protobuf(&commit).unwrap();
         let mut sm = build_sm_with_backend(backend.clone()).await;
         let result = sm
             .apply(vec![Entry::<TypeConfig> {
                 log_id: LogId::new(LeaderId::new(3, 10), 42),
                 payload: EntryPayload::Normal(
-                    crate::datastore::raft::types::StorageCommandPayload::from_bytes(payload),
+                    klights_replication::types::StorageCommandPayload::from_bytes(payload),
                 ),
             }])
             .await
@@ -1692,7 +1353,7 @@ mod tests {
             "a newly visible committed Pod status update must request downstream effects"
         );
         assert_eq!(
-            result[0].pod_endpoint_effect,
+            result[0].pod_endpoint_effect(),
             klights_cluster_core::PodEndpointEffect::Changed,
             "real committed-Raft apply must carry the transaction-derived endpoint effect"
         );
@@ -1721,8 +1382,7 @@ mod tests {
     async fn apply_membership_entry_stores_membership() {
         let mut sm = fresh_sm().await;
         let voters: BTreeSet<NodeId> = [10u64, 20, 30].into_iter().collect();
-        let m: Membership<NodeId, crate::datastore::raft::types::RaftMemberNode> =
-            Membership::new(vec![voters], None);
+        let m: Membership<NodeId, RaftMemberNode> = Membership::new(vec![voters], None);
         let entry = Entry::<TypeConfig> {
             log_id: LogId::new(LeaderId::new(2, 10), 7),
             payload: EntryPayload::Membership(m),

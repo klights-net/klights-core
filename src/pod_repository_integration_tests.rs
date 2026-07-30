@@ -2619,7 +2619,7 @@ impl crate::datastore::raft::proposal::RaftProposal for StatusRacingRaftProposal
     async fn propose_command(
         &self,
         command: klights_cluster_core::command::StorageCommand,
-    ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
+    ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
         let key = format!("status-race-{}", uuid::Uuid::new_v4());
         let outcome = self
             .apply_command(
@@ -2631,14 +2631,14 @@ impl crate::datastore::raft::proposal::RaftProposal for StatusRacingRaftProposal
             )
             .await
             .map_err(|err| anyhow::anyhow!("status race raft propose: {err}"))?;
-        Ok(crate::datastore::raft::types::StorageCommandResult {
-            applied_rv: outcome.applied_resource_version(),
-            error_message: None,
-            rejection_code: None,
-            public_resource_changed: false,
-            applied_mutation: None,
-            pod_endpoint_effect: outcome.pod_endpoint_effect,
-        })
+        Ok(klights_replication::types::StorageCommandResult::new(
+            outcome.applied_resource_version(),
+            None,
+            None,
+            false,
+            None,
+            outcome.pod_endpoint_effect,
+        ))
     }
 
     async fn propose_outbox_command(
@@ -13101,12 +13101,12 @@ impl crate::datastore::raft::proposal::RaftProposal for DeleteCasRacingRaftPropo
     async fn propose_command(
         &self,
         command: klights_cluster_core::command::StorageCommand,
-    ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
+    ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
         if self.targets_delete_of_pod(&command) {
             self.race_before_delete().await;
         }
         self.apply_command_to_inner(command).await?;
-        Ok(crate::datastore::raft::types::StorageCommandResult::default())
+        Ok(klights_replication::types::StorageCommandResult::default())
     }
 
     async fn propose_outbox_command(

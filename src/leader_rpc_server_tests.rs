@@ -3117,7 +3117,7 @@ async fn join_as_controlplane_accepts_valid_controlplane_token_for_first_join() 
 }
 
 fn raft_node_id_for_node_name_in_test(node_name: &str) -> u64 {
-    crate::datastore::raft::types::raft_node_id_for_node_name(node_name)
+    klights_replication::types::raft_node_id_for_node_name(node_name)
 }
 
 #[tokio::test]

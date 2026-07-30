@@ -806,7 +806,7 @@ mod tests {
         async fn apply_inline(
             &self,
             command: StorageCommand,
-        ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
+        ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
             if matches!(command, StorageCommand::DeleteResourceWithTombstone { .. }) {
                 let commit = self
                     .inner
@@ -830,14 +830,14 @@ mod tests {
             )
             .await
             .map_err(|err| anyhow::anyhow!("inline propose: {err}"))?;
-            Ok(crate::datastore::raft::types::StorageCommandResult {
-                applied_rv: outcome.applied_resource_version(),
-                error_message: None,
-                rejection_code: None,
-                public_resource_changed: false,
-                applied_mutation: None,
-                pod_endpoint_effect: Default::default(),
-            })
+            Ok(klights_replication::types::StorageCommandResult::new(
+                outcome.applied_resource_version(),
+                None,
+                None,
+                false,
+                None,
+                Default::default(),
+            ))
         }
 
         async fn reinsert_orphan_finalizer(&self) -> anyhow::Result<()> {
@@ -872,7 +872,7 @@ mod tests {
         async fn propose_command(
             &self,
             command: StorageCommand,
-        ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
+        ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
             let should_reinject = Self::should_reinject_orphan_finalizer(&command)
                 && !self.reinjected.swap(true, Ordering::SeqCst);
             let result = self.apply_inline(command).await?;

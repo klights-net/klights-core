@@ -15,7 +15,7 @@ use klights_node_store::{
 };
 use openraft::LogId;
 
-use crate::datastore::raft::types::NodeId;
+use klights_replication::types::NodeId;
 
 pub(crate) struct OpenRaftNodeDurabilityAdapter {
     log: Arc<dyn RaftLogPersistence>,

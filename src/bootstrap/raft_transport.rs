@@ -95,7 +95,7 @@ fn map_rpc_outcome(
 impl GrpcRaftRpcClient for ReplicationGrpcRaftRpcClient {
     async fn append_entries(
         &self,
-        receiver: crate::datastore::raft::types::RaftMemberNode,
+        receiver: klights_replication::types::RaftMemberNode,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, GrpcRaftRpcError> {
         let receiver = klights_leader_rpc::raft_rpc::RaftReceiverAdmission {
@@ -116,7 +116,7 @@ impl GrpcRaftRpcClient for ReplicationGrpcRaftRpcClient {
     }
     async fn vote(
         &self,
-        receiver: crate::datastore::raft::types::RaftMemberNode,
+        receiver: klights_replication::types::RaftMemberNode,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, GrpcRaftRpcError> {
         let receiver = klights_leader_rpc::raft_rpc::RaftReceiverAdmission {
@@ -137,7 +137,7 @@ impl GrpcRaftRpcClient for ReplicationGrpcRaftRpcClient {
     }
     async fn install_snapshot(
         &self,
-        receiver: crate::datastore::raft::types::RaftMemberNode,
+        receiver: klights_replication::types::RaftMemberNode,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, GrpcRaftRpcError> {
         let receiver = klights_leader_rpc::raft_rpc::RaftReceiverAdmission {
@@ -220,7 +220,7 @@ impl GrpcRaftClientFactory for ReplicationGrpcRaftClientFactory {
 pub struct ReplicationGrpcMemberFeatureProbe {
     supervisor: Arc<TaskSupervisor>,
     template: ReplicationGrpcRaftClientTemplate,
-    local_node_id: crate::datastore::raft::types::NodeId,
+    local_node_id: klights_replication::types::NodeId,
 }
 
 impl ReplicationGrpcMemberFeatureProbe {
@@ -229,7 +229,7 @@ impl ReplicationGrpcMemberFeatureProbe {
         template: ReplicationGrpcRaftClientTemplate,
     ) -> Self {
         let local_node_id =
-            crate::datastore::raft::types::raft_node_id_for_node_name(&template.node_name);
+            klights_replication::types::raft_node_id_for_node_name(&template.node_name);
         Self {
             supervisor,
             template,
@@ -238,8 +238,8 @@ impl ReplicationGrpcMemberFeatureProbe {
     }
 
     fn local_metadata_for_member(
-        local_node_id: crate::datastore::raft::types::NodeId,
-        node_id: crate::datastore::raft::types::NodeId,
+        local_node_id: klights_replication::types::NodeId,
+        node_id: klights_replication::types::NodeId,
     ) -> Option<klights_leader_api::MetadataResponse> {
         (node_id == local_node_id).then(|| klights_leader_api::MetadataResponse {
             cluster_id: String::new(),
@@ -255,7 +255,7 @@ impl ReplicationGrpcMemberFeatureProbe {
 impl crate::datastore::raft::node::MemberFeatureProbe for ReplicationGrpcMemberFeatureProbe {
     async fn metadata_for_member(
         &self,
-        node_id: crate::datastore::raft::types::NodeId,
+        node_id: klights_replication::types::NodeId,
         addr: &str,
     ) -> anyhow::Result<klights_leader_api::MetadataResponse> {
         if let Some(metadata) = Self::local_metadata_for_member(self.local_node_id, node_id) {
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn local_member_feature_probe_shortcuts_to_local_capabilities() {
-        let local = crate::datastore::raft::types::raft_node_id_for_node_name("cp-1");
+        let local = klights_replication::types::raft_node_id_for_node_name("cp-1");
         let metadata = ReplicationGrpcMemberFeatureProbe::local_metadata_for_member(local, local)
             .expect("the local member must not require a self gRPC connection");
         assert_eq!(

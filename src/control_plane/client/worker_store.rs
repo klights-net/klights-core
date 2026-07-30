@@ -1284,7 +1284,7 @@ impl crate::datastore::ReplicationStore for WorkerStoreAdapter {
     async fn apply_raft_log_apply_commit(
         &self,
         _commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
+    ) -> Result<klights_replication::types::StorageCommandResult> {
         self.unsupported("apply_raft_log_apply_commit")
     }
 

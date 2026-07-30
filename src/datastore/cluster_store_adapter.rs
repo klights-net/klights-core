@@ -1,10 +1,7 @@
 //! Temporary root adapters from the legacy datastore to cluster-store ports.
 
-use klights_cluster_core::{CommittedApplyOutcome, LogApplyCommit, LogApplyMutation};
-use klights_cluster_store::{
-    CommittedRaftApplyReceipt, CommittedRaftApplyRequest, PrivilegedCommittedRaftApply,
-    SnapshotPersistenceError,
-};
+use klights_cluster_core::LogApplyCommit;
+use klights_cluster_store::SnapshotPersistenceError;
 
 use super::DatastoreHandle;
 
@@ -55,7 +52,7 @@ fn map_storage_mutation_error(error: anyhow::Error) -> klights_cluster_core::Sto
 }
 
 #[async_trait::async_trait]
-impl crate::datastore::raft::node::RaftCommitMaterializer for DatastoreRaftCommitMaterializer {
+impl klights_replication::materializer::RaftCommitMaterializer for DatastoreRaftCommitMaterializer {
     async fn read_raft_metadata(
         &self,
         key: &str,
@@ -100,20 +97,33 @@ impl crate::datastore::raft::node::RaftCommitMaterializer for DatastoreRaftCommi
 }
 
 #[cfg(test)]
+struct TestNoopPostCommitWakeup;
+
+#[cfg(test)]
+impl klights_leader_api::PostCommitWakeup for TestNoopPostCommitWakeup {
+    fn wake(&self, _advances: &[klights_leader_api::PostCommitAdvance]) {}
+
+    fn wake_namespace_contents(&self, _namespace: &str, _resource_version: i64) {}
+}
+
+#[cfg(test)]
 pub(crate) fn raft_state_machine_store_ports_for_test(
     db: std::sync::Arc<super::sqlite::Datastore>,
-) -> crate::datastore::raft::state_machine_impl::RaftStateMachineStorePorts {
+) -> klights_replication::state_machine::RaftStateMachineStorePorts {
     let db_handle: DatastoreHandle = db.clone();
     let materializer = std::sync::Arc::new(DatastoreRaftCommitMaterializer::new(db_handle.clone()));
     let persistence = db.focused_committed_apply();
-    crate::datastore::raft::state_machine_impl::RaftStateMachineStorePorts::new(
-        std::sync::Arc::new(ObservedCommittedRaftApply::new_for_test(persistence)),
+    klights_replication::state_machine::RaftStateMachineStorePorts::new(
+        std::sync::Arc::new(
+            klights_replication::committed_apply::ObservedCommittedRaftApply::new(
+                persistence,
+                std::sync::Arc::new(TestNoopPostCommitWakeup),
+            ),
+        ),
         std::sync::Arc::new(SqliteRaftSnapshotRestore::new(
             db.focused_recovery_store(),
             crate::datastore::raft::snapshot_install(),
-        )),
-        std::sync::Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(
-            db_handle.clone(),
+            std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(Default::default())),
         )),
         std::sync::Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(
             db_handle,
@@ -128,216 +138,77 @@ pub(crate) fn raft_store_ports_for_test(
 ) -> crate::datastore::raft::node::RaftStorePorts {
     let db_handle: DatastoreHandle = db.clone();
     let materializer = std::sync::Arc::new(DatastoreRaftCommitMaterializer::new(db_handle));
+    let recovery = std::sync::Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(
+        db.clone(),
+    ));
+    let lifecycle = std::sync::Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(
+        db.clone(),
+    ));
     crate::datastore::raft::node::RaftStorePorts::new(
         materializer,
         raft_state_machine_store_ports_for_test(db),
+        recovery,
+        lifecycle,
     )
-}
-
-/// Root decorator that projects the canonical persistence receipt into the
-/// OpenRaft response and publishes active post-commit wakeups.
-pub(crate) struct ObservedCommittedRaftApply {
-    persistence: std::sync::Arc<dyn PrivilegedCommittedRaftApply>,
-    wakeups: Option<std::sync::Arc<dyn klights_leader_api::PostCommitWakeup>>,
-}
-
-impl ObservedCommittedRaftApply {
-    pub(crate) fn new(
-        persistence: std::sync::Arc<dyn PrivilegedCommittedRaftApply>,
-        wakeups: std::sync::Arc<dyn klights_leader_api::PostCommitWakeup>,
-    ) -> Self {
-        Self {
-            persistence,
-            wakeups: Some(wakeups),
-        }
-    }
-
-    #[cfg(test)]
-    fn new_for_test(persistence: std::sync::Arc<dyn PrivilegedCommittedRaftApply>) -> Self {
-        Self {
-            persistence,
-            wakeups: None,
-        }
-    }
-
-    fn publish_visible_commit(&self, commit: &LogApplyCommit, resource_version: i64) {
-        let Some(wakeups) = &self.wakeups else {
-            return;
-        };
-        let advances = post_commit_advances(commit, resource_version);
-        wakeups.wake(&advances);
-        for mutation in commit.mutations() {
-            if let LogApplyMutation::DeleteNamespaceContents { name } = mutation {
-                wakeups.wake_namespace_contents(name, resource_version);
-            }
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::datastore::raft::state_machine_impl::RaftCommittedApply for ObservedCommittedRaftApply {
-    async fn apply_committed(
-        &self,
-        request: CommittedRaftApplyRequest,
-    ) -> Result<
-        crate::datastore::raft::types::StorageCommandResult,
-        klights_cluster_store::CommittedApplyError,
-    > {
-        let commit = request.commit().clone();
-        let receipt = self.persistence.apply_committed_raft(request).await?;
-        if let CommittedApplyOutcome::Visible {
-            resource_version, ..
-        } = receipt.outcome()
-        {
-            self.publish_visible_commit(&commit, *resource_version);
-        }
-        Ok(storage_command_result_from_committed_outcome(&receipt))
-    }
-}
-
-pub(crate) fn storage_command_result_from_committed_outcome(
-    receipt: &CommittedRaftApplyReceipt,
-) -> crate::datastore::raft::types::StorageCommandResult {
-    let applied_mutation = receipt
-        .applied_resource()
-        .cloned()
-        .map(crate::datastore::raft::types::AppliedMutation::Resource);
-    match receipt.outcome() {
-        CommittedApplyOutcome::Visible {
-            resource_version, ..
-        } => crate::datastore::raft::types::StorageCommandResult {
-            applied_rv: Some(*resource_version),
-            error_message: None,
-            rejection_code: None,
-            public_resource_changed: true,
-            applied_mutation,
-            pod_endpoint_effect: receipt.pod_endpoint_effect(),
-        },
-        CommittedApplyOutcome::NoPublicChange {
-            resource_version, ..
-        } => crate::datastore::raft::types::StorageCommandResult {
-            applied_rv: Some(*resource_version),
-            error_message: None,
-            rejection_code: None,
-            public_resource_changed: false,
-            applied_mutation,
-            pod_endpoint_effect: receipt.pod_endpoint_effect(),
-        },
-        CommittedApplyOutcome::Rejected(rejection) => {
-            use klights_cluster_core::{CommittedApplyRejection, StorageCommandRejectionCode};
-            let rejection_code = match rejection {
-                CommittedApplyRejection::AlreadyExists { .. } => {
-                    StorageCommandRejectionCode::AlreadyExists
-                }
-                CommittedApplyRejection::NotFound { .. } => StorageCommandRejectionCode::NotFound,
-                CommittedApplyRejection::UidConflict { .. }
-                | CommittedApplyRejection::ResourceVersionConflict { .. } => {
-                    StorageCommandRejectionCode::Conflict
-                }
-                CommittedApplyRejection::InvalidCommit { .. } => {
-                    StorageCommandRejectionCode::InvalidCommit
-                }
-                _ => StorageCommandRejectionCode::InvalidCommit,
-            };
-            crate::datastore::raft::types::StorageCommandResult {
-                applied_rv: None,
-                error_message: Some(rejection.message().to_string()),
-                rejection_code: Some(rejection_code),
-                public_resource_changed: false,
-                applied_mutation: None,
-                pod_endpoint_effect: receipt.pod_endpoint_effect(),
-            }
-        }
-        _ => crate::datastore::raft::types::StorageCommandResult {
-            applied_rv: None,
-            error_message: Some("unsupported canonical committed-apply outcome".to_string()),
-            rejection_code: Some(klights_cluster_core::StorageCommandRejectionCode::InvalidCommit),
-            public_resource_changed: false,
-            applied_mutation: None,
-            pod_endpoint_effect: receipt.pod_endpoint_effect(),
-        },
-    }
 }
 
 impl super::sqlite::Datastore {
     pub async fn apply_raft_log_apply_commit(
         &self,
         commit: LogApplyCommit,
-    ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
+    ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
         let receipt = self.apply_raft_log_apply_commit_receipt(commit).await?;
-        Ok(storage_command_result_from_committed_outcome(&receipt))
+        Ok(
+            klights_replication::committed_apply::storage_command_result_from_committed_outcome(
+                &receipt,
+            ),
+        )
     }
-}
-
-fn post_commit_advances(
-    commit: &LogApplyCommit,
-    resource_version: i64,
-) -> Vec<klights_leader_api::PostCommitAdvance> {
-    commit
-        .mutations()
-        .iter()
-        .filter_map(|mutation| {
-            let (api_version, kind, namespace) = match mutation {
-                LogApplyMutation::PutResource(row) => {
-                    (&row.api_version, &row.kind, row.namespace.clone())
-                }
-                LogApplyMutation::PatchResourceLatest(row) => {
-                    (&row.api_version, &row.kind, row.namespace.clone())
-                }
-                LogApplyMutation::DeleteResource(row) => {
-                    (&row.api_version, &row.kind, row.namespace.clone())
-                }
-                LogApplyMutation::FinalizeBoundPod(row) => {
-                    return Some(klights_leader_api::PostCommitAdvance::new(
-                        "v1",
-                        "Pod",
-                        Some(row.namespace.clone()),
-                        resource_version,
-                    ));
-                }
-                LogApplyMutation::PutNamespace(_) | LogApplyMutation::DeleteNamespace { .. } => {
-                    return Some(klights_leader_api::PostCommitAdvance::new(
-                        "v1",
-                        "Namespace",
-                        None,
-                        resource_version,
-                    ));
-                }
-                LogApplyMutation::PutWatchEvent(row) => {
-                    (&row.api_version, &row.kind, row.namespace.clone())
-                }
-                _ => return None,
-            };
-            Some(klights_leader_api::PostCommitAdvance::new(
-                api_version,
-                kind,
-                namespace,
-                resource_version,
-            ))
-        })
-        .collect()
 }
 
 /// Root-only OpenRaft envelope adapter over the SQLite recovery port.
 pub(crate) struct SqliteRaftSnapshotRestore {
     recovery: std::sync::Arc<klights_cluster_datastore::sqlite::recovery::SqliteRecoveryStore>,
+    supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl SqliteRaftSnapshotRestore {
     pub(crate) fn new(
         recovery: std::sync::Arc<klights_cluster_datastore::sqlite::recovery::SqliteRecoveryStore>,
         _authority: crate::datastore::raft::SnapshotInstallAuthority,
+        supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
-        Self { recovery }
+        Self {
+            recovery,
+            supervisor,
+        }
     }
 }
 
 #[async_trait::async_trait]
-impl crate::datastore::raft::state_machine_impl::RaftSnapshotRestore for SqliteRaftSnapshotRestore {
+impl klights_replication::state_machine::RaftSnapshotRestore for SqliteRaftSnapshotRestore {
     async fn restore_snapshot(
         &self,
-        data: crate::datastore::raft::snapshot::RaftSnapshotData,
+        snapshot_bytes: Vec<u8>,
     ) -> Result<(), SnapshotPersistenceError> {
+        let data = self
+            .supervisor
+            .run_blocking(
+                klights_supervisor::TaskCategory::Others,
+                "raft-snapshot-json-zstd-decode",
+                move || {
+                    crate::datastore::raft::snapshot::RaftSnapshotData::deserialize_from_bytes(
+                        &snapshot_bytes,
+                    )
+                },
+            )
+            .await
+            .map_err(|error| SnapshotPersistenceError::PersistenceFailed {
+                message: error.to_string(),
+            })?
+            .map_err(|error| SnapshotPersistenceError::PersistenceFailed {
+                message: error.to_string(),
+            })?;
         let metadata = data.cluster_metadata;
         let membership = match data.cluster_membership {
             None => klights_cluster_datastore::sqlite::recovery::SnapshotMembership::LegacyOmitted,

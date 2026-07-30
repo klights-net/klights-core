@@ -55,7 +55,7 @@ pub(crate) trait RaftProposal: Send + Sync {
     async fn propose_command(
         &self,
         command: StorageCommand,
-    ) -> Result<super::types::StorageCommandResult>;
+    ) -> Result<klights_replication::types::StorageCommandResult>;
 
     async fn propose_outbox_command(
         &self,

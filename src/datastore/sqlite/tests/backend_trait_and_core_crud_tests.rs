@@ -2,15 +2,16 @@ use super::*;
 #[cfg(test)]
 use crate::datastore::TestWatchStore;
 use crate::datastore::{
-    AppliedOutboxStore, BackendLifecycleStore, ClusterResourceQueryStore,
-    CurrentResourceVersionStore, LeaderResourceMutationStore, MetaStore, NamespaceContentStore,
-    NetworkMetadataStore, OwnershipStore, PodCleanupStore, RawWatchReplayStore, ReplicationStore,
-    ResourceBatchOperation, ResourceBatchPutMode, ResourceListStore, ResourcePreconditions,
-    StatusStore, WatchHistoryStore, WatchMaintenanceStore, WatchReplayAnchorStore,
+    AppliedOutboxStore, ClusterResourceQueryStore, CurrentResourceVersionStore,
+    LeaderResourceMutationStore, MetaStore, NamespaceContentStore, NetworkMetadataStore,
+    OwnershipStore, PodCleanupStore, RawWatchReplayStore, ReplicationStore, ResourceBatchOperation,
+    ResourceBatchPutMode, ResourceListStore, ResourcePreconditions, StatusStore, WatchHistoryStore,
+    WatchMaintenanceStore, WatchReplayAnchorStore,
 };
 use klights_cluster_core::LogApplyCommit;
 use klights_cluster_core::command::StorageCommand;
 use klights_cluster_datastore::sqlite::live_apply::RaftLogApplyOutcome;
+use klights_cluster_store::BackendLifecycleStore;
 use serde_json::json;
 
 fn apply_commit_in_tx_for_raft(

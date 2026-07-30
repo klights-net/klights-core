@@ -132,7 +132,7 @@ impl DatastoreBackend for SequencedDatastore {
     async fn apply_raft_log_apply_commit(
         &self,
         _commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
+    ) -> Result<klights_replication::types::StorageCommandResult> {
         reject_application_committed_apply("apply_raft_log_apply_commit")
     }
 
@@ -551,7 +551,7 @@ impl DatastoreBackend for SequencedDatastore {
             )
         })?;
         match applied.applied_mutation {
-            Some(crate::datastore::raft::types::AppliedMutation::Resource(mut resource)) => {
+            Some(klights_replication::types::AppliedMutation::Resource(mut resource)) => {
                 let Some(metadata) = std::sync::Arc::make_mut(&mut resource.data)
                     .pointer_mut("/metadata")
                     .and_then(serde_json::Value::as_object_mut)
@@ -1799,7 +1799,7 @@ impl crate::datastore::ReplicationStore for SequencedDatastore {
     async fn apply_raft_log_apply_commit(
         &self,
         _commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
+    ) -> Result<klights_replication::types::StorageCommandResult> {
         reject_application_committed_apply("apply_raft_log_apply_commit")
     }
 
@@ -1858,7 +1858,7 @@ impl crate::datastore::DurableRecoveryStore for SequencedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::BackendLifecycleStore for SequencedDatastore {
+impl klights_cluster_store::BackendLifecycleStore for SequencedDatastore {
     async fn acquire_snapshot_exclusive_fence(
         &self,
     ) -> Result<Option<crate::datastore::backend::SnapshotExclusiveFence>> {

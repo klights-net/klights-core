@@ -26,8 +26,9 @@ mod topology;
 mod watch_range;
 
 pub use backend_snapshot::{
-    DatastoreSnapshotter, SnapshotEntry, SnapshotEnvelope, SnapshotExclusiveFence,
-    SnapshotMutationFence, SnapshotRestoreError, SnapshotTable, compute_schema_fingerprint,
+    BackendLifecycleStore, DatastoreSnapshotter, SnapshotEntry, SnapshotEnvelope,
+    SnapshotExclusiveFence, SnapshotMutationFence, SnapshotRestoreError, SnapshotTable,
+    compute_schema_fingerprint,
 };
 pub use committed_apply::{
     AppliedOutboxLookup, CommittedApplyError, CommittedApplyFuture, CommittedRaftApplyReceipt,

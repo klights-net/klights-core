@@ -30,8 +30,9 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 use super::super::DatastoreHandle;
-use super::super::{BackendLifecycleStore, DurableRecoveryStore};
-use super::types::{NodeId, TypeConfig};
+use super::super::DurableRecoveryStore;
+use klights_cluster_store::BackendLifecycleStore;
+use klights_replication::types::{NodeId, TypeConfig};
 
 /// Self-describing snapshot envelope. Carries the `last_applied`
 /// log-id, the membership configuration, and an ordered list of
@@ -41,7 +42,7 @@ use super::types::{NodeId, TypeConfig};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RaftSnapshotData {
     pub last_applied: Option<LogId<NodeId>>,
-    pub membership: StoredMembership<NodeId, super::types::RaftMemberNode>,
+    pub membership: StoredMembership<NodeId, klights_replication::types::RaftMemberNode>,
     #[serde(default)]
     pub current_rv: i64,
     /// Exact-v3 activation proof captured from the same immutable backend
@@ -129,7 +130,7 @@ impl RaftSnapshotData {
     pub async fn serialize_from_backend_to_cursor(
         db: DatastoreHandle,
         last_applied: Option<LogId<NodeId>>,
-        membership: &StoredMembership<NodeId, super::types::RaftMemberNode>,
+        membership: &StoredMembership<NodeId, klights_replication::types::RaftMemberNode>,
     ) -> Result<Cursor<Vec<u8>>> {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()));
         let recovery = Arc::new(super::super::DatastoreDurableRecoveryPort::new(db.clone()));
@@ -155,7 +156,7 @@ impl RaftSnapshotData {
     ) -> Result<(
         Cursor<Vec<u8>>,
         Option<LogId<NodeId>>,
-        StoredMembership<NodeId, super::types::RaftMemberNode>,
+        StoredMembership<NodeId, klights_replication::types::RaftMemberNode>,
     )> {
         let request = klights_cluster_store::SnapshotCaptureRequest::try_new(
             klights_cluster_store::SnapshotPageLimit::try_new(
@@ -294,14 +295,14 @@ enum RaftSnapshotAppliedStateSource {
     #[cfg(test)]
     Fixed {
         last_applied: Option<LogId<NodeId>>,
-        membership: StoredMembership<NodeId, super::types::RaftMemberNode>,
+        membership: StoredMembership<NodeId, klights_replication::types::RaftMemberNode>,
     },
     Durable(Arc<dyn RaftAppliedStateDurability>),
 }
 
 type CapturedRaftAppliedState = (
     Option<LogId<NodeId>>,
-    StoredMembership<NodeId, super::types::RaftMemberNode>,
+    StoredMembership<NodeId, klights_replication::types::RaftMemberNode>,
 );
 
 impl RaftSnapshotAppliedStateSource {
@@ -694,7 +695,7 @@ mod tests {
                     vec![std::collections::BTreeSet::from([7])],
                     std::collections::BTreeMap::<
                         NodeId,
-                        crate::datastore::raft::types::RaftMemberNode,
+                        klights_replication::types::RaftMemberNode,
                     >::new(),
                 ),
             );
@@ -819,7 +820,7 @@ mod tests {
         .unwrap();
 
         let membership =
-            StoredMembership::<NodeId, crate::datastore::raft::types::RaftMemberNode>::default();
+            StoredMembership::<NodeId, klights_replication::types::RaftMemberNode>::default();
         let cursor = RaftSnapshotData::serialize_from_backend_to_cursor(
             Arc::new(db.clone()),
             None,
@@ -953,7 +954,7 @@ mod tests {
     fn legacy_snapshot_without_watch_allocator_remains_decodable() {
         let legacy = serde_json::json!({
             "last_applied": null,
-            "membership": StoredMembership::<NodeId, crate::datastore::raft::types::RaftMemberNode>::default(),
+            "membership": StoredMembership::<NodeId, klights_replication::types::RaftMemberNode>::default(),
             "current_rv": 7,
             "commits": []
         });
