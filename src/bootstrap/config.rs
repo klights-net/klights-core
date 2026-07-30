@@ -398,6 +398,15 @@ impl KlightsConfig {
     }
 }
 
+fn parse_pod_subnet(raw: &str) -> anyhow::Result<String> {
+    use anyhow::anyhow;
+    use klights_types::PodSubnet;
+
+    PodSubnet::parse(raw)
+        .map(|subnet| subnet.to_string())
+        .map_err(|e| anyhow!("invalid KLIGHTS_POD_SUBNET '{}': {}", raw, e))
+}
+
 fn parse_datastore_backend_env() -> anyhow::Result<BackendKind> {
     match std::env::var("KLIGHTS_DATASTORE_BACKEND") {
         Ok(value) => BackendKind::parse(&value),
@@ -490,10 +499,14 @@ fn parse_optional_ipv4_env(var: &str) -> anyhow::Result<Option<String>> {
     let Some(value) = parse_optional_trimmed_env(var) else {
         return Ok(None);
     };
+    parse_ipv4_value(var, &value).map(Some)
+}
+
+fn parse_ipv4_value(var: &str, value: &str) -> anyhow::Result<String> {
     value.parse::<std::net::Ipv4Addr>().map_err(|err| {
         anyhow::anyhow!("{} must be a valid IPv4 address '{}': {}", var, value, err)
     })?;
-    Ok(Some(value))
+    Ok(value.to_string())
 }
 
 fn parse_wireguard_device_env(default: &str) -> anyhow::Result<String> {
@@ -896,12 +909,8 @@ mod tests {
 
     #[test]
     fn test_from_env_rejects_invalid_node_ip() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("KLIGHTS_NODE_IP", "not-an-ip") };
-
-        let err = KlightsConfig::from_env().expect_err("must reject invalid node IP");
+        let err = parse_ipv4_value("KLIGHTS_NODE_IP", "not-an-ip")
+            .expect_err("must reject invalid node IP");
 
         assert!(
             format!("{:#}", err).contains("KLIGHTS_NODE_IP"),
