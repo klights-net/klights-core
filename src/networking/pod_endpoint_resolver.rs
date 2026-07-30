@@ -183,7 +183,7 @@ fn translate_endpoint_event(
 mod tests {
     use super::*;
     use crate::control_plane::client::local::LocalApiClient;
-    use crate::datastore::node_local::{NodeLocalHandle, selector};
+    use crate::datastore::node_local::{NodeLocalStores, selector};
     use crate::datastore::sqlite::Datastore;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use std::sync::Arc;
@@ -236,7 +236,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn build_resolver() -> (NodeLocalHandle, Datastore, SqlitePodEndpointResolver) {
+    async fn build_resolver() -> (Arc<NodeLocalStores>, Datastore, SqlitePodEndpointResolver) {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let node_local = selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
@@ -253,10 +253,8 @@ mod tests {
             "node-a".to_string(),
             crate::control_plane::client::local::always_leader_watch(),
         ));
-        let node_network =
-            crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(
-                node_local.clone(),
-            );
+        let node_local = Arc::new(node_local);
+        let node_network = node_local.clone();
         let topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> = cluster_api;
         let resolver = SqlitePodEndpointResolver::new(node_network.clone(), node_network, topology);
         (node_local, cluster_db, resolver)
@@ -660,19 +658,17 @@ mod tests {
         )
         .await
         .expect("open node-local executor");
-        let node_local = crate::datastore::node_local::SqliteNodeLocalDb::from_executor(executor)
-            .expect("open node-local backend");
+        let node_local = Arc::new(
+            crate::datastore::node_local::NodeLocalStores::from_executor(executor)
+                .expect("open node-local stores"),
+        );
         let cluster_db = Datastore::new_in_memory().await.unwrap();
         let cluster_api = Arc::new(LocalApiClient::new(
             Arc::new(cluster_db),
             "node-a".to_string(),
             crate::control_plane::client::local::always_leader_watch(),
         ));
-        let node_handle: NodeLocalHandle = Arc::new(node_local.clone());
-        let node_network =
-            crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(
-                node_handle,
-            );
+        let node_network = node_local.clone();
         let topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> = cluster_api;
         let resolver = SqlitePodEndpointResolver::new(node_network.clone(), node_network, topology);
         let mut failed_stream = resolver.subscribe().await.expect("initial subscription");
@@ -681,7 +677,7 @@ mod tests {
             Some(klights_network_api::PodEndpointEvent::Resync(_))
         ));
         node_local
-            .db_call("test_insert_malformed_endpoint_for_relist", move |conn| {
+            .with_test_connection("test_insert_malformed_endpoint_for_relist", move |conn| {
                 conn.execute(
                     "INSERT INTO pod_endpoints \
                      (pod_uid, namespace, pod_name, node_name, mode, pod_ip, node_ip, \
@@ -696,7 +692,7 @@ mod tests {
             .unwrap();
         for i in 0..4_097u16 {
             persist_endpoint(
-                &node_local,
+                node_local.as_ref(),
                 sample_row(
                     &format!("failed-relist-{i:05}"),
                     Ipv4Addr::new(10, 64, (i / 256) as u8, (i % 256) as u8),
@@ -713,7 +709,7 @@ mod tests {
         assert!(matches!(error, PodEndpointError::EventSource { .. }));
 
         node_local
-            .db_call("test_delete_malformed_endpoint_for_retry", move |conn| {
+            .with_test_connection("test_delete_malformed_endpoint_for_retry", move |conn| {
                 conn.execute(
                     "DELETE FROM pod_endpoints WHERE pod_uid = 'malformed-relist'",
                     [],
@@ -727,7 +723,7 @@ mod tests {
             Ipv4Addr::new(10, 63, 0, 1),
             PodEndpointMode::EncryptedDirect,
         );
-        persist_endpoint(&node_local, current.clone()).await;
+        persist_endpoint(node_local.as_ref(), current.clone()).await;
         let mut retry = resolver.subscribe().await.expect("fresh retry");
         let Some(klights_network_api::PodEndpointEvent::Resync(snapshot)) =
             next_endpoint_event(&mut retry).await

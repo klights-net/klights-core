@@ -11,15 +11,15 @@ use klights_node_store::{
     RuntimeObservationCheckpoint, RuntimeObservationCheckpointStore,
 };
 
-use super::SqliteNodeLocalDb;
+use super::NodeLocalStores;
 
-impl OutboxProducerStore for SqliteNodeLocalDb {
+impl OutboxProducerStore for NodeLocalStores {
     fn enqueue_outbox(&self, entry: OutboxEnqueue) -> DeliveryFuture<'_, ()> {
         self.delivery_ref().enqueue_outbox(entry)
     }
 }
 
-impl OutboxDispatcherStore for SqliteNodeLocalDb {
+impl OutboxDispatcherStore for NodeLocalStores {
     fn claim_next_due_outbox(
         &self,
         request: OutboxClaimRequest,
@@ -77,7 +77,7 @@ impl OutboxDispatcherStore for SqliteNodeLocalDb {
     }
 }
 
-impl OutboxStatusStampStore for SqliteNodeLocalDb {
+impl OutboxStatusStampStore for NodeLocalStores {
     fn read_status_stamp_high_water(&self) -> DeliveryFuture<'_, i64> {
         self.delivery_ref().read_status_stamp_high_water()
     }
@@ -88,7 +88,7 @@ impl OutboxStatusStampStore for SqliteNodeLocalDb {
     }
 }
 
-impl DeadLetterStore for SqliteNodeLocalDb {
+impl DeadLetterStore for NodeLocalStores {
     fn move_outbox_to_dead_letter_if_max_attempts(
         &self,
         request: DeadLetterMoveRequest,
@@ -118,7 +118,7 @@ impl DeadLetterStore for SqliteNodeLocalDb {
     }
 }
 
-impl PodStatusCheckpointStore for SqliteNodeLocalDb {
+impl PodStatusCheckpointStore for NodeLocalStores {
     fn upsert_pod_status_checkpoint(
         &self,
         checkpoint: PodStatusCheckpointUpsert,
@@ -146,7 +146,7 @@ impl PodStatusCheckpointStore for SqliteNodeLocalDb {
     }
 }
 
-impl RuntimeObservationCheckpointStore for SqliteNodeLocalDb {
+impl RuntimeObservationCheckpointStore for NodeLocalStores {
     fn upsert_runtime_observation_checkpoint(
         &self,
         checkpoint: RuntimeObservationCheckpoint,
@@ -171,7 +171,7 @@ impl RuntimeObservationCheckpointStore for SqliteNodeLocalDb {
     }
 }
 
-impl ReplicationCheckpointStore for SqliteNodeLocalDb {
+impl ReplicationCheckpointStore for NodeLocalStores {
     fn read_replication_checkpoint(&self) -> DeliveryFuture<'_, Option<ReplicationCheckpoint>> {
         self.delivery_ref().read_replication_checkpoint()
     }

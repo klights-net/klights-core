@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use crate::datastore::ResourcePreconditions;
 use crate::datastore::backend_kind::BackendKind;
+use crate::datastore::node_local::selector;
 use crate::datastore::node_local::{
-    DeadLetterTestInsert, LegacyDeliveryTestStore as _, NodeLocalHandle, OutboxInsert,
+    DeadLetterTestInsert, LegacyDeliveryTestStore as _, NodeLocalStores, OutboxInsert,
 };
-use crate::datastore::node_local::{SqliteNodeLocalDb, selector};
 use crate::node_outbox::payload::OutboxPayload;
 use klights_cluster_core::command::StorageCommand;
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
@@ -34,7 +34,7 @@ fn terminal_delete_classification() -> klights_node_store::OutboxClassification 
     .expect("valid actor-owned terminal delete classification")
 }
 
-async fn node_db() -> NodeLocalHandle {
+async fn node_db() -> NodeLocalStores {
     selector::open_node_local(
         BackendKind::Sqlite,
         None,
@@ -46,7 +46,7 @@ async fn node_db() -> NodeLocalHandle {
     .expect("open node-local test db")
 }
 
-async fn node_db_concrete() -> SqliteNodeLocalDb {
+async fn node_db_concrete() -> NodeLocalStores {
     let executor = klights_node_datastore::open::open_with_opts(
         klights_node_datastore::open::in_memory_opts(),
         supervisor(),
@@ -54,7 +54,7 @@ async fn node_db_concrete() -> SqliteNodeLocalDb {
     )
     .await
     .expect("open node-local executor");
-    SqliteNodeLocalDb::from_executor(executor).expect("create sqlite node-local db")
+    NodeLocalStores::from_executor(executor).expect("create sqlite node-local db")
 }
 
 fn pod_status_payload_bytes(namespace: &str, name: &str, uid: &str) -> Vec<u8> {

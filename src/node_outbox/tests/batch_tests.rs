@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 
 use crate::datastore::ResourcePreconditions;
 use crate::datastore::backend_kind::BackendKind;
-use crate::datastore::node_local::{LegacyDeliveryTestStore as _, NodeLocalHandle, selector};
+use crate::datastore::node_local::{LegacyDeliveryTestStore as _, NodeLocalStores, selector};
 use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
 use crate::node_outbox::{DispatchOutcome, Outbox, OutboxCommand, OutboxDispatcher, OutboxSubject};
 use klights_cluster_core::command::StorageCommand;
@@ -29,7 +29,7 @@ fn pod_status_classification() -> klights_node_store::OutboxClassification {
     .expect("valid Pod status classification")
 }
 
-async fn node_db() -> NodeLocalHandle {
+async fn node_db() -> NodeLocalStores {
     selector::open_node_local(
         BackendKind::Sqlite,
         None,

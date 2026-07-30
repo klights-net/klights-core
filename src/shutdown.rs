@@ -42,12 +42,12 @@ fn require_success<'a>(
 pub async fn cleanup_pod_sandboxes(
     file_process: &klights_supervisor::FileProcessExecutor,
     cri: &mut crate::kubelet::CriClient,
-    node_local: &dyn crate::datastore::node_local::NodeLocalBackend,
+    runtime_store: &dyn klights_node_store::PodRuntimeStore,
     network: &dyn klights_network_api::Datapath,
     containerd_ns: &str,
 ) -> Result<()> {
     let mut sandbox_ids = std::collections::HashSet::new();
-    let sandboxes = node_local.list_pod_runtime().await?;
+    let sandboxes = runtime_store.list_pod_runtime().await?;
     tracing::info!("Stopping {} recorded pod sandboxes", sandboxes.len());
 
     for sb in sandboxes {
@@ -58,7 +58,7 @@ pub async fn cleanup_pod_sandboxes(
         cleanup_one_pod_sandbox(
             file_process,
             cri,
-            node_local,
+            runtime_store,
             network,
             containerd_ns,
             sandbox_id,
@@ -74,7 +74,7 @@ pub async fn cleanup_pod_sandboxes(
                     cleanup_one_pod_sandbox(
                         file_process,
                         cri,
-                        node_local,
+                        runtime_store,
                         network,
                         containerd_ns,
                         &sandbox.id,
@@ -99,7 +99,7 @@ pub async fn cleanup_pod_sandboxes(
 async fn cleanup_one_pod_sandbox(
     file_process: &klights_supervisor::FileProcessExecutor,
     cri: &mut crate::kubelet::CriClient,
-    node_local: &dyn crate::datastore::node_local::NodeLocalBackend,
+    runtime_store: &dyn klights_node_store::PodRuntimeStore,
     network: &dyn klights_network_api::Datapath,
     containerd_ns: &str,
     sandbox_id: &str,
@@ -143,7 +143,11 @@ async fn cleanup_one_pod_sandbox(
             }
             if let Some((namespace, pod_name, pod_uid)) = owner
                 && let Err(e) = delete_shutdown_sandbox_row(
-                    node_local, namespace, pod_name, pod_uid, sandbox_id,
+                    runtime_store,
+                    namespace,
+                    pod_name,
+                    pod_uid,
+                    sandbox_id,
                 )
                 .await
             {
@@ -160,7 +164,7 @@ async fn cleanup_one_pod_sandbox(
 }
 
 async fn delete_shutdown_sandbox_row(
-    node_local: &dyn crate::datastore::node_local::NodeLocalBackend,
+    runtime_store: &dyn klights_node_store::PodRuntimeStore,
     _namespace: &str,
     _pod_name: &str,
     pod_uid: &str,
@@ -169,14 +173,14 @@ async fn delete_shutdown_sandbox_row(
     if pod_uid.trim().is_empty() {
         return Ok(());
     }
-    let Some(runtime) = node_local
+    let Some(runtime) = runtime_store
         .get_pod_runtime(klights_node_store::RuntimePodUid::try_new(pod_uid)?)
         .await?
     else {
         return Ok(());
     };
     if runtime.sandbox_id() == Some(sandbox_id) {
-        node_local
+        runtime_store
             .delete_pod_runtime_for_uid(klights_node_store::RuntimePodUid::try_new(pod_uid)?)
             .await?;
     }
@@ -1057,7 +1061,8 @@ tmpfs on /data/klights/pods/pod-a/volumes/empty-dir/cache type tmpfs (rw,relatim
         )
         .await
         .unwrap();
-        node_local
+        let pod_runtime = node_local.pod_runtime();
+        pod_runtime
             .record_owned_sandbox(
                 klights_node_store::OwnedPodSandbox::try_new(
                     klights_types::PodIdentity::new("default", "same-name", "uid-a"),
@@ -1069,7 +1074,7 @@ tmpfs on /data/klights/pods/pod-a/volumes/empty-dir/cache type tmpfs (rw,relatim
             )
             .await
             .unwrap();
-        node_local
+        pod_runtime
             .record_owned_sandbox(
                 klights_node_store::OwnedPodSandbox::try_new(
                     klights_types::PodIdentity::new("default", "same-name", "uid-b"),
@@ -1083,7 +1088,7 @@ tmpfs on /data/klights/pods/pod-a/volumes/empty-dir/cache type tmpfs (rw,relatim
             .unwrap();
 
         delete_shutdown_sandbox_row(
-            node_local.as_ref(),
+            pod_runtime.as_ref(),
             "default",
             "same-name",
             "uid-a",
@@ -1093,13 +1098,13 @@ tmpfs on /data/klights/pods/pod-a/volumes/empty-dir/cache type tmpfs (rw,relatim
         .unwrap();
 
         assert!(
-            node_local
+            pod_runtime
                 .get_pod_runtime(klights_node_store::RuntimePodUid::try_new("uid-a").unwrap())
                 .await
                 .unwrap()
                 .is_none()
         );
-        let replacement = node_local
+        let replacement = pod_runtime
             .get_pod_runtime(klights_node_store::RuntimePodUid::try_new("uid-b").unwrap())
             .await
             .unwrap()

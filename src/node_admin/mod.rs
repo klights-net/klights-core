@@ -11,14 +11,15 @@ use serde::Serialize;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::datastore::node_local::NodeLocalHandle;
 use crate::node_outbox::payload::OutboxOperationExt as _;
-use klights_node_store::{DeadLetterEntry, DeadLetterKey, DeadLetterReplayRequest};
+use klights_node_store::{
+    DeadLetterEntry, DeadLetterKey, DeadLetterReplayRequest, DeadLetterStore,
+};
 use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 
 #[derive(Clone)]
 struct AdminState {
-    node_db: NodeLocalHandle,
+    dead_letters: Arc<dyn DeadLetterStore>,
     outbox_notify: Arc<Notify>,
 }
 
@@ -85,7 +86,7 @@ async fn outbox_status(
     State(state): State<AdminState>,
 ) -> Result<Json<OutboxStatusResponse>, StatusCode> {
     let stats = state
-        .node_db
+        .dead_letters
         .outbox_stats()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -102,7 +103,7 @@ async fn dead_letter_list(
     State(state): State<AdminState>,
 ) -> Result<Json<Vec<DeadLetterResponse>>, StatusCode> {
     let rows = state
-        .node_db
+        .dead_letters
         .list_dead_letter()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -114,7 +115,7 @@ async fn dead_letter_replay(
     Path(id): Path<i64>,
 ) -> Result<StatusCode, StatusCode> {
     let row = state
-        .node_db
+        .dead_letters
         .get_dead_letter(DeadLetterKey::try_new(id).map_err(|_| StatusCode::NOT_FOUND)?)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -128,7 +129,7 @@ async fn dead_letter_replay(
         .classification(payload.command())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let replayed = state
-        .node_db
+        .dead_letters
         .replay_dead_letter(DeadLetterReplayRequest::new(
             DeadLetterKey::try_new(id).map_err(|_| StatusCode::NOT_FOUND)?,
             classification,
@@ -148,7 +149,7 @@ async fn dead_letter_delete(
     Path(id): Path<i64>,
 ) -> Result<StatusCode, StatusCode> {
     let deleted = state
-        .node_db
+        .dead_letters
         .delete_dead_letter(DeadLetterKey::try_new(id).map_err(|_| StatusCode::NOT_FOUND)?)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -159,9 +160,9 @@ async fn dead_letter_delete(
     }
 }
 
-fn build_router(node_db: NodeLocalHandle, outbox_notify: Arc<Notify>) -> Router {
+fn build_router(dead_letters: Arc<dyn DeadLetterStore>, outbox_notify: Arc<Notify>) -> Router {
     let state = AdminState {
-        node_db,
+        dead_letters,
         outbox_notify,
     };
     Router::new()
@@ -179,7 +180,7 @@ fn build_router(node_db: NodeLocalHandle, outbox_notify: Arc<Notify>) -> Router 
 }
 
 pub async fn start_node_admin(
-    node_db: NodeLocalHandle,
+    dead_letters: Arc<dyn DeadLetterStore>,
     outbox_notify: Arc<Notify>,
     supervisor: Arc<TaskSupervisor>,
     cancel: CancellationToken,
@@ -189,7 +190,7 @@ pub async fn start_node_admin(
         .and_then(|v| v.parse().ok())
         .unwrap_or(7781);
 
-    let app = build_router(node_db, outbox_notify);
+    let app = build_router(dead_letters, outbox_notify);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
 
     supervisor
@@ -218,7 +219,7 @@ mod tests {
     use crate::datastore::backend_kind::BackendKind;
     use crate::datastore::node_local::sqlite::DeadLetterTestInsert;
     use crate::datastore::node_local::{
-        LegacyDeliveryTestStore as _, NodeLocalHandle, OutboxInsert, selector,
+        LegacyDeliveryTestStore as _, NodeLocalStores, OutboxInsert, selector,
     };
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
@@ -253,7 +254,7 @@ mod tests {
         .expect("encode test Pod status outbox envelope")
     }
 
-    async fn node_db() -> NodeLocalHandle {
+    async fn node_db() -> NodeLocalStores {
         selector::open_node_local(
             BackendKind::Sqlite,
             None,
@@ -265,9 +266,9 @@ mod tests {
         .expect("open node-local test db")
     }
 
-    async fn node_db_with_dead_letter() -> (NodeLocalHandle, i64) {
+    async fn node_db_with_dead_letter() -> (NodeLocalStores, i64) {
         let ndb = node_db().await;
-        // Use the concrete SqliteNodeLocalDb for test-only insert.
+        // Use the concrete NodeLocalStores for test-only insert.
         // We open a separate handle via selector and downcast isn't available,
         // so we insert via enqueue + move.
         ndb.legacy_enqueue_outbox(OutboxInsert {
@@ -298,7 +299,7 @@ mod tests {
         (ndb, id)
     }
 
-    async fn node_db_with_unassigned_dead_letter() -> (NodeLocalHandle, i64) {
+    async fn node_db_with_unassigned_dead_letter() -> (NodeLocalStores, i64) {
         let (ndb, sqlite) = selector::open_node_local_with_sqlite(
             BackendKind::Sqlite,
             None,
@@ -335,8 +336,8 @@ mod tests {
         (ndb, id)
     }
 
-    fn build_router(node_db: NodeLocalHandle) -> axum::Router {
-        super::build_router(node_db, Arc::new(tokio::sync::Notify::new()))
+    fn build_router(node_db: NodeLocalStores) -> axum::Router {
+        super::build_router(node_db.dead_letters(), Arc::new(tokio::sync::Notify::new()))
     }
 
     #[tokio::test]
@@ -412,7 +413,7 @@ mod tests {
         let (ndb, id) = node_db_with_dead_letter().await;
 
         let notify = Arc::new(tokio::sync::Notify::new());
-        let app = super::build_router(ndb.clone(), notify.clone());
+        let app = super::build_router(ndb.dead_letters(), notify.clone());
         let response = app
             .oneshot(
                 Request::builder()
@@ -468,10 +469,12 @@ mod tests {
         let ndb = node_db().await;
 
         // Simulate what the dispatcher does: write counters to _node_meta.
-        ndb.set_node_meta("outbox_dispatch_total", "42")
+        ndb.identity()
+            .set_node_meta("outbox_dispatch_total", "42")
             .await
             .expect("write counter");
-        ndb.set_node_meta("outbox_dispatch_errors_total", "7")
+        ndb.identity()
+            .set_node_meta("outbox_dispatch_errors_total", "7")
             .await
             .expect("write errors counter");
 

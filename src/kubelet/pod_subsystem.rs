@@ -392,7 +392,7 @@ mod tests {
         let repository_parts =
             PodRepository::build_parts(crate::kubelet::pod_repository::PodRepositoryBuildConfig {
                 db: db.clone(),
-                node_local: None,
+                pod_workqueue_store: None,
                 supervisor: supervisor.clone(),
                 side_effects,
                 metrics,

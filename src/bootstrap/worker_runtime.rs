@@ -212,11 +212,11 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
 
     let ob_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let outbox_stores = crate::node_outbox::OutboxStores::new(
-        node_local.clone(),
-        node_local.clone(),
-        node_local.clone(),
-        node_local.clone(),
-        node_local.clone(),
+        node_local.outbox_producer(),
+        node_local.outbox_dispatcher(),
+        node_local.pod_status_checkpoints(),
+        node_local.runtime_observation_checkpoints(),
+        node_local.outbox_status_stamps(),
     );
     let outbox_codec = crate::replication::outbox_payload_codec::new_codec();
     let outbox_wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock> =
@@ -269,7 +269,11 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         watch: leader_ports.watch.clone(),
         subnet_allocation: leader_ports.node_subnet_allocation.clone(),
         network_topology: leader_ports.network_topology.clone(),
-        node_local: node_local.clone(),
+        pod_network_cache: node_local.pod_network_cache(),
+        pod_ipam: node_local.pod_ipam(),
+        pod_runtime: node_local.pod_runtime(),
+        pod_endpoints: node_local.pod_endpoints(),
+        pod_endpoint_events: node_local.pod_endpoint_events(),
         network_cleanup: &network_cleanup,
         runtime_paths: &runtime_paths,
         runtime_inputs: network_runtime_inputs,
@@ -449,7 +453,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let pod_repository_parts = compose_worker_pod_repository_parts(
         crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
             resource_query: leader_ports.resource_query.clone(),
-            node_local: node_local.clone(),
+            pod_workqueue_store: node_local.pod_workqueue(),
             supervisor: task_supervisor.clone(),
             metrics: metrics.clone(),
             pod_network_cache,
@@ -478,10 +482,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         leader_ports.projected_tokens.clone(),
         outbox.clone(),
     );
-    let pod_slot_store: std::sync::Arc<dyn klights_node_store::PodSlotAdmissionStore> =
-        node_local.clone();
-    let pod_slot_events: std::sync::Arc<dyn klights_node_store::PodSlotAdmissionEventSource> =
-        node_local.clone();
+    let pod_slot_store = node_local.pod_slots();
+    let pod_slot_events = node_local.pod_slot_events();
     let pod_subsystem = crate::kubelet::pod_subsystem::PodSubsystem::new(
         crate::kubelet::pod_subsystem::PodSubsystemConfig {
             repository_parts: pod_repository_parts,
@@ -663,7 +665,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     shutdown_signal.await;
     tracing::info!("Worker soft shutdown");
     shutdown_token.cancel();
-    node_local.close();
+    node_local.identity().close();
     let to = std::time::Duration::from_secs(10);
     if let Some(h) = pod_watcher_handle {
         let _ = task_supervisor.timeout("wp", to, h.join()).await;
@@ -838,7 +840,7 @@ mod tests {
         let parts = compose_worker_pod_repository_parts(
             crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
                 resource_query: std::sync::Arc::new(UnavailableWorkerQuery),
-                node_local,
+                pod_workqueue_store: node_local.pod_workqueue(),
                 supervisor,
                 metrics: crate::side_effects::SideEffectMetrics::new(),
                 pod_network_cache: crate::kubelet::pod_repository::empty_test_pod_network_cache(),

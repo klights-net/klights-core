@@ -583,7 +583,7 @@ mod tests {
 
     async fn node_local_for_test(
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    ) -> crate::datastore::node_local::NodeLocalHandle {
+    ) -> crate::datastore::node_local::NodeLocalStores {
         crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
@@ -630,8 +630,7 @@ mod tests {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let node_local = node_local_for_test(supervisor.clone()).await;
-        let node_network =
-            crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(node_local);
+        let node_network = Arc::new(node_local);
         let assignment_bus =
             Arc::new(crate::networking::pod_network_events::PodNetworkAssignmentBus::new());
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -677,8 +676,7 @@ mod tests {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let node_local = node_local_for_test(supervisor.clone()).await;
-        let node_network =
-            crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(node_local);
+        let node_network = Arc::new(node_local);
         let assignment_bus =
             Arc::new(crate::networking::pod_network_events::PodNetworkAssignmentBus::new());
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -744,8 +742,7 @@ mod tests {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let node_local = node_local_for_test(supervisor.clone()).await;
-        let node_network =
-            crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(node_local);
+        let node_network = Arc::new(node_local);
         let assignment_bus =
             Arc::new(crate::networking::pod_network_events::PodNetworkAssignmentBus::new());
         let cancel = tokio_util::sync::CancellationToken::new();

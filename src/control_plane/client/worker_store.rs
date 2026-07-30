@@ -284,7 +284,7 @@ fn worker_replay_boundaries(
 ///
 /// This type deliberately does not open or own `cluster.db`. Cluster resource
 /// reads are served through the focused leader query/cache port;
-/// node-local runtime/network rows are served through `NodeLocalBackend`.
+/// node-local runtime/network rows are served through focused node-store ports.
 pub trait WorkerWatchEvents: Send + Sync {
     fn subscribe_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver;
     #[cfg(test)]
@@ -3115,6 +3115,7 @@ mod tests {
         assert_eq!(pod.uid, "uid-1");
 
         node_local
+            .pod_runtime()
             .record_owned_sandbox(
                 klights_node_store::OwnedPodSandbox::try_new(
                     klights_types::PodIdentity::new("default", "web", "uid-1"),
@@ -3128,6 +3129,7 @@ mod tests {
             .expect("record sandbox in node-local store");
         assert_eq!(
             node_local
+                .pod_runtime()
                 .get_pod_runtime(klights_node_store::RuntimePodUid::try_new("uid-1").unwrap())
                 .await
                 .expect("read worker sandbox")

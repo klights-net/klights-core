@@ -6,7 +6,7 @@
 
 use klights_node_store::{NodeIdentity, NodeIdentityFuture};
 
-impl NodeIdentity for super::SqliteNodeLocalDb {
+impl NodeIdentity for super::NodeLocalStores {
     fn backend_name(&self) -> &'static str {
         self.identity_ref().backend_name()
     }

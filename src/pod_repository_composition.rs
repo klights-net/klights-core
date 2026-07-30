@@ -66,7 +66,7 @@ pub enum PodSchedulingMode {
 #[derive(Clone)]
 pub struct PodRepositoryBuildConfig {
     pub db: DatastoreHandle,
-    pub node_local: Option<crate::datastore::node_local::NodeLocalHandle>,
+    pub pod_workqueue_store: Option<Arc<dyn klights_node_store::PodWorkqueueStore>>,
     pub supervisor: Arc<TaskSupervisor>,
     pub side_effects: Arc<SideEffectRegistry>,
     pub metrics: Arc<SideEffectMetrics>,
@@ -85,7 +85,7 @@ pub struct PodRepositoryBuildConfig {
 #[derive(Clone)]
 pub struct WorkerPodRepositoryBuildConfig {
     pub resource_query: Arc<dyn LeaderResourceQuery>,
-    pub node_local: crate::datastore::node_local::NodeLocalHandle,
+    pub pod_workqueue_store: Arc<dyn klights_node_store::PodWorkqueueStore>,
     pub supervisor: Arc<TaskSupervisor>,
     pub metrics: Arc<SideEffectMetrics>,
     pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
@@ -1020,7 +1020,7 @@ pub(crate) fn build_pod_repository_parts(
 ) -> RootPodRepositoryParts {
     let PodRepositoryBuildConfig {
         db,
-        node_local,
+        pod_workqueue_store,
         supervisor,
         side_effects,
         metrics,
@@ -1056,10 +1056,8 @@ pub(crate) fn build_pod_repository_parts(
         Arc::new(RootPodPersistence { db: db.clone() }),
         wall_clock.clone(),
     ));
-    let node_local =
-        node_local.map(|store| -> Arc<dyn klights_node_store::PodWorkqueueStore> { store });
     let workqueue_persistence = RootPodWorkqueuePersistence {
-        node_local,
+        node_local: pod_workqueue_store,
         #[cfg(test)]
         wall_clock: wall_clock.clone(),
         #[cfg(test)]
@@ -1161,7 +1159,7 @@ pub(crate) fn build_worker_pod_repository_parts(
     let workqueue = PodWorkqueue::new(
         store.clone(),
         RootPodWorkqueuePersistence {
-            node_local: Some(config.node_local),
+            node_local: Some(config.pod_workqueue_store),
             #[cfg(test)]
             wall_clock: wall_clock.clone(),
             #[cfg(test)]

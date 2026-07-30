@@ -1,28 +1,12 @@
 use anyhow::Result;
 #[cfg(test)]
 use anyhow::anyhow;
-use klights_node_datastore::{
-    SqliteNodeIdentity, SqliteNodeNetworkStateStore, SqliteRaftDurability, SqliteRuntimeWorkStore,
-    delivery::SqliteDeliveryStore,
-};
-
-use klights_supervisor::DbExecutor;
 #[cfg(test)]
 use rusqlite::OptionalExtension;
 #[cfg(test)]
 use serde_json::Value;
 #[cfg(test)]
 use sha2::{Digest, Sha256};
-
-#[derive(Clone)]
-pub struct SqliteNodeLocalDb {
-    executor: DbExecutor,
-    identity: std::sync::Arc<SqliteNodeIdentity>,
-    raft_persistence: std::sync::Arc<SqliteRaftDurability>,
-    delivery: std::sync::Arc<SqliteDeliveryStore>,
-    network_state: std::sync::Arc<SqliteNodeNetworkStateStore>,
-    runtime_work: std::sync::Arc<SqliteRuntimeWorkStore>,
-}
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
@@ -158,68 +142,18 @@ pub struct OutboxStats {
     pub dispatch_errors_total: i64,
 }
 
-impl SqliteNodeLocalDb {
-    #[cfg(test)]
-    pub fn from_executor(executor: DbExecutor) -> Result<Self> {
-        Self::from_executor_with_clock(
-            executor,
-            std::sync::Arc::new(klights_supervisor::SystemWallClock),
-        )
-    }
-
-    pub fn from_executor_with_clock(
-        executor: DbExecutor,
-        wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
-    ) -> Result<Self> {
-        Ok(Self {
-            identity: std::sync::Arc::new(SqliteNodeIdentity::new(executor.clone())),
-            raft_persistence: std::sync::Arc::new(SqliteRaftDurability::new(executor.clone())),
-            delivery: std::sync::Arc::new(SqliteDeliveryStore::new(
-                executor.clone(),
-                wall_clock.clone(),
-            )),
-            network_state: std::sync::Arc::new(SqliteNodeNetworkStateStore::new(
-                executor.clone(),
-                wall_clock.clone(),
-            )),
-            runtime_work: std::sync::Arc::new(SqliteRuntimeWorkStore::new(
-                executor.clone(),
-                wall_clock,
-            )),
-            executor,
-        })
-    }
-
-    pub(crate) fn raft_persistence(&self) -> std::sync::Arc<SqliteRaftDurability> {
-        self.raft_persistence.clone()
-    }
-
-    pub(crate) fn raft_persistence_ref(&self) -> &SqliteRaftDurability {
-        &self.raft_persistence
-    }
-
-    pub(crate) fn identity_ref(&self) -> &SqliteNodeIdentity {
-        &self.identity
-    }
-
-    pub(crate) fn delivery_ref(&self) -> &SqliteDeliveryStore {
-        &self.delivery
-    }
-
-    pub(crate) fn network_state_ref(&self) -> &SqliteNodeNetworkStateStore {
-        &self.network_state
-    }
-
-    pub(crate) fn runtime_work_ref(&self) -> &SqliteRuntimeWorkStore {
-        &self.runtime_work
-    }
-
-    pub async fn db_call<T, F>(&self, query_name: &'static str, f: F) -> tokio_rusqlite::Result<T>
+#[cfg(test)]
+impl super::NodeLocalStores {
+    pub(crate) async fn with_test_connection<T, F>(
+        &self,
+        query_name: &'static str,
+        f: F,
+    ) -> tokio_rusqlite::Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
     {
-        self.executor.call_raw(query_name, f).await
+        self.executor_for_test().call_raw(query_name, f).await
     }
 
     #[cfg(test)]
@@ -228,7 +162,7 @@ impl SqliteNodeLocalDb {
         idempotency_key: &str,
     ) -> Result<Option<(i64, i64)>> {
         let idempotency_key = idempotency_key.to_string();
-        self.db_call("node_local:outbox_stream_position_test", move |conn| {
+        self.with_test_connection("node_local:outbox_stream_position_test", move |conn| {
             conn.query_row(
                 "SELECT stream_id, stream_seq FROM outbox WHERE idempotency_key = ?1",
                 [idempotency_key],
@@ -244,7 +178,7 @@ impl SqliteNodeLocalDb {
     #[cfg(test)]
     pub async fn clear_outbox_stream_identity_for_test(&self, idempotency_key: &str) -> Result<()> {
         let idempotency_key = idempotency_key.to_string();
-        self.db_call("node_local:outbox_legacy_stream_test", move |conn| {
+        self.with_test_connection("node_local:outbox_legacy_stream_test", move |conn| {
             let tx = conn.transaction()?;
             let changed = tx.execute(
                 "UPDATE outbox SET client_id = '', stream_id = 0, stream_seq = 0 \
@@ -268,7 +202,7 @@ impl SqliteNodeLocalDb {
 
     #[cfg(test)]
     pub async fn clear_all_outbox_stream_identity_for_test(&self) -> Result<()> {
-        self.db_call("node_local:outbox_legacy_stream_all_test", move |conn| {
+        self.with_test_connection("node_local:outbox_legacy_stream_all_test", move |conn| {
             let tx = conn.transaction()?;
             tx.execute(
                 "UPDATE outbox SET client_id = '', stream_id = 0, stream_seq = 0 \
@@ -296,7 +230,7 @@ impl SqliteNodeLocalDb {
     ) -> Result<()> {
         let idempotency_key = idempotency_key.to_string();
         let operation = operation.to_string();
-        self.db_call("node_local:outbox_operation_test_update", move |conn| {
+        self.with_test_connection("node_local:outbox_operation_test_update", move |conn| {
             conn.execute_batch("PRAGMA ignore_check_constraints = ON")?;
             let update = conn.execute(
                 "UPDATE outbox SET operation = ?2 WHERE idempotency_key = ?1",
@@ -320,7 +254,7 @@ impl SqliteNodeLocalDb {
     #[cfg(test)]
     pub async fn outbox_operation_for_test(&self, idempotency_key: &str) -> Result<Option<String>> {
         let idempotency_key = idempotency_key.to_string();
-        self.db_call("node_local:outbox_operation_test_read", move |conn| {
+        self.with_test_connection("node_local:outbox_operation_test_read", move |conn| {
             conn.query_row(
                 "SELECT operation FROM outbox WHERE idempotency_key = ?1",
                 [idempotency_key],
@@ -340,7 +274,7 @@ impl SqliteNodeLocalDb {
         attempt: i64,
     ) -> Result<()> {
         let idempotency_key = idempotency_key.to_string();
-        self.db_call("node_local:outbox_attempt_test_update", move |conn| {
+        self.with_test_connection("node_local:outbox_attempt_test_update", move |conn| {
             let changed = conn.execute(
                 "UPDATE outbox SET attempt = ?2 WHERE idempotency_key = ?1",
                 rusqlite::params![idempotency_key, attempt],
@@ -373,7 +307,7 @@ impl SqliteNodeLocalDb {
         let attempts = row.attempts;
         let last_error = row.last_error.to_string();
         let moved_at_ms = row.moved_at_ms;
-        self.db_call("node_local:dead_letter_test_insert", move |conn| {
+        self.with_test_connection("node_local:dead_letter_test_insert", move |conn| {
             conn.execute(
                 "INSERT INTO outbox_dead_letter \
                  (original_id, client_id, idempotency_key, enqueued_ms, subject_key, \
@@ -408,21 +342,9 @@ impl SqliteNodeLocalDb {
         .map_err(|error| anyhow!("dead letter test insert failed: {error}"))
     }
 
-    // T3: `append_log_apply_entry`, `list_log_apply_entries_after`,
-    // `load_log_apply_checkpoint`, `save_log_apply_checkpoint` removed.
-    // These were consumed only by the BackupApplier (deleted in T1.6).
-    // The `raft_log_entries` table (used by openraft's RaftLogStorage)
-    // is the sole durable log.
-
-    pub async fn current_log_apply_index(&self) -> Result<i64> {
-        // T3: returns 0 since the `log_apply_entries` table is gone.
-        // The raft `last_applied` index is the authoritative source.
-        Ok(0)
-    }
-
     #[cfg(test)]
     pub async fn table_names_for_test(&self) -> Result<Vec<String>> {
-        self.db_call("node_local:test_table_names", move |conn| {
+        self.with_test_connection("node_local:test_table_names", move |conn| {
             let rows = conn
                 .prepare(
                     "SELECT name FROM sqlite_master \
@@ -445,7 +367,7 @@ impl SqliteNodeLocalDb {
     ) -> Result<bool> {
         let table = table.to_string();
         let column = column.to_string();
-        self.db_call("node_local:test_not_null_column", move |conn| {
+        self.with_test_connection("node_local:test_not_null_column", move |conn| {
             let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", quote_ident(&table)))?;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
@@ -464,7 +386,7 @@ impl SqliteNodeLocalDb {
 
     #[cfg(test)]
     pub async fn schema_contains_full_resource_body_column_for_test(&self) -> Result<bool> {
-        self.db_call("node_local:test_body_column", move |conn| {
+        self.with_test_connection("node_local:test_body_column", move |conn| {
             let tables = conn
                 .prepare(
                     "SELECT name FROM sqlite_master \

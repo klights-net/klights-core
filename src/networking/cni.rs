@@ -1501,8 +1501,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let adapter =
-            crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(backend);
+        let adapter = Arc::new(backend);
         let base = u32::from(Ipv4Addr::new(10, 42, 91, 0));
         let stale_pod = klights_types::PodIdentity::new("default", "stale", "uid-stale");
         let stale = adapter

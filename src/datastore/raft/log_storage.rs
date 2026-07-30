@@ -265,7 +265,7 @@ impl RaftLogStorage<TypeConfig> for SqliteRaftLogStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::node_local::sqlite::SqliteNodeLocalDb;
+    use crate::datastore::node_local::NodeLocalStores;
     use crate::datastore::raft::types::{NodeId, StorageCommandPayload};
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use openraft::{Entry, EntryPayload, LeaderId};
@@ -287,7 +287,7 @@ mod tests {
         .await
         .expect("open node-local executor");
         let nl: Arc<dyn RaftLogDurability> =
-            Arc::new(SqliteNodeLocalDb::from_executor(executor).expect("create node-local db"));
+            Arc::new(NodeLocalStores::from_executor(executor).expect("create node-local db"));
         SqliteRaftLogStorage::new(nl, supervisor)
     }
 

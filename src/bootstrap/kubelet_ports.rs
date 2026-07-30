@@ -119,13 +119,17 @@ impl crate::kubelet::pod_watch_handlers::PersistentVolumeEventHandler
 
 #[cfg(test)]
 pub struct DatastorePodSlotAdapter {
-    store: crate::datastore::node_local::NodeLocalHandle,
+    store: Arc<dyn klights_node_store::PodSlotAdmissionStore>,
+    events: Arc<dyn klights_node_store::PodSlotAdmissionEventSource>,
 }
 
 #[cfg(test)]
 impl DatastorePodSlotAdapter {
-    pub fn new(store: crate::datastore::node_local::NodeLocalHandle) -> Arc<Self> {
-        Arc::new(Self { store })
+    pub fn new(
+        store: Arc<dyn klights_node_store::PodSlotAdmissionStore>,
+        events: Arc<dyn klights_node_store::PodSlotAdmissionEventSource>,
+    ) -> Arc<Self> {
+        Arc::new(Self { store, events })
     }
 }
 
@@ -156,7 +160,7 @@ impl klights_node_store::PodSlotAdmissionStore for DatastorePodSlotAdapter {
 #[cfg(test)]
 impl klights_node_store::PodSlotAdmissionEventSource for DatastorePodSlotAdapter {
     fn subscribe(&self) -> Box<dyn klights_node_store::PodSlotEventSubscription> {
-        self.store.subscribe()
+        self.events.subscribe()
     }
 }
 

@@ -8,9 +8,9 @@ use klights_node_store::{
     ProbeStateStore, RuntimeNamespace, RuntimePodUid, RuntimeWorkFuture,
 };
 
-use super::SqliteNodeLocalDb;
+use super::NodeLocalStores;
 
-impl PodRuntimeStore for SqliteNodeLocalDb {
+impl PodRuntimeStore for NodeLocalStores {
     fn admit_pod_runtime(&self, admission: PodRuntimeAdmission) -> RuntimeWorkFuture<'_, ()> {
         self.runtime_work_ref().admit_pod_runtime(admission)
     }
@@ -47,7 +47,7 @@ impl PodRuntimeStore for SqliteNodeLocalDb {
     }
 }
 
-impl ProbeStateStore for SqliteNodeLocalDb {
+impl ProbeStateStore for NodeLocalStores {
     fn record_probe_result(&self, result: ProbeResult) -> RuntimeWorkFuture<'_, ()> {
         self.runtime_work_ref().record_probe_result(result)
     }
@@ -57,7 +57,7 @@ impl ProbeStateStore for SqliteNodeLocalDb {
     }
 }
 
-impl PodWorkqueueStore for SqliteNodeLocalDb {
+impl PodWorkqueueStore for NodeLocalStores {
     fn enqueue_work(&self, entry: PodWorkqueueEnqueue) -> RuntimeWorkFuture<'_, ()> {
         self.runtime_work_ref().enqueue_work(entry)
     }
@@ -71,7 +71,7 @@ impl PodWorkqueueStore for SqliteNodeLocalDb {
     }
 }
 
-impl PodSlotAdmissionStore for SqliteNodeLocalDb {
+impl PodSlotAdmissionStore for NodeLocalStores {
     fn try_admit(
         &self,
         request: PodSlotAdmissionRequest,
@@ -94,7 +94,7 @@ impl PodSlotAdmissionStore for SqliteNodeLocalDb {
     }
 }
 
-impl PodSlotAdmissionEventSource for SqliteNodeLocalDb {
+impl PodSlotAdmissionEventSource for NodeLocalStores {
     fn subscribe(&self) -> Box<dyn PodSlotEventSubscription> {
         self.runtime_work_ref().subscribe()
     }

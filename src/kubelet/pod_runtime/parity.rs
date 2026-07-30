@@ -311,7 +311,7 @@ impl ParityFixture {
             crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
         let parts = PodRepository::build_parts(PodRepositoryBuildConfig {
             db: handle.clone(),
-            node_local: Some(node_local.clone()),
+            pod_workqueue_store: Some(node_local.clone()),
             supervisor,
             side_effects,
             metrics,

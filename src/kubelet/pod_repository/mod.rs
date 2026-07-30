@@ -71,12 +71,12 @@ fn resource_list_from_leader(result: klights_leader_api::ResourceListResult) -> 
 
 #[cfg(test)]
 struct TestDatastorePodNetworkCache {
-    node_local: Option<crate::datastore::node_local::KubeletTestStoreHandle>,
+    node_local: Option<std::sync::Arc<crate::datastore::node_local::NodeLocalStores>>,
 }
 
 #[cfg(test)]
 pub(crate) fn test_pod_network_cache(
-    node_local: crate::datastore::node_local::KubeletTestStoreHandle,
+    node_local: std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
 ) -> Arc<dyn klights_node_store::PodNetworkCache> {
     Arc::new(TestDatastorePodNetworkCache {
         node_local: Some(node_local),
@@ -97,16 +97,18 @@ pub(crate) fn test_assignment_bus()
 #[cfg(test)]
 pub(crate) async fn test_node_local_store(
     supervisor: Arc<TaskSupervisor>,
-) -> crate::datastore::node_local::KubeletTestStoreHandle {
-    crate::datastore::node_local::selector::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
-        None,
-        supervisor,
-        None,
-        "sqlite:pod-repository-network-test",
+) -> std::sync::Arc<crate::datastore::node_local::NodeLocalStores> {
+    std::sync::Arc::new(
+        crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "sqlite:pod-repository-network-test",
+        )
+        .await
+        .expect("open node-local test store"),
     )
-    .await
-    .expect("open node-local test store")
 }
 
 #[cfg(test)]
@@ -944,7 +946,7 @@ impl PodRepository {
         let assignment_waiter = test_assignment_bus();
         Self::new_with_network_events_and_cluster_api(PodRepositoryBuildConfig {
             db,
-            node_local: None,
+            pod_workqueue_store: None,
             supervisor,
             side_effects,
             metrics,
@@ -970,7 +972,7 @@ impl PodRepository {
     ) -> Self {
         Self::new_with_network_events_and_cluster_api(PodRepositoryBuildConfig {
             db,
-            node_local: None,
+            pod_workqueue_store: None,
             supervisor,
             side_effects,
             metrics,

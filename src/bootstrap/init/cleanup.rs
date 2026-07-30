@@ -336,7 +336,7 @@ pub async fn stop_namespace_containerd_after_cleanup(
 async fn open_cleanup_node_local(
     config: &KlightsConfig,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
-) -> anyhow::Result<crate::datastore::node_local::NodeLocalHandle> {
+) -> anyhow::Result<crate::datastore::node_local::NodeLocalStores> {
     let node_db_path: Option<&std::path::Path> = if config.in_memory {
         None
     } else {
@@ -355,18 +355,15 @@ async fn open_cleanup_node_local(
 
 async fn cleanup_directories_and_network(
     network_cleanup: &networking::NetworkCleanup,
-    node_local: Option<&crate::datastore::node_local::NodeLocalHandle>,
+    node_local: Option<&crate::datastore::node_local::NodeLocalStores>,
     containerd_state_dir: &str,
     namespace: &str,
     task_supervisor: &klights_supervisor::TaskSupervisor,
     file_process: &klights_supervisor::FileProcessExecutor,
 ) -> anyhow::Result<()> {
     if let Some(node_local) = node_local
-        && let cache = crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(
-            node_local.clone(),
-        )
         && let Err(e) = network_cleanup
-            .cleanup_recorded_pod_networks(cache.as_ref())
+            .cleanup_recorded_pod_networks(node_local.pod_network_cache().as_ref())
             .await
     {
         tracing::warn!("Failed to cleanup recorded pod networks: {}", e);

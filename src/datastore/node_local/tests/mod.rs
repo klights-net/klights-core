@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use crate::datastore::backend_kind::BackendKind;
 use crate::datastore::node_local::{
-    LegacyDeliveryTestStore as _, NodeLocalBackend, NodeLocalDb, NodeLocalHandle,
-    OutboxFailureDisposition, OutboxInsert, SqliteNodeLocalDb, selector,
+    LegacyDeliveryTestStore as _, NodeLocalStores, OutboxFailureDisposition, OutboxInsert, selector,
 };
 use klights_node_store::{
     NodeIdentity, PodRuntimeAdmission, PodRuntimeStore, PodSlotAdmissionEvent,
@@ -26,7 +25,7 @@ fn supervisor() -> Arc<TaskSupervisor> {
     Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))
 }
 
-async fn open_node_local_in_memory() -> NodeLocalDb {
+async fn open_node_local_in_memory() -> NodeLocalStores {
     let executor = klights_node_datastore::open::open_with_opts(
         klights_node_datastore::open::in_memory_opts(),
         supervisor(),
@@ -34,10 +33,10 @@ async fn open_node_local_in_memory() -> NodeLocalDb {
     )
     .await
     .expect("open node-local executor");
-    NodeLocalDb::from_executor(executor).expect("create node-local db")
+    NodeLocalStores::from_executor(executor).expect("create node-local db")
 }
 
-async fn open_sqlite_node_local_backend_handle() -> NodeLocalHandle {
+async fn open_sqlite_node_local_store() -> Arc<NodeLocalStores> {
     let executor = klights_node_datastore::open::open_with_opts(
         klights_node_datastore::open::in_memory_opts(),
         supervisor(),
@@ -45,11 +44,11 @@ async fn open_sqlite_node_local_backend_handle() -> NodeLocalHandle {
     )
     .await
     .expect("open node-local executor");
-    let db = SqliteNodeLocalDb::from_executor(executor).expect("create sqlite node-local db");
+    let db = NodeLocalStores::from_executor(executor).expect("create sqlite node-local db");
     Arc::new(db)
 }
 
-async fn open_node_local_on_disk(path: &std::path::Path) -> NodeLocalDb {
+async fn open_node_local_on_disk(path: &std::path::Path) -> NodeLocalStores {
     let mut opts = klights_node_datastore::open::disk_opts(path.to_path_buf());
     opts.allow_existing_perms = true;
     let executor = klights_node_datastore::open::open_with_opts(
@@ -59,7 +58,7 @@ async fn open_node_local_on_disk(path: &std::path::Path) -> NodeLocalDb {
     )
     .await
     .expect("open disk node-local executor");
-    NodeLocalDb::from_executor(executor).expect("create disk node-local db")
+    NodeLocalStores::from_executor(executor).expect("create disk node-local db")
 }
 
 fn test_outbox_insert(key: &str, subject_key: &str, now_ms: i64) -> OutboxInsert {
@@ -930,10 +929,10 @@ async fn pod_slot_persistence_preserves_uid_cas_outcomes_and_monotonic_versions(
 }
 
 #[tokio::test]
-async fn sqlite_backend_implements_node_local_backend() {
-    let handle = open_sqlite_node_local_backend_handle().await;
-    fn assert_backend_trait(_: &dyn NodeLocalBackend) {}
-    assert_backend_trait(handle.as_ref());
+async fn sqlite_store_implements_focused_node_identity() {
+    let handle = open_sqlite_node_local_store().await;
+    fn assert_identity_trait(_: &dyn NodeIdentity) {}
+    assert_identity_trait(handle.as_ref());
     assert_eq!(handle.backend_name(), "sqlite");
 
     handle
@@ -1029,7 +1028,7 @@ async fn malformed_endpoint_ports_fail_instead_of_wrapping_to_u16() {
         (None, Some(-1i64)),
         (Some(0i64), None),
     ] {
-        db.db_call("test_insert_malformed_endpoint_port", move |conn| {
+        db.with_test_connection("test_insert_malformed_endpoint_port", move |conn| {
             conn.execute("DELETE FROM pod_endpoints", [])?;
             conn.execute(
                 "INSERT INTO pod_endpoints

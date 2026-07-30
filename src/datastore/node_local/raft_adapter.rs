@@ -166,7 +166,8 @@ impl RaftAppliedStateDurability for OpenRaftNodeDurabilityAdapter {
     }
 }
 
-impl RaftLogPersistence for crate::datastore::node_local::sqlite::SqliteNodeLocalDb {
+#[cfg(test)]
+impl RaftLogPersistence for crate::datastore::node_local::NodeLocalStores {
     fn read_log_range(
         &self,
         range: RaftLogRange,
@@ -228,13 +229,15 @@ impl RaftLogPersistence for crate::datastore::node_local::sqlite::SqliteNodeLoca
     }
 }
 
-impl RaftLogDurability for crate::datastore::node_local::sqlite::SqliteNodeLocalDb {
+#[cfg(test)]
+impl RaftLogDurability for crate::datastore::node_local::NodeLocalStores {
     fn load_storage_current_boundary(&self) -> RaftDurabilityFuture<'_, Option<RaftLogCoordinate>> {
         load_current_boundary(self.raft_persistence_ref())
     }
 }
 
-impl RaftAppliedStateDurability for crate::datastore::node_local::sqlite::SqliteNodeLocalDb {
+#[cfg(test)]
+impl RaftAppliedStateDurability for crate::datastore::node_local::NodeLocalStores {
     fn load_applied_state(&self) -> RaftDurabilityFuture<'_, EncodedRaftAppliedState> {
         self.raft_persistence_ref().load_applied_state()
     }

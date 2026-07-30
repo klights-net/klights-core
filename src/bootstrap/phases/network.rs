@@ -36,7 +36,11 @@ pub struct NetworkBootArgs<'a> {
     pub watch: Arc<dyn klights_leader_api::LeaderWatch>,
     pub subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
     pub network_topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery>,
-    pub node_local: crate::datastore::node_local::handle::NodeLocalHandle,
+    pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
+    pub pod_ipam: Arc<dyn klights_node_store::PodIpamStore>,
+    pub pod_runtime: Arc<dyn klights_node_store::PodRuntimeStore>,
+    pub pod_endpoints: Arc<dyn klights_node_store::PodEndpointStore>,
+    pub pod_endpoint_events: Arc<dyn klights_node_store::PodEndpointStoreEventSource>,
     pub network_cleanup: &'a NetworkCleanup,
     pub runtime_paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
     pub runtime_inputs: crate::bootstrap::runtime_inputs::NetworkRuntimeInputs,
@@ -63,7 +67,11 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         watch,
         subnet_allocation,
         network_topology,
-        node_local,
+        pod_network_cache,
+        pod_ipam,
+        pod_runtime,
+        pod_endpoints,
+        pod_endpoint_events,
         network_cleanup,
         runtime_paths,
         runtime_inputs,
@@ -73,9 +81,6 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     } = args;
     let (cni_readiness_publisher, cni_readiness) =
         crate::kubelet::cni_readiness::CniReadiness::channel();
-    let node_network = crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(
-        node_local.clone(),
-    );
     let (assignment_publisher, assignment_waiter) = assignment_bus_views();
     let mode = match node_mode {
         NodeMode::Root => networking::NetworkMode::Root,
@@ -99,9 +104,9 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         networking::boot::NetworkBootStores::new(
             subnet_allocation,
             network_topology.clone(),
-            node_network.clone(),
-            node_network.clone(),
-            node_local.clone(),
+            pod_network_cache.clone(),
+            pod_ipam,
+            pod_runtime.clone(),
             assignment_publisher,
         ),
         shutdown_token.clone(),
@@ -142,8 +147,8 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         .map_err(|e| anyhow::anyhow!("bad service_cidr '{}': {}", config.service_cidr, e))?;
 
     let endpoint_adapter = Arc::new(networking::SqlitePodEndpointResolver::new(
-        node_network.clone(),
-        node_network.clone(),
+        pod_endpoints.clone(),
+        pod_endpoint_events,
         network_topology.clone(),
     ));
     let endpoint_source: Arc<dyn klights_network_api::PodEndpointEventSource> =
@@ -319,9 +324,9 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         cri_for_api,
         cni_readiness,
         dataplane_health: network_boot.health().clone(),
-        pod_network_cache: node_network.clone(),
-        pod_runtime_store: node_local,
-        pod_endpoint_store: node_network,
+        pod_network_cache,
+        pod_runtime_store: pod_runtime,
+        pod_endpoint_store: pod_endpoints,
         assignment_waiter,
     })
 }

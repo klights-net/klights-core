@@ -87,7 +87,7 @@ mod tests {
         let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
             crate::kubelet::pod_repository::PodRepositoryBuildConfig {
                 db: db_handle.clone(),
-                node_local: None,
+                pod_workqueue_store: None,
                 supervisor: supervisor.clone(),
                 side_effects: Arc::new(crate::side_effects::SideEffectRegistry::new()),
                 metrics: crate::side_effects::SideEffectMetrics::new(),

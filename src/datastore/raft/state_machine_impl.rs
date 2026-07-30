@@ -406,7 +406,7 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
 mod tests {
     use super::*;
     use crate::datastore::DatastoreBackend;
-    use crate::datastore::node_local::SqliteNodeLocalDb;
+    use crate::datastore::node_local::NodeLocalStores;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use openraft::storage::RaftSnapshotBuilder;
     use openraft::{Entry, EntryPayload, LeaderId, Membership};
@@ -426,9 +426,8 @@ mod tests {
         )
         .await
         .expect("open node-local executor");
-        let node_local = Arc::new(
-            SqliteNodeLocalDb::from_executor(node_executor).expect("create node-local db"),
-        );
+        let node_local =
+            Arc::new(NodeLocalStores::from_executor(node_executor).expect("create node-local db"));
         let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         SqliteRaftStateMachine::new(backend, node_local, supervisor)
@@ -523,9 +522,8 @@ mod tests {
         )
         .await
         .expect("open node-local executor");
-        let node_local = Arc::new(
-            SqliteNodeLocalDb::from_executor(node_executor).expect("create node-local db"),
-        );
+        let node_local =
+            Arc::new(NodeLocalStores::from_executor(node_executor).expect("create node-local db"));
         SqliteRaftStateMachine::new(backend, node_local, supervisor)
     }
 

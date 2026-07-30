@@ -66,7 +66,7 @@ pub struct DatastorePhase {
     /// effects (RS/Service reconcile) silently no-op.
     pub local_api_client: Arc<crate::control_plane::client::local::LocalApiClient>,
     pub replication_service: Option<Arc<crate::replication::ReplicationService>>,
-    pub node_local: crate::datastore::node_local::handle::NodeLocalHandle,
+    pub node_local: crate::datastore::node_local::NodeLocalStores,
     pub outbox: Arc<crate::node_outbox::Outbox>,
     pub node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
     pub node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
@@ -866,11 +866,11 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     let outbox = {
         let notify = Arc::new(tokio::sync::Notify::new());
         let outbox_stores = crate::node_outbox::OutboxStores::new(
-            node_local.clone(),
-            node_local.clone(),
-            node_local.clone(),
-            node_local.clone(),
-            node_local.clone(),
+            node_local.outbox_producer(),
+            node_local.outbox_dispatcher(),
+            node_local.pod_status_checkpoints(),
+            node_local.runtime_observation_checkpoints(),
+            node_local.outbox_status_stamps(),
         );
         let outbox_codec = crate::replication::outbox_payload_codec::new_codec();
         let outbox_wall_clock: Arc<dyn klights_supervisor::WallClock> =
@@ -961,7 +961,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     let (local_api_client, positioned_watch) = local_services;
 
     match crate::node_admin::start_node_admin(
-        node_local.clone(),
+        node_local.dead_letters(),
         outbox.notify_handle(),
         supervisor.clone(),
         shutdown_token.clone(),

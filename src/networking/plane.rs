@@ -834,8 +834,7 @@ mod stale_route_tests {
         )
         .await
         .expect("open node-local test store");
-        let node_network =
-            crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(node_local);
+        let node_network = Arc::new(node_local);
         let assignment_bus =
             Arc::new(crate::networking::pod_network_events::PodNetworkAssignmentBus::new());
         let (connection, handle, _) = rtnetlink::new_connection().expect("open rtnetlink");

@@ -66,11 +66,11 @@ pub fn pod_repository_for_test(
     ))
 }
 
-pub async fn pod_repository_with_node_local_for_test(
+pub(crate) async fn pod_repository_with_node_local_for_test(
     db: &crate::datastore::sqlite::Datastore,
 ) -> (
     Arc<crate::kubelet::pod_repository::PodRepository>,
-    crate::datastore::node_local::NodeLocalHandle,
+    Arc<crate::datastore::node_local::NodeLocalStores>,
 ) {
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
@@ -81,7 +81,7 @@ pub async fn pod_repository_with_node_local_for_test(
     let repository = crate::kubelet::pod_repository::PodRepository::build_parts(
         crate::kubelet::pod_repository::PodRepositoryBuildConfig {
             db: db_handle,
-            node_local: Some(node_local.clone()),
+            pod_workqueue_store: Some(node_local.clone()),
             supervisor,
             side_effects: Arc::new(crate::side_effects::SideEffectRegistry::new()),
             metrics: crate::side_effects::SideEffectMetrics::new(),

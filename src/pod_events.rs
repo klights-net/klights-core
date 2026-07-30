@@ -143,7 +143,7 @@ pub async fn emit_pod_event(
 }
 
 #[cfg(test)]
-async fn test_node_db() -> Result<crate::datastore::node_local::NodeLocalHandle> {
+async fn test_node_db() -> Result<crate::datastore::node_local::NodeLocalStores> {
     selector::open_node_local(
         BackendKind::Sqlite,
         None,
@@ -157,7 +157,7 @@ async fn test_node_db() -> Result<crate::datastore::node_local::NodeLocalHandle>
 #[cfg(test)]
 async fn flush_single_outbox_command(
     ds: &dyn DatastoreBackend,
-    node_db: &crate::datastore::node_local::NodeLocalHandle,
+    node_db: &crate::datastore::node_local::NodeLocalStores,
     lease_token: &str,
 ) -> Result<()> {
     let Some(row) = node_db

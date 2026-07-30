@@ -97,13 +97,13 @@ impl OutboxStores {
     }
 
     #[cfg(test)]
-    fn from_node_db(node_db: crate::datastore::node_local::NodeLocalHandle) -> Self {
+    fn from_node_db(node_db: &crate::datastore::node_local::NodeLocalStores) -> Self {
         Self::new(
-            node_db.clone(),
-            node_db.clone(),
-            node_db.clone(),
-            node_db.clone(),
-            node_db,
+            node_db.outbox_producer(),
+            node_db.outbox_dispatcher(),
+            node_db.pod_status_checkpoints(),
+            node_db.runtime_observation_checkpoints(),
+            node_db.outbox_status_stamps(),
         )
     }
 
@@ -473,17 +473,19 @@ impl OutboxCommand {
 
 impl Outbox {
     #[cfg(test)]
-    pub fn new(node_db: crate::datastore::node_local::NodeLocalHandle) -> Self {
+    pub(crate) fn new(
+        node_db: impl std::borrow::Borrow<crate::datastore::node_local::NodeLocalStores>,
+    ) -> Self {
         Self::with_notify(node_db, Arc::new(Notify::new()))
     }
 
     #[cfg(test)]
-    pub fn with_notify(
-        node_db: crate::datastore::node_local::NodeLocalHandle,
+    pub(crate) fn with_notify(
+        node_db: impl std::borrow::Borrow<crate::datastore::node_local::NodeLocalStores>,
         notify: Arc<Notify>,
     ) -> Self {
         Self::compose(
-            OutboxStores::from_node_db(node_db),
+            OutboxStores::from_node_db(node_db.borrow()),
             crate::replication::outbox_payload_codec::new_codec(),
             notify,
             Arc::new(klights_supervisor::SystemWallClock),
@@ -1157,12 +1159,12 @@ impl OutboxDispatcher {
     }
 
     #[cfg(test)]
-    pub fn for_tests(
-        node_db: crate::datastore::node_local::NodeLocalHandle,
+    pub(crate) fn for_tests(
+        node_db: impl std::borrow::Borrow<crate::datastore::node_local::NodeLocalStores>,
         client: Arc<dyn LeaderOutboxDelivery>,
     ) -> Self {
         Self::new(
-            OutboxStores::from_node_db(node_db),
+            OutboxStores::from_node_db(node_db.borrow()),
             crate::replication::outbox_payload_codec::new_codec(),
             client,
             Arc::new(Notify::new()),
@@ -1171,13 +1173,13 @@ impl OutboxDispatcher {
     }
 
     #[cfg(test)]
-    pub fn for_tests_with_rtt_estimator(
-        node_db: crate::datastore::node_local::NodeLocalHandle,
+    pub(crate) fn for_tests_with_rtt_estimator(
+        node_db: impl std::borrow::Borrow<crate::datastore::node_local::NodeLocalStores>,
         client: Arc<dyn LeaderOutboxDelivery>,
         rtt: std::sync::Arc<klights_types::RttEstimator>,
     ) -> Self {
         Self::new_with_rtt_estimator(
-            OutboxStores::from_node_db(node_db),
+            OutboxStores::from_node_db(node_db.borrow()),
             crate::replication::outbox_payload_codec::new_codec(),
             client,
             Arc::new(Notify::new()),
@@ -1187,8 +1189,8 @@ impl OutboxDispatcher {
     }
 
     #[cfg(test)]
-    pub fn for_tests_with_lease_renewal(
-        node_db: crate::datastore::node_local::NodeLocalHandle,
+    pub(crate) fn for_tests_with_lease_renewal(
+        node_db: impl std::borrow::Borrow<crate::datastore::node_local::NodeLocalStores>,
         client: Arc<dyn LeaderOutboxDelivery>,
         supervisor: Arc<TaskSupervisor>,
         lease_ms: i64,
@@ -1200,8 +1202,8 @@ impl OutboxDispatcher {
     }
 
     #[cfg(test)]
-    pub fn batch_mode_for_tests(
-        node_db: crate::datastore::node_local::NodeLocalHandle,
+    pub(crate) fn batch_mode_for_tests(
+        node_db: impl std::borrow::Borrow<crate::datastore::node_local::NodeLocalStores>,
         client: Arc<dyn LeaderOutboxDelivery>,
         batch_size: usize,
     ) -> Self {
@@ -1210,12 +1212,12 @@ impl OutboxDispatcher {
 
     #[cfg(test)]
     fn production_for_tests(
-        node_db: crate::datastore::node_local::NodeLocalHandle,
+        node_db: impl std::borrow::Borrow<crate::datastore::node_local::NodeLocalStores>,
         client: Arc<dyn LeaderOutboxDelivery>,
         notify: Arc<Notify>,
     ) -> Self {
         Self::new(
-            OutboxStores::from_node_db(node_db),
+            OutboxStores::from_node_db(node_db.borrow()),
             crate::replication::outbox_payload_codec::new_codec(),
             client,
             notify,
@@ -1988,7 +1990,7 @@ mod tests {
     use tokio::sync::{Mutex, Notify};
 
     use crate::datastore::backend_kind::BackendKind;
-    use crate::datastore::node_local::{LegacyDeliveryTestStore as _, NodeLocalHandle, selector};
+    use crate::datastore::node_local::{LegacyDeliveryTestStore as _, NodeLocalStores, selector};
     use crate::node_outbox::payload::OutboxOperationExt as _;
     use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
     use klights_cluster_core::ResourcePreconditions;
@@ -2055,7 +2057,7 @@ mod tests {
 
     #[test]
     fn dispatcher_constructor_requires_only_the_focused_delivery_port() {
-        let constructor: fn(NodeLocalHandle, Arc<dyn LeaderOutboxDelivery>) -> OutboxDispatcher =
+        let constructor: fn(NodeLocalStores, Arc<dyn LeaderOutboxDelivery>) -> OutboxDispatcher =
             OutboxDispatcher::for_tests;
         let _ = constructor;
     }
@@ -2138,7 +2140,7 @@ mod tests {
         Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))
     }
 
-    async fn node_db() -> NodeLocalHandle {
+    async fn node_db() -> NodeLocalStores {
         selector::open_node_local(
             BackendKind::Sqlite,
             None,
@@ -3698,6 +3700,7 @@ mod tests {
             .await
             .expect("enqueue known successor row");
         let client_id = node_db
+            .identity()
             .get_node_meta("outbox_client_id")
             .await
             .expect("read outbox client id")
@@ -3819,6 +3822,7 @@ mod tests {
             .await
             .unwrap();
         let client_id = node_db
+            .identity()
             .get_node_meta("outbox_client_id")
             .await
             .unwrap()

@@ -24,7 +24,7 @@ use crate::kubelet::pod_runtime::volumes::PodVolumeRuntime;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-async fn node_local_runtime_store() -> Arc<crate::datastore::node_local::SqliteNodeLocalDb> {
+async fn node_local_runtime_store() -> Arc<crate::datastore::node_local::NodeLocalStores> {
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
@@ -35,13 +35,13 @@ async fn node_local_runtime_store() -> Arc<crate::datastore::node_local::SqliteN
     )
     .await
     .expect("open node-local runtime store");
-    let backend = crate::datastore::node_local::SqliteNodeLocalDb::from_executor(executor)
+    let backend = crate::datastore::node_local::NodeLocalStores::from_executor(executor)
         .expect("create node-local runtime store");
     Arc::new(backend)
 }
 
 async fn admit_runtime_key(
-    store: &crate::datastore::node_local::SqliteNodeLocalDb,
+    store: &crate::datastore::node_local::NodeLocalStores,
     key: &PodRuntimeKey,
 ) {
     klights_node_store::PodRuntimeStore::admit_pod_runtime(
@@ -524,7 +524,7 @@ async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_matc
     let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
         crate::kubelet::pod_repository::PodRepositoryBuildConfig {
             db: db.clone(),
-            node_local: Some(node_local.clone()),
+            pod_workqueue_store: Some(node_local.clone()),
             supervisor,
             side_effects: Arc::new(crate::side_effects::SideEffectRegistry::new()),
             metrics: crate::side_effects::SideEffectMetrics::new(),
@@ -1124,7 +1124,7 @@ async fn fixture_pod_repository() -> std::sync::Arc<crate::kubelet::pod_reposito
     let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
         crate::kubelet::pod_repository::PodRepositoryBuildConfig {
             db: handle.clone(),
-            node_local: Some(node_local.clone()),
+            pod_workqueue_store: Some(node_local.clone()),
             supervisor,
             side_effects,
             metrics,
@@ -5046,8 +5046,10 @@ async fn real_pod_slot_admission_admits_and_clears_slot() {
         klights_supervisor::TaskCategoryConfig::default(),
     ));
     let node_local = crate::kubelet::pod_repository::test_node_local_store(supervisor).await;
-    let pod_slot_adapter =
-        crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(node_local);
+    let pod_slot_adapter = crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(
+        node_local.pod_slots(),
+        node_local.pod_slot_events(),
+    );
     let admission = crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
         pod_slot_adapter.clone(),
         pod_slot_adapter,
@@ -5079,8 +5081,10 @@ async fn real_pod_slot_admission_blocks_duplicate_re_admit() {
         klights_supervisor::TaskCategoryConfig::default(),
     ));
     let node_local = crate::kubelet::pod_repository::test_node_local_store(supervisor).await;
-    let pod_slot_adapter =
-        crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(node_local);
+    let pod_slot_adapter = crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(
+        node_local.pod_slots(),
+        node_local.pod_slot_events(),
+    );
     let admission = crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
         pod_slot_adapter.clone(),
         pod_slot_adapter,
@@ -10540,7 +10544,7 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
     let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
         crate::kubelet::pod_repository::PodRepositoryBuildConfig {
             db: db.clone(),
-            node_local: Some(node_local.clone()),
+            pod_workqueue_store: Some(node_local.clone()),
             supervisor: supervisor.clone(),
             side_effects: std::sync::Arc::new(crate::side_effects::SideEffectRegistry::new()),
             metrics: crate::side_effects::SideEffectMetrics::new(),

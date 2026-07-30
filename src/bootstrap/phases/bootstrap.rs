@@ -53,7 +53,9 @@ pub struct BootstrapRunArgs<'a> {
     pub db_handle: &'a DatastoreHandle,
     pub watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     pub positioned_watch: klights_watch::PositionedWatchService,
-    pub node_local: crate::datastore::node_local::NodeLocalHandle,
+    pub pod_workqueue_store: Arc<dyn klights_node_store::PodWorkqueueStore>,
+    pub pod_slot_store: Arc<dyn klights_node_store::PodSlotAdmissionStore>,
+    pub pod_slot_events: Arc<dyn klights_node_store::PodSlotAdmissionEventSource>,
     pub worker_store_adapter:
         Option<Arc<crate::control_plane::client::worker_store::WorkerStoreAdapter>>,
     pub kubelet_uses_worker_store_adapter: bool,
@@ -300,7 +302,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         db_handle,
         watch_signals,
         positioned_watch,
-        node_local,
+        pod_workqueue_store,
+        pod_slot_store,
+        pod_slot_events,
         worker_store_adapter,
         kubelet_uses_worker_store_adapter,
         db,
@@ -516,7 +520,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             crate::pod_repository_composition::build_worker_pod_repository_parts(
                 crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
                     resource_query: leader_ports.resource_query.clone(),
-                    node_local: node_local.clone(),
+                    pod_workqueue_store: pod_workqueue_store.clone(),
                     supervisor: supervisor.clone(),
                     metrics: metrics.clone(),
                     pod_network_cache: pod_network_cache.clone(),
@@ -530,7 +534,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let root_parts = crate::pod_repository_composition::build_pod_repository_parts(
             crate::pod_repository_composition::PodRepositoryBuildConfig {
                 db: db_handle.clone(),
-                node_local: Some(node_local.clone()),
+                pod_workqueue_store: Some(pod_workqueue_store.clone()),
                 supervisor: supervisor.clone(),
                 side_effects: side_effects.clone(),
                 metrics: metrics.clone(),
@@ -555,9 +559,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             )),
         )
     };
-    let pod_slot_store: Arc<dyn klights_node_store::PodSlotAdmissionStore> = node_local.clone();
-    let pod_slot_events: Arc<dyn klights_node_store::PodSlotAdmissionEventSource> =
-        node_local.clone();
     let kubelet_file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
     let registration_profile =
         crate::bootstrap::node_registration_profile::build(node_mode, &cli.role);
@@ -662,7 +663,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             let root_parts = crate::pod_repository_composition::build_pod_repository_parts(
                 crate::pod_repository_composition::PodRepositoryBuildConfig {
                     db: db_handle.clone(),
-                    node_local: Some(node_local.clone()),
+                    pod_workqueue_store: Some(pod_workqueue_store.clone()),
                     supervisor: supervisor.clone(),
                     side_effects: side_effects.clone(),
                     metrics: metrics.clone(),

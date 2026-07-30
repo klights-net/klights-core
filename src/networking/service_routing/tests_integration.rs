@@ -1036,8 +1036,7 @@ mod integration_tests {
         )
         .await
         .expect("open node-local test db");
-        let node_network =
-            crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(node_local);
+        let node_network = std::sync::Arc::new(node_local);
         let topology: std::sync::Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> =
             cluster_api.clone();
         let endpoint_source: std::sync::Arc<dyn klights_network_api::PodEndpointEventSource> =

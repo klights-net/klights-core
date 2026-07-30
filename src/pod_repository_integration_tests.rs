@@ -49,27 +49,29 @@ fn fixture_mutation_reconcile(
     ))
 }
 
-async fn fixture_node_local() -> crate::datastore::node_local::KubeletTestStoreHandle {
-    crate::datastore::node_local::selector::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
-        None,
-        fixture_supervisor(),
-        None,
-        "sqlite:pod-repository-test",
+async fn fixture_node_local() -> std::sync::Arc<crate::datastore::node_local::NodeLocalStores> {
+    std::sync::Arc::new(
+        crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            fixture_supervisor(),
+            None,
+            "sqlite:pod-repository-test",
+        )
+        .await
+        .expect("open node-local test db"),
     )
-    .await
-    .expect("open node-local test db")
 }
 
 fn build_worker_repository_for_test(
     cluster_api: Arc<dyn klights_leader_api::LeaderResourceQuery>,
-    node_local: crate::datastore::node_local::KubeletTestStoreHandle,
+    node_local: std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
     outbox: Arc<crate::node_outbox::Outbox>,
 ) -> PodRepository {
     crate::pod_repository_composition::build_worker_pod_repository_parts(
         crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
             resource_query: cluster_api,
-            node_local,
+            pod_workqueue_store: node_local,
             supervisor: fixture_supervisor(),
             metrics: crate::side_effects::SideEffectMetrics::new(),
             pod_network_cache: super::empty_test_pod_network_cache(),
@@ -84,13 +86,13 @@ async fn fixture_repository_with_node_local(
     db: crate::datastore::DatastoreHandle,
 ) -> (
     PodRepository,
-    crate::datastore::node_local::KubeletTestStoreHandle,
+    std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
 ) {
     let supervisor = fixture_supervisor();
     let node_local = fixture_node_local().await;
     let repository = PodRepository::build_parts(PodRepositoryBuildConfig {
         db,
-        node_local: Some(node_local.clone()),
+        pod_workqueue_store: Some(node_local.clone()),
         supervisor,
         side_effects: fixture_side_effects(),
         metrics: crate::side_effects::SideEffectMetrics::new(),
@@ -332,7 +334,7 @@ async fn build_repo_with_scheduling_mode_for_outbox(
 ) -> (
     super::PodRepository,
     crate::datastore::DatastoreHandle,
-    crate::datastore::node_local::KubeletTestStoreHandle,
+    std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
 ) {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
@@ -353,7 +355,7 @@ async fn build_repo_with_scheduling_mode_for_outbox(
 
 async fn drain_repo_outbox(
     db: crate::datastore::DatastoreHandle,
-    node_db: &crate::datastore::node_local::KubeletTestStoreHandle,
+    node_db: &std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
 ) -> Result<()> {
     let client = std::sync::Arc::new(TestOutboxDelivery::new(db));
     let dispatcher = crate::node_outbox::OutboxDispatcher::for_tests(node_db.clone(), client);
@@ -389,7 +391,7 @@ async fn pod_repository_build_parts_exposes_repository_and_background_without_st
 
     let parts = PodRepository::build_parts(PodRepositoryBuildConfig {
         db,
-        node_local: Some(node_local),
+        pod_workqueue_store: Some(node_local),
         supervisor,
         side_effects,
         metrics,
@@ -420,7 +422,7 @@ async fn pod_repository_build_parts_does_not_start_workqueue_until_background_st
 
     let parts = PodRepository::build_parts(PodRepositoryBuildConfig {
         db,
-        node_local: Some(node_local),
+        pod_workqueue_store: Some(node_local),
         supervisor,
         side_effects,
         metrics,
@@ -461,7 +463,7 @@ async fn pod_workqueue_runner_start_calls_workqueue_start_once() {
 
     let parts = PodRepository::build_parts(PodRepositoryBuildConfig {
         db,
-        node_local: Some(node_local),
+        pod_workqueue_store: Some(node_local),
         supervisor,
         side_effects,
         metrics,
@@ -2709,7 +2711,7 @@ async fn build_repo_with_scheduling_mode_and_gate(
     let side_effects = fixture_side_effects();
     super::PodRepository::build_parts(PodRepositoryBuildConfig {
         db,
-        node_local: None,
+        pod_workqueue_store: None,
         supervisor,
         side_effects,
         metrics,
@@ -6705,7 +6707,7 @@ async fn pod_subresource_writes_return_conflict_on_stale_rv() {
 }
 
 async fn reserve_test_network_assignment(
-    node_local: &crate::datastore::node_local::NodeLocalHandle,
+    node_local: &crate::datastore::node_local::NodeLocalStores,
     sandbox_id: &str,
     pod_name: &str,
     pod_uid: &str,
@@ -6721,7 +6723,7 @@ async fn reserve_test_network_assignment(
         netns_path,
     )
     .unwrap();
-    klights_node_store::PodIpamStore::reserve_ip_and_insert_network(node_local.as_ref(), request)
+    klights_node_store::PodIpamStore::reserve_ip_and_insert_network(node_local, request)
         .await
         .unwrap();
 }

@@ -4,42 +4,31 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::datastore::backend_kind::BackendKind;
-use crate::datastore::node_local::{NodeLocalHandle, SqliteNodeLocalDb};
+use crate::datastore::node_local::NodeLocalStores;
 use klights_node_store::{RaftAppliedStateDurability, RaftLogDurability};
 use klights_supervisor::TaskSupervisor;
 
-pub struct LeaderNodeLocalStores {
-    pub node: NodeLocalHandle,
-    pub raft_log: Arc<dyn RaftLogDurability>,
-    pub raft_applied_state: Arc<dyn RaftAppliedStateDurability>,
+pub(crate) struct LeaderNodeLocalStores {
+    pub(crate) node: NodeLocalStores,
+    pub(crate) raft_log: Arc<dyn RaftLogDurability>,
+    pub(crate) raft_applied_state: Arc<dyn RaftAppliedStateDurability>,
 }
 
-pub async fn open_node_local(
+pub(crate) async fn open_node_local(
     kind: BackendKind,
     path: Option<&Path>,
     supervisor: Arc<TaskSupervisor>,
     key_file: Option<&Path>,
     connection_key: &'static str,
-) -> Result<NodeLocalHandle> {
+) -> Result<NodeLocalStores> {
     match kind {
-        BackendKind::Sqlite => {
-            let sqlite = open_sqlite(path, supervisor, key_file, connection_key).await?;
-            Ok(sqlite as NodeLocalHandle)
-        }
+        BackendKind::Sqlite => open_sqlite(path, supervisor, key_file, connection_key).await,
         BackendKind::Redb => crate::datastore::node_local::redb::open().await,
     }
 }
 
-/// Opens both forms of the node-local handle for the SQLite backend:
-/// the trait-object `NodeLocalHandle` for the existing callers, and the
-/// concrete `Arc<SqliteNodeLocalDb>` for components that need direct
-/// SQLite access (P3-11: `SqliteRaftLogStorage` + `SqliteRaftStateMachine`
-/// both work against the concrete handle so they can use raft-specific
-/// tables in the same SQLite file).
-///
-/// Returns `None` for the `Arc<SqliteNodeLocalDb>` slot when the
-/// backend isn't SQLite.
-pub async fn open_leader_node_local(
+/// Opens focused node-local ports plus the root-only OpenRaft conversion.
+pub(crate) async fn open_leader_node_local(
     kind: BackendKind,
     path: Option<&Path>,
     supervisor: Arc<TaskSupervisor>,
@@ -48,16 +37,15 @@ pub async fn open_leader_node_local(
 ) -> Result<LeaderNodeLocalStores> {
     match kind {
         BackendKind::Sqlite => {
-            let sqlite = open_sqlite(path, supervisor, key_file, connection_key).await?;
-            let persistence = sqlite.raft_persistence();
+            let node = open_sqlite(path, supervisor, key_file, connection_key).await?;
             let raft = Arc::new(
                 crate::datastore::node_local::raft_adapter::OpenRaftNodeDurabilityAdapter::new(
-                    persistence.clone(),
-                    persistence,
+                    node.raft_log_persistence(),
+                    node.raft_applied_state_persistence(),
                 ),
             );
             Ok(LeaderNodeLocalStores {
-                node: sqlite.clone(),
+                node,
                 raft_log: raft.clone(),
                 raft_applied_state: raft,
             })
@@ -69,17 +57,25 @@ pub async fn open_leader_node_local(
 }
 
 #[cfg(test)]
-pub async fn open_node_local_with_sqlite(
+pub(crate) async fn open_node_local_with_sqlite(
     kind: BackendKind,
     path: Option<&Path>,
     supervisor: Arc<TaskSupervisor>,
     key_file: Option<&Path>,
     connection_key: &'static str,
-) -> Result<(NodeLocalHandle, Option<Arc<SqliteNodeLocalDb>>)> {
+) -> Result<(
+    NodeLocalStores,
+    Option<Arc<crate::datastore::node_local::NodeLocalStores>>,
+)> {
     match kind {
         BackendKind::Sqlite => {
-            let sqlite = open_sqlite(path, supervisor, key_file, connection_key).await?;
-            Ok((sqlite.clone(), Some(sqlite)))
+            let node = open_sqlite(path, supervisor, key_file, connection_key).await?;
+            let legacy = Arc::new(
+                crate::datastore::node_local::NodeLocalStores::from_executor(
+                    node.executor_for_test(),
+                )?,
+            );
+            Ok((node, Some(legacy)))
         }
         BackendKind::Redb => Ok((crate::datastore::node_local::redb::open().await?, None)),
     }
@@ -90,7 +86,7 @@ async fn open_sqlite(
     supervisor: Arc<TaskSupervisor>,
     key_file: Option<&Path>,
     connection_key: &'static str,
-) -> Result<Arc<SqliteNodeLocalDb>> {
+) -> Result<NodeLocalStores> {
     let opts = match path {
         Some(path) => klights_node_datastore::open::disk_opts(path.to_path_buf()),
         None => klights_node_datastore::open::in_memory_opts(),
@@ -98,8 +94,8 @@ async fn open_sqlite(
     .with_key_file(key_file)?;
     let executor =
         klights_node_datastore::open::open_with_opts(opts, supervisor, connection_key).await?;
-    Ok(Arc::new(SqliteNodeLocalDb::from_executor_with_clock(
+    NodeLocalStores::from_executor_with_clock(
         executor,
         Arc::new(klights_supervisor::SystemWallClock),
-    )?))
+    )
 }

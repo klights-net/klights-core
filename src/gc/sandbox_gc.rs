@@ -16,7 +16,6 @@
 //!   * Second pass: `pod_sandboxes` rows whose sandbox_id is not in the CRI
 //!     list get dropped, along with their matching `pod_networks` rows.
 
-use crate::datastore::node_local::NodeLocalHandle;
 use crate::kubelet::cgroup_cleanup::cleanup_pod_cgroup;
 use crate::kubelet::cri::CriClient;
 use crate::kubelet::pod_repository::PodReader;
@@ -33,7 +32,8 @@ use tokio::sync::Mutex;
 pub const MAX_PER_TICK: usize = 64;
 
 pub struct SandboxGc {
-    node_local: NodeLocalHandle,
+    pod_network_cache: Arc<dyn PodNetworkCache>,
+    pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
     cri: Arc<Mutex<CriClient>>,
     pod_reader: Arc<dyn PodReader>,
     containerd_ns: String,
@@ -45,7 +45,8 @@ pub struct SandboxGc {
 
 impl SandboxGc {
     pub fn new(
-        node_local: NodeLocalHandle,
+        pod_network_cache: Arc<dyn PodNetworkCache>,
+        pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
         cri: Arc<Mutex<CriClient>>,
         pod_reader: Arc<dyn PodReader>,
         containerd_ns: impl Into<String>,
@@ -53,7 +54,8 @@ impl SandboxGc {
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
         Self {
-            node_local,
+            pod_network_cache,
+            pod_runtime_store,
             cri,
             pod_reader,
             containerd_ns: containerd_ns.into(),
@@ -70,14 +72,14 @@ impl SandboxGc {
 
     async fn delete_cached_network(&self, sandbox_id: &str) -> Result<(), CacheNetworkError> {
         PodNetworkCache::delete_network_for_sandbox(
-            self.node_local.as_ref(),
+            self.pod_network_cache.as_ref(),
             SandboxKey::try_new(sandbox_id)?,
         )
         .await
     }
 
     async fn list_cached_network_ids(&self) -> Result<Vec<String>, CacheNetworkError> {
-        PodNetworkCache::list_network_assignments(self.node_local.as_ref())
+        PodNetworkCache::list_network_assignments(self.pod_network_cache.as_ref())
             .await
             .map(|rows| {
                 rows.into_iter()
@@ -211,7 +213,7 @@ impl SandboxGc {
         // Second pass: drop SQLite pod_sandboxes rows whose sandbox_id has
         // disappeared from CRI. Records were never the leak themselves; this
         // just keeps the table from accumulating dead entries.
-        match self.node_local.list_pod_runtime().await {
+        match self.pod_runtime_store.list_pod_runtime().await {
             Ok(rows) => {
                 for sb in rows {
                     let Some(sandbox_id) = sb.sandbox_id().map(str::to_string) else {
@@ -293,11 +295,11 @@ impl SandboxGc {
 
     async fn delete_runtime_for_match(&self, pod_uid: &str, sandbox_id: &str) -> Result<()> {
         let key = klights_node_store::RuntimePodUid::try_new(pod_uid)?;
-        let Some(row) = self.node_local.get_pod_runtime(key).await? else {
+        let Some(row) = self.pod_runtime_store.get_pod_runtime(key).await? else {
             return Ok(());
         };
         if row.sandbox_id() == Some(sandbox_id) {
-            self.node_local
+            self.pod_runtime_store
                 .delete_pod_runtime_for_uid(klights_node_store::RuntimePodUid::try_new(pod_uid)?)
                 .await?;
         }

@@ -2250,7 +2250,7 @@ impl PodRuntimeHarness {
         let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
             crate::kubelet::pod_repository::PodRepositoryBuildConfig {
                 db: handle.clone(),
-                node_local: Some(node_local.clone()),
+                pod_workqueue_store: Some(node_local.clone()),
                 supervisor: supervisor.clone(),
                 side_effects,
                 metrics,

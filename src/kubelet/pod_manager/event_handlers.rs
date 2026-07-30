@@ -695,7 +695,7 @@ mod tests {
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> (
         Arc<crate::kubelet::pod_repository::PodRepository>,
-        crate::datastore::node_local::KubeletTestStoreHandle,
+        std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
     ) {
         let node_local =
             crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
@@ -703,7 +703,7 @@ mod tests {
             crate::kubelet::pod_repository::PodRepository::build_parts(
                 crate::kubelet::pod_repository::PodRepositoryBuildConfig {
                     db: db_handle,
-                    node_local: Some(node_local.clone()),
+                    pod_workqueue_store: Some(node_local.clone()),
                     supervisor: supervisor.clone(),
                     side_effects: Arc::new(crate::side_effects::SideEffectRegistry::new()),
                     metrics: crate::side_effects::SideEffectMetrics::new(),
