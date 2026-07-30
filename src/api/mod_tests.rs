@@ -1153,7 +1153,7 @@ fn test_wants_table_format_unsupported_group_returns_406() {
 #[tokio::test]
 async fn test_self_subject_access_review_returns_406_for_table_format() {
     let state = crate::api::test_support::build_test_app_state().await;
-    let identity = crate::auth::AuthenticatedIdentity::admin("test-admin");
+    let identity = crate::auth::test_admin("test-admin");
     let mut headers = HeaderMap::new();
     headers.insert(
         "accept",
@@ -1189,7 +1189,7 @@ async fn test_self_subject_access_review_returns_406_for_table_format() {
 #[tokio::test]
 async fn test_self_subject_access_review_without_table_returns_allowed() {
     let state = crate::api::test_support::build_test_app_state().await;
-    let identity = crate::auth::AuthenticatedIdentity::admin("test-admin");
+    let identity = crate::auth::test_admin("test-admin");
     let mut headers = HeaderMap::new();
     headers.insert("accept", "application/json".parse().unwrap());
     let body = serde_json::to_vec(&serde_json::json!({
@@ -1219,7 +1219,7 @@ async fn test_self_subject_access_review_without_table_returns_allowed() {
 #[tokio::test]
 async fn test_self_subject_access_review_spec_round_trips_verbatim() {
     let state = crate::api::test_support::build_test_app_state().await;
-    let identity = crate::auth::AuthenticatedIdentity::admin("test-admin");
+    let identity = crate::auth::test_admin("test-admin");
     let headers = HeaderMap::new();
     let spec_in = serde_json::json!({
         "user": "alice",
@@ -1255,7 +1255,7 @@ async fn test_self_subject_access_review_spec_round_trips_verbatim() {
 #[tokio::test]
 async fn test_local_subject_access_review_injects_namespace_into_spec() {
     let state = crate::api::test_support::build_test_app_state().await;
-    let identity = crate::auth::AuthenticatedIdentity::admin("test-admin");
+    let identity = crate::auth::test_admin("test-admin");
     let headers = HeaderMap::new();
     let body = serde_json::to_vec(&serde_json::json!({
         "apiVersion": "authorization.k8s.io/v1",
@@ -1285,7 +1285,7 @@ async fn test_local_subject_access_review_injects_namespace_into_spec() {
 #[tokio::test]
 async fn test_subject_access_review_accepts_json_body() {
     let state = crate::api::test_support::build_test_app_state().await;
-    let identity = crate::auth::AuthenticatedIdentity::admin("test-admin");
+    let identity = crate::auth::test_admin("test-admin");
     let headers = HeaderMap::new();
     let body = serde_json::to_vec(&serde_json::json!({
         "apiVersion": "authorization.k8s.io/v1",
@@ -1307,7 +1307,7 @@ async fn test_subject_access_review_accepts_json_body() {
 #[tokio::test]
 async fn test_subject_access_review_rejects_invalid_body() {
     let state = crate::api::test_support::build_test_app_state().await;
-    let identity = crate::auth::AuthenticatedIdentity::admin("test-admin");
+    let identity = crate::auth::test_admin("test-admin");
     let headers = HeaderMap::new();
     let invalid_body = Bytes::from_static(b"not json, not proto");
     let result = create_subject_access_review(
@@ -4926,7 +4926,7 @@ async fn test_impersonated_request_authorizes_effective_subject_not_real_admin()
                 .header("impersonate-group", "system:authenticated")
                 .header("impersonate-group", "system:serviceaccounts")
                 .header("impersonate-group", "system:serviceaccounts:default")
-                .extension(crate::auth::AuthenticatedIdentity::admin("test-admin"))
+                .extension(crate::auth::test_admin("test-admin"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -4991,7 +4991,7 @@ async fn test_get_bootstrap_secret_returns_rotated_token_when_near_expiry() {
             Request::builder()
                 .method("GET")
                 .uri("/api/v1/namespaces/kube-system/secrets/worker-bootstrap-token")
-                .extension(crate::auth::AuthenticatedIdentity::admin("test-admin"))
+                .extension(crate::auth::test_admin("test-admin"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -5122,7 +5122,7 @@ async fn test_get_kube_system_nonfixed_bootstrap_secret_does_not_rotate() {
             Request::builder()
                 .method("GET")
                 .uri("/api/v1/namespaces/kube-system/secrets/custom-bootstrap-token")
-                .extension(crate::auth::AuthenticatedIdentity::admin("test-admin"))
+                .extension(crate::auth::test_admin("test-admin"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -5342,7 +5342,7 @@ async fn serviceaccount_token_request_uses_injected_api_wall_clock() {
                 .method("POST")
                 .uri("/api/v1/namespaces/default/serviceaccounts/clock-test/token")
                 .header("content-type", "application/json")
-                .extension(crate::auth::AuthenticatedIdentity::admin("test-admin"))
+                .extension(crate::auth::test_admin("test-admin"))
                 .body(Body::from(
                     serde_json::json!({
                         "apiVersion": "authentication.k8s.io/v1",
@@ -5665,7 +5665,7 @@ async fn test_task_supervisor_category_and_task_endpoints() {
             Request::builder()
                 .method("GET")
                 .uri("/klights/v1/task-supervisor/categories")
-                .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
+                .extension(crate::auth::test_admin("klights-admin"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -5707,7 +5707,7 @@ async fn test_task_supervisor_category_and_task_endpoints() {
             Request::builder()
                 .method("GET")
                 .uri("/klights/v1/task-supervisor/tasks")
-                .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
+                .extension(crate::auth::test_admin("klights-admin"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -5724,7 +5724,7 @@ async fn test_task_supervisor_category_and_task_endpoints() {
                     .uri(format!(
                         "/klights/v1/task-supervisor/categories/{category}/tasks"
                     ))
-                    .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
+                    .extension(crate::auth::test_admin("klights-admin"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -5738,7 +5738,7 @@ async fn test_task_supervisor_category_and_task_endpoints() {
             Request::builder()
                 .method("GET")
                 .uri("/klights/v1/task-supervisor/categories/FILE/tasks")
-                .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
+                .extension(crate::auth::test_admin("klights-admin"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -5817,7 +5817,7 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
             Request::builder()
                 .method("GET")
                 .uri(path)
-                .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
+                .extension(crate::auth::test_admin("klights-admin"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -6000,7 +6000,7 @@ async fn raft_follower_without_leader_returns_503_for_get_list_watch_and_write()
         };
         app.oneshot(
             builder
-                .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
+                .extension(crate::auth::test_admin("klights-admin"))
                 .body(body)
                 .unwrap(),
         )
@@ -6102,7 +6102,7 @@ async fn raft_follower_with_unreachable_leader_returns_503_without_local_handler
             Request::builder()
                 .method("GET")
                 .uri("/api/v1/nodes/worker-a")
-                .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
+                .extension(crate::auth::test_admin("klights-admin"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -6142,7 +6142,7 @@ async fn test_task_supervisor_db_query_logging_toggle() {
             Request::builder()
                 .method("GET")
                 .uri("/klights/v1/task-supervisor/db-query-logging")
-                .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
+                .extension(crate::auth::test_admin("klights-admin"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -6163,7 +6163,7 @@ async fn test_task_supervisor_db_query_logging_toggle() {
             Request::builder()
                 .method("PUT")
                 .uri("/klights/v1/task-supervisor/db-query-logging")
-                .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
+                .extension(crate::auth::test_admin("klights-admin"))
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"enabled":true}"#))
                 .unwrap(),
@@ -6184,7 +6184,7 @@ async fn test_task_supervisor_db_query_logging_toggle() {
             Request::builder()
                 .method("GET")
                 .uri("/klights/v1/task-supervisor/db-query-logging")
-                .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
+                .extension(crate::auth::test_admin("klights-admin"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -6241,7 +6241,7 @@ async fn test_task_supervisor_active_background_and_others_tasks_are_queryable()
             Request::builder()
                 .method("GET")
                 .uri("/klights/v1/task-supervisor/categories/background/tasks")
-                .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
+                .extension(crate::auth::test_admin("klights-admin"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -6267,7 +6267,7 @@ async fn test_task_supervisor_active_background_and_others_tasks_are_queryable()
             Request::builder()
                 .method("GET")
                 .uri("/klights/v1/task-supervisor/categories/others/tasks")
-                .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
+                .extension(crate::auth::test_admin("klights-admin"))
                 .body(Body::empty())
                 .unwrap(),
         )

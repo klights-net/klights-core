@@ -1,4 +1,4 @@
-//! Immutable authenticated identity type used across all authenticators.
+//! Immutable authenticated identity used across all authentication policies.
 //!
 //! Every authenticator (client cert, bootstrap token, ServiceAccount token,
 //! extension-injected) produces an `AuthenticatedIdentity`. Authorizers consume

@@ -2517,7 +2517,7 @@ mod tests {
             },
             "rules": [aggregate_rule.clone()]
         });
-        let identity = crate::auth::AuthenticatedIdentity::admin("test-admin");
+        let identity = crate::auth::test_admin("test-admin");
 
         let (status, _) = create_inner(
             state.clone(),
@@ -2547,7 +2547,7 @@ mod tests {
             .await;
         assert!(view_has_rule(&state, &aggregate_rule).await);
 
-        let identity = crate::auth::AuthenticatedIdentity::admin("test-admin");
+        let identity = crate::auth::test_admin("test-admin");
         let _ = update_inner(
             state.clone(),
             &identity,
@@ -2584,7 +2584,7 @@ mod tests {
             .await;
         assert!(view_has_rule(&state, &aggregate_rule).await);
 
-        let identity = crate::auth::AuthenticatedIdentity::admin("test-admin");
+        let identity = crate::auth::test_admin("test-admin");
         let _ = delete_inner(
             state.clone(),
             &identity,
@@ -2690,7 +2690,7 @@ mod tests {
                 .expect("create RC child Pod");
         }
 
-        let identity = crate::auth::AuthenticatedIdentity::admin("test-admin");
+        let identity = crate::auth::test_admin("test-admin");
         let (status, body) = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             delete_inner(

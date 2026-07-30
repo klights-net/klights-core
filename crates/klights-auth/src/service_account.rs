@@ -1,4 +1,4 @@
-use crate::auth::clock::Clock;
+use crate::Clock;
 use anyhow::Result;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,16 @@ use klights_types::{
     DEFAULT_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS, MAX_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS,
     MIN_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS,
 };
+
+#[cfg(test)]
+struct TestSystemClock;
+
+#[cfg(test)]
+impl Clock for TestSystemClock {
+    fn now(&self) -> time::OffsetDateTime {
+        time::OffsetDateTime::now_utc()
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SaTokenClaims {
@@ -48,12 +58,7 @@ pub fn decode_serviceaccount_token(
     ca_key_pem: &str,
     requested_audiences: Option<&[String]>,
 ) -> Result<SaTokenClaims, String> {
-    decode_serviceaccount_token_with_clock(
-        token,
-        ca_key_pem,
-        requested_audiences,
-        &crate::auth::clock::SystemClock,
-    )
+    decode_serviceaccount_token_with_clock(token, ca_key_pem, requested_audiences, &TestSystemClock)
 }
 
 pub fn decode_serviceaccount_token_with_clock(
@@ -282,7 +287,7 @@ pub struct ServiceAccountTokenRequest<'a> {
 /// token volumes). When `sa_uid` is `Some`, it overrides the random fallback UID.
 #[cfg(test)]
 pub fn generate_sa_token_with_bound_pod(request: ServiceAccountTokenRequest<'_>) -> Result<String> {
-    generate_sa_token_with_bound_pod_and_clock(request, &crate::auth::clock::SystemClock)
+    generate_sa_token_with_bound_pod_and_clock(request, &TestSystemClock)
 }
 
 pub fn generate_sa_token_with_bound_pod_and_clock(
@@ -438,8 +443,29 @@ pub fn generate_sa_token_with_bound_pod_at(
 mod tests {
     use super::*;
     use jsonwebtoken::{DecodingKey, Validation, decode};
-    use rsa::{RsaPrivateKey, pkcs8::DecodePrivateKey, pkcs8::EncodePublicKey};
+    use rsa::{
+        RsaPrivateKey,
+        pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding},
+    };
     use time::OffsetDateTime;
+
+    struct FixedClock {
+        now: OffsetDateTime,
+    }
+
+    impl Clock for FixedClock {
+        fn now(&self) -> OffsetDateTime {
+            self.now
+        }
+    }
+
+    fn signing_key() -> String {
+        RsaPrivateKey::new(&mut rand_core::OsRng, 2048)
+            .expect("generate test RSA key")
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("encode test RSA key")
+            .to_string()
+    }
 
     #[test]
     fn expiration_is_clamped_between_min_and_max() {
@@ -466,9 +492,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_generate_sa_token_is_valid() {
-        let (_, _, _, key) = super::super::cert::generate_ca_full().unwrap();
+    #[test]
+    fn test_generate_sa_token_is_valid() {
+        let key = signing_key();
         let token = generate_sa_token(key.as_str(), "foo", "default", &["aud1", "aud2"]).unwrap();
 
         let claims =
@@ -480,7 +506,7 @@ mod tests {
 
     #[test]
     fn test_generate_sa_token_bounds() {
-        let (_, _, _, key) = super::super::cert::generate_ca_full().unwrap();
+        let key = signing_key();
         let token = generate_sa_token(
             key.as_str(),
             "bar",
@@ -631,7 +657,7 @@ mod tests {
 
     #[test]
     fn decode_serviceaccount_token_expired_token_rejected() {
-        let (_, _, _, key) = super::super::cert::generate_ca_full().unwrap();
+        let key = signing_key();
         // Token expired 1 hour ago
         let exp = (OffsetDateTime::now_utc() - Duration::hours(1)).unix_timestamp();
         let token = generate_token_with_exp(&key, "default", "default", &["api"], exp);
@@ -648,7 +674,7 @@ mod tests {
 
     #[test]
     fn decode_serviceaccount_token_valid_token_accepted() {
-        let (_, _, _, key) = super::super::cert::generate_ca_full().unwrap();
+        let key = signing_key();
         // Token expires 1 hour from now
         let exp = (OffsetDateTime::now_utc() + Duration::hours(1)).unix_timestamp();
         let token = generate_token_with_exp(&key, "default", "default", &["api"], exp);
@@ -663,7 +689,7 @@ mod tests {
     #[test]
     fn decode_serviceaccount_token_without_exp_rejected() {
         use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-        let (_, _, _, key) = super::super::cert::generate_ca_full().unwrap();
+        let key = signing_key();
         #[derive(serde::Serialize)]
         struct NoExpClaims {
             iss: String,
@@ -684,7 +710,7 @@ mod tests {
     #[test]
     fn decode_serviceaccount_token_with_future_nbf_rejected() {
         use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-        let (_, _, _, key) = super::super::cert::generate_ca_full().unwrap();
+        let key = signing_key();
         let exp = (OffsetDateTime::now_utc() + Duration::hours(1)).unix_timestamp();
         let nbf = (OffsetDateTime::now_utc() + Duration::minutes(30)).unix_timestamp();
         #[derive(serde::Serialize)]
@@ -710,10 +736,10 @@ mod tests {
 
     #[test]
     fn serviceaccount_token_expiration_uses_injected_clock() {
-        let (_, _, _, key) = super::super::cert::generate_ca_full().unwrap();
+        let key = signing_key();
         let fixed_now =
             time::OffsetDateTime::from_unix_timestamp(1_704_067_200).expect("valid timestamp");
-        let clock = crate::auth::clock::FixedClock { now: fixed_now };
+        let clock = FixedClock { now: fixed_now };
 
         let token = generate_sa_token_with_bound_pod_and_clock(
             ServiceAccountTokenRequest {
@@ -738,7 +764,7 @@ mod tests {
             Some((fixed_now + Duration::hours(1)).unix_timestamp())
         );
 
-        let later = crate::auth::clock::FixedClock {
+        let later = FixedClock {
             now: fixed_now + Duration::hours(2),
         };
         let err = decode_serviceaccount_token_with_clock(&token, &key, None, &later)
@@ -751,10 +777,10 @@ mod tests {
 
     #[test]
     fn serviceaccount_token_honors_requested_expiration_seconds() {
-        let (_, _, _, key) = super::super::cert::generate_ca_full().unwrap();
+        let key = signing_key();
         let fixed_now =
             time::OffsetDateTime::from_unix_timestamp(1_704_067_200).expect("valid timestamp");
-        let clock = crate::auth::clock::FixedClock { now: fixed_now };
+        let clock = FixedClock { now: fixed_now };
 
         let token = generate_sa_token_with_bound_pod_and_clock(
             ServiceAccountTokenRequest {
@@ -782,7 +808,7 @@ mod tests {
 
     #[test]
     fn decode_serviceaccount_token_wrong_audience_rejected() {
-        let (_, _, _, key) = super::super::cert::generate_ca_full().unwrap();
+        let key = signing_key();
         let exp = (OffsetDateTime::now_utc() + Duration::hours(1)).unix_timestamp();
         // Token has audience "wrong-audience" but we request "api"
         let token = generate_token_with_exp(&key, "default", "default", &["wrong-audience"], exp);
@@ -803,7 +829,7 @@ mod tests {
 
     #[test]
     fn decode_serviceaccount_token_correct_audience_accepted() {
-        let (_, _, _, key) = super::super::cert::generate_ca_full().unwrap();
+        let key = signing_key();
         let exp = (OffsetDateTime::now_utc() + Duration::hours(1)).unix_timestamp();
         let token = generate_token_with_exp(&key, "default", "default", &["api"], exp);
         let requested = vec!["api".to_string()];
@@ -817,22 +843,22 @@ mod tests {
 
     #[test]
     fn decode_serviceaccount_token_malformed_token_rejected() {
-        let (_, _, _, key) = super::super::cert::generate_ca_full().unwrap();
+        let key = signing_key();
         let result = decode_serviceaccount_token("not.a.valid.jwt.token.at.all", &key, None);
         assert!(result.is_err(), "malformed token should be rejected");
     }
 
     #[test]
     fn decode_serviceaccount_token_empty_token_rejected() {
-        let (_, _, _, key) = super::super::cert::generate_ca_full().unwrap();
+        let key = signing_key();
         let result = decode_serviceaccount_token("", &key, None);
         assert!(result.is_err(), "empty token should be rejected");
     }
 
     #[test]
     fn decode_serviceaccount_token_wrong_signing_key_rejected() {
-        let (_, _, _, key1) = super::super::cert::generate_ca_full().unwrap();
-        let (_, _, _, key2) = super::super::cert::generate_ca_full().unwrap();
+        let key1 = signing_key();
+        let key2 = signing_key();
         let exp = (OffsetDateTime::now_utc() + Duration::hours(1)).unix_timestamp();
         let token = generate_token_with_exp(&key1, "default", "default", &["api"], exp);
         // Decode with a different key
@@ -845,7 +871,7 @@ mod tests {
 
     #[test]
     fn decode_serviceaccount_token_claims_match_kubernetes_identity() {
-        let (_, _, _, key) = super::super::cert::generate_ca_full().unwrap();
+        let key = signing_key();
         let exp = (OffsetDateTime::now_utc() + Duration::hours(1)).unix_timestamp();
         let token = generate_token_with_exp(&key, "my-sa", "my-ns", &["api"], exp);
         let claims = decode_serviceaccount_token(&token, &key, None).unwrap();
@@ -859,7 +885,7 @@ mod tests {
 
     #[test]
     fn decode_serviceaccount_token_default_audience_accepted_when_no_audience_requested() {
-        let (_, _, _, key) = super::super::cert::generate_ca_full().unwrap();
+        let key = signing_key();
         let exp = (OffsetDateTime::now_utc() + Duration::hours(1)).unix_timestamp();
         // Token has audience ["https://kubernetes.default.svc.cluster.local"]
         let token = generate_token_with_exp(

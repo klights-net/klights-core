@@ -13,22 +13,80 @@ pub use self::cert::{
 };
 #[cfg(test)]
 pub use self::cert::{generate_admin_cert, generate_ca_full, generate_server_cert};
-pub use self::identity::AuthenticatedIdentity;
+pub use klights_auth::AuthenticatedIdentity;
+pub mod identity {
+    pub use klights_auth::AuthenticatedIdentity;
+}
+#[cfg(test)]
+pub(crate) fn test_admin(username: impl Into<String>) -> AuthenticatedIdentity {
+    AuthenticatedIdentity::client_cert(username.into(), vec!["system:masters".to_string()])
+}
 pub(crate) use self::kubeconfig::{KubeconfigParams, generate_kubeconfig};
 pub use self::middleware::{BoundTokenSubjectLookup, validate_sa_token_bindings};
-pub use self::token::{
+pub use klights_auth::{
     BoundServiceAccountToken, ServiceAccountTokenRequest,
     generate_sa_token_with_bound_pod_and_clock, generate_sa_token_with_bound_pod_at,
 };
-pub use self::token::{
+pub use klights_auth::{
     SaTokenClaims, decode_serviceaccount_token_with_clock, serviceaccount_groups_from_claims,
     serviceaccount_uid_from_claims, validate_service_account_uid,
 };
 #[cfg(test)]
-pub use self::token::{
-    decode_serviceaccount_token, generate_sa_token, generate_sa_token_with_bound_pod,
-    generate_sa_token_with_sa_uid,
-};
+pub fn decode_serviceaccount_token(
+    token: &str,
+    ca_key_pem: &str,
+    requested_audiences: Option<&[String]>,
+) -> Result<SaTokenClaims, String> {
+    decode_serviceaccount_token_with_clock(
+        token,
+        ca_key_pem,
+        requested_audiences,
+        &clock::SystemClock,
+    )
+}
+#[cfg(test)]
+pub fn generate_sa_token(
+    ca_key_pem: &str,
+    service_account: &str,
+    namespace: &str,
+    audiences: &[&str],
+) -> anyhow::Result<String> {
+    generate_sa_token_with_bound_pod(ServiceAccountTokenRequest {
+        ca_key_pem,
+        service_account,
+        namespace,
+        audiences,
+        expiration_seconds: None,
+        bound: BoundServiceAccountToken::default(),
+    })
+}
+#[cfg(test)]
+pub fn generate_sa_token_with_sa_uid(
+    ca_key_pem: &str,
+    service_account: &str,
+    namespace: &str,
+    audiences: &[&str],
+    expiration_seconds: i64,
+    sa_uid: &str,
+) -> anyhow::Result<String> {
+    generate_sa_token_with_bound_pod(ServiceAccountTokenRequest {
+        ca_key_pem,
+        service_account,
+        namespace,
+        audiences,
+        expiration_seconds: Some(expiration_seconds),
+        bound: BoundServiceAccountToken {
+            sa_uid: Some(sa_uid),
+            ..BoundServiceAccountToken::default()
+        },
+    })
+}
+#[cfg(test)]
+pub fn generate_sa_token_with_bound_pod(
+    request: ServiceAccountTokenRequest<'_>,
+) -> anyhow::Result<String> {
+    generate_sa_token_with_bound_pod_and_clock(request, &clock::SystemClock)
+}
 pub use self::user::user_from_cert;
 pub use self::user::verify_client_cert_signed_by_ca;
 
@@ -39,7 +97,6 @@ pub(crate) mod cert;
 pub mod clock;
 pub mod csr_policy;
 pub mod csr_signer;
-pub mod identity;
 pub mod impersonation;
 mod kubeconfig;
 pub mod kubelet_client_cert;
@@ -53,7 +110,6 @@ pub mod rbac_authorizer;
 pub mod rbac_policy_store;
 pub mod rbac_rule_evaluator;
 pub mod request_attributes;
-mod token;
 mod user;
 pub mod webhook_auth;
 #[cfg(test)]

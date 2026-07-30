@@ -2109,6 +2109,17 @@ version = "0.0.0"
 [[package]]
 name = "klights-auth"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "jsonwebtoken",
+ "klights-types",
+ "rand_core 0.6.4",
+ "rsa",
+ "serde",
+ "serde_json",
+ "time",
+ "uuid",
+]
 
 [[package]]
 name = "klights-cluster-core"

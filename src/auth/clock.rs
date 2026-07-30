@@ -1,11 +1,7 @@
 use std::time::Instant;
 use time::OffsetDateTime;
 
-/// Object-safe time source for auth code that must be unit-testable without
-/// depending on the host wall clock.
-pub trait Clock: Send + Sync {
-    fn now(&self) -> OffsetDateTime;
-}
+pub use klights_auth::Clock;
 
 pub fn chrono_utc(now: OffsetDateTime) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::from(std::time::SystemTime::from(now))

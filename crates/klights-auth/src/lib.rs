@@ -1,6 +1,24 @@
 //! Framework-neutral authentication and authorization contracts for klights.
 
 use std::{error::Error, fmt};
+use time::OffsetDateTime;
+
+pub mod identity;
+pub mod service_account;
+
+pub use identity::AuthenticatedIdentity;
+pub use service_account::{
+    BoundServiceAccountToken, SaKubernetesIoClaims, SaObjectClaims, SaServiceAccountClaims,
+    SaTokenClaims, ServiceAccountTokenRequest, decode_serviceaccount_token_with_clock,
+    generate_sa_token_with_bound_pod_and_clock, generate_sa_token_with_bound_pod_at,
+    serviceaccount_groups_from_claims, serviceaccount_uid_from_claims,
+    validate_service_account_uid,
+};
+
+/// Object-safe wall-clock input for authentication policy.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> OffsetDateTime;
+}
 
 /// Authentication failed without selecting an HTTP status or response shape.
 #[derive(Clone, Debug, PartialEq, Eq)]

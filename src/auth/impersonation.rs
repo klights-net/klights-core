@@ -201,7 +201,7 @@ mod tests {
         };
         let identity = effective_identity(
             &authorizer,
-            &AuthenticatedIdentity::admin("real-admin"),
+            &crate::auth::test_admin("real-admin"),
             Some(request),
         )
         .await

@@ -441,7 +441,7 @@ mod tests {
 
         let result = create_subject_access_review(
             State(Arc::new(state)),
-            axum::Extension(AuthenticatedIdentity::admin("caller-admin")),
+            axum::Extension(crate::auth::test_admin("caller-admin")),
             HeaderMap::new(),
             Bytes::from(body),
         )
@@ -487,7 +487,7 @@ mod tests {
         let result = create_local_subject_access_review(
             State(Arc::new(state)),
             Path("default".to_string()),
-            axum::Extension(AuthenticatedIdentity::admin("caller-admin")),
+            axum::Extension(crate::auth::test_admin("caller-admin")),
             HeaderMap::new(),
             Bytes::from(body),
         )
@@ -520,7 +520,7 @@ mod tests {
 
         let result = create_subject_access_review(
             State(Arc::new(state)),
-            axum::Extension(AuthenticatedIdentity::admin("caller-admin")),
+            axum::Extension(crate::auth::test_admin("caller-admin")),
             HeaderMap::new(),
             Bytes::from(body),
         )
@@ -565,7 +565,7 @@ mod tests {
 
         let allowed_result = create_subject_access_review(
             State(Arc::new(state)),
-            axum::Extension(AuthenticatedIdentity::admin("caller-admin")),
+            axum::Extension(crate::auth::test_admin("caller-admin")),
             HeaderMap::new(),
             Bytes::from(body),
         )
@@ -582,7 +582,7 @@ mod tests {
         .await;
         let denied_result = create_subject_access_review(
             State(Arc::new(state)),
-            axum::Extension(AuthenticatedIdentity::admin("caller-admin")),
+            axum::Extension(crate::auth::test_admin("caller-admin")),
             HeaderMap::new(),
             Bytes::from(
                 serde_json::to_vec(&serde_json::json!({
@@ -609,7 +609,7 @@ mod tests {
         .await;
         let error_result = create_subject_access_review(
             State(Arc::new(state)),
-            axum::Extension(AuthenticatedIdentity::admin("caller-admin")),
+            axum::Extension(crate::auth::test_admin("caller-admin")),
             HeaderMap::new(),
             Bytes::from(
                 serde_json::to_vec(&serde_json::json!({
