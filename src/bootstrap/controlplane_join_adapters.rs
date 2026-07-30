@@ -198,7 +198,8 @@ impl ClusterControlplaneJoinRegistration {
             host,
         };
 
-        let pending_dataplane = crate::networking::dataplane_health::DataplaneHealth::new_healthy();
+        let pending_dataplane =
+            klights_networking::dataplane_health::DataplaneHealth::new_healthy();
         pending_dataplane.set_peers_pending();
         let pending_dataplane = pending_dataplane.snapshot();
         crate::bootstrap::node_registration_adapter::register_node_snapshot(

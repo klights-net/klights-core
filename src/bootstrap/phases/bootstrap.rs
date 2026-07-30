@@ -77,7 +77,7 @@ pub struct BootstrapRunArgs<'a> {
     pub authenticated_outbox_delivery:
         Arc<dyn klights_leader_api::LeaderAuthenticatedOutboxDelivery>,
     pub control_plane_lease_client: Option<Arc<klights_leader_rpc::client::ReplicationGrpcClient>>,
-    pub dataplane_health: &'a crate::networking::dataplane_health::DataplaneHealth,
+    pub dataplane_health: &'a klights_networking::dataplane_health::DataplaneHealth,
     pub cri_for_pod_watcher: Option<CriClient>,
     pub cri_for_api: Option<Arc<tokio::sync::Mutex<CriClient>>>,
     pub cni_readiness: crate::kubelet::cni_readiness::CniReadiness,

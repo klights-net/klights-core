@@ -744,7 +744,7 @@ mod tests {
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.external_endpoint = Some("192.0.2.10".to_string());
-        config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
+        config.dataplane_encryption = klights_networking::wireguard::DataplaneEncryption::Disabled;
         let supervisor = klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         );

@@ -119,31 +119,8 @@ pub(crate) fn legacy_dataplane(
 #[cfg(test)]
 pub(crate) fn runtime_dataplane(
     metadata: klights_cluster_store::DataplanePeerMetadata,
-) -> std::result::Result<crate::networking::wireguard::DataplanePeerMetadata, NetworkTopologyError>
-{
-    crate::networking::wireguard::DataplanePeerMetadata::try_new(
-        metadata.node_name,
-        match metadata.mode {
-            klights_cluster_store::DataplaneMode::Root => {
-                crate::networking::wireguard::DataplaneMode::Root
-            }
-            klights_cluster_store::DataplaneMode::Rootless => {
-                crate::networking::wireguard::DataplaneMode::Rootless
-            }
-        },
-        match metadata.encryption {
-            klights_cluster_store::DataplaneEncryption::Enabled => {
-                crate::networking::wireguard::DataplaneEncryption::Enabled
-            }
-            klights_cluster_store::DataplaneEncryption::Disabled => {
-                crate::networking::wireguard::DataplaneEncryption::Disabled
-            }
-        },
-        metadata.public_key.map(|key| key.to_string()),
-        Some(metadata.endpoint.to_string()),
-        metadata.port,
-    )
-    .map_err(|error| NetworkTopologyError::corrupt_response(error.to_string()))
+) -> std::result::Result<NetworkDataplane, NetworkTopologyError> {
+    focused_dataplane(metadata)
 }
 
 pub(crate) fn node_subnet_allocation_is_exhausted(message: &str) -> bool {

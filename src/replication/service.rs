@@ -63,36 +63,6 @@ impl FollowerDataplane for NetworkDataplane {
     }
 }
 
-#[cfg(test)]
-impl FollowerDataplane for crate::networking::wireguard::DataplanePeerMetadata {
-    fn into_follower_dataplane(
-        self,
-    ) -> std::result::Result<NetworkDataplane, klights_leader_api::NetworkTopologyError> {
-        NetworkDataplane::try_new(
-            self.node_name,
-            match self.mode {
-                crate::networking::wireguard::DataplaneMode::Root => {
-                    klights_leader_api::NetworkNodeMode::Root
-                }
-                crate::networking::wireguard::DataplaneMode::Rootless => {
-                    klights_leader_api::NetworkNodeMode::Rootless
-                }
-            },
-            match self.encryption {
-                crate::networking::wireguard::DataplaneEncryption::Enabled => {
-                    klights_leader_api::DataplaneEncryption::WireGuard
-                }
-                crate::networking::wireguard::DataplaneEncryption::Disabled => {
-                    klights_leader_api::DataplaneEncryption::Direct
-                }
-            },
-            self.public_key.as_ref().map(|key| key.as_str()),
-            self.endpoint,
-            self.port,
-        )
-    }
-}
-
 struct PendingNodeOperation<T> {
     node_name: String,
     follower_session: u64,
@@ -1517,6 +1487,46 @@ mod tests {
     use klights_supervisor::TaskCategoryConfig;
     use serde_json::json;
 
+    fn test_network_dataplane(
+        node_name: String,
+        mode: klights_networking::wireguard::DataplaneMode,
+        encryption: klights_networking::wireguard::DataplaneEncryption,
+        public_key: Option<String>,
+        endpoint: Option<String>,
+        port: Option<u16>,
+    ) -> Result<NetworkDataplane, klights_leader_api::NetworkTopologyError> {
+        NetworkDataplane::try_new(
+            node_name,
+            match mode {
+                klights_networking::wireguard::DataplaneMode::Root => {
+                    klights_leader_api::NetworkNodeMode::Root
+                }
+                klights_networking::wireguard::DataplaneMode::Rootless => {
+                    klights_leader_api::NetworkNodeMode::Rootless
+                }
+            },
+            match encryption {
+                klights_networking::wireguard::DataplaneEncryption::Enabled => {
+                    klights_leader_api::DataplaneEncryption::WireGuard
+                }
+                klights_networking::wireguard::DataplaneEncryption::Disabled => {
+                    klights_leader_api::DataplaneEncryption::Direct
+                }
+            },
+            public_key.as_deref(),
+            endpoint
+                .as_deref()
+                .unwrap_or_default()
+                .parse()
+                .map_err(|error| {
+                    klights_leader_api::NetworkTopologyError::corrupt_response(format!(
+                        "invalid test endpoint: {error}"
+                    ))
+                })?,
+            port,
+        )
+    }
+
     async fn test_service() -> ReplicationService {
         let db = Arc::new(crate::datastore::test_support::in_memory().await);
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -1682,19 +1692,19 @@ mod tests {
     #[tokio::test]
     async fn fanout_stream_replaces_existing_node_sender_on_rejoin() {
         let service = Arc::new(test_service().await);
-        let metadata_a = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        let metadata_a = test_network_dataplane(
             "replica-1".to_string(),
-            crate::networking::wireguard::DataplaneMode::Root,
-            crate::networking::wireguard::DataplaneEncryption::Enabled,
+            klights_networking::wireguard::DataplaneMode::Root,
+            klights_networking::wireguard::DataplaneEncryption::Enabled,
             Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
             Some("127.0.0.1".to_string()),
             Some(51_820),
         )
         .unwrap();
-        let metadata_b = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        let metadata_b = test_network_dataplane(
             "replica-1".to_string(),
-            crate::networking::wireguard::DataplaneMode::Root,
-            crate::networking::wireguard::DataplaneEncryption::Enabled,
+            klights_networking::wireguard::DataplaneMode::Root,
+            klights_networking::wireguard::DataplaneEncryption::Enabled,
             Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".to_string()),
             Some("127.0.0.1".to_string()),
             Some(51_821),
@@ -1721,7 +1731,7 @@ mod tests {
         assert_eq!(new_stream.recv().await.unwrap().meta.resource_version, 3);
 
         let metrics = service.follower_metrics().await;
-        let expected_key = metadata_b.public_key.as_ref().map(ToString::to_string);
+        let expected_key = metadata_b.public_key().map(str::to_owned);
         assert_eq!(
             metrics.followers[0].public_key.as_deref(),
             expected_key.as_deref()
@@ -1755,10 +1765,10 @@ mod tests {
     #[tokio::test]
     async fn pod_log_follow_stream_routes_chunks_until_terminal_frame() {
         let service = Arc::new(test_service().await);
-        let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        let metadata = test_network_dataplane(
             "worker-1".to_string(),
-            crate::networking::wireguard::DataplaneMode::Root,
-            crate::networking::wireguard::DataplaneEncryption::Disabled,
+            klights_networking::wireguard::DataplaneMode::Root,
+            klights_networking::wireguard::DataplaneEncryption::Disabled,
             None,
             Some("127.0.0.1".to_string()),
             None,
@@ -2048,10 +2058,10 @@ mod tests {
     async fn follower_metrics_track_ack_lag_and_disconnect() {
         let service = test_service().await;
         service.notify_entry(sample_entry(10));
-        let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        let metadata = test_network_dataplane(
             "replica-1".to_string(),
-            crate::networking::wireguard::DataplaneMode::Root,
-            crate::networking::wireguard::DataplaneEncryption::Disabled,
+            klights_networking::wireguard::DataplaneMode::Root,
+            klights_networking::wireguard::DataplaneEncryption::Disabled,
             None,
             Some("127.0.0.1".to_string()),
             None,
@@ -2074,19 +2084,19 @@ mod tests {
     #[tokio::test]
     async fn reconnect_race_old_session_unregister_must_not_remove_new_follower() {
         let service = test_service().await;
-        let metadata_a = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        let metadata_a = test_network_dataplane(
             "replica-1".to_string(),
-            crate::networking::wireguard::DataplaneMode::Root,
-            crate::networking::wireguard::DataplaneEncryption::Enabled,
+            klights_networking::wireguard::DataplaneMode::Root,
+            klights_networking::wireguard::DataplaneEncryption::Enabled,
             Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
             Some("127.0.0.1".to_string()),
             Some(51_820),
         )
         .unwrap();
-        let metadata_b = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        let metadata_b = test_network_dataplane(
             "replica-1".to_string(),
-            crate::networking::wireguard::DataplaneMode::Root,
-            crate::networking::wireguard::DataplaneEncryption::Enabled,
+            klights_networking::wireguard::DataplaneMode::Root,
+            klights_networking::wireguard::DataplaneEncryption::Enabled,
             Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".to_string()),
             Some("127.0.0.1".to_string()),
             Some(51_821),
@@ -2113,7 +2123,7 @@ mod tests {
             metrics.follower_count, 1,
             "new follower must survive old-session unregister"
         );
-        let expected_key = metadata_b.public_key.as_ref().map(ToString::to_string);
+        let expected_key = metadata_b.public_key().map(str::to_owned);
         assert_eq!(
             metrics.followers[0].public_key.as_deref(),
             expected_key.as_deref(),
@@ -2130,10 +2140,10 @@ mod tests {
     #[tokio::test]
     async fn node_exec_stream_session_drop_clears_pending_entry() {
         let service = Arc::new(test_service().await);
-        let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        let metadata = test_network_dataplane(
             "worker-1".to_string(),
-            crate::networking::wireguard::DataplaneMode::Root,
-            crate::networking::wireguard::DataplaneEncryption::Disabled,
+            klights_networking::wireguard::DataplaneMode::Root,
+            klights_networking::wireguard::DataplaneEncryption::Disabled,
             None,
             Some("127.0.0.1".to_string()),
             None,
@@ -2173,10 +2183,10 @@ mod tests {
     #[tokio::test]
     async fn pod_log_stream_session_drop_clears_pending_entry() {
         let service = Arc::new(test_service().await);
-        let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        let metadata = test_network_dataplane(
             "worker-1".to_string(),
-            crate::networking::wireguard::DataplaneMode::Root,
-            crate::networking::wireguard::DataplaneEncryption::Disabled,
+            klights_networking::wireguard::DataplaneMode::Root,
+            klights_networking::wireguard::DataplaneEncryption::Disabled,
             None,
             Some("127.0.0.1".to_string()),
             None,
@@ -2217,10 +2227,10 @@ mod tests {
         let service = test_service().await;
 
         // Register a follower.
-        let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        let metadata = test_network_dataplane(
             "test-node".to_string(),
-            crate::networking::wireguard::DataplaneMode::Root,
-            crate::networking::wireguard::DataplaneEncryption::Enabled,
+            klights_networking::wireguard::DataplaneMode::Root,
+            klights_networking::wireguard::DataplaneEncryption::Enabled,
             Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
             Some("127.0.0.1".to_string()),
             Some(51_820),
@@ -2363,10 +2373,10 @@ mod tests {
     #[tokio::test]
     async fn request_node_metrics_sends_control_message_and_completes_response() {
         let service = Arc::new(test_service().await);
-        let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        let metadata = test_network_dataplane(
             "worker-1".to_string(),
-            crate::networking::wireguard::DataplaneMode::Root,
-            crate::networking::wireguard::DataplaneEncryption::Disabled,
+            klights_networking::wireguard::DataplaneMode::Root,
+            klights_networking::wireguard::DataplaneEncryption::Disabled,
             None,
             Some("127.0.0.1".to_string()),
             None,
@@ -2418,10 +2428,10 @@ mod tests {
     #[tokio::test]
     async fn duplicate_node_metrics_correlation_does_not_replace_original_waiter() {
         let service = Arc::new(test_service().await);
-        let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        let metadata = test_network_dataplane(
             "worker-1".to_string(),
-            crate::networking::wireguard::DataplaneMode::Root,
-            crate::networking::wireguard::DataplaneEncryption::Disabled,
+            klights_networking::wireguard::DataplaneMode::Root,
+            klights_networking::wireguard::DataplaneEncryption::Disabled,
             None,
             Some("127.0.0.1".to_string()),
             None,
@@ -2475,10 +2485,10 @@ mod tests {
     async fn authenticated_completion_mismatch_never_consumes_metrics_waiter() {
         let service = Arc::new(test_service().await);
         let worker = |name: &str| {
-            crate::networking::wireguard::DataplanePeerMetadata::try_new(
+            test_network_dataplane(
                 name.to_string(),
-                crate::networking::wireguard::DataplaneMode::Root,
-                crate::networking::wireguard::DataplaneEncryption::Disabled,
+                klights_networking::wireguard::DataplaneMode::Root,
+                klights_networking::wireguard::DataplaneEncryption::Disabled,
                 None,
                 Some("127.0.0.1".to_string()),
                 None,
@@ -2587,10 +2597,10 @@ mod tests {
     #[tokio::test]
     async fn stale_exec_stream_completion_cannot_remove_reused_request_id() {
         let service = Arc::new(test_service().await);
-        let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        let metadata = test_network_dataplane(
             "worker-1".to_string(),
-            crate::networking::wireguard::DataplaneMode::Root,
-            crate::networking::wireguard::DataplaneEncryption::Disabled,
+            klights_networking::wireguard::DataplaneMode::Root,
+            klights_networking::wireguard::DataplaneEncryption::Disabled,
             None,
             Some("127.0.0.1".to_string()),
             None,
@@ -2671,10 +2681,10 @@ mod tests {
     #[tokio::test]
     async fn unregister_follower_closes_pending_node_exec_stream_immediately() {
         let service = Arc::new(test_service().await);
-        let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        let metadata = test_network_dataplane(
             "worker-1".to_string(),
-            crate::networking::wireguard::DataplaneMode::Root,
-            crate::networking::wireguard::DataplaneEncryption::Disabled,
+            klights_networking::wireguard::DataplaneMode::Root,
+            klights_networking::wireguard::DataplaneEncryption::Disabled,
             None,
             Some("127.0.0.1".to_string()),
             None,
@@ -2725,10 +2735,10 @@ mod tests {
     #[tokio::test]
     async fn unregister_follower_closes_pending_pod_log_stream_immediately() {
         let service = Arc::new(test_service().await);
-        let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        let metadata = test_network_dataplane(
             "worker-1".to_string(),
-            crate::networking::wireguard::DataplaneMode::Root,
-            crate::networking::wireguard::DataplaneEncryption::Disabled,
+            klights_networking::wireguard::DataplaneMode::Root,
+            klights_networking::wireguard::DataplaneEncryption::Disabled,
             None,
             Some("127.0.0.1".to_string()),
             None,

@@ -570,12 +570,12 @@ async fn test_remote_pod_log_follow_keeps_http_body_open_until_terminal_frame() 
         state.resource_mutation().db.clone(),
         state.operational().task_supervisor.clone(),
     ));
-    let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+    let metadata = klights_leader_api::NetworkDataplane::try_new(
         remote_node.clone(),
-        crate::networking::wireguard::DataplaneMode::Root,
-        crate::networking::wireguard::DataplaneEncryption::Disabled,
+        klights_leader_api::NetworkNodeMode::Root,
+        klights_leader_api::DataplaneEncryption::Direct,
         None,
-        Some("127.0.0.1".to_string()),
+        "127.0.0.1".parse().unwrap(),
         None,
     )
     .unwrap();
@@ -1872,12 +1872,11 @@ async fn test_spdy_exec_accepts_stdout_only_client_when_only_stdout_requested() 
 
 #[tokio::test]
 async fn test_remote_exec_sync_websocket_closes_after_terminal_status_without_client_close() {
-    use std::net::{IpAddr, Ipv4Addr};
-
-    use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
-    use klights_node_api::{FollowerControlMessage, RoutedNodeExecSyncResponse};
-    use klights_node_api::{NodeExec, NodeExecSyncResult};
+    use klights_node_api::{
+        FollowerControlMessage, NodeExec, NodeExecSyncResult, RoutedNodeExecSyncResponse,
+    };
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use std::net::Ipv4Addr;
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
     use tokio_tungstenite::tungstenite::protocol::Role;
 
@@ -1889,14 +1888,17 @@ async fn test_remote_exec_sync_websocket_closes_after_terminal_status_without_cl
         supervisor.clone(),
     ));
     let (mut follower_rx, follower_session) = replication
-        .register_follower(DataplanePeerMetadata {
-            node_name: "worker-1".to_string(),
-            mode: DataplaneMode::Root,
-            encryption: DataplaneEncryption::Disabled,
-            public_key: None,
-            endpoint: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port: None,
-        })
+        .register_follower(
+            klights_leader_api::NetworkDataplane::try_new(
+                "worker-1",
+                klights_leader_api::NetworkNodeMode::Root,
+                klights_leader_api::DataplaneEncryption::Direct,
+                None,
+                Ipv4Addr::LOCALHOST.into(),
+                None,
+            )
+            .unwrap(),
+        )
         .await;
 
     let replication_for_follower = replication.clone();
@@ -1983,12 +1985,12 @@ async fn test_remote_exec_sync_websocket_closes_after_terminal_status_without_cl
 
 #[tokio::test]
 async fn test_remote_exec_sync_websocket_waits_for_peer_close_reply() {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::Ipv4Addr;
 
-    use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
     use futures::{SinkExt as _, StreamExt as _};
-    use klights_node_api::{FollowerControlMessage, RoutedNodeExecSyncResponse};
-    use klights_node_api::{NodeExec, NodeExecSyncResult};
+    use klights_node_api::{
+        FollowerControlMessage, NodeExec, NodeExecSyncResult, RoutedNodeExecSyncResponse,
+    };
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
     use tokio_tungstenite::tungstenite::protocol::Role;
@@ -2001,14 +2003,17 @@ async fn test_remote_exec_sync_websocket_waits_for_peer_close_reply() {
         supervisor.clone(),
     ));
     let (mut follower_rx, follower_session) = replication
-        .register_follower(DataplanePeerMetadata {
-            node_name: "worker-1".to_string(),
-            mode: DataplaneMode::Root,
-            encryption: DataplaneEncryption::Disabled,
-            public_key: None,
-            endpoint: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port: None,
-        })
+        .register_follower(
+            klights_leader_api::NetworkDataplane::try_new(
+                "worker-1",
+                klights_leader_api::NetworkNodeMode::Root,
+                klights_leader_api::DataplaneEncryption::Direct,
+                None,
+                Ipv4Addr::LOCALHOST.into(),
+                None,
+            )
+            .unwrap(),
+        )
         .await;
 
     let replication_for_follower = replication.clone();

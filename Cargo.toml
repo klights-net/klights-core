@@ -67,6 +67,7 @@ klights-node-api = { path = "crates/klights-node-api" }
 klights-pod-api = { path = "crates/klights-pod-api" }
 klights-reconcile-api = { path = "crates/klights-reconcile-api" }
 klights-network-api = { path = "crates/klights-network-api" }
+klights-networking = { path = "crates/klights-networking" }
 klights-auth = { path = "crates/klights-auth" }
 klights-supervisor = { path = "crates/klights-supervisor" }
 klights-internal-protobuf = { path = "crates/klights-internal-protobuf" }
@@ -161,6 +162,7 @@ aes-gcm = "0.10.3"
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 tempfile = "3"
+trybuild = "1.0.118"
 rstest = "0.25"
 proptest = "1.11.0"
 syn = { version = "2", features = ["full", "visit", "extra-traits"] }
@@ -211,6 +213,7 @@ klights-node-datastore = { workspace = true }
 klights-pod-api = { workspace = true }
 klights-reconcile-api = { workspace = true }
 klights-network-api = { workspace = true }
+klights-networking = { workspace = true }
 klights-auth = { workspace = true }
 klights-supervisor = { workspace = true }
 klights-internal-protobuf = { workspace = true }
@@ -272,7 +275,6 @@ serde_yaml = { workspace = true }
 flate2 = { workspace = true }
 zstd = { workspace = true }
 nix = { workspace = true }
-rtnetlink = { workspace = true }
 rand = { workspace = true }
 rand_core = { workspace = true }
 rsa = { workspace = true }
@@ -281,17 +283,7 @@ paste = { workspace = true }
 h2 = { workspace = true }
 rust-cel-parser = { workspace = true }
 cel = { workspace = true }
-nftnl = { workspace = true }
-mnl = { workspace = true }
 cron = { workspace = true }
-netlink-packet-core = { workspace = true }
-netlink-packet-core-08 = { workspace = true }
-netlink-packet-generic-04 = { workspace = true }
-netlink-packet-route = { workspace = true }
-netlink-sys = { workspace = true }
-genetlink = { workspace = true }
-netlink-packet-wireguard = { workspace = true }
-x25519-dalek = { workspace = true }
 openraft = { workspace = true }
 aes-gcm = { workspace = true }
 # memory: jemalloc global allocator. Replaces glibc malloc, whose per-thread
@@ -307,6 +299,8 @@ debug = 1
 [dev-dependencies]
 klights-cluster-datastore = { workspace = true, features = ["test-support"] }
 klights-cluster-store = { workspace = true, features = ["test-support"] }
+klights-networking = { workspace = true, features = ["test-support"] }
+rtnetlink = { workspace = true }
 tempfile = { workspace = true }
 rstest = { workspace = true }
 proptest = { workspace = true }

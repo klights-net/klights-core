@@ -92,7 +92,7 @@ impl PeerTopologyProjection for DatastorePeerTopologyProjection {
     }
 }
 
-impl PeerDataplaneHealth for crate::networking::dataplane_health::DataplaneHealth {
+impl PeerDataplaneHealth for klights_networking::dataplane_health::DataplaneHealth {
     fn apply_peer_sync_outcome(
         &self,
         outcome: &PeerSyncOutcome,

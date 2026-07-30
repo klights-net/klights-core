@@ -500,10 +500,11 @@ mod tests {
             file_process: file_process.clone(),
             grpc_transport_policy:
                 klights_leader_rpc::transport_policy::GrpcTransportPolicy::shared_default(),
-            network_cleanup: crate::networking::NetworkCleanup::from_config(
-                &crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config).unwrap(),
-                file_process,
-            ),
+            network_cleanup: crate::bootstrap::network_adapters::cleanup_config(
+                &node_mode, &config,
+            )
+            .unwrap()
+            .build_cleanup(file_process),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             etc_dir: data_root.join("etc").to_string_lossy().into_owned(),
             containerd_state_dir: data_root
@@ -569,7 +570,7 @@ mod tests {
         let mut config = crate::KlightsConfig::test_default();
         config.containerd_namespace = namespace.clone();
         config.node_name = "mn-worker".to_string();
-        config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
+        config.dataplane_encryption = klights_networking::wireguard::DataplaneEncryption::Disabled;
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
@@ -744,7 +745,7 @@ mod tests {
         config.containerd_namespace = joiner_namespace.clone();
         config.data_root = joiner_data_root.clone();
         config.node_name = "mn-controlplane2".to_string();
-        config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
+        config.dataplane_encryption = klights_networking::wireguard::DataplaneEncryption::Disabled;
         config.external_endpoint = Some("10.99.0.14".to_string());
         let joiner_supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
@@ -807,7 +808,7 @@ mod tests {
         let mut config = crate::KlightsConfig::test_default();
         config.containerd_namespace = namespace.clone();
         config.node_name = "mn-controlplane2".to_string();
-        config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Enabled;
+        config.dataplane_encryption = klights_networking::wireguard::DataplaneEncryption::Enabled;
         config.external_endpoint = Some("10.99.0.14".to_string());
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
@@ -858,7 +859,7 @@ mod tests {
         let mut config = crate::KlightsConfig::test_default();
         config.containerd_namespace = namespace.clone();
         config.node_name = "mn-controlplane1".to_string();
-        config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
+        config.dataplane_encryption = klights_networking::wireguard::DataplaneEncryption::Disabled;
         config.external_endpoint = Some("10.99.0.10".to_string());
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
@@ -916,7 +917,7 @@ mod tests {
         let mut config = crate::KlightsConfig::test_default();
         config.containerd_namespace = namespace;
         config.node_name = "mn-controlplane1".to_string();
-        config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
+        config.dataplane_encryption = klights_networking::wireguard::DataplaneEncryption::Disabled;
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));

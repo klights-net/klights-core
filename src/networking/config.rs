@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use crate::networking::BridgeName;
-use crate::networking::wireguard::DataplaneEncryption;
+use klights_networking::wireguard::DataplaneEncryption;
 use klights_types::{ClusterCidr, NodeName};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,5 +144,24 @@ impl NetworkCleanupConfig {
     }
     pub const fn inside_rootlesskit(&self) -> bool {
         self.inside_rootlesskit
+    }
+
+    pub fn build_cleanup(
+        &self,
+        file_process: klights_supervisor::FileProcessExecutor,
+    ) -> klights_networking::NetworkCleanup {
+        let kind = match self.mode {
+            NetworkMode::Root => klights_networking::NetworkCleanupKind::Root,
+            NetworkMode::Rootless => klights_networking::NetworkCleanupKind::Rootless,
+        };
+        let args = klights_networking::NetworkCleanupArgs::try_new(
+            kind,
+            self.bridge_name.clone(),
+            self.wireguard_device.clone(),
+            self.nft_table_name.clone(),
+            self.inside_rootlesskit,
+        )
+        .expect("NetworkCleanupConfig already validated destination cleanup arguments");
+        klights_networking::NetworkCleanup::new(args, file_process)
     }
 }

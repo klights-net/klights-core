@@ -509,12 +509,10 @@ mod peer_endpoint_tests {
 
     /// Compile-time check: `MockNetworkProvider` satisfies `PeerRouter`.
     #[test]
-    fn test_network_plane_implements_peer_router() {
+    fn test_root_peer_dataplane_implements_peer_router() {
         fn assert_impl<T: klights_network_api::PeerRouter>() {}
         assert_impl::<MockNetworkProvider>();
-        let _erase = |p: std::sync::Arc<crate::networking::plane::NetworkPlane>| {
-            let _: std::sync::Arc<dyn klights_network_api::PeerRouter> = p;
-        };
+        assert_impl::<klights_networking::RootPeerDataplane>();
     }
 
     /// Compile-time check: a kubelet-style caller takes only `&dyn Datapath`

@@ -1,6 +1,7 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -30,6 +31,67 @@ pub const WIREGUARD_MTU: u32 = 1280;
 pub const WGPEER_F_REMOVE_ME: u32 = 1 << 0;
 pub const WGPEER_F_REPLACE_ALLOWEDIPS: u32 = 1 << 1;
 const IFNAMSIZ: usize = 15;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WireGuardBootConfigError(Arc<str>);
+
+impl fmt::Display for WireGuardBootConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WireGuardBootConfigError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WireGuardBootConfig {
+    device: String,
+    key_path: PathBuf,
+    port: u16,
+}
+
+impl WireGuardBootConfig {
+    pub fn try_new(
+        device: impl Into<String>,
+        key_path: impl Into<PathBuf>,
+        port: u16,
+    ) -> Result<Self, WireGuardBootConfigError> {
+        let device = device.into();
+        if device.is_empty() || device.len() > IFNAMSIZ || device.as_bytes().contains(&0) {
+            return Err(WireGuardBootConfigError(Arc::from(
+                "WireGuard device must contain 1..=15 non-NUL bytes",
+            )));
+        }
+        let key_path = key_path.into();
+        if !key_path.is_absolute() {
+            return Err(WireGuardBootConfigError(Arc::from(
+                "WireGuard key path must be absolute",
+            )));
+        }
+        if port == 0 {
+            return Err(WireGuardBootConfigError(Arc::from(
+                "WireGuard port must be non-zero",
+            )));
+        }
+        Ok(Self {
+            device,
+            key_path,
+            port,
+        })
+    }
+
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+
+    pub fn key_path(&self) -> &Path {
+        &self.key_path
+    }
+
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+}
 
 pub fn wireguard_device_config_retry_delays() -> [Duration; 4] {
     [
@@ -164,93 +226,41 @@ impl fmt::Debug for WireGuardPrivateKey {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DataplanePeerMetadata {
-    pub node_name: String,
-    pub mode: DataplaneMode,
-    pub encryption: DataplaneEncryption,
-    pub public_key: Option<WireGuardPublicKey>,
-    pub endpoint: IpAddr,
-    pub port: Option<u16>,
-}
-
-impl DataplanePeerMetadata {
-    pub fn try_new(
-        node_name: String,
-        mode: DataplaneMode,
-        encryption: DataplaneEncryption,
-        public_key: Option<String>,
-        endpoint: Option<String>,
-        port: Option<u16>,
-    ) -> Result<Self> {
-        if node_name.trim().is_empty() {
-            return Err(anyhow!("dataplane peer node_name is required"));
-        }
-        let endpoint = endpoint
-            .as_deref()
-            .ok_or_else(|| anyhow!("dataplane peer endpoint is required"))?
-            .parse::<IpAddr>()
-            .with_context(|| "dataplane peer endpoint must be an IP address")?;
-        let public_key = match encryption {
-            DataplaneEncryption::Enabled => {
-                let raw = public_key.as_deref().ok_or_else(|| {
-                    anyhow!("WireGuard public key is required when encryption is enabled")
-                })?;
-                let port = port.ok_or_else(|| {
-                    anyhow!("WireGuard listen port is required when encryption is enabled")
-                })?;
-                if port == 0 {
-                    return Err(anyhow!("WireGuard listen port must be non-zero"));
-                }
-                Some(WireGuardPublicKey::parse(raw)?)
-            }
-            DataplaneEncryption::Disabled => None,
-        };
-        Ok(Self {
-            node_name,
-            mode,
-            encryption,
-            public_key,
-            endpoint,
-            port: port.filter(|value| *value != 0),
-        })
-    }
-}
-
 /// Project cluster topology metadata into the canonical runtime peer-route
 /// contract. Topology mode and base64 representation remain outside the port.
-#[cfg(test)]
-pub(crate) fn peer_route_from_metadata(
-    metadata: DataplanePeerMetadata,
+pub fn peer_route_from_metadata(
+    metadata: klights_leader_api::NetworkDataplane,
     peer_pod_cidr: &str,
 ) -> Result<klights_network_api::PeerRoute> {
-    match metadata.encryption {
-        DataplaneEncryption::Enabled => {
-            let public_key = metadata.public_key.ok_or_else(|| {
+    match metadata.encryption() {
+        klights_leader_api::DataplaneEncryption::WireGuard => {
+            let public_key = metadata.public_key().ok_or_else(|| {
                 anyhow!(
                     "WireGuard peer route requires a public key for {}",
-                    metadata.node_name
+                    metadata.node_name()
                 )
             })?;
-            let port = metadata.port.ok_or_else(|| {
+            let port = metadata.port().ok_or_else(|| {
                 anyhow!(
                     "WireGuard peer route requires a listen port for {}",
-                    metadata.node_name
+                    metadata.node_name()
                 )
             })?;
             let route = klights_network_api::WireGuardPeerRoute::try_new(
-                metadata.node_name,
-                klights_network_api::WireGuardPeerKey::new(public_key.to_bytes()?),
-                std::net::SocketAddr::new(metadata.endpoint, port),
+                metadata.node_name(),
+                klights_network_api::WireGuardPeerKey::new(
+                    WireGuardPublicKey::parse(public_key)?.to_bytes()?,
+                ),
+                std::net::SocketAddr::new(metadata.endpoint(), port),
                 peer_pod_cidr,
             )
             .map_err(|error| anyhow!(error))?;
             Ok(klights_network_api::PeerRoute::WireGuard(route))
         }
-        DataplaneEncryption::Disabled => {
+        klights_leader_api::DataplaneEncryption::Direct => {
             let route = klights_network_api::DirectPeerRoute::try_new(
-                metadata.node_name,
-                metadata.endpoint,
+                metadata.node_name(),
+                metadata.endpoint(),
                 peer_pod_cidr,
             )
             .map_err(|error| anyhow!(error))?;
@@ -389,7 +399,7 @@ impl WireGuardController {
             .with_context(|| format!("remove WireGuard peer {}", route.node_name()))
     }
 
-    pub(crate) async fn shutdown(&self) -> Result<()> {
+    pub async fn shutdown(&self) -> Result<()> {
         self.connection_cancel.cancel();
         if let Some(connection) = self._conn.lock().await.take() {
             connection
@@ -767,18 +777,51 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::{
-        WGPEER_F_REMOVE_ME, WGPEER_F_REPLACE_ALLOWEDIPS, WireGuardController,
+        WGPEER_F_REMOVE_ME, WGPEER_F_REPLACE_ALLOWEDIPS, WireGuardBootConfig, WireGuardController,
         WireGuardDeviceConfig, WireGuardPrivateKey, build_remove_peer_message,
         build_set_device_message, build_set_peer_message, route_delete_result,
         unencrypted_direct_route_message, wireguard_device_config_retry_delays,
         wireguard_message_attrs, wireguard_route_message,
     };
-    use crate::networking::wireguard::{
-        DataplaneEncryption, DataplaneMode, DataplanePeerMetadata, WireGuardIdentity,
-        WireGuardPublicKey, peer_route_from_metadata,
+    use crate::wireguard::{
+        DataplaneEncryption, DataplaneMode, WireGuardIdentity, WireGuardPublicKey,
+        peer_route_from_metadata,
     };
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use tokio::sync::Mutex as AsyncMutex;
+
+    fn dataplane_peer_metadata(
+        node_name: String,
+        mode: DataplaneMode,
+        encryption: DataplaneEncryption,
+        public_key: Option<String>,
+        endpoint: Option<String>,
+        port: Option<u16>,
+    ) -> Result<klights_leader_api::NetworkDataplane, klights_leader_api::NetworkTopologyError>
+    {
+        klights_leader_api::NetworkDataplane::try_new(
+            node_name,
+            match mode {
+                DataplaneMode::Root => klights_leader_api::NetworkNodeMode::Root,
+                DataplaneMode::Rootless => klights_leader_api::NetworkNodeMode::Rootless,
+            },
+            match encryption {
+                DataplaneEncryption::Enabled => klights_leader_api::DataplaneEncryption::WireGuard,
+                DataplaneEncryption::Disabled => klights_leader_api::DataplaneEncryption::Direct,
+            },
+            public_key.as_deref(),
+            endpoint
+                .as_deref()
+                .unwrap_or_default()
+                .parse()
+                .map_err(|error| {
+                    klights_leader_api::NetworkTopologyError::corrupt_response(format!(
+                        "invalid test endpoint: {error}"
+                    ))
+                })?,
+            port,
+        )
+    }
 
     #[test]
     fn wireguard_mtu_is_safe_for_public_internet_overlay() {
@@ -796,6 +839,33 @@ mod tests {
             7_679,
             "default multinode WireGuard dataplane traffic must listen on UDP 7679"
         );
+    }
+
+    #[test]
+    fn boot_config_rejects_every_raw_wireguard_bypass() {
+        assert!(WireGuardBootConfig::try_new("", "/var/lib/klights/wg.key", 7679).is_err());
+        assert!(
+            WireGuardBootConfig::try_new(
+                "wireguard-device-too-long",
+                "/var/lib/klights/wg.key",
+                7679
+            )
+            .is_err()
+        );
+        assert!(WireGuardBootConfig::try_new("klights.wg", "relative/wg.key", 7679).is_err());
+        assert!(WireGuardBootConfig::try_new("klights.wg", "/var/lib/klights/wg.key", 0).is_err());
+    }
+
+    #[test]
+    fn boot_config_exposes_only_validated_values() {
+        let config =
+            WireGuardBootConfig::try_new("klights.wg", "/var/lib/klights/wg.key", 7679).unwrap();
+        assert_eq!(config.device(), "klights.wg");
+        assert_eq!(
+            config.key_path(),
+            std::path::Path::new("/var/lib/klights/wg.key")
+        );
+        assert_eq!(config.port(), 7679);
     }
 
     #[test]
@@ -824,7 +894,7 @@ mod tests {
         assert!(DataplaneMode::parse("rootless").is_ok());
         assert!(DataplaneMode::parse("vxlan").is_err());
 
-        let enabled = DataplanePeerMetadata::try_new(
+        let enabled = dataplane_peer_metadata(
             "worker-1".to_string(),
             DataplaneMode::Root,
             DataplaneEncryption::Enabled,
@@ -833,11 +903,14 @@ mod tests {
             Some(51_820),
         )
         .unwrap();
-        assert_eq!(enabled.encryption, DataplaneEncryption::Enabled);
-        assert!(enabled.public_key.is_some());
+        assert_eq!(
+            enabled.encryption(),
+            klights_leader_api::DataplaneEncryption::WireGuard
+        );
+        assert!(enabled.public_key().is_some());
 
         assert!(
-            DataplanePeerMetadata::try_new(
+            dataplane_peer_metadata(
                 "worker-1".to_string(),
                 DataplaneMode::Rootless,
                 DataplaneEncryption::Enabled,
@@ -848,7 +921,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            DataplanePeerMetadata::try_new(
+            dataplane_peer_metadata(
                 "worker-1".to_string(),
                 DataplaneMode::Root,
                 DataplaneEncryption::Enabled,
@@ -859,7 +932,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            DataplanePeerMetadata::try_new(
+            dataplane_peer_metadata(
                 "worker-1".to_string(),
                 DataplaneMode::Root,
                 DataplaneEncryption::Enabled,
@@ -870,7 +943,7 @@ mod tests {
             .is_err()
         );
 
-        let disabled = DataplanePeerMetadata::try_new(
+        let disabled = dataplane_peer_metadata(
             "worker-1".to_string(),
             DataplaneMode::Rootless,
             DataplaneEncryption::Disabled,
@@ -879,8 +952,11 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(disabled.encryption, DataplaneEncryption::Disabled);
-        assert!(disabled.public_key.is_none());
+        assert_eq!(
+            disabled.encryption(),
+            klights_leader_api::DataplaneEncryption::Direct
+        );
+        assert!(disabled.public_key().is_none());
     }
 
     #[tokio::test]
@@ -1000,7 +1076,7 @@ mod tests {
 
     #[test]
     fn topology_projects_to_wireguard_route_with_peer_pod_cidr() {
-        let metadata = DataplanePeerMetadata::try_new(
+        let metadata = dataplane_peer_metadata(
             "worker-1".to_string(),
             DataplaneMode::Rootless,
             DataplaneEncryption::Enabled,
@@ -1022,7 +1098,7 @@ mod tests {
 
     #[test]
     fn topology_projects_disabled_encryption_to_direct_and_rejects_malformed_cidr() {
-        let disabled = DataplanePeerMetadata::try_new(
+        let disabled = dataplane_peer_metadata(
             "worker-1".to_string(),
             DataplaneMode::Root,
             DataplaneEncryption::Disabled,
@@ -1036,7 +1112,7 @@ mod tests {
             klights_network_api::PeerRoute::Direct(_)
         ));
 
-        let enabled = DataplanePeerMetadata::try_new(
+        let enabled = dataplane_peer_metadata(
             "worker-2".to_string(),
             DataplaneMode::Root,
             DataplaneEncryption::Enabled,
@@ -1103,7 +1179,7 @@ mod tests {
             WireguardPeerAttribute,
         };
 
-        let metadata = DataplanePeerMetadata::try_new(
+        let metadata = dataplane_peer_metadata(
             "node-b".to_string(),
             DataplaneMode::Root,
             DataplaneEncryption::Enabled,

@@ -4,6 +4,27 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutingStateError {
+    detail: Arc<str>,
+}
+
+impl RoutingStateError {
+    pub fn unavailable(detail: impl Into<Arc<str>>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for RoutingStateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "routing state unavailable: {}", self.detail)
+    }
+}
+
+impl std::error::Error for RoutingStateError {}
+
 #[derive(Clone, Debug)]
 pub struct ServiceRoutingResource {
     pub api_version: String,
@@ -28,7 +49,8 @@ pub struct NetworkPolicySnapshot {
     pub namespaces: Vec<Arc<Value>>,
 }
 
-pub type RoutingStateFuture<'a, T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send + 'a>>;
+pub type RoutingStateFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, RoutingStateError>> + Send + 'a>>;
 
 pub trait RoutingStateSource: Send + Sync {
     fn service_routing_snapshot(&self) -> RoutingStateFuture<'_, ServiceRoutingSnapshot>;

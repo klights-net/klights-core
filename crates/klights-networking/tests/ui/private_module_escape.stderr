@@ -1,0 +1,83 @@
+error[E0603]: module `pod_link` is private
+ --> tests/ui/private_module_escape.rs:6:29
+  |
+6 |         let _ = networking::pod_link::open_netns_file_blocking;
+  |                             ^^^^^^^^  ------------------------ function `open_netns_file_blocking` is not publicly re-exported
+  |                             |
+  |                             private module
+  |
+note: the module `pod_link` is defined here
+ --> src/lib.rs
+  |
+  | mod pod_link;
+  | ^^^^^^^^^^^^
+
+error[E0603]: module `root_datapath` is private
+ --> tests/ui/private_module_escape.rs:8:45
+  |
+8 |     let _ = std::mem::size_of::<networking::root_datapath::RootDatapath>();
+  |                                             ^^^^^^^^^^^^^  ------------ struct `RootDatapath` is not publicly re-exported
+  |                                             |
+  |                                             private module
+  |
+note: the module `root_datapath` is defined here
+ --> src/lib.rs
+  |
+  | mod root_datapath;
+  | ^^^^^^^^^^^^^^^^^
+
+error[E0603]: module `peer_dataplane` is private
+ --> tests/ui/private_module_escape.rs:9:45
+  |
+9 |     let _ = std::mem::size_of::<networking::peer_dataplane::RootPeerDataplane>();
+  |                                             ^^^^^^^^^^^^^^  ----------------- struct `RootPeerDataplane` is not publicly re-exported
+  |                                             |
+  |                                             private module
+  |
+note: the module `peer_dataplane` is defined here
+ --> src/lib.rs
+  |
+  | mod peer_dataplane;
+  | ^^^^^^^^^^^^^^^^^^
+
+error[E0603]: module `device_state` is private
+  --> tests/ui/private_module_escape.rs:10:45
+   |
+10 |     let _ = std::mem::size_of::<networking::device_state::LinkKind>();
+   |                                             ^^^^^^^^^^^^  -------- enum `LinkKind` is not publicly re-exported
+   |                                             |
+   |                                             private module
+   |
+note: the module `device_state` is defined here
+  --> src/lib.rs
+   |
+   | mod device_state;
+   | ^^^^^^^^^^^^^^^^
+
+error[E0603]: module `pod_link` is private
+  --> tests/ui/private_module_escape.rs:11:25
+   |
+11 |     let _ = networking::pod_link::open_netns_file_blocking;
+   |                         ^^^^^^^^  ------------------------ function `open_netns_file_blocking` is not publicly re-exported
+   |                         |
+   |                         private module
+   |
+note: the module `pod_link` is defined here
+  --> src/lib.rs
+   |
+   | mod pod_link;
+   | ^^^^^^^^^^^^
+
+error[E0603]: module `netns_sync` is private
+  --> tests/ui/private_module_escape.rs:12:25
+   |
+12 |     let _ = networking::netns_sync::new_route_socket;
+   |                         ^^^^^^^^^^  ---------------- function `new_route_socket` is not publicly re-exported
+   |                         |
+   |                         private module
+   |
+note: the module `netns_sync` is defined here
+  --> src/lib.rs
+   |
+   | mod netns_sync;
+   | ^^^^^^^^^^^^^^

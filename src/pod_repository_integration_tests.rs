@@ -6904,10 +6904,49 @@ async fn read_pod_network_assignment_host_network_returns_host_ip_twice_without_
     assert!(!assignment.pod_ip.is_empty());
 }
 
+struct RegistrationSignalingAssignmentBus {
+    inner: klights_networking::PodNetworkAssignmentBus,
+    registration_tx: tokio::sync::watch::Sender<u64>,
+}
+
+impl RegistrationSignalingAssignmentBus {
+    fn new() -> (std::sync::Arc<Self>, tokio::sync::watch::Receiver<u64>) {
+        let (registration_tx, registration_rx) = tokio::sync::watch::channel(0);
+        (
+            std::sync::Arc::new(Self {
+                inner: klights_networking::PodNetworkAssignmentBus::new(),
+                registration_tx,
+            }),
+            registration_rx,
+        )
+    }
+}
+
+impl klights_network_api::PodNetworkAssignmentPublisher for RegistrationSignalingAssignmentBus {
+    fn publish_assignment(&self, key: &klights_network_api::PodNetworkAssignmentKey) {
+        klights_network_api::PodNetworkAssignmentPublisher::publish_assignment(&self.inner, key);
+    }
+}
+
+impl klights_network_api::PodNetworkAssignmentWaiter for RegistrationSignalingAssignmentBus {
+    fn subscribe(
+        &self,
+        key: klights_network_api::PodNetworkAssignmentKey,
+    ) -> Result<
+        Box<dyn klights_network_api::PodNetworkAssignmentSubscription>,
+        klights_network_api::PodNetworkAssignmentEventError,
+    > {
+        let subscription =
+            klights_network_api::PodNetworkAssignmentWaiter::subscribe(&self.inner, key)?;
+        self.registration_tx
+            .send_modify(|generation| *generation += 1);
+        Ok(subscription)
+    }
+}
+
 #[tokio::test]
 async fn read_pod_network_assignment_retries_then_succeeds() {
     use super::PodNetworkReader;
-    use crate::networking::pod_network_events::PodNetworkAssignmentBus;
     use klights_network_api::{PodNetworkAssignmentKey, PodNetworkAssignmentPublisher};
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
@@ -6915,8 +6954,7 @@ async fn read_pod_network_assignment_retries_then_succeeds() {
     let node_local = super::test_node_local_store(supervisor.clone()).await;
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
-    let events = std::sync::Arc::new(PodNetworkAssignmentBus::new());
-    let mut registered = events.registration_observer_for_test();
+    let (events, mut registered) = RegistrationSignalingAssignmentBus::new();
     let repo = std::sync::Arc::new(super::PodRepository::new_with_network_events(
         db.clone(),
         supervisor,
@@ -6967,7 +7005,7 @@ async fn read_pod_network_assignment_retains_publish_inside_first_lookup_gap() {
     use klights_network_api::{PodNetworkAssignmentKey, PodNetworkAssignmentPublisher};
 
     struct PublishInsideLookupCache {
-        bus: std::sync::Arc<crate::networking::pod_network_events::PodNetworkAssignmentBus>,
+        bus: std::sync::Arc<klights_networking::PodNetworkAssignmentBus>,
         key: PodNetworkAssignmentKey,
         sandbox_reads: AtomicUsize,
     }
@@ -7093,7 +7131,6 @@ async fn read_pod_network_assignment_retains_publish_inside_first_lookup_gap() {
 #[tokio::test]
 async fn read_pod_network_assignment_tolerates_cni_db_backlog() {
     use super::PodNetworkReader;
-    use crate::networking::pod_network_events::PodNetworkAssignmentBus;
     use klights_network_api::{PodNetworkAssignmentKey, PodNetworkAssignmentPublisher};
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
@@ -7101,8 +7138,7 @@ async fn read_pod_network_assignment_tolerates_cni_db_backlog() {
     let node_local = super::test_node_local_store(supervisor.clone()).await;
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
-    let events = std::sync::Arc::new(PodNetworkAssignmentBus::new());
-    let mut registered = events.registration_observer_for_test();
+    let (events, mut registered) = RegistrationSignalingAssignmentBus::new();
     let repo = std::sync::Arc::new(super::PodRepository::new_with_network_events(
         db.clone(),
         supervisor,

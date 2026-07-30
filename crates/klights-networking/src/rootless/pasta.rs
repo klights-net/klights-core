@@ -95,7 +95,7 @@ mod tests {
         // 0xCA70 = 51824 — not our port
         assert!(port_not_found(
             contents,
-            crate::networking::wireguard::DEFAULT_WIREGUARD_PORT
+            crate::wireguard::DEFAULT_WIREGUARD_PORT
         ));
         // 0x0035 = 53 — found in line 24
         assert!(!port_not_found(contents, 53));
@@ -109,7 +109,7 @@ mod tests {
 ";
         assert!(port_not_found(
             contents,
-            crate::networking::wireguard::DEFAULT_WIREGUARD_PORT
+            crate::wireguard::DEFAULT_WIREGUARD_PORT
         ));
     }
 
@@ -122,7 +122,7 @@ mod tests {
 ";
         assert!(!port_not_found(
             contents,
-            crate::networking::wireguard::DEFAULT_WIREGUARD_PORT
+            crate::wireguard::DEFAULT_WIREGUARD_PORT
         ));
     }
 
@@ -133,7 +133,7 @@ mod tests {
 ";
         assert!(port_not_found(
             contents,
-            crate::networking::wireguard::DEFAULT_WIREGUARD_PORT
+            crate::wireguard::DEFAULT_WIREGUARD_PORT
         ));
     }
 }

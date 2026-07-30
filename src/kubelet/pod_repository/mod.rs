@@ -89,9 +89,8 @@ pub(crate) fn empty_test_pod_network_cache() -> Arc<dyn klights_node_store::PodN
 }
 
 #[cfg(test)]
-pub(crate) fn test_assignment_bus()
--> Arc<crate::networking::pod_network_events::PodNetworkAssignmentBus> {
-    Arc::new(crate::networking::pod_network_events::PodNetworkAssignmentBus::new())
+pub(crate) fn test_assignment_bus() -> Arc<klights_networking::PodNetworkAssignmentBus> {
+    Arc::new(klights_networking::PodNetworkAssignmentBus::new())
 }
 
 #[cfg(test)]

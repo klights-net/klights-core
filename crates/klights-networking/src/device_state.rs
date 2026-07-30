@@ -1,3 +1,5 @@
+//! Parsed Linux link state for concrete networking adapters.
+
 use netlink_packet_route::link::{
     InfoKind, LinkAttribute, LinkFlag, LinkInfo, LinkMessage, State as LinkOperState,
 };

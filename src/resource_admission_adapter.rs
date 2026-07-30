@@ -13,7 +13,7 @@ use crate::admission::{
     AdmissionWebhookClient, AdmissionWebhookRequest, WebhookTarget, WebhookTargetResolver,
 };
 use crate::datastore::{DatastoreHandle, ResourceListQuery};
-use crate::networking::service_routing::{Protocol, ServiceSpec};
+use klights_networking::service_routing::{Protocol, ServiceSpec};
 
 const CA_BUNDLE_CLIENT_CACHE_CAPACITY: usize = 32;
 type CaFingerprint = [u8; 32];

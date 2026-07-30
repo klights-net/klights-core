@@ -222,7 +222,7 @@ pub async fn refresh_node_network_conditions(
     db: &dyn crate::datastore::DatastoreBackend,
     outbox: Option<&Outbox>,
     node_name: &str,
-    dataplane_health: &crate::networking::dataplane_health::DataplaneHealth,
+    dataplane_health: &klights_networking::dataplane_health::DataplaneHealth,
 ) -> Result<NodeNetworkRefreshResult> {
     let Some(existing) = db.get_resource("v1", "Node", None, node_name).await? else {
         return Ok(NodeNetworkRefreshResult::Missing);
@@ -416,7 +416,7 @@ mod tests {
     use crate::kubelet::node_heartbeat::{
         NODE_HEARTBEAT_INTERVAL, build_lease, run_heartbeat_with_interval,
     };
-    use crate::networking::dataplane_health::DataplaneHealth;
+    use klights_networking::dataplane_health::DataplaneHealth;
     use std::sync::{Arc as StdArc, Mutex};
     use std::time::Duration;
 

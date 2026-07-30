@@ -27,7 +27,7 @@ pub struct KlightsConfig {
     pub anonymous_auth: bool,
 
     /// Dataplane encryption mode. Missing/empty env defaults to enabled.
-    pub dataplane_encryption: crate::networking::wireguard::DataplaneEncryption,
+    pub dataplane_encryption: klights_networking::wireguard::DataplaneEncryption,
 
     /// Public/ingress endpoint advertised to peers for API joins and encrypted
     /// dataplane reachability.
@@ -228,11 +228,11 @@ impl KlightsConfig {
                 false,
             )?,
             wireguard_device: parse_wireguard_device_env(
-                crate::networking::wireguard::DEFAULT_WIREGUARD_DEVICE,
+                klights_networking::wireguard::DEFAULT_WIREGUARD_DEVICE,
             )?,
             wireguard_port: parse_u16_env(
                 "KLIGHTS_WIREGUARD_PORT",
-                crate::networking::wireguard::DEFAULT_WIREGUARD_PORT,
+                klights_networking::wireguard::DEFAULT_WIREGUARD_PORT,
             )?,
             cluster_db_path,
             node_db_path,
@@ -337,11 +337,11 @@ impl KlightsConfig {
             node_name: "test-node".into(),
             node_ip: None,
             anonymous_auth: true,
-            dataplane_encryption: crate::networking::wireguard::DataplaneEncryption::Enabled,
+            dataplane_encryption: klights_networking::wireguard::DataplaneEncryption::Enabled,
             external_endpoint: None,
             worker_dataplane_no_ingress: false,
-            wireguard_device: crate::networking::wireguard::DEFAULT_WIREGUARD_DEVICE.into(),
-            wireguard_port: crate::networking::wireguard::DEFAULT_WIREGUARD_PORT,
+            wireguard_device: klights_networking::wireguard::DEFAULT_WIREGUARD_DEVICE.into(),
+            wireguard_port: klights_networking::wireguard::DEFAULT_WIREGUARD_PORT,
             cluster_db_path: crate::paths::test_data_root_path(ns)
                 .join("db")
                 .join("sqlite")
@@ -480,14 +480,14 @@ fn parse_optional_ipv4_env(var: &str) -> anyhow::Result<Option<String>> {
 
 fn parse_wireguard_device_env(default: &str) -> anyhow::Result<String> {
     let raw = std::env::var("KLIGHTS_WIREGUARD_DEVICE").unwrap_or_else(|_| default.to_string());
-    crate::networking::wireguard::parse_wireguard_device_name(&raw)
+    klights_networking::wireguard::parse_wireguard_device_name(&raw)
 }
 
 fn parse_dataplane_encryption_env()
--> anyhow::Result<crate::networking::wireguard::DataplaneEncryption> {
+-> anyhow::Result<klights_networking::wireguard::DataplaneEncryption> {
     std::env::var("KLIGHTS_DATAPLANE_ENCRYPTION")
         .ok()
-        .map(|value| crate::networking::wireguard::DataplaneEncryption::parse(Some(&value)))
+        .map(|value| klights_networking::wireguard::DataplaneEncryption::parse(Some(&value)))
         .transpose()
         .map(|mode| mode.unwrap_or_default())
 }
@@ -568,11 +568,11 @@ mod tests {
         assert_eq!(config.service_cidr, "10.43.128.0/17");
         assert_eq!(
             config.dataplane_encryption,
-            crate::networking::wireguard::DataplaneEncryption::Enabled
+            klights_networking::wireguard::DataplaneEncryption::Enabled
         );
         assert_eq!(
             config.wireguard_device,
-            crate::networking::wireguard::DEFAULT_WIREGUARD_DEVICE
+            klights_networking::wireguard::DEFAULT_WIREGUARD_DEVICE
         );
         assert_eq!(
             config.wireguard_port, 7_679,
@@ -580,7 +580,7 @@ mod tests {
         );
         assert_eq!(
             config.wireguard_port,
-            crate::networking::wireguard::DEFAULT_WIREGUARD_PORT
+            klights_networking::wireguard::DEFAULT_WIREGUARD_PORT
         );
         assert!(
             config.external_endpoint.is_none(),

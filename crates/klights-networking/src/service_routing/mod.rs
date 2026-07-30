@@ -54,9 +54,11 @@ pub(crate) use service_rules::{
 };
 pub use session_affinity::SessionAffinity;
 pub use state_source::{
-    NetworkPolicySnapshot, RoutingStateFuture, RoutingStateSource, ServiceRoutingResource,
-    ServiceRoutingSnapshot,
+    NetworkPolicySnapshot, RoutingStateError, RoutingStateFuture, RoutingStateSource,
+    ServiceRoutingResource, ServiceRoutingSnapshot,
 };
 
 #[cfg(test)]
-mod tests;
+mod tests_integration;
+#[cfg(test)]
+mod tests_unit;

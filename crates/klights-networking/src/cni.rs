@@ -11,42 +11,42 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::stream::TryStreamExt;
-use netlink_packet_route::link::InfoData;
-use netlink_packet_route::link::InfoKind;
-use netlink_packet_route::link::InfoVeth;
-use netlink_packet_route::link::{LinkAttribute, LinkFlag, LinkMessage};
+use netlink_packet_route::link::{LinkAttribute, LinkFlag};
 use netlink_packet_route::neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourMessage};
 use netlink_packet_route::{AddressFamily, route::RouteType};
-use nix::sched::{CloneFlags, setns};
-use std::collections::HashSet;
 use std::net::Ipv4Addr;
-use std::os::fd::AsFd;
 use std::os::unix::io::AsRawFd;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, Weak};
 
+#[cfg(test)]
+use crate::pod_link::restore_host_netns_or_abort_with_policy;
+use crate::pod_link::{
+    allocate_ip_with_reclaim, configure_pod_netns, create_veth_pair_with_peer_in_netns,
+    netns_path_usable_blocking, open_netns_file_blocking, validate_pod_netns_state,
+};
+use crate::root_datapath::get_link_index;
 use klights_network_api::{PodNetwork, PodNetworkAssignmentKey, PodNetworkAssignmentPublisher};
 use klights_node_store::{
-    CacheNetworkError, PodIpamStore, PodNetworkAllocationRequest, PodNetworkCache, PodRuntimeStore,
-    SandboxKey,
+    PodIpamStore, PodNetworkAllocationRequest, PodNetworkCache, PodRuntimeStore, SandboxKey,
 };
 
-use super::types::BridgeName;
+use crate::BridgeName;
 use klights_types::{NodeName, PodSubnet};
 
 #[derive(Default)]
-pub(crate) struct SandboxOperationLocks {
+pub struct SandboxOperationLocks {
     gates: Arc<Mutex<std::collections::HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
 }
 
-pub(crate) struct SandboxOperationGuard {
+pub struct SandboxOperationGuard {
     sandbox_id: String,
     gates: Arc<Mutex<std::collections::HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
     _gate: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl SandboxOperationLocks {
-    pub(crate) async fn acquire(&self, sandbox_id: &str) -> SandboxOperationGuard {
+    pub async fn acquire(&self, sandbox_id: &str) -> SandboxOperationGuard {
         let gate = {
             let mut gates = self.gates.lock().unwrap();
             gates.retain(|_, gate| gate.strong_count() > 0);
@@ -285,7 +285,7 @@ pub async fn add(args: CniAddArgs<'_>) -> Result<PodNetwork> {
     let pod_ip = Ipv4Addr::from_str(&ip_addr_str).context("Invalid allocated IP")?;
 
     let setup_result: Result<(String, Ipv4Addr)> = async {
-        if let Ok(existing) = crate::networking::get_link_index(handle, &veth_host).await {
+        if let Ok(existing) = get_link_index(handle, &veth_host).await {
             handle
                 .link()
                 .del(existing)
@@ -321,7 +321,7 @@ pub async fn add(args: CniAddArgs<'_>) -> Result<PodNetwork> {
         flush_host_neighbour(handle, bridge_idx, pod_ip, "add-before-reuse").await;
 
         // Get host-side interface index (peer is already in the pod netns)
-        let veth_host_idx = crate::networking::get_link_index(handle, &veth_host)
+        let veth_host_idx = get_link_index(handle, &veth_host)
             .await
             .with_context(|| format!("veth_host {} not found after creation", veth_host))?;
 
@@ -443,7 +443,7 @@ pub async fn del(
 
     let mut veth_delete_failed = false;
     // Delete host veth — kernel removes pod side automatically
-    match crate::networking::get_link_index(handle, &veth_host).await {
+    match get_link_index(handle, &veth_host).await {
         Ok(idx) => {
             if let Err(e) = handle.link().del(idx).execute().await {
                 tracing::warn!(
@@ -518,78 +518,10 @@ async fn flush_host_neighbour(
 }
 
 async fn cleanup_host_veth(handle: &rtnetlink::Handle, veth_host: &str) {
-    if let Ok(idx) = crate::networking::get_link_index(handle, veth_host).await
+    if let Ok(idx) = get_link_index(handle, veth_host).await
         && let Err(e) = handle.link().del(idx).execute().await
     {
         tracing::warn!("cni: failed to rollback veth {}: {}", veth_host, e);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn allocate_ip_with_reclaim(
-    cache: &dyn PodNetworkCache,
-    ipam: &dyn PodIpamStore,
-    runtime: &dyn PodRuntimeStore,
-    sandbox_id: &str,
-    pod: &klights_types::PodIdentity,
-    subnet_base: u32,
-    subnet_size: u32,
-    veth_host: &str,
-    netns_record_path: &str,
-) -> Result<(String, u32)> {
-    let request = || {
-        PodNetworkAllocationRequest::try_new(
-            sandbox_id,
-            pod.clone(),
-            subnet_base,
-            subnet_size,
-            veth_host,
-            netns_record_path,
-        )
-    };
-    let first = ipam.reserve_ip_and_insert_network(request()?).await;
-
-    match first {
-        Ok(alloc) => Ok(alloc.into_parts()),
-        Err(e) => {
-            if !matches!(e, CacheNetworkError::AddressExhausted { .. }) {
-                return Err(anyhow::Error::new(e));
-            }
-
-            let live_sandboxes: HashSet<String> = runtime
-                .list_pod_runtime()
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|record| record.sandbox_id().map(str::to_owned))
-                .collect();
-
-            let mut reclaimed = 0usize;
-            if let Ok(assignments) = cache.list_network_assignments().await {
-                for assignment in assignments {
-                    let stale = assignment.request().clone();
-                    if !live_sandboxes.contains(stale.sandbox_id())
-                        && cache
-                            .delete_network_if_matches(stale)
-                            .await
-                            .unwrap_or(false)
-                    {
-                        reclaimed += 1;
-                    }
-                }
-            }
-            if reclaimed > 0 {
-                tracing::warn!(
-                    reclaimed,
-                    "cni::add: reclaimed stale pod_network IPAM rows after exhaustion"
-                );
-            }
-
-            ipam.reserve_ip_and_insert_network(request()?)
-                .await
-                .map(|allocation| allocation.into_parts())
-                .map_err(anyhow::Error::new)
-        }
     }
 }
 
@@ -601,139 +533,6 @@ fn complete_persisted_assignment<T>(
     let value = result?;
     assignment_publisher.publish_assignment(assignment_key);
     Ok(value)
-}
-
-// Create a veth pair where the peer side is created directly inside the target
-// network namespace. This avoids the separate RTM_SETLINK + IFLA_NET_NS_FD move
-// that fails with EPERM inside a rootless user namespace.
-//
-// The peer LinkMessage carries IFLA_NET_NS_FD so the kernel places it into
-// the target netns at creation time (RTM_NEWLINK).
-async fn create_veth_pair_with_peer_in_netns(
-    handle: &rtnetlink::Handle,
-    veth_host_name: &str,
-    veth_pod_name: &str,
-    netns_fd: std::os::unix::io::RawFd,
-) -> Result<()> {
-    // Build the peer LinkMessage with NetNsFd so it is created inside the pod netns.
-    // In rtnetlink's veth() helper convention: the first arg to veth() is the
-    // peer name (goes into InfoVeth::Peer), the second arg is the main link name.
-    // We replicate that but add NetNsFd to the peer so the kernel places it into
-    // the target netns at creation time.
-    let mut peer = LinkMessage::default();
-    peer.attributes
-        .push(LinkAttribute::IfName(veth_pod_name.to_string()));
-    peer.attributes.push(LinkAttribute::NetNsFd(netns_fd));
-    let link_info_data = InfoData::Veth(InfoVeth::Peer(peer));
-
-    // Build the link info NLA (replicates the private link_info() method).
-    let link_info_nlas = vec![
-        netlink_packet_route::link::LinkInfo::Kind(InfoKind::Veth),
-        netlink_packet_route::link::LinkInfo::Data(link_info_data),
-    ];
-
-    let mut req = handle.link().add();
-    req.message_mut()
-        .attributes
-        .push(LinkAttribute::IfName(veth_host_name.to_string()));
-    req.message_mut()
-        .attributes
-        .push(LinkAttribute::LinkInfo(link_info_nlas));
-    // Bring the host-side link up (replicates the private up() method).
-    req.message_mut().header.flags.push(LinkFlag::Up);
-    req.message_mut().header.change_mask.push(LinkFlag::Up);
-
-    req.execute().await.with_context(|| {
-        format!(
-            "rtnetlink RTM_NEWLINK veth pair {}/{} with peer in netns",
-            veth_host_name, veth_pod_name
-        )
-    })?;
-    Ok(())
-}
-
-fn run_command_output(args: &[&str], context: &str) -> Result<String> {
-    let result = std::process::Command::new("ip")
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to run ip {context}"))?;
-
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
-        return Err(anyhow::anyhow!("ip {context} failed: {stderr}"));
-    }
-
-    Ok(String::from_utf8_lossy(&result.stdout).to_string())
-}
-
-// Configure the pod-side interface inside the sandbox netns.
-// Called from spawn_blocking while this thread is temporarily moved into pod netns.
-fn configure_pod_netns(
-    netns_path: &str,
-    veth_temp_name: &str,
-    pod_ip: Ipv4Addr,
-    prefix_len: u8,
-    gateway: Ipv4Addr,
-    pod_link_mtu: u32,
-) -> Result<()> {
-    use std::os::unix::io::AsFd;
-
-    // Save host netns
-    let host_netns =
-        std::fs::File::open("/proc/self/ns/net").context("Failed to open host netns")?;
-
-    // Enter pod netns
-    let pod_netns = std::fs::File::open(netns_path).context("Failed to open pod netns")?;
-    setns(pod_netns.as_fd(), CloneFlags::CLONE_NEWNET).context("Failed to setns into pod netns")?;
-    drop(pod_netns);
-
-    let result: Result<()> = (|| {
-        let mut netns_socket =
-            super::netns_sync::new_route_socket().context("Failed to create netlink socket")?;
-
-        let pod_idx = super::netns_sync::link_index_by_name(&mut netns_socket, veth_temp_name)?;
-        super::netns_sync::link_rename(&mut netns_socket, pod_idx, "eth0")?;
-        super::netns_sync::link_set_mtu(&mut netns_socket, pod_idx, pod_link_mtu)?;
-
-        super::netns_sync::addr_add_v4(&mut netns_socket, pod_idx, pod_ip, prefix_len)?;
-
-        super::netns_sync::link_up(&mut netns_socket, pod_idx)?;
-        let loopback_idx = super::netns_sync::link_index_by_name(&mut netns_socket, "lo")?;
-        super::netns_sync::link_up(&mut netns_socket, loopback_idx)?;
-
-        super::netns_sync::route_add_default_v4(&mut netns_socket, gateway, pod_idx)
-    })();
-
-    let restore = setns(host_netns.as_fd(), CloneFlags::CLONE_NEWNET);
-    drop(host_netns);
-    restore_host_netns_or_abort(result, restore)
-}
-
-// Centralises the "failed to restore host netns → process-fatal" policy.
-//
-// A spawn_blocking worker that stays in the pod netns after returning would
-// silently route later work into the wrong namespace. There is no safe way to
-// recover: abort is the only correct response.
-//
-// The inner `_with_policy` variant accepts a caller-supplied diverging
-// function so the abort branch can be exercised in unit tests without killing
-// the test binary.
-fn restore_host_netns_or_abort(result: Result<()>, restore: nix::Result<()>) -> Result<()> {
-    restore_host_netns_or_abort_with_policy(result, restore, || std::process::abort())
-}
-
-fn restore_host_netns_or_abort_with_policy(
-    result: Result<()>,
-    restore: nix::Result<()>,
-    on_restore_fail: impl Fn(),
-) -> Result<()> {
-    if let Err(e) = restore {
-        tracing::error!("CRITICAL: failed to restore host netns: {e}");
-        on_restore_fail();
-        // on_restore_fail must diverge (abort or panic); any return is a bug.
-        unreachable!("on_restore_fail returned without diverging")
-    }
-    result
 }
 
 fn is_interface_not_found_error(err: &anyhow::Error) -> bool {
@@ -789,7 +588,7 @@ async fn validate_existing_allocation(
         });
     }
 
-    let veth_idx = match crate::networking::get_link_index(handle, veth_host).await {
+    let veth_idx = match get_link_index(handle, veth_host).await {
         Ok(idx) => idx,
         Err(e) if is_interface_not_found_error(&e) => {
             return Ok(ExistingAllocation::Stale {
@@ -799,9 +598,7 @@ async fn validate_existing_allocation(
         Err(e) => return Err(e).context("failed to look up host veth"),
     };
 
-    let bridge_idx = crate::networking::get_link_index(handle, bridge_name)
-        .await
-        .ok();
+    let bridge_idx = get_link_index(handle, bridge_name).await.ok();
     let mut links = handle.link().get().match_index(veth_idx).execute();
     let veth = links
         .try_next()
@@ -902,7 +699,7 @@ async fn remove_stale_allocation(
     // durable identity row in place while deleting its datapath so no
     // same-sandbox rebuild can reserve and recreate a veth that this cleanup
     // then mistakes for the stale link.
-    if let Ok(veth_idx) = crate::networking::get_link_index(handle, veth_host).await {
+    if let Ok(veth_idx) = get_link_index(handle, veth_host).await {
         handle
             .link()
             .del(veth_idx)
@@ -921,73 +718,6 @@ async fn remove_stale_allocation(
         );
     }
     Ok(())
-}
-
-fn validate_pod_netns_state(
-    netns_setns_path: &str,
-    pod_ip: Ipv4Addr,
-    prefix: u8,
-    gateway: Ipv4Addr,
-) -> Result<()> {
-    let host_netns =
-        std::fs::File::open("/proc/self/ns/net").context("Failed to open host netns handle")?;
-    let pod_netns = std::fs::File::open(netns_setns_path)
-        .with_context(|| format!("Failed to open pod netns {}", netns_setns_path))?;
-
-    setns(pod_netns.as_fd(), CloneFlags::CLONE_NEWNET).with_context(|| {
-        format!(
-            "Failed to setns into pod netns for validation {}",
-            netns_setns_path
-        )
-    })?;
-    drop(pod_netns);
-
-    let result: Result<()> = (|| {
-        let ip_output = run_command_output(
-            &["-4", "-o", "addr", "show", "dev", "eth0"],
-            "addr show eth0",
-        )?;
-        let expected_addr = format!(" {}/{}", pod_ip, prefix);
-        if !ip_output.contains(&expected_addr) {
-            anyhow::bail!(
-                "eth0 is missing expected address {}/{} in pod netns",
-                pod_ip,
-                prefix
-            );
-        }
-
-        let lo_output = run_command_output(&["-o", "link", "show", "dev", "lo"], "link show lo")?;
-        if !lo_output.contains(" UP ") {
-            anyhow::bail!("lo is not UP in pod netns");
-        }
-
-        let eth_output =
-            run_command_output(&["-o", "link", "show", "dev", "eth0"], "link show eth0")?;
-        if !eth_output.contains(" UP ") {
-            anyhow::bail!("eth0 is not UP in pod netns");
-        }
-
-        let route_output =
-            run_command_output(&["-4", "route", "show", "default"], "route show default")?;
-        let expected = format!("default via {} dev eth0", gateway);
-        if !route_output.contains(&expected) {
-            anyhow::bail!("missing expected default route: {expected}");
-        }
-
-        Ok(())
-    })();
-
-    let restore = setns(host_netns.as_fd(), CloneFlags::CLONE_NEWNET);
-    drop(host_netns);
-    restore_host_netns_or_abort(result, restore)
-}
-
-fn open_netns_file_blocking(path: String) -> Result<std::fs::File> {
-    std::fs::File::open(&path).with_context(|| format!("Failed to open netns path {}", path))
-}
-
-fn netns_path_usable_blocking(path: String) -> bool {
-    std::fs::File::open(path).is_ok()
 }
 
 #[cfg(test)]
@@ -1487,70 +1217,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn real_adapter_exhaustion_reclaims_stale_row_and_retries_once() {
-        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
-            klights_supervisor::TaskCategoryConfig::default(),
-        ));
-        let backend = crate::datastore::node_local::selector::open_node_local(
-            crate::datastore::backend_kind::BackendKind::Sqlite,
-            None,
-            supervisor,
-            None,
-            "sqlite:cni-real-adapter-stale-reclaim",
-        )
-        .await
-        .unwrap();
-        let adapter = Arc::new(backend);
-        let base = u32::from(Ipv4Addr::new(10, 42, 91, 0));
-        let stale_pod = klights_types::PodIdentity::new("default", "stale", "uid-stale");
-        let stale = adapter
-            .reserve_ip_and_insert_network(
-                PodNetworkAllocationRequest::try_new(
-                    "sandbox-stale",
-                    stale_pod,
-                    base,
-                    4,
-                    "veth-stale",
-                    "/run/netns/stale",
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(stale.ip_int(), base + 2);
-
-        let winner_pod = klights_types::PodIdentity::new("default", "winner", "uid-winner");
-        let winner = allocate_ip_with_reclaim(
-            adapter.as_ref(),
-            adapter.as_ref(),
-            adapter.as_ref(),
-            "sandbox-winner",
-            &winner_pod,
-            base,
-            4,
-            "veth-winner",
-            "/run/netns/winner",
-        )
-        .await
-        .expect("typed exhaustion must trigger stale-row reclaim and one retry");
-        assert_eq!(winner.1, base + 2);
-        assert!(
-            adapter
-                .get_network_for_sandbox(SandboxKey::try_new("sandbox-stale").unwrap())
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            adapter
-                .get_network_for_sandbox(SandboxKey::try_new("sandbox-winner").unwrap())
-                .await
-                .unwrap()
-                .is_some()
-        );
-    }
-
     #[test]
     fn test_neighbour_delete_message_targets_bridge_and_pod_ip() {
         let pod_ip = Ipv4Addr::new(10, 43, 0, 223);
@@ -1598,7 +1264,7 @@ mod tests {
         let res = validate_existing_allocation_netns(
             &inspector,
             &test_task_supervisor(),
-            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &klights_supervisor::FileProcessExecutor::new(Arc::new(test_task_supervisor())),
             "/definitely/missing/netns/path",
             Ipv4Addr::new(10, 43, 0, 10),
             24,
@@ -1619,7 +1285,7 @@ mod tests {
         let res = validate_existing_allocation_netns(
             &inspector,
             &test_task_supervisor(),
-            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &klights_supervisor::FileProcessExecutor::new(Arc::new(test_task_supervisor())),
             "/proc/self/ns/net",
             Ipv4Addr::new(10, 43, 0, 11),
             24,
@@ -1642,7 +1308,7 @@ mod tests {
         let res = validate_existing_allocation_netns(
             &inspector,
             &test_task_supervisor(),
-            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &klights_supervisor::FileProcessExecutor::new(Arc::new(test_task_supervisor())),
             "/proc/self/ns/net",
             Ipv4Addr::new(10, 43, 0, 12),
             24,

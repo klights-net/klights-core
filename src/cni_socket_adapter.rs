@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
-use crate::cni_plugin::{CniSocketFilesystem, CniSocketFuture, CniSocketPath};
+use klights_networking::cni_plugin::{
+    CniSocketError, CniSocketFilesystem, CniSocketFuture, CniSocketPath,
+};
 
 pub(crate) struct RootCniSocketFilesystem {
     file_process: klights_supervisor::FileProcessExecutor,
@@ -29,7 +31,10 @@ impl CniSocketFilesystem for RootCniSocketFilesystem {
             if let Some(parent) = path.parent() {
                 klights_supervisor::runtime_fs::create_dir_all_async(&self.file_process, parent)
                     .await
-                    .with_context(|| format!("failed to create {}", parent.display()))?;
+                    .with_context(|| format!("failed to create {}", parent.display()))
+                    .map_err(|error| {
+                        CniSocketError::new("create parent directory", error.to_string())
+                    })?;
             }
             let _ = klights_supervisor::runtime_fs::remove_file_if_exists_async(
                 &self.file_process,
@@ -38,6 +43,7 @@ impl CniSocketFilesystem for RootCniSocketFilesystem {
             .await;
             tokio::net::UnixListener::bind(path)
                 .with_context(|| format!("failed to bind {}", path.display()))
+                .map_err(|error| CniSocketError::new("bind listener", error.to_string()))
         })
     }
 
@@ -50,6 +56,7 @@ impl CniSocketFilesystem for RootCniSocketFilesystem {
             )
             .await
             .map(|_| ())
+            .map_err(|error| CniSocketError::new("remove socket", error.to_string()))
         })
     }
 }

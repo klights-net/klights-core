@@ -1,27 +1,17 @@
 pub mod boot;
-pub mod cleanup;
-pub mod cni;
+#[cfg(test)]
+mod cni_integration_tests;
 pub mod config;
-pub mod dataplane_health;
-pub mod device_state;
-pub mod netfilter;
-pub mod netns_sync;
 pub mod plane;
-pub mod pod_endpoint_resolver;
-pub mod pod_network_events;
-pub mod rootless;
-pub mod rootless_plane;
-/// Concrete service-routing internals do not own a second public hostPort DTO;
-/// callers use `klights_network_api::HostPortBinding`.
-///
-/// ```compile_fail,E0432
-/// use klights::networking::service_routing::HostPortSpec;
-/// ```
-pub mod service_routing;
-pub(crate) mod subnet_allocator;
+#[cfg(test)]
+mod pod_endpoint_resolver_integration_tests;
+#[cfg(test)]
+mod rootless_plane_integration_tests;
+#[cfg(test)]
+#[path = "service_routing/tests.rs"]
+mod service_routing_tests;
 #[cfg(test)]
 pub mod test_support;
-pub mod types;
 
 #[cfg(test)]
 mod contract_conformance_tests {
@@ -34,34 +24,34 @@ mod contract_conformance_tests {
     #[test]
     fn concrete_network_adapters_implement_focused_ports() {
         assert_datapath::<super::NetworkPlane>();
-        assert_peer_router::<super::NetworkPlane>();
-        assert_datapath::<super::RootlessNetworkPlane>();
-        assert_peer_router::<super::RootlessNetworkPlane>();
-        assert_service_router::<super::service_routing::NftServiceRouter>();
-        assert_endpoint_resolver::<super::SqlitePodEndpointResolver>();
-        assert_endpoint_source::<super::SqlitePodEndpointResolver>();
+        assert_peer_router::<klights_networking::RootPeerDataplane>();
+        assert_datapath::<klights_networking::rootless::RootlessNetworkPlane>();
+        assert_peer_router::<klights_networking::rootless::RootlessNetworkPlane>();
+        assert_service_router::<klights_networking::service_routing::NftServiceRouter>();
+        assert_endpoint_resolver::<klights_networking::StorePodEndpointResolver>();
+        assert_endpoint_source::<klights_networking::StorePodEndpointResolver>();
     }
 }
-pub mod wireguard;
 
 use anyhow::Context;
 use std::sync::Arc;
 
 pub use boot::NetworkBoot;
-pub use cleanup::NetworkCleanup;
 pub use config::{NetworkBootConfig, NetworkCleanupConfig, NetworkMode};
+pub use klights_networking::{BridgeName, NetworkCleanup};
 pub use plane::NetworkPlane;
-pub use pod_endpoint_resolver::SqlitePodEndpointResolver;
-pub use rootless_plane::RootlessNetworkPlane;
-pub use types::BridgeName;
 
 /// Historical pod-link MTU used when encryption is disabled.
 pub const POD_OVERLAY_MTU: u32 = 1450;
 
-pub fn pod_link_mtu_for_encryption(encryption: wireguard::DataplaneEncryption) -> u32 {
+pub fn pod_link_mtu_for_encryption(
+    encryption: klights_networking::wireguard::DataplaneEncryption,
+) -> u32 {
     match encryption {
-        wireguard::DataplaneEncryption::Enabled => wireguard::WIREGUARD_MTU,
-        wireguard::DataplaneEncryption::Disabled => POD_OVERLAY_MTU,
+        klights_networking::wireguard::DataplaneEncryption::Enabled => {
+            klights_networking::wireguard::WIREGUARD_MTU
+        }
+        klights_networking::wireguard::DataplaneEncryption::Disabled => POD_OVERLAY_MTU,
     }
 }
 
@@ -144,38 +134,6 @@ impl Network {
     }
 }
 
-pub async fn get_link_index(handle: &rtnetlink::Handle, name: &str) -> anyhow::Result<u32> {
-    use futures::stream::TryStreamExt;
-
-    let mut links = handle.link().get().match_name(name.to_owned()).execute();
-    if let Some(link) = links
-        .try_next()
-        .await
-        .context("failed to list links while resolving interface index")?
-    {
-        Ok(link.header.index)
-    } else {
-        anyhow::bail!("Interface '{}' not found", name)
-    }
-}
-
-pub fn is_nl_eexist_error(err: &rtnetlink::Error) -> bool {
-    match err {
-        rtnetlink::Error::NetlinkError(e) => {
-            if let Some(code) = e.code {
-                let code = code.get();
-                code == libc::EEXIST || code == -(libc::EEXIST)
-            } else {
-                false
-            }
-        }
-        // Other variants are not expected for add operations and are treated
-        // as non-EEXIST failures. We intentionally avoid string matching on
-        // the fallback/error path.
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod network_facade_tests {
     use super::*;
@@ -183,15 +141,19 @@ mod network_facade_tests {
     #[test]
     fn pod_link_mtu_tracks_selected_cross_node_dataplane() {
         assert_eq!(
-            pod_link_mtu_for_encryption(wireguard::DataplaneEncryption::Enabled),
-            wireguard::WIREGUARD_MTU
+            pod_link_mtu_for_encryption(
+                klights_networking::wireguard::DataplaneEncryption::Enabled
+            ),
+            klights_networking::wireguard::WIREGUARD_MTU
         );
         assert_eq!(
-            pod_link_mtu_for_encryption(wireguard::DataplaneEncryption::Disabled),
+            pod_link_mtu_for_encryption(
+                klights_networking::wireguard::DataplaneEncryption::Disabled
+            ),
             POD_OVERLAY_MTU
         );
         const _: () = assert!(
-            wireguard::WIREGUARD_MTU <= POD_OVERLAY_MTU,
+            klights_networking::wireguard::WIREGUARD_MTU <= POD_OVERLAY_MTU,
             "encrypted pod links must not exceed the lower WireGuard transport MTU"
         );
     }

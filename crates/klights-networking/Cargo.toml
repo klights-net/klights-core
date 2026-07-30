@@ -8,5 +8,44 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+test-support = []
+
 [lints]
 workspace = true
+
+[dependencies]
+klights-types = { workspace = true }
+klights-network-api = { workspace = true }
+klights-node-store = { workspace = true }
+klights-leader-api = { workspace = true }
+klights-supervisor = { workspace = true }
+anyhow = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+futures = { workspace = true }
+genetlink = { workspace = true }
+libc = { workspace = true }
+mnl = { workspace = true }
+netlink-packet-core = { workspace = true }
+netlink-packet-core-08 = { workspace = true }
+netlink-packet-generic-04 = { workspace = true }
+netlink-packet-route = { workspace = true }
+netlink-packet-wireguard = { workspace = true }
+netlink-sys = { workspace = true }
+nix = { workspace = true }
+nftnl = { workspace = true }
+rand_core = { workspace = true }
+rtnetlink = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+x25519-dalek = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+trybuild = { workspace = true }

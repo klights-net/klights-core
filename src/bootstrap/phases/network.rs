@@ -21,7 +21,7 @@ pub struct NetworkPhase {
     pub cri_for_pod_watcher: Option<crate::kubelet::CriClient>,
     pub cri_for_api: Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
     pub cni_readiness: crate::kubelet::cni_readiness::CniReadiness,
-    pub dataplane_health: networking::dataplane_health::DataplaneHealth,
+    pub dataplane_health: klights_networking::dataplane_health::DataplaneHealth,
     pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
     pub pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
     pub pod_endpoint_store: Arc<dyn klights_node_store::PodEndpointStore>,
@@ -53,7 +53,7 @@ fn assignment_bus_views() -> (
     Arc<dyn klights_network_api::PodNetworkAssignmentPublisher>,
     Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
 ) {
-    let bus = Arc::new(crate::networking::pod_network_events::PodNetworkAssignmentBus::new());
+    let bus = Arc::new(klights_networking::PodNetworkAssignmentBus::new());
     (bus.clone(), bus)
 }
 
@@ -120,10 +120,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         }
     };
 
-    let boot_peering: Arc<dyn klights_network_api::PeerRouter> = match &network_boot {
-        networking::NetworkBoot::Root(p) => p.clone(),
-        networking::NetworkBoot::Rootless(p) => p.clone(),
-    };
+    let boot_peering = network_boot.peer_router();
     {
         let mut applied = std::collections::HashMap::new();
         if let Err(e) = crate::controllers::node_subnet::sync_peer_routes_with_ports(
@@ -145,7 +142,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     let service_cidr = klights_types::ClusterCidr::parse(&config.service_cidr)
         .map_err(|e| anyhow::anyhow!("bad service_cidr '{}': {}", config.service_cidr, e))?;
 
-    let endpoint_adapter = Arc::new(networking::SqlitePodEndpointResolver::new(
+    let endpoint_adapter = Arc::new(klights_networking::StorePodEndpointResolver::new(
         pod_endpoints.clone(),
         pod_endpoint_events,
         network_topology.clone(),
@@ -161,11 +158,11 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
             .context("prepare rootless bridge before service-router sysctls")?;
     }
 
-    let srm = networking::service_routing::ServiceRoutingMode::new();
+    let srm = klights_networking::service_routing::ServiceRoutingMode::new();
     let services: Arc<dyn klights_network_api::ServiceRouter> =
-        networking::service_routing::NftServiceRouter::boot_with_defaults(
-            networking::service_routing::NftServiceRouterDefaultBoot::new(
-                networking::service_routing::NftServiceRouterStores::new(
+        klights_networking::service_routing::NftServiceRouter::boot_with_defaults(
+            klights_networking::service_routing::NftServiceRouterDefaultBoot::new(
+                klights_networking::service_routing::NftServiceRouterStores::new(
                     Arc::new(
                         crate::networking_state_adapter::LeaderRoutingStateAdapter::new(
                             resource_query,
@@ -174,12 +171,12 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
                     watch,
                     endpoint_source,
                 ),
-                networking::service_routing::NftServiceRouterTableConfig::new(
+                klights_networking::service_routing::NftServiceRouterTableConfig::new(
                     &config.node_name,
                     &config.containerd_namespace,
                     &config.bridge_name,
                 ),
-                networking::service_routing::NftServiceRouterNetworkConfig::new(
+                klights_networking::service_routing::NftServiceRouterNetworkConfig::new(
                     network_boot.local_pod_subnet(),
                     cluster_cidr,
                     service_cidr,
@@ -196,10 +193,11 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         Arc<dyn klights_network_api::Datapath>,
         Arc<dyn klights_network_api::PeerRouter>,
     ) = match (&network_boot, node_mode) {
-        (networking::NetworkBoot::Root(p), _) => (p.clone(), p.clone()),
-        (networking::NetworkBoot::Rootless(p), _) => (p.clone(), p.clone()),
+        (networking::NetworkBoot::Root(p), _) => (p.clone(), network_boot.peer_router()),
+        (networking::NetworkBoot::Rootless(p), _) => (p.clone(), network_boot.peer_router()),
     };
 
+    let cni_datapath = datapath.clone();
     let network = Arc::new(networking::Network::new(
         datapath,
         peering,
@@ -210,8 +208,8 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     // CNI RPC
     let cni_rpc_token = CancellationToken::new();
     let cni_rpc_handle = {
-        let state = Arc::new(crate::cni_plugin::CniRpcState {
-            socket_path: crate::cni_plugin::CniSocketPath::try_new(
+        let state = Arc::new(klights_networking::cni_plugin::CniRpcState {
+            socket_path: klights_networking::cni_plugin::CniSocketPath::try_new(
                 crate::paths::cni_rpc_socket_path(&config.containerd_namespace)
                     .to_string_lossy()
                     .into_owned(),
@@ -219,7 +217,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
             socket_filesystem: crate::cni_socket_adapter::RootCniSocketFilesystem::shared(
                 klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
             ),
-            network: network.clone(),
+            datapath: cni_datapath,
             task_supervisor: supervisor.clone(),
         });
         let cancel = cni_rpc_token.clone();
@@ -228,7 +226,9 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
                 klights_supervisor::TaskCategory::Background,
                 "runtime_cni_rpc_server",
                 async move {
-                    if let Err(e) = crate::cni_plugin::run_rpc_server(state, cancel).await {
+                    if let Err(e) =
+                        klights_networking::cni_plugin::run_rpc_server(state, cancel).await
+                    {
                         tracing::warn!("CNI RPC error: {}", e);
                     }
                 },

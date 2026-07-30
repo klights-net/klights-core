@@ -1,7 +1,7 @@
 // Native nftables service routing for klights.
 //
 // Owns the `inet <containerd_namespace>` table. All rule writes go through
-// [`crate::networking::netfilter`] over a persistent netlink socket —
+// [`crate::netfilter`] over a persistent netlink socket —
 // no `iptables` / `nft` binary fork on the datapath.
 //
 // Table layout (mirrors the kube-proxy nftables-mode design from
@@ -638,6 +638,13 @@ fn service_inventory_watch_target_requires_full_sync(target: ServiceRoutingWatch
     )
 }
 
+fn policy_watch_target_triggers_sync(target: ServiceRoutingWatchTarget) -> bool {
+    matches!(
+        (target.api_version, target.kind),
+        ("networking.k8s.io/v1", "NetworkPolicy") | ("v1", "Pod") | ("v1", "Namespace")
+    )
+}
+
 enum ServiceRoutingWatchItem {
     Event {
         target: ServiceRoutingWatchTarget,
@@ -758,7 +765,7 @@ fn apply_service_routing_watch_event_to_inventory(
     let object = event.resource().data.as_ref();
 
     match (target.api_version, target.kind) {
-        ("networking.k8s.io/v1", "NetworkPolicy") | ("v1", "Pod") | ("v1", "Namespace") => {
+        _ if policy_watch_target_triggers_sync(target) => {
             Ok(Some(super::inventory::InventoryApply::Applied))
         }
         ("v1", "Service") => {
@@ -1217,12 +1224,8 @@ async fn ensure_sysctl_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::Resource;
     use klights_leader_api::{
-        CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderCacheReadiness,
-        LeaderResourceQuery, LeaderWatch, LeaderWatchError, LeaderWatchFuture, ResourceEvent,
-        ResourceGetRequest, ResourceListRequest, ResourceListResult, ResourceQueryError,
-        ResourceQueryFuture, WatchEventType, WatchRequest, WatchStream,
+        LeaderWatch, LeaderWatchError, LeaderWatchFuture, ResourceEvent, WatchRequest, WatchStream,
     };
     use std::sync::{
         Arc, Mutex,
@@ -1230,22 +1233,6 @@ mod tests {
     };
     use tokio::sync::Notify;
 
-    macro_rules! impl_unavailable_cache_readiness {
-        ($client:ty) => {
-            impl LeaderCacheReadiness for $client {
-                fn wait_cache_ready(
-                    &self,
-                    scope: CacheReadinessRequest,
-                ) -> CacheReadinessFuture<'_> {
-                    Box::pin(async move {
-                        Err(CacheReadinessError::unavailable(format!(
-                            "unexpected wait_cache_ready for {scope:?}"
-                        )))
-                    })
-                }
-            }
-        };
-    }
     use tokio_util::sync::CancellationToken;
 
     fn test_service_table(
@@ -1385,38 +1372,6 @@ mod tests {
         assert!(source.subscriptions.load(Ordering::SeqCst) >= 2);
     }
 
-    macro_rules! impl_unexpected_resource_query {
-        ($client:ty) => {
-            impl LeaderResourceQuery for $client {
-                fn get_resource(
-                    &self,
-                    request: ResourceGetRequest,
-                ) -> ResourceQueryFuture<'_, Option<Resource>> {
-                    Box::pin(async move {
-                        Err(ResourceQueryError::query_failed(format!(
-                            "unexpected get_resource for {:?}",
-                            request.key()
-                        )))
-                    })
-                }
-
-                fn list_resources(
-                    &self,
-                    request: ResourceListRequest,
-                ) -> ResourceQueryFuture<'_, ResourceListResult> {
-                    Box::pin(async move {
-                        Err(ResourceQueryError::query_failed(format!(
-                            "unexpected list_resources for {request:?}"
-                        )))
-                    })
-                }
-            }
-        };
-    }
-
-    impl_unexpected_resource_query!(WatchOnlyLeaderApiClient);
-    impl_unexpected_resource_query!(ReopeningLeaderApiClient);
-
     impl ReopeningLeaderApiClient {
         async fn wait_for_opened(&self, expected: usize) {
             loop {
@@ -1437,72 +1392,22 @@ mod tests {
 
     #[test]
     fn policy_only_watch_targets_trigger_sync_without_service_inventory_identity() {
-        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
-            klights_supervisor::TaskCategoryConfig::default(),
-        ));
-        let table = test_service_table(supervisor);
-        let cases = [
-            (
-                ServiceRoutingWatchTarget {
-                    api_version: "networking.k8s.io/v1",
-                    kind: "NetworkPolicy",
-                },
-                serde_json::json!({
-                    "apiVersion": "networking.k8s.io/v1",
-                    "kind": "NetworkPolicy",
-                    "metadata": {
-                        "namespace": "policy-ns",
-                        "name": "allow-backend",
-                        "resourceVersion": "7"
-                    }
-                }),
-            ),
-            (
-                ServiceRoutingWatchTarget {
-                    api_version: "v1",
-                    kind: "Pod",
-                },
-                serde_json::json!({
-                    "apiVersion": "v1",
-                    "kind": "Pod",
-                    "metadata": {
-                        "namespace": "policy-ns",
-                        "name": "backend",
-                        "resourceVersion": "8"
-                    }
-                }),
-            ),
-            (
-                ServiceRoutingWatchTarget {
-                    api_version: "v1",
-                    kind: "Namespace",
-                },
-                serde_json::json!({
-                    "apiVersion": "v1",
-                    "kind": "Namespace",
-                    "metadata": {
-                        "name": "policy-ns",
-                        "resourceVersion": "9"
-                    }
-                }),
-            ),
-        ];
-
-        for (target, object) in cases {
-            let result = apply_service_routing_watch_event_to_inventory(
-                table.as_ref(),
-                target,
-                ResourceEvent::try_new(
-                    WatchEventType::Modified,
-                    Resource::try_from_data(Arc::new(object)).expect("valid watch object"),
-                    None,
-                )
-                .expect("valid focused watch event"),
-            )
-            .expect("policy-only watch target must not poison service inventory sync");
-            assert_eq!(
-                result,
-                Some(crate::networking::service_routing::inventory::InventoryApply::Applied),
+        for target in [
+            ServiceRoutingWatchTarget {
+                api_version: "networking.k8s.io/v1",
+                kind: "NetworkPolicy",
+            },
+            ServiceRoutingWatchTarget {
+                api_version: "v1",
+                kind: "Pod",
+            },
+            ServiceRoutingWatchTarget {
+                api_version: "v1",
+                kind: "Namespace",
+            },
+        ] {
+            assert!(
+                policy_watch_target_triggers_sync(target),
                 "{}/{} event should wake network-policy reconcile without requiring a Service inventory key",
                 target.api_version,
                 target.kind
@@ -1525,9 +1430,6 @@ mod tests {
         }
     }
 
-    impl_unavailable_cache_readiness!(WatchOnlyLeaderApiClient);
-    crate::control_plane::client::impl_unavailable_leader_pod_effects!(WatchOnlyLeaderApiClient);
-
     impl LeaderWatch for ReopeningLeaderApiClient {
         fn watch_resources(&self, req: WatchRequest) -> LeaderWatchFuture<'_> {
             self.watches_opened.fetch_add(1, Ordering::SeqCst);
@@ -1549,9 +1451,6 @@ mod tests {
             })
         }
     }
-
-    impl_unavailable_cache_readiness!(ReopeningLeaderApiClient);
-    crate::control_plane::client::impl_unavailable_leader_pod_effects!(ReopeningLeaderApiClient);
 
     #[tokio::test]
     async fn service_routing_watch_worker_requests_full_sync_after_watches_open() {
@@ -1608,6 +1507,18 @@ mod tests {
         );
     }
 
+    struct EmptyRoutingState;
+
+    impl RoutingStateSource for EmptyRoutingState {
+        fn service_routing_snapshot(&self) -> RoutingStateFuture<'_, ServiceRoutingSnapshot> {
+            Box::pin(async { Ok(ServiceRoutingSnapshot::default()) })
+        }
+
+        fn network_policy_snapshot(&self) -> RoutingStateFuture<'_, NetworkPolicySnapshot> {
+            Box::pin(async { Ok(NetworkPolicySnapshot::default()) })
+        }
+    }
+
     #[test]
     fn request_services_sync_marks_next_coalesced_pass_as_full_sync() {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
@@ -1616,11 +1527,7 @@ mod tests {
         let force_full_sync = Arc::new(AtomicBool::new(false));
         let router = NftServiceRouter {
             table: test_service_table(supervisor.clone()),
-            routing_state: Arc::new(
-                crate::networking_state_adapter::LeaderRoutingStateAdapter::new(Arc::new(
-                    WatchOnlyLeaderApiClient::default(),
-                )),
-            ),
+            routing_state: Arc::new(EmptyRoutingState),
             notify: Arc::new(Notify::new()),
             force_full_sync: force_full_sync.clone(),
             cancel: CancellationToken::new(),
@@ -1751,8 +1658,6 @@ mod tests {
         opened_notify: Notify,
     }
 
-    impl_unexpected_resource_query!(ErroringLeaderApiClient);
-
     impl ErroringLeaderApiClient {
         async fn wait_for_opened(&self, expected: usize) {
             loop {
@@ -1788,9 +1693,6 @@ mod tests {
             })
         }
     }
-
-    impl_unavailable_cache_readiness!(ErroringLeaderApiClient);
-    crate::control_plane::client::impl_unavailable_leader_pod_effects!(ErroringLeaderApiClient);
 
     /// Regression test for the per-watch reconnect introduced in f46660f: an
     /// erroring watch stream must NOT leak duplicate watches (one new open per

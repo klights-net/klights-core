@@ -6,10 +6,15 @@ use super::network_policy::{
 use super::prelude::*;
 use super::service_rules::select_authoritative_service_spec;
 use super::*;
-use crate::sync_lock::lock_recover;
 use nftnl::expr::Expression;
 use nftnl::nftnl_sys as sys;
 use std::ptr;
+
+fn lock_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 const IP_CT_DIR_ORIGINAL: u32 = 0;
 const NFT_CT_PROTOCOL: u32 = 10;
@@ -2183,12 +2188,7 @@ mod remote_endpoint_failure_tests {
             .remove_remote_pod_endpoint(replacement.pod_ip)
             .await
             .expect_err("first incremental removal must expose flush failure");
-        assert!(
-            table
-                .remote_pod_snapshot()
-                .iter()
-                .any(|spec| *spec == replacement)
-        );
+        assert!(table.remote_pod_snapshot().contains(&replacement));
         assert_eq!(table.test_remote_entry_ptr(unrelated.pod_ip), unrelated_ptr);
 
         table
@@ -2217,7 +2217,7 @@ impl Verdict {
 #[cfg(test)]
 mod kernel_compat_tests {
     use super::*;
-    use crate::networking::netfilter::{Batch, Netfilter};
+    use crate::netfilter::{Batch, Netfilter};
     use klights_types::{ClusterCidr, PodSubnet};
     use std::process::Command;
     use std::sync::Arc;

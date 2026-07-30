@@ -1,4 +1,4 @@
-//! Strongly-typed network primitives.
+//! Strongly typed concrete-networking primitives.
 //!
 //! Replaces string-passing for network identifiers with newtypes that
 //! enforce validation at parse time and provide type-safe APIs.
@@ -6,6 +6,26 @@
 use std::fmt;
 
 const IFNAMSIZ: usize = 15;
+const MIN_POD_LINK_MTU: u32 = 576;
+const MAX_POD_LINK_MTU: u32 = 65_535;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PodLinkMtu(u32);
+
+impl PodLinkMtu {
+    pub fn try_new(value: u32) -> Result<Self, String> {
+        if !(MIN_POD_LINK_MTU..=MAX_POD_LINK_MTU).contains(&value) {
+            return Err(format!(
+                "pod link MTU must be in {MIN_POD_LINK_MTU}..={MAX_POD_LINK_MTU}"
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
 
 /// A bridge interface name (e.g., "klights").
 ///
@@ -96,6 +116,14 @@ mod tests {
     use klights_types::{ClusterCidr, NodeName, PodSubnet};
 
     use super::*;
+
+    #[test]
+    fn pod_link_mtu_rejects_raw_kernel_invalid_values() {
+        assert!(PodLinkMtu::try_new(0).is_err());
+        assert!(PodLinkMtu::try_new(575).is_err());
+        assert!(PodLinkMtu::try_new(65_536).is_err());
+        assert_eq!(PodLinkMtu::try_new(1280).unwrap().get(), 1280);
+    }
 
     // PodSubnet ---------------------------------------------------------
     #[test]

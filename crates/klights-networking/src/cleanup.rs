@@ -79,6 +79,50 @@ fn inspection_reports_not_found(output: &std::process::Output) -> bool {
         || stderr.contains("no such file or directory")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkCleanupKind {
+    Root,
+    Rootless,
+}
+
+/// Validated, backend-neutral construction inputs for network cleanup.
+#[derive(Clone, Debug)]
+pub struct NetworkCleanupArgs {
+    kind: NetworkCleanupKind,
+    bridge_name: String,
+    wireguard_device: String,
+    nft_table_name: String,
+    inside_rootlesskit: bool,
+}
+
+impl NetworkCleanupArgs {
+    pub fn try_new(
+        kind: NetworkCleanupKind,
+        bridge_name: impl Into<String>,
+        wireguard_device: impl Into<String>,
+        nft_table_name: impl Into<String>,
+        inside_rootlesskit: bool,
+    ) -> Result<Self, String> {
+        let bridge_name = bridge_name.into();
+        crate::BridgeName::parse(&bridge_name)?;
+        let wireguard_device = wireguard_device.into();
+        if wireguard_device.is_empty() || wireguard_device.len() > 15 {
+            return Err("wireguard device must contain 1..=15 bytes".to_string());
+        }
+        let nft_table_name = nft_table_name.into();
+        if nft_table_name.trim().is_empty() {
+            return Err("nft table name must not be empty".to_string());
+        }
+        Ok(Self {
+            kind,
+            bridge_name,
+            wireguard_device,
+            nft_table_name,
+            inside_rootlesskit,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 enum NetworkCleanupMode {
     Root {
@@ -106,7 +150,7 @@ struct CniCleanupScope {
 /// Unlike `Datapath`, this does not depend on rtnetlink handles, CNI state, or
 /// a successful `NetworkPlane::boot()`. It only captures mode + static config,
 /// which lets cleanup run even after partial network boot failure while still
-/// keeping direct network operations inside `src/networking/`.
+/// keeping direct network operations inside the `klights-networking` package.
 #[derive(Clone)]
 pub struct NetworkCleanup {
     mode: NetworkCleanupMode,
@@ -126,24 +170,24 @@ impl std::fmt::Debug for NetworkCleanup {
 }
 
 impl NetworkCleanup {
-    /// Build cleanup from immutable startup mode/config. Must be called before
-    /// network boot so failure paths still have a networking-owned fallback.
-    pub fn from_config(
-        cfg: &crate::networking::NetworkCleanupConfig,
+    /// Build cleanup from validated immutable startup inputs. Must be called
+    /// before network boot so failure paths retain a networking-owned fallback.
+    pub fn new(
+        args: NetworkCleanupArgs,
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
-        match cfg.mode() {
-            crate::networking::NetworkMode::Root => Self::root_with_runtime(
-                cfg.bridge_name(),
-                cfg.wireguard_device(),
-                cfg.nft_table_name(),
+        match args.kind {
+            NetworkCleanupKind::Root => Self::root_with_runtime(
+                args.bridge_name,
+                args.wireguard_device,
+                args.nft_table_name,
                 file_process,
             ),
-            crate::networking::NetworkMode::Rootless => Self::rootless_with_cni(
-                cfg.bridge_name(),
-                cfg.wireguard_device(),
-                cfg.nft_table_name(),
-                cfg.inside_rootlesskit(),
+            NetworkCleanupKind::Rootless => Self::rootless_with_cni(
+                args.bridge_name,
+                args.wireguard_device,
+                args.nft_table_name,
+                args.inside_rootlesskit,
                 file_process,
             ),
         }
@@ -158,7 +202,7 @@ impl NetworkCleanup {
         ));
         Self::root_with_runtime(
             bridge_name.clone(),
-            crate::networking::wireguard::DEFAULT_WIREGUARD_DEVICE.to_string(),
+            crate::wireguard::DEFAULT_WIREGUARD_DEVICE.to_string(),
             bridge_name,
             klights_supervisor::FileProcessExecutor::new(supervisor),
         )
@@ -998,10 +1042,24 @@ fn cni_netns_basename(raw: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kubelet::file_blocking::process_test_support::output;
-    use crate::networking::{NetworkCleanupConfig, NetworkMode};
     use std::collections::VecDeque;
+    use std::os::unix::process::ExitStatusExt;
     use std::sync::Mutex;
+
+    fn output(status: i32, stdout: &[u8], stderr: &[u8]) -> std::process::Output {
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(status << 8),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    fn test_file_process_executor() -> klights_supervisor::FileProcessExecutor {
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        klights_supervisor::FileProcessExecutor::new(supervisor)
+    }
 
     struct FakeProcessOutputRunner {
         results: Mutex<VecDeque<Result<std::process::Output>>>,
@@ -1153,23 +1211,15 @@ mod tests {
 
     #[test]
     fn root_cleanup_plans_bridge_wireguard_nft_and_cni_artifacts() {
-        let mut cfg = crate::KlightsConfig::test_default();
-        cfg.bridge_name = "klights".to_string();
-        cfg.containerd_namespace = "klights".to_string();
-        cfg.wireguard_device = "klights.wg".to_string();
-
-        let focused = NetworkCleanupConfig::try_new(
-            NetworkMode::Root,
-            cfg.bridge_name.clone(),
-            cfg.wireguard_device.clone(),
-            cfg.containerd_namespace.clone(),
+        let args = NetworkCleanupArgs::try_new(
+            NetworkCleanupKind::Root,
+            "klights",
+            "klights.wg",
+            "klights",
             false,
         )
         .unwrap();
-        let cleanup = NetworkCleanup::from_config(
-            &focused,
-            crate::kubelet::file_blocking::test_file_process_executor(),
-        );
+        let cleanup = NetworkCleanup::new(args, test_file_process_executor());
 
         assert_eq!(cleanup.bridge_name_for_test(), Some("klights"));
         assert_eq!(
@@ -1316,23 +1366,15 @@ mod tests {
 
     #[test]
     fn rootless_cleanup_handle_targets_current_user_netns_resources() {
-        let mut cfg = crate::KlightsConfig::test_default();
-        cfg.bridge_name = "klights".to_string();
-        cfg.containerd_namespace = "klights".to_string();
-        cfg.wireguard_device = "klights.wg".to_string();
-
-        let focused = NetworkCleanupConfig::try_new(
-            NetworkMode::Rootless,
-            cfg.bridge_name.clone(),
-            cfg.wireguard_device.clone(),
-            cfg.containerd_namespace.clone(),
+        let args = NetworkCleanupArgs::try_new(
+            NetworkCleanupKind::Rootless,
+            "klights",
+            "klights.wg",
+            "klights",
             true,
         )
         .unwrap();
-        let cleanup = NetworkCleanup::from_config(
-            &focused,
-            crate::kubelet::file_blocking::test_file_process_executor(),
-        );
+        let cleanup = NetworkCleanup::new(args, test_file_process_executor());
 
         assert_eq!(
             cleanup.bridge_name_for_test(),

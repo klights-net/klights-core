@@ -87,7 +87,7 @@ pub fn validate_worker_dataplane_ingress(
     if !matches!(role, NodeRole::Worker { .. }) {
         return Ok(());
     }
-    if config.dataplane_encryption != crate::networking::wireguard::DataplaneEncryption::Enabled {
+    if config.dataplane_encryption != klights_networking::wireguard::DataplaneEncryption::Enabled {
         return Ok(());
     }
     if config.worker_dataplane_no_ingress {

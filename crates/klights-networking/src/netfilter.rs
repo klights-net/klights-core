@@ -1,6 +1,6 @@
 //! Thin wrapper over `nftnl` + `mnl` for klights service-routing rule management.
 //!
-//! Exposes only what [`crate::networking::service_routing`] needs to talk to
+//! Exposes only what [`crate::service_routing`] needs to talk to
 //! the kernel `nf_tables` subsystem over a persistent netlink socket:
 //!
 //! - [`Netfilter::ensure_table`]          — idempotent table create

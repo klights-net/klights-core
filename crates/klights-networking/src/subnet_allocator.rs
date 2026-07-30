@@ -1,3 +1,5 @@
+//! Focused leader-port client for allocating the local Pod CIDR.
+
 use anyhow::{Context, Result};
 use klights_leader_api::{
     LeaderNetworkTopologyQuery, LeaderNodeSubnetAllocation, NodeSubnetAllocationError,
@@ -25,7 +27,7 @@ impl Default for NodeSubnetAllocationRetryPolicy {
     }
 }
 
-pub(crate) struct NodeSubnetAllocator {
+pub struct NodeSubnetAllocator {
     allocation: Arc<dyn LeaderNodeSubnetAllocation>,
     topology: Arc<dyn LeaderNetworkTopologyQuery>,
     supervisor: Arc<TaskSupervisor>,
@@ -33,7 +35,7 @@ pub(crate) struct NodeSubnetAllocator {
 }
 
 impl NodeSubnetAllocator {
-    pub(crate) fn new(
+    pub fn new(
         allocation: Arc<dyn LeaderNodeSubnetAllocation>,
         topology: Arc<dyn LeaderNetworkTopologyQuery>,
         supervisor: Arc<TaskSupervisor>,
@@ -60,7 +62,7 @@ impl NodeSubnetAllocator {
         }
     }
 
-    pub(crate) async fn allocate(
+    pub async fn allocate(
         &self,
         node_name: &str,
         cluster_cidr: &str,
@@ -99,7 +101,7 @@ impl NodeSubnetAllocator {
         }
     }
 
-    pub(crate) async fn allocate_or_reuse_existing(
+    pub async fn allocate_or_reuse_existing(
         &self,
         node_name: &str,
         cluster_cidr: &str,
@@ -147,14 +149,12 @@ fn is_retryable_allocation_error(err: &NodeSubnetAllocationError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_plane::client::focused_node_subnet;
     use klights_leader_api::{
-        NetworkTopologyError, NetworkTopologyFuture, NodeDataplaneQuery, NodeDataplaneResult,
-        NodeSubnetAllocationFuture, NodeSubnetAllocationResult, NodeSubnetResult, PeerSubnetsQuery,
-        PeerSubnetsResult,
+        NetworkNodeMode, NetworkTopologyError, NetworkTopologyFuture, NodeDataplaneQuery,
+        NodeDataplaneResult, NodeSubnet, NodeSubnetAllocationFuture, NodeSubnetAllocationResult,
+        NodeSubnetResult, PeerSubnetsQuery, PeerSubnetsResult,
     };
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
-    use klights_types::{NodeName, PodSubnet};
     use std::collections::VecDeque;
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -163,7 +163,7 @@ mod tests {
 
     #[derive(Clone)]
     enum Outcome {
-        Ok(klights_cluster_store::StoredNodeSubnet),
+        Ok(NodeSubnet),
         Err(NodeSubnetAllocationError),
     }
 
@@ -187,12 +187,12 @@ mod tests {
 
     struct FakeTopologyClient {
         calls: AtomicUsize,
-        row: Mutex<Option<klights_cluster_store::StoredNodeSubnet>>,
+        row: Mutex<Option<NodeSubnet>>,
         error: Option<&'static str>,
     }
 
     impl FakeTopologyClient {
-        fn new(row: Option<klights_cluster_store::StoredNodeSubnet>) -> Self {
+        fn new(row: Option<NodeSubnet>) -> Self {
             Self {
                 calls: AtomicUsize::new(0),
                 row: Mutex::new(row),
@@ -225,8 +225,7 @@ mod tests {
                 if let Some(error) = error {
                     return Err(NetworkTopologyError::query_failed(error));
                 }
-                let focused = row.map(focused_node_subnet).transpose()?;
-                NodeSubnetResult::try_from_wire(request.node_name(), focused.is_some(), focused)
+                NodeSubnetResult::try_from_wire(request.node_name(), row.is_some(), row)
             })
         }
 
@@ -267,10 +266,7 @@ mod tests {
                 .expect("test must provide enough outcomes");
             Box::pin(async move {
                 match outcome {
-                    Outcome::Ok(row) => {
-                        let subnet = focused_node_subnet(row).map_err(|error| {
-                            NodeSubnetAllocationError::corrupt_response(error.to_string())
-                        })?;
+                    Outcome::Ok(subnet) => {
                         NodeSubnetAllocationResult::try_from_wire(request.node_name(), Some(subnet))
                     }
                     Outcome::Err(error) => Err(error),
@@ -279,16 +275,17 @@ mod tests {
         }
     }
 
-    fn subnet_row() -> klights_cluster_store::StoredNodeSubnet {
-        klights_cluster_store::StoredNodeSubnet {
-            node_name: NodeName::parse("node-a").unwrap(),
-            subnet: PodSubnet::parse("10.50.1.0/24").unwrap(),
-            subnet_base_int: u32::from(Ipv4Addr::new(10, 50, 1, 0)),
-            gateway_ip: Ipv4Addr::new(10, 50, 1, 0),
-            node_ip: Ipv4Addr::new(192, 0, 2, 10),
-            mode: crate::controllers::annotations::NodePeerMode::Root,
-            hostport_range: None,
-        }
+    fn subnet_row() -> NodeSubnet {
+        NodeSubnet::try_new(
+            "node-a",
+            "10.50.1.0/24",
+            u32::from(Ipv4Addr::new(10, 50, 1, 0)),
+            Ipv4Addr::new(10, 50, 1, 0),
+            Ipv4Addr::new(192, 0, 2, 10),
+            NetworkNodeMode::Root,
+            None,
+        )
+        .unwrap()
     }
 
     fn test_allocator_with_topology(

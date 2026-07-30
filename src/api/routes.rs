@@ -1104,12 +1104,12 @@ mod status_tests {
         ));
         let (_follower_rx, _follower_session) = replication
             .register_follower(
-                crate::networking::wireguard::DataplanePeerMetadata::try_new(
-                    "replica-1".to_string(),
-                    crate::networking::wireguard::DataplaneMode::Root,
-                    crate::networking::wireguard::DataplaneEncryption::Disabled,
+                klights_leader_api::NetworkDataplane::try_new(
+                    "replica-1",
+                    klights_leader_api::NetworkNodeMode::Root,
+                    klights_leader_api::DataplaneEncryption::Direct,
                     None,
-                    Some("127.0.0.1".to_string()),
+                    "127.0.0.1".parse().unwrap(),
                     None,
                 )
                 .unwrap(),

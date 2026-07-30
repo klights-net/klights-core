@@ -16,13 +16,13 @@ use tokio_util::sync::CancellationToken;
 
 use klights_types::PodSubnet;
 
-const DEFAULT_MTU: u32 = crate::networking::wireguard::WIREGUARD_MTU;
+const DEFAULT_MTU: u32 = crate::wireguard::WIREGUARD_MTU;
 const CLEANUP_RPC_MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 pub struct CniRpcState {
     pub socket_path: CniSocketPath,
     pub socket_filesystem: Arc<dyn CniSocketFilesystem>,
-    pub network: Arc<crate::networking::Network>,
+    pub datapath: Arc<dyn klights_network_api::Datapath>,
     pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
@@ -30,16 +30,25 @@ pub struct CniRpcState {
 pub struct CniSocketPath(Arc<str>);
 
 impl CniSocketPath {
-    pub fn try_new(path: impl Into<String>) -> Result<Self> {
+    pub fn try_new(path: impl Into<String>) -> std::result::Result<Self, CniSocketError> {
         let path = path.into();
         if path.is_empty() {
-            return Err(anyhow!("CNI RPC socket path must not be empty"));
+            return Err(CniSocketError::new(
+                "validate path",
+                "path must not be empty",
+            ));
         }
         if path.as_bytes().contains(&0) {
-            return Err(anyhow!("CNI RPC socket path must not contain NUL"));
+            return Err(CniSocketError::new(
+                "validate path",
+                "path must not contain NUL",
+            ));
         }
         if !std::path::Path::new(&path).is_absolute() {
-            return Err(anyhow!("CNI RPC socket path must be absolute"));
+            return Err(CniSocketError::new(
+                "validate path",
+                "path must be absolute",
+            ));
         }
         Ok(Self(Arc::from(path)))
     }
@@ -49,7 +58,35 @@ impl CniSocketPath {
     }
 }
 
-pub type CniSocketFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CniSocketError {
+    operation: &'static str,
+    detail: Arc<str>,
+}
+
+impl CniSocketError {
+    pub fn new(operation: &'static str, detail: impl Into<Arc<str>>) -> Self {
+        Self {
+            operation,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for CniSocketError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "CNI socket {} failed: {}",
+            self.operation, self.detail
+        )
+    }
+}
+
+impl std::error::Error for CniSocketError {}
+
+pub type CniSocketFuture<'a, T> =
+    Pin<Box<dyn std::future::Future<Output = Result<T, CniSocketError>> + Send + 'a>>;
 
 pub trait CniSocketFilesystem: Send + Sync {
     fn bind_listener(
@@ -531,8 +568,7 @@ async fn handle_request(
             let pod_namespace_for_log = pod_namespace.clone();
             let pod_name_for_log = pod_name.clone();
             let network = state
-                .network
-                .datapath()
+                .datapath
                 .cni_add(klights_network_api::CniAddRequest::try_new(
                     req.container_id.clone(),
                     klights_types::PodIdentity::new(&pod_namespace, &pod_name, &pod_uid),
@@ -553,8 +589,7 @@ async fn handle_request(
         "DEL" => {
             let sandbox_id = klights_network_api::SandboxId::try_new(req.container_id.clone())?;
             state
-                .network
-                .datapath()
+                .datapath
                 .cni_del(&sandbox_id)
                 .await
                 .with_context(|| format!("failed in-process CNI DEL for {}", req.container_id))?;
@@ -713,6 +748,38 @@ fn cni_version(config: &CniConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestCniSocketFilesystem;
+
+    impl CniSocketFilesystem for TestCniSocketFilesystem {
+        fn bind_listener(
+            &self,
+            socket_path: &CniSocketPath,
+        ) -> CniSocketFuture<'_, tokio::net::UnixListener> {
+            let socket_path = socket_path.clone();
+            Box::pin(async move {
+                let path = std::path::Path::new(socket_path.as_str());
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|error| CniSocketError::new("test create", error.to_string()))?;
+                }
+                let _ = std::fs::remove_file(path);
+                tokio::net::UnixListener::bind(path)
+                    .map_err(|error| CniSocketError::new("test bind", error.to_string()))
+            })
+        }
+
+        fn remove_socket(&self, socket_path: &CniSocketPath) -> CniSocketFuture<'_, ()> {
+            let socket_path = socket_path.clone();
+            Box::pin(async move {
+                match std::fs::remove_file(socket_path.as_str()) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(CniSocketError::new("test remove", error.to_string())),
+                }
+            })
+        }
+    }
 
     #[test]
     fn cni_version_defaults_to_1_0_0() {
@@ -883,9 +950,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let socket_path = tmp.path().join("cleanup.sock");
         let socket_path = socket_path.to_string_lossy().into_owned();
-        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
-        let socket_filesystem =
-            crate::cni_socket_adapter::RootCniSocketFilesystem::shared(file_process);
+        let socket_filesystem: Arc<dyn CniSocketFilesystem> = Arc::new(TestCniSocketFilesystem);
         let validated_socket_path = CniSocketPath::try_new(socket_path.clone()).unwrap();
         let listener = socket_filesystem
             .bind_listener(&validated_socket_path)
@@ -922,9 +987,6 @@ mod tests {
         drop(slow);
         server_task.await.unwrap().unwrap();
     }
-
-    // The "no crate::api::ApiState in cni_plugin.rs" invariant is enforced by
-    // the base-repo source guard run by `./build.sh`.
 
     #[test]
     fn build_cni_result_includes_default_route_gateway() {

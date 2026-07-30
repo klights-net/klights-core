@@ -3,7 +3,8 @@
 use anyhow::Context;
 
 use crate::bootstrap::{CliFlags, NodeMode};
-use crate::{KlightsConfig, cni_plugin, kubelet, networking, paths, pidfile, shutdown};
+use crate::{KlightsConfig, kubelet, networking, paths, pidfile, shutdown};
+use klights_networking::cni_plugin;
 
 /// Full teardown with the same immutable mode detection used by startup. This
 /// keeps root/rootless cleanup dispatch centralized in `networking::NetworkCleanup`.
@@ -35,10 +36,8 @@ pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
         klights_leader_rpc::transport_policy::GrpcTransportPolicy::shared_default();
     let node_mode =
         NodeMode::detect(cli.rootless).context("failed to detect klights operating mode")?;
-    let network_cleanup = networking::NetworkCleanup::from_config(
-        &crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config)?,
-        file_process.clone(),
-    );
+    let network_cleanup = crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config)?
+        .build_cleanup(file_process.clone());
     let cleanup_node_local =
         match open_cleanup_node_local(config.as_ref(), cleanup_task_supervisor.clone()).await {
             Ok(node_local) => Some(node_local),

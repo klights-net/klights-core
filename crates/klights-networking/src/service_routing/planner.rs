@@ -64,8 +64,8 @@ impl RoutePlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::networking::service_routing::service_rules::{PortSpec, Protocol};
-    use crate::networking::service_routing::session_affinity::SessionAffinity;
+    use crate::service_routing::service_rules::{PortSpec, Protocol};
+    use crate::service_routing::session_affinity::SessionAffinity;
     use std::net::Ipv4Addr;
 
     fn spec(cluster_ip: &str, endpoint: &str, port: u16) -> ServiceSpec {

@@ -18,10 +18,10 @@ use crate::controllers::annotations::{
 #[cfg(test)]
 use crate::datastore::DatastoreBackend;
 #[cfg(test)]
-use crate::networking::dataplane_health::{DataplaneHealth, DataplaneHealthStatus};
-#[cfg(test)]
 use crate::node_outbox::Outbox;
 use klights_network_api::parse_node_peer_mode;
+#[cfg(test)]
+use klights_networking::dataplane_health::{DataplaneHealth, DataplaneHealthStatus};
 use klights_types::HostPortRange;
 
 #[cfg(test)]
@@ -153,7 +153,7 @@ async fn endpoint_for_peer(
     };
 
     Ok(Some(
-        crate::networking::wireguard::peer_route_from_metadata(
+        klights_networking::wireguard::peer_route_from_metadata(
             crate::control_plane::client::runtime_dataplane(metadata)
                 .map_err(anyhow::Error::new)?,
             &peer.subnet.to_string(),
@@ -1953,7 +1953,7 @@ mod tests {
             "a Ready peer without dataplane metadata must count as unreachable"
         );
 
-        let health = crate::networking::dataplane_health::DataplaneHealth::new_healthy();
+        let health = klights_networking::dataplane_health::DataplaneHealth::new_healthy();
         super::apply_peer_sync_outcome(&health, &outcome);
         assert!(
             !health.status().is_healthy(),
@@ -2003,7 +2003,7 @@ mod tests {
             "NotReady peers must be excluded from readiness gating"
         );
 
-        let health = crate::networking::dataplane_health::DataplaneHealth::new_healthy();
+        let health = klights_networking::dataplane_health::DataplaneHealth::new_healthy();
         health.set_peers_pending();
         super::apply_peer_sync_outcome(&health, &outcome);
         assert!(
@@ -2062,7 +2062,7 @@ mod tests {
 
         assert_eq!(outcome.unreachable_ready_peers, 0);
 
-        let health = crate::networking::dataplane_health::DataplaneHealth::new_healthy();
+        let health = klights_networking::dataplane_health::DataplaneHealth::new_healthy();
         health.set_peers_pending();
         super::apply_peer_sync_outcome(&health, &outcome);
         assert!(
@@ -2102,7 +2102,7 @@ mod tests {
     /// appears via the watch mirror.
     #[tokio::test]
     async fn reconcile_local_readiness_does_not_memo_when_node_not_found() {
-        use crate::networking::dataplane_health::DataplaneHealth;
+        use klights_networking::dataplane_health::DataplaneHealth;
 
         let db = crate::datastore::test_support::in_memory().await;
         let health = DataplaneHealth::new_healthy();
@@ -2150,7 +2150,7 @@ mod tests {
     /// and update the node's conditions.
     #[tokio::test]
     async fn reconcile_local_readiness_memos_after_node_appears() {
-        use crate::networking::dataplane_health::{DataplaneHealth, DataplaneHealthStatus};
+        use klights_networking::dataplane_health::{DataplaneHealth, DataplaneHealthStatus};
 
         let db = crate::datastore::test_support::in_memory().await;
         let health = DataplaneHealth::new_healthy();
@@ -2253,7 +2253,7 @@ mod tests {
     /// handles it; when conditions already match in the DB, no write is needed.
     #[tokio::test]
     async fn reconcile_local_readiness_noop_when_conditions_already_match() {
-        use crate::networking::dataplane_health::DataplaneHealth;
+        use klights_networking::dataplane_health::DataplaneHealth;
         let db = crate::datastore::test_support::in_memory().await;
         let health = DataplaneHealth::new_healthy();
         // Health starts Healthy, no peer tracking → Healthy
@@ -2302,14 +2302,14 @@ mod tests {
         // The early return at `last_readiness.as_ref() == Some(&new_status)` handles this.
         assert_eq!(
             last_readiness,
-            Some(crate::networking::dataplane_health::DataplaneHealthStatus::Healthy),
+            Some(klights_networking::dataplane_health::DataplaneHealthStatus::Healthy),
             "last_readiness stays Healthy when conditions already match"
         );
     }
 
     #[tokio::test]
     async fn reconcile_local_readiness_memos_initial_noop_when_conditions_already_match() {
-        use crate::networking::dataplane_health::DataplaneHealth;
+        use klights_networking::dataplane_health::DataplaneHealth;
 
         let db = crate::datastore::test_support::in_memory().await;
         let health = DataplaneHealth::new_healthy();
@@ -2352,7 +2352,7 @@ mod tests {
 
         assert_eq!(
             last_readiness,
-            Some(crate::networking::dataplane_health::DataplaneHealthStatus::Healthy),
+            Some(klights_networking::dataplane_health::DataplaneHealthStatus::Healthy),
             "initial no-op reconcile must memo confirmed readiness so later Node events do not keep rechecking"
         );
     }

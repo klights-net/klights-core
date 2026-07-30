@@ -1870,7 +1870,7 @@ mod tests {
             &rpc_socket,
             "klights-test",
             "10.43.0.0/24",
-            crate::networking::wireguard::WIREGUARD_MTU,
+            klights_networking::wireguard::WIREGUARD_MTU,
         )
         .await
         .unwrap();
@@ -1882,7 +1882,7 @@ mod tests {
         assert_eq!(parsed["type"], "klights-cni");
         assert_eq!(parsed["bridge"], "klights-test");
         assert_eq!(parsed["subnet"], "10.43.0.0/24");
-        assert_eq!(parsed["mtu"], crate::networking::wireguard::WIREGUARD_MTU);
+        assert_eq!(parsed["mtu"], klights_networking::wireguard::WIREGUARD_MTU);
         assert_eq!(
             parsed["rpcSocket"],
             rpc_socket.to_string_lossy().into_owned()

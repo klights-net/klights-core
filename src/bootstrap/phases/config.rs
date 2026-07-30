@@ -45,10 +45,8 @@ pub async fn load(cli: &CliFlags) -> Result<ConfigPhase> {
         .context("invalid task supervisor category limits")?;
     let supervisor = Arc::new(TaskSupervisor::new(task_config));
     let file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
-    let network_cleanup = NetworkCleanup::from_config(
-        &crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config)?,
-        file_process.clone(),
-    );
+    let network_cleanup = crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config)?
+        .build_cleanup(file_process.clone());
     let grpc_transport_policy =
         klights_leader_rpc::transport_policy::GrpcTransportPolicy::shared_default();
     let task_limits = supervisor.config();

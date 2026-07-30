@@ -219,11 +219,11 @@ async fn test_replicationcontroller_scale_subresource() {
             node_name: "test-node".to_string(),
             node_ip: None,
             anonymous_auth: true,
-            dataplane_encryption: crate::networking::wireguard::DataplaneEncryption::Enabled,
+            dataplane_encryption: klights_networking::wireguard::DataplaneEncryption::Enabled,
             external_endpoint: None,
             worker_dataplane_no_ingress: false,
-            wireguard_device: crate::networking::wireguard::DEFAULT_WIREGUARD_DEVICE.to_string(),
-            wireguard_port: crate::networking::wireguard::DEFAULT_WIREGUARD_PORT,
+            wireguard_device: klights_networking::wireguard::DEFAULT_WIREGUARD_DEVICE.to_string(),
+            wireguard_port: klights_networking::wireguard::DEFAULT_WIREGUARD_PORT,
             cluster_db_path: crate::paths::test_data_root_path(ns)
                 .join("db")
                 .join("sqlite")

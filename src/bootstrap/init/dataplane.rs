@@ -19,18 +19,18 @@ pub async fn local_join_dataplane_metadata(
         endpoint: config.external_endpoint.clone().unwrap_or_default(),
         port: identity.port,
         mode: match identity.mode {
-            crate::networking::wireguard::DataplaneMode::Root => {
+            klights_networking::wireguard::DataplaneMode::Root => {
                 klights_leader_api::NetworkNodeMode::Root
             }
-            crate::networking::wireguard::DataplaneMode::Rootless => {
+            klights_networking::wireguard::DataplaneMode::Rootless => {
                 klights_leader_api::NetworkNodeMode::Rootless
             }
         },
         encryption: match identity.encryption {
-            crate::networking::wireguard::DataplaneEncryption::Enabled => {
+            klights_networking::wireguard::DataplaneEncryption::Enabled => {
                 klights_leader_api::DataplaneEncryption::WireGuard
             }
-            crate::networking::wireguard::DataplaneEncryption::Disabled => {
+            klights_networking::wireguard::DataplaneEncryption::Disabled => {
                 klights_leader_api::DataplaneEncryption::Direct
             }
         },
@@ -58,18 +58,18 @@ pub async fn local_dataplane_peer_metadata_with_endpoint(
     klights_cluster_store::DataplanePeerMetadata::try_new(
         config.node_name.clone(),
         match identity.mode {
-            crate::networking::wireguard::DataplaneMode::Root => {
+            klights_networking::wireguard::DataplaneMode::Root => {
                 klights_cluster_store::DataplaneMode::Root
             }
-            crate::networking::wireguard::DataplaneMode::Rootless => {
+            klights_networking::wireguard::DataplaneMode::Rootless => {
                 klights_cluster_store::DataplaneMode::Rootless
             }
         },
         match identity.encryption {
-            crate::networking::wireguard::DataplaneEncryption::Enabled => {
+            klights_networking::wireguard::DataplaneEncryption::Enabled => {
                 klights_cluster_store::DataplaneEncryption::Enabled
             }
-            crate::networking::wireguard::DataplaneEncryption::Disabled => {
+            klights_networking::wireguard::DataplaneEncryption::Disabled => {
                 klights_cluster_store::DataplaneEncryption::Disabled
             }
         },
@@ -81,8 +81,8 @@ pub async fn local_dataplane_peer_metadata_with_endpoint(
 }
 
 struct LocalDataplaneIdentity {
-    mode: crate::networking::wireguard::DataplaneMode,
-    encryption: crate::networking::wireguard::DataplaneEncryption,
+    mode: klights_networking::wireguard::DataplaneMode,
+    encryption: klights_networking::wireguard::DataplaneEncryption,
     public_key: Option<String>,
     port: Option<u16>,
 }
@@ -93,19 +93,19 @@ async fn local_dataplane_identity(
     supervisor: &klights_supervisor::TaskSupervisor,
 ) -> anyhow::Result<LocalDataplaneIdentity> {
     let mode = match node_mode {
-        NodeMode::Root => crate::networking::wireguard::DataplaneMode::Root,
-        NodeMode::Rootless { .. } => crate::networking::wireguard::DataplaneMode::Rootless,
+        NodeMode::Root => klights_networking::wireguard::DataplaneMode::Root,
+        NodeMode::Rootless { .. } => klights_networking::wireguard::DataplaneMode::Rootless,
     };
     let encryption = config.dataplane_encryption;
-    let port = if encryption == crate::networking::wireguard::DataplaneEncryption::Enabled {
+    let port = if encryption == klights_networking::wireguard::DataplaneEncryption::Enabled {
         Some(config.wireguard_port)
     } else {
         None
     };
-    let public_key = if encryption == crate::networking::wireguard::DataplaneEncryption::Enabled {
+    let public_key = if encryption == klights_networking::wireguard::DataplaneEncryption::Enabled {
         let key_path = config.data_root.join("etc/wireguard-private.key");
         let identity =
-            crate::networking::wireguard::WireGuardIdentity::load_or_create(&key_path, supervisor)
+            klights_networking::wireguard::WireGuardIdentity::load_or_create(&key_path, supervisor)
                 .await?;
         Some(identity.public_key().to_string())
     } else {
@@ -273,7 +273,7 @@ mod tests {
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "mn-worker".to_string();
         config.external_endpoint = None;
-        config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
+        config.dataplane_encryption = klights_networking::wireguard::DataplaneEncryption::Disabled;
         let supervisor = klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         );
@@ -299,7 +299,7 @@ mod tests {
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "mn-controlplane1".to_string();
         config.external_endpoint = None;
-        config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
+        config.dataplane_encryption = klights_networking::wireguard::DataplaneEncryption::Disabled;
         let supervisor = klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         );
@@ -410,7 +410,7 @@ mod tests {
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.external_endpoint = None;
-        config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
+        config.dataplane_encryption = klights_networking::wireguard::DataplaneEncryption::Disabled;
         let supervisor = klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         );
@@ -457,7 +457,7 @@ mod tests {
         let db = crate::datastore::test_support::in_memory().await;
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
-        config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
+        config.dataplane_encryption = klights_networking::wireguard::DataplaneEncryption::Disabled;
         let supervisor = klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         );
@@ -486,7 +486,7 @@ mod tests {
         let db = crate::datastore::test_support::in_memory().await;
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
-        config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
+        config.dataplane_encryption = klights_networking::wireguard::DataplaneEncryption::Disabled;
         let supervisor = klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         );

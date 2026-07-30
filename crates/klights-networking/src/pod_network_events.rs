@@ -26,8 +26,6 @@ struct BusState {
 /// the registration-to-wait lost-wakeup gap and coalesces duplicate hints.
 pub struct PodNetworkAssignmentBus {
     inner: Arc<Mutex<BusState>>,
-    #[cfg(test)]
-    registration_tx: watch::Sender<u64>,
 }
 
 impl Default for PodNetworkAssignmentBus {
@@ -38,12 +36,8 @@ impl Default for PodNetworkAssignmentBus {
 
 impl PodNetworkAssignmentBus {
     pub fn new() -> Self {
-        #[cfg(test)]
-        let (registration_tx, _) = watch::channel(0);
         Self {
             inner: Arc::new(Mutex::new(BusState::default())),
-            #[cfg(test)]
-            registration_tx,
         }
     }
 
@@ -63,11 +57,6 @@ impl PodNetworkAssignmentBus {
     #[cfg(test)]
     pub fn entry_count_for_test(&self) -> usize {
         self.state().entries.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn registration_observer_for_test(&self) -> watch::Receiver<u64> {
-        self.registration_tx.subscribe()
     }
 }
 
@@ -108,10 +97,6 @@ impl PodNetworkAssignmentWaiter for PodNetworkAssignmentBus {
             );
             (entry_id, receiver)
         };
-        #[cfg(test)]
-        self.registration_tx
-            .send_modify(|generation| *generation += 1);
-
         Ok(Box::new(AssignmentSubscription {
             key,
             entry_id,

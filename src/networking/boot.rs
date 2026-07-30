@@ -11,9 +11,13 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use crate::networking::dataplane_health::DataplaneHealth;
-use crate::networking::{NetworkPlane, RootlessNetworkPlane};
+use klights_networking::dataplane_health::DataplaneHealth;
+use klights_networking::rootless::{
+    RootlessNetworkBoot, RootlessNetworkPlane, RootlessNetworkStores,
+};
 use klights_types::PodSubnet;
+
+use crate::networking::NetworkPlane;
 
 pub(crate) struct NetworkBootStores {
     pub(crate) subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
@@ -63,8 +67,7 @@ impl NetworkBoot {
                 Ok(Self::Root(plane))
             }
             crate::networking::NetworkMode::Rootless => {
-                let plane =
-                    RootlessNetworkPlane::boot(cfg, stores, cancel, task_supervisor).await?;
+                let plane = boot_rootless(cfg, stores, cancel, task_supervisor).await?;
                 Ok(Self::Rootless(plane))
             }
         }
@@ -96,6 +99,13 @@ impl NetworkBoot {
         }
     }
 
+    pub fn peer_router(&self) -> Arc<dyn klights_network_api::PeerRouter> {
+        match self {
+            Self::Root(plane) => plane.peer_router(),
+            Self::Rootless(plane) => plane.clone(),
+        }
+    }
+
     /// Dataplane health snapshot. Callers wire this into node conditions
     /// so that WireGuard/pasta failures surface as `NetworkUnavailable=True`.
     pub fn health(&self) -> &DataplaneHealth {
@@ -104,6 +114,50 @@ impl NetworkBoot {
             Self::Rootless(plane) => plane.health(),
         }
     }
+}
+
+pub(crate) async fn boot_rootless(
+    cfg: &crate::networking::NetworkBootConfig,
+    stores: NetworkBootStores,
+    cancel: tokio_util::sync::CancellationToken,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
+) -> Result<Arc<RootlessNetworkPlane>> {
+    let NetworkBootStores {
+        subnet_allocation,
+        topology,
+        pod_network_cache,
+        pod_ipam,
+        pod_runtime,
+        assignment_publisher,
+    } = stores;
+    RootlessNetworkPlane::boot(RootlessNetworkBoot::new(
+        cfg.bridge().clone(),
+        cfg.node().clone(),
+        *cfg.cluster_cidr(),
+        cfg.host_ip(),
+        cfg.encryption(),
+        klights_networking::wireguard::WireGuardBootConfig::try_new(
+            cfg.wireguard_device(),
+            cfg.wireguard_key_path(),
+            cfg.wireguard_port(),
+        )
+        .map_err(anyhow::Error::new)?,
+        klights_networking::PodLinkMtu::try_new(crate::networking::pod_link_mtu_for_encryption(
+            cfg.encryption(),
+        ))
+        .map_err(anyhow::Error::msg)?,
+        RootlessNetworkStores::new(
+            subnet_allocation,
+            topology,
+            pod_network_cache,
+            pod_ipam,
+            pod_runtime,
+            assignment_publisher,
+        ),
+        cancel,
+        task_supervisor,
+    ))
+    .await
 }
 
 #[cfg(test)]
@@ -126,11 +180,11 @@ mod tests {
             node_name: node_name.to_string(),
             node_ip: None,
             anonymous_auth: true,
-            dataplane_encryption: crate::networking::wireguard::DataplaneEncryption::Disabled,
+            dataplane_encryption: klights_networking::wireguard::DataplaneEncryption::Disabled,
             external_endpoint: None,
             worker_dataplane_no_ingress: false,
-            wireguard_device: crate::networking::wireguard::DEFAULT_WIREGUARD_DEVICE.to_string(),
-            wireguard_port: crate::networking::wireguard::DEFAULT_WIREGUARD_PORT,
+            wireguard_device: klights_networking::wireguard::DEFAULT_WIREGUARD_DEVICE.to_string(),
+            wireguard_port: klights_networking::wireguard::DEFAULT_WIREGUARD_PORT,
             cluster_db_path: data_root
                 .clone()
                 .join("db")
@@ -201,8 +255,7 @@ mod tests {
         ));
         let node_local = node_local_for_test(supervisor.clone()).await;
         let node_network = Arc::new(node_local);
-        let assignment_bus =
-            Arc::new(crate::networking::pod_network_events::PodNetworkAssignmentBus::new());
+        let assignment_bus = Arc::new(klights_networking::PodNetworkAssignmentBus::new());
         let cancel = tokio_util::sync::CancellationToken::new();
         let cluster_api = cluster_api_for_test(db.clone(), &cfg.node_name);
         let subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation> =

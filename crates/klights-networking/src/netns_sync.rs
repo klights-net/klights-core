@@ -1,4 +1,4 @@
-//! Sync netlink helpers used to configure a pod netns without tokio runtime.
+//! Synchronous netlink helpers used to configure a pod netns without Tokio.
 //!
 //! These helpers build and send `netlink-sys` requests directly using
 //! `NETLINK_ROUTE` and parse acknowledgements with matching sequence numbers.
