@@ -825,7 +825,7 @@ async fn list_resources_response_rv_precedes_delete_committed_after_snapshot() {
         .build_log_apply_commit_for_outbox(
             "pending-delete-list-watch",
             crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "mn-controlplane1",
         )
         .await

@@ -85,7 +85,7 @@ pub(crate) async fn resolve_token_file_if_present(
 
 async fn start_controlplane_leader_control_stream_if_needed(
     role: &NodeRole,
-    client: Option<std::sync::Arc<crate::replication::grpc::client::ReplicationGrpcClient>>,
+    client: Option<std::sync::Arc<klights_leader_rpc::client::ReplicationGrpcClient>>,
     cri_for_api: Option<&std::sync::Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
     config: &std::sync::Arc<crate::KlightsConfig>,
     pod_watch: std::sync::Arc<dyn crate::api::pod_subresources::logs::PodLogFollowWatchPort>,
@@ -99,29 +99,29 @@ async fn start_controlplane_leader_control_stream_if_needed(
 
     let (exec_runtime, metrics_runtime) = match cri_for_api {
         Some(cri) => (
-            crate::replication::grpc::client::NodeExecCapability::Available(std::sync::Arc::new(
+            klights_leader_rpc::client::NodeExecCapability::Available(std::sync::Arc::new(
                 crate::kubelet::remote_runtime::CriNodeExecRuntime::new(
                     cri.clone(),
                     task_supervisor.clone(),
                 ),
             )),
-            crate::replication::grpc::client::NodeMetricsCapability::Available(
-                std::sync::Arc::new(crate::kubelet::remote_runtime::CriNodeMetricsRuntime::new(
-                    std::sync::Arc::new(crate::kubelet::metrics::CriNodeMetricsSampler::new(
+            klights_leader_rpc::client::NodeMetricsCapability::Available(std::sync::Arc::new(
+                crate::kubelet::remote_runtime::CriNodeMetricsRuntime::new(std::sync::Arc::new(
+                    crate::kubelet::metrics::CriNodeMetricsSampler::new(
                         cri.clone(),
                         task_supervisor.clone(),
-                    )),
+                    ),
                 )),
-            ),
+            )),
         ),
         None => (
-            crate::replication::grpc::client::NodeExecCapability::Unavailable,
-            crate::replication::grpc::client::NodeMetricsCapability::Unavailable,
+            klights_leader_rpc::client::NodeExecCapability::Unavailable,
+            klights_leader_rpc::client::NodeMetricsCapability::Unavailable,
         ),
     };
-    let control_runtimes = crate::replication::grpc::client::NodeControlRuntimes::new(
+    let control_runtimes = klights_leader_rpc::client::NodeControlRuntimes::new(
         exec_runtime,
-        crate::replication::grpc::client::NodeLogCapability::Available(std::sync::Arc::new(
+        klights_leader_rpc::client::NodeLogCapability::Available(std::sync::Arc::new(
             crate::api::pod_subresources::local_node_log_runtime::LocalNodeLogRuntime::new_with_pod_event_store(
                 crate::paths::pod_logs_root_path(&config.containerd_namespace),
                 task_supervisor.clone(),
@@ -787,7 +787,7 @@ mod tests {
         .await
         .expect("open node-local test db");
         let outbox = crate::node_outbox::Outbox::new(node_db.clone());
-        let dataplane = crate::replication::grpc::client::JoinDataplaneMetadata {
+        let dataplane = klights_leader_rpc::client::JoinDataplaneMetadata {
             public_key: Some("worker-public-key".to_string()),
             endpoint: "192.0.2.55".to_string(),
             port: Some(7679),

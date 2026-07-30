@@ -8,7 +8,7 @@ use crate::bootstrap::credential_store::BootstrapCredentialStore;
 
 pub struct IdentityPhase {
     pub node_ip: String,
-    pub follower_dataplane: Option<crate::replication::grpc::client::JoinDataplaneMetadata>,
+    pub follower_dataplane: Option<klights_leader_rpc::client::JoinDataplaneMetadata>,
     pub grpc_ca_cert_path: Option<std::path::PathBuf>,
 }
 
@@ -85,7 +85,7 @@ async fn resolve_csr_via_rpc(
     cfg: &ConfigPhase,
     role: &crate::bootstrap::NodeRole,
     pending: &crate::bootstrap::certificate_bootstrap::PendingCsr,
-    local_dataplane: &crate::replication::grpc::client::JoinDataplaneMetadata,
+    local_dataplane: &klights_leader_rpc::client::JoinDataplaneMetadata,
 ) -> Result<()> {
     use crate::bootstrap::NodeRole;
 
@@ -120,12 +120,12 @@ async fn resolve_csr_via_rpc(
 
     let rpc_ca_cert_path = csr_signing_ca_cert_path(&cfg.config, role);
 
-    let client = crate::replication::grpc::client::ReplicationGrpcClient::new(
-        crate::replication::grpc::client::GrpcClientConfig {
+    let client = klights_leader_rpc::client::ReplicationGrpcClient::new(
+        klights_leader_rpc::client::GrpcClientConfig {
             leader_endpoint: leader_endpoint.clone(),
             token: token_value.clone(),
             node_name: cfg.config.node_name.clone(),
-            role: crate::replication::protocol::JoinRole::Worker,
+            role: klights_leader_api::JoinRole::Worker,
             dataplane: local_dataplane.clone(),
             ca_cert_path: rpc_ca_cert_path.clone(),
             skip_ca,
@@ -499,7 +499,7 @@ mod tests {
             supervisor,
             file_process: file_process.clone(),
             grpc_transport_policy:
-                crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
+                klights_leader_rpc::transport_policy::GrpcTransportPolicy::shared_default(),
             network_cleanup: crate::networking::NetworkCleanup::from_config(
                 &crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config).unwrap(),
                 file_process,
@@ -691,7 +691,7 @@ mod tests {
             db.clone(),
             leader_supervisor.clone(),
         ));
-        let app = crate::replication::grpc::server::mount_service_full(
+        let app = crate::grpc_test_support::mount_service_full(
             axum::Router::new(),
             service,
             db,
@@ -707,7 +707,7 @@ mod tests {
             None,
             None,
             None,
-            crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
+            klights_leader_rpc::transport_policy::GrpcTransportPolicy::shared_default(),
         );
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -723,7 +723,7 @@ mod tests {
                 &addr.to_string(),
                 &server_data_root,
                 server_supervisor,
-                crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
+                klights_leader_rpc::transport_policy::GrpcTransportPolicy::shared_default(),
                 server_shutdown.cancelled_owned(),
             )
             .await

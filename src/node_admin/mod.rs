@@ -123,7 +123,7 @@ async fn dead_letter_replay(
     let operation = crate::node_outbox::payload::OutboxOperation::try_from(row.operation())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let payload =
-        crate::replication::storage_wire_codec::decode_outbox_payload_protobuf(row.payload())
+        klights_leader_rpc::storage_wire_codec::decode_outbox_payload_protobuf(row.payload())
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let classification = operation
         .classification(payload.command())

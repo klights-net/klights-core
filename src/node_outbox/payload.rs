@@ -1,10 +1,10 @@
 #[cfg(test)]
-use crate::replication::storage_wire_codec::{
-    decode_outbox_payload_protobuf, encode_outbox_payload_protobuf,
-};
-#[cfg(test)]
 use anyhow::Result;
 use klights_cluster_core::{ResourcePreconditions, StorageCommand};
+#[cfg(test)]
+use klights_leader_rpc::storage_wire_codec::{
+    decode_outbox_payload_protobuf, encode_outbox_payload_protobuf,
+};
 
 pub use klights_cluster_core::OutboxOperation;
 

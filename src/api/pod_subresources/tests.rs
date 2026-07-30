@@ -622,8 +622,7 @@ async fn test_remote_pod_log_follow_keeps_http_body_open_until_terminal_frame() 
         resp.headers().get(header::CONTENT_TYPE).unwrap(),
         "text/plain; charset=utf-8"
     );
-    let Some(crate::replication::protocol::FollowerControlMessage::PodLog(request)) =
-        follower_rx.recv().await
+    let Some(klights_node_api::FollowerControlMessage::PodLog(request)) = follower_rx.recv().await
     else {
         panic!("expected remote pod log follow request");
     };
@@ -638,7 +637,7 @@ async fn test_remote_pod_log_follow_keeps_http_body_open_until_terminal_frame() 
                 follower_session,
                 crate::replication::service::NodeOperationKind::Log,
             ),
-            crate::replication::protocol::RoutedNodeLogEvent {
+            klights_node_api::RoutedNodeLogEvent {
                 request_id: request.request_id.clone(),
                 event: klights_node_api::NodeLogEvent::data(b"tail ".to_vec()),
             },
@@ -652,7 +651,7 @@ async fn test_remote_pod_log_follow_keeps_http_body_open_until_terminal_frame() 
                 follower_session,
                 crate::replication::service::NodeOperationKind::Log,
             ),
-            crate::replication::protocol::RoutedNodeLogEvent {
+            klights_node_api::RoutedNodeLogEvent {
                 request_id: request.request_id.clone(),
                 event: klights_node_api::NodeLogEvent::data(b"\xf6\n".to_vec()),
             },
@@ -673,7 +672,7 @@ async fn test_remote_pod_log_follow_keeps_http_body_open_until_terminal_frame() 
                 follower_session,
                 crate::replication::service::NodeOperationKind::Log,
             ),
-            crate::replication::protocol::RoutedNodeLogEvent {
+            klights_node_api::RoutedNodeLogEvent {
                 request_id: request.request_id,
                 event: klights_node_api::NodeLogEvent::terminal(),
             },
@@ -1876,7 +1875,7 @@ async fn test_remote_exec_sync_websocket_closes_after_terminal_status_without_cl
     use std::net::{IpAddr, Ipv4Addr};
 
     use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
-    use crate::replication::protocol::{FollowerControlMessage, RoutedNodeExecSyncResponse};
+    use klights_node_api::{FollowerControlMessage, RoutedNodeExecSyncResponse};
     use klights_node_api::{NodeExec, NodeExecSyncResult};
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
@@ -1987,8 +1986,8 @@ async fn test_remote_exec_sync_websocket_waits_for_peer_close_reply() {
     use std::net::{IpAddr, Ipv4Addr};
 
     use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
-    use crate::replication::protocol::{FollowerControlMessage, RoutedNodeExecSyncResponse};
     use futures::{SinkExt as _, StreamExt as _};
+    use klights_node_api::{FollowerControlMessage, RoutedNodeExecSyncResponse};
     use klights_node_api::{NodeExec, NodeExecSyncResult};
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;

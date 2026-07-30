@@ -7,20 +7,20 @@ use std::path::PathBuf;
 /// `CaPem` contains only the configured public cluster CA certificate. Private
 /// CA keys and certificate issuance remain outside this client trust policy.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ResolvedLeaderTlsVerification {
+pub enum ResolvedLeaderTlsVerification {
     CaPem(Vec<u8>),
     SkipCa,
     SystemRoots,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LeaderTlsVerificationPolicy {
+pub struct LeaderTlsVerificationPolicy {
     ca_cert_path: Option<PathBuf>,
     skip_ca: bool,
 }
 
 impl LeaderTlsVerificationPolicy {
-    pub(crate) fn new(ca_cert_path: Option<PathBuf>, skip_ca: bool) -> Self {
+    pub fn new(ca_cert_path: Option<PathBuf>, skip_ca: bool) -> Self {
         Self {
             ca_cert_path,
             skip_ca,
@@ -29,7 +29,7 @@ impl LeaderTlsVerificationPolicy {
 
     /// Resolve verification mode and load an explicit public CA certificate
     /// through the application-owned supervised filesystem boundary.
-    pub(crate) async fn resolve(
+    pub async fn resolve(
         &self,
         supervisor: &TaskSupervisor,
     ) -> Result<ResolvedLeaderTlsVerification> {

@@ -17,29 +17,27 @@ use std::time::Duration;
 
 use anyhow::Result;
 use anyhow::anyhow;
+use klights_cluster_core::ReplicationEntry;
+use klights_leader_api::{JoinRequest, JoinResponse, MetadataResponse};
 use klights_node_api::{
     BoundedByteStream, ByteStreamBounds, ByteStreamError, ByteStreamFuture, ExecSetupError,
-    NodeExec, NodeExecFrame, NodeExecFuture, NodeExecRequest, NodeExecSession, NodeExecSyncRequest,
-    NodeExecSyncResult, NodeLog, NodeLogEvent, NodeLogFuture, NodeLogRequest, NodeLogResult,
-    NodeLogSetupError, NodeMetrics, NodeMetricsError, NodeMetricsFuture, NodeMetricsRequest,
-    NodeMetricsResult,
+    FollowerControlMessage, NodeExec, NodeExecFrame, NodeExecFuture, NodeExecRequest,
+    NodeExecSession, NodeExecSyncRequest, NodeExecSyncResult, NodeLog, NodeLogEvent, NodeLogFuture,
+    NodeLogRequest, NodeLogResult, NodeLogSetupError, NodeMetrics, NodeMetricsError,
+    NodeMetricsFuture, NodeMetricsRequest, NodeMetricsResult, RoutedNodeExecFrame,
+    RoutedNodeExecRequest, RoutedNodeExecSyncRequest, RoutedNodeExecSyncResponse,
+    RoutedNodeLogEvent, RoutedNodeLogRequest, RoutedNodeMetricsRequest, RoutedNodeMetricsResponse,
 };
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch};
 
 #[cfg(test)]
-pub(crate) use super::protocol::{FollowerCompletionContext, NodeOperationKind};
+pub(crate) use klights_node_api::{FollowerCompletionContext, NodeOperationKind};
 #[cfg(not(test))]
-use super::protocol::{FollowerCompletionContext, NodeOperationKind};
-use super::protocol::{
-    FollowerControlMessage, JoinRequest, JoinResponse, MetadataResponse, ReplicationEntry,
-    RoutedNodeExecFrame, RoutedNodeExecRequest, RoutedNodeExecSyncRequest,
-    RoutedNodeExecSyncResponse, RoutedNodeLogEvent, RoutedNodeLogRequest, RoutedNodeMetricsRequest,
-    RoutedNodeMetricsResponse,
-};
+use klights_node_api::{FollowerCompletionContext, NodeOperationKind};
 
+use super::fanout::FanoutPool;
 #[cfg(test)]
 use crate::datastore::backend::DatastoreBackend;
-use crate::replication::grpc::fanout::FanoutPool;
 use klights_leader_api::NetworkDataplane;
 use klights_supervisor::{TaskCategory, TaskSupervisor};
 
@@ -1851,7 +1849,7 @@ mod tests {
         let req = JoinRequest {
             token,
             node_name: "worker-1".into(),
-            role: crate::replication::protocol::JoinRole::Worker,
+            role: klights_leader_api::JoinRole::Worker,
         };
 
         let resp = service.handle_join(req).await;
@@ -1889,7 +1887,7 @@ mod tests {
             .handle_authenticated_join(JoinRequest {
                 token: "token".into(),
                 node_name: "worker-1".into(),
-                role: crate::replication::protocol::JoinRole::Worker,
+                role: klights_leader_api::JoinRole::Worker,
             })
             .await;
         assert!(
@@ -1913,7 +1911,7 @@ mod tests {
         let req = JoinRequest {
             token: "abcdef.0123456789abcdef".into(),
             node_name: "worker-1".into(),
-            role: crate::replication::protocol::JoinRole::Worker,
+            role: klights_leader_api::JoinRole::Worker,
         };
 
         let resp = service.handle_join(req).await;
@@ -1934,7 +1932,7 @@ mod tests {
         let req = JoinRequest {
             token: "wrong-token".into(),
             node_name: "worker-1".into(),
-            role: crate::replication::protocol::JoinRole::Worker,
+            role: klights_leader_api::JoinRole::Worker,
         };
 
         let resp = service.handle_join(req).await;
@@ -1963,7 +1961,7 @@ mod tests {
         let req = JoinRequest {
             token: "abcdef.0123456789abcdef".into(),
             node_name: "worker-1".into(),
-            role: crate::replication::protocol::JoinRole::Worker,
+            role: klights_leader_api::JoinRole::Worker,
         };
 
         let resp = service.handle_join(req).await;
@@ -2025,7 +2023,7 @@ mod tests {
             .handle_authenticated_join(JoinRequest {
                 token: String::new(),
                 node_name: "worker-1".into(),
-                role: crate::replication::protocol::JoinRole::Worker,
+                role: klights_leader_api::JoinRole::Worker,
             })
             .await;
         assert_eq!(

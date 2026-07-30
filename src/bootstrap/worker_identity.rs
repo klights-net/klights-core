@@ -10,7 +10,7 @@ use base64::{Engine as _, engine::general_purpose};
 use serde_json::json;
 use std::{path::PathBuf, sync::Arc};
 
-use crate::leader_tls_policy::{LeaderTlsVerificationPolicy, ResolvedLeaderTlsVerification};
+use klights_leader_rpc::tls_policy::{LeaderTlsVerificationPolicy, ResolvedLeaderTlsVerification};
 
 const WORKER_CREDENTIAL_RENEW_BEFORE_SECONDS: i64 = 3600;
 

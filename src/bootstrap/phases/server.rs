@@ -28,8 +28,7 @@ pub struct ServeArgs<'a> {
     pub db_handle: crate::datastore::DatastoreHandle,
     pub shutdown_token: CancellationToken,
     pub supervisor: Arc<TaskSupervisor>,
-    pub grpc_transport_policy:
-        crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
+    pub grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
 }
 
 pub async fn serve(args: ServeArgs<'_>) -> Result<()> {

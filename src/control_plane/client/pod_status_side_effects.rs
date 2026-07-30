@@ -20,8 +20,7 @@
 //! from drifting.
 
 use crate::datastore::DatastoreBackend;
-use crate::replication::protocol::ForwardedResource;
-use klights_cluster_core::command::StorageCommand;
+use klights_cluster_core::{Resource, command::StorageCommand};
 use klights_reconcile_api::{
     ControllerReconcileSink, GcForegroundDeleteCoordination, GcNonPodFinalizationPort,
     GcPodDeleteSink, ReconcileKey, ServiceReconcileKey, ServiceReconcileSink,
@@ -55,7 +54,7 @@ pub(crate) fn needs_committed_pod_side_effects(command: &StorageCommand) -> bool
 pub async fn handle_applied_pod_side_effects(
     sinks: PodSideEffectSinks<'_>,
     command: &StorageCommand,
-    resource: Option<&ForwardedResource>,
+    resource: Option<&Resource>,
     pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
     db: &dyn DatastoreBackend,
 ) -> Result<(), String> {
@@ -98,7 +97,7 @@ async fn enqueue_pod_status_side_effects_with_endpoint_change(
     controller_sink: Option<&dyn ControllerReconcileSink>,
     service_sink: Option<&dyn ServiceReconcileSink>,
     command: &StorageCommand,
-    resource: Option<&ForwardedResource>,
+    resource: Option<&Resource>,
     pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
     db: &dyn DatastoreBackend,
 ) {
@@ -247,7 +246,7 @@ async fn finalize_foreground_owners_after_pod_delete(
     non_pod_finalization: Option<&dyn GcNonPodFinalizationPort>,
     coordination: &dyn GcForegroundDeleteCoordination,
     command: &StorageCommand,
-    resource: Option<&ForwardedResource>,
+    resource: Option<&Resource>,
     db: &dyn DatastoreBackend,
 ) {
     let is_pod_delete = matches!(
@@ -268,7 +267,7 @@ async fn finalize_foreground_owners_after_pod_delete(
     let Some(non_pod_finalization) = non_pod_finalization else {
         return;
     };
-    let deleted_resource = resource.clone().into_resource();
+    let deleted_resource = resource.clone();
     if let Err(err) = crate::controllers::gc::finalize_foreground_owners_after_dependent_delete(
         db,
         &deleted_resource,
@@ -293,7 +292,7 @@ async fn cascade_dependents_after_actor_pod_delete(
     non_pod_finalization: Option<&dyn GcNonPodFinalizationPort>,
     coordination: &dyn GcForegroundDeleteCoordination,
     command: &StorageCommand,
-    resource: Option<&ForwardedResource>,
+    resource: Option<&Resource>,
     db: &dyn DatastoreBackend,
 ) -> Result<(), String> {
     if !matches!(command, StorageCommand::FinalizeBoundPod { .. }) {
@@ -347,7 +346,7 @@ async fn cascade_dependents_after_actor_pod_delete(
 
 async fn reconcile_namespace_after_pod_delete(
     command: &StorageCommand,
-    resource: Option<&ForwardedResource>,
+    resource: Option<&Resource>,
     sink: Option<&dyn NamespaceTerminationSink>,
 ) {
     let Some(sink) = sink else {
@@ -439,10 +438,32 @@ mod tests {
 
     use crate::controllers::ControllerDispatcher;
     use crate::datastore::ResourcePreconditions;
-    use crate::replication::protocol::ForwardedResource;
     use klights_cluster_core::command::StorageCommand;
     use klights_types::PodIdentity;
     use serde_json::json;
+
+    macro_rules! test_resource {
+        (
+            api_version: $api_version:expr,
+            kind: $kind:expr,
+            namespace: $namespace:expr,
+            name: $name:expr,
+            resource_version: $resource_version:expr,
+            data: $data:expr $(,)?
+        ) => {{
+            let data = Arc::new($data);
+            Resource {
+                id: 0,
+                api_version: $api_version,
+                kind: $kind,
+                namespace: $namespace,
+                name: $name,
+                uid: Resource::uid_from_data(&data),
+                resource_version: $resource_version,
+                data,
+            }
+        }};
+    }
 
     #[derive(Default)]
     struct RecordingPodDeleteSink {
@@ -524,7 +545,7 @@ mod tests {
             },
             observed_status_stamp: None,
         };
-        let resource = ForwardedResource {
+        let resource = test_resource! {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some("default".to_string()),
@@ -600,7 +621,7 @@ mod tests {
             node_name: "worker-a".to_string(),
             observed_resource_version: 7,
         };
-        let receipt = ForwardedResource {
+        let receipt = test_resource! {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some("default".to_string()),
@@ -718,7 +739,7 @@ mod tests {
             node_name: "worker-a".to_string(),
             observed_resource_version: 7,
         };
-        let receipt = ForwardedResource {
+        let receipt = test_resource! {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some("default".to_string()),
@@ -800,7 +821,7 @@ mod tests {
             },
             observed_status_stamp: None,
         };
-        let resource = ForwardedResource {
+        let resource = test_resource! {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some("default".to_string()),
@@ -924,7 +945,7 @@ mod tests {
             },
             observed_status_stamp: None,
         };
-        let resource = ForwardedResource {
+        let resource = test_resource! {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some("default".to_string()),
@@ -998,7 +1019,7 @@ mod tests {
         .await
         .expect("create service");
         let service_key = ReconcileKey::namespaced("v1", "Service", "default", "web");
-        let resource = ForwardedResource {
+        let resource = test_resource! {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some("default".to_string()),
@@ -1135,7 +1156,7 @@ mod tests {
             },
             strict_resource_version: false,
         };
-        let resource = ForwardedResource {
+        let resource = test_resource! {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some("default".to_string()),
@@ -1205,7 +1226,7 @@ mod tests {
             },
             observed_status_stamp: None,
         };
-        let resource = ForwardedResource {
+        let resource = test_resource! {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some("default".to_string()),

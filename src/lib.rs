@@ -35,13 +35,14 @@ pub mod gc;
 mod gc_delete_adapter;
 mod gc_resource_store_adapter;
 mod generated_handler_adapter;
+#[cfg(test)]
+mod grpc_test_support;
 mod hpa_controller_adapter;
 mod hpa_side_effect_adapter;
 mod job_side_effect_adapter;
 mod job_store_adapter;
 pub mod kubelet;
 pub mod leader_election;
-pub(crate) mod leader_tls_policy;
 mod list_query_adapter;
 mod namespace_admission;
 mod namespace_termination_adapter;
@@ -116,6 +117,8 @@ mod bound_pod_finalization_adapter;
 mod deployment_replicaset_error_test;
 mod deployment_store_adapter;
 #[cfg(test)]
+mod leader_rpc_server_tests;
+#[cfg(test)]
 mod node_conditions_tests;
 #[cfg(test)]
 mod resource_quota_event_driven_tests;
@@ -129,6 +132,13 @@ pub use bootstrap::config::KlightsConfig;
 
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) use grpc_test_support::{
+    GrpcReplicationServer, mount_configured_test_service, mount_service, mount_service_full,
+};
+#[cfg(test)]
+pub(crate) use klights_leader_rpc::server::insert_tonic_tcp_connect_info;
 
 fn cli_flags_for_runtime(cli: cli::Cli) -> Result<Option<bootstrap::CliFlags>, String> {
     let role = match cli.node_role()? {

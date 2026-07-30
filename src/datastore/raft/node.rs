@@ -137,7 +137,7 @@ pub trait MemberFeatureProbe: Send + Sync {
         &self,
         node_id: NodeId,
         addr: &str,
-    ) -> Result<crate::replication::protocol::MetadataResponse>;
+    ) -> Result<klights_leader_api::MetadataResponse>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1499,9 +1499,9 @@ impl RaftNodeRpcRouter {
 
     fn validate_receiver_admission(
         &self,
-        receiver: &crate::replication::grpc::raft_rpc::RaftReceiverAdmission,
-    ) -> std::result::Result<(), crate::replication::grpc::raft_rpc::RaftRpcRouterError> {
-        use crate::replication::grpc::raft_rpc::RaftRpcRouterError;
+        receiver: &klights_leader_rpc::raft_rpc::RaftReceiverAdmission,
+    ) -> std::result::Result<(), klights_leader_rpc::raft_rpc::RaftRpcRouterError> {
+        use klights_leader_rpc::raft_rpc::RaftRpcRouterError;
         if receiver.storage_incarnation != self.storage_incarnation {
             return Err(RaftRpcRouterError::Retryable(format!(
                 "stale Raft receiver incarnation: membership admits {}, local node.db is {}",
@@ -1558,13 +1558,13 @@ fn append_entries_starts_unanchored_nonzero_suffix(
 }
 
 #[async_trait]
-impl crate::replication::grpc::raft_rpc::RaftRpcRouter for RaftNodeRpcRouter {
+impl klights_leader_rpc::raft_rpc::RaftRpcRouter for RaftNodeRpcRouter {
     async fn append_entries(
         &self,
-        receiver: crate::replication::grpc::raft_rpc::RaftReceiverAdmission,
+        receiver: klights_leader_rpc::raft_rpc::RaftReceiverAdmission,
         payload: Vec<u8>,
-    ) -> std::result::Result<Vec<u8>, crate::replication::grpc::raft_rpc::RaftRpcRouterError> {
-        use crate::replication::grpc::raft_rpc::RaftRpcRouterError;
+    ) -> std::result::Result<Vec<u8>, klights_leader_rpc::raft_rpc::RaftRpcRouterError> {
+        use klights_leader_rpc::raft_rpc::RaftRpcRouterError;
         self.validate_receiver_admission(&receiver)?;
         let req: openraft::raft::AppendEntriesRequest<TypeConfig> =
             serde_json::from_slice(&payload)
@@ -1594,10 +1594,10 @@ impl crate::replication::grpc::raft_rpc::RaftRpcRouter for RaftNodeRpcRouter {
 
     async fn vote(
         &self,
-        receiver: crate::replication::grpc::raft_rpc::RaftReceiverAdmission,
+        receiver: klights_leader_rpc::raft_rpc::RaftReceiverAdmission,
         payload: Vec<u8>,
-    ) -> std::result::Result<Vec<u8>, crate::replication::grpc::raft_rpc::RaftRpcRouterError> {
-        use crate::replication::grpc::raft_rpc::RaftRpcRouterError;
+    ) -> std::result::Result<Vec<u8>, klights_leader_rpc::raft_rpc::RaftRpcRouterError> {
+        use klights_leader_rpc::raft_rpc::RaftRpcRouterError;
         self.validate_receiver_admission(&receiver)?;
         let req: openraft::raft::VoteRequest<NodeId> = serde_json::from_slice(&payload)
             .map_err(|e| RaftRpcRouterError::Dispatch(format!("decode Vote: {e}")))?;
@@ -1612,10 +1612,10 @@ impl crate::replication::grpc::raft_rpc::RaftRpcRouter for RaftNodeRpcRouter {
 
     async fn install_snapshot(
         &self,
-        receiver: crate::replication::grpc::raft_rpc::RaftReceiverAdmission,
+        receiver: klights_leader_rpc::raft_rpc::RaftReceiverAdmission,
         payload: Vec<u8>,
-    ) -> std::result::Result<Vec<u8>, crate::replication::grpc::raft_rpc::RaftRpcRouterError> {
-        use crate::replication::grpc::raft_rpc::RaftRpcRouterError;
+    ) -> std::result::Result<Vec<u8>, klights_leader_rpc::raft_rpc::RaftRpcRouterError> {
+        use klights_leader_rpc::raft_rpc::RaftRpcRouterError;
         self.validate_receiver_admission(&receiver)?;
         let req: openraft::raft::InstallSnapshotRequest<TypeConfig> =
             serde_json::from_slice(&payload)
@@ -1754,14 +1754,14 @@ mod tests {
             &self,
             node_id: NodeId,
             _addr: &str,
-        ) -> Result<crate::replication::protocol::MetadataResponse> {
+        ) -> Result<klights_leader_api::MetadataResponse> {
             let command_codec_version = self
                 .replies
                 .get(&node_id)
                 .expect("test probe reply")
                 .as_ref()
                 .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-            Ok(crate::replication::protocol::MetadataResponse {
+            Ok(klights_leader_api::MetadataResponse {
                 cluster_id: "test".to_string(),
                 leader_epoch: 1,
                 current_rv: 0,
@@ -3454,7 +3454,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_node_rpc_router_round_trips_vote_envelope() {
-        use crate::replication::grpc::raft_rpc::RaftRpcRouter;
+        use klights_leader_rpc::raft_rpc::RaftRpcRouter;
         let (node, _) = fresh_node(70).await;
         node.bootstrap_single_voter("https://10.99.0.70:7679".into())
             .await
@@ -3486,7 +3486,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_router_fences_stale_nonzero_suffix_for_fresh_same_id_node() {
-        use crate::replication::grpc::raft_rpc::RaftRpcRouter;
+        use klights_leader_rpc::raft_rpc::RaftRpcRouter;
         let (node, _) = fresh_node(71).await;
         let router = RaftNodeRpcRouter::from_node(&node);
         let receiver =
@@ -3499,7 +3499,7 @@ mod tests {
             .expect_err("a stale storage incarnation must fail before payload decode");
         assert!(matches!(
             error,
-            crate::replication::grpc::raft_rpc::RaftRpcRouterError::Retryable(_)
+            klights_leader_rpc::raft_rpc::RaftRpcRouterError::Retryable(_)
         ));
         let rolled_back_receiver = RaftMemberNode::new(
             "loopback".into(),
@@ -3516,7 +3516,7 @@ mod tests {
             .expect_err("a receiver below its admitted floor must fail before payload decode");
         assert!(matches!(
             error,
-            crate::replication::grpc::raft_rpc::RaftRpcRouterError::Retryable(_)
+            klights_leader_rpc::raft_rpc::RaftRpcRouterError::Retryable(_)
         ));
         let stale = openraft::raft::AppendEntriesRequest::<TypeConfig> {
             vote: openraft::Vote::new_committed(1, 70),
@@ -3538,7 +3538,7 @@ mod tests {
         assert!(
             matches!(
                 error,
-                crate::replication::grpc::raft_rpc::RaftRpcRouterError::Retryable(_)
+                klights_leader_rpc::raft_rpc::RaftRpcRouterError::Retryable(_)
             ),
             "unexpected stale-session error: {error}"
         );

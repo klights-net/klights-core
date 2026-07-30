@@ -133,7 +133,7 @@ async fn watermarked_outbox_commit_appends_applied_outbox_ledger_mutation() {
         .build_log_apply_commit_for_outbox_with_watermark(
             "legacy-key-ignored-for-watermark",
             "PodMetadata",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
             Some(OutboxStreamWatermark {
                 client_id: "client-a".to_string(),
@@ -187,7 +187,7 @@ async fn watermarked_uid_bound_missing_pod_outbox_builds_watermark_only_commit()
         .build_log_apply_commit_for_outbox_with_watermark(
             "missing-pod-status",
             "PodStatus",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
             Some(OutboxStreamWatermark {
                 client_id: "worker-client".to_string(),
@@ -240,7 +240,7 @@ async fn stamped_worker_pod_status_merges_against_latest_preserving_scheduler_fi
         .build_log_apply_commit_for_outbox(
             "stamped-status",
             "PodStatus",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -379,7 +379,7 @@ async fn outbox_commit_builders_materialize_committed_apply_v1_templates() {
         .build_log_apply_commit_for_outbox(
             "v1-outbox-template",
             "CreateResource",
-            crate::replication::storage_wire_codec::test_outbox_command(v1_payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(v1_payload.as_ref()),
             "worker-a",
         )
         .await
@@ -409,7 +409,7 @@ async fn outbox_commit_builders_materialize_committed_apply_v1_templates() {
         .build_log_apply_commit_for_outbox_with_watermark(
             "v1-watermarked-outbox-template",
             "CreateResource",
-            crate::replication::storage_wire_codec::test_outbox_command(
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(
                 watermarked_payload.as_ref(),
             ),
             "worker-a",
@@ -995,7 +995,7 @@ async fn raft_commit_builder_rejects_update_for_deleted_resource() {
         .build_log_apply_commit_for_outbox(
             "raft-leader-stale-pvc-update",
             "UpdateResource",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await;
@@ -1187,7 +1187,7 @@ async fn raft_commit_builder_applies_pod_status_outbox_against_latest_same_uid()
         .build_log_apply_commit_for_outbox(
             "raft-leader-stale-pod-status",
             "PodStatus",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "mn-replica",
         )
         .await
@@ -1265,7 +1265,7 @@ async fn raft_commit_builder_defers_resource_version_allocation_until_apply() {
         .build_log_apply_commit_for_outbox(
             "raft-leader-deferred-rv",
             "CreateResource",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -1355,7 +1355,7 @@ async fn strict_committed_apply_rejects_divergent_follower_resource_version() {
         .build_log_apply_commit_for_outbox(
             "raft-leader-create-scheduled-later",
             "CreateResource",
-            crate::replication::storage_wire_codec::test_outbox_command(create_payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(create_payload.as_ref()),
             "leader",
         )
         .await
@@ -1400,7 +1400,7 @@ async fn strict_committed_apply_rejects_divergent_follower_resource_version() {
         .build_log_apply_commit_for_outbox(
             "raft-leader-bind-scheduled-later",
             "UpdateResource",
-            crate::replication::storage_wire_codec::test_outbox_command(update_payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(update_payload.as_ref()),
             "leader",
         )
         .await
@@ -1474,7 +1474,7 @@ async fn raft_apply_rejects_duplicate_create_built_before_first_apply() {
                 .build_log_apply_commit_for_outbox(
                     idempotency_key,
                     "CreateResource",
-                    crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+                    klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
                     "leader",
                 )
                 .await
@@ -1556,7 +1556,7 @@ async fn raft_apply_rejects_stale_resource_version_built_before_prior_apply() {
                 .build_log_apply_commit_for_outbox(
                     idempotency_key,
                     "UpdateResource",
-                    crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+                    klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
                     "leader",
                 )
                 .await
@@ -1644,7 +1644,7 @@ async fn raft_status_apply_built_before_metadata_update_preserves_live_metadata(
         .build_log_apply_commit_for_outbox(
             "raft-status-metadata-race",
             "PodStatus",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -1765,7 +1765,7 @@ async fn stale_status_only_apply_rejects_and_preserves_live_job_status_scalars()
         .build_log_apply_commit_for_outbox(
             "stale-job-status-commit",
             "JobStatus",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -1998,7 +1998,7 @@ async fn stale_committed_pod_bind_preserves_live_owner_references() {
         .build_log_apply_commit_for_outbox(
             "stale-cycle-pod-bind",
             "UpdateResource",
-            crate::replication::storage_wire_codec::test_outbox_command(bind_payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(bind_payload.as_ref()),
             "leader",
         )
         .await
@@ -2121,7 +2121,7 @@ async fn stale_committed_pod_bind_preserves_stale_owner_ref_subset() {
         .build_log_apply_commit_for_outbox(
             "stale-bind-pod-stale-owner-subset",
             "UpdateResource",
-            crate::replication::storage_wire_codec::test_outbox_command(bind_payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(bind_payload.as_ref()),
             "leader",
         )
         .await
@@ -2254,7 +2254,7 @@ async fn stale_committed_pod_put_same_node_preserves_live_owner_references() {
         .build_log_apply_commit_for_outbox(
             "stale-same-node-pod-put",
             "UpdateResource",
-            crate::replication::storage_wire_codec::test_outbox_command(
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(
                 stale_same_node_payload.as_ref(),
             ),
             "leader",
@@ -2382,7 +2382,7 @@ async fn stale_committed_pod_put_with_explicit_empty_owner_references_clears_liv
         .build_log_apply_commit_for_outbox(
             "stale-explicit-owner-clear",
             "UpdateResource",
-            crate::replication::storage_wire_codec::test_outbox_command(
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(
                 stale_clear_payload.as_ref(),
             ),
             "leader",
@@ -2479,7 +2479,7 @@ async fn stale_committed_pod_bind_does_not_rebind_already_bound_pod() {
         .build_log_apply_commit_for_outbox(
             "stale-rebind-pod-bind",
             "UpdateResource",
-            crate::replication::storage_wire_codec::test_outbox_command(
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(
                 stale_bind_payload.as_ref(),
             ),
             "leader",
@@ -2859,7 +2859,7 @@ async fn raft_status_apply_built_before_preemption_preserves_disruption_target()
         .build_log_apply_commit_for_outbox(
             "raft-status-preemption-condition-race",
             "PodStatus",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -2973,7 +2973,7 @@ async fn raft_scale_patch_applies_against_live_resource_after_status_rv_race() {
         .build_log_apply_commit_for_outbox(
             "raft-rc-scale-latest-patch",
             "PatchResource",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3078,7 +3078,7 @@ async fn raft_pod_delete_mark_patch_applies_against_live_resource_after_status_r
         .build_log_apply_commit_for_outbox(
             "raft-pod-delete-mark-latest-patch",
             "PatchResource",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3207,7 +3207,7 @@ async fn raft_zero_grace_pod_delete_mark_patch_replays_identical_watch_payloads(
         .build_log_apply_commit_for_outbox(
             "raft-zero-grace-delete-mark-deterministic",
             "PatchResource",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3565,7 +3565,7 @@ async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
         .build_log_apply_commit_for_outbox(
             "raft-stale-deployment-revision-patch",
             "PatchResource",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3649,7 +3649,7 @@ async fn raft_apply_same_idempotency_key_returns_same_rv_without_reapply() {
         .build_log_apply_commit_for_outbox(
             "raft-idempotent-apply",
             "CreateResource",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3783,7 +3783,7 @@ async fn raft_outbox_build_rejects_incomplete_durable_ledger_row() {
         .build_log_apply_commit_for_outbox(
             "fresh-raft-placeholder-key",
             "PodMetadata",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await;
@@ -3843,7 +3843,7 @@ async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
         .build_log_apply_commit_for_outbox(
             idempotency_key,
             "CreateResource",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3868,7 +3868,7 @@ async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
         .build_log_apply_commit_for_outbox(
             idempotency_key,
             "CreateResource",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await;
@@ -4205,7 +4205,7 @@ async fn raft_commit_builder_does_not_treat_api_node_update_as_node_status_refre
         .build_log_apply_commit_for_outbox(
             "raft-leader-node-api-update",
             "PodStatus",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "mn-controlplane1",
         )
         .await
@@ -4524,7 +4524,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .build_log_apply_commit_for_outbox(
             "actor-finalize-finalizer-race",
             "PodMetadata",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4629,7 +4629,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .build_log_apply_commit_for_outbox(
             "actor-finalize-after-finalizer-drain",
             "PodMetadata",
-            crate::replication::storage_wire_codec::test_outbox_command(fresh_payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(fresh_payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4678,7 +4678,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .build_log_apply_commit_for_outbox(
             "actor-finalize-already-missing",
             "PodMetadata",
-            crate::replication::storage_wire_codec::test_outbox_command(missing_payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(missing_payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4738,7 +4738,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .build_log_apply_commit_for_outbox(
             "actor-finalize-stale-replacement",
             "PodMetadata",
-            crate::replication::storage_wire_codec::test_outbox_command(stale_payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(stale_payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4789,7 +4789,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .build_log_apply_commit_for_outbox(
             "actor-finalize-fixed-contract",
             "PodMetadata",
-            crate::replication::storage_wire_codec::test_outbox_command(eligible_payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(eligible_payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4861,7 +4861,7 @@ async fn actor_finalize_bound_pod_serializes_a_status_write_after_proposal_build
         .build_log_apply_commit_for_outbox(
             "actor-finalize-rv-race",
             "PodMetadata",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4968,7 +4968,7 @@ async fn watermarked_actor_finalize_bound_pod_covers_eligibility() {
             .build_log_apply_commit_for_outbox_with_watermark(
                 &idempotency_key,
                 "PodMetadata",
-                crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+                klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
                 "worker-a",
                 Some(klights_cluster_core::OutboxStreamWatermark {
                     client_id: format!("client-{}", case.name),
@@ -6003,7 +6003,7 @@ async fn build_candidate_rv_commit(
         .build_log_apply_commit_for_outbox(
             idempotency_key,
             crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "mn-controlplane1",
         )
         .await
@@ -6085,7 +6085,7 @@ async fn raft_terminal_conflict_does_not_consume_candidate_resource_version() {
         .build_log_apply_commit_for_outbox(
             "conflicting-node-registration",
             crate::node_outbox::payload::OutboxOperation::NodeRegistration.as_str(),
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "mn-controlplane2",
         )
         .await

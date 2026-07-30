@@ -8,10 +8,8 @@ use tokio_util::sync::CancellationToken;
 use crate::bootstrap::NodeMode;
 use crate::controllers::annotations::GRPC_PORT_ANNOTATION;
 use crate::datastore::{DatastoreHandle, ResourceListQuery};
-use crate::replication::grpc::client::{
-    GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient,
-};
-use crate::replication::protocol::JoinRole;
+use klights_leader_api::JoinRole;
+use klights_leader_rpc::client::{GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient};
 use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,7 +46,7 @@ pub(crate) async fn start_leader_peer_endpoint_observer(
     watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     deps: LeaderPeerEndpointObserverDeps,
     supervisor: Arc<TaskSupervisor>,
-    grpc_transport_policy: crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
+    grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
     shutdown_token: CancellationToken,
 ) -> Result<SupervisedJoinHandle<()>> {
     let client_identity = load_local_node_client_identity(
@@ -85,7 +83,7 @@ async fn run_leader_peer_endpoint_observer(
     deps: LeaderPeerEndpointObserverDeps,
     client_identity: ClientIdentity,
     supervisor: Arc<TaskSupervisor>,
-    grpc_transport_policy: crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
+    grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
     shutdown_token: CancellationToken,
 ) {
     // If the leader already has an ExternalIP (e.g. from registration or a
@@ -165,7 +163,7 @@ async fn observe_from_existing_nodes(
     deps: &LeaderPeerEndpointObserverDeps,
     client_identity: &ClientIdentity,
     supervisor: Arc<TaskSupervisor>,
-    grpc_transport_policy: crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
+    grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
 ) -> Result<()> {
     let nodes = db
         .list_resources("v1", "Node", None, ResourceListQuery::all())
@@ -197,7 +195,7 @@ async fn observe_from_peer(
     deps: &LeaderPeerEndpointObserverDeps,
     client_identity: &ClientIdentity,
     supervisor: Arc<TaskSupervisor>,
-    grpc_transport_policy: crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
+    grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
     peer: PeerEndpoint,
 ) -> Result<bool> {
     let client = ReplicationGrpcClient::new(

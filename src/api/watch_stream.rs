@@ -3010,7 +3010,7 @@ mod tests {
         assert_eq!(metadata.name.as_deref(), Some("positioned"));
         assert_eq!(metadata.resource_version.as_deref(), Some("73"));
 
-        let grpc = crate::replication::grpc::server::resource_to_proto(event.resource());
+        let grpc = klights_leader_rpc::server::resource_to_proto(event.resource());
         assert_eq!(grpc.api_version, "v1");
         assert_eq!(grpc.kind, "ConfigMap");
         assert_eq!(grpc.namespace.as_deref(), Some("default"));

@@ -11,10 +11,10 @@ pub async fn local_join_dataplane_metadata(
     node_mode: &NodeMode,
     node_ip: &str,
     supervisor: &klights_supervisor::TaskSupervisor,
-) -> anyhow::Result<crate::replication::grpc::client::JoinDataplaneMetadata> {
+) -> anyhow::Result<klights_leader_rpc::client::JoinDataplaneMetadata> {
     let _ = node_ip;
     let identity = local_dataplane_identity(config, node_mode, supervisor).await?;
-    Ok(crate::replication::grpc::client::JoinDataplaneMetadata {
+    Ok(klights_leader_rpc::client::JoinDataplaneMetadata {
         public_key: identity.public_key,
         endpoint: config.external_endpoint.clone().unwrap_or_default(),
         port: identity.port,
@@ -227,7 +227,7 @@ pub async fn publish_local_dataplane_metadata_self_heal(
 pub async fn enqueue_worker_dataplane_metadata_outbox(
     outbox: Option<&Outbox>,
     node_name: &str,
-    dataplane: &crate::replication::grpc::client::JoinDataplaneMetadata,
+    dataplane: &klights_leader_rpc::client::JoinDataplaneMetadata,
 ) -> anyhow::Result<()> {
     let subject_key = format!("v1/Node/{node_name}/dataplane");
     OutboxSendPlanner::new(outbox)

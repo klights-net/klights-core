@@ -2034,6 +2034,7 @@ dependencies = [
  "klights-internal-protobuf",
  "klights-kube-protobuf",
  "klights-leader-api",
+ "klights-leader-rpc",
  "klights-network-api",
  "klights-node-api",
  "klights-node-datastore",
@@ -2219,6 +2220,38 @@ dependencies = [
 [[package]]
 name = "klights-leader-rpc"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "futures",
+ "hyper 1.9.0",
+ "hyper-util",
+ "klights-cluster-core",
+ "klights-internal-protobuf",
+ "klights-leader-api",
+ "klights-node-api",
+ "klights-supervisor",
+ "klights-types",
+ "libc",
+ "prost",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tonic",
+ "tonic-reflection",
+ "tower",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "klights-network-api"

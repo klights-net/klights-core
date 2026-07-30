@@ -73,16 +73,14 @@ pub struct BootstrapRunArgs<'a> {
     pub network: Arc<crate::networking::Network>,
     pub services: Arc<dyn klights_network_api::ServiceRouter>,
     pub local_api_client: Arc<crate::control_plane::client::local::LocalApiClient>,
-    pub control_plane_lease_client:
-        Option<Arc<crate::replication::grpc::client::ReplicationGrpcClient>>,
+    pub control_plane_lease_client: Option<Arc<klights_leader_rpc::client::ReplicationGrpcClient>>,
     pub dataplane_health: &'a crate::networking::dataplane_health::DataplaneHealth,
     pub cri_for_pod_watcher: Option<CriClient>,
     pub cri_for_api: Option<Arc<tokio::sync::Mutex<CriClient>>>,
     pub cni_readiness: crate::kubelet::cni_readiness::CniReadiness,
     pub runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
     pub supervisor: Arc<TaskSupervisor>,
-    pub grpc_transport_policy:
-        crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
+    pub grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
     pub shutdown_token: CancellationToken,
     /// P3-11c: when raft mode is active on a leader-class boot, this
     /// is the live `RaftNode`. The bootstrap phase wires its router +
@@ -1767,7 +1765,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         // this server.
         let (raft_rpc_router, controlplane_join_handler) = match raft_node.as_ref() {
             Some(rn) => {
-                let router: Arc<dyn crate::replication::grpc::raft_rpc::RaftRpcRouter> = Arc::new(
+                let router: Arc<dyn klights_leader_rpc::raft_rpc::RaftRpcRouter> = Arc::new(
                     crate::datastore::raft::node::RaftNodeRpcRouter::from_node(rn.as_ref()),
                 );
                 let handler =
@@ -1794,14 +1792,14 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     local_api_client.clone(),
                 ),
             );
-            let grpc_ports = crate::replication::grpc::server::ReplicationServerPorts::from_shared(
+            let grpc_ports = klights_leader_rpc::server::ReplicationServerPorts::from_shared(
                 local_api_client.clone(),
                 authenticated_projected_token,
             );
-            crate::replication::grpc::server::mount_service_full_production(
+            klights_leader_rpc::server::mount_service_full_production(
                 api_router,
-                crate::replication::grpc::server::GrpcReplicationRuntimePorts::from_shared(
-                    crate::replication::grpc::runtime_adapter::GrpcReplicationRuntimeAdapter::new(
+                klights_leader_rpc::server::GrpcReplicationRuntimePorts::from_shared(
+                    crate::replication::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(
                         rs,
                     ),
                 ),
@@ -1820,7 +1818,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 Arc::new(chrono::Utc::now),
                 raft_rpc_router,
                 controlplane_join_handler,
-                crate::replication::grpc::ReplicationRuntimeFiles {
+                klights_leader_rpc::ReplicationRuntimeFiles {
                     ca_cert: crate::paths::ca_cert_path(&config.containerd_namespace),
                     ca_key: crate::paths::ca_key_path(&config.containerd_namespace),
                     service_account_signing_key: crate::paths::service_account_signing_key_path(
@@ -1877,11 +1875,11 @@ mod tests {
     use std::sync::Arc;
 
     use crate::control_plane::client::remote::RemoteApiClient;
-    use crate::replication::grpc::client::{
+    use klights_leader_api::JoinRole;
+    use klights_leader_rpc::client::{
         GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient,
     };
-    use crate::replication::grpc::transport_policy::GrpcTransportPolicy;
-    use crate::replication::protocol::JoinRole;
+    use klights_leader_rpc::transport_policy::GrpcTransportPolicy;
     use klights_supervisor::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
 
     #[tokio::test]

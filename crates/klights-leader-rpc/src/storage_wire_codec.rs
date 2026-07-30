@@ -11,10 +11,10 @@ use klights_cluster_core::{
 use klights_internal_protobuf::storage::*;
 use prost::Message;
 
-pub(crate) type CodecResult<T> = std::result::Result<T, StorageCodecError>;
+pub type CodecResult<T> = std::result::Result<T, StorageCodecError>;
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum StorageCodecError {
+pub enum StorageCodecError {
     #[error("JSON codec failure: {source}")]
     Json {
         #[from]
@@ -111,39 +111,33 @@ impl BoundaryFrom<ProtoCommandMeta> for CommandMeta {
 // ---------------------------------------------------------------------------
 
 /// Encode a `StorageCommand` as a JSON byte vector.
-#[cfg(test)]
-pub(crate) fn encode_command_json(cmd: &StorageCommand) -> CodecResult<Vec<u8>> {
+pub fn encode_command_json(cmd: &StorageCommand) -> CodecResult<Vec<u8>> {
     Ok(serde_json::to_vec(cmd)?)
 }
 
 /// Decode a `StorageCommand` from JSON bytes.
-#[cfg(test)]
-pub(crate) fn decode_command_json(bytes: &[u8]) -> CodecResult<StorageCommand> {
+pub fn decode_command_json(bytes: &[u8]) -> CodecResult<StorageCommand> {
     Ok(serde_json::from_slice(bytes)?)
 }
 
 /// Encode `StorageResponse` as JSON.
-#[cfg(test)]
-pub(crate) fn encode_response_json(resp: &StorageResponse) -> CodecResult<Vec<u8>> {
+pub fn encode_response_json(resp: &StorageResponse) -> CodecResult<Vec<u8>> {
     Ok(serde_json::to_vec(resp)?)
 }
 
 /// Decode `StorageResponse` from JSON.
-#[cfg(test)]
-pub(crate) fn decode_response_json(bytes: &[u8]) -> CodecResult<StorageResponse> {
+pub fn decode_response_json(bytes: &[u8]) -> CodecResult<StorageResponse> {
     Ok(serde_json::from_slice(bytes)?)
 }
 
 /// Encode `CommandMeta` as JSON.
-#[cfg(test)]
-pub(crate) fn encode_meta_json(meta: &CommandMeta) -> CodecResult<Vec<u8>> {
+pub fn encode_meta_json(meta: &CommandMeta) -> CodecResult<Vec<u8>> {
     validate_meta_codec(meta)?;
     Ok(serde_json::to_vec(meta)?)
 }
 
 /// Decode `CommandMeta` from JSON.
-#[cfg(test)]
-pub(crate) fn decode_meta_json(bytes: &[u8]) -> CodecResult<CommandMeta> {
+pub fn decode_meta_json(bytes: &[u8]) -> CodecResult<CommandMeta> {
     let meta = serde_json::from_slice(bytes)?;
     validate_meta_codec(&meta)?;
     Ok(meta)
@@ -154,7 +148,7 @@ pub(crate) fn decode_meta_json(bytes: &[u8]) -> CodecResult<CommandMeta> {
 // ---------------------------------------------------------------------------
 
 /// Encode a `StorageCommand` as protobuf bytes.
-pub(crate) fn encode_command_protobuf(cmd: &StorageCommand) -> CodecResult<Vec<u8>> {
+pub fn encode_command_protobuf(cmd: &StorageCommand) -> CodecResult<Vec<u8>> {
     let proto = ProtoStorageCommand::boundary_try_from(cmd.clone())?;
     let mut buf = Vec::with_capacity(proto.encoded_len());
     prost::Message::encode(&proto, &mut buf)?;
@@ -162,13 +156,13 @@ pub(crate) fn encode_command_protobuf(cmd: &StorageCommand) -> CodecResult<Vec<u
 }
 
 /// Decode a `StorageCommand` from protobuf bytes.
-pub(crate) fn decode_command_protobuf(bytes: &[u8]) -> CodecResult<StorageCommand> {
+pub fn decode_command_protobuf(bytes: &[u8]) -> CodecResult<StorageCommand> {
     let proto: ProtoStorageCommand = prost::Message::decode(bytes)?;
     StorageCommand::boundary_try_from(proto)
 }
 
 /// Encode a durable outbox payload with explicit command-codec provenance.
-pub(crate) fn encode_outbox_payload_protobuf(
+pub fn encode_outbox_payload_protobuf(
     payload: &klights_cluster_core::OutboxPayload,
 ) -> CodecResult<Vec<u8>> {
     let command_payload = encode_command_protobuf(payload.command())?;
@@ -181,7 +175,7 @@ pub(crate) fn encode_outbox_payload_protobuf(
 
 /// Decode a durable outbox envelope only after validating its exact command
 /// codec version. The inner command bytes remain opaque to persistence.
-pub(crate) fn decode_outbox_payload_protobuf(
+pub fn decode_outbox_payload_protobuf(
     bytes: &[u8],
 ) -> CodecResult<klights_cluster_core::OutboxPayload> {
     let envelope = ProtoOutboxCommandEnvelope::decode(bytes)?;
@@ -196,16 +190,14 @@ pub(crate) fn decode_outbox_payload_protobuf(
     ))
 }
 
-#[cfg(test)]
-pub(crate) fn test_outbox_command(bytes: &[u8]) -> StorageCommand {
+pub fn test_outbox_command(bytes: &[u8]) -> StorageCommand {
     decode_outbox_payload_protobuf(bytes)
         .expect("test outbox payload must decode")
         .into_command()
 }
 
 /// Encode `StorageResponse` as protobuf bytes.
-#[cfg(test)]
-pub(crate) fn encode_response_protobuf(resp: &StorageResponse) -> CodecResult<Vec<u8>> {
+pub fn encode_response_protobuf(resp: &StorageResponse) -> CodecResult<Vec<u8>> {
     let proto = ProtoStorageResponse::boundary_try_from(resp.clone())?;
     let mut buf = Vec::with_capacity(proto.encoded_len());
     prost::Message::encode(&proto, &mut buf)?;
@@ -213,14 +205,13 @@ pub(crate) fn encode_response_protobuf(resp: &StorageResponse) -> CodecResult<Ve
 }
 
 /// Decode `StorageResponse` from protobuf bytes.
-#[cfg(test)]
-pub(crate) fn decode_response_protobuf(bytes: &[u8]) -> CodecResult<StorageResponse> {
+pub fn decode_response_protobuf(bytes: &[u8]) -> CodecResult<StorageResponse> {
     let proto: ProtoStorageResponse = prost::Message::decode(bytes)?;
     StorageResponse::boundary_try_from(proto)
 }
 
 /// Encode `CommandMeta` as protobuf bytes.
-pub(crate) fn encode_meta_protobuf(meta: &CommandMeta) -> CodecResult<Vec<u8>> {
+pub fn encode_meta_protobuf(meta: &CommandMeta) -> CodecResult<Vec<u8>> {
     validate_meta_codec(meta)?;
     let proto = ProtoCommandMeta::boundary_from(meta.clone());
     let mut buf = Vec::with_capacity(proto.encoded_len());
@@ -229,7 +220,7 @@ pub(crate) fn encode_meta_protobuf(meta: &CommandMeta) -> CodecResult<Vec<u8>> {
 }
 
 /// Decode `CommandMeta` from protobuf bytes.
-pub(crate) fn decode_meta_protobuf(bytes: &[u8]) -> CodecResult<CommandMeta> {
+pub fn decode_meta_protobuf(bytes: &[u8]) -> CodecResult<CommandMeta> {
     let proto: ProtoCommandMeta = prost::Message::decode(bytes)?;
     let meta = CommandMeta::boundary_from(proto);
     validate_meta_codec(&meta)?;
@@ -237,8 +228,7 @@ pub(crate) fn decode_meta_protobuf(bytes: &[u8]) -> CodecResult<CommandMeta> {
 }
 
 /// Encode `CommandError` as protobuf bytes.
-#[cfg(test)]
-pub(crate) fn encode_error_protobuf(err: &CommandError) -> CodecResult<Vec<u8>> {
+pub fn encode_error_protobuf(err: &CommandError) -> CodecResult<Vec<u8>> {
     let proto = ProtoCommandError::boundary_try_from(err.clone())?;
     let mut buf = Vec::with_capacity(proto.encoded_len());
     prost::Message::encode(&proto, &mut buf)?;
@@ -246,8 +236,7 @@ pub(crate) fn encode_error_protobuf(err: &CommandError) -> CodecResult<Vec<u8>> 
 }
 
 /// Decode `CommandError` from protobuf bytes.
-#[cfg(test)]
-pub(crate) fn decode_error_protobuf(bytes: &[u8]) -> CodecResult<CommandError> {
+pub fn decode_error_protobuf(bytes: &[u8]) -> CodecResult<CommandError> {
     let proto: ProtoCommandError = prost::Message::decode(bytes)?;
     CommandError::boundary_try_from(proto)
 }

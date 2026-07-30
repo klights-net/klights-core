@@ -1237,7 +1237,7 @@ impl LocalApiClient {
         let watermark = crate::control_plane::client::apply::outbox_stream_watermark(
             &client_id, stream_id, stream_seq,
         );
-        let decoded = match crate::replication::storage_wire_codec::decode_outbox_payload_protobuf(
+        let decoded = match klights_leader_rpc::storage_wire_codec::decode_outbox_payload_protobuf(
             payload.as_ref(),
         ) {
             Ok(decoded) => decoded,

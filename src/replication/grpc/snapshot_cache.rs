@@ -54,7 +54,7 @@ where
 mod tests {
     use std::time::Duration;
 
-    use crate::replication::grpc::snapshot_cache::SnapshotCache;
+    use super::SnapshotCache;
 
     #[tokio::test]
     async fn snapshot_cache_reuses_entries_within_ttl_and_same_rv() {

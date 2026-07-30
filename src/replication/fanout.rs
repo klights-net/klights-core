@@ -1,3 +1,5 @@
+//! Event-driven replication fanout.
+
 use tokio::sync::mpsc;
 
 pub struct FanoutPool<T> {
@@ -68,7 +70,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::replication::grpc::fanout::FanoutPool;
+    use super::FanoutPool;
 
     #[test]
     fn fanout_distributes_followers_across_batches() {

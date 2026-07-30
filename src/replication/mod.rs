@@ -9,13 +9,18 @@
 //! - Service is idle-silent when no replicas connect.
 //! - Request/response types support JSON and protobuf codecs.
 
-pub mod grpc;
+pub mod fanout;
+#[cfg(test)]
+#[path = "grpc/client/tests.rs"]
+mod grpc_client_tests;
+pub(crate) mod grpc_runtime_adapter;
 pub mod log_apply_wire;
 pub(crate) mod outbox_payload_codec;
 pub(crate) mod outbox_response_wire;
-pub mod protocol;
 pub mod service;
-pub(crate) mod storage_wire_codec;
+#[cfg(test)]
+#[path = "grpc/snapshot_cache.rs"]
+pub mod snapshot_cache;
 #[cfg(test)]
 pub mod test_proto_channel_sink;
 pub use service::ReplicationService;

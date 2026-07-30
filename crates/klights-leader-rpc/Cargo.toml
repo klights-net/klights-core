@@ -10,3 +10,38 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+klights-types = { workspace = true }
+klights-cluster-core = { workspace = true }
+klights-leader-api = { workspace = true }
+klights-node-api = { workspace = true }
+klights-internal-protobuf = { workspace = true }
+klights-supervisor = { workspace = true }
+anyhow = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true, features = ["clock", "oldtime", "wasmbind"] }
+futures = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+libc = { workspace = true }
+prost = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { workspace = true, features = ["router", "transport", "codegen", "tls-ring"] }
+tonic-reflection = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["std", "v4"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

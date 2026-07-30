@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use klights_cluster_core::{
-    OutboxApplyError, OutboxApplyOutcome, OutboxOperation, StorageCommand,
+    OutboxApplyError, OutboxApplyOutcome, OutboxOperation, Resource, StorageCommand,
     classify_apply_error_for_command, pod_target,
 };
 use klights_cluster_store::{
@@ -11,8 +11,7 @@ use klights_cluster_store::{
 use tokio::sync::RwLock;
 
 use crate::datastore::DatastoreBackend;
-use crate::replication::protocol::ForwardedResource;
-use crate::replication::storage_wire_codec::decode_outbox_payload_protobuf;
+use klights_leader_rpc::storage_wire_codec::decode_outbox_payload_protobuf;
 
 #[derive(Clone)]
 pub(crate) struct RootOutboxApplyAdapter {
@@ -187,7 +186,7 @@ pub(crate) async fn propose_outbox_on_backend_with_watermark(
         decoded.command,
         StorageCommand::DeleteResource { .. } | StorageCommand::FinalizeBoundPod { .. }
     ) {
-        committed_resource.map(crate::replication::protocol::ForwardedResource::from)
+        committed_resource.map(normalize_receipt_resource)
     } else if matches!(
         decoded.command,
         StorageCommand::DeleteResourceWithTombstone { .. }
@@ -221,6 +220,14 @@ pub(crate) async fn propose_outbox_on_backend_with_watermark(
         command,
         pod_endpoint_effect,
     })
+}
+
+/// Preserve the historical forwarded-receipt contract without a second DTO:
+/// datastore row IDs are local implementation details and never cross the
+/// actor-finalization receipt boundary.
+fn normalize_receipt_resource(mut resource: Resource) -> Resource {
+    resource.id = 0;
+    resource
 }
 
 async fn reject_pod_uid_mismatch(
@@ -308,7 +315,7 @@ fn is_uid_bound_pod_command(command: &StorageCommand) -> bool {
 
 pub(crate) struct RaftOutboxApply {
     pub(crate) result: OutboxApplyOutcome,
-    pub(crate) resource: Option<ForwardedResource>,
+    pub(crate) resource: Option<Resource>,
     pub(crate) command: Option<StorageCommand>,
     pub(crate) pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
 }
@@ -325,7 +332,7 @@ impl RaftOutboxApply {
 async fn resource_before_apply(
     db: &dyn DatastoreBackend,
     command: &StorageCommand,
-) -> std::result::Result<Option<ForwardedResource>, OutboxApplyError> {
+) -> std::result::Result<Option<Resource>, OutboxApplyError> {
     match command {
         StorageCommand::DeleteResource { .. } => Ok(None),
         StorageCommand::DeleteResourceWithTombstone {
@@ -337,7 +344,6 @@ async fn resource_before_apply(
         } => db
             .get_resource(api_version, kind, namespace.as_deref(), name)
             .await
-            .map(|resource| resource.map(ForwardedResource::from))
             .map_err(|err| OutboxApplyError::Retryable(err.to_string())),
         StorageCommand::FinalizeBoundPod { .. } => Ok(None),
         StorageCommand::PatchResource {
@@ -350,7 +356,6 @@ async fn resource_before_apply(
         } if api_version == "v1" && kind == "Pod" && pod_patch_touches_endpoint_metadata(patch) => {
             db.get_resource(api_version, kind, namespace.as_deref(), name)
                 .await
-                .map(|resource| resource.map(ForwardedResource::from))
                 .map_err(|err| OutboxApplyError::Retryable(err.to_string()))
         }
         _ => Ok(None),
@@ -360,7 +365,7 @@ async fn resource_before_apply(
 async fn resource_after_apply(
     db: &dyn DatastoreBackend,
     command: &StorageCommand,
-) -> std::result::Result<Option<ForwardedResource>, OutboxApplyError> {
+) -> std::result::Result<Option<Resource>, OutboxApplyError> {
     match command {
         StorageCommand::CreateResource {
             api_version,
@@ -392,7 +397,6 @@ async fn resource_after_apply(
         } => db
             .get_resource(api_version, kind, namespace.as_deref(), name)
             .await
-            .map(|resource| resource.map(ForwardedResource::from))
             .map_err(|err| OutboxApplyError::Retryable(err.to_string())),
         _ => Ok(None),
     }
@@ -400,8 +404,8 @@ async fn resource_after_apply(
 
 fn pod_side_effect_resource_changed(
     command: &StorageCommand,
-    resource_before: Option<&ForwardedResource>,
-    resource_after: Option<&ForwardedResource>,
+    resource_before: Option<&Resource>,
+    resource_after: Option<&Resource>,
     resource_changed: bool,
 ) -> Option<bool> {
     match command {
@@ -435,10 +439,7 @@ fn pod_patch_touches_endpoint_metadata(patch: &serde_json::Value) -> bool {
         })
 }
 
-fn pod_endpoint_metadata_changed(
-    before: Option<&ForwardedResource>,
-    after: Option<&ForwardedResource>,
-) -> bool {
+fn pod_endpoint_metadata_changed(before: Option<&Resource>, after: Option<&Resource>) -> bool {
     ["/metadata/labels", "/metadata/deletionTimestamp"]
         .into_iter()
         .any(|pointer| {
@@ -575,7 +576,11 @@ mod tests {
         let eligible = create_bound_terminating_pod("eligible", "eligible-uid", json!([]))
             .await
             .unwrap();
-        let eligible_before = ForwardedResource::from(eligible);
+        let eligible_before = normalize_receipt_resource(eligible);
+        assert_eq!(
+            eligible_before.id, 0,
+            "actor-finalization receipts must not expose datastore-local row IDs"
+        );
 
         let finalize =
             |id: &'static str, name: &'static str, uid: &'static str, observed_resource_version| {

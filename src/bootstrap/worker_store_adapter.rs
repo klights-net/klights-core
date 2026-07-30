@@ -5,9 +5,7 @@ pub(crate) async fn start_worker_store_adapter(
     node_name: String,
     supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     shutdown_token: tokio_util::sync::CancellationToken,
-    discovery_client: Option<
-        std::sync::Arc<crate::replication::grpc::client::ReplicationGrpcClient>,
-    >,
+    discovery_client: Option<std::sync::Arc<klights_leader_rpc::client::ReplicationGrpcClient>>,
     initial_leader_endpoints: Vec<String>,
 ) -> anyhow::Result<std::sync::Arc<crate::control_plane::client::worker_store::WorkerStoreAdapter>>
 {

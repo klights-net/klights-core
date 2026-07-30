@@ -88,7 +88,7 @@ pub async fn consume_terminal_outbox_sequence(
     watermark: Option<OutboxStreamWatermark>,
 ) -> std::result::Result<(), OutboxApplyError> {
     let assigned_sequence = watermark.is_some();
-    let payload = crate::replication::storage_wire_codec::encode_outbox_payload_protobuf(
+    let payload = klights_leader_rpc::storage_wire_codec::encode_outbox_payload_protobuf(
         &klights_cluster_core::OutboxPayload::new(
             crate::node_outbox::payload::terminal_decision_command(idempotency_key),
         ),

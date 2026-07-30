@@ -45,11 +45,10 @@ pub struct OpenLeaderArgs<'a> {
     pub role: &'a NodeRole,
     pub node_mode: &'a crate::bootstrap::NodeMode,
     pub supervisor: Arc<TaskSupervisor>,
-    pub grpc_transport_policy:
-        crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
+    pub grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
     pub shutdown_token: CancellationToken,
     pub is_leader_rx: tokio::sync::watch::Receiver<bool>,
-    pub local_dataplane: crate::replication::grpc::client::JoinDataplaneMetadata,
+    pub local_dataplane: klights_leader_rpc::client::JoinDataplaneMetadata,
     pub node_ip: &'a str,
 }
 
@@ -85,8 +84,7 @@ pub struct DatastorePhase {
     pub skip_seed_bootstrap: bool,
     /// Lease renew fallback for control-plane joiners while follower.
     /// Used by heartbeat to send `renew_node_lease` RPCs to the leader.
-    pub control_plane_lease_client:
-        Option<Arc<crate::replication::grpc::client::ReplicationGrpcClient>>,
+    pub control_plane_lease_client: Option<Arc<klights_leader_rpc::client::ReplicationGrpcClient>>,
 }
 
 struct RemoteForwarderParts {
@@ -95,7 +93,7 @@ struct RemoteForwarderParts {
     outbox_deliveries: Arc<dyn klights_leader_api::LeaderOutboxDelivery>,
     node_lease_renewals: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
     remote_api_client: Option<Arc<crate::control_plane::client::remote::RemoteApiClient>>,
-    lease_client: Option<Arc<crate::replication::grpc::client::ReplicationGrpcClient>>,
+    lease_client: Option<Arc<klights_leader_rpc::client::ReplicationGrpcClient>>,
 }
 
 fn passive_store_open_request(config: &KlightsConfig) -> PassiveStoreOpenRequest<'_> {
@@ -681,12 +679,12 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                                     );
                                     return;
                                 };
-                                let client = crate::replication::grpc::client::ReplicationGrpcClient::new(
-                                    crate::replication::grpc::client::GrpcClientConfig {
+                                let client = klights_leader_rpc::client::ReplicationGrpcClient::new(
+                                    klights_leader_rpc::client::GrpcClientConfig {
                                         leader_endpoint: target.clone(),
                                         token: token.clone(),
                                         node_name: node_name.clone(),
-                                        role: crate::replication::protocol::JoinRole::Worker,
+                                        role: klights_leader_api::JoinRole::Worker,
                                         dataplane: join_dataplane.clone(),
                                         ca_cert_path: join_ca_cert_path.clone(),
                                         skip_ca,
@@ -1008,12 +1006,12 @@ fn build_remote_forwarder(
     role: &NodeRole,
     supervisor: Arc<TaskSupervisor>,
     client_identity: ControlplaneJoinClientIdentity,
-    local_dataplane: crate::replication::grpc::client::JoinDataplaneMetadata,
-    grpc_transport_policy: crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
+    local_dataplane: klights_leader_rpc::client::JoinDataplaneMetadata,
+    grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
 ) -> RemoteForwarderParts {
     use crate::control_plane::client::leader_proxy::StubRemoteForwarder;
     use crate::control_plane::client::remote::RemoteApiClient;
-    use crate::replication::grpc::client::{GrpcClientConfig, ReplicationGrpcClient};
+    use klights_leader_rpc::client::{GrpcClientConfig, ReplicationGrpcClient};
 
     let (endpoints, token, skip_ca) = match role {
         NodeRole::Controlplane {
@@ -1069,7 +1067,7 @@ fn build_remote_forwarder(
         leader_endpoint: initial,
         token,
         node_name: config.node_name.clone(),
-        role: crate::replication::protocol::JoinRole::Worker,
+        role: klights_leader_api::JoinRole::Worker,
         dataplane: local_dataplane,
         ca_cert_path,
         skip_ca: effective_skip_ca,
@@ -1659,13 +1657,12 @@ mod tests {
         ))
     }
 
-    fn test_transport_policy()
-    -> crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy {
-        crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default()
+    fn test_transport_policy() -> klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy {
+        klights_leader_rpc::transport_policy::GrpcTransportPolicy::shared_default()
     }
 
-    fn test_dataplane() -> crate::replication::grpc::client::JoinDataplaneMetadata {
-        crate::replication::grpc::client::JoinDataplaneMetadata {
+    fn test_dataplane() -> klights_leader_rpc::client::JoinDataplaneMetadata {
+        klights_leader_rpc::client::JoinDataplaneMetadata {
             public_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
             endpoint: "10.99.0.14".to_string(),
             port: Some(7679),
@@ -1836,7 +1833,7 @@ mod tests {
             remote_parts
                 .lease_client
                 .expect("joiner must have a remote gRPC client")
-                .uses_client_cert_auth_for_test(),
+                .uses_client_cert_auth(),
             "tokenless controlplane rejoin remote RPCs must use persisted node mTLS cert"
         );
     }
@@ -1863,7 +1860,7 @@ mod tests {
             remote_parts
                 .lease_client
                 .expect("joiner must have a remote gRPC client")
-                .dataplane_for_test(),
+                .dataplane(),
             dataplane,
             "joining controlplane remote RPCs must carry local WireGuard metadata"
         );

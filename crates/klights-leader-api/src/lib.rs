@@ -3,6 +3,7 @@
 mod crd_registry;
 pub use crd_registry::{CrdRegistry, CrdResourceInfo, resource_infos_from_value};
 mod controlplane_join;
+pub mod replication;
 pub use controlplane_join::{
     ControlplaneJoinAdmission, ControlplaneJoinAdmissionFuture, ControlplaneJoinAdmissionOutcome,
     ControlplaneJoinAuthority, ControlplaneJoinError, ControlplaneJoinFuture,
@@ -11,6 +12,10 @@ pub use controlplane_join::{
     ControlplaneJoinRegistrationSnapshot, ControlplaneJoinRequest, ControlplaneJoinRoute,
     ControlplaneMemberQuery, ControlplaneMemberQueryFuture, RaftStorageAttestation,
     RaftStorageLogAttestation, RemoteNodeHostFacts, RemoteNodeMode, RemoteNodeRegistrationSnapshot,
+};
+pub use replication::{
+    JoinRequest, JoinResponse, JoinRole, MetadataRequest, MetadataResponse,
+    require_exact_command_codec,
 };
 
 use std::any::Any;

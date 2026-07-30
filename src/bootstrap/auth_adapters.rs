@@ -13,7 +13,7 @@ use crate::controllers::csr_signer::{
 use crate::datastore::backend::DatastoreHandle;
 use crate::datastore::types::ListPageRequest;
 use crate::kubelet::pod_repository::PodReader;
-use crate::replication::grpc::server::{
+use klights_leader_rpc::server::{
     ControlplaneCredentialError, ControlplaneCredentialIssuer, ReplicationPeerAuthenticationError,
     ReplicationPeerAuthenticator, ReplicationPeerIdentity,
 };

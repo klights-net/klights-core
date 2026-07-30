@@ -9649,7 +9649,7 @@ async fn scheduler_preemption_condition_survives_interleaved_worker_status_and_g
         .build_log_apply_commit_for_outbox(
             "stale-worker-status-after-preemption",
             "PodStatus",
-            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await

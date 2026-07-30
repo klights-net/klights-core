@@ -592,7 +592,7 @@ async fn outbox_apply_rolls_back_mutation_when_ledger_insert_fails() {
         .apply_outbox_transactionally(
             "rollback-key",
             "PodStatus",
-            crate::replication::storage_wire_codec::test_outbox_command(&pod_status_payload(
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(&pod_status_payload(
                 "uid-rb",
             )),
             "node-a",
@@ -641,7 +641,7 @@ async fn outbox_apply_rolls_back_mutation_when_ledger_insert_fails() {
         .apply_outbox_transactionally(
             "rollback-key",
             "PodStatus",
-            crate::replication::storage_wire_codec::test_outbox_command(&pod_status_payload(
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(&pod_status_payload(
                 "uid-rb",
             )),
             "node-a",
@@ -698,7 +698,7 @@ async fn outbox_apply_rejects_incomplete_ledger_row_without_age_based_recovery()
         .apply_outbox_transactionally(
             "stale-placeholder-key",
             "PodStatus",
-            crate::replication::storage_wire_codec::test_outbox_command(&pod_status_payload(
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(&pod_status_payload(
                 "uid-stale",
             )),
             "node-a",
@@ -763,7 +763,7 @@ async fn outbox_apply_rejects_fresh_incomplete_ledger_row_without_consuming_it()
         .apply_outbox_transactionally(
             "fresh-placeholder-key",
             "PodStatus",
-            crate::replication::storage_wire_codec::test_outbox_command(&pod_status_payload(
+            klights_leader_rpc::storage_wire_codec::test_outbox_command(&pod_status_payload(
                 "uid-fresh-placeholder",
             )),
             "node-a",

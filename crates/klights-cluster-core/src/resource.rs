@@ -122,7 +122,7 @@ impl fmt::Display for ResourceIdentityError {
 impl std::error::Error for ResourceIdentityError {}
 
 /// Canonical stored Kubernetes resource.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Resource {
     pub id: i64,
     pub api_version: String,

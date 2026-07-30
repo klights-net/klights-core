@@ -9,7 +9,7 @@ impl OutboxPayloadCodec for InternalProtobufOutboxPayloadCodec {
         &self,
         command: &klights_cluster_core::StorageCommand,
     ) -> Result<Arc<[u8]>, OutboxPayloadCodecError> {
-        super::storage_wire_codec::encode_outbox_payload_protobuf(
+        klights_leader_rpc::storage_wire_codec::encode_outbox_payload_protobuf(
             &klights_cluster_core::OutboxPayload::new(command.clone()),
         )
         .map(Arc::from)
@@ -20,7 +20,7 @@ impl OutboxPayloadCodec for InternalProtobufOutboxPayloadCodec {
         &self,
         payload: &[u8],
     ) -> Result<klights_cluster_core::StorageCommand, OutboxPayloadCodecError> {
-        super::storage_wire_codec::decode_outbox_payload_protobuf(payload)
+        klights_leader_rpc::storage_wire_codec::decode_outbox_payload_protobuf(payload)
             .map(klights_cluster_core::OutboxPayload::into_command)
             .map_err(|error| OutboxPayloadCodecError::invalid_payload(error.to_string()))
     }

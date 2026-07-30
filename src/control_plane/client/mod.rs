@@ -906,7 +906,7 @@ mod tests {
             .expect("read terminal ledger")
             .expect("terminal ledger row");
         assert!(matches!(
-            crate::replication::storage_wire_codec::decode_response_protobuf(&ledger.result_proto),
+            klights_leader_rpc::storage_wire_codec::decode_response_protobuf(&ledger.result_proto),
             Ok(klights_cluster_core::command::StorageResponse::Error { message })
                 if message.contains("delivery UID mismatch")
         ));

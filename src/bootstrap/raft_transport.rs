@@ -20,7 +20,7 @@ use klights_supervisor::TaskSupervisor;
 /// envelope-bytes return of the three Raft RPCs into the typed
 /// `GrpcRaftRpcError` the network layer expects.
 pub struct ReplicationGrpcRaftRpcClient {
-    inner: Arc<crate::replication::grpc::client::ReplicationGrpcClient>,
+    inner: Arc<klights_leader_rpc::client::ReplicationGrpcClient>,
     /// P3/P0#3-fix1: the peer address this client targets (the address openraft
     /// membership passed to `client_for`), carried into the typed transport
     /// error so raft RPC failures log the exact peer (not a flattened generic
@@ -30,7 +30,7 @@ pub struct ReplicationGrpcRaftRpcClient {
 
 impl ReplicationGrpcRaftRpcClient {
     pub fn new(
-        inner: Arc<crate::replication::grpc::client::ReplicationGrpcClient>,
+        inner: Arc<klights_leader_rpc::client::ReplicationGrpcClient>,
         peer_addr: String,
     ) -> Self {
         Self { inner, peer_addr }
@@ -67,7 +67,7 @@ fn map_rpc_outcome(
             // production client's `UnaryRpcError::Status` before flattening;
             // a plain `transport_err.to_string()` loses the code and message,
             // hiding auth/deadline/unavailable distinctions.
-            use crate::replication::grpc::client::UnaryRpcError;
+            use klights_leader_rpc::client::UnaryRpcError;
             let (tonic_code, tonic_message, detail) =
                 if let Some(unary) = transport_err.downcast_ref::<UnaryRpcError>() {
                     match unary {
@@ -98,11 +98,11 @@ impl GrpcRaftRpcClient for ReplicationGrpcRaftRpcClient {
         receiver: crate::datastore::raft::types::RaftMemberNode,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, GrpcRaftRpcError> {
-        let receiver = crate::replication::grpc::raft_rpc::RaftReceiverAdmission {
+        let receiver = klights_leader_rpc::raft_rpc::RaftReceiverAdmission {
             addr: receiver.addr,
             storage_incarnation: receiver.storage_incarnation,
             admitted_log: receiver.admitted_log.map(|log| {
-                crate::replication::grpc::raft_rpc::RaftReceiverLogId {
+                klights_leader_rpc::raft_rpc::RaftReceiverLogId {
                     term: log.term,
                     leader_node_id: log.leader_node_id,
                     index: log.index,
@@ -119,11 +119,11 @@ impl GrpcRaftRpcClient for ReplicationGrpcRaftRpcClient {
         receiver: crate::datastore::raft::types::RaftMemberNode,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, GrpcRaftRpcError> {
-        let receiver = crate::replication::grpc::raft_rpc::RaftReceiverAdmission {
+        let receiver = klights_leader_rpc::raft_rpc::RaftReceiverAdmission {
             addr: receiver.addr,
             storage_incarnation: receiver.storage_incarnation,
             admitted_log: receiver.admitted_log.map(|log| {
-                crate::replication::grpc::raft_rpc::RaftReceiverLogId {
+                klights_leader_rpc::raft_rpc::RaftReceiverLogId {
                     term: log.term,
                     leader_node_id: log.leader_node_id,
                     index: log.index,
@@ -140,11 +140,11 @@ impl GrpcRaftRpcClient for ReplicationGrpcRaftRpcClient {
         receiver: crate::datastore::raft::types::RaftMemberNode,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, GrpcRaftRpcError> {
-        let receiver = crate::replication::grpc::raft_rpc::RaftReceiverAdmission {
+        let receiver = klights_leader_rpc::raft_rpc::RaftReceiverAdmission {
             addr: receiver.addr,
             storage_incarnation: receiver.storage_incarnation,
             admitted_log: receiver.admitted_log.map(|log| {
-                crate::replication::grpc::raft_rpc::RaftReceiverLogId {
+                klights_leader_rpc::raft_rpc::RaftReceiverLogId {
                     term: log.term,
                     leader_node_id: log.leader_node_id,
                     index: log.index,
@@ -169,8 +169,8 @@ pub struct ReplicationGrpcRaftClientTemplate {
     pub skip_ca: bool,
     pub client_cert_pem: Option<String>,
     pub client_key_pem: Option<String>,
-    pub dataplane: crate::replication::grpc::client::JoinDataplaneMetadata,
-    pub transport_policy: crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
+    pub dataplane: klights_leader_rpc::client::JoinDataplaneMetadata,
+    pub transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
 }
 
 /// Mints a per-peer `ReplicationGrpcClient` on demand, keyed on the
@@ -195,24 +195,22 @@ impl ReplicationGrpcRaftClientFactory {
 
 impl GrpcRaftClientFactory for ReplicationGrpcRaftClientFactory {
     fn client_for(&self, addr: &str) -> Arc<dyn GrpcRaftRpcClient> {
-        let config = crate::replication::grpc::client::GrpcClientConfig {
+        let config = klights_leader_rpc::client::GrpcClientConfig {
             leader_endpoint: addr.to_string(),
             token: self.template.token.clone(),
             node_name: self.template.node_name.clone(),
-            role: crate::replication::protocol::JoinRole::Worker,
+            role: klights_leader_api::JoinRole::Worker,
             dataplane: self.template.dataplane.clone(),
             ca_cert_path: self.template.ca_cert_path.clone(),
             skip_ca: self.template.skip_ca,
             client_cert_pem: self.template.client_cert_pem.clone(),
             client_key_pem: self.template.client_key_pem.clone(),
         };
-        let client = Arc::new(
-            crate::replication::grpc::client::ReplicationGrpcClient::new(
-                config,
-                self.supervisor.clone(),
-                self.template.transport_policy.clone(),
-            ),
-        );
+        let client = Arc::new(klights_leader_rpc::client::ReplicationGrpcClient::new(
+            config,
+            self.supervisor.clone(),
+            self.template.transport_policy.clone(),
+        ));
         Arc::new(ReplicationGrpcRaftRpcClient::new(client, addr.to_string()))
     }
 }
@@ -242,8 +240,8 @@ impl ReplicationGrpcMemberFeatureProbe {
     fn local_metadata_for_member(
         local_node_id: crate::datastore::raft::types::NodeId,
         node_id: crate::datastore::raft::types::NodeId,
-    ) -> Option<crate::replication::protocol::MetadataResponse> {
-        (node_id == local_node_id).then(|| crate::replication::protocol::MetadataResponse {
+    ) -> Option<klights_leader_api::MetadataResponse> {
+        (node_id == local_node_id).then(|| klights_leader_api::MetadataResponse {
             cluster_id: String::new(),
             leader_epoch: 0,
             current_rv: 0,
@@ -259,16 +257,16 @@ impl crate::datastore::raft::node::MemberFeatureProbe for ReplicationGrpcMemberF
         &self,
         node_id: crate::datastore::raft::types::NodeId,
         addr: &str,
-    ) -> anyhow::Result<crate::replication::protocol::MetadataResponse> {
+    ) -> anyhow::Result<klights_leader_api::MetadataResponse> {
         if let Some(metadata) = Self::local_metadata_for_member(self.local_node_id, node_id) {
             return Ok(metadata);
         }
-        let client = crate::replication::grpc::client::ReplicationGrpcClient::new(
-            crate::replication::grpc::client::GrpcClientConfig {
+        let client = klights_leader_rpc::client::ReplicationGrpcClient::new(
+            klights_leader_rpc::client::GrpcClientConfig {
                 leader_endpoint: addr.to_string(),
                 token: self.template.token.clone(),
                 node_name: self.template.node_name.clone(),
-                role: crate::replication::protocol::JoinRole::Worker,
+                role: klights_leader_api::JoinRole::Worker,
                 dataplane: self.template.dataplane.clone(),
                 ca_cert_path: self.template.ca_cert_path.clone(),
                 skip_ca: self.template.skip_ca,
@@ -286,7 +284,7 @@ impl crate::datastore::raft::node::MemberFeatureProbe for ReplicationGrpcMemberF
 mod tests {
     use super::*;
     use crate::datastore::raft::grpc_network::GrpcRaftRpcError;
-    use crate::replication::grpc::client::UnaryRpcError;
+    use klights_leader_rpc::client::UnaryRpcError;
 
     #[test]
     fn local_member_feature_probe_shortcuts_to_local_capabilities() {
@@ -371,7 +369,7 @@ mod tests {
             got: ("snapshot-a", 512).into(),
         };
         let outcome = Ok(Err(
-            crate::replication::grpc::raft_rpc::RaftRpcRouterError::snapshot_mismatch(
+            klights_leader_rpc::raft_rpc::RaftRpcRouterError::snapshot_mismatch(
                 serde_json::to_string(&mismatch).unwrap(),
             )
             .to_string(),

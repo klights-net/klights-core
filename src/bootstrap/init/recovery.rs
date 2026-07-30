@@ -15,7 +15,7 @@ pub struct StartupRecoveryContext<'a> {
     pub runtime_paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
     pub task_supervisor: &'a klights_supervisor::TaskSupervisor,
     pub file_process: &'a klights_supervisor::FileProcessExecutor,
-    pub grpc_transport_policy: &'a crate::replication::grpc::transport_policy::GrpcTransportPolicy,
+    pub grpc_transport_policy: &'a klights_leader_rpc::transport_policy::GrpcTransportPolicy,
 }
 
 pub async fn run_startup_resource_recovery(

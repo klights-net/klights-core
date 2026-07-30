@@ -9,6 +9,7 @@ pub mod node_projection;
 pub mod outbox;
 pub mod recovery;
 pub mod replay;
+pub mod replication;
 pub mod resource;
 pub mod stale_resource;
 pub mod status;
@@ -53,6 +54,7 @@ pub use outbox::{
 };
 pub use recovery::{ClusterMetadata, MetadataComparison, compare_metadata, needs_confirmation};
 pub use replay::{PositionedWatchEvent, WatchReplayPosition};
+pub use replication::{ReplicationEntry, StreamItem, StreamRequest};
 pub use resource::{
     PatchKind, PodEndpointState, Resource, ResourceBatchOperation, ResourceBatchPutMode,
     ResourceEventObject, ResourceIdentityError, ResourcePatchRequest, ResourcePreconditions,

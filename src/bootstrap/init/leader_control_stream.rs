@@ -6,8 +6,8 @@
 //! after a raft election without restart.
 
 pub async fn start_worker_leader_control_stream(
-    client: std::sync::Arc<crate::replication::grpc::client::ReplicationGrpcClient>,
-    runtimes: crate::replication::grpc::client::NodeControlRuntimes,
+    client: std::sync::Arc<klights_leader_rpc::client::ReplicationGrpcClient>,
+    runtimes: klights_leader_rpc::client::NodeControlRuntimes,
     supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<klights_supervisor::SupervisedJoinHandle<()>> {
@@ -27,8 +27,8 @@ pub async fn start_worker_leader_control_stream(
 }
 
 async fn run_worker_leader_control_stream(
-    client: std::sync::Arc<crate::replication::grpc::client::ReplicationGrpcClient>,
-    runtimes: crate::replication::grpc::client::NodeControlRuntimes,
+    client: std::sync::Arc<klights_leader_rpc::client::ReplicationGrpcClient>,
+    runtimes: klights_leader_rpc::client::NodeControlRuntimes,
     supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -48,14 +48,14 @@ async fn run_worker_leader_control_stream(
                         _ = cancel.cancelled() => return,
                         next = client.stream_next() => {
                             match next {
-                                Ok(crate::replication::protocol::StreamItem::Entry(entry)) => {
+                                Ok(klights_cluster_core::StreamItem::Entry(entry)) => {
                                     observed_rv = observed_rv.max(entry.meta.resource_version);
                                     if let Err(err) = client.ack(observed_rv).await {
                                         tracing::debug!(error = %err, "failed to ACK worker leader stream entry");
                                         break;
                                     }
                                 }
-                                Ok(crate::replication::protocol::StreamItem::Heartbeat { current_rv }) => {
+                                Ok(klights_cluster_core::StreamItem::Heartbeat { current_rv }) => {
                                     observed_rv = observed_rv.max(current_rv);
                                     if let Err(err) = client.ack(observed_rv).await {
                                         tracing::debug!(error = %err, "failed to ACK worker leader stream heartbeat");

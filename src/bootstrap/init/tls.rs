@@ -115,7 +115,7 @@ pub(crate) async fn serve_https_connection(
             req.extensions_mut()
                 .insert(klights_types::TlsClientCertificate(cert));
         }
-        crate::replication::grpc::server::insert_tonic_tcp_connect_info(
+        klights_leader_rpc::server::insert_tonic_tcp_connect_info(
             &mut req,
             local_addr,
             Some(remote_addr),
@@ -136,7 +136,7 @@ pub async fn serve_https<F>(
     addr: &str,
     data_root: &std::path::Path,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
-    transport_policy: crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
+    transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
     shutdown_signal: F,
 ) -> anyhow::Result<()>
 where

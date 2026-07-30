@@ -75,13 +75,13 @@ impl RaftMemberNode {
     }
 }
 
-impl From<RaftMemberNode> for crate::replication::grpc::raft_rpc::RaftReceiverAdmission {
+impl From<RaftMemberNode> for klights_leader_rpc::raft_rpc::RaftReceiverAdmission {
     fn from(value: RaftMemberNode) -> Self {
         Self {
             addr: value.addr,
             storage_incarnation: value.storage_incarnation,
             admitted_log: value.admitted_log.map(|log| {
-                crate::replication::grpc::raft_rpc::RaftReceiverLogId {
+                klights_leader_rpc::raft_rpc::RaftReceiverLogId {
                     term: log.term,
                     leader_node_id: log.leader_node_id,
                     index: log.index,

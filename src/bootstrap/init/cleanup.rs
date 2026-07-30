@@ -32,7 +32,7 @@ pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
     let file_process =
         klights_supervisor::FileProcessExecutor::new(cleanup_task_supervisor.clone());
     let grpc_transport_policy =
-        crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default();
+        klights_leader_rpc::transport_policy::GrpcTransportPolicy::shared_default();
     let node_mode =
         NodeMode::detect(cli.rootless).context("failed to detect klights operating mode")?;
     let network_cleanup = networking::NetworkCleanup::from_config(

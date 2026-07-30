@@ -154,24 +154,23 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         }
     };
 
-    let grpc_config = crate::replication::grpc::client::GrpcClientConfig {
+    let grpc_config = klights_leader_rpc::client::GrpcClientConfig {
         leader_endpoint: le.clone(),
         token: tk.unwrap_or_default(),
         node_name: config.node_name.clone(),
-        role: crate::replication::protocol::JoinRole::Worker,
+        role: klights_leader_api::JoinRole::Worker,
         dataplane: follower_dataplane.clone(),
         ca_cert_path: grpc_ca_cert_path.clone(),
         skip_ca,
         client_cert_pem,
         client_key_pem,
     };
-    let follower_grpc_client = std::sync::Arc::new(
-        crate::replication::grpc::client::ReplicationGrpcClient::new(
+    let follower_grpc_client =
+        std::sync::Arc::new(klights_leader_rpc::client::ReplicationGrpcClient::new(
             grpc_config,
             task_supervisor.clone(),
             grpc_transport_policy.clone(),
-        ),
-    );
+        ));
     // T2 step 5: register all known leader endpoints so the reconnect
     // loop can cycle through them after a stream failure.
     follower_grpc_client.set_all_leader_endpoints(all_leader_endpoints.clone());
@@ -342,29 +341,29 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
 
     let (exec_runtime, metrics_runtime) = match &cri_for_api {
         Some(cri) => (
-            crate::replication::grpc::client::NodeExecCapability::Available(std::sync::Arc::new(
+            klights_leader_rpc::client::NodeExecCapability::Available(std::sync::Arc::new(
                 crate::kubelet::remote_runtime::CriNodeExecRuntime::new(
                     cri.clone(),
                     task_supervisor.clone(),
                 ),
             )),
-            crate::replication::grpc::client::NodeMetricsCapability::Available(
-                std::sync::Arc::new(crate::kubelet::remote_runtime::CriNodeMetricsRuntime::new(
-                    std::sync::Arc::new(crate::kubelet::metrics::CriNodeMetricsSampler::new(
+            klights_leader_rpc::client::NodeMetricsCapability::Available(std::sync::Arc::new(
+                crate::kubelet::remote_runtime::CriNodeMetricsRuntime::new(std::sync::Arc::new(
+                    crate::kubelet::metrics::CriNodeMetricsSampler::new(
                         cri.clone(),
                         task_supervisor.clone(),
-                    )),
+                    ),
                 )),
-            ),
+            )),
         ),
         None => (
-            crate::replication::grpc::client::NodeExecCapability::Unavailable,
-            crate::replication::grpc::client::NodeMetricsCapability::Unavailable,
+            klights_leader_rpc::client::NodeExecCapability::Unavailable,
+            klights_leader_rpc::client::NodeMetricsCapability::Unavailable,
         ),
     };
-    let control_runtimes = crate::replication::grpc::client::NodeControlRuntimes::new(
+    let control_runtimes = klights_leader_rpc::client::NodeControlRuntimes::new(
         exec_runtime,
-        crate::replication::grpc::client::NodeLogCapability::Available(std::sync::Arc::new(
+        klights_leader_rpc::client::NodeLogCapability::Available(std::sync::Arc::new(
             crate::api::pod_subresources::local_node_log_runtime::LocalNodeLogRuntime::new_with_pod_event_store(
                 crate::paths::pod_logs_root_path(&config.containerd_namespace),
                 task_supervisor.clone(),

@@ -30,10 +30,10 @@ use super::{
     ListRequest, ResourceList, focused_watch_event, legacy_list_request, legacy_list_response,
     legacy_watch_event, query_error, query_list_result,
 };
-use crate::replication::grpc::client::ReplicationGrpcClient;
 use klights_cluster_core::Resource;
 #[cfg(test)]
 use klights_cluster_core::WatchReplayPosition;
+use klights_leader_rpc::client::ReplicationGrpcClient;
 use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 
 /// bug-grpc: a worker watch stream that delivers neither an event nor a
@@ -704,12 +704,9 @@ mod tests {
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::backend::DatastoreHandle;
     use crate::node_outbox::payload::OutboxPayload;
-    use crate::replication::grpc::client::{
-        GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient,
-    };
-    use crate::replication::protocol::JoinRole;
     use crate::replication::service::ReplicationService;
     use klights_cluster_core::command::StorageCommand;
+    use klights_leader_api::JoinRole;
     use klights_leader_api::OutboxDeliveryError as OutboxApplyError;
     use klights_leader_api::{
         CacheReadinessError, CacheReadinessRequest, LeaderCacheReadiness,
@@ -720,6 +717,9 @@ mod tests {
         WatchEventType, WatchRequest, pod_get_request,
     };
     use klights_leader_api::{LeaderOutboxDelivery, OutboxDeliveryRequest};
+    use klights_leader_rpc::client::{
+        GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient,
+    };
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use klights_types::ResourceKey;
 
@@ -783,17 +783,17 @@ mod tests {
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
-        let app = crate::replication::grpc::server::mount_service_with_passive_reads(
+        let app = crate::grpc_test_support::mount_service_with_passive_reads(
             axum::Router::new(),
             service,
             db.clone(),
             passive_reads,
-            crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
+            klights_leader_rpc::transport_policy::GrpcTransportPolicy::shared_default(),
         );
-        // Simulate the mTLS edge: in production the TLS layer injects the
-        // caller's client certificate; over the in-process plaintext channel we
-        // inject the gRPC transport's node cert so node-scoped RPCs
-        // (NodeRestriction) see the same authenticated identity.
+        // Simulate the mTLS identity edge: the shared test server provides the
+        // production-required TLS 1.3 transport, while this middleware injects
+        // the gRPC transport's node cert so node-scoped RPCs (NodeRestriction)
+        // see the same authenticated identity.
         let grpc_node_cert = test_node_cert_der(&grpc_node_name);
         let app = app.layer(axum::middleware::from_fn(
             move |mut request: axum::extract::Request, next: axum::middleware::Next| {
@@ -806,11 +806,7 @@ mod tests {
                 }
             },
         ));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let handle = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
+        let (endpoint, handle) = crate::grpc_test_support::serve_tls_test_app(app).await;
         let grpc = Arc::new(
             ReplicationGrpcClient::connect(
                 GrpcClientConfig {
@@ -820,16 +816,16 @@ mod tests {
                     role: JoinRole::Worker,
                     dataplane: dataplane(),
                     ca_cert_path: None,
-                    skip_ca: false,
+                    skip_ca: true,
                     client_cert_pem: None,
                     client_key_pem: None,
                 },
                 supervisor.clone(),
-                crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
-                crate::replication::grpc::client::NodeControlRuntimes::new(
-                    crate::replication::grpc::client::NodeExecCapability::Unavailable,
-                    crate::replication::grpc::client::NodeLogCapability::Unavailable,
-                    crate::replication::grpc::client::NodeMetricsCapability::Unavailable,
+                klights_leader_rpc::transport_policy::GrpcTransportPolicy::shared_default(),
+                klights_leader_rpc::client::NodeControlRuntimes::new(
+                    klights_leader_rpc::client::NodeExecCapability::Unavailable,
+                    klights_leader_rpc::client::NodeLogCapability::Unavailable,
+                    klights_leader_rpc::client::NodeMetricsCapability::Unavailable,
                 ),
             )
             .await

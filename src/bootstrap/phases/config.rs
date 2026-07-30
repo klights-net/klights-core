@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::KlightsConfig;
 use crate::bootstrap::{CliFlags, NodeMode};
 use crate::networking::NetworkCleanup;
-use crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy;
+use klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy;
 use klights_supervisor::TaskSupervisor;
 
 pub struct ConfigPhase {
@@ -50,7 +50,7 @@ pub async fn load(cli: &CliFlags) -> Result<ConfigPhase> {
         file_process.clone(),
     );
     let grpc_transport_policy =
-        crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default();
+        klights_leader_rpc::transport_policy::GrpcTransportPolicy::shared_default();
     let task_limits = supervisor.config();
     tracing::info!(
         "task supervisor category limits: background={}, file={}, db={}, timer={}, network={}, pod_delete_workqueue={}, others={}",

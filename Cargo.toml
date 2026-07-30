@@ -201,6 +201,7 @@ klights-cluster-core = { workspace = true }
 klights-cluster-datastore = { workspace = true }
 klights-cluster-store = { workspace = true }
 klights-leader-api = { workspace = true }
+klights-leader-rpc = { workspace = true }
 klights-watch = { workspace = true }
 klights-node-api = { workspace = true }
 klights-node-store = { workspace = true }

@@ -1,5 +1,7 @@
 //! Transport-neutral node-facing API contracts for klights.
 
+pub mod replication;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
@@ -7,6 +9,12 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 
 use bytes::Bytes;
+
+pub use replication::{
+    FollowerCompletionContext, FollowerControlMessage, NodeOperationKind, RoutedNodeExecFrame,
+    RoutedNodeExecRequest, RoutedNodeExecSyncRequest, RoutedNodeExecSyncResponse,
+    RoutedNodeLogEvent, RoutedNodeLogRequest, RoutedNodeMetricsRequest, RoutedNodeMetricsResponse,
+};
 
 /// Transport limits needed by the kubelet's local containerd CRI channel.
 ///

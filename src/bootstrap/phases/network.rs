@@ -45,8 +45,7 @@ pub struct NetworkBootArgs<'a> {
     pub runtime_paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
     pub runtime_inputs: crate::bootstrap::runtime_inputs::NetworkRuntimeInputs,
     pub supervisor: Arc<TaskSupervisor>,
-    pub grpc_transport_policy:
-        crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
+    pub grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
     pub shutdown_token: CancellationToken,
 }
 

@@ -1,15 +1,18 @@
+//! Root composition adapter for the reusable leader RPC runtime ports.
+
 use std::sync::Arc;
 
-use crate::replication::grpc::server::{
+use crate::replication::service::ReplicationService;
+use klights_cluster_core::ReplicationEntry;
+use klights_leader_api::{JoinRequest, JoinResponse, MetadataResponse};
+use klights_leader_rpc::server::{
     GrpcBootstrapRuntime, GrpcFollowerCompletionRuntime, GrpcFollowerSessionRuntime,
     GrpcMetadataRuntime, GrpcRuntimeError, GrpcRuntimeSupervision,
 };
-use crate::replication::protocol::{
-    FollowerCompletionContext, FollowerControlMessage, JoinRequest, JoinResponse, MetadataResponse,
-    ReplicationEntry, RoutedNodeExecFrame, RoutedNodeExecSyncResponse, RoutedNodeLogEvent,
-    RoutedNodeMetricsResponse,
+use klights_node_api::{
+    FollowerCompletionContext, FollowerControlMessage, RoutedNodeExecFrame,
+    RoutedNodeExecSyncResponse, RoutedNodeLogEvent, RoutedNodeMetricsResponse,
 };
-use crate::replication::service::ReplicationService;
 
 /// Embedded replication application adapter for the reusable authenticated
 /// gRPC transport contracts.

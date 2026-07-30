@@ -5,8 +5,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context as TaskContext, Poll};
-#[cfg(test)]
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use futures::StreamExt as _;
@@ -41,9 +39,9 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Uri};
 use tower::Service;
 
-use crate::leader_tls_policy::{LeaderTlsVerificationPolicy, ResolvedLeaderTlsVerification};
-use crate::replication::grpc::transport_policy::GrpcTransportPolicy;
-use crate::replication::grpc::{
+use crate::tls_policy::{LeaderTlsVerificationPolicy, ResolvedLeaderTlsVerification};
+use crate::transport_policy::GrpcTransportPolicy;
+use crate::{
     JOIN_TOKEN_METADATA_KEY, entry_from_proto, resource_command_request_to_proto,
     watch_replay_position_from_proto, watch_replay_position_to_proto,
 };
@@ -59,7 +57,7 @@ pub struct SignControlplaneCsrResponse {
     pub service_account_signing_key_nonce: Vec<u8>,
 }
 
-use crate::replication::protocol::{
+use crate::protocol::{
     JoinResponse, JoinRole, RoutedNodeMetricsRequest, RoutedNodeMetricsResponse, StreamItem,
 };
 use klights_supervisor::{TaskCategory, TaskSupervisor};
@@ -262,7 +260,7 @@ pub struct GrpcClientConfig {
     // would only confuse callers; struct shape simplified.
 }
 
-pub(crate) fn node_registration_to_proto(
+pub fn node_registration_to_proto(
     registration: &klights_leader_api::RemoteNodeRegistrationSnapshot,
 ) -> klights_internal_protobuf::NodeRegistrationSnapshot {
     let node_mode = match &registration.node_mode {
@@ -366,6 +364,28 @@ enum ChannelLane {
     /// snapshot transfer cannot head-of-line-block heartbeats/AppendEntries
     /// multiplexed over the same Raft connection under loss.
     InstallSnapshot,
+}
+
+/// Public diagnostic representation of an isolated client channel lane.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum GrpcChannelLane {
+    Stream,
+    Status,
+    Read,
+    Raft,
+    InstallSnapshot,
+}
+
+impl From<GrpcChannelLane> for ChannelLane {
+    fn from(lane: GrpcChannelLane) -> Self {
+        match lane {
+            GrpcChannelLane::Stream => Self::Stream,
+            GrpcChannelLane::Status => Self::Status,
+            GrpcChannelLane::Read => Self::Read,
+            GrpcChannelLane::Raft => Self::Raft,
+            GrpcChannelLane::InstallSnapshot => Self::InstallSnapshot,
+        }
+    }
 }
 
 impl ChannelLane {
@@ -524,76 +544,45 @@ impl ReplicationGrpcClient {
         &self.policy
     }
 
-    /// Test seam: shrink the unary RPC deadline so timeout behaviour can be
-    /// exercised in milliseconds instead of the production 15 s.
-    #[cfg(test)]
-    pub(crate) fn override_unary_deadline(&mut self, deadline: Duration) {
-        let mut policy = *self.policy;
-        policy.unary_deadline = deadline;
-        self.policy = Arc::new(policy);
-    }
-
-    /// Test seam: shrink the Raft unary RPC deadline so timeout behaviour
-    /// can be exercised in milliseconds instead of the production value.
-    /// bug-grpc T6: the three Raft consensus RPCs now have their own
-    /// per-call deadline (`raft_unary_deadline`) so a wedged peer cannot
-    /// stall consensus under partial packet loss.
-    #[cfg(test)]
-    pub(crate) fn override_raft_unary_deadline(&mut self, deadline: Duration) {
-        let mut policy = *self.policy;
-        policy.raft_unary_deadline = deadline;
-        self.policy = Arc::new(policy);
-    }
-
     /// bug-grpc: number of real channel builds (TLS handshakes) so far.
-    /// Test seam asserting unary RPCs reuse a cached channel.
-    #[cfg(test)]
+    /// Read-only diagnostic for verifying channel reuse.
     pub fn channel_build_count(&self) -> u64 {
         self.channel_build_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// T7: test seam — number of raft RPC deadline-exceeded timeouts recorded
+    /// Number of raft RPC deadline-exceeded timeouts recorded
     /// across all three raft RPC methods (AppendEntries, Vote, InstallSnapshot).
-    #[cfg(test)]
     pub fn raft_timeout_count(&self) -> u64 {
         self.raft_timeout_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// T7: test seam — number of AppendEntries RPCs dispatched.
-    #[cfg(test)]
+    /// Number of AppendEntries RPCs dispatched.
     pub fn raft_append_entries_call_count(&self) -> u64 {
         self.raft_append_entries_call_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// T7: test seam — total bytes sent in AppendEntries payloads.
-    #[cfg(test)]
+    /// Total bytes sent in AppendEntries payloads.
     pub fn raft_append_entries_byte_count(&self) -> u64 {
         self.raft_append_entries_byte_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// bug-grpc: test seam — the endpoint a lane's pool is currently
-    /// built for (None if the lane has never been used / was invalidated).
-    #[cfg(test)]
-    async fn lane_endpoint(&self, lane: ChannelLane) -> Option<String> {
+    pub async fn lane_endpoint(&self, lane: GrpcChannelLane) -> Option<String> {
         self.channel_pools
             .lock()
             .await
-            .get(&lane)
+            .get(&lane.into())
             .map(|pool| pool.endpoint.clone())
     }
 
-    /// bug-grpc: test seam — number of pooled connections currently held
-    /// for a lane.
-    #[cfg(test)]
-    async fn lane_pool_len(&self, lane: ChannelLane) -> usize {
+    pub async fn lane_pool_len(&self, lane: GrpcChannelLane) -> usize {
         self.channel_pools
             .lock()
             .await
-            .get(&lane)
+            .get(&lane.into())
             .map(|pool| pool.channels.len())
             .unwrap_or(0)
     }
@@ -725,7 +714,7 @@ impl ReplicationGrpcClient {
         Ok(client)
     }
 
-    pub(crate) async fn ensure_joined_with_runtimes(
+    pub async fn ensure_joined_with_runtimes(
         &self,
         runtimes: NodeControlRuntimes,
     ) -> Result<JoinResponse> {
@@ -753,7 +742,7 @@ impl ReplicationGrpcClient {
         Ok(response)
     }
 
-    pub async fn metadata(&self) -> Result<crate::replication::protocol::MetadataResponse> {
+    pub async fn metadata(&self) -> Result<crate::protocol::MetadataResponse> {
         let response = self
             .unary_call(
                 "grpc_get_metadata",
@@ -767,7 +756,7 @@ impl ReplicationGrpcClient {
             )
             .await
             .map_err(|err| err.into_anyhow("gRPC GetMetadata failed"))?;
-        Ok(crate::replication::protocol::MetadataResponse {
+        Ok(crate::protocol::MetadataResponse {
             cluster_id: response.cluster_id,
             leader_epoch: response.leader_epoch,
             current_rv: response.current_rv,
@@ -1172,7 +1161,7 @@ impl ReplicationGrpcClient {
         }
     }
 
-    pub(crate) async fn apply_outbox_rpc(
+    pub async fn apply_outbox_rpc(
         &self,
         request: OutboxDeliveryRequest,
     ) -> std::result::Result<OutboxDeliveryResult, OutboxDeliveryError> {
@@ -1216,7 +1205,7 @@ impl ReplicationGrpcClient {
     /// Fail startup before this client can submit commands to an older leader.
     pub async fn require_command_codec_v3(&self) -> anyhow::Result<()> {
         let metadata = self.metadata().await?;
-        crate::replication::protocol::require_exact_command_codec(
+        crate::protocol::require_exact_command_codec(
             metadata.command_codec_version,
             "replication leader",
         )
@@ -1231,7 +1220,7 @@ impl ReplicationGrpcClient {
     /// `datastore::raft::grpc_network::GrpcRaftRpcClient`.
     pub async fn raft_append_entries_rpc(
         &self,
-        receiver: crate::replication::grpc::raft_rpc::RaftReceiverAdmission,
+        receiver: crate::raft_rpc::RaftReceiverAdmission,
         payload: Vec<u8>,
     ) -> Result<std::result::Result<Vec<u8>, String>> {
         let receiver_admission = serde_json::to_vec(&receiver).map_err(|error| {
@@ -1273,7 +1262,7 @@ impl ReplicationGrpcClient {
 
     pub async fn raft_vote_rpc(
         &self,
-        receiver: crate::replication::grpc::raft_rpc::RaftReceiverAdmission,
+        receiver: crate::raft_rpc::RaftReceiverAdmission,
         payload: Vec<u8>,
     ) -> Result<std::result::Result<Vec<u8>, String>> {
         let receiver_admission = serde_json::to_vec(&receiver).map_err(|error| {
@@ -1306,7 +1295,7 @@ impl ReplicationGrpcClient {
 
     pub async fn raft_install_snapshot_rpc(
         &self,
-        receiver: crate::replication::grpc::raft_rpc::RaftReceiverAdmission,
+        receiver: crate::raft_rpc::RaftReceiverAdmission,
         payload: Vec<u8>,
     ) -> Result<std::result::Result<Vec<u8>, String>> {
         let receiver_admission = serde_json::to_vec(&receiver).map_err(|error| {
@@ -1520,7 +1509,7 @@ impl ReplicationGrpcClient {
             .context("gRPC RenewNodeLease failed")
     }
 
-    pub(crate) async fn renew_node_lease_focused_rpc(
+    pub async fn renew_node_lease_focused_rpc(
         &self,
         renew_time: &str,
         lease_duration_seconds: i64,
@@ -1882,7 +1871,7 @@ impl ReplicationGrpcClient {
         Ok((stream.sender.clone(), stream.stream_items.clone()))
     }
 
-    pub(crate) async fn clear_stream(&self) {
+    pub async fn clear_stream(&self) {
         *self.stream.lock().await = None;
         // bug-grpc: a dropped stream means only the stream's connection
         // is suspect. Invalidate ONLY the Stream lane so the next
@@ -2032,11 +2021,8 @@ impl ReplicationGrpcClient {
         }
     }
 
-    /// Test accessor: whether a warm channel pool currently exists for a
-    /// lane. Used to assert lane eviction (self-heal) in tests.
-    #[cfg(test)]
-    async fn lane_pool_present_for_test(&self, lane: ChannelLane) -> bool {
-        self.channel_pools.lock().await.contains_key(&lane)
+    pub async fn lane_pool_present(&self, lane: GrpcChannelLane) -> bool {
+        self.channel_pools.lock().await.contains_key(&lane.into())
     }
 
     async fn channel_to_endpoint(&self, current: &str) -> Result<Channel> {
@@ -2053,7 +2039,7 @@ impl ReplicationGrpcClient {
         // bug-grpc A1: all dial tunables come from the injected policy.
         let mut builder = self.policy.configure_endpoint(
             Endpoint::from_shared(endpoint.clone())?,
-            crate::replication::grpc::transport_policy::ChannelKind::InterNode,
+            crate::transport_policy::ChannelKind::InterNode,
         );
         if endpoint.starts_with("https://") {
             let host = endpoint_host(&endpoint)?;
@@ -2129,17 +2115,15 @@ impl ReplicationGrpcClient {
         None
     }
 
-    fn uses_client_cert_auth(&self) -> bool {
+    pub fn observed_leader_endpoint(&self) -> Option<String> {
+        self.observed_leader_endpoint_for_report()
+    }
+
+    pub fn uses_client_cert_auth(&self) -> bool {
         self.config.client_cert_pem.is_some() && self.config.client_key_pem.is_some()
     }
 
-    #[cfg(test)]
-    pub(crate) fn uses_client_cert_auth_for_test(&self) -> bool {
-        self.uses_client_cert_auth()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dataplane_for_test(&self) -> JoinDataplaneMetadata {
+    pub fn dataplane(&self) -> JoinDataplaneMetadata {
         self.config.dataplane.clone()
     }
 
@@ -3025,9 +3009,7 @@ fn resource_command_rpc_error(error: UnaryRpcError) -> ResourceCommandError {
 }
 
 fn watch_status_error(status: tonic::Status) -> LeaderWatchError {
-    if let Some(accepted_resource_version) =
-        crate::replication::grpc::watch_replay_expired_resource_version(&status)
-    {
+    if let Some(accepted_resource_version) = crate::watch_replay_expired_resource_version(&status) {
         return LeaderWatchError::ReplayExpired {
             accepted_resource_version,
         };
@@ -3523,19 +3505,8 @@ fn normalized_endpoint(endpoint: &str) -> Result<String> {
     }
 }
 
-#[cfg(not(test))]
 fn connector_endpoint(endpoint: &str) -> Result<String> {
     normalized_endpoint(endpoint)
-}
-
-#[cfg(test)]
-fn connector_endpoint(endpoint: &str) -> Result<String> {
-    let trimmed = endpoint.trim();
-    if trimmed.starts_with("http://") {
-        Ok(trimmed.to_string())
-    } else {
-        normalized_endpoint(endpoint)
-    }
 }
 
 fn endpoint_host(endpoint: &str) -> Result<String> {
@@ -3787,9 +3758,8 @@ fn node_metrics_response_to_proto(
 }
 
 // `forwarded_*_from_proto` helpers removed in T6 along with the
-// ForwardedResource / ForwardedNodeSubnet / ForwardedPodSlotAdmission
+// Resource / ForwardedNodeSubnet / ForwardedPodSlotAdmission
 // proto messages.
 
 #[cfg(test)]
-#[path = "tests.rs"]
 mod tests;

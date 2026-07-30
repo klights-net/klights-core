@@ -5,10 +5,10 @@ use tonic::Status;
 use klights_supervisor::TaskSupervisor;
 
 #[derive(Clone)]
-pub(crate) struct ReplicationRuntimeFiles {
-    pub(crate) ca_cert: PathBuf,
-    pub(crate) ca_key: PathBuf,
-    pub(crate) service_account_signing_key: PathBuf,
+pub struct ReplicationRuntimeFiles {
+    pub ca_cert: PathBuf,
+    pub ca_key: PathBuf,
+    pub service_account_signing_key: PathBuf,
 }
 
 #[derive(Clone)]
