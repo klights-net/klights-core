@@ -501,7 +501,8 @@ fn apply_commit_in_tx_with_watch_events(
         klights_cluster_core::OutboxWatermarkDecision::Apply => {}
     }
     let mutation_count = commit.mutations.len();
-    let applied_mutation = applied_mutation_from_stamped_commit(&commit)?;
+    let deleted_resource = deleted_resource_from_stamped_commit(&commit)?;
+    let returned_resource_target = returned_resource_target(&commit);
     let apply_start = std::time::Instant::now();
     let mut effects = ApplyEffects::new();
     let mut applier = RaftClusterStateApplier::new(tx);
@@ -513,6 +514,14 @@ fn apply_commit_in_tx_with_watch_events(
             &mut effects,
         )?;
     }
+    let applied_mutation = match deleted_resource {
+        Some(resource) => Some(resource),
+        None => returned_resource_target
+            .as_ref()
+            .map(|target| read_returned_resource_in_tx(tx, target))
+            .transpose()?
+            .flatten(),
+    };
     if let Some(watermark) = watermark.as_ref() {
         upsert_outbox_watermark_in_tx(tx, watermark)?;
     }
@@ -618,7 +627,137 @@ fn resolve_bound_pod_finalizations_in_tx(
     Ok(commit)
 }
 
-fn applied_mutation_from_stamped_commit(
+#[derive(Clone, Debug)]
+enum ReturnedResourceTarget {
+    Resource {
+        api_version: String,
+        kind: String,
+        namespace: Option<String>,
+        name: String,
+    },
+    Namespace {
+        name: String,
+    },
+}
+
+fn returned_resource_target(commit: &ApplyCommit) -> Option<ReturnedResourceTarget> {
+    commit.mutations.iter().find_map(|mutation| match mutation {
+        LogApplyMutation::PutResource(row) => Some(ReturnedResourceTarget::Resource {
+            api_version: row.api_version.clone(),
+            kind: row.kind.clone(),
+            namespace: row.namespace.clone(),
+            name: row.name.clone(),
+        }),
+        LogApplyMutation::PatchResourceLatest(patch) => Some(ReturnedResourceTarget::Resource {
+            api_version: patch.api_version.clone(),
+            kind: patch.kind.clone(),
+            namespace: patch.namespace.clone(),
+            name: patch.name.clone(),
+        }),
+        LogApplyMutation::PutNamespace(row) => Some(ReturnedResourceTarget::Namespace {
+            name: row.name.clone(),
+        }),
+        _ => None,
+    })
+}
+
+fn read_returned_resource_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    target: &ReturnedResourceTarget,
+) -> tokio_rusqlite::Result<Option<Resource>> {
+    match target {
+        ReturnedResourceTarget::Resource {
+            api_version,
+            kind,
+            namespace: Some(namespace),
+            name,
+        } => tx
+            .query_row(
+                queries::NAMESPACED_GET,
+                rusqlite::params![api_version, kind, namespace, name],
+                |row| {
+                    let data: Vec<u8> = row.get(7)?;
+                    Ok(Resource {
+                        id: row.get(0)?,
+                        api_version: row.get(1)?,
+                        kind: row.get(2)?,
+                        namespace: row.get(3)?,
+                        name: row.get(4)?,
+                        resource_version: row.get(5)?,
+                        uid: row.get(6)?,
+                        data: std::sync::Arc::new(serde_json::from_slice(&data).map_err(
+                            |error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    data.len(),
+                                    rusqlite::types::Type::Blob,
+                                    Box::new(error),
+                                )
+                            },
+                        )?),
+                    })
+                },
+            )
+            .optional()
+            .map_err(tokio_rusqlite::Error::from),
+        ReturnedResourceTarget::Resource {
+            api_version,
+            kind,
+            namespace: None,
+            name,
+        } => tx
+            .query_row(
+                queries::CLUSTER_GET,
+                rusqlite::params![api_version, kind, name],
+                |row| {
+                    let data: Vec<u8> = row.get(6)?;
+                    Ok(Resource {
+                        id: row.get(0)?,
+                        api_version: row.get(1)?,
+                        kind: row.get(2)?,
+                        namespace: None,
+                        name: row.get(3)?,
+                        resource_version: row.get(4)?,
+                        uid: row.get(5)?,
+                        data: std::sync::Arc::new(serde_json::from_slice(&data).map_err(
+                            |error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    data.len(),
+                                    rusqlite::types::Type::Blob,
+                                    Box::new(error),
+                                )
+                            },
+                        )?),
+                    })
+                },
+            )
+            .optional()
+            .map_err(tokio_rusqlite::Error::from),
+        ReturnedResourceTarget::Namespace { name } => tx
+            .query_row(queries::NAMESPACE_GET, [name], |row| {
+                let data: Vec<u8> = row.get(3)?;
+                Ok(Resource {
+                    id: 0,
+                    api_version: "v1".to_string(),
+                    kind: "Namespace".to_string(),
+                    namespace: None,
+                    name: row.get(0)?,
+                    resource_version: row.get(1)?,
+                    uid: row.get(2)?,
+                    data: std::sync::Arc::new(serde_json::from_slice(&data).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            data.len(),
+                            rusqlite::types::Type::Blob,
+                            Box::new(error),
+                        )
+                    })?),
+                })
+            })
+            .optional()
+            .map_err(tokio_rusqlite::Error::from),
+    }
+}
+
+fn deleted_resource_from_stamped_commit(
     commit: &ApplyCommit,
 ) -> tokio_rusqlite::Result<Option<Resource>> {
     let Some(deleted_key) = commit.mutations.iter().find_map(|mutation| match mutation {

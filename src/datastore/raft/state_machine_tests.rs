@@ -1210,6 +1210,13 @@ mod tests {
             Some(1),
             "state machine must return the commit's resource_version as applied_rv"
         );
+        let applied_resource = match results[0].applied_mutation.as_ref() {
+            Some(klights_replication::types::AppliedMutation::Resource(resource)) => resource,
+            None => panic!("state machine must return the exact committed resource"),
+        };
+        assert_eq!(applied_resource.name, "from-raft");
+        assert_eq!(applied_resource.uid, "cm-uid-1");
+        assert_eq!(applied_resource.resource_version, 1);
 
         let row = backend
             .get_resource("v1", "ConfigMap", Some("default"), "from-raft")
@@ -1357,9 +1364,17 @@ mod tests {
             klights_cluster_core::PodEndpointEffect::Changed,
             "real committed-Raft apply must carry the transaction-derived endpoint effect"
         );
-        assert!(
-            result[0].applied_mutation.is_none(),
-            "visible status updates must not manufacture delete-tombstone mutation payloads"
+        let applied_resource = match result[0].applied_mutation.as_ref() {
+            Some(klights_replication::types::AppliedMutation::Resource(resource)) => resource,
+            None => panic!("visible status update must return its exact committed resource"),
+        };
+        assert_eq!(applied_resource.name, "guestbook-0");
+        assert_eq!(
+            applied_resource
+                .data
+                .pointer("/status/conditions/0/status")
+                .and_then(|value| value.as_str()),
+            Some("True")
         );
         let ready_rv = result[0].applied_rv.unwrap();
         assert!(ready_rv > list.resource_version);
