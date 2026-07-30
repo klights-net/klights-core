@@ -146,6 +146,16 @@ pub fn apply_commit_in_tx_for_raft_with_context(
     commit
         .validate_live_template()
         .map_err(|error| other_error(error.to_string()))?;
+    if commit.mutations().is_empty() && commit.outbox_watermark().is_none() {
+        return RaftLogApplyOutcome::try_new(
+            klights_cluster_core::CommittedApplyOutcome::NoPublicChange {
+                resource_version: transaction_primitives::current_resource_version(tx)?,
+                reason: klights_cluster_core::NoPublicChangeReason::LedgerOnly,
+            },
+            Vec::new(),
+            klights_cluster_core::PodEndpointEffect::NotApplicable,
+        );
+    }
     let before_position = WatchReplayPosition {
         resource_version: transaction_primitives::current_resource_version(tx)?,
         event_id: transaction_primitives::watch_event_allocator_high_water(tx)?,

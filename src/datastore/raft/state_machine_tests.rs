@@ -1227,6 +1227,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_empty_live_commit_preserves_public_resource_version() {
+        let backend: Arc<crate::datastore::sqlite::Datastore> =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        backend.advance_resource_version_after(41).await.unwrap();
+        let before_rv = backend.get_current_resource_version().await.unwrap();
+        let mut sm = build_sm_with_backend(backend.clone()).await;
+        let commit = crate::datastore::test_support::test_live_commit(0, Vec::new());
+        let payload_bytes = klights_replication::log_apply_wire::encode_commit_protobuf(&commit)
+            .expect("encode empty LogApplyCommit");
+        let results = sm
+            .apply(vec![Entry::<TypeConfig> {
+                log_id: LogId::new(LeaderId::new(3, 10), 42),
+                payload: EntryPayload::Normal(
+                    klights_replication::types::StorageCommandPayload::from_bytes(payload_bytes),
+                ),
+            }])
+            .await
+            .expect("apply empty live commit");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].applied_rv, Some(before_rv));
+        assert!(
+            !results[0].public_resource_changed,
+            "an empty live commit must not allocate a public resourceVersion"
+        );
+        assert!(results[0].applied_mutation.is_none());
+        assert_eq!(
+            backend.get_current_resource_version().await.unwrap(),
+            before_rv,
+            "empty live commit must preserve the datastore public resourceVersion"
+        );
+    }
+
+    #[tokio::test]
     async fn apply_normal_entry_stamps_provisional_rv_after_current_store_rv() {
         let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
