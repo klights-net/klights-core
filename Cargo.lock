@@ -2328,10 +2328,12 @@ dependencies = [
  "klights-leader-rpc",
  "klights-node-store",
  "klights-supervisor",
+ "klights-types",
  "openraft",
  "prost",
  "serde",
  "serde_json",
+ "tokio",
  "tracing",
  "uuid",
 ]

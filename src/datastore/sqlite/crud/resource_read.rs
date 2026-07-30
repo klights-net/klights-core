@@ -5,11 +5,6 @@ use klights_cluster_datastore::sqlite::read_store::SqliteResourceListQuery;
 
 impl Datastore {
     #[cfg(test)]
-    pub(crate) fn resource_get_call_count_for_test(&self) -> u64 {
-        self.focused_reads.resource_get_call_count_for_test()
-    }
-
-    #[cfg(test)]
     pub(crate) fn install_list_resources_snapshot_pause_for_test(
         api_version: &str,
         kind: &str,

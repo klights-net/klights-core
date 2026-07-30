@@ -1965,17 +1965,19 @@ async fn worker_actor_finalization_enqueues_uid_qualified_pod_delete_outbox() {
         }
         other => panic!("expected FinalizeBoundPod outbox command, got {other:?}"),
     }
-    let applied = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
+    let applied = crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
         leader_db.as_ref(),
         &row.idempotency_key,
         crate::kubelet::outbox::OutboxOperation::PodMetadata,
-        bytes::Bytes::copy_from_slice(row.payload_proto.as_slice()),
+        payload.command,
         "worker-1",
+        None,
     )
     .await
     .expect("apply the actor-authored command through the Raft outbox reducer");
+    let (_, _, _, committed_resource) = applied.into_parts();
     assert!(
-        applied.command.is_some(),
+        committed_resource.is_some(),
         "newly committed actor finalization must preserve its side-effect receipt"
     );
     assert!(
@@ -2596,26 +2598,24 @@ impl StatusRacingRaftProposal {
         authoring_node: &str,
         _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<
-        crate::bootstrap::outbox_apply_adapter::RaftOutboxApply,
+        klights_replication::proposal::RaftProposalEffect,
         crate::node_outbox::OutboxApplyError,
     > {
         self.bump_status_before_delete_mark(&command).await;
-        let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
-            .encode_protobuf()
-            .map_err(|err| crate::node_outbox::OutboxApplyError::Retryable(err.to_string()))?;
-        crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
+        crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
             self.inner.as_ref(),
             idempotency_key,
             operation,
-            bytes::Bytes::from(payload),
+            command,
             authoring_node,
+            None,
         )
         .await
     }
 }
 
 #[async_trait::async_trait]
-impl crate::datastore::raft::proposal::RaftProposal for StatusRacingRaftProposal {
+impl klights_replication::proposal::RaftProposal for StatusRacingRaftProposal {
     async fn propose_command(
         &self,
         command: klights_cluster_core::command::StorageCommand,
@@ -2631,13 +2631,19 @@ impl crate::datastore::raft::proposal::RaftProposal for StatusRacingRaftProposal
             )
             .await
             .map_err(|err| anyhow::anyhow!("status race raft propose: {err}"))?;
+        let (result, resource_effect, pod_endpoint_effect, committed_resource) =
+            outcome.into_parts();
+        let applied_rv = match result {
+            crate::node_outbox::OutboxApplyResult::Applied { applied_rv } => Some(applied_rv),
+            crate::node_outbox::OutboxApplyResult::AlreadyApplied { applied_rv } => applied_rv,
+        };
         Ok(klights_replication::types::StorageCommandResult::new(
-            outcome.applied_resource_version(),
+            applied_rv,
             None,
             None,
-            false,
-            None,
-            outcome.pod_endpoint_effect,
+            resource_effect == klights_cluster_core::ResourceMutationEffect::Changed,
+            committed_resource.map(klights_replication::types::AppliedMutation::Resource),
+            pod_endpoint_effect,
         ))
     }
 
@@ -2657,7 +2663,7 @@ impl crate::datastore::raft::proposal::RaftProposal for StatusRacingRaftProposal
         let outcome = self
             .apply_command(command, idempotency_key, operation, authoring_node, None)
             .await?;
-        Ok(outcome.result)
+        Ok(outcome.into_parts().0)
     }
 }
 
@@ -13097,7 +13103,7 @@ impl DeleteCasRacingRaftProposal {
 }
 
 #[async_trait::async_trait]
-impl crate::datastore::raft::proposal::RaftProposal for DeleteCasRacingRaftProposal {
+impl klights_replication::proposal::RaftProposal for DeleteCasRacingRaftProposal {
     async fn propose_command(
         &self,
         command: klights_cluster_core::command::StorageCommand,

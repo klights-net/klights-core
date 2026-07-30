@@ -1074,10 +1074,10 @@ mod parity_tests {
             status_stamp: Some(99),
         };
 
-        let row: LogApplyAppliedOutboxRow = record.into();
+        let row: ProtoLogApplyAppliedOutboxRow = record.into_wire();
         assert_eq!(row.status_stamp, Some(99));
 
-        let restored: LogApplyAppliedOutboxRow = row.into();
+        let restored: LogApplyAppliedOutboxRow = row.into_wire();
         assert_eq!(restored.status_stamp, Some(99));
     }
 

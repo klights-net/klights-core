@@ -1,3 +1,4 @@
+#[cfg(test)]
 use bytes::Bytes;
 use klights_leader_api::{
     OutboxDeliveryError as OutboxApplyError, OutboxDeliveryResult as OutboxApplyResult,
@@ -5,7 +6,9 @@ use klights_leader_api::{
 
 use crate::datastore::DatastoreBackend;
 use crate::datastore::ResourcePreconditions;
+#[cfg(test)]
 use crate::node_outbox::payload::OutboxOperation;
+#[cfg(test)]
 use klights_cluster_core::OutboxStreamWatermark;
 use klights_cluster_core::command::StorageCommand;
 
@@ -59,6 +62,7 @@ pub async fn gc_applied_outbox(
         .map_err(|e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()))
 }
 
+#[cfg(test)]
 pub fn outbox_stream_watermark(
     client_id: &str,
     stream_id: i64,
@@ -80,6 +84,7 @@ pub fn outbox_stream_watermark(
 /// ledger-and-watermark-only raft commit. Its deliberately invalid Kubernetes
 /// namespace cannot collide with an API-created Pod, and no resource mutation
 /// or public watch event is produced.
+#[cfg(test)]
 pub async fn consume_terminal_outbox_sequence(
     db: &dyn DatastoreBackend,
     idempotency_key: &str,
@@ -131,6 +136,7 @@ pub async fn consume_terminal_outbox_sequence(
     }
 }
 
+#[cfg(test)]
 pub async fn apply_outbox_to_local_leader(
     db: &dyn DatastoreBackend,
     idempotency_key: &str,
@@ -150,6 +156,7 @@ pub async fn apply_outbox_to_local_leader(
     .await
 }
 
+#[cfg(test)]
 async fn apply_outbox_to_local_leader_with_node_operation(
     db: &dyn DatastoreBackend,
     idempotency_key: &str,
@@ -158,19 +165,20 @@ async fn apply_outbox_to_local_leader_with_node_operation(
     authoring_node: &str,
     watermark: Option<OutboxStreamWatermark>,
 ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-    Ok(
-        crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend_with_watermark(
-            db,
-            idempotency_key,
-            operation,
-            payload,
-            authoring_node,
-            watermark,
-        )
-        .await?
-        .result
-        .into(),
+    let command = crate::node_outbox::payload::OutboxPayload::decode_protobuf(&payload)
+        .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?
+        .command;
+    crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
+        db,
+        idempotency_key,
+        operation,
+        command,
+        authoring_node,
+        watermark,
     )
+    .await
+    .map_err(OutboxApplyError::from)
+    .map(|effect| effect.into_parts().0.into())
 }
 
 pub async fn reject_pod_uid_mismatch(

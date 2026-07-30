@@ -383,8 +383,8 @@ mod tests {
     async fn raft_handle() -> crate::datastore::backend::DatastoreHandle {
         use crate::bootstrap::sequenced_datastore::SequencedDatastore;
         use crate::datastore::backend::DatastoreHandle;
-        use crate::datastore::raft::proposal::RaftProposal;
         use klights_cluster_core::StorageCommand;
+        use klights_replication::proposal::RaftProposal;
 
         struct InlineProposer {
             inner: DatastoreHandle,
@@ -396,26 +396,12 @@ mod tests {
                 &self,
                 command: StorageCommand,
             ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
-                let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
-                    .encode_protobuf()?;
-                let key = format!("csr-signer-test-{}", uuid::Uuid::new_v4());
-                let outcome = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
+                crate::bootstrap::outbox_apply_adapter::propose_command_on_backend(
                     self.inner.as_ref(),
-                    &key,
-                    crate::node_outbox::payload::OutboxOperation::PodStatus,
-                    bytes::Bytes::from(payload),
-                    "csr-signer-test",
+                    command,
                 )
                 .await
-                .map_err(|err| anyhow::anyhow!("inline raft propose failed: {err}"))?;
-                Ok(klights_replication::types::StorageCommandResult::new(
-                    outcome.applied_resource_version(),
-                    None,
-                    None,
-                    false,
-                    None,
-                    Default::default(),
-                ))
+                .map_err(|err| anyhow::anyhow!("inline raft propose failed: {err}"))
             }
 
             async fn propose_outbox_command(
@@ -429,24 +415,20 @@ mod tests {
                 crate::node_outbox::OutboxApplyResult,
                 crate::node_outbox::OutboxApplyError,
             > {
-                let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
-                    .encode_protobuf()
-                    .map_err(|err| {
-                        crate::node_outbox::OutboxApplyError::Retryable(err.to_string())
-                    })?;
                 let operation = crate::node_outbox::payload::OutboxOperation::try_from(operation)
                     .map_err(|err| {
                     crate::node_outbox::OutboxApplyError::Retryable(err.to_string())
                 })?;
-                crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
+                crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
                     self.inner.as_ref(),
                     idempotency_key,
                     operation,
-                    bytes::Bytes::from(payload),
+                    command,
                     authoring_node,
+                    None,
                 )
                 .await
-                .map(|outcome| outcome.result)
+                .map(|outcome| outcome.into_parts().0)
             }
         }
 

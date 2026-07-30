@@ -558,7 +558,7 @@ mod tests {
         let (_datastore, db) = crate::datastore::test_support::in_memory_with_handle().await;
         let store = RootNamespaceTerminationStore::new(db.clone());
         let (authority, publisher) =
-            crate::authority_adapter::WatchLeaderAuthority::channel(true, None);
+            klights_replication::authority::WatchLeaderAuthority::channel(true, None);
         let AuthorityRoute::Local(permit) = authority.route() else {
             panic!("test authority must begin local");
         };

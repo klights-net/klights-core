@@ -15,11 +15,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use klights_cluster_core::{
-    OutboxApplyError, OutboxApplyOutcome, OutboxOperation, StorageCommand,
-    StorageCommandRejectionCode, StorageMutationError,
-};
+#[cfg(test)]
+use klights_cluster_core::OutboxOperation;
+use klights_cluster_core::{OutboxApplyError, OutboxApplyOutcome, StorageCommand};
 use klights_node_store::{RaftAppliedStateDurability, RaftLogDurability};
+#[cfg(test)]
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::{ChangeMembers, Config, Raft};
 
@@ -80,7 +80,7 @@ pub enum CommandCodecV3PreflightError {
 /// Dropping it reopens both gates.
 pub struct CommandCodecV3Preflight<'a> {
     _membership_guard: tokio::sync::MutexGuard<'a, ()>,
-    _proposal_drain: super::flow_control::RaftCommitFlowControlDrain,
+    _proposal_drain: klights_replication::flow_control::RaftCommitFlowControlDrain,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -137,7 +137,7 @@ pub(crate) const RAFT_MAX_PAYLOAD_ENTRIES: u64 = 16;
 /// Coupling both to 3 capped leader commit concurrency at 3 — at ~200 ms quorum
 /// RTT a hard ~15 commits/sec ceiling. Default 16 keeps the cap in the measured
 /// safe range 8..=32.
-pub(crate) const RAFT_MAX_INFLIGHT_PROPOSALS: usize = 32;
+pub(crate) use klights_replication::proposal::RAFT_MAX_INFLIGHT_PROPOSALS;
 
 pub struct RaftStorePorts {
     materializer: Arc<dyn RaftCommitMaterializer>,
@@ -179,7 +179,7 @@ pub struct RaftNode {
     /// A permit is acquired BEFORE the leader materializes the next
     /// resourceVersion so the leader cannot build an unacknowledged RV backlog
     /// ahead of raft progress under loss (finding.md flow-control plan).
-    pub(crate) flow_control: Arc<super::flow_control::RaftCommitFlowControl>,
+    pub(crate) flow_control: Arc<klights_replication::flow_control::RaftCommitFlowControl>,
     command_codec_v3_activation: Arc<CommandCodecV3Activation>,
 }
 
@@ -317,9 +317,11 @@ impl RaftNode {
             membership_mutex: tokio::sync::Mutex::new(()),
             materializer: stores.materializer,
             authoring_node: node_name,
-            flow_control: Arc::new(super::flow_control::RaftCommitFlowControl::new(
-                RAFT_MAX_INFLIGHT_PROPOSALS,
-            )),
+            flow_control: Arc::new(
+                klights_replication::flow_control::RaftCommitFlowControl::new(
+                    RAFT_MAX_INFLIGHT_PROPOSALS,
+                ),
+            ),
             command_codec_v3_activation,
         })
     }
@@ -330,6 +332,67 @@ impl RaftNode {
     pub fn with_forwarder(mut self, forwarder: Arc<dyn LeaderForwarder>) -> Self {
         self.forwarder = Some(forwarder);
         self
+    }
+
+    pub fn proposal(&self) -> Arc<klights_replication::proposal::EmbeddedRaftProposal> {
+        Arc::new(klights_replication::proposal::EmbeddedRaftProposal::new(
+            self.node_id,
+            self.raft.clone(),
+            self.materializer.clone(),
+            self.authoring_node.clone(),
+            self.flow_control.clone(),
+            self.command_codec_v3_activation.clone(),
+        ))
+    }
+
+    pub async fn propose_command(
+        &self,
+        command: StorageCommand,
+    ) -> Result<klights_replication::types::StorageCommandResult> {
+        klights_replication::proposal::RaftProposal::propose_command(
+            self.proposal().as_ref(),
+            command,
+        )
+        .await
+    }
+
+    pub async fn propose_outbox_command(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        command: StorageCommand,
+        authoring_node: &str,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
+    ) -> std::result::Result<OutboxApplyOutcome, OutboxApplyError> {
+        klights_replication::proposal::RaftProposal::propose_outbox_command(
+            self.proposal().as_ref(),
+            idempotency_key,
+            operation,
+            command,
+            authoring_node,
+            watermark,
+        )
+        .await
+    }
+
+    pub async fn propose_outbox_command_effect(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        command: StorageCommand,
+        authoring_node: &str,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
+    ) -> std::result::Result<klights_replication::proposal::RaftProposalEffect, OutboxApplyError>
+    {
+        klights_replication::proposal::RaftProposal::propose_outbox_command_effect(
+            self.proposal().as_ref(),
+            idempotency_key,
+            operation,
+            command,
+            authoring_node,
+            watermark,
+        )
+        .await
     }
 
     /// Manual promotion entry point. Calls `Raft::initialize` with this
@@ -361,6 +424,7 @@ impl RaftNode {
     /// On a non-leader voter, openraft returns `ForwardToLeader`; if a
     /// `LeaderForwarder` was attached via `with_forwarder` the proposal is
     /// transparently re-dispatched to the current leader.
+    #[cfg(test)]
     pub async fn propose(&self, payload: StorageCommandPayload) -> Result<()> {
         self.command_codec_v3_activation
             .ensure_command_codec_v3_activated()?;
@@ -387,19 +451,7 @@ impl RaftNode {
         &self,
         payload: StorageCommandPayload,
     ) -> Result<klights_replication::types::StorageCommandResult> {
-        match self.raft.client_write(payload).await {
-            Ok(response) => Ok(response.data),
-            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
-                let leader = forward
-                    .leader_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-                Err(anyhow::anyhow!(
-                    "Raft::client_write rejected locally materialized commit: ForwardToLeader({leader})"
-                ))
-            }
-            Err(e) => Err(anyhow::anyhow!("Raft::client_write: {e}")),
-        }
+        self.proposal().propose_materialized_commit(payload).await
     }
 
     /// Add a new voter to the running cluster. Wraps openraft's two-step
@@ -1115,9 +1167,7 @@ impl RaftNode {
     }
 
     pub(crate) fn local_commit_materialization_ready(&self) -> bool {
-        let m = self.raft.metrics().borrow().clone();
-        let voter_ids: BTreeSet<NodeId> = m.membership_config.membership().voter_ids().collect();
-        local_commit_materialization_allowed(self.node_id, m.current_leader, &voter_ids)
+        self.proposal().is_local_leader()
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -1126,279 +1176,34 @@ impl RaftNode {
             .await
             .map_err(|e| anyhow::anyhow!("Raft::shutdown: {e}"))
     }
-
-    fn ensure_local_leader_for_commit_materialization(&self) -> Result<()> {
-        let m = self.raft.metrics().borrow().clone();
-        let voter_ids: BTreeSet<NodeId> = m.membership_config.membership().voter_ids().collect();
-        if local_commit_materialization_allowed(self.node_id, m.current_leader, &voter_ids) {
-            return Ok(());
-        }
-        let current_leader = self.current_leader_info();
-        anyhow::bail!(
-            "not raft leader: refusing local commit materialization on node {} current_leader={current_leader:?} voters={voter_ids:?}",
-            self.node_id
-        );
-    }
 }
 
+#[cfg(test)]
 fn local_commit_materialization_allowed(
     node_id: NodeId,
     current_leader: Option<NodeId>,
     voter_ids: &BTreeSet<NodeId>,
 ) -> bool {
-    (current_leader == Some(node_id) && voter_ids.contains(&node_id))
-        || (current_leader.is_none() && voter_ids.len() == 1 && voter_ids.contains(&node_id))
+    klights_replication::proposal::local_commit_materialization_allowed(
+        node_id,
+        current_leader,
+        voter_ids,
+    )
 }
 
-/// Replication-private proposal capability used by the sequencing facade to
-/// build a `LogApplyCommit` on the leader and submit the encoded commit
-/// through openraft's `client_write`. Generic `propose_command` uses the
-/// ledger-free command builder; worker outbox writes use the separate
-/// watermarked outbox builder. The state machine apply path on every node —
-/// leader, voter follower, and learner — is the only caller of
-/// `apply_commit_in_tx` after raft commits the entry.
-#[async_trait]
-impl super::proposal::RaftProposal for RaftNode {
-    async fn propose_command(
-        &self,
-        command: klights_cluster_core::command::StorageCommand,
-    ) -> Result<klights_replication::types::StorageCommandResult> {
-        self.command_codec_v3_activation
-            .ensure_command_codec_v3_activated()?;
-        self.ensure_local_leader_for_commit_materialization()?;
-        let operation = derive_operation_label(&command);
-        // Flow-control gate: acquire a permit BEFORE commit materialization. The
-        // leader cannot build an unacknowledged RV backlog ahead of raft progress.
-        // The permit is held as an RAII guard; every exit path (success, materialization
-        // failure, client_write failure) returns it to the pool.
-        let _flow_permit = self.flow_control.acquire().await;
-        let commit = self
-            .materializer
-            .build_command(command, operation.as_str(), &self.authoring_node)
-            .await
-            .map_err(map_commit_materialization_error)?;
-        let entry_bytes = klights_replication::log_apply_wire::encode_commit_protobuf(&commit)
-            .context("encode LogApplyCommit for raft propose")?;
-        let apply_result = match self
-            .propose_materialized_commit(StorageCommandPayload::from_bytes(entry_bytes))
-            .await
-        {
-            Ok(result) => result,
-            Err(err) => return Err(err),
-        };
-        if let Some(message) = apply_result.error_message {
-            let code = apply_result
-                .rejection_code
-                .unwrap_or(StorageCommandRejectionCode::InvalidCommit);
-            return Err(StorageMutationError::rejected(code, message).into());
-        }
-        Ok(apply_result)
-    }
-
-    /// T6 step 4c: propose an outbox-flavored write through raft.
-    /// Same flow as `propose_command` but preserves the caller's
-    /// idempotency + stream watermark metadata for durable worker retry
-    /// dedupe. Returns the committed `OutboxApplyResult` after raft has
-    /// applied the entry on this member.
-    async fn propose_outbox_command(
-        &self,
-        idempotency_key: &str,
-        operation: &str,
-        command: klights_cluster_core::command::StorageCommand,
-        authoring_node: &str,
-        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
-    ) -> std::result::Result<OutboxApplyOutcome, OutboxApplyError> {
-        self.propose_outbox_command_effect(
-            idempotency_key,
-            operation,
-            command,
-            authoring_node,
-            watermark,
-        )
-        .await
-        .map(|effect| effect.into_parts().0)
-    }
-
-    async fn propose_outbox_command_effect(
-        &self,
-        idempotency_key: &str,
-        operation: &str,
-        command: klights_cluster_core::command::StorageCommand,
-        authoring_node: &str,
-        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
-    ) -> std::result::Result<super::proposal::RaftProposalEffect, OutboxApplyError> {
-        use klights_cluster_core::BuildOutboxOutcome;
-        if let Err(err) = self
-            .command_codec_v3_activation
-            .ensure_command_codec_v3_activated()
-        {
-            return Err(OutboxApplyError::Retryable(err.to_string()));
-        }
-        if let Err(err) = self.ensure_local_leader_for_commit_materialization() {
-            return Err(OutboxApplyError::Retryable(err.to_string()));
-        }
-        // Control-critical outbox writes retain a reserved fast path. Pod
-        // status writes wait asynchronously on the normal gate: at 200 ms RTT,
-        // immediate retry/backoff can hide readiness for seconds while the
-        // runtime has already started the Pod. Waiting here still happens
-        // before build_log_apply_commit_for_outbox reserves an RV, so status
-        // traffic cannot build a committed-RV backlog ahead of raft progress.
-        let _flow_permit = if outbox_operation_uses_priority_permit(operation) {
-            self.flow_control.try_acquire_priority().ok_or_else(|| {
-                OutboxApplyError::Retryable(
-                    "raft proposal flow control saturated; retry outbox later".to_string(),
-                )
-            })?
-        } else if outbox_operation_waits_for_permit(operation) {
-            self.flow_control.acquire().await
-        } else {
-            self.flow_control.try_acquire().ok_or_else(|| {
-                OutboxApplyError::Retryable(
-                    "raft proposal flow control saturated; retry outbox later".to_string(),
-                )
-            })?
-        };
-        let outcome = self
-            .materializer
-            .build_outbox(
-                idempotency_key,
-                operation,
-                command,
-                authoring_node,
-                watermark,
-            )
-            .await
-            .map_err(|err| match err {
-                OutboxApplyError::ConflictTerminal(message) => {
-                    OutboxApplyError::ConflictTerminal(message)
-                }
-                OutboxApplyError::NotFound(message) => OutboxApplyError::NotFound(message),
-                OutboxApplyError::UidMismatch { expected, actual } => {
-                    OutboxApplyError::UidMismatch { expected, actual }
-                }
-                OutboxApplyError::Retryable(message) => OutboxApplyError::Retryable(format!(
-                    "build log_apply commit for raft outbox propose: {message}"
-                )),
-            })?;
-        let (commit, terminal_error) = match outcome {
-            BuildOutboxOutcome::NeedsPropose {
-                commit,
-                terminal_error,
-                ..
-            } => (commit, terminal_error),
-            BuildOutboxOutcome::LeaseRenewShortcircuit => {
-                // Lease renews don't go through raft.
-                return Ok(super::proposal::RaftProposalEffect::new(
-                    OutboxApplyOutcome::Applied { applied_rv: 0 },
-                    klights_cluster_core::ResourceMutationEffect::Unchanged,
-                    klights_cluster_core::PodEndpointEffect::NotApplicable,
-                ));
-            }
-            BuildOutboxOutcome::AlreadyApplied {
-                applied_rv,
-                committed_resource,
-            } => {
-                // The idempotency key already applied, avoid duplicate
-                // proposal and keep the existing RV.
-                return Ok(super::proposal::RaftProposalEffect::new(
-                    OutboxApplyOutcome::AlreadyApplied { applied_rv },
-                    klights_cluster_core::ResourceMutationEffect::Unchanged,
-                    klights_cluster_core::PodEndpointEffect::Unchanged,
-                )
-                .with_committed_resource(committed_resource));
-            }
-        };
-        let entry_bytes = klights_replication::log_apply_wire::encode_commit_protobuf(&commit)
-            .map_err(|err| {
-                OutboxApplyError::Retryable(format!(
-                    "encode LogApplyCommit for raft outbox propose: {err}"
-                ))
-            })?;
-        let apply_result = match self
-            .propose_materialized_commit(StorageCommandPayload::from_bytes(entry_bytes))
-            .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                return Err(OutboxApplyError::Retryable(format!("raft propose: {err}")));
-            }
-        };
-        let resource_effect = if apply_result.public_resource_changed {
-            klights_cluster_core::ResourceMutationEffect::Changed
-        } else {
-            klights_cluster_core::ResourceMutationEffect::Unchanged
-        };
-        let pod_endpoint_effect = apply_result.pod_endpoint_effect();
-        let committed_resource =
-            apply_result
-                .applied_mutation
-                .as_ref()
-                .map(|mutation| match mutation {
-                    klights_replication::types::AppliedMutation::Resource(resource) => {
-                        resource.clone()
-                    }
-                });
-        if let Some(message) = apply_result.error_message {
-            return Err(OutboxApplyError::ConflictTerminal(message));
-        }
-        if let Some(error) = terminal_error {
-            return Err(error);
-        }
-        let applied_rv = apply_result.applied_rv.unwrap_or(0);
-        Ok(super::proposal::RaftProposalEffect::new(
-            OutboxApplyOutcome::Applied { applied_rv },
-            resource_effect,
-            pod_endpoint_effect,
-        )
-        .with_committed_resource(committed_resource))
-    }
-}
-
-/// Preserve Kubernetes storage semantics when a backend rejects proposal
-/// materialization. SQLite work crosses an FFI boundary and therefore carries
-/// semantic failures inside a database error string; adding anyhow context
-/// directly would hide the nested 409/404 from `AppError::from`, which
-/// intentionally uses the top-level display string.
-fn map_commit_materialization_error(error: StorageMutationError) -> anyhow::Error {
-    let rejection_code = error.rejection_code();
-    let diagnostic = format!(
-        "build log_apply commit for raft propose: {}",
-        error.message()
-    );
-    match rejection_code {
-        Some(code) => StorageMutationError::rejected(code, diagnostic).into(),
-        None => StorageMutationError::persistence(diagnostic).into(),
-    }
-}
-
+#[cfg(test)]
 fn derive_operation_label(command: &StorageCommand) -> OutboxOperation {
-    match command {
-        StorageCommand::UpdateStatus { kind, .. } if kind == "Node" => OutboxOperation::NodeStatus,
-        StorageCommand::UpdateStatus { kind, .. } if kind == "Lease" => OutboxOperation::LeaseRenew,
-        _ => OutboxOperation::PodStatus,
-    }
+    klights_replication::proposal::derive_operation_label(command)
 }
 
+#[cfg(test)]
 fn outbox_operation_uses_priority_permit(operation: &str) -> bool {
-    matches!(
-        OutboxOperation::try_from(operation),
-        Ok(OutboxOperation::NodeRegistration)
-            | Ok(OutboxOperation::NodeDataplane)
-            | Ok(OutboxOperation::NodeStatus)
-    )
+    klights_replication::proposal::outbox_operation_uses_priority_permit(operation)
 }
 
+#[cfg(test)]
 fn outbox_operation_waits_for_permit(operation: &str) -> bool {
-    matches!(
-        OutboxOperation::try_from(operation),
-        Ok(OutboxOperation::PodStatus)
-            | Ok(OutboxOperation::PodMetadata)
-            | Ok(OutboxOperation::RuntimeReconcile)
-            | Ok(OutboxOperation::ProbeReadiness)
-            | Ok(OutboxOperation::DeadlineExceeded)
-            | Ok(OutboxOperation::ContainerStatusSnapshot)
-            | Ok(OutboxOperation::EphemeralContainerStatuses)
-    )
+    klights_replication::proposal::outbox_operation_waits_for_permit(operation)
 }
 
 /// Adapter that wraps a `RaftNode` so the gRPC layer can dispatch
@@ -1579,7 +1384,46 @@ mod tests {
     use crate::bootstrap::controlplane_join_handler::validate_command_codec_v3_join;
     use crate::datastore::DatastoreBackend;
     use crate::datastore::node_local::NodeLocalStores;
+    use klights_leader_api::{
+        LeaderResourceCommand, LeaderResourceQuery, ResourceCommandError, ResourceCommandRequest,
+        ResourceGetRequest, ResourceListRequest, ResourceListResult, ResourceQueryError,
+        ResourceQueryFuture,
+    };
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
+
+    struct BackendResourceQuery {
+        backend: Arc<crate::datastore::sqlite::Datastore>,
+    }
+
+    impl LeaderResourceQuery for BackendResourceQuery {
+        fn get_resource(
+            &self,
+            request: ResourceGetRequest,
+        ) -> ResourceQueryFuture<'_, Option<klights_cluster_core::Resource>> {
+            let backend = self.backend.clone();
+            Box::pin(async move {
+                let key = request.into_key();
+                backend
+                    .get_resource(
+                        &key.api_version,
+                        &key.kind,
+                        key.namespace.as_deref(),
+                        &key.name,
+                    )
+                    .await
+                    .map_err(|error| ResourceQueryError::query_failed(error.to_string()))
+            })
+        }
+
+        fn list_resources(
+            &self,
+            _request: ResourceListRequest,
+        ) -> ResourceQueryFuture<'_, ResourceListResult> {
+            Box::pin(async move {
+                panic!("resource-command integration tests do not issue LIST requests")
+            })
+        }
+    }
 
     fn raft_store_ports(backend: Arc<crate::datastore::sqlite::Datastore>) -> RaftStorePorts {
         crate::datastore::cluster_store_adapter::raft_store_ports_for_test(backend)
@@ -2098,8 +1942,6 @@ mod tests {
 
     #[tokio::test]
     async fn production_startup_gate_with_restored_membership_exposes_no_proposal_capability() {
-        use crate::datastore::raft::proposal::RaftProposal;
-
         let (nodes, backends, _registry) = fresh_three_voter_cluster().await;
         let mut members = std::collections::BTreeMap::new();
         for node in &nodes {
@@ -2303,7 +2145,6 @@ mod tests {
     #[tokio::test]
     async fn follower_raft_proposer_refuses_before_local_commit_materialization() {
         use crate::datastore::raft::network::{LoopbackRaftNetworkFactory, LoopbackRegistry};
-        use crate::datastore::raft::proposal::RaftProposal;
 
         let registry = LoopbackRegistry::new();
         let mut nodes = Vec::new();
@@ -2423,8 +2264,6 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_materialized_commit_leaves_no_proposal_time_ledger_state() {
-        use crate::datastore::raft::proposal::RaftProposal;
-
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let exec = klights_node_datastore::open::open_with_opts(
             klights_node_datastore::open::in_memory_opts(),
@@ -2633,8 +2472,6 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_node_subnet_proposals_do_not_close_apply_channel() {
-        use crate::datastore::raft::proposal::RaftProposal;
-
         let (node, backend) = fresh_node(90).await;
         node.bootstrap_single_voter("https://10.99.0.90:7679".into())
             .await
@@ -2697,8 +2534,6 @@ mod tests {
 
     #[tokio::test]
     async fn raft_node_propose_command_does_not_create_applied_outbox_placeholder() {
-        use crate::datastore::raft::proposal::RaftProposal;
-
         let (node, backend) = fresh_node(92).await;
         node.bootstrap_single_voter("https://10.99.0.92:7679".into())
             .await
@@ -2752,8 +2587,6 @@ mod tests {
 
     #[tokio::test]
     async fn raft_create_resource_rejects_duplicate_name() {
-        use crate::datastore::raft::proposal::RaftProposal;
-
         let (node, backend) = fresh_node(91).await;
         node.bootstrap_single_voter("https://10.99.0.91:7679".into())
             .await
@@ -4168,8 +4001,6 @@ mod tests {
     /// would make this test fail (rv would advance during the timeout window).
     #[tokio::test]
     async fn raft_proposal_permit_is_acquired_before_resource_version_reservation() {
-        use crate::datastore::raft::proposal::RaftProposal;
-
         let (node, backend) = fresh_node(70).await;
         node.bootstrap_single_voter("https://10.99.0.70:7679".into())
             .await
@@ -4221,8 +4052,6 @@ mod tests {
     /// an RV backlog ahead of raft progress.
     #[tokio::test]
     async fn raft_pod_status_outbox_waits_for_flow_control_without_reserving_rv() {
-        use crate::datastore::raft::proposal::RaftProposal;
-
         let (node, backend) = fresh_node(75).await;
         node.bootstrap_single_voter("https://10.99.0.75:7679".into())
             .await
@@ -4275,7 +4104,6 @@ mod tests {
 
     #[tokio::test]
     async fn raft_critical_outbox_uses_reserved_permit_when_general_gate_is_saturated() {
-        use crate::datastore::raft::proposal::RaftProposal;
         use OutboxOperation;
 
         let (node, backend) = fresh_node(76).await;
@@ -4375,8 +4203,6 @@ mod tests {
     /// not the smaller payload-entries value.
     #[tokio::test]
     async fn at_most_max_inflight_raft_proposals_are_in_flight() {
-        use crate::datastore::raft::proposal::RaftProposal;
-
         let (node, backend) = fresh_node(71).await;
         node.bootstrap_single_voter("https://10.99.0.71:7679".into())
             .await
@@ -4431,8 +4257,6 @@ mod tests {
     /// RAII guard handles this naturally on every error-return path.
     #[tokio::test]
     async fn raft_proposal_permit_released_on_materialization_failure() {
-        use crate::datastore::raft::proposal::RaftProposal;
-
         let (node, backend) = fresh_node(72).await;
         node.bootstrap_single_voter("https://10.99.0.72:7679".into())
             .await
@@ -4479,8 +4303,6 @@ mod tests {
     /// rather than hiding the materialization CAS failure behind HTTP 500.
     #[tokio::test]
     async fn stale_csi_pv_update_materialization_surfaces_conflict() {
-        use crate::datastore::raft::proposal::RaftProposal;
-
         let (node, backend) = fresh_node(75).await;
         node.bootstrap_single_voter("https://10.99.0.75:7679".into())
             .await
@@ -4556,30 +4378,36 @@ mod tests {
         // The CSI conformance client adds one label to its stale GET result.
         let mut client_update = (*stale_client_read.data).clone();
         client_update["metadata"]["labels"][pv_name] = serde_json::json!("updated");
-        let error = node
-            .propose_command(
-                klights_cluster_core::command::StorageCommand::UpdateResource {
-                    api_version: "v1".into(),
-                    kind: "PersistentVolume".into(),
-                    namespace: None,
-                    name: pv_name.into(),
-                    data: client_update,
-                    expected_rv: stale_client_read.resource_version,
-                    preconditions: crate::datastore::ResourcePreconditions::from_resource(
-                        &stale_client_read,
-                    ),
-                },
+        let command_service = klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
+            node.proposal(),
+            Arc::new(BackendResourceQuery {
+                backend: backend.clone(),
+            }),
+            crate::control_plane::client::local::always_leader_watch(),
+        );
+        let error = command_service
+            .submit_resource_command(
+                ResourceCommandRequest::try_new(
+                    klights_cluster_core::command::StorageCommand::UpdateResource {
+                        api_version: "v1".into(),
+                        kind: "PersistentVolume".into(),
+                        namespace: None,
+                        name: pv_name.into(),
+                        data: client_update,
+                        expected_rv: stale_client_read.resource_version,
+                        preconditions: crate::datastore::ResourcePreconditions::from_resource(
+                            &stale_client_read,
+                        ),
+                    },
+                )
+                .expect("valid stale CSI update request"),
             )
             .await
             .expect_err("stale CSI update must be retryable as a conflict");
 
         assert!(
-            format!("{error:#}").contains("build log_apply commit for raft propose"),
-            "preserve the proposal materialization context: {error:#}"
-        );
-        assert!(
-            error.to_string().contains("409 Conflict"),
-            "top-level API conversion must see a retryable conflict, got: {error:#}"
+            matches!(error, ResourceCommandError::Conflict { .. }),
+            "focused leader command API must preserve stale-update conflict, got: {error}"
         );
 
         node.shutdown().await.unwrap();
@@ -4629,8 +4457,6 @@ mod tests {
     /// can proceed.
     #[tokio::test]
     async fn raft_proposal_permit_released_on_terminal_success() {
-        use crate::datastore::raft::proposal::RaftProposal;
-
         let (node, _backend) = fresh_node(74).await;
         node.bootstrap_single_voter("https://10.99.0.74:7679".into())
             .await
@@ -4657,8 +4483,6 @@ mod tests {
 
     #[tokio::test]
     async fn raft_outbox_effect_preserves_committed_actor_delete_receipt() {
-        use crate::datastore::raft::proposal::RaftProposal;
-
         let (node, backend) = fresh_node(77).await;
         node.bootstrap_single_voter("https://10.99.0.77:7679".into())
             .await

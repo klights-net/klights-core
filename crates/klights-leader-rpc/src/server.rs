@@ -461,6 +461,40 @@ pub trait ControlplaneCredentialIssuer: Send + Sync {
 }
 
 impl ReplicationServerPorts {
+    pub fn from_split<T>(
+        shared: Arc<T>,
+        resource_command: Arc<dyn klights_leader_api::LeaderResourceCommand>,
+        authenticated_outbox: Arc<dyn klights_leader_api::LeaderAuthenticatedOutboxDelivery>,
+        projected_token: Arc<
+            dyn klights_leader_api::LeaderAuthenticatedProjectedServiceAccountToken,
+        >,
+    ) -> Self
+    where
+        T: klights_leader_api::LeaderResourceQuery
+            + klights_leader_api::LeaderWatch
+            + klights_leader_api::LeaderPodCleanupIntents
+            + klights_leader_api::LeaderNodeLeaseRenewal
+            + klights_leader_api::LeaderNodeSubnetAllocation
+            + klights_leader_api::LeaderNetworkTopologyQuery
+            + klights_leader_api::LeaderNetworkTopologyCommand
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            resource_query: shared.clone(),
+            resource_command,
+            watch: shared.clone(),
+            projected_token,
+            pod_cleanup: shared.clone(),
+            node_lease: shared.clone(),
+            node_subnet: shared.clone(),
+            topology_query: shared.clone(),
+            topology_command: shared,
+            authenticated_outbox,
+        }
+    }
+
     pub fn from_shared<T>(
         shared: Arc<T>,
         projected_token: Arc<

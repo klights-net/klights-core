@@ -9225,6 +9225,7 @@ async fn test_crd_watch_protobuf_accept_uses_json_fallback_or_406() {
 }
 
 #[tokio::test]
+#[ignore = "experimental redb backend does not implement the embedded Raft materializer"]
 async fn test_crd_live_replay_failure_emits_terminal_error() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};

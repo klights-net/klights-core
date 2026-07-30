@@ -191,29 +191,9 @@ fn valid_join() -> JoinRequest {
     }
 }
 
-/// bug-grpc A1/B2: serve the replication gRPC service built with an
-/// explicit [`GrpcTransportPolicy`] so a test can shrink `max_message_bytes`
-/// (decode-limit test) or `watch_heartbeat_interval` (per-stream heartbeat
-/// test). `injected_node_cert` injects a node client cert so handlers that
-/// require steady-state auth (e.g. `watch_resources`) accept the request;
-/// `None` leaves auth to fail (the decode-size check fires first regardless).
-
-/// bug-grpc A1: the server now applies `GrpcTransportPolicy::max_message_bytes`
-/// to the tonic service decode limit (previously unset → unbounded). A
-/// request larger than the configured limit must be rejected at decode,
-/// before the handler runs.
-
-/// bug-grpc B2: a quiet *matching* internal watch stream must still emit a
-/// per-stream BOOKMARK heartbeat even while the global broadcast carries a
-/// continuous stream of *non-matching* events. The old code reset the
-/// heartbeat deadline on every loop iteration, so unrelated traffic starved
-/// the bookmark and the worker idle-reconnected every window.
-
-/// Worker pod watches are field-selected by `spec.nodeName`. A signal for a
-/// higher-RV non-matching Pod must replay the durable Pod history from the
-/// worker stream's accepted RV, so a lower-RV matching Pod already present
-/// in `watch_events` is delivered instead of being skipped behind the
-/// non-matching high-water mark.
+// The gRPC transport regressions below cover bounded decode size, watch
+// heartbeat behavior under non-matching traffic, and durable replay from a
+// worker stream's accepted resourceVersion.
 
 // --- watch_resources leadership-termination tests (issue #4) -----------
 
@@ -259,13 +239,8 @@ fn controlplane_node_registration_rejects_empty_or_invalid_host_facts() {
     }
 }
 
-/// Test double whose callers are never existing members — exercises the
-/// "worker / first-time caller without a controlplane token is rejected"
-/// path on JoinAsControlplane.
-
-/// A control-plane node client certificate: `system:nodes` plus the
-/// `system:controlplanes` group that the controlplane-token-gated bootstrap
-/// stamps. This is what authorizes raft consensus RPCs.
+// The authentication regressions below exercise first-time control-plane
+// admission and the system:controlplanes identity used for consensus RPCs.
 
 // ── CRIT-2: NodeRestriction on node-scoped RPCs ──
 
@@ -280,7 +255,6 @@ struct StatefulPeerAuthenticator {
 }
 
 #[async_trait::async_trait]
-
 impl super::ReplicationPeerAuthenticator for StatefulPeerAuthenticator {
     async fn authenticate(
         &self,

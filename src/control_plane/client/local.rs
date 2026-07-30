@@ -1,35 +1,35 @@
-use async_trait::async_trait;
 use klights_leader_api::{
-    CacheReadinessFuture, CacheReadinessRequest, LeaderAuthenticatedProjectedServiceAccountToken,
+    AuthenticatedOutboxDeliveryRequest, CacheReadinessFuture, CacheReadinessRequest,
+    LeaderAuthenticatedOutboxDelivery, LeaderAuthenticatedProjectedServiceAccountToken,
     LeaderCacheReadiness, LeaderNetworkTopologyCommand, LeaderNetworkTopologyQuery,
     LeaderNodeLeaseRenewal, LeaderNodeLifecycleStatus, LeaderNodeSubnetAllocation,
     LeaderOutboxDelivery, LeaderPodCleanupIntents, LeaderProjectedServiceAccountToken,
-    LeaderResourceCommand, LeaderResourceQuery, LeaderWatch, LeaderWatchFuture, NetworkDataplane,
-    NetworkTopologyError, NetworkTopologyFuture, NodeDataplaneQuery, NodeDataplaneResult,
-    NodeLeaseRenewalError, NodeLeaseRenewalFuture, NodeLeaseRenewalRequest, NodeLeaseRenewalResult,
+    LeaderResourceQuery, LeaderWatch, LeaderWatchFuture, NetworkDataplane, NetworkTopologyError,
+    NetworkTopologyFuture, NodeDataplaneQuery, NodeDataplaneResult, NodeLeaseRenewalError,
+    NodeLeaseRenewalFuture, NodeLeaseRenewalRequest, NodeLeaseRenewalResult,
     NodeLifecycleStatusError, NodeLifecycleStatusFuture, NodeLifecycleStatusRequest,
     NodeLifecycleStatusResult, NodeSubnetAllocationError, NodeSubnetAllocationFuture,
     NodeSubnetAllocationRequest, NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult,
-    OutboxDeliveryError, OutboxDeliveryFuture, OutboxDeliveryRequest, OutboxDeliveryResult,
-    PeerSubnetsQuery, PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest,
-    PodCleanupIntentError, PodCleanupIntentFuture, PodCleanupIntentListRequest,
-    ProjectedServiceAccountTokenError, ProjectedServiceAccountTokenFuture,
-    ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandFuture,
-    ResourceCommandRequest, ResourceCommandResult, ResourceGetRequest, ResourceListRequest,
-    ResourceListResult, ResourceQueryFuture, WatchRequest,
+    OutboxDeliveryFuture, OutboxDeliveryRequest, OutboxPayloadCodec, PeerSubnetsQuery,
+    PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest, PodCleanupIntentError,
+    PodCleanupIntentFuture, PodCleanupIntentListRequest, ProjectedServiceAccountTokenError,
+    ProjectedServiceAccountTokenFuture, ProjectedServiceAccountTokenRequest, ResourceGetRequest,
+    ResourceListRequest, ResourceListResult, ResourceQueryFuture, WatchRequest,
+};
+#[cfg(test)]
+use klights_leader_api::{
+    LeaderResourceCommand, ResourceCommandFuture, ResourceCommandRequest, ResourceCommandResult,
 };
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tokio::sync::watch;
 
-use crate::bootstrap::sequenced_datastore::WriteRejection;
 use crate::control_plane::client::{
     focused_dataplane, focused_node_subnet, query_error, query_list_result,
 };
 use crate::controllers::ControllerDispatcher;
 use crate::datastore::{DatastoreHandle, Resource};
 use crate::kubelet::pod_repository::store::PodStore;
-use crate::node_outbox::OutboxApplyError;
 #[cfg(test)]
 use crate::node_outbox::payload::OutboxOperationExt as _;
 use klights_cluster_core::LogApplyPodCleanupIntentRow as StoredPodCleanupIntent;
@@ -200,12 +200,236 @@ pub(crate) fn focused_pod_cleanup_intent(
     )
 }
 
+pub(crate) struct RootOutboxSideEffectState {
+    db: DatastoreHandle,
+    controller_dispatcher: OnceCell<Arc<ControllerDispatcher>>,
+    non_pod_finalization: OnceCell<Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>>,
+    namespace_termination: OnceCell<Arc<dyn klights_reconcile_api::NamespaceTerminationSink>>,
+}
+
+impl RootOutboxSideEffectState {
+    fn new(db: DatastoreHandle) -> Self {
+        Self {
+            db,
+            controller_dispatcher: OnceCell::new(),
+            non_pod_finalization: OnceCell::new(),
+            namespace_termination: OnceCell::new(),
+        }
+    }
+
+    fn set_controller_dispatcher(&self, dispatcher: Arc<ControllerDispatcher>) {
+        let _ = self.controller_dispatcher.set(dispatcher);
+    }
+
+    fn set_non_pod_finalization(
+        &self,
+        port: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
+    ) {
+        let _ = self.non_pod_finalization.set(port);
+    }
+
+    fn set_namespace_termination(
+        &self,
+        port: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
+    ) {
+        let _ = self.namespace_termination.set(port);
+    }
+}
+
+pub(crate) struct RootCommittedOutboxDelivery {
+    embedded: Arc<klights_replication::leader_api::EmbeddedOutboxDelivery>,
+    side_effects: Arc<RootOutboxSideEffectState>,
+    codec: Arc<dyn OutboxPayloadCodec>,
+    local_node: String,
+}
+
+impl RootCommittedOutboxDelivery {
+    pub(crate) fn new(
+        embedded: Arc<klights_replication::leader_api::EmbeddedOutboxDelivery>,
+        side_effects: Arc<RootOutboxSideEffectState>,
+        codec: Arc<dyn OutboxPayloadCodec>,
+        local_node: String,
+    ) -> Self {
+        Self {
+            embedded,
+            side_effects,
+            codec,
+            local_node,
+        }
+    }
+
+    async fn deliver_authenticated(
+        &self,
+        request: AuthenticatedOutboxDeliveryRequest,
+    ) -> Result<klights_leader_api::OutboxDeliveryResult, klights_leader_api::OutboxDeliveryError>
+    {
+        let (authenticated_node, request) = request.into_parts();
+        let (
+            codec_version,
+            idempotency_key,
+            operation,
+            payload,
+            client_id,
+            stream_id,
+            stream_sequence,
+        ) = request.into_parts();
+        if !klights_cluster_core::supports_command_codec_version(codec_version) {
+            return Err(klights_leader_api::OutboxDeliveryError::codec_incompatible(
+                codec_version,
+                klights_cluster_core::COMMAND_CODEC_VERSION,
+            ));
+        }
+        let decoded_command = self.codec.decode(payload.as_ref()).map_err(|error| {
+            klights_leader_api::OutboxDeliveryError::invalid("delivery.payload", error.to_string())
+        });
+        let side_effect_command = decoded_command
+            .as_ref()
+            .ok()
+            .filter(|command| {
+                crate::control_plane::client::pod_status_side_effects::needs_committed_pod_side_effects(
+                    command,
+                )
+            })
+            .cloned();
+        let watermark = Some(klights_cluster_core::OutboxStreamWatermark {
+            client_id,
+            stream_id,
+            stream_seq: stream_sequence,
+        });
+        let effect = self
+            .embedded
+            .deliver_authenticated_outbox_command_effect(
+                authenticated_node,
+                idempotency_key,
+                operation,
+                decoded_command,
+                watermark,
+            )
+            .await?;
+        let (result, resource_effect, pod_endpoint_effect, resource) = effect.into_parts();
+        if let Some(command) = side_effect_command.as_ref() {
+            self.dispatch_committed_side_effects(
+                command,
+                resource.as_ref(),
+                resource_effect,
+                pod_endpoint_effect,
+            )
+            .await?;
+        }
+        Ok(result.into())
+    }
+
+    async fn dispatch_committed_side_effects(
+        &self,
+        command: &StorageCommand,
+        resource: Option<&Resource>,
+        resource_effect: klights_cluster_core::ResourceMutationEffect,
+        pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
+    ) -> Result<(), klights_leader_api::OutboxDeliveryError> {
+        if resource_effect == klights_cluster_core::ResourceMutationEffect::Unchanged
+            && resource.is_none()
+        {
+            return Ok(());
+        }
+        let controller_dispatcher =
+            self.side_effects
+                .controller_dispatcher
+                .get()
+                .ok_or_else(|| {
+                    klights_leader_api::OutboxDeliveryError::unavailable(
+                        "controller dispatcher is not ready for committed Pod side effects",
+                    )
+                })?;
+        #[cfg(not(test))]
+        let gc_pod_delete_sink = if matches!(
+            command,
+            StorageCommand::DeleteResource { api_version, kind, .. }
+                if api_version == "v1" && kind == "Pod"
+        ) || matches!(command, StorageCommand::FinalizeBoundPod { .. })
+        {
+            Some(controller_dispatcher.pod_delete_sink())
+        } else {
+            None
+        };
+        #[cfg(test)]
+        let gc_pod_delete_sink = if matches!(
+            command,
+            StorageCommand::DeleteResource { api_version, kind, .. }
+                if api_version == "v1" && kind == "Pod"
+        ) || matches!(command, StorageCommand::FinalizeBoundPod { .. })
+        {
+            controller_dispatcher
+                .current_pod_repository()
+                .await
+                .map(|repository| repository as Arc<dyn klights_reconcile_api::GcPodDeleteSink>)
+        } else {
+            None
+        };
+        crate::control_plane::client::pod_status_side_effects::handle_applied_pod_side_effects(
+            crate::control_plane::client::pod_status_side_effects::PodSideEffectSinks {
+                controller: Some(controller_dispatcher.as_ref()
+                    as &dyn klights_reconcile_api::ControllerReconcileSink),
+                service: Some(controller_dispatcher.as_ref()
+                    as &dyn klights_reconcile_api::ServiceReconcileSink),
+                #[cfg(not(test))]
+                pod_delete: gc_pod_delete_sink,
+                #[cfg(test)]
+                pod_delete: gc_pod_delete_sink.as_deref(),
+                non_pod_finalization: self
+                    .side_effects
+                    .non_pod_finalization
+                    .get()
+                    .map(Arc::as_ref),
+                namespace_termination: self
+                    .side_effects
+                    .namespace_termination
+                    .get()
+                    .map(Arc::as_ref),
+                gc_coordination: controller_dispatcher.gc_coordination(),
+            },
+            command,
+            resource,
+            pod_endpoint_effect,
+            self.side_effects.db.as_ref(),
+        )
+        .await
+        .map_err(klights_leader_api::OutboxDeliveryError::unavailable)
+    }
+}
+
+impl LeaderAuthenticatedOutboxDelivery for RootCommittedOutboxDelivery {
+    fn deliver_authenticated_outbox(
+        &self,
+        request: AuthenticatedOutboxDeliveryRequest,
+    ) -> OutboxDeliveryFuture<'_> {
+        Box::pin(self.deliver_authenticated(request))
+    }
+}
+
+impl LeaderOutboxDelivery for RootCommittedOutboxDelivery {
+    fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
+        Box::pin(async move {
+            let request =
+                AuthenticatedOutboxDeliveryRequest::try_new(self.local_node.clone(), request)?;
+            self.deliver_authenticated(request).await
+        })
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct LocalApiTestServices {
+    resource_command: Arc<dyn LeaderResourceCommand>,
+    outbox_delivery: Arc<RootCommittedOutboxDelivery>,
+}
+
 #[derive(Clone)]
 pub struct LocalApiClient {
     db: DatastoreHandle,
     positioned_watch: klights_watch::PositionedWatchService,
     pod_store: Arc<PodStore>,
-    outbox_apply: crate::bootstrap::outbox_apply_adapter::RootOutboxApplyAdapter,
+    #[cfg(test)]
+    test_services: LocalApiTestServices,
     authoring_node: String,
     containerd_namespace: String,
     service_account_signing_key_path: std::path::PathBuf,
@@ -217,9 +441,7 @@ pub struct LocalApiClient {
     /// outbox apply on a Pod status fires the same Service / workload
     /// reconcile keys that the gRPC `Replication::apply_outbox` handler
     /// fires for remote-worker forwarded writes.
-    controller_dispatcher: Arc<OnceCell<Arc<ControllerDispatcher>>>,
-    non_pod_finalization: Arc<OnceCell<Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>>>,
-    namespace_termination: Arc<OnceCell<Arc<dyn klights_reconcile_api::NamespaceTerminationSink>>>,
+    outbox_side_effects: Arc<RootOutboxSideEffectState>,
     /// T6 step 1 inner gate: every mutation method on this client first
     /// reads `*is_leader_rx.borrow()`. When false (this node is not the
     /// elected raft leader) the call is refused with
@@ -487,11 +709,47 @@ impl LocalApiClient {
         } = persistence;
         let pod_store = Arc::new(crate::pod_repository_composition::new_pod_store(db.clone()));
         let crypto = file_process.crypto_executor();
+        let outbox_side_effects = Arc::new(RootOutboxSideEffectState::new(db.clone()));
+        #[cfg(test)]
+        let test_services = {
+            let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
+                crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()),
+            );
+            let resource_query: Arc<dyn LeaderResourceQuery> = Arc::new(
+                crate::bootstrap::outbox_apply_adapter::BackendResourceQueryFixture::new(
+                    db.clone(),
+                    is_leader_rx.clone(),
+                ),
+            );
+            let resource_command = Arc::new(
+                klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
+                    proposal.clone(),
+                    resource_query.clone(),
+                    is_leader_rx.clone(),
+                ),
+            );
+            let embedded_outbox = Arc::new(
+                klights_replication::leader_api::EmbeddedOutboxDelivery::new(
+                    proposal,
+                    resource_query,
+                    is_leader_rx.clone(),
+                ),
+            );
+            let committed_outbox = Arc::new(RootCommittedOutboxDelivery::new(
+                embedded_outbox,
+                outbox_side_effects.clone(),
+                crate::replication::outbox_payload_codec::new_codec(),
+                authoring_node.clone(),
+            ));
+            LocalApiTestServices {
+                resource_command,
+                outbox_delivery: committed_outbox,
+            }
+        };
         Self {
-            outbox_apply: crate::bootstrap::outbox_apply_adapter::RootOutboxApplyAdapter::new(
-                db.clone(),
-            ),
-            db,
+            #[cfg(test)]
+            test_services,
+            db: db.clone(),
             positioned_watch,
             pod_store,
             authoring_node,
@@ -500,24 +758,8 @@ impl LocalApiClient {
             file_process,
             crypto,
             node_lease_tracker,
-            controller_dispatcher: Arc::new(OnceCell::new()),
-            non_pod_finalization: Arc::new(OnceCell::new()),
-            namespace_termination: Arc::new(OnceCell::new()),
+            outbox_side_effects,
             is_leader_rx,
-        }
-    }
-
-    /// `OutboxApplyError`-returning equivalent of `check_leader` for
-    /// `apply_outbox` paths. Maps the rejection to `Retryable` so the
-    /// outbox dispatcher leaves the command in the queue and re-attempts
-    /// once leadership flips.
-    fn check_leader_outbox(&self) -> std::result::Result<(), OutboxApplyError> {
-        if *self.is_leader_rx.borrow() {
-            Ok(())
-        } else {
-            Err(OutboxApplyError::Retryable(
-                WriteRejection::FollowerWrite.to_string(),
-            ))
         }
     }
 
@@ -542,33 +784,36 @@ impl LocalApiClient {
             stream_id,
             stream_seq,
         )?;
-        self.deliver_outbox(request).await
+        self.test_services
+            .outbox_delivery
+            .deliver_outbox(request)
+            .await
     }
 
     /// Wire in the leader's `ControllerDispatcher`. Called from the bootstrap
     /// runtime once the dispatcher has been built. Idempotent: a second call
     /// is silently ignored (OnceCell::set returns Err on repeat).
     pub fn set_controller_dispatcher(&self, dispatcher: Arc<ControllerDispatcher>) {
-        let _ = self.controller_dispatcher.set(dispatcher);
+        self.outbox_side_effects
+            .set_controller_dispatcher(dispatcher);
     }
 
     pub fn set_non_pod_finalization(
         &self,
         port: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
     ) {
-        let _ = self.non_pod_finalization.set(port);
+        self.outbox_side_effects.set_non_pod_finalization(port);
     }
 
     pub fn set_namespace_termination(
         &self,
         port: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     ) {
-        let _ = self.namespace_termination.set(port);
+        self.outbox_side_effects.set_namespace_termination(port);
     }
 
-    #[cfg(test)]
-    pub async fn last_raft_commit_index_for_test(&self) -> i64 {
-        self.outbox_apply.last_commit_index().await
+    pub(crate) fn outbox_side_effect_state(&self) -> Arc<RootOutboxSideEffectState> {
+        self.outbox_side_effects.clone()
     }
 }
 
@@ -646,223 +891,34 @@ impl LeaderResourceQuery for LocalApiClient {
     }
 }
 
-pub(crate) async fn submit_resource_command_to_store(
-    db: &DatastoreHandle,
-    request: ResourceCommandRequest,
-) -> std::result::Result<ResourceCommandResult, ResourceCommandError> {
-    use crate::datastore::ResourcePatchRequest;
-    use klights_cluster_core::command::StorageCommand;
-
-    let result = match request.into_command() {
-        StorageCommand::CreateResource {
-            api_version,
-            kind,
-            namespace,
-            name,
-            data,
-        } => ResourceCommandResult::Resource(
-            db.create_resource(&api_version, &kind, namespace.as_deref(), &name, data)
-                .await
-                .map_err(resource_command_store_error)?,
-        ),
-        StorageCommand::UpdateResource {
-            api_version,
-            kind,
-            namespace,
-            name,
-            data,
-            expected_rv: _,
-            preconditions,
-        } => ResourceCommandResult::Resource(
-            db.update_resource_with_preconditions(
-                &api_version,
-                &kind,
-                namespace.as_deref(),
-                &name,
-                data,
-                preconditions,
-            )
-            .await
-            .map_err(resource_command_store_error)?,
-        ),
-        StorageCommand::PatchResource {
-            api_version,
-            kind,
-            namespace,
-            name,
-            patch_kind,
-            patch,
-            preconditions,
-            strict_resource_version,
-        } => ResourceCommandResult::Resource(
-            db.patch_resource_latest_with_preconditions(
-                &api_version,
-                &kind,
-                namespace.as_deref(),
-                &name,
-                ResourcePatchRequest {
-                    patch_kind,
-                    patch,
-                    preconditions,
-                    strict_resource_version,
-                },
-            )
-            .await
-            .map_err(resource_command_store_error)?
-            .ok_or_else(|| ResourceCommandError::NotFound {
-                message: format!("{api_version}/{kind}/{name} not found"),
-            })?,
-        ),
-        StorageCommand::UpdateStatus {
-            api_version,
-            kind,
-            namespace,
-            name,
-            status,
-            expected_rv: _,
-            preconditions,
-            observed_status_stamp: _,
-        } => ResourceCommandResult::Resource(
-            db.update_status_only_with_preconditions(
-                &api_version,
-                &kind,
-                namespace.as_deref(),
-                &name,
-                status,
-                preconditions,
-            )
-            .await
-            .map_err(resource_command_store_error)?,
-        ),
-        StorageCommand::DeleteResource {
-            api_version,
-            kind,
-            namespace,
-            name,
-            preconditions,
-        } => {
-            let resource_version = db
-                .delete_resource_with_preconditions_observed_rv(
-                    &api_version,
-                    &kind,
-                    namespace.as_deref(),
-                    &name,
-                    preconditions,
-                )
-                .await
-                .map_err(resource_command_store_error)?;
-            ResourceCommandResult::Ack { resource_version }
-        }
-        StorageCommand::DeleteResourceWithTombstone {
-            api_version,
-            kind,
-            namespace,
-            name,
-            preconditions,
-            grace_seconds,
-        } => ResourceCommandResult::Resource(
-            db.delete_resource_without_watch_with_tombstone(
-                &api_version,
-                &kind,
-                namespace.as_deref(),
-                &name,
-                preconditions,
-                grace_seconds,
-            )
-            .await
-            .map_err(resource_command_store_error)?,
-        ),
-        StorageCommand::CreateNamespace { name, data } => ResourceCommandResult::Resource(
-            db.create_namespace(&name, data)
-                .await
-                .map_err(resource_command_store_error)?,
-        ),
-        StorageCommand::UpdateNamespace {
-            name,
-            data,
-            expected_rv,
-        } => ResourceCommandResult::Resource(
-            db.update_namespace(&name, data, expected_rv)
-                .await
-                .map_err(resource_command_store_error)?,
-        ),
-        StorageCommand::DeleteNamespace { name } => {
-            db.delete_namespace(&name)
-                .await
-                .map_err(resource_command_store_error)?;
-            ResourceCommandResult::Ack {
-                resource_version: db
-                    .get_current_resource_version()
-                    .await
-                    .map_err(resource_command_store_error)?,
-            }
-        }
-        command => {
-            return Err(ResourceCommandError::UnsupportedCommand {
-                command: command.variant_name(),
-            });
-        }
-    };
-    Ok(result)
-}
-
-fn resource_command_store_error(error: anyhow::Error) -> ResourceCommandError {
-    if let Some(error) = error.downcast_ref::<klights_cluster_datastore::errors::DatastoreError>() {
-        return match error {
-            klights_cluster_datastore::errors::DatastoreError::AlreadyExists { message } => {
-                ResourceCommandError::AlreadyExists {
-                    message: message.clone(),
-                }
-            }
-            klights_cluster_datastore::errors::DatastoreError::Conflict { message } => {
-                ResourceCommandError::Conflict {
-                    message: message.clone(),
-                }
-            }
-            klights_cluster_datastore::errors::DatastoreError::NotFound { message } => {
-                ResourceCommandError::NotFound {
-                    message: message.clone(),
-                }
-            }
-        };
-    }
-    let lower = format!("{error:#}").to_ascii_lowercase();
-    if lower.contains("already exists") {
-        return ResourceCommandError::AlreadyExists {
-            message: error.to_string(),
-        };
-    }
-    if klights_cluster_datastore::errors::is_conflict_error(&error) {
-        return ResourceCommandError::Conflict {
-            message: error.to_string(),
-        };
-    }
-    if lower.contains("not found") {
-        return ResourceCommandError::NotFound {
-            message: error.to_string(),
-        };
-    }
-    ResourceCommandError::submission_failed(error.to_string())
-}
-
+#[cfg(test)]
 impl LeaderResourceCommand for LocalApiClient {
     fn submit_resource_command(
         &self,
         request: ResourceCommandRequest,
     ) -> ResourceCommandFuture<'_, ResourceCommandResult> {
-        Box::pin(async move {
-            if !*self.is_leader_rx.borrow() {
-                return Err(ResourceCommandError::NotLeader);
-            }
-            klights_leader_api::validate_authority_if_scoped()
-                .map_err(|_| ResourceCommandError::NotLeader)?;
-            klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
-                ResourceCommandError::retryable(format!(
-                    "controller authority rejected resource command: {error}"
-                ))
-            })?;
-            submit_resource_command_to_store(&self.db, request).await
-        })
+        self.test_services
+            .resource_command
+            .submit_resource_command(request)
+    }
+}
+
+#[cfg(test)]
+impl LeaderOutboxDelivery for LocalApiClient {
+    fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
+        self.test_services.outbox_delivery.deliver_outbox(request)
+    }
+}
+
+#[cfg(test)]
+impl LeaderAuthenticatedOutboxDelivery for LocalApiClient {
+    fn deliver_authenticated_outbox(
+        &self,
+        request: klights_leader_api::AuthenticatedOutboxDeliveryRequest,
+    ) -> OutboxDeliveryFuture<'_> {
+        self.test_services
+            .outbox_delivery
+            .deliver_authenticated_outbox(request)
     }
 }
 
@@ -1212,195 +1268,6 @@ impl LeaderNetworkTopologyCommand for LocalApiClient {
     }
 }
 
-#[async_trait]
-impl LeaderOutboxDelivery for LocalApiClient {
-    fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
-        Box::pin(self.deliver_outbox_as(request, &self.authoring_node))
-    }
-}
-
-impl LocalApiClient {
-    async fn deliver_outbox_as(
-        &self,
-        request: OutboxDeliveryRequest,
-        authoring_node: &str,
-    ) -> Result<OutboxDeliveryResult, OutboxDeliveryError> {
-        self.check_leader_outbox()?;
-        let (codec_version, idempotency_key, operation, payload, client_id, stream_id, stream_seq) =
-            request.into_parts();
-        if !klights_cluster_core::supports_command_codec_version(codec_version) {
-            return Err(OutboxDeliveryError::codec_incompatible(
-                codec_version,
-                klights_cluster_core::COMMAND_CODEC_VERSION,
-            ));
-        }
-        let watermark = crate::control_plane::client::apply::outbox_stream_watermark(
-            &client_id, stream_id, stream_seq,
-        );
-        let decoded = match klights_leader_rpc::storage_wire_codec::decode_outbox_payload_protobuf(
-            payload.as_ref(),
-        ) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                let terminal = OutboxDeliveryError::invalid("delivery.payload", error.to_string());
-                crate::control_plane::client::apply::consume_terminal_outbox_sequence(
-                    self.db.as_ref(),
-                    &idempotency_key,
-                    operation.into(),
-                    authoring_node,
-                    watermark.clone(),
-                )
-                .await?;
-                return Err(terminal);
-            }
-        };
-        if let Err(error) = crate::control_plane::client::apply::authorize_outbox_command(
-            operation,
-            decoded.command(),
-            authoring_node,
-        ) {
-            crate::control_plane::client::apply::consume_terminal_outbox_sequence(
-                self.db.as_ref(),
-                &idempotency_key,
-                operation.into(),
-                authoring_node,
-                watermark.clone(),
-            )
-            .await?;
-            return Err(error);
-        }
-        if operation == klights_leader_api::OutboxDeliveryOperation::PodMetadata
-            && let Err(error) =
-                crate::control_plane::client::apply::authorize_live_pod_metadata_command(
-                    self.db.as_ref(),
-                    &decoded.command,
-                    authoring_node,
-                )
-                .await
-        {
-            if error.is_terminal() {
-                crate::control_plane::client::apply::consume_terminal_outbox_sequence(
-                    self.db.as_ref(),
-                    &idempotency_key,
-                    operation.into(),
-                    &self.authoring_node,
-                    watermark.clone(),
-                )
-                .await?;
-            }
-            return Err(error);
-        }
-        if operation == klights_leader_api::OutboxDeliveryOperation::NodeStatus
-            && let Err(error) =
-                klights_leader_api::NodeSelfStatusRequest::validate_command(&decoded.command)
-                    .map_err(|error| match error {
-                        klights_leader_api::NodeSelfStatusError::InvalidRequest {
-                            field,
-                            message,
-                        } => OutboxDeliveryError::invalid(field, message),
-                        other => {
-                            OutboxDeliveryError::invalid("delivery.payload", other.to_string())
-                        }
-                    })
-        {
-            crate::control_plane::client::apply::consume_terminal_outbox_sequence(
-                self.db.as_ref(),
-                &idempotency_key,
-                operation.into(),
-                authoring_node,
-                watermark.clone(),
-            )
-            .await?;
-            return Err(error);
-        }
-        let outcome = self
-            .outbox_apply
-            .propose_outbox_with_watermark(
-                &idempotency_key,
-                operation.into(),
-                bytes::Bytes::from_owner(payload),
-                authoring_node,
-                watermark,
-            )
-            .await?;
-        if let Some(command) = outcome.command.as_ref() {
-            if !crate::control_plane::client::pod_status_side_effects::needs_committed_pod_side_effects(
-                command,
-            ) {
-                return Ok(outcome.result.into());
-            }
-            let controller_dispatcher = self.controller_dispatcher.get();
-            let controller_dispatcher = controller_dispatcher.ok_or_else(|| {
-                crate::node_outbox::OutboxApplyError::Retryable(
-                    "controller dispatcher is not ready for committed Pod side effects".to_string(),
-                )
-            })?;
-            #[cfg(not(test))]
-            let gc_pod_delete_sink =
-                if matches!(
-                    command,
-                    StorageCommand::DeleteResource { api_version, kind, .. }
-                        if api_version == "v1" && kind == "Pod"
-                ) || matches!(command, StorageCommand::FinalizeBoundPod { .. })
-                {
-                    Some(controller_dispatcher.pod_delete_sink())
-                } else {
-                    None
-                };
-            #[cfg(test)]
-            let gc_pod_delete_sink = if matches!(
-                command,
-                StorageCommand::DeleteResource { api_version, kind, .. }
-                    if api_version == "v1" && kind == "Pod"
-            ) || matches!(
-                command,
-                StorageCommand::FinalizeBoundPod { .. }
-            ) {
-                controller_dispatcher
-                    .current_pod_repository()
-                    .await
-                    .map(|repository| repository as Arc<dyn klights_reconcile_api::GcPodDeleteSink>)
-            } else {
-                None
-            };
-            crate::control_plane::client::pod_status_side_effects::handle_applied_pod_side_effects(
-                crate::control_plane::client::pod_status_side_effects::PodSideEffectSinks {
-                    controller: Some(controller_dispatcher.as_ref()
-                        as &dyn klights_reconcile_api::ControllerReconcileSink),
-                    service: Some(controller_dispatcher.as_ref()
-                        as &dyn klights_reconcile_api::ServiceReconcileSink),
-                    #[cfg(not(test))]
-                    pod_delete: gc_pod_delete_sink,
-                    #[cfg(test)]
-                    pod_delete: gc_pod_delete_sink.as_deref(),
-                    non_pod_finalization: self.non_pod_finalization.get().map(Arc::as_ref),
-                    namespace_termination: self.namespace_termination.get().map(Arc::as_ref),
-                    gc_coordination: controller_dispatcher.gc_coordination(),
-                },
-                command,
-                outcome.resource.as_ref(),
-                outcome.pod_endpoint_effect,
-                self.db.as_ref(),
-            )
-            .await
-            .map_err(crate::node_outbox::OutboxApplyError::Retryable)?;
-        }
-        Ok(outcome.result.into())
-    }
-}
-
-impl klights_leader_api::LeaderAuthenticatedOutboxDelivery for LocalApiClient {
-    fn deliver_authenticated_outbox(
-        &self,
-        request: klights_leader_api::AuthenticatedOutboxDeliveryRequest,
-    ) -> OutboxDeliveryFuture<'_> {
-        Box::pin(async move {
-            let (authenticated_node, delivery) = request.into_parts();
-            self.deliver_outbox_as(delivery, &authenticated_node).await
-        })
-    }
-}
-
 #[cfg(test)]
 mod inner_gate_tests {
     //! T6 step 1: `LocalApiClient` inner write gate.
@@ -1603,15 +1470,8 @@ mod inner_gate_tests {
             )
             .await
             .expect_err("non-leader apply_outbox must be rejected");
-        match err {
-            OutboxApplyError::Retryable(msg) => {
-                assert!(
-                    msg.contains("follower"),
-                    "expected FollowerWrite message, got: {msg}"
-                );
-            }
-            other => panic!("expected Retryable(follower-write), got {other:?}"),
-        }
+        assert_eq!(err, OutboxApplyError::NotLeader);
+        assert!(err.is_retryable());
     }
 
     #[tokio::test]
@@ -2488,10 +2348,8 @@ mod inner_gate_tests {
             )
             .await
             .expect_err("post-demotion write must be refused");
-        assert!(
-            matches!(post, OutboxApplyError::Retryable(_)),
-            "demoted write surfaces as Retryable, got {post:?}"
-        );
+        assert_eq!(post, OutboxApplyError::NotLeader);
+        assert!(post.is_retryable());
     }
 
     /// The focused delivery port uses the same leader gate as every local
@@ -2518,9 +2376,10 @@ mod inner_gate_tests {
             )
             .await
             .expect_err("non-leader outbox apply must be refused");
+        assert_eq!(err, OutboxApplyError::NotLeader);
         assert!(
-            matches!(err, OutboxApplyError::Retryable(_)),
-            "outbox dispatcher must see Retryable so it re-queues on next leadership flip"
+            err.is_retryable(),
+            "outbox dispatcher must re-queue typed NotLeader"
         );
     }
 
@@ -2884,19 +2743,11 @@ mod inner_gate_tests {
         }
     }
 
-    /// T6 step 2 (audit): `LocalApiClient`'s embedded `N1Raft` writer is
-    /// a *private field* invoked only from `apply_outbox`. There is no
-    /// public method on `LocalApiClient` that exposes the N1Raft handle
-    /// or lets it write outside the gated apply path. Combined with
-    /// step 1's `apply_outbox` gate, this proves the N1Raft writer
-    /// inherits the leadership refusal: a non-leader's apply_outbox
-    /// returns `Retryable` before reaching N1Raft.
-    ///
-    /// This test exercises the path end-to-end: invoke apply_outbox
-    /// with watch=false → assert refusal → confirm the cluster.db has
-    /// no trace of the would-be write (i.e., N1Raft never ran).
+    /// The test-only focused services preserve the production leader gate:
+    /// invoke delivery with watch=false, assert typed refusal, and confirm
+    /// cluster.db has no trace of a proposal.
     #[tokio::test]
-    async fn n1raft_inside_local_api_client_writes_via_gated_apply_outbox() {
+    async fn delegated_outbox_service_refuses_before_proposal_on_non_leader() {
         let db = crate::datastore::test_support::in_memory().await;
         make_pod(&db).await;
         let pre_rv = db
@@ -2918,11 +2769,12 @@ mod inner_gate_tests {
                 1,
             )
             .await
-            .expect_err("non-leader apply_outbox must refuse before reaching N1Raft");
-        assert!(matches!(err, OutboxApplyError::Retryable(_)));
+            .expect_err("non-leader delivery must refuse before proposal");
+        assert_eq!(err, OutboxApplyError::NotLeader);
+        assert!(err.is_retryable());
 
-        // Confirm N1Raft never executed: the Pod's resource_version
-        // and status are unchanged from the pre-call state.
+        // Confirm proposal never executed: resourceVersion and status remain
+        // unchanged from the pre-call state.
         let post = db
             .get_resource("v1", "Pod", Some("default"), "web")
             .await
@@ -2930,11 +2782,11 @@ mod inner_gate_tests {
             .expect("pod still exists");
         assert_eq!(
             post.resource_version, pre_rv,
-            "N1Raft must not have written: cluster.db rv must be unchanged"
+            "non-leader proposal must not advance cluster.db resourceVersion"
         );
         assert!(
             post.data.pointer("/status/phase").is_none(),
-            "N1Raft must not have written: status must be absent (no Running phase)"
+            "non-leader proposal must not write Pod status"
         );
     }
 }

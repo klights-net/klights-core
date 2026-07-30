@@ -49,26 +49,12 @@ mod cases {
                         .await?;
                     return self.inner.apply_raft_log_apply_commit(commit).await;
                 }
-                let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
-                    .encode_protobuf()?;
-                let key = format!("inline-{}", uuid::Uuid::new_v4());
-                let outcome = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
+                crate::bootstrap::outbox_apply_adapter::propose_command_on_backend(
                     self.inner.as_ref(),
-                    &key,
-                    crate::node_outbox::payload::OutboxOperation::PodStatus,
-                    bytes::Bytes::from(payload),
-                    "inline-proposer",
+                    command,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("inline propose: {e}"))?;
-                Ok(klights_replication::types::StorageCommandResult::new(
-                    outcome.applied_resource_version(),
-                    None,
-                    None,
-                    false,
-                    None,
-                    Default::default(),
-                ))
+                .map_err(|e| anyhow::anyhow!("inline propose: {e}"))
             }
 
             async fn propose_outbox_command(
@@ -86,20 +72,19 @@ mod cases {
                     .lock()
                     .unwrap()
                     .push(command.variant_name().to_string());
-                let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
-                    .encode_protobuf()
-                    .map_err(|e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()))?;
-                let outcome = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
-                    self.inner.as_ref(),
-                    idempotency_key,
-                    crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
-                        |e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()),
-                    )?,
-                    bytes::Bytes::from(payload),
-                    authoring_node,
-                )
-                .await?;
-                Ok(outcome.result)
+                let outcome =
+                    crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
+                        self.inner.as_ref(),
+                        idempotency_key,
+                        crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
+                            |e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()),
+                        )?,
+                        command,
+                        authoring_node,
+                        None,
+                    )
+                    .await?;
+                Ok(outcome.into_parts().0)
             }
         }
 
@@ -808,8 +793,8 @@ mod cases {
         assert!(
             remaining
                 .iter()
-                .any(|row| row.subject_key == "GcAppliedOutbox"),
-            "GC command should leave an outbox ledger row for this operation"
+                .all(|row| row.subject_key != "GcAppliedOutbox"),
+            "leader-authored GC is a regular raft proposal and must not fabricate an outbox ledger row"
         );
     }
 
@@ -2208,26 +2193,12 @@ mod cases {
                 command: StorageCommand,
             ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
                 self.calls.lock().unwrap().push(command.clone());
-                let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
-                    .encode_protobuf()?;
-                let key = format!("inline-{}", uuid::Uuid::new_v4());
-                let outcome = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
+                crate::bootstrap::outbox_apply_adapter::propose_command_on_backend(
                     self.inner.as_ref(),
-                    &key,
-                    crate::node_outbox::payload::OutboxOperation::PodStatus,
-                    bytes::Bytes::from(payload),
-                    "raft-inline",
+                    command,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("inline propose apply: {e}"))?;
-                Ok(klights_replication::types::StorageCommandResult::new(
-                    outcome.applied_resource_version(),
-                    None,
-                    None,
-                    false,
-                    None,
-                    Default::default(),
-                ))
+                .map_err(|e| anyhow::anyhow!("inline propose apply: {e}"))
             }
 
             async fn propose_outbox_command(
@@ -2242,20 +2213,19 @@ mod cases {
                 crate::node_outbox::OutboxApplyError,
             > {
                 self.calls.lock().unwrap().push(command.clone());
-                let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
-                    .encode_protobuf()
-                    .map_err(|e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()))?;
-                let result = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
-                    self.inner.as_ref(),
-                    idempotency_key,
-                    crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
-                        |e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()),
-                    )?,
-                    bytes::Bytes::from(payload),
-                    authoring_node,
-                )
-                .await?;
-                Ok(result.result)
+                let result =
+                    crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
+                        self.inner.as_ref(),
+                        idempotency_key,
+                        crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
+                            |e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()),
+                        )?,
+                        command,
+                        authoring_node,
+                        None,
+                    )
+                    .await?;
+                Ok(result.into_parts().0)
             }
         }
 
@@ -2406,20 +2376,19 @@ mod cases {
                 crate::node_outbox::OutboxApplyError,
             > {
                 self.calls.lock().unwrap().push(command.clone());
-                let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
-                    .encode_protobuf()
-                    .map_err(|e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()))?;
-                let outcome = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
-                    self.inner.as_ref(),
-                    idempotency_key,
-                    crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
-                        |e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()),
-                    )?,
-                    bytes::Bytes::from(payload),
-                    authoring_node,
-                )
-                .await?;
-                Ok(outcome.result)
+                let outcome =
+                    crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
+                        self.inner.as_ref(),
+                        idempotency_key,
+                        crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
+                            |e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()),
+                        )?,
+                        command,
+                        authoring_node,
+                        None,
+                    )
+                    .await?;
+                Ok(outcome.into_parts().0)
             }
         }
 
@@ -2522,21 +2491,20 @@ mod cases {
                 crate::node_outbox::OutboxApplyError,
             > {
                 self.calls.lock().unwrap().push(command.variant_name());
-                let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
-                    .encode_protobuf()
+                let outcome =
+                    crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
+                        self.inner.as_ref(),
+                        idempotency_key,
+                        crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
+                            |e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()),
+                        )?,
+                        command,
+                        authoring_node,
+                        None,
+                    )
+                    .await
                     .map_err(|e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()))?;
-                let outcome = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
-                    self.inner.as_ref(),
-                    idempotency_key,
-                    crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
-                        |e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()),
-                    )?,
-                    bytes::Bytes::from(payload),
-                    authoring_node,
-                )
-                .await
-                .map_err(|e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()))?;
-                Ok(outcome.result)
+                Ok(outcome.into_parts().0)
             }
         }
 

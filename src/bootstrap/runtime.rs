@@ -210,6 +210,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     let positioned_watch = ds.positioned_watch;
     let db: &dyn datastore::DatastoreBackend = &*db_handle;
     let leader_ports = ds.leader_ports;
+    let resource_commands = ds.resource_commands;
     let remote_api_client = ds.remote_api_client;
     let replication_service_for_router = ds.replication_service.clone();
     let _replication_service = ds.replication_service;
@@ -237,7 +238,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         std::sync::Arc<dyn klights_leader_api::ControllerCoordination>,
     > = match (raft_node.as_ref(), is_leader_runtime) {
         (Some(rn), true) => Some(std::sync::Arc::new(
-            crate::leader_election::RaftLeaderLease::new(rn.clone()),
+            klights_replication::authority::RaftLeaderLease::new(rn.raft.clone(), rn.node_id),
         )),
         _ => None,
     };
@@ -250,6 +251,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     // apply client reads — silently dropping every pod-status side effect
     // (RS readyReplicas, Service endpoint reconcile).
     let local_api_client = ds.local_api_client;
+    let authenticated_outbox_delivery = ds.authenticated_outbox_delivery;
     let kubelet_uses_worker_store_adapter = should_use_worker_store_adapter_for_kubelet(&cli.role);
     let worker_store_adapter = if kubelet_uses_worker_store_adapter {
         let remote_api_client = remote_api_client
@@ -372,6 +374,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         kubelet_uses_worker_store_adapter,
         db,
         leader_ports: leader_ports.clone(),
+        resource_commands,
         remote_api_client: remote_api_client.clone(),
         pod_network_cache,
         pod_runtime_store,
@@ -385,6 +388,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         network: network.clone(),
         services: services.clone(),
         local_api_client: local_api_client.clone(),
+        authenticated_outbox_delivery,
         dataplane_health: &dataplane_health,
         cri_for_pod_watcher,
         cri_for_api: cri_for_api.clone(),

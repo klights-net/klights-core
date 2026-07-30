@@ -1,113 +1,12 @@
+#[cfg(test)]
 use std::sync::Arc;
 
+use klights_leader_api::NodeRoleProjection;
+#[cfg(test)]
 use klights_leader_api::{
     AuthorityAcquireFuture, AuthorityError, AuthorityPermit, AuthorityPermitIssuer,
-    AuthorityRevocationFuture, AuthorityRoute, LeaderAuthority, NodeRoleProjection,
+    AuthorityRevocationFuture, AuthorityRoute, LeaderAuthority,
 };
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AuthorityState {
-    generation: u64,
-    local: bool,
-    endpoint: Option<String>,
-}
-
-pub(crate) struct AuthorityPublisher {
-    sender: tokio::sync::watch::Sender<AuthorityState>,
-}
-
-impl AuthorityPublisher {
-    pub(crate) fn publish(&self, local: bool, endpoint: Option<String>) {
-        let generation = self.sender.borrow().generation.checked_add(1).unwrap_or(1);
-        self.sender.send_replace(AuthorityState {
-            generation,
-            local,
-            endpoint,
-        });
-    }
-}
-
-pub(crate) struct WatchLeaderAuthority {
-    receiver: tokio::sync::watch::Receiver<AuthorityState>,
-    issuer: AuthorityPermitIssuer,
-}
-
-impl WatchLeaderAuthority {
-    pub(crate) fn channel(
-        local: bool,
-        endpoint: Option<String>,
-    ) -> (Arc<Self>, AuthorityPublisher) {
-        let (sender, receiver) = tokio::sync::watch::channel(AuthorityState {
-            generation: 1,
-            local,
-            endpoint,
-        });
-        (
-            Arc::new(Self {
-                receiver,
-                issuer: AuthorityPermitIssuer::new(),
-            }),
-            AuthorityPublisher { sender },
-        )
-    }
-}
-
-impl LeaderAuthority for WatchLeaderAuthority {
-    fn route(&self) -> AuthorityRoute {
-        let state = self.receiver.borrow();
-        if state.local {
-            AuthorityRoute::Local(self.issuer.issue(state.generation))
-        } else if let Some(endpoint) = state.endpoint.clone() {
-            AuthorityRoute::Forward { endpoint }
-        } else {
-            AuthorityRoute::Unavailable
-        }
-    }
-
-    fn validate(&self, permit: &AuthorityPermit) -> Result<(), AuthorityError> {
-        let state = self.receiver.borrow();
-        if !state.local {
-            Err(AuthorityError::NotAuthoritative)
-        } else {
-            self.issuer.validate(permit, state.generation)
-        }
-    }
-
-    fn acquire(&self) -> AuthorityAcquireFuture<'_> {
-        let mut receiver = self.receiver.clone();
-        Box::pin(async move {
-            loop {
-                let state = receiver.borrow_and_update().clone();
-                if state.local {
-                    return Ok(self.issuer.issue(state.generation));
-                }
-                receiver
-                    .changed()
-                    .await
-                    .map_err(|_| AuthorityError::Closed)?;
-            }
-        })
-    }
-
-    fn wait_for_revocation<'a>(
-        &'a self,
-        permit: &'a AuthorityPermit,
-    ) -> AuthorityRevocationFuture<'a> {
-        let mut receiver = self.receiver.clone();
-        let permit = permit.clone();
-        Box::pin(async move {
-            loop {
-                let revoked = {
-                    let state = receiver.borrow();
-                    !state.local || self.issuer.validate(&permit, state.generation).is_err()
-                };
-                if revoked || receiver.changed().await.is_err() {
-                    return;
-                }
-            }
-        })
-    }
-}
 
 #[cfg(test)]
 pub(crate) struct TestBooleanWatchAuthority {
@@ -219,6 +118,7 @@ pub(crate) fn project_raft_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use klights_replication::authority::WatchLeaderAuthority;
 
     #[tokio::test]
     async fn authority_generation_rejects_demotion_promotion_aba() {

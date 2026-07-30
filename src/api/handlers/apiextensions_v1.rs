@@ -485,14 +485,18 @@ async fn create_crd_with_registration(
     // This mimics the K8s CRD controller updating the status after creation.
     // Return the latest RV in the create response so watch catch-up from this RV
     // does not replay this intermediate MODIFIED event before DELETE.
-    let updated = crate::api::resource_command_ports::update_non_pod_resource(
+    let established_status = body_with_status
+        .get("status")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let updated = crate::api::resource_command_ports::update_resource_status(
         state.resource_mutation().resource_command.as_ref(),
         "apiextensions.k8s.io/v1",
         "CustomResourceDefinition",
         None,
         &name,
-        body_with_status,
-        resource.resource_version,
+        established_status,
+        klights_cluster_core::ResourcePreconditions::from_resource(&resource),
     )
     .await;
 
@@ -609,8 +613,12 @@ async fn update_crd_with_registration(
     if let Some(status) = body["status"].as_object_mut() {
         status.insert("storedVersions".to_string(), merged);
     }
+    let merged_status = body
+        .get("status")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
-    let resource = crate::api::resource_command_ports::update_non_pod_resource(
+    let main_resource = crate::api::resource_command_ports::update_non_pod_resource(
         state.resource_mutation().resource_command.as_ref(),
         "apiextensions.k8s.io/v1",
         "CustomResourceDefinition",
@@ -618,6 +626,16 @@ async fn update_crd_with_registration(
         &name,
         body.clone(),
         current.resource_version,
+    )
+    .await?;
+    let resource = crate::api::resource_command_ports::update_resource_status(
+        state.resource_mutation().resource_command.as_ref(),
+        "apiextensions.k8s.io/v1",
+        "CustomResourceDefinition",
+        None,
+        &name,
+        merged_status,
+        klights_cluster_core::ResourcePreconditions::from_resource(&main_resource),
     )
     .await?;
 
@@ -724,15 +742,19 @@ async fn patch_crd_with_registration(
                 tracing::error!("Failed to register CRD from apply PATCH create: {}", e);
             }
 
+            let established_status = body_with_status
+                .get("status")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
             let response_resource =
-                match crate::api::resource_command_ports::update_non_pod_resource(
+                match crate::api::resource_command_ports::update_resource_status(
                     state.resource_mutation().resource_command.as_ref(),
                     "apiextensions.k8s.io/v1",
                     "CustomResourceDefinition",
                     None,
                     &name,
-                    body_with_status,
-                    resource.resource_version,
+                    established_status,
+                    klights_cluster_core::ResourcePreconditions::from_resource(&resource),
                 )
                 .await
                 {

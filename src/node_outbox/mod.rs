@@ -24,7 +24,9 @@ use klights_types::{PodIdentity, ResourceKey};
 
 use self::payload::{OutboxOperation, OutboxOperationExt as _};
 
-pub(crate) use klights_cluster_core::{OutboxApplyError, OutboxApplyOutcome as OutboxApplyResult};
+#[cfg(test)]
+pub(crate) use klights_cluster_core::OutboxApplyError;
+pub(crate) use klights_cluster_core::OutboxApplyOutcome as OutboxApplyResult;
 
 // bug-grpc: lease must outlast a worst-case pipelined WAN apply so a slow
 // `apply_outbox` does not expire its own claim mid-flight (which would let

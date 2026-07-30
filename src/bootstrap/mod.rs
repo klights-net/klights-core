@@ -19,6 +19,7 @@ pub(crate) mod node_registration_profile;
 pub mod node_role;
 pub mod observed_endpoint;
 pub(crate) mod operational_adapters;
+#[cfg(test)]
 pub(crate) mod outbox_apply_adapter;
 pub mod phases;
 pub mod raft_transport;

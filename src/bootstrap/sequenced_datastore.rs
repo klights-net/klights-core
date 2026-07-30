@@ -30,21 +30,11 @@ use std::sync::Arc;
 use crate::datastore::DatastoreBackend;
 #[cfg(test)]
 use crate::datastore::ReplicatedCreateOptions;
-use crate::datastore::raft::proposal::RaftProposal;
 #[cfg(test)]
 use klights_cluster_core::ResourcePatchRequest;
+use klights_replication::proposal::RaftProposal;
 
 mod backend_impl;
-
-// ---------------------------------------------------------------------------
-// WriteRejection
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, thiserror::Error)]
-pub(crate) enum WriteRejection {
-    #[error("this node is a follower and does not accept writes; redirect to leader")]
-    FollowerWrite,
-}
 
 // ---------------------------------------------------------------------------
 // DatastoreApplier — deterministic local apply trait

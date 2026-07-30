@@ -4,11 +4,14 @@
 //! outside both modules prevents either subsystem from depending on the other,
 //! while the generated protobuf crate remains wire-only.
 
+use std::sync::Arc;
+
 use klights_cluster_core::{
     CommandError, CommandId, CommandMeta, PatchKind, ResourceBatchOperation, ResourceBatchPutMode,
     ResourcePreconditions, StorageCommand, StorageResponse,
 };
 use klights_internal_protobuf::storage::*;
+use klights_leader_api::{OutboxPayloadCodec, OutboxPayloadCodecError};
 use prost::Message;
 
 pub type CodecResult<T> = std::result::Result<T, StorageCodecError>;
@@ -188,6 +191,24 @@ pub fn decode_outbox_payload_protobuf(
     Ok(klights_cluster_core::OutboxPayload::new(
         decode_command_protobuf(&envelope.command_payload)?,
     ))
+}
+
+/// Internal-protobuf implementation of the pre-existing transport-neutral
+/// durable-outbox payload codec.
+pub struct InternalProtobufOutboxPayloadCodec;
+
+impl OutboxPayloadCodec for InternalProtobufOutboxPayloadCodec {
+    fn encode(&self, command: &StorageCommand) -> Result<Arc<[u8]>, OutboxPayloadCodecError> {
+        encode_outbox_payload_protobuf(&klights_cluster_core::OutboxPayload::new(command.clone()))
+            .map(Arc::from)
+            .map_err(|error| OutboxPayloadCodecError::encoding_failed(error.to_string()))
+    }
+
+    fn decode(&self, payload: &[u8]) -> Result<StorageCommand, OutboxPayloadCodecError> {
+        decode_outbox_payload_protobuf(payload)
+            .map(klights_cluster_core::OutboxPayload::into_command)
+            .map_err(|error| OutboxPayloadCodecError::invalid_payload(error.to_string()))
+    }
 }
 
 pub fn test_outbox_command(bytes: &[u8]) -> StorageCommand {

@@ -818,26 +818,12 @@ mod tests {
                     .await?;
                 return self.inner.apply_raft_log_apply_commit(commit).await;
             }
-            let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
-                .encode_protobuf()?;
-            let key = format!("orphan-race-{}", uuid::Uuid::new_v4());
-            let outcome = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
+            crate::bootstrap::outbox_apply_adapter::propose_command_on_backend(
                 self.inner.as_ref(),
-                &key,
-                crate::node_outbox::payload::OutboxOperation::PodStatus,
-                bytes::Bytes::from(payload),
-                "orphan-race-proposer",
+                command,
             )
             .await
-            .map_err(|err| anyhow::anyhow!("inline propose: {err}"))?;
-            Ok(klights_replication::types::StorageCommandResult::new(
-                outcome.applied_resource_version(),
-                None,
-                None,
-                false,
-                None,
-                Default::default(),
-            ))
+            .map_err(|err| anyhow::anyhow!("inline propose: {err}"))
         }
 
         async fn reinsert_orphan_finalizer(&self) -> anyhow::Result<()> {
@@ -868,7 +854,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::datastore::raft::proposal::RaftProposal for OrphanFinalizerReinjectingProposer {
+    impl klights_replication::proposal::RaftProposal for OrphanFinalizerReinjectingProposer {
         async fn propose_command(
             &self,
             command: StorageCommand,

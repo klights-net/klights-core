@@ -51,6 +51,13 @@ fn map_storage_mutation_error(error: anyhow::Error) -> klights_cluster_core::Sto
     }
 }
 
+#[cfg(test)]
+pub(crate) fn map_storage_mutation_error_for_test(
+    error: anyhow::Error,
+) -> klights_cluster_core::StorageMutationError {
+    map_storage_mutation_error(error)
+}
+
 #[async_trait::async_trait]
 impl klights_replication::materializer::RaftCommitMaterializer for DatastoreRaftCommitMaterializer {
     async fn read_raft_metadata(

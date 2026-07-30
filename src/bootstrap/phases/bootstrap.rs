@@ -61,6 +61,7 @@ pub struct BootstrapRunArgs<'a> {
     pub kubelet_uses_worker_store_adapter: bool,
     pub db: &'a dyn crate::datastore::DatastoreBackend,
     pub leader_ports: crate::control_plane::client::LeaderClientPorts,
+    pub resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     pub remote_api_client: Option<Arc<crate::control_plane::client::remote::RemoteApiClient>>,
     pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
     pub pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
@@ -73,6 +74,8 @@ pub struct BootstrapRunArgs<'a> {
     pub network: Arc<crate::networking::Network>,
     pub services: Arc<dyn klights_network_api::ServiceRouter>,
     pub local_api_client: Arc<crate::control_plane::client::local::LocalApiClient>,
+    pub authenticated_outbox_delivery:
+        Arc<dyn klights_leader_api::LeaderAuthenticatedOutboxDelivery>,
     pub control_plane_lease_client: Option<Arc<klights_leader_rpc::client::ReplicationGrpcClient>>,
     pub dataplane_health: &'a crate::networking::dataplane_health::DataplaneHealth,
     pub cri_for_pod_watcher: Option<CriClient>,
@@ -307,6 +310,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         kubelet_uses_worker_store_adapter,
         db,
         leader_ports,
+        resource_commands,
         remote_api_client,
         pod_network_cache,
         pod_runtime_store: node_pod_runtime_store,
@@ -320,6 +324,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         network,
         services,
         local_api_client,
+        authenticated_outbox_delivery,
         dataplane_health,
         cri_for_pod_watcher,
         cri_for_api,
@@ -805,7 +810,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         lease_client.set_current_leader_endpoint(Some(leader_addr.clone()));
     }
     let (leader_authority, authority_publisher) =
-        crate::authority_adapter::WatchLeaderAuthority::channel(
+        klights_replication::authority::WatchLeaderAuthority::channel(
             initial_is_leader,
             initial_leader_addr.clone(),
         );
@@ -965,7 +970,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     db_handle.clone(),
                 ),
             resource_query: leader_ports.resource_query.clone(),
-            resource_command: local_api_client.clone(),
+            resource_command: resource_commands.clone(),
             finalizer_lifecycle,
             mutation_effects,
             list_resource_versions,
@@ -1683,7 +1688,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         ),
         namespace_lifecycle_store,
         leader_ports.resource_query.clone(),
-        local_api_client.clone(),
+        resource_commands.clone(),
         finalizer_lifecycle,
         mutation_effects,
         list_resource_versions,
@@ -1792,8 +1797,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     local_api_client.clone(),
                 ),
             );
-            let grpc_ports = klights_leader_rpc::server::ReplicationServerPorts::from_shared(
+            let grpc_ports = klights_leader_rpc::server::ReplicationServerPorts::from_split(
                 local_api_client.clone(),
+                resource_commands,
+                authenticated_outbox_delivery,
                 authenticated_projected_token,
             );
             klights_leader_rpc::server::mount_service_full_production(

@@ -13,8 +13,8 @@ use crate::bootstrap::NodeRole;
 use crate::bootstrap::credential_store::BootstrapCredentialStore;
 use crate::datastore::DatastoreHandle;
 use crate::datastore::backend_kind::BackendKind;
-use crate::datastore::raft::proposal::RaftProposal;
 use crate::datastore::selector::PassiveStoreOpenRequest;
+use klights_replication::proposal::RaftProposal;
 use klights_supervisor::TaskSupervisor;
 
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +57,7 @@ pub struct DatastorePhase {
     pub watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     pub positioned_watch: klights_watch::PositionedWatchService,
     pub leader_ports: crate::control_plane::client::LeaderClientPorts,
+    pub resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     pub remote_api_client: Option<Arc<crate::control_plane::client::remote::RemoteApiClient>>,
     /// The concrete leader-side LocalApiClient that the outbox dispatcher
     /// uses as its apply client. Must be reused (not re-created) by later
@@ -64,6 +65,8 @@ pub struct DatastorePhase {
     /// same instance the outbox calls into — otherwise pod-status side
     /// effects (RS/Service reconcile) silently no-op.
     pub local_api_client: Arc<crate::control_plane::client::local::LocalApiClient>,
+    pub authenticated_outbox_delivery:
+        Arc<dyn klights_leader_api::LeaderAuthenticatedOutboxDelivery>,
     pub replication_service: Option<Arc<crate::replication::ReplicationService>>,
     pub node_local: crate::datastore::node_local::NodeLocalStores,
     pub outbox: Arc<crate::node_outbox::Outbox>,
@@ -378,7 +381,8 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     "leader-class startup is codec-preactivation; command proposals remain gated while Raft RPC admission starts"
                 );
             }
-            let proposal: Arc<dyn crate::datastore::raft::proposal::RaftProposal> = raft.clone();
+            let embedded_proposal = raft.proposal();
+            let proposal: Arc<dyn RaftProposal> = embedded_proposal.clone();
             let db_handle: DatastoreHandle = Arc::new(
                 crate::bootstrap::sequenced_datastore::SequencedDatastore::new_with_clock(
                     passive_backend.clone(),
@@ -409,6 +413,28 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     klights_supervisor::FileProcessExecutor::from_supervisor(supervisor.as_ref()),
                 ),
             );
+            let local_resource_commands = Arc::new(
+                klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
+                    embedded_proposal.clone(),
+                    local_api_client.clone(),
+                    is_leader_rx.clone(),
+                ),
+            );
+            let embedded_outbox_delivery = Arc::new(
+                klights_replication::leader_api::EmbeddedOutboxDelivery::new(
+                    embedded_proposal,
+                    local_api_client.clone(),
+                    is_leader_rx.clone(),
+                ),
+            );
+            let local_outbox_delivery = Arc::new(
+                crate::control_plane::client::local::RootCommittedOutboxDelivery::new(
+                    embedded_outbox_delivery,
+                    local_api_client.outbox_side_effect_state(),
+                    crate::replication::outbox_payload_codec::new_codec(),
+                    config.node_name.clone(),
+                ),
+            );
             let leader_proxy = Arc::new(
                 crate::control_plane::client::leader_proxy::LeaderProxyApiClient::new(
                     crate::control_plane::client::LeaderClientPorts::from_client(
@@ -418,11 +444,11 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     is_leader_rx.clone(),
                 )
                 .with_resource_command_targets(
-                    local_api_client.clone(),
+                    local_resource_commands,
                     remote_parts.resource_commands.clone(),
                 )
                 .with_outbox_delivery_targets(
-                    local_api_client.clone(),
+                    local_outbox_delivery.clone(),
                     remote_parts.outbox_deliveries.clone(),
                 )
                 .with_node_lease_renewal_targets(
@@ -832,7 +858,12 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             (
                 Some(raft),
                 db_handle,
-                (local_api_client, positioned_watch),
+                (
+                    local_api_client,
+                    positioned_watch,
+                    local_outbox_delivery
+                        as Arc<dyn klights_leader_api::LeaderAuthenticatedOutboxDelivery>,
+                ),
                 leader_proxy,
                 leader_ports,
             )
@@ -845,6 +876,8 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     };
 
     let outbox_delivery_client: Arc<dyn klights_leader_api::LeaderOutboxDelivery> =
+        leader_proxy.clone();
+    let resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand> =
         leader_proxy.clone();
     let node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal> =
         leader_proxy.clone();
@@ -957,7 +990,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         }
         ob
     };
-    let (local_api_client, positioned_watch) = local_services;
+    let (local_api_client, positioned_watch, authenticated_outbox_delivery) = local_services;
 
     match crate::node_admin::start_node_admin(
         node_local.dead_letters(),
@@ -978,8 +1011,10 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         watch_signals: watch_commit_wiring.signals,
         positioned_watch,
         leader_ports,
+        resource_commands,
         remote_api_client: remote_parts.remote_api_client,
         local_api_client,
+        authenticated_outbox_delivery,
         replication_service,
         node_local,
         outbox,

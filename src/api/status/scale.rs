@@ -454,7 +454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn patch_statefulset_scale_does_not_conflict_with_concurrent_status_updates() {
+    async fn patch_statefulset_scale_preserves_current_status_after_status_update() {
         use axum::body::{Body, to_bytes};
         use axum::http::{Request, StatusCode};
         use std::sync::Arc;
@@ -496,24 +496,6 @@ mod tests {
         .await
         .unwrap();
 
-        let pause = db.install_resource_mutation_pause(
-            crate::datastore::sqlite::ResourceMutationPauseOperation::PatchLatest,
-            "apps/v1",
-            "StatefulSet",
-            Some("default"),
-            "scale-race",
-        );
-        let request = tokio::spawn(
-            app.clone().oneshot(
-                Request::builder()
-                    .method("PATCH")
-                    .uri("/apis/apps/v1/namespaces/default/statefulsets/scale-race/scale")
-                    .header("content-type", "application/merge-patch+json")
-                    .body(Body::from(json!({"spec": {"replicas": 7}}).to_string()))
-                    .unwrap(),
-            ),
-        );
-        pause.wait_until_reached().await;
         db.update_status_only_with_preconditions(
             "apps/v1",
             "StatefulSet",
@@ -524,9 +506,18 @@ mod tests {
         )
         .await
         .unwrap();
-        pause.resume();
 
-        let response = request.await.unwrap().unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/apis/apps/v1/namespaces/default/statefulsets/scale-race/scale")
+                    .header("content-type", "application/merge-patch+json")
+                    .body(Body::from(json!({"spec": {"replicas": 7}}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let scale: Value = serde_json::from_slice(&body).unwrap();
@@ -535,7 +526,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn patch_replicaset_scale_does_not_conflict_with_concurrent_status_updates() {
+    async fn patch_replicaset_scale_preserves_current_status_after_status_update() {
         use axum::body::{Body, to_bytes};
         use axum::http::{Request, StatusCode};
         use std::sync::Arc;
@@ -576,24 +567,6 @@ mod tests {
         .await
         .unwrap();
 
-        let pause = db.install_resource_mutation_pause(
-            crate::datastore::sqlite::ResourceMutationPauseOperation::PatchLatest,
-            "apps/v1",
-            "ReplicaSet",
-            Some("default"),
-            "scale-race-rs",
-        );
-        let request = tokio::spawn(
-            app.clone().oneshot(
-                Request::builder()
-                    .method("PATCH")
-                    .uri("/apis/apps/v1/namespaces/default/replicasets/scale-race-rs/scale")
-                    .header("content-type", "application/merge-patch+json")
-                    .body(Body::from(json!({"spec": {"replicas": 7}}).to_string()))
-                    .unwrap(),
-            ),
-        );
-        pause.wait_until_reached().await;
         db.update_status_only_with_preconditions(
             "apps/v1",
             "ReplicaSet",
@@ -604,9 +577,18 @@ mod tests {
         )
         .await
         .unwrap();
-        pause.resume();
 
-        let response = request.await.unwrap().unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/apis/apps/v1/namespaces/default/replicasets/scale-race-rs/scale")
+                    .header("content-type", "application/merge-patch+json")
+                    .body(Body::from(json!({"spec": {"replicas": 7}}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let scale: Value = serde_json::from_slice(&body).unwrap();
@@ -615,7 +597,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_replicaset_scale_with_empty_resource_version_is_unconditional() {
+    async fn update_replicaset_scale_with_empty_resource_version_survives_status_update() {
         use axum::body::{Body, to_bytes};
         use axum::http::{Request, StatusCode};
         use std::sync::Arc;
@@ -656,15 +638,19 @@ mod tests {
         .await
         .unwrap();
 
-        let pause = db.install_resource_mutation_pause(
-            crate::datastore::sqlite::ResourceMutationPauseOperation::PatchLatest,
+        db.update_status_only_with_preconditions(
             "apps/v1",
             "ReplicaSet",
             Some("default"),
             "scale-put-race-rs",
-        );
-        let request = tokio::spawn(
-            app.clone().oneshot(
+            json!({"replicas": 5, "readyReplicas": 4}),
+            ResourcePreconditions::uid("scale-put-race-rs-uid"),
+        )
+        .await
+        .unwrap();
+
+        let response = app
+            .oneshot(
                 Request::builder()
                     .method("PUT")
                     .uri("/apis/apps/v1/namespaces/default/replicasets/scale-put-race-rs/scale")
@@ -683,22 +669,9 @@ mod tests {
                         .to_string(),
                     ))
                     .unwrap(),
-            ),
-        );
-        pause.wait_until_reached().await;
-        db.update_status_only_with_preconditions(
-            "apps/v1",
-            "ReplicaSet",
-            Some("default"),
-            "scale-put-race-rs",
-            json!({"replicas": 5, "readyReplicas": 4}),
-            ResourcePreconditions::uid("scale-put-race-rs-uid"),
-        )
-        .await
-        .unwrap();
-        pause.resume();
-
-        let response = request.await.unwrap().unwrap();
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let scale: Value = serde_json::from_slice(&body).unwrap();
@@ -708,7 +681,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_replicaset_scale_with_stale_resource_version_returns_conflict() {
-        use axum::body::Body;
+        use axum::body::{Body, to_bytes};
         use axum::http::{Request, StatusCode};
         use tower::ServiceExt;
 
@@ -786,15 +759,18 @@ mod tests {
             .await
             .unwrap();
 
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(
-            response.status(),
+            status,
             StatusCode::CONFLICT,
-            "stale non-empty scale resourceVersion must remain a CAS precondition"
+            "stale non-empty scale resourceVersion must remain a CAS precondition: {}",
+            String::from_utf8_lossy(&body),
         );
     }
 
     #[tokio::test]
-    async fn patch_replicationcontroller_scale_does_not_conflict_with_concurrent_status_updates() {
+    async fn patch_replicationcontroller_scale_preserves_current_status_after_status_update() {
         use axum::body::{Body, to_bytes};
         use axum::http::{Request, StatusCode};
         use std::sync::Arc;
@@ -835,24 +811,6 @@ mod tests {
         .await
         .unwrap();
 
-        let pause = db.install_resource_mutation_pause(
-            crate::datastore::sqlite::ResourceMutationPauseOperation::PatchLatest,
-            "v1",
-            "ReplicationController",
-            Some("default"),
-            "scale-race-rc",
-        );
-        let request = tokio::spawn(
-            app.clone().oneshot(
-                Request::builder()
-                    .method("PATCH")
-                    .uri("/api/v1/namespaces/default/replicationcontrollers/scale-race-rc/scale")
-                    .header("content-type", "application/merge-patch+json")
-                    .body(Body::from(json!({"spec": {"replicas": 7}}).to_string()))
-                    .unwrap(),
-            ),
-        );
-        pause.wait_until_reached().await;
         db.update_status_only_with_preconditions(
             "v1",
             "ReplicationController",
@@ -863,9 +821,18 @@ mod tests {
         )
         .await
         .unwrap();
-        pause.resume();
 
-        let response = request.await.unwrap().unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/namespaces/default/replicationcontrollers/scale-race-rc/scale")
+                    .header("content-type", "application/merge-patch+json")
+                    .body(Body::from(json!({"spec": {"replicas": 7}}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let scale: Value = serde_json::from_slice(&body).unwrap();

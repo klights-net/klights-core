@@ -1345,6 +1345,15 @@ impl Datastore {
             }
 
             StorageCommand::CreateNamespace { name, data } => {
+                let exists = tx
+                    .query_row(queries::NAMESPACE_GET, rusqlite::params![&name], |_| Ok(()))
+                    .optional()?
+                    .is_some();
+                if exists {
+                    return Err(Self::sqlite_conversion_error(anyhow!(
+                        "namespaces \"{name}\" already exists (409 Conflict)"
+                    )));
+                }
                 Self::author_live_commit_from_cluster_mutations(
                     rv,
                     vec![ClusterMutation::Namespace(NamespaceMutation::PutNamespace(
