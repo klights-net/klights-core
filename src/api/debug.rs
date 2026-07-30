@@ -1,8 +1,8 @@
 use crate::api::AppError;
 use crate::api::state::ApiState;
-use crate::auth::identity::AuthenticatedIdentity;
-use crate::auth::request_attributes::AuthorizationRequest;
 use axum::{Extension, Json, extract::State};
+use klights_auth::AuthenticatedIdentity;
+use klights_auth::request_attributes::AuthorizationRequest;
 use klights_reconcile_api::ReconcileKey;
 use serde_json::json;
 use std::sync::Arc;

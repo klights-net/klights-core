@@ -4,9 +4,9 @@
 //! can ONLY access CSR resources and discovery endpoints, regardless of what
 //! RBAC rules might grant. It acts as a safety net in the authorizer chain.
 
-use crate::auth::authorizer::{AuthorizationDecision, Authorizer};
-use crate::auth::identity::AuthenticatedIdentity;
-use crate::auth::request_attributes::{AuthorizationRequest, RequestKind};
+use crate::authorizer::{AuthorizationDecision, Authorizer};
+use crate::identity::AuthenticatedIdentity;
+use crate::request_attributes::{AuthorizationRequest, RequestKind};
 use async_trait::async_trait;
 
 /// Authorizer that restricts bootstrap token identities to CSR operations only.

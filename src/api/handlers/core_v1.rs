@@ -403,7 +403,7 @@ async fn create_service(
     State(state): State<Arc<ApiState>>,
     Path(namespace): Path<String>,
     Query(query): Query<CreateUpdateQuery>,
-    axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+    axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     // F3-04: borrow `body` for the quota check, then move it into the inner
@@ -440,7 +440,7 @@ async fn update_service(
     State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
-    axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+    axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
     // F6-02: Check if NodePort allocator is ready before allowing Service mutations.
@@ -491,7 +491,7 @@ async fn patch_service(
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     headers: HeaderMap,
-    axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+    axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     // F6-02: Check if NodePort allocator is ready before allowing Service mutations.
@@ -689,7 +689,7 @@ async fn create_serviceaccount_token(
     // validate_sa_token_bindings invalidates the token once the object is
     // deleted/recreated. Without this, a caller could mint a token nominally
     // "bound" to a Pod yet outliving it.
-    let mut bound = crate::auth::BoundServiceAccountToken::default();
+    let mut bound = klights_auth::BoundServiceAccountToken::default();
     let bound_pod_name;
     let bound_pod_uid;
     let bound_secret_name;
@@ -817,14 +817,14 @@ async fn create_serviceaccount_token(
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
-            crate::auth::generate_sa_token_with_bound_pod_at(
-                crate::auth::ServiceAccountTokenRequest {
+            klights_auth::generate_sa_token_with_bound_pod_at(
+                klights_auth::ServiceAccountTokenRequest {
                     ca_key_pem: &signing_key_pem,
                     service_account: &signing_name,
                     namespace: &signing_namespace,
                     audiences: &audience_refs,
                     expiration_seconds: Some(expiration_seconds),
-                    bound: crate::auth::BoundServiceAccountToken {
+                    bound: klights_auth::BoundServiceAccountToken {
                         pod_name: owned_bound.0.as_deref(),
                         pod_uid: owned_bound.1.as_deref(),
                         node_name: owned_bound.2.as_deref(),

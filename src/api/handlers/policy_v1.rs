@@ -36,7 +36,7 @@ async fn create_poddisruptionbudget(
     State(state): State<Arc<ApiState>>,
     Path(namespace): Path<String>,
     Query(query): Query<CreateUpdateQuery>,
-    axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+    axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let result = create_poddisruptionbudget_base(
@@ -61,7 +61,7 @@ async fn update_poddisruptionbudget(
     State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
-    axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+    axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
     let result = update_poddisruptionbudget_base(
@@ -87,7 +87,7 @@ async fn patch_poddisruptionbudget(
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     headers: HeaderMap,
-    axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+    axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let result = patch_poddisruptionbudget_base(

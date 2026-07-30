@@ -12,13 +12,13 @@ use klights_types::TlsClientCertificate;
 
 use super::{ApiState, AppError};
 use crate::auth::clock::SnapshotClock;
-use crate::auth::identity::AuthenticatedIdentity;
-use crate::auth::impersonation::ImpersonationRequest;
 use crate::auth::middleware::{
     AuthnRuntime, BoundTokenSubjectLookup, ServiceAccountSigningKeyProvider,
     authenticate_forwarded_client_cert, authenticate_parts, client_cert_is_trusted_proxy,
     resolve_request_identity,
 };
+use klights_auth::AuthenticatedIdentity;
+use klights_auth::impersonation::ImpersonationRequest;
 
 pub const FORWARDED_CLIENT_CERT_HEADER: &str = "x-remote-client-certificate";
 const IMPERSONATE_USER: &str = "impersonate-user";
@@ -119,7 +119,7 @@ impl BoundTokenSubjectLookup for ApiAuthResources<'_> {
 #[cfg(test)]
 async fn validate_sa_token_bindings(
     state: &ApiState,
-    claims: &crate::auth::SaTokenClaims,
+    claims: &klights_auth::SaTokenClaims,
 ) -> Result<(), AppError> {
     crate::auth::validate_sa_token_bindings(&ApiAuthResources { state }, claims)
         .await
@@ -226,7 +226,7 @@ pub(in crate::api) async fn authenticate_request(
         Ok(impersonation) => impersonation,
         Err(error) => return AppError::from(error).into_response(),
     };
-    let effective_identity = match crate::auth::impersonation::effective_identity(
+    let effective_identity = match klights_auth::impersonation::effective_identity(
         auth_policy.authorizer.as_ref(),
         &authenticated_identity,
         impersonation,
@@ -555,7 +555,7 @@ mod tests {
         assert_eq!(forwarded_client_cert_from_headers(&headers), None);
     }
 
-    fn sa_claims(value: serde_json::Value) -> crate::auth::SaTokenClaims {
+    fn sa_claims(value: serde_json::Value) -> klights_auth::SaTokenClaims {
         serde_json::from_value(value).expect("valid ServiceAccount token claims")
     }
 
@@ -699,8 +699,8 @@ mod tests {
     #[tokio::test]
     async fn authorization_denial_writes_structured_audit_event() {
         let audit_sink = Arc::new(crate::audit::MemoryAuditSink::default());
-        let authorizer: Arc<dyn crate::auth::authorizer::Authorizer> = Arc::new(
-            crate::auth::authorizer::RecordingAuthorizer::deny("policy denied secret read"),
+        let authorizer: Arc<dyn klights_auth::authorizer::Authorizer> = Arc::new(
+            klights_auth::authorizer::RecordingAuthorizer::deny("policy denied secret read"),
         );
         let mut state =
             crate::api::test_support::build_test_app_state_with_authorizer(authorizer).await;
@@ -742,8 +742,8 @@ mod tests {
     #[tokio::test]
     async fn pod_exec_authorization_writes_high_value_audit_event() {
         let audit_sink = Arc::new(crate::audit::MemoryAuditSink::default());
-        let authorizer: Arc<dyn crate::auth::authorizer::Authorizer> =
-            Arc::new(crate::auth::authorizer::RecordingAuthorizer::allow());
+        let authorizer: Arc<dyn klights_auth::authorizer::Authorizer> =
+            Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
         let mut state =
             crate::api::test_support::build_test_app_state_with_authorizer(authorizer).await;
         state.audit_sink = audit_sink.clone();
@@ -835,16 +835,16 @@ mod tests {
             for (accept, expected_content_type) in encodings {
                 let state = match failure.failure {
                     Failure::ForbiddenImpersonation => {
-                        let authorizer: Arc<dyn crate::auth::authorizer::Authorizer> =
-                            Arc::new(crate::auth::authorizer::RecordingAuthorizer::deny(
+                        let authorizer: Arc<dyn klights_auth::authorizer::Authorizer> =
+                            Arc::new(klights_auth::authorizer::RecordingAuthorizer::deny(
                                 "impersonation denied",
                             ));
                         crate::api::test_support::build_test_app_state_with_authorizer(authorizer)
                             .await
                     }
                     Failure::AuthorizationDenied => {
-                        let authorizer: Arc<dyn crate::auth::authorizer::Authorizer> =
-                            Arc::new(crate::auth::authorizer::RecordingAuthorizer::deny(
+                        let authorizer: Arc<dyn klights_auth::authorizer::Authorizer> =
+                            Arc::new(klights_auth::authorizer::RecordingAuthorizer::deny(
                                 "authorization denied",
                             ));
                         crate::api::test_support::build_test_app_state_with_authorizer(authorizer)

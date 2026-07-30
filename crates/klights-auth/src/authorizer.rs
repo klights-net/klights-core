@@ -6,11 +6,11 @@
 
 use std::sync::Arc;
 
-use crate::auth::identity::AuthenticatedIdentity;
-use crate::auth::node_authorizer::NodeAuthorizer;
-use crate::auth::node_policy_store::NodePolicyStore;
-use crate::auth::rbac_policy_store::RbacPolicyStore;
-use crate::auth::request_attributes::AuthorizationRequest;
+use crate::identity::AuthenticatedIdentity;
+use crate::node_authorizer::NodeAuthorizer;
+use crate::node_policy_store::NodePolicyStore;
+use crate::rbac_policy_store::RbacPolicyStore;
+use crate::request_attributes::AuthorizationRequest;
 use async_trait::async_trait;
 
 /// Kubernetes-compatible authorization decision.
@@ -107,8 +107,8 @@ impl AuthorizerChain {
         rbac_policy_store: Arc<dyn RbacPolicyStore>,
         node_policy_store: Arc<dyn NodePolicyStore>,
     ) -> Self {
-        use crate::auth::bootstrap_authorizer::BootstrapCsrAuthorizer;
-        use crate::auth::rbac_authorizer::RbacAuthorizer;
+        use crate::bootstrap_authorizer::BootstrapCsrAuthorizer;
+        use crate::rbac_authorizer::RbacAuthorizer;
         Self::new(vec![
             Box::new(SystemMastersAuthorizer),
             Box::new(BootstrapCsrAuthorizer),
@@ -244,7 +244,7 @@ impl Authorizer for RecordingAuthorizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::identity::AuthenticatedIdentity;
+    use crate::identity::AuthenticatedIdentity;
 
     fn admin_identity() -> AuthenticatedIdentity {
         AuthenticatedIdentity::client_cert("admin".to_string(), vec!["system:masters".to_string()])

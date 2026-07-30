@@ -4242,15 +4242,15 @@ async fn test_tokenreview_create_validates_serviceaccount_jwt() {
     let app = crate::api::build_router(state);
 
     let token =
-        crate::auth::generate_sa_token_with_bound_pod(crate::auth::ServiceAccountTokenRequest {
+        crate::auth::generate_sa_token_with_bound_pod(klights_auth::ServiceAccountTokenRequest {
             ca_key_pem: &ca_key_pem,
             service_account: "default",
             namespace: "kube-system",
             audiences: &["https://kubernetes.default.svc.cluster.local"],
             expiration_seconds: None,
-            bound: crate::auth::BoundServiceAccountToken {
+            bound: klights_auth::BoundServiceAccountToken {
                 sa_uid: Some(sa_uid),
-                ..crate::auth::BoundServiceAccountToken::default()
+                ..klights_auth::BoundServiceAccountToken::default()
             },
         })
         .unwrap();
@@ -4352,15 +4352,15 @@ async fn test_tokenreview_create_validates_serviceaccount_jwt() {
     );
 
     let other_audience_token =
-        crate::auth::generate_sa_token_with_bound_pod(crate::auth::ServiceAccountTokenRequest {
+        crate::auth::generate_sa_token_with_bound_pod(klights_auth::ServiceAccountTokenRequest {
             ca_key_pem: &ca_key_pem,
             service_account: "default",
             namespace: "kube-system",
             audiences: &["https://untrusted.example.test"],
             expiration_seconds: None,
-            bound: crate::auth::BoundServiceAccountToken {
+            bound: klights_auth::BoundServiceAccountToken {
                 sa_uid: Some(sa_uid),
-                ..crate::auth::BoundServiceAccountToken::default()
+                ..klights_auth::BoundServiceAccountToken::default()
             },
         })
         .unwrap();
@@ -4605,17 +4605,17 @@ async fn test_tokenreview_includes_pod_extra_for_pod_bound_token() {
     let app = crate::api::build_router(state);
 
     let token =
-        crate::auth::generate_sa_token_with_bound_pod(crate::auth::ServiceAccountTokenRequest {
+        crate::auth::generate_sa_token_with_bound_pod(klights_auth::ServiceAccountTokenRequest {
             ca_key_pem: &ca_key_pem,
             service_account: "default",
             namespace: "kube-system",
             audiences: &["https://kubernetes.default.svc.cluster.local"],
             expiration_seconds: None,
-            bound: crate::auth::BoundServiceAccountToken {
+            bound: klights_auth::BoundServiceAccountToken {
                 pod_name: Some(pod_name),
                 pod_uid: Some(pod_uid),
                 sa_uid: Some(sa_uid),
-                ..crate::auth::BoundServiceAccountToken::default()
+                ..klights_auth::BoundServiceAccountToken::default()
             },
         })
         .unwrap();
@@ -4794,7 +4794,7 @@ async fn test_tokenreview_omitted_audiences_validate_webhook_default_without_ech
         async fn authenticate(
             &self,
             _token: &str,
-        ) -> Option<Result<crate::auth::AuthenticatedIdentity, klights_auth::AuthenticationError>>
+        ) -> Option<Result<klights_auth::AuthenticatedIdentity, klights_auth::AuthenticationError>>
         {
             unreachable!("TokenReview must use the audience-aware capability")
         }
@@ -4805,7 +4805,7 @@ async fn test_tokenreview_omitted_audiences_validate_webhook_default_without_ech
             audiences: &[String],
         ) -> Option<
             Result<
-                (crate::auth::AuthenticatedIdentity, Vec<String>),
+                (klights_auth::AuthenticatedIdentity, Vec<String>),
                 klights_auth::AuthenticationError,
             >,
         > {
@@ -4817,7 +4817,7 @@ async fn test_tokenreview_omitted_audiences_validate_webhook_default_without_ech
                 )));
             }
             Some(Ok((
-                crate::auth::AuthenticatedIdentity::webhook(
+                klights_auth::AuthenticatedIdentity::webhook(
                     "webhook-default-audience-user".to_string(),
                     vec!["webhook-default-audience-group".to_string()],
                     None,
@@ -5064,9 +5064,8 @@ async fn test_tokenreview_reports_signing_key_dependency_failure_in_status() {
         async fn authenticate(
             &self,
             _token: &str,
-        ) -> Option<
-            Result<crate::auth::identity::AuthenticatedIdentity, klights_auth::AuthenticationError>,
-        > {
+        ) -> Option<Result<klights_auth::AuthenticatedIdentity, klights_auth::AuthenticationError>>
+        {
             Some(Err(klights_auth::AuthenticationError::unauthenticated(
                 "webhook rejected token",
             )))
@@ -5196,9 +5195,8 @@ async fn test_tokenreview_reports_webhook_dependency_failure_in_status() {
         async fn authenticate(
             &self,
             _token: &str,
-        ) -> Option<
-            Result<crate::auth::identity::AuthenticatedIdentity, klights_auth::AuthenticationError>,
-        > {
+        ) -> Option<Result<klights_auth::AuthenticatedIdentity, klights_auth::AuthenticationError>>
+        {
             Some(Err(klights_auth::AuthenticationError::dependency_failure(
                 "webhook unavailable",
             )))
@@ -5277,7 +5275,7 @@ async fn test_tokenreview_reports_bootstrap_store_failure_in_status() {
         async fn authenticate_bootstrap_token(
             &self,
             _token: &str,
-        ) -> Result<crate::auth::identity::AuthenticatedIdentity, klights_auth::AuthenticationError>
+        ) -> Result<klights_auth::AuthenticatedIdentity, klights_auth::AuthenticationError>
         {
             Err(klights_auth::AuthenticationError::dependency_failure(
                 "bootstrap datastore unavailable",
@@ -5389,19 +5387,19 @@ async fn test_tokenreview_includes_node_name_extra_for_node_bound_token() {
     let app = crate::api::build_router(state);
 
     let token =
-        crate::auth::generate_sa_token_with_bound_pod(crate::auth::ServiceAccountTokenRequest {
+        crate::auth::generate_sa_token_with_bound_pod(klights_auth::ServiceAccountTokenRequest {
             ca_key_pem: &ca_key_pem,
             service_account: "default",
             namespace: "kube-system",
             audiences: &["https://kubernetes.default.svc.cluster.local"],
             expiration_seconds: None,
-            bound: crate::auth::BoundServiceAccountToken {
+            bound: klights_auth::BoundServiceAccountToken {
                 pod_name: Some(pod_name),
                 pod_uid: Some(pod_uid),
                 node_name: Some(node_name),
                 node_uid: Some(node_uid),
                 sa_uid: Some(sa_uid),
-                ..crate::auth::BoundServiceAccountToken::default()
+                ..klights_auth::BoundServiceAccountToken::default()
             },
         })
         .unwrap();
@@ -5498,17 +5496,17 @@ async fn test_tokenreview_rejects_token_bound_to_deleted_pod() {
     let app = crate::api::build_router(state);
 
     let token =
-        crate::auth::generate_sa_token_with_bound_pod(crate::auth::ServiceAccountTokenRequest {
+        crate::auth::generate_sa_token_with_bound_pod(klights_auth::ServiceAccountTokenRequest {
             ca_key_pem: &ca_key_pem,
             service_account: "default",
             namespace: "kube-system",
             audiences: &["https://kubernetes.default.svc.cluster.local"],
             expiration_seconds: None,
-            bound: crate::auth::BoundServiceAccountToken {
+            bound: klights_auth::BoundServiceAccountToken {
                 pod_name: Some("gone-pod"),
                 pod_uid: Some("11111111-1111-1111-1111-111111111111"),
                 sa_uid: Some(sa_uid),
-                ..crate::auth::BoundServiceAccountToken::default()
+                ..klights_auth::BoundServiceAccountToken::default()
             },
         })
         .unwrap();
@@ -9927,8 +9925,8 @@ async fn apiservice_proxy_denies_request_before_backend_contact() {
         .unwrap();
 
     // Build router with deny-all authorizer
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
     let mut deny_state = build_test_app_state().await;
     deny_state.resource_mutation_mut().db = state.resource_mutation().db.clone();
     deny_state.authorizer = authorizer;
@@ -10064,8 +10062,8 @@ async fn apiservice_proxy_forwards_real_caller_identity_headers() {
         .await
         .unwrap();
 
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::AllowAllAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::AllowAllAuthorizer);
     let mut test_state = build_test_app_state().await;
     test_state.resource_mutation_mut().db = state.resource_mutation().db.clone();
     test_state.authorizer = authorizer;
@@ -10119,8 +10117,8 @@ async fn custom_resource_operations_denied_with_deny_authorizer() {
     use tower::ServiceExt;
 
     // Build app with deny-all authorizer
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
     let state = build_test_app_state_with_authorizer(authorizer).await;
 
     // Register a CRD so the local CRD path is used (not proxy)
@@ -10244,8 +10242,8 @@ async fn custom_resource_allowed_identity_gets_normal_response() {
     use serde_json::json;
     use tower::ServiceExt;
 
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::AllowAllAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::AllowAllAuthorizer);
     let state = build_test_app_state_with_authorizer(authorizer).await;
 
     // Register a CRD
@@ -10398,8 +10396,8 @@ async fn apiservice_backed_custom_resource_denied_before_backend_contact() {
     });
 
     // Build state with DenyAuthorizer — all API requests will be denied
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
     let state = build_test_app_state_with_authorizer(authorizer).await;
     let db = state.resource_mutation().db.clone();
 

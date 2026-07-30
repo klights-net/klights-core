@@ -163,7 +163,7 @@ pub struct ApiServiceDispatchRequest<'a> {
     pub path_and_query: &'a str,
     pub body: Bytes,
     pub forward_headers: Option<&'a HeaderMap>,
-    pub identity: &'a crate::auth::identity::AuthenticatedIdentity,
+    pub identity: &'a klights_auth::AuthenticatedIdentity,
 }
 
 impl ApiServiceRequestDispatcher {
@@ -588,7 +588,7 @@ pub(in crate::api) async fn proxy_apiservice_request(
     path_and_query: &str,
     body: Bytes,
     forward_headers: Option<&HeaderMap>,
-    identity: &crate::auth::identity::AuthenticatedIdentity,
+    identity: &klights_auth::AuthenticatedIdentity,
 ) -> Result<Option<Response>, AppError> {
     // keep the hot-path cache check satisfied: proxy_apiservice_request must route through cached_apiservice_proxy_client via ApiServiceRequestDispatcher.
     ApiServiceRequestDispatcher::new(state.clone())

@@ -4,10 +4,10 @@
 //! Uses `NodePolicyStore` for pod-scoped access decisions — pure OO,
 //! mockable, no datastore/network/filesystem dependency.
 
-use crate::auth::authorizer::{AuthorizationDecision, Authorizer};
-use crate::auth::identity::AuthenticatedIdentity;
-use crate::auth::node_policy_store::NodePolicyStore;
-use crate::auth::request_attributes::{AuthorizationRequest, RequestKind};
+use crate::authorizer::{AuthorizationDecision, Authorizer};
+use crate::identity::AuthenticatedIdentity;
+use crate::node_policy_store::NodePolicyStore;
+use crate::request_attributes::{AuthorizationRequest, RequestKind};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -228,7 +228,7 @@ fn field_selector_matches_node(field_selector: &str, node_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::node_policy_store::InMemoryNodePolicyStore;
+    use crate::node_policy_store::InMemoryNodePolicyStore;
 
     fn node_identity(name: &str) -> AuthenticatedIdentity {
         AuthenticatedIdentity::client_cert(

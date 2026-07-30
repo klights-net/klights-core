@@ -3,11 +3,11 @@
 //! Uses `RbacRuleEvaluator` for pure rule matching and `RbacPolicyStore`
 //! for loading bindings. No datastore/network/filesystem dependency.
 
-use crate::auth::authorizer::{AuthorizationDecision, Authorizer};
-use crate::auth::identity::AuthenticatedIdentity;
-use crate::auth::rbac_policy_store::RbacPolicyStore;
-use crate::auth::rbac_rule_evaluator::{rule_matches, subject_matches};
-use crate::auth::request_attributes::{AuthorizationRequest, RequestKind};
+use crate::authorizer::{AuthorizationDecision, Authorizer};
+use crate::identity::AuthenticatedIdentity;
+use crate::rbac_policy_store::RbacPolicyStore;
+use crate::rbac_rule_evaluator::{rule_matches, subject_matches};
+use crate::request_attributes::{AuthorizationRequest, RequestKind};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -53,7 +53,7 @@ impl Authorizer for RbacAuthorizer {
                 let field_selector = request.field_selector.as_deref();
                 if rule_matches(
                     rule,
-                    crate::auth::rbac_rule_evaluator::RuleMatchRequest {
+                    crate::rbac_rule_evaluator::RuleMatchRequest {
                         verb: &request.verb,
                         api_group,
                         resource,
@@ -80,8 +80,8 @@ impl Authorizer for RbacAuthorizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::rbac_policy_store::{InMemoryRbacPolicyStore, ResolvedBinding};
-    use crate::auth::rbac_rule_evaluator::{PolicyRule, Subject, SubjectKind};
+    use crate::rbac_policy_store::{InMemoryRbacPolicyStore, ResolvedBinding};
+    use crate::rbac_rule_evaluator::{PolicyRule, Subject, SubjectKind};
 
     fn bootstrap_store() -> InMemoryRbacPolicyStore {
         InMemoryRbacPolicyStore::new(vec![

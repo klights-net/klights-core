@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::auth::node_policy_store::NodePolicyStore;
-use crate::auth::rbac_policy_store::RbacResourceReader;
 use crate::controllers::csr_signer::{
     CsrIssuanceError, CsrIssuanceOutcome, CsrIssuanceRequest, CsrIssuer, IssuedCsr,
 };
 use crate::datastore::backend::DatastoreHandle;
 use crate::datastore::types::ListPageRequest;
 use crate::kubelet::pod_repository::PodReader;
+use klights_auth::node_policy_store::NodePolicyStore;
+use klights_auth::rbac_policy_store::RbacResourceReader;
 use klights_leader_rpc::server::{
     ControlplaneCredentialError, ControlplaneCredentialIssuer, ReplicationPeerAuthenticationError,
     ReplicationPeerAuthenticator, ReplicationPeerIdentity,
@@ -35,12 +35,11 @@ impl crate::auth::middleware::BootstrapTokenAuthenticator for DatastoreBootstrap
     async fn authenticate_bootstrap_token(
         &self,
         token: &str,
-    ) -> Result<crate::auth::identity::AuthenticatedIdentity, klights_auth::AuthenticationError>
-    {
+    ) -> Result<klights_auth::AuthenticatedIdentity, klights_auth::AuthenticationError> {
         crate::bootstrap::bootstrap_token::validate_bootstrap_token(self.db.as_ref(), token)
             .await
             .map(|identity| {
-                crate::auth::identity::AuthenticatedIdentity::bootstrap(
+                klights_auth::AuthenticatedIdentity::bootstrap(
                     &identity.token_id,
                     &identity.extra_groups,
                 )
@@ -445,10 +444,10 @@ mod tests {
     use async_trait::async_trait;
 
     use super::{PodRepositoryNodePolicyStore, extract_referenced_objects};
-    use crate::auth::node_policy_store::NodePolicyStore;
     use crate::datastore::Resource;
     use crate::kubelet::pod_repository::PodReader;
     use crate::kubelet::pod_repository::PodResourceList as ResourceList;
+    use klights_auth::node_policy_store::NodePolicyStore;
 
     struct FakePodReader {
         pods: Vec<Resource>,

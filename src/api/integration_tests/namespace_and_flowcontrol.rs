@@ -3149,7 +3149,7 @@ async fn test_apf_rejects_matching_request_when_limited_priority_level_is_full()
         .body(Body::empty())
         .unwrap();
     req.extensions_mut()
-        .insert(crate::auth::AuthenticatedIdentity::client_cert(
+        .insert(klights_auth::AuthenticatedIdentity::client_cert(
             "bob".to_string(),
             vec![],
         ));
@@ -3252,7 +3252,7 @@ async fn test_apf_queue_mode_rejects_when_queue_length_limit_is_full() {
         .unwrap();
     first
         .extensions_mut()
-        .insert(crate::auth::AuthenticatedIdentity::client_cert(
+        .insert(klights_auth::AuthenticatedIdentity::client_cert(
             "bob".to_string(),
             vec![],
         ));
@@ -3264,7 +3264,7 @@ async fn test_apf_queue_mode_rejects_when_queue_length_limit_is_full() {
         .unwrap();
     second
         .extensions_mut()
-        .insert(crate::auth::AuthenticatedIdentity::client_cert(
+        .insert(klights_auth::AuthenticatedIdentity::client_cert(
             "bob".to_string(),
             vec![],
         ));
@@ -3407,7 +3407,7 @@ async fn test_apf_queue_mode_separates_unrelated_flows() {
         .unwrap();
     alice_req
         .extensions_mut()
-        .insert(crate::auth::AuthenticatedIdentity::client_cert(
+        .insert(klights_auth::AuthenticatedIdentity::client_cert(
             "alice".to_string(),
             vec![],
         ));
@@ -3419,7 +3419,7 @@ async fn test_apf_queue_mode_separates_unrelated_flows() {
         .unwrap();
     bob_req
         .extensions_mut()
-        .insert(crate::auth::AuthenticatedIdentity::client_cert(
+        .insert(klights_auth::AuthenticatedIdentity::client_cert(
             "bob".to_string(),
             vec![],
         ));

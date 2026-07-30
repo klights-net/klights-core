@@ -4,7 +4,7 @@
 //! consumes only focused authentication capabilities and scalar policy input.
 
 use crate::auth::clock::Clock;
-use crate::auth::identity::AuthenticatedIdentity;
+use klights_auth::AuthenticatedIdentity;
 use klights_auth::{AuthenticationError, validate_bound_object_uid};
 use klights_supervisor::{TaskCategory, TaskSupervisor};
 use klights_types::TlsClientCertificate;
@@ -245,7 +245,7 @@ async fn validate_sa_token_claims(
     runtime: &AuthnRuntime<'_>,
     token: &str,
     audiences: &[String],
-) -> Result<crate::auth::SaTokenClaims, AuthenticationError> {
+) -> Result<klights_auth::SaTokenClaims, AuthenticationError> {
     let signing_key_pem = runtime
         .service_account_signing_keys
         .service_account_signing_key_pem()
@@ -265,7 +265,7 @@ async fn validate_sa_token_claims(
                         self.0
                     }
                 }
-                crate::auth::decode_serviceaccount_token_with_clock(
+                klights_auth::decode_serviceaccount_token_with_clock(
                     &token,
                     &signing_key_pem,
                     Some(&audiences),
@@ -288,17 +288,17 @@ async fn validate_sa_token_claims(
     Ok(claims)
 }
 
-fn service_account_identity(claims: &crate::auth::SaTokenClaims) -> AuthenticatedIdentity {
+fn service_account_identity(claims: &klights_auth::SaTokenClaims) -> AuthenticatedIdentity {
     AuthenticatedIdentity::service_account(
         claims.sub.clone(),
-        crate::auth::serviceaccount_groups_from_claims(claims),
-        crate::auth::serviceaccount_uid_from_claims(claims),
+        klights_auth::serviceaccount_groups_from_claims(claims),
+        klights_auth::serviceaccount_uid_from_claims(claims),
     )
 }
 
 pub(crate) enum ReviewedTokenIdentity {
     ServiceAccount {
-        claims: crate::auth::SaTokenClaims,
+        claims: klights_auth::SaTokenClaims,
         audiences: Vec<String>,
     },
     Other {
@@ -475,7 +475,7 @@ pub(crate) async fn authenticate_token_for_review(
 /// with matching UIDs.
 pub async fn validate_sa_token_bindings(
     subjects: &dyn BoundTokenSubjectLookup,
-    claims: &crate::auth::SaTokenClaims,
+    claims: &klights_auth::SaTokenClaims,
 ) -> Result<(), AuthenticationError> {
     let Some((namespace, service_account_name)) = claims
         .sub
@@ -485,11 +485,11 @@ pub async fn validate_sa_token_bindings(
         return Ok(());
     };
 
-    if let Some(token_uid) = crate::auth::serviceaccount_uid_from_claims(claims) {
+    if let Some(token_uid) = klights_auth::serviceaccount_uid_from_claims(claims) {
         let stored_uid = subjects
             .service_account_uid(namespace, service_account_name)
             .await?;
-        crate::auth::validate_service_account_uid(Some(&token_uid), stored_uid.as_deref())
+        klights_auth::validate_service_account_uid(Some(&token_uid), stored_uid.as_deref())
             .map_err(|error| {
                 AuthenticationError::unauthenticated(format!(
                     "invalid serviceaccount token UID: {error}"
@@ -776,7 +776,7 @@ mod tests {
         supervisor.shutdown(Duration::from_secs(1)).await;
     }
 
-    fn claims(value: serde_json::Value) -> crate::auth::SaTokenClaims {
+    fn claims(value: serde_json::Value) -> klights_auth::SaTokenClaims {
         serde_json::from_value(value).expect("valid service account claims")
     }
 

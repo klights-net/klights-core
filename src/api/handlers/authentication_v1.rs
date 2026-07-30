@@ -12,8 +12,8 @@ pub struct TokenReviewSpec {
     audiences: Option<Vec<String>>,
 }
 
-pub fn tokenreview_user_from_claims(claims: &crate::auth::SaTokenClaims) -> Value {
-    let groups = crate::auth::serviceaccount_groups_from_claims(claims);
+pub fn tokenreview_user_from_claims(claims: &klights_auth::SaTokenClaims) -> Value {
+    let groups = klights_auth::serviceaccount_groups_from_claims(claims);
     let mut extra = serde_json::Map::new();
 
     if let Some((_, rest)) = claims.sub.split_once("system:serviceaccount:")
@@ -105,9 +105,7 @@ pub fn tokenreview_user_from_claims(claims: &crate::auth::SaTokenClaims) -> Valu
     user
 }
 
-pub fn tokenreview_user_from_identity(
-    identity: &crate::auth::identity::AuthenticatedIdentity,
-) -> Value {
+pub fn tokenreview_user_from_identity(identity: &klights_auth::AuthenticatedIdentity) -> Value {
     let mut user = serde_json::json!({
         "username": identity.username,
         "groups": identity.groups,

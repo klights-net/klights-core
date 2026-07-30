@@ -2,9 +2,9 @@
 //! Extracted from generated_handlers.rs (refactor).
 
 use crate::api::*;
-use crate::auth::identity::AuthenticatedIdentity;
 #[cfg(test)]
 use crate::datastore::DatastoreBackend;
+use klights_auth::AuthenticatedIdentity;
 
 /// Extract the API group from a compound apiVersion string.
 ///

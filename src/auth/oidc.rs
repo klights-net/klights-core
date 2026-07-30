@@ -259,7 +259,7 @@ pub async fn try_oidc_auth(
     authenticator: Option<&dyn OidcValidator>,
     token: &str,
     clock: &dyn crate::auth::clock::Clock,
-) -> Option<Result<crate::auth::identity::AuthenticatedIdentity, AuthenticationError>> {
+) -> Option<Result<klights_auth::AuthenticatedIdentity, AuthenticationError>> {
     try_oidc_auth_with_audiences(authenticator, token, clock)
         .await
         .map(|result| result.map(|(identity, _audiences)| identity))
@@ -269,13 +269,12 @@ async fn try_oidc_auth_with_audiences(
     authenticator: Option<&dyn OidcValidator>,
     token: &str,
     clock: &dyn crate::auth::clock::Clock,
-) -> Option<Result<(crate::auth::identity::AuthenticatedIdentity, Vec<String>), AuthenticationError>>
-{
+) -> Option<Result<(klights_auth::AuthenticatedIdentity, Vec<String>), AuthenticationError>> {
     let authenticator = authenticator?;
     let now = clock.now();
     match authenticator.validate_token(token, now).await {
         Ok(claims) => {
-            let identity = crate::auth::identity::AuthenticatedIdentity::oidc(
+            let identity = klights_auth::AuthenticatedIdentity::oidc(
                 claims.username,
                 claims.groups,
                 claims.uid,
@@ -305,8 +304,7 @@ pub async fn try_oidc_auth_for_review(
     token: &str,
     clock: &dyn crate::auth::clock::Clock,
     requested_audiences: &[String],
-) -> Option<Result<(crate::auth::identity::AuthenticatedIdentity, Vec<String>), AuthenticationError>>
-{
+) -> Option<Result<(klights_auth::AuthenticatedIdentity, Vec<String>), AuthenticationError>> {
     const DEFAULT_API_AUDIENCE: &str = "https://kubernetes.default.svc.cluster.local";
     let result = try_oidc_auth_with_audiences(authenticator, token, clock).await?;
     Some(result.and_then(|(identity, _client_id_audiences)| {

@@ -19,7 +19,7 @@ pub(in crate::api) async fn custom_resource_discovery(
         // Use an authenticated identity for APIService discovery proxying
         // so backends that require authentication can serve the discovery
         // document (e.g., sample-apiserver).
-        let discovery_identity = crate::auth::identity::AuthenticatedIdentity::client_cert(
+        let discovery_identity = klights_auth::AuthenticatedIdentity::client_cert(
             "system:apiserver".to_string(),
             vec!["system:authenticated".to_string()],
         );

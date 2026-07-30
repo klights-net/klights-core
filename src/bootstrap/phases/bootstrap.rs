@@ -876,15 +876,15 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .as_ref()
         .map(|_| leader_authority.clone() as Arc<dyn klights_leader_api::LeaderAuthority>);
 
-    let rbac_policy_store: std::sync::Arc<dyn crate::auth::rbac_policy_store::RbacPolicyStore> =
+    let rbac_policy_store: std::sync::Arc<dyn klights_auth::rbac_policy_store::RbacPolicyStore> =
         std::sync::Arc::new(
-            crate::auth::rbac_policy_store::ReaderBackedRbacPolicyStore::new(std::sync::Arc::new(
+            klights_auth::rbac_policy_store::ReaderBackedRbacPolicyStore::new(std::sync::Arc::new(
                 crate::bootstrap::auth_adapters::DatastoreRbacResourceReader::new(
                     db_handle.clone(),
                 ),
             )),
         );
-    let node_policy_store: std::sync::Arc<dyn crate::auth::node_policy_store::NodePolicyStore> =
+    let node_policy_store: std::sync::Arc<dyn klights_auth::node_policy_store::NodePolicyStore> =
         std::sync::Arc::new(
             crate::bootstrap::auth_adapters::PodRepositoryNodePolicyStore::new(
                 api_pod_repository.clone(),
@@ -955,7 +955,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let watcher_state = Arc::new(api::ApiState::new(
         crate::api::ApiAuthPolicy::new(
             std::sync::Arc::new(
-                crate::auth::authorizer::AuthorizerChain::default_chain_with_rbac(
+                klights_auth::authorizer::AuthorizerChain::default_chain_with_rbac(
                     rbac_policy_store.clone(),
                     node_policy_store,
                 ),
@@ -1691,7 +1691,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     #[cfg(not(test))]
     let (api_router, api_outer_layers) = api::build_router_from_root(
         Arc::new(
-            crate::auth::authorizer::AuthorizerChain::default_chain_with_rbac(
+            klights_auth::authorizer::AuthorizerChain::default_chain_with_rbac(
                 rbac_policy_store.clone(),
                 node_policy_store,
             ),

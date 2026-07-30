@@ -114,11 +114,11 @@ pub(crate) async fn build_test_app_state_with_db(
     );
     crate::api::ApiState::new(
         crate::api::ApiAuthPolicy::new(
-            std::sync::Arc::new(crate::auth::authorizer::AuthorizerChain::test_allow_all()),
+            std::sync::Arc::new(klights_auth::authorizer::AuthorizerChain::test_allow_all()),
             crate::audit::default_audit_sink(),
             std::sync::Arc::new(crate::api::priority_fairness::ApiPriorityFairness::new()),
             std::sync::Arc::new(
-                crate::auth::rbac_policy_store::ReaderBackedRbacPolicyStore::new(
+                klights_auth::rbac_policy_store::ReaderBackedRbacPolicyStore::new(
                     std::sync::Arc::new(
                         crate::bootstrap::auth_adapters::DatastoreRbacResourceReader::new(
                             db_handle.clone(),
@@ -236,7 +236,7 @@ pub async fn build_test_router_with_db() -> (axum::Router, crate::datastore::Dat
 
 #[cfg(test)]
 pub(crate) async fn build_test_app_state_with_authorizer(
-    authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer>,
+    authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer>,
 ) -> crate::api::ApiState {
     let mut state = build_test_app_state().await;
     state.authorizer = authorizer;
@@ -245,7 +245,7 @@ pub(crate) async fn build_test_app_state_with_authorizer(
 
 #[cfg(test)]
 pub async fn build_test_router_with_authorizer(
-    authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer>,
+    authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer>,
 ) -> axum::Router {
     crate::api::build_router(build_test_app_state_with_authorizer(authorizer).await)
 }

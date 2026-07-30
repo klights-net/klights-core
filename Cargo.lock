@@ -2111,6 +2111,7 @@ name = "klights-auth"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "jsonwebtoken",
  "klights-types",
  "rand_core 0.6.4",
@@ -2118,6 +2119,8 @@ dependencies = [
  "serde",
  "serde_json",
  "time",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

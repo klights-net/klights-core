@@ -54,10 +54,10 @@ impl ApiAuthenticators {
 
 #[derive(Clone)]
 pub(crate) struct ApiAuthPolicy {
-    pub(crate) authorizer: Arc<dyn crate::auth::authorizer::Authorizer>,
+    pub(crate) authorizer: Arc<dyn klights_auth::authorizer::Authorizer>,
     pub(crate) audit_sink: Arc<dyn crate::audit::AuditSink>,
     pub(crate) api_priority_fairness: Arc<crate::api::priority_fairness::ApiPriorityFairness>,
-    pub(crate) rbac_policy_store: Arc<dyn crate::auth::rbac_policy_store::RbacPolicyStore>,
+    pub(crate) rbac_policy_store: Arc<dyn klights_auth::rbac_policy_store::RbacPolicyStore>,
     pub(crate) bootstrap_token_authenticator:
         Arc<dyn crate::auth::middleware::BootstrapTokenAuthenticator>,
     pub(crate) oidc_authenticator: Option<Arc<dyn crate::auth::oidc::OidcValidator>>,
@@ -68,10 +68,10 @@ pub(crate) struct ApiAuthPolicy {
 
 impl ApiAuthPolicy {
     pub(crate) fn new(
-        authorizer: Arc<dyn crate::auth::authorizer::Authorizer>,
+        authorizer: Arc<dyn klights_auth::authorizer::Authorizer>,
         audit_sink: Arc<dyn crate::audit::AuditSink>,
         api_priority_fairness: Arc<crate::api::priority_fairness::ApiPriorityFairness>,
-        rbac_policy_store: Arc<dyn crate::auth::rbac_policy_store::RbacPolicyStore>,
+        rbac_policy_store: Arc<dyn klights_auth::rbac_policy_store::RbacPolicyStore>,
         authenticators: ApiAuthenticators,
         cluster_ca_pem: Option<Arc<String>>,
     ) -> Self {
@@ -421,8 +421,8 @@ pub(crate) type RootApiRemoteNodeServices = (
 #[cfg(not(test))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_router_from_root(
-    authorizer: Arc<dyn crate::auth::authorizer::Authorizer>,
-    rbac_policy_store: Arc<dyn crate::auth::rbac_policy_store::RbacPolicyStore>,
+    authorizer: Arc<dyn klights_auth::authorizer::Authorizer>,
+    rbac_policy_store: Arc<dyn klights_auth::rbac_policy_store::RbacPolicyStore>,
     bootstrap_token: Arc<dyn crate::auth::middleware::BootstrapTokenAuthenticator>,
     oidc: Option<Arc<dyn crate::auth::oidc::OidcValidator>>,
     webhook: Option<Arc<dyn crate::auth::webhook_auth::WebhookAuthenticator>>,

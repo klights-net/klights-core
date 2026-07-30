@@ -13,13 +13,17 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 jsonwebtoken = { workspace = true }
 klights-types = { workspace = true }
 rsa = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 time = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
 uuid = { workspace = true, features = ["std", "v4"] }
 
 [dev-dependencies]
 rand_core = { workspace = true }
-serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

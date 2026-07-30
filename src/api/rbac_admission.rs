@@ -15,9 +15,9 @@
 //! step on RBAC create/update before the object is persisted.
 
 use crate::api::{ApiState, AppError};
-use crate::auth::identity::AuthenticatedIdentity;
-use crate::auth::rbac_rule_evaluator::{PolicyRule, rules_cover_all};
-use crate::auth::request_attributes::AuthorizationRequest;
+use klights_auth::AuthenticatedIdentity;
+use klights_auth::rbac_rule_evaluator::{PolicyRule, rules_cover_all};
+use klights_auth::request_attributes::AuthorizationRequest;
 use serde_json::Value;
 
 const RBAC_GROUP: &str = "rbac.authorization.k8s.io";
@@ -288,11 +288,11 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    use crate::auth::authorizer::{AuthorizerChain, DenyAuthorizer, SystemMastersAuthorizer};
-    use crate::auth::identity::AuthenticatedIdentity;
-    use crate::auth::rbac_authorizer::RbacAuthorizer;
-    use crate::auth::rbac_policy_store::ReaderBackedRbacPolicyStore;
     use crate::bootstrap::auth_adapters::DatastoreRbacResourceReader;
+    use klights_auth::AuthenticatedIdentity;
+    use klights_auth::authorizer::{AuthorizerChain, DenyAuthorizer, SystemMastersAuthorizer};
+    use klights_auth::rbac_authorizer::RbacAuthorizer;
+    use klights_auth::rbac_policy_store::ReaderBackedRbacPolicyStore;
 
     fn cluster_role(name: &str, rules: serde_json::Value) -> serde_json::Value {
         json!({

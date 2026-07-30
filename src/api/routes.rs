@@ -780,7 +780,7 @@ mod status_tests {
         )
         .await
         .unwrap();
-        state.authorizer = std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+        state.authorizer = std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
         let app = crate::api::build_router(state);
 
         let response = app
@@ -798,7 +798,7 @@ mod status_tests {
     #[tokio::test]
     async fn metrics_route_requires_authorization() {
         let mut state = crate::api::test_support::build_test_app_state().await;
-        state.authorizer = std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+        state.authorizer = std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
         let app = crate::api::build_router(state);
 
         let response = app
@@ -820,7 +820,7 @@ mod status_tests {
         config.anonymous_auth = false;
         state.operational_mut().config = crate::api::ApiOperationalConfig::from_test(config);
         state.authorizer =
-            std::sync::Arc::new(crate::auth::authorizer::AuthorizerChain::test_allow_all());
+            std::sync::Arc::new(klights_auth::authorizer::AuthorizerChain::test_allow_all());
         let app = crate::api::build_router(state);
 
         let response = app

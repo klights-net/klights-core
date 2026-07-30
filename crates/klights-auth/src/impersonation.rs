@@ -1,9 +1,9 @@
 //! Kubernetes impersonation authorization policy.
 
-use crate::auth::authorizer::{AuthorizationDecision, Authorizer};
-use crate::auth::identity::AuthenticatedIdentity;
-use crate::auth::request_attributes::AuthorizationRequest;
-use klights_auth::ImpersonationError;
+use crate::ImpersonationError;
+use crate::authorizer::{AuthorizationDecision, Authorizer};
+use crate::identity::AuthenticatedIdentity;
+use crate::request_attributes::AuthorizationRequest;
 
 const AUTHENTICATION_API_GROUP: &str = "authentication.k8s.io";
 const SERVICEACCOUNT_PREFIX: &str = "system:serviceaccount:";
@@ -140,7 +140,7 @@ fn service_account_username_parts(username: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::authorizer::AuthorizationDecision;
+    use crate::authorizer::AuthorizationDecision;
     use async_trait::async_trait;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -201,7 +201,10 @@ mod tests {
         };
         let identity = effective_identity(
             &authorizer,
-            &crate::auth::test_admin("real-admin"),
+            &AuthenticatedIdentity::client_cert(
+                "real-admin".to_string(),
+                vec!["system:masters".to_string()],
+            ),
             Some(request),
         )
         .await

@@ -20,7 +20,7 @@ macro_rules! namespaced_resource_handlers {
             Path(namespace): Path<String>,
             Query(query): Query<ListQuery>,
             headers: HeaderMap,
-            axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+            axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
         ) -> Result<Response, AppError> {
             list_inner(
                 state,
@@ -42,7 +42,7 @@ macro_rules! namespaced_resource_handlers {
             State(state): State<Arc<ApiState>>,
             Path((namespace, name)): Path<(String, String)>,
             headers: HeaderMap,
-            axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+            axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
         ) -> Result<K8sResponse, AppError> {
             get_inner(
                 state,
@@ -60,7 +60,7 @@ macro_rules! namespaced_resource_handlers {
             State(state): State<Arc<ApiState>>,
             Path(namespace): Path<String>,
             Query(query): Query<CreateUpdateQuery>,
-            axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+            axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
             LenientJson(body): LenientJson<Value>,
         ) -> Result<(StatusCode, Json<Value>), AppError> {
             create_inner(
@@ -79,7 +79,7 @@ macro_rules! namespaced_resource_handlers {
             State(state): State<Arc<ApiState>>,
             Path((namespace, name)): Path<(String, String)>,
             Query(query): Query<CreateUpdateQuery>,
-            axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+            axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
             LenientJson(body): LenientJson<Value>,
         ) -> Result<Json<Value>, AppError> {
             update_inner(
@@ -103,7 +103,7 @@ macro_rules! namespaced_resource_handlers {
             State(state): State<Arc<ApiState>>,
             Path((namespace, name)): Path<(String, String)>,
             Query(query): Query<CreateUpdateQuery>,
-            axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+            axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
             body: Bytes,
         ) -> Result<(StatusCode, Json<Value>), AppError> {
             delete_inner(
@@ -128,7 +128,7 @@ macro_rules! namespaced_resource_handlers {
             Path((namespace, name)): Path<(String, String)>,
             Query(query): Query<CreateUpdateQuery>,
             headers: HeaderMap,
-            axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+            axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
             body: Bytes,
         ) -> Result<(StatusCode, Json<Value>), AppError> {
             patch_inner(
@@ -153,7 +153,7 @@ macro_rules! namespaced_resource_handlers {
             State(state): State<Arc<ApiState>>,
             Path(namespace): Path<String>,
             Query(query): Query<DeleteCollectionQuery>,
-            axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+            axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
         ) -> Result<Json<Value>, AppError> {
             delete_collection_inner(state, &identity, $api_version, $kind, &namespace, query).await
         }
@@ -166,7 +166,7 @@ macro_rules! cluster_resource_handlers {
             State(state): State<Arc<ApiState>>,
             Query(query): Query<ListQuery>,
             headers: HeaderMap,
-            axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+            axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
         ) -> Result<Response, AppError> {
             list_inner(
                 state,
@@ -188,7 +188,7 @@ macro_rules! cluster_resource_handlers {
             State(state): State<Arc<ApiState>>,
             Path(name): Path<String>,
             headers: HeaderMap,
-            axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+            axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
         ) -> Result<K8sResponse, AppError> {
             get_inner(state, &identity, $api_version, $kind, None, &name, headers).await
         }
@@ -196,7 +196,7 @@ macro_rules! cluster_resource_handlers {
         pub(in crate::api) async fn $create_fn(
             State(state): State<Arc<ApiState>>,
             Query(query): Query<CreateUpdateQuery>,
-            axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+            axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
             LenientJson(body): LenientJson<Value>,
         ) -> Result<(StatusCode, Json<Value>), AppError> {
             create_inner(state, &identity, $api_version, $kind, None, query, body).await
@@ -206,7 +206,7 @@ macro_rules! cluster_resource_handlers {
             State(state): State<Arc<ApiState>>,
             Path(name): Path<String>,
             Query(query): Query<CreateUpdateQuery>,
-            axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+            axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
             LenientJson(body): LenientJson<Value>,
         ) -> Result<Json<Value>, AppError> {
             update_inner(
@@ -225,7 +225,7 @@ macro_rules! cluster_resource_handlers {
             State(state): State<Arc<ApiState>>,
             Path(name): Path<String>,
             Query(query): Query<CreateUpdateQuery>,
-            axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+            axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
             body: Bytes,
         ) -> Result<(StatusCode, Json<Value>), AppError> {
             delete_inner(
@@ -245,7 +245,7 @@ macro_rules! cluster_resource_handlers {
             Path(name): Path<String>,
             Query(query): Query<CreateUpdateQuery>,
             headers: HeaderMap,
-            axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+            axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
             body: Bytes,
         ) -> Result<(StatusCode, Json<Value>), AppError> {
             patch_inner(
@@ -1035,7 +1035,7 @@ macro_rules! cluster_wide_list_handler {
             State(state): State<Arc<ApiState>>,
             Query(query): Query<ListQuery>,
             headers: HeaderMap,
-            axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+            axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
         ) -> Result<Response, AppError> {
             list_inner(
                 state,

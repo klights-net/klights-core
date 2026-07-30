@@ -10,8 +10,8 @@
 //! - `WebhookAuth` — cached authenticator wrapping the reviewer.
 
 use crate::auth::clock::MonotonicClock;
-use crate::auth::identity::AuthenticatedIdentity;
 use anyhow::{Result, anyhow};
+use klights_auth::AuthenticatedIdentity;
 use klights_auth::AuthenticationError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

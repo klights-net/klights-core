@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::auth::rbac_rule_evaluator::{PolicyRule, Subject, SubjectKind};
+use crate::rbac_rule_evaluator::{PolicyRule, Subject, SubjectKind};
 
 /// A resolved role binding: the subjects and the rules they grant.
 #[derive(Clone, Debug)]
@@ -49,7 +49,7 @@ pub trait RbacPolicyStore: Send + Sync {
     /// normalizing wildcards or collapsing distinct `resourceNames` scopes.
     async fn enumerate_effective_rules(
         &self,
-        identity: &crate::auth::identity::AuthenticatedIdentity,
+        identity: &crate::identity::AuthenticatedIdentity,
         namespace: Option<&str>,
     ) -> (
         Vec<EffectiveResourceRule>,
@@ -62,11 +62,7 @@ pub trait RbacPolicyStore: Send + Sync {
 
         for binding in &bindings {
             let subject_match = binding.subjects.iter().any(|s| {
-                crate::auth::rbac_rule_evaluator::subject_matches(
-                    s,
-                    &identity.username,
-                    &identity.groups,
-                )
+                crate::rbac_rule_evaluator::subject_matches(s, &identity.username, &identity.groups)
             });
             if !subject_match {
                 continue;
@@ -397,15 +393,17 @@ async fn load_namespaced_roles(
 #[cfg(test)]
 mod reader_tests {
     use super::*;
-    use crate::auth::identity::AuthenticatedIdentity;
+    use crate::identity::AuthenticatedIdentity;
     use std::collections::HashMap;
     use std::sync::Arc;
 
     const RBAC_API_VERSION: &str = "rbac.authorization.k8s.io/v1";
+    type ResourceKey = (Option<String>, String);
+    type ResourceMap = HashMap<ResourceKey, Vec<Value>>;
 
     #[derive(Default)]
     struct FakeRbacResourceReader {
-        resources: std::sync::Mutex<HashMap<(Option<String>, String), Vec<Value>>>,
+        resources: std::sync::Mutex<ResourceMap>,
     }
 
     impl FakeRbacResourceReader {

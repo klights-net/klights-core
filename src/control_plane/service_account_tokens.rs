@@ -65,14 +65,14 @@ pub(crate) fn sign_authorized_projected_service_account_token(
     clock: &dyn crate::auth::clock::Clock,
 ) -> Result<ProjectedServiceAccountToken, ProjectedServiceAccountTokenError> {
     let audience_refs: Vec<&str> = claims.audiences.iter().map(String::as_str).collect();
-    let token = crate::auth::generate_sa_token_with_bound_pod_and_clock(
-        crate::auth::ServiceAccountTokenRequest {
+    let token = klights_auth::generate_sa_token_with_bound_pod_and_clock(
+        klights_auth::ServiceAccountTokenRequest {
             ca_key_pem: signing_key_pem,
             service_account: &claims.service_account_name,
             namespace: &claims.namespace,
             audiences: &audience_refs,
             expiration_seconds: Some(claims.expiration_seconds),
-            bound: crate::auth::BoundServiceAccountToken {
+            bound: klights_auth::BoundServiceAccountToken {
                 pod_name: Some(&claims.bound_pod_name),
                 pod_uid: Some(&claims.bound_pod_uid),
                 node_name: Some(&claims.bound_node_name),

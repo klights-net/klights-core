@@ -78,7 +78,7 @@ pub(in crate::api) async fn apiservice_discovery_resources(
     // proxying. Backends typically allow authenticated users to read
     // the discovery document. The aggregator's own admin client cert
     // is used for the mTLS connection.
-    let discovery_identity = crate::auth::identity::AuthenticatedIdentity::client_cert(
+    let discovery_identity = klights_auth::AuthenticatedIdentity::client_cert(
         "system:apiserver".to_string(),
         vec!["system:authenticated".to_string()],
     );

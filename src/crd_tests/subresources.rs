@@ -87,8 +87,8 @@ async fn crd_operations_denied_with_deny_authorizer() {
     use serde_json::json;
     use tower::ServiceExt;
 
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
     let state = crate::api::test_support::build_test_app_state_with_authorizer(authorizer).await;
 
     // Register a CRD locally
@@ -209,8 +209,8 @@ async fn crd_allowed_identity_gets_normal_response() {
     use serde_json::json;
     use tower::ServiceExt;
 
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::AllowAllAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::AllowAllAuthorizer);
     let state = crate::api::test_support::build_test_app_state_with_authorizer(authorizer).await;
 
     // Register a CRD
@@ -315,9 +315,9 @@ async fn crd_list_authorization_preserves_field_and_label_selectors() {
     use serde_json::json;
     use tower::ServiceExt;
 
-    let recording = std::sync::Arc::new(crate::auth::authorizer::RecordingAuthorizer::allow());
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        recording.clone() as std::sync::Arc<dyn crate::auth::authorizer::Authorizer>;
+    let recording = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        recording.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>;
     let state =
         crate::api::test_support::build_test_app_state_with_authorizer(authorizer.clone()).await;
 
@@ -459,9 +459,9 @@ async fn crd_rbac_resource_names_uses_field_selector() {
     use serde_json::json;
     use tower::ServiceExt;
 
-    let recording = std::sync::Arc::new(crate::auth::authorizer::RecordingAuthorizer::allow());
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        recording.clone() as std::sync::Arc<dyn crate::auth::authorizer::Authorizer>;
+    let recording = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        recording.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>;
     let state =
         crate::api::test_support::build_test_app_state_with_authorizer(authorizer.clone()).await;
 
@@ -561,13 +561,13 @@ async fn crd_rbac_resource_names_requires_matching_metadata_name_selector() {
 
     // Build a real RBAC authorizer with bindings that grant list/watch
     // on the CRD plurals but restrict to resourceNames: ["allowed"].
-    let namespaced_binding = crate::auth::rbac_policy_store::ResolvedBinding {
-        subjects: vec![crate::auth::rbac_rule_evaluator::Subject {
-            kind: crate::auth::rbac_rule_evaluator::SubjectKind::User,
+    let namespaced_binding = klights_auth::rbac_policy_store::ResolvedBinding {
+        subjects: vec![klights_auth::rbac_rule_evaluator::Subject {
+            kind: klights_auth::rbac_rule_evaluator::SubjectKind::User,
             name: "test-user".to_string(),
             namespace: None,
         }],
-        rules: vec![crate::auth::rbac_rule_evaluator::PolicyRule {
+        rules: vec![klights_auth::rbac_rule_evaluator::PolicyRule {
             verbs: vec!["list".to_string(), "watch".to_string()],
             api_groups: vec!["example-rbac.com".to_string()],
             resources: vec!["rbacwidgets".to_string()],
@@ -576,13 +576,13 @@ async fn crd_rbac_resource_names_requires_matching_metadata_name_selector() {
         }],
         namespace: None,
     };
-    let cluster_binding = crate::auth::rbac_policy_store::ResolvedBinding {
-        subjects: vec![crate::auth::rbac_rule_evaluator::Subject {
-            kind: crate::auth::rbac_rule_evaluator::SubjectKind::User,
+    let cluster_binding = klights_auth::rbac_policy_store::ResolvedBinding {
+        subjects: vec![klights_auth::rbac_rule_evaluator::Subject {
+            kind: klights_auth::rbac_rule_evaluator::SubjectKind::User,
             name: "test-user".to_string(),
             namespace: None,
         }],
-        rules: vec![crate::auth::rbac_rule_evaluator::PolicyRule {
+        rules: vec![klights_auth::rbac_rule_evaluator::PolicyRule {
             verbs: vec!["list".to_string(), "watch".to_string()],
             api_groups: vec!["example-rbac.com".to_string()],
             resources: vec!["clusterrbacs".to_string()],
@@ -591,12 +591,12 @@ async fn crd_rbac_resource_names_requires_matching_metadata_name_selector() {
         }],
         namespace: None,
     };
-    let store = crate::auth::rbac_policy_store::InMemoryRbacPolicyStore::new(vec![
+    let store = klights_auth::rbac_policy_store::InMemoryRbacPolicyStore::new(vec![
         namespaced_binding,
         cluster_binding,
     ]);
-    let rbac: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> = std::sync::Arc::new(
-        crate::auth::rbac_authorizer::RbacAuthorizer::new(std::sync::Arc::new(store)),
+    let rbac: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> = std::sync::Arc::new(
+        klights_auth::rbac_authorizer::RbacAuthorizer::new(std::sync::Arc::new(store)),
     );
 
     let state = crate::api::test_support::build_test_app_state_with_authorizer(rbac).await;
@@ -697,7 +697,7 @@ async fn crd_rbac_resource_names_requires_matching_metadata_name_selector() {
     let app = crate::api::build_router(state);
     let base = "/apis/example-rbac.com/v1/namespaces/default/rbacwidgets";
     let non_admin =
-        crate::auth::identity::AuthenticatedIdentity::client_cert("test-user".to_string(), vec![]);
+        klights_auth::AuthenticatedIdentity::client_cert("test-user".to_string(), vec![]);
 
     // 1. List with fieldSelector=metadata.name=allowed should succeed
     let resp = app

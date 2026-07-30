@@ -3,9 +3,9 @@ use crate::api::mutation::write::{
     CreateStrategy, PatchStrategy, UpdateStrategy, WriteResult, create_with_strategy,
     patch_with_strategy, update_with_strategy,
 };
-use crate::auth::identity::AuthenticatedIdentity;
 use async_trait::async_trait;
 use axum::Extension;
+use klights_auth::AuthenticatedIdentity;
 
 // Custom-resource authorization is enforced by the global `authorize_request`
 // middleware chokepoint (see src/api/auth_middleware.rs). The CRD handlers still

@@ -880,7 +880,7 @@ mod default_roles_tests {
 
     #[test]
     fn cluster_admin_grants_both_resource_and_non_resource_access() {
-        use crate::auth::rbac_rule_evaluator::{PolicyRule, RuleMatchRequest, rule_matches};
+        use klights_auth::rbac_rule_evaluator::{PolicyRule, RuleMatchRequest, rule_matches};
 
         let objs = default_rbac_fixtures();
         let role = find(&objs, "ClusterRole", "cluster-admin");

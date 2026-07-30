@@ -380,7 +380,7 @@ async fn run_post_hard_delete_effects(
 
 pub(in crate::api) async fn list_inner(
     state: Arc<ApiState>,
-    _identity: &crate::auth::AuthenticatedIdentity,
+    _identity: &klights_auth::AuthenticatedIdentity,
     request: GeneratedListInnerRequest,
 ) -> Result<Response, AppError> {
     let GeneratedListInnerRequest {
@@ -577,7 +577,7 @@ pub(in crate::api) async fn list_inner(
 
 pub(in crate::api) async fn get_inner(
     state: Arc<ApiState>,
-    _identity: &crate::auth::AuthenticatedIdentity,
+    _identity: &klights_auth::AuthenticatedIdentity,
     api_version: &'static str,
     kind: &'static str,
     ns: Option<&str>,
@@ -675,7 +675,7 @@ async fn inject_node_last_heartbeat_on_leader(
 
 struct BuiltinCreateStrategy<'a> {
     state: &'a Arc<ApiState>,
-    identity: &'a crate::auth::AuthenticatedIdentity,
+    identity: &'a klights_auth::AuthenticatedIdentity,
     api_version: &'static str,
     kind: &'static str,
     namespace: Option<&'a str>,
@@ -949,7 +949,7 @@ impl<'a> CreateStrategy for BuiltinCreateStrategy<'a> {
 
 struct BuiltinUpdateStrategy<'a> {
     state: &'a Arc<ApiState>,
-    identity: &'a crate::auth::AuthenticatedIdentity,
+    identity: &'a klights_auth::AuthenticatedIdentity,
     api_version: &'static str,
     kind: &'static str,
     namespace: Option<&'a str>,
@@ -1129,7 +1129,7 @@ impl<'a> UpdateStrategy for BuiltinUpdateStrategy<'a> {
 
 struct BuiltinPatchStrategy<'a> {
     state: &'a Arc<ApiState>,
-    identity: &'a crate::auth::AuthenticatedIdentity,
+    identity: &'a klights_auth::AuthenticatedIdentity,
     target: GeneratedNamedResource<'a>,
     query: &'a CreateUpdateQuery,
     headers: &'a HeaderMap,
@@ -1451,7 +1451,7 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
 
 pub(in crate::api) async fn create_inner(
     state: Arc<ApiState>,
-    identity: &crate::auth::AuthenticatedIdentity,
+    identity: &klights_auth::AuthenticatedIdentity,
     api_version: &'static str,
     kind: &'static str,
     ns: Option<&str>,
@@ -1544,7 +1544,7 @@ pub(in crate::api) async fn create_inner(
 
 pub(in crate::api) async fn update_inner(
     state: Arc<ApiState>,
-    identity: &crate::auth::AuthenticatedIdentity,
+    identity: &klights_auth::AuthenticatedIdentity,
     request: GeneratedUpdateInnerRequest<'_>,
 ) -> Result<Json<Value>, AppError> {
     let GeneratedUpdateInnerRequest {
@@ -1729,7 +1729,7 @@ async fn run_owner_cascade_sweeps(
 
 pub(in crate::api) async fn delete_inner(
     state: Arc<ApiState>,
-    _identity: &crate::auth::AuthenticatedIdentity,
+    _identity: &klights_auth::AuthenticatedIdentity,
     request: GeneratedDeleteInnerRequest<'_>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let GeneratedDeleteInnerRequest {
@@ -1998,7 +1998,7 @@ pub(in crate::api) async fn delete_inner(
 
 pub(in crate::api) async fn patch_inner(
     state: Arc<ApiState>,
-    identity: &crate::auth::AuthenticatedIdentity,
+    identity: &klights_auth::AuthenticatedIdentity,
     request: GeneratedPatchInnerRequest<'_>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let GeneratedPatchInnerRequest {
@@ -2098,7 +2098,7 @@ pub(in crate::api) async fn patch_inner(
 
 pub(in crate::api) async fn delete_collection_inner(
     state: Arc<ApiState>,
-    identity: &crate::auth::AuthenticatedIdentity,
+    identity: &klights_auth::AuthenticatedIdentity,
     api_version: &'static str,
     kind: &'static str,
     namespace: &str,
@@ -2109,7 +2109,7 @@ pub(in crate::api) async fn delete_collection_inner(
 
 pub(in crate::api) async fn delete_collection_shared_inner(
     state: Arc<ApiState>,
-    _identity: &crate::auth::AuthenticatedIdentity,
+    _identity: &klights_auth::AuthenticatedIdentity,
     api_version: &'static str,
     kind: &'static str,
     namespace: Option<&str>,
@@ -2362,7 +2362,7 @@ mod tests {
                 "usages": ["client auth"]
             }
         });
-        let identity = crate::auth::AuthenticatedIdentity::bootstrap(
+        let identity = klights_auth::AuthenticatedIdentity::bootstrap(
             "abcdef",
             &["system:bootstrappers:klights:worker".to_string()],
         );
@@ -2440,7 +2440,7 @@ mod tests {
             "application/apply-patch+yaml".parse().unwrap(),
         );
 
-        let identity = crate::auth::AuthenticatedIdentity::bootstrap(
+        let identity = klights_auth::AuthenticatedIdentity::bootstrap(
             "abcdef",
             &["system:bootstrappers:klights:worker".to_string()],
         );

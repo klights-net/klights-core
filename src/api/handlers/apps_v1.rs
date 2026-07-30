@@ -130,7 +130,7 @@ async fn create_deployment(
     State(state): State<Arc<ApiState>>,
     Path(namespace): Path<String>,
     Query(query): Query<CreateUpdateQuery>,
-    axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+    axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let is_protobuf = body.len() >= 4 && &body[..4] == b"k8s\x00";
@@ -164,7 +164,7 @@ async fn update_deployment(
     State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
-    axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+    axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
     let result = update_deployment_base(
@@ -190,7 +190,7 @@ async fn patch_deployment(
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     headers: HeaderMap,
-    axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+    axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let result = patch_deployment_base(

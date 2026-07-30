@@ -4914,7 +4914,7 @@ async fn test_impersonated_request_authorizes_effective_subject_not_real_admin()
 
     let mut state = crate::api::test_support::build_test_app_state().await;
     state.authorizer =
-        std::sync::Arc::new(crate::auth::authorizer::AuthorizerChain::default_chain());
+        std::sync::Arc::new(klights_auth::authorizer::AuthorizerChain::default_chain());
     let app = crate::api::build_router(state);
 
     let response = app
@@ -5270,8 +5270,8 @@ async fn test_api_accepts_valid_serviceaccount_bearer_token() {
 
     let app = crate::api::build_router(state);
 
-    let token = crate::auth::generate_sa_token_with_bound_pod_at(
-        crate::auth::ServiceAccountTokenRequest {
+    let token = klights_auth::generate_sa_token_with_bound_pod_at(
+        klights_auth::ServiceAccountTokenRequest {
             ca_key_pem: &signing_key_pem,
             service_account: "sonobuoy-serviceaccount",
             namespace: "sonobuoy",
@@ -5279,7 +5279,7 @@ async fn test_api_accepts_valid_serviceaccount_bearer_token() {
             expiration_seconds: Some(
                 klights_types::DEFAULT_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS,
             ),
-            bound: crate::auth::BoundServiceAccountToken {
+            bound: klights_auth::BoundServiceAccountToken {
                 sa_uid: Some(&sa_uid),
                 ..Default::default()
             },
@@ -5485,9 +5485,10 @@ async fn test_trusted_api_proxy_identity_is_authorized_as_delegated_user() {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let recording = std::sync::Arc::new(crate::auth::authorizer::RecordingAuthorizer::allow());
+    let recording = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
     let mut state = crate::api::test_support::build_test_app_state().await;
-    state.authorizer = recording.clone() as std::sync::Arc<dyn crate::auth::authorizer::Authorizer>;
+    state.authorizer =
+        recording.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>;
     let app = crate::api::build_router(state);
 
     let (ca_cert, ca_key, _, _) = crate::auth::generate_ca_full().unwrap();
@@ -5537,9 +5538,10 @@ async fn test_server_cert_identity_cannot_delegate_requestheaders() {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let recording = std::sync::Arc::new(crate::auth::authorizer::RecordingAuthorizer::allow());
+    let recording = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
     let mut state = crate::api::test_support::build_test_app_state().await;
-    state.authorizer = recording.clone() as std::sync::Arc<dyn crate::auth::authorizer::Authorizer>;
+    state.authorizer =
+        recording.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>;
     let app = crate::api::build_router(state);
 
     let (ca_cert, ca_key, _, _) = crate::auth::generate_ca_full().unwrap();

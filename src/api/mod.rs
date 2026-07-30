@@ -601,7 +601,7 @@ async fn update_replicationcontroller(
     State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
-    axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+    axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
     let result = generated_handlers::update_replicationcontroller(
@@ -628,7 +628,7 @@ async fn patch_replicationcontroller(
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     headers: HeaderMap,
-    axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+    axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let result = generated_handlers::patch_replicationcontroller(

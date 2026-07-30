@@ -116,11 +116,11 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
     let network = crate::networking::test_support::mock_network(db_handle.clone());
     crate::api::ApiState::new(
         crate::api::ApiAuthPolicy::new(
-            std::sync::Arc::new(crate::auth::authorizer::AuthorizerChain::test_allow_all()),
+            std::sync::Arc::new(klights_auth::authorizer::AuthorizerChain::test_allow_all()),
             crate::audit::default_audit_sink(),
             std::sync::Arc::new(crate::api::priority_fairness::ApiPriorityFairness::new()),
             std::sync::Arc::new(
-                crate::auth::rbac_policy_store::ReaderBackedRbacPolicyStore::new(
+                klights_auth::rbac_policy_store::ReaderBackedRbacPolicyStore::new(
                     std::sync::Arc::new(
                         crate::bootstrap::auth_adapters::DatastoreRbacResourceReader::new(
                             db_handle.clone(),

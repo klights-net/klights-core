@@ -3,7 +3,16 @@
 use std::{error::Error, fmt};
 use time::OffsetDateTime;
 
+pub mod authorizer;
+pub mod bootstrap_authorizer;
 pub mod identity;
+pub mod impersonation;
+pub mod node_authorizer;
+pub mod node_policy_store;
+pub mod rbac_authorizer;
+pub mod rbac_policy_store;
+pub mod rbac_rule_evaluator;
+pub mod request_attributes;
 pub mod service_account;
 
 pub use identity::AuthenticatedIdentity;

@@ -5,9 +5,9 @@
 //! tracing target, so production callers get a structured stream without
 //! blocking the async runtime on file I/O.
 
-use crate::auth::authorizer::AuthorizationDecision;
-use crate::auth::identity::AuthenticatedIdentity;
-use crate::auth::request_attributes::AuthorizationRequest;
+use klights_auth::AuthenticatedIdentity;
+use klights_auth::authorizer::AuthorizationDecision;
+use klights_auth::request_attributes::AuthorizationRequest;
 use serde::Serialize;
 use std::sync::Arc;
 

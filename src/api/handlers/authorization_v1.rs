@@ -1,7 +1,7 @@
 use crate::api::*;
-use crate::auth::authorizer::AuthorizationDecision;
-use crate::auth::identity::AuthenticatedIdentity;
-use crate::auth::request_attributes::AuthorizationRequest;
+use klights_auth::AuthenticatedIdentity;
+use klights_auth::authorizer::AuthorizationDecision;
+use klights_auth::request_attributes::AuthorizationRequest;
 
 /// Take `spec` out of a decoded request body without deep-cloning. The
 /// json! response macro consumes its arguments, so moving spec straight
@@ -361,10 +361,10 @@ pub(crate) async fn create_local_subject_access_review(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::authorizer::{AuthorizationDecision, Authorizer};
-    use crate::auth::rbac_policy_store::{InMemoryRbacPolicyStore, ResolvedBinding};
-    use crate::auth::rbac_rule_evaluator::{PolicyRule, Subject, SubjectKind};
     use async_trait::async_trait;
+    use klights_auth::authorizer::{AuthorizationDecision, Authorizer};
+    use klights_auth::rbac_policy_store::{InMemoryRbacPolicyStore, ResolvedBinding};
+    use klights_auth::rbac_rule_evaluator::{PolicyRule, Subject, SubjectKind};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 

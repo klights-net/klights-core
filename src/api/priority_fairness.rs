@@ -6,14 +6,14 @@
 
 use crate::api::AppError;
 use crate::api::request_info::{ResolvedAuthz, resolve_request_info};
-use crate::auth::AuthenticatedIdentity;
-use crate::auth::request_attributes::AuthorizationRequest;
 #[cfg(test)]
 use crate::datastore::DatastoreBackend;
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use klights_auth::AuthenticatedIdentity;
+use klights_auth::request_attributes::AuthorizationRequest;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -937,8 +937,8 @@ fn stable_hash(priority_level_name: &str, flow_schema_name: &str, flow_key: &str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::request_attributes::AuthorizationRequest;
     use crate::datastore::test_support;
+    use klights_auth::request_attributes::AuthorizationRequest;
 
     async fn create_test_priority_level(
         db: &dyn DatastoreBackend,

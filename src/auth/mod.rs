@@ -13,23 +13,19 @@ pub use self::cert::{
 };
 #[cfg(test)]
 pub use self::cert::{generate_admin_cert, generate_ca_full, generate_server_cert};
-pub use klights_auth::AuthenticatedIdentity;
-pub mod identity {
-    pub use klights_auth::AuthenticatedIdentity;
-}
 #[cfg(test)]
-pub(crate) fn test_admin(username: impl Into<String>) -> AuthenticatedIdentity {
-    AuthenticatedIdentity::client_cert(username.into(), vec!["system:masters".to_string()])
+pub(crate) fn test_admin(username: impl Into<String>) -> klights_auth::AuthenticatedIdentity {
+    klights_auth::AuthenticatedIdentity::client_cert(
+        username.into(),
+        vec!["system:masters".to_string()],
+    )
 }
 pub(crate) use self::kubeconfig::{KubeconfigParams, generate_kubeconfig};
 pub use self::middleware::{BoundTokenSubjectLookup, validate_sa_token_bindings};
-pub use klights_auth::{
-    BoundServiceAccountToken, ServiceAccountTokenRequest,
-    generate_sa_token_with_bound_pod_and_clock, generate_sa_token_with_bound_pod_at,
-};
-pub use klights_auth::{
-    SaTokenClaims, decode_serviceaccount_token_with_clock, serviceaccount_groups_from_claims,
-    serviceaccount_uid_from_claims, validate_service_account_uid,
+#[cfg(test)]
+use klights_auth::{
+    BoundServiceAccountToken, SaTokenClaims, ServiceAccountTokenRequest,
+    decode_serviceaccount_token_with_clock, generate_sa_token_with_bound_pod_and_clock,
 };
 #[cfg(test)]
 pub fn decode_serviceaccount_token(
@@ -90,26 +86,17 @@ pub fn generate_sa_token_with_bound_pod(
 pub use self::user::user_from_cert;
 pub use self::user::verify_client_cert_signed_by_ca;
 
-pub mod authorizer;
-pub mod bootstrap_authorizer;
 pub mod ca_transport;
 pub(crate) mod cert;
 pub mod clock;
 pub mod csr_policy;
 pub mod csr_signer;
-pub mod impersonation;
 mod kubeconfig;
 pub mod kubelet_client_cert;
 pub(crate) mod middleware;
-pub mod node_authorizer;
-pub mod node_policy_store;
 pub mod oidc;
 #[cfg(test)]
 mod oidc_tests;
-pub mod rbac_authorizer;
-pub mod rbac_policy_store;
-pub mod rbac_rule_evaluator;
-pub mod request_attributes;
 mod user;
 pub mod webhook_auth;
 #[cfg(test)]
@@ -121,18 +108,18 @@ mod object_safety_tests {
 
     #[test]
     fn every_substitutable_auth_port_is_object_safe() {
-        assert_object_safe::<dyn super::authorizer::Authorizer>();
+        assert_object_safe::<dyn klights_auth::authorizer::Authorizer>();
         assert_object_safe::<dyn super::clock::Clock>();
         assert_object_safe::<dyn super::clock::MonotonicClock>();
         assert_object_safe::<dyn super::csr_signer::CsrSigner>();
         assert_object_safe::<dyn super::middleware::BootstrapTokenAuthenticator>();
         assert_object_safe::<dyn super::middleware::BoundTokenSubjectLookup>();
         assert_object_safe::<dyn super::middleware::ServiceAccountSigningKeyProvider>();
-        assert_object_safe::<dyn super::node_policy_store::NodePolicyStore>();
+        assert_object_safe::<dyn klights_auth::node_policy_store::NodePolicyStore>();
         assert_object_safe::<dyn super::oidc::OidcDiscovery>();
         assert_object_safe::<dyn super::oidc::OidcValidator>();
-        assert_object_safe::<dyn super::rbac_policy_store::RbacPolicyStore>();
-        assert_object_safe::<dyn super::rbac_policy_store::RbacResourceReader>();
+        assert_object_safe::<dyn klights_auth::rbac_policy_store::RbacPolicyStore>();
+        assert_object_safe::<dyn klights_auth::rbac_policy_store::RbacResourceReader>();
         assert_object_safe::<dyn super::webhook_auth::WebhookAuthenticator>();
         assert_object_safe::<dyn super::webhook_auth::WebhookTokenReviewer>();
     }

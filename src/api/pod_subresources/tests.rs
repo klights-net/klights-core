@@ -2701,8 +2701,8 @@ async fn pod_subresource_routes_denied_with_deny_all_authorizer() {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
     let state = crate::api::test_support::build_test_app_state_with_authorizer(authorizer).await;
     let app = crate::api::build_router(state);
 
@@ -3034,9 +3034,9 @@ async fn pod_and_node_proxy_use_method_specific_rbac_verbs() {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    let recorder = std::sync::Arc::new(crate::auth::authorizer::RecordingAuthorizer::allow());
+    let recorder = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
     let state = crate::api::test_support::build_test_app_state_with_authorizer(
-        recorder.clone() as std::sync::Arc<dyn crate::auth::authorizer::Authorizer>
+        recorder.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>
     )
     .await;
     let app = crate::api::build_router(state);
@@ -3169,8 +3169,8 @@ async fn tokenrequest_denied_does_not_read_signing_key() {
     use serde_json::json;
     use tower::ServiceExt;
 
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
     let app = crate::api::test_support::build_test_router_with_authorizer(authorizer.clone()).await;
 
     // ServiceAccount token request — should be denied before any side effect
@@ -3205,8 +3205,8 @@ async fn eviction_denied_does_not_mark_pod_deletion() {
     use serde_json::json;
     use tower::ServiceExt;
 
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
     let app = crate::api::test_support::build_test_router_with_authorizer(authorizer.clone()).await;
 
     let body = json!({
@@ -3267,9 +3267,9 @@ async fn tokenrequest_authorization_has_correct_verb_and_resource() {
     use serde_json::json;
     use tower::ServiceExt;
 
-    let recording = std::sync::Arc::new(crate::auth::authorizer::RecordingAuthorizer::allow());
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        recording.clone() as std::sync::Arc<dyn crate::auth::authorizer::Authorizer>;
+    let recording = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        recording.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>;
     let app = crate::api::test_support::build_test_router_with_authorizer(authorizer.clone()).await;
 
     let body = json!({
@@ -3310,9 +3310,9 @@ async fn pod_log_authorization_has_correct_subresource() {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    let recording = std::sync::Arc::new(crate::auth::authorizer::RecordingAuthorizer::allow());
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        recording.clone() as std::sync::Arc<dyn crate::auth::authorizer::Authorizer>;
+    let recording = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        recording.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>;
     let app = crate::api::test_support::build_test_router_with_authorizer(authorizer.clone()).await;
 
     let _ = app
@@ -3345,9 +3345,9 @@ async fn handwritten_routes_emit_exact_rbac_attributes() {
     use serde_json::json;
     use tower::ServiceExt;
 
-    let recording = std::sync::Arc::new(crate::auth::authorizer::RecordingAuthorizer::allow());
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        recording.clone() as std::sync::Arc<dyn crate::auth::authorizer::Authorizer>;
+    let recording = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        recording.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>;
     let app = crate::api::test_support::build_test_router_with_authorizer(authorizer.clone()).await;
 
     struct RouteTest {
@@ -3588,8 +3588,8 @@ async fn proxy_denied_does_not_connect_to_backend() {
         }
     });
 
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
     let state = crate::api::test_support::build_test_app_state_with_authorizer(authorizer).await;
     let app = crate::api::build_router(state);
 
@@ -3625,8 +3625,8 @@ async fn log_denied_does_not_read_log_file() {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
     let state = crate::api::test_support::build_test_app_state_with_authorizer(authorizer).await;
     let app = crate::api::build_router(state);
 
@@ -3658,8 +3658,8 @@ async fn exec_attach_portforward_denied_do_not_open_runtime_or_upgrade_streams()
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
     let state = crate::api::test_support::build_test_app_state_with_authorizer(authorizer).await;
     let app = crate::api::build_router(state);
 
@@ -3710,8 +3710,8 @@ async fn service_delete_denied_leaves_service_endpoints_allocations_and_hooks() 
     use serde_json::json;
     use tower::ServiceExt;
 
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
     let state = crate::api::test_support::build_test_app_state_with_authorizer(authorizer).await;
     let db = state.resource_mutation().db.clone();
 
@@ -3805,8 +3805,8 @@ async fn pod_crud_denied_returns_403_via_middleware() {
     use serde_json::json;
     use tower::ServiceExt;
 
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
     let app = crate::api::test_support::build_test_router_with_authorizer(authorizer).await;
 
     let cases: Vec<(&str, &str, Option<serde_json::Value>)> = vec![
@@ -3848,8 +3848,8 @@ async fn pod_create_denied_does_not_persist() {
     use serde_json::json;
     use tower::ServiceExt;
 
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
     let state = crate::api::test_support::build_test_app_state_with_authorizer(authorizer).await;
     let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
@@ -3885,8 +3885,8 @@ async fn namespace_crud_and_finalize_denied_returns_403() {
     use serde_json::json;
     use tower::ServiceExt;
 
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
     let app = crate::api::test_support::build_test_router_with_authorizer(authorizer).await;
 
     let cases: Vec<(&str, &str, Option<serde_json::Value>)> = vec![
@@ -3932,8 +3932,8 @@ async fn service_proxy_denied_returns_403() {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
     let app = crate::api::test_support::build_test_router_with_authorizer(authorizer).await;
 
     for uri in [
@@ -4135,8 +4135,8 @@ async fn k8s_non_resource_info_endpoints_still_require_authorization() {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
     let app = crate::api::test_support::build_test_router_with_authorizer(authorizer).await;
 
     for uri in [
@@ -4173,8 +4173,8 @@ async fn metrics_endpoint_requires_authorization() {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        std::sync::Arc::new(klights_auth::authorizer::DenyAuthorizer);
     let app = crate::api::test_support::build_test_router_with_authorizer(authorizer).await;
 
     let resp = app
@@ -4196,9 +4196,9 @@ async fn pod_list_authorization_attributes_recorded_by_middleware() {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    let recording = std::sync::Arc::new(crate::auth::authorizer::RecordingAuthorizer::allow());
-    let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
-        recording.clone() as std::sync::Arc<dyn crate::auth::authorizer::Authorizer>;
+    let recording = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
+    let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
+        recording.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>;
     let app = crate::api::test_support::build_test_router_with_authorizer(authorizer).await;
 
     let _ = app

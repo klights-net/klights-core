@@ -8,8 +8,8 @@
 //! pure, exhaustively-tested function is what makes authorization DRY and
 //! "secure by construction": no handler can be reached without it.
 
-use crate::auth::request_attributes::AuthorizationRequest;
 use axum::http::Method;
+use klights_auth::request_attributes::AuthorizationRequest;
 
 /// Outcome of resolving a request path into authorization attributes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -260,7 +260,7 @@ fn non_resource(method: &Method, path: &str) -> ResolvedAuthz {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::request_attributes::RequestKind;
+    use klights_auth::request_attributes::RequestKind;
 
     /// Helper: resolve and unwrap to an authorization request.
     fn req(method: Method, path: &str, query: Option<&str>) -> AuthorizationRequest {

@@ -393,7 +393,7 @@ async fn proxy_raw(
         .body(body_bytes.to_vec());
     let delegated_identity = parts
         .extensions
-        .get::<crate::auth::AuthenticatedIdentity>()
+        .get::<klights_auth::AuthenticatedIdentity>()
         .cloned();
     // The original caller's actual TLS client certificate, if they authenticated
     // with one. The follower's TLS stack already verified it against the cluster
@@ -487,7 +487,7 @@ async fn proxy_raw(
 
 fn stamp_delegated_identity_headers(
     mut req_builder: reqwest::RequestBuilder,
-    identity: &crate::auth::AuthenticatedIdentity,
+    identity: &klights_auth::AuthenticatedIdentity,
 ) -> reqwest::RequestBuilder {
     req_builder = req_builder.header("x-remote-user", identity.username.as_str());
     for group in &identity.groups {
