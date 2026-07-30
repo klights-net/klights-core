@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use time::OffsetDateTime;
 
-use crate::auth::cert::{
+use klights_auth::cert::{
     CertificateAuthority, api_proxy_cert_and_key_match_config,
     apiservice_proxy_cert_and_key_match_config, generate_server_csr, server_cert_matches_config,
 };
@@ -574,9 +574,9 @@ async fn write_file_keyed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::cert::{
-        api_proxy_cert_and_key_match_config, generate_api_proxy_cert, generate_ca_full,
-        generate_server_cert_with_config, parse_certificate_extended_key_usage,
+    use klights_auth::cert::{
+        api_proxy_cert_and_key_match_config, generate_api_proxy_cert, generate_ca_full_at,
+        generate_server_cert_with_config_at, parse_certificate_extended_key_usage,
     };
     use rcgen::CertificateParams;
     use rsa::RsaPrivateKey;
@@ -691,7 +691,7 @@ mod tests {
         assert_eq!(proxy_key_mode, 0o600, "api-proxy.key must be owner-only");
 
         let der = pem_to_der(&proxy_cert_pem);
-        let user = crate::auth::user_from_cert(&der).unwrap();
+        let user = klights_auth::user::user_from_cert(&der).unwrap();
         assert_eq!(user.username, "system:klights:api-proxy:mn-controlplane2");
         assert!(
             !user.groups.contains(&"system:masters".to_string()),
@@ -747,7 +747,7 @@ mod tests {
         );
 
         let der = pem_to_der(&proxy_cert_pem);
-        let user = crate::auth::user_from_cert(&der).unwrap();
+        let user = klights_auth::user::user_from_cert(&der).unwrap();
         assert_eq!(user.username, "system:klights:apiservice-proxy");
         assert_eq!(
             user.groups,
@@ -819,7 +819,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let etc_dir = dir.path().join("etc");
         std::fs::create_dir_all(&etc_dir).unwrap();
-        let (_, _, ca_cert_pem, ca_key_pem) = generate_ca_full().unwrap();
+        let (_, _, ca_cert_pem, ca_key_pem) =
+            generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
         std::fs::write(etc_dir.join("ca.crt"), ca_cert_pem).unwrap();
         std::fs::write(etc_dir.join("ca.key"), ca_key_pem).unwrap();
 
@@ -860,7 +861,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let etc_dir = dir.path().join("etc");
         std::fs::create_dir_all(&etc_dir).unwrap();
-        let (_, _, ca_cert_pem, ca_key_pem) = generate_ca_full().unwrap();
+        let (_, _, ca_cert_pem, ca_key_pem) =
+            generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
         std::fs::write(etc_dir.join("ca.crt"), ca_cert_pem).unwrap();
         std::fs::write(etc_dir.join("ca.key"), ca_key_pem).unwrap();
         let signer_path = etc_dir.join("service-account-signing.key");
@@ -904,7 +906,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let etc_dir = dir.path().join("etc");
         std::fs::create_dir_all(&etc_dir).unwrap();
-        let (_, _, ca_cert_pem, ca_key_pem) = generate_ca_full().unwrap();
+        let (_, _, ca_cert_pem, ca_key_pem) =
+            generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
         std::fs::write(etc_dir.join("ca.crt"), ca_cert_pem).unwrap();
         std::fs::write(etc_dir.join("ca.key"), ca_key_pem).unwrap();
         let signer_path = etc_dir.join("service-account-signing.key");
@@ -963,7 +966,8 @@ mod tests {
 
         let proxy_cert_path = etc_dir.join("api-proxy.crt");
         let proxy_key_path = etc_dir.join("api-proxy.key");
-        let (_, wrong_ca_key, wrong_ca_cert_pem, _) = generate_ca_full().unwrap();
+        let (_, wrong_ca_key, wrong_ca_cert_pem, _) =
+            generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
         let wrong_ca_cert = CertificateParams::from_ca_cert_pem(&wrong_ca_cert_pem)
             .unwrap()
             .self_signed(&wrong_ca_key)
@@ -992,8 +996,9 @@ mod tests {
     async fn init_certificates_regenerates_server_cert_when_service_ip_san_changes() {
         let dir = tempfile::tempdir().unwrap();
         let etc_dir = dir.path();
-        let (ca_cert, ca_key, ca_cert_pem, ca_key_pem) = generate_ca_full().unwrap();
-        let (old_server_cert_pem, old_server_key_pem) = generate_server_cert_with_config(
+        let (ca_cert, ca_key, ca_cert_pem, ca_key_pem) =
+            generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+        let (old_server_cert_pem, old_server_key_pem) = generate_server_cert_with_config_at(
             &ca_cert,
             &ca_key,
             "10.50.0.0/24",
@@ -1001,6 +1006,7 @@ mod tests {
             Some("10.99.0.10".to_string()),
             "mn-controlplane1",
             None,
+            time::OffsetDateTime::now_utc(),
         )
         .unwrap();
         std::fs::write(etc_dir.join("ca.crt"), ca_cert_pem).unwrap();

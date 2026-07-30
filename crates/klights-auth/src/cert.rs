@@ -36,7 +36,7 @@ pub const CONTROLPLANE_NODES_GROUP: &str = "system:controlplanes";
 /// decides where the PEM material comes from and whether/how it is persisted,
 /// then injects it through this capability.
 #[derive(Clone)]
-pub(crate) struct CertificateAuthority {
+pub struct CertificateAuthority {
     certificate: Arc<Certificate>,
     private_key: Arc<KeyPair>,
     certificate_pem: Arc<str>,
@@ -44,7 +44,7 @@ pub(crate) struct CertificateAuthority {
 }
 
 impl CertificateAuthority {
-    pub(crate) fn from_pem(
+    pub fn from_pem(
         certificate_pem: String,
         private_key_pem: String,
         valid_at: OffsetDateTime,
@@ -60,7 +60,7 @@ impl CertificateAuthority {
         })
     }
 
-    pub(crate) fn generate(valid_at: OffsetDateTime) -> Result<Self> {
+    pub fn generate(valid_at: OffsetDateTime) -> Result<Self> {
         let (certificate, private_key, certificate_pem, private_key_pem) =
             generate_ca_full_at(valid_at)?;
         Ok(Self {
@@ -71,16 +71,16 @@ impl CertificateAuthority {
         })
     }
 
-    pub(crate) fn certificate_pem(&self) -> &str {
+    pub fn certificate_pem(&self) -> &str {
         &self.certificate_pem
     }
 
-    pub(crate) fn private_key_pem(&self) -> &str {
+    pub fn private_key_pem(&self) -> &str {
         &self.private_key_pem
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn issue_server_certificate(
+    pub fn issue_server_certificate(
         &self,
         service_cidr: &str,
         pod_subnet: &str,
@@ -89,7 +89,7 @@ impl CertificateAuthority {
         api_fqdn: Option<&str>,
         valid_at: OffsetDateTime,
     ) -> Result<(String, String)> {
-        generate_server_cert_with_config_at(
+        generate_server_cert_from_config(
             &self.certificate,
             &self.private_key,
             ServerCertGenerationConfig {
@@ -103,14 +103,11 @@ impl CertificateAuthority {
         )
     }
 
-    pub(crate) fn issue_admin_certificate(
-        &self,
-        valid_at: OffsetDateTime,
-    ) -> Result<(String, String)> {
+    pub fn issue_admin_certificate(&self, valid_at: OffsetDateTime) -> Result<(String, String)> {
         generate_admin_cert_at(&self.certificate, &self.private_key, valid_at)
     }
 
-    pub(crate) fn issue_api_proxy_certificate(
+    pub fn issue_api_proxy_certificate(
         &self,
         node_name: &str,
         valid_at: OffsetDateTime,
@@ -118,7 +115,7 @@ impl CertificateAuthority {
         generate_api_proxy_cert(&self.certificate, &self.private_key, node_name, valid_at)
     }
 
-    pub(crate) fn issue_apiservice_proxy_certificate(
+    pub fn issue_apiservice_proxy_certificate(
         &self,
         valid_at: OffsetDateTime,
     ) -> Result<(String, String)> {
@@ -166,7 +163,7 @@ fn generate_rsa_key_pair() -> Result<KeyPair> {
 /// Returns: (cert, key, cert_pem, key_pem)
 /// - `cert` and `key`: rcgen objects for signing
 /// - `cert_pem` and `key_pem`: PEM strings for file I/O
-fn generate_ca_full_at(
+pub fn generate_ca_full_at(
     valid_at: OffsetDateTime,
 ) -> Result<(rcgen::Certificate, KeyPair, String, String)> {
     let params = generate_ca_params_at(valid_at);
@@ -195,7 +192,7 @@ struct ServerCertGenerationConfig<'a> {
     valid_at: OffsetDateTime,
 }
 
-fn generate_server_cert_with_config_at(
+fn generate_server_cert_from_config(
     ca_cert: &rcgen::Certificate,
     ca_key: &KeyPair,
     config: ServerCertGenerationConfig<'_>,
@@ -222,6 +219,31 @@ fn generate_server_cert_with_config_at(
     Ok((cert.pem(), key_pair.serialize_pem()))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn generate_server_cert_with_config_at(
+    ca_cert: &rcgen::Certificate,
+    ca_key: &KeyPair,
+    service_cidr: &str,
+    pod_subnet: &str,
+    host_ip: Option<String>,
+    node_name: &str,
+    api_fqdn: Option<&str>,
+    valid_at: OffsetDateTime,
+) -> Result<(String, String)> {
+    generate_server_cert_from_config(
+        ca_cert,
+        ca_key,
+        ServerCertGenerationConfig {
+            service_cidr,
+            pod_subnet,
+            host_ip: host_ip.as_deref(),
+            node_name,
+            api_fqdn,
+            valid_at,
+        },
+    )
+}
+
 #[cfg(test)]
 pub fn generate_server_cert_with_config(
     ca_cert: &rcgen::Certificate,
@@ -235,27 +257,23 @@ pub fn generate_server_cert_with_config(
     generate_server_cert_with_config_at(
         ca_cert,
         ca_key,
-        ServerCertGenerationConfig {
-            service_cidr,
-            pod_subnet,
-            host_ip: host_ip.as_deref(),
-            node_name,
-            api_fqdn,
-            valid_at: OffsetDateTime::now_utc(),
-        },
+        service_cidr,
+        pod_subnet,
+        host_ip,
+        node_name,
+        api_fqdn,
+        OffsetDateTime::now_utc(),
     )
 }
 
-/// Generate a server certificate with hardcoded defaults (for backward compatibility).
-///
-/// DEPRECATED: Use `generate_server_cert_with_config` instead.
-/// Only used in tests.
-#[cfg(test)]
-pub fn generate_server_cert(
+/// Generate a server certificate with deterministic fixture defaults at a
+/// caller-selected time.
+pub fn generate_server_cert_at(
     ca_cert: &rcgen::Certificate,
     ca_key: &KeyPair,
+    valid_at: OffsetDateTime,
 ) -> Result<(String, String)> {
-    generate_server_cert_with_config_at(
+    generate_server_cert_from_config(
         ca_cert,
         ca_key,
         ServerCertGenerationConfig {
@@ -264,13 +282,21 @@ pub fn generate_server_cert(
             host_ip: None,
             node_name: "test-node",
             api_fqdn: None,
-            valid_at: OffsetDateTime::now_utc(),
+            valid_at,
         },
     )
 }
 
+#[cfg(test)]
+pub fn generate_server_cert(
+    ca_cert: &rcgen::Certificate,
+    ca_key: &KeyPair,
+) -> Result<(String, String)> {
+    generate_server_cert_at(ca_cert, ca_key, OffsetDateTime::now_utc())
+}
+
 /// Generate an admin certificate signed by the CA.
-fn generate_admin_cert_at(
+pub fn generate_admin_cert_at(
     ca_cert: &rcgen::Certificate,
     ca_key: &KeyPair,
     valid_at: OffsetDateTime,
@@ -364,11 +390,7 @@ pub fn generate_apiservice_proxy_cert(
     Ok((cert.pem(), key_pair.serialize_pem()))
 }
 
-pub(crate) fn api_proxy_cert_and_key_match_config(
-    cert_pem: &str,
-    key_pem: &str,
-    node_name: &str,
-) -> bool {
+pub fn api_proxy_cert_and_key_match_config(cert_pem: &str, key_pem: &str, node_name: &str) -> bool {
     let der = match first_pem_cert_der(cert_pem) {
         Some(der) => der,
         None => return false,
@@ -390,7 +412,7 @@ pub(crate) fn api_proxy_cert_and_key_match_config(
     certificate_key_pair_matches(cert_pem, key_pem)
 }
 
-pub(crate) fn apiservice_proxy_cert_and_key_match_config(cert_pem: &str, key_pem: &str) -> bool {
+pub fn apiservice_proxy_cert_and_key_match_config(cert_pem: &str, key_pem: &str) -> bool {
     let der = match first_pem_cert_der(cert_pem) {
         Some(der) => der,
         None => return false,
@@ -436,7 +458,7 @@ fn certificate_subject_public_key_info_der(cert_pem: &str) -> Option<Vec<u8>> {
     })
 }
 
-pub(crate) fn parse_certificate_extended_key_usage(cert_pem: &str) -> Option<(bool, bool)> {
+pub fn parse_certificate_extended_key_usage(cert_pem: &str) -> Option<(bool, bool)> {
     use x509_parser::prelude::*;
     with_parsed_certificate(cert_pem, |cert| {
         cert.extensions().iter().find_map(|ext| {
@@ -515,7 +537,7 @@ fn server_cert_san_types(
     sans
 }
 
-pub(crate) fn server_cert_matches_config(
+pub fn server_cert_matches_config(
     cert_pem: &str,
     service_cidr: &str,
     pod_subnet: &str,

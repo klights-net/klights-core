@@ -162,7 +162,7 @@ async fn resolve_csr_via_rpc(
             .get(..12)
             .ok_or_else(|| anyhow!("ca_key_nonce must be 12 bytes"))?;
         let nonce: [u8; 12] = nonce_slice.try_into().unwrap();
-        let ca_key_bytes = crate::auth::ca_transport::decrypt_ca_key(
+        let ca_key_bytes = klights_auth::ca_transport::decrypt_ca_key(
             &token_value,
             &response.encrypted_ca_key,
             &nonce,
@@ -180,7 +180,7 @@ async fn resolve_csr_via_rpc(
             .get(..12)
             .ok_or_else(|| anyhow!("service_account_signing_key_nonce must be 12 bytes"))?;
         let nonce: [u8; 12] = nonce_slice.try_into().unwrap();
-        let service_account_signing_key_bytes = crate::auth::ca_transport::decrypt_ca_key(
+        let service_account_signing_key_bytes = klights_auth::ca_transport::decrypt_ca_key(
             &token_value,
             &response.encrypted_service_account_signing_key,
             &nonce,
@@ -305,11 +305,11 @@ async fn controlplane_rpc_client_identity_for_token(
 }
 
 async fn ensure_local_node_client_certificate(cfg: &ConfigPhase) -> Result<()> {
-    use crate::auth::csr_signer::CsrSigner;
     use crate::bootstrap::worker_identity::{
         AsyncWorkerCredentialStore, CredentialSource, SupervisedFilesystemWorkerCredentialStore,
         WorkerCredential, credential_has_group, resolve_credential_async,
     };
+    use klights_auth::csr_signer::CsrSigner;
 
     let etc_dir = std::path::Path::new(&cfg.etc_dir);
     let store = SupervisedFilesystemWorkerCredentialStore::new(
@@ -331,7 +331,7 @@ async fn ensure_local_node_client_certificate(cfg: &ConfigPhase) -> Result<()> {
             .run_blocking("check-controlplane-client-certificate-group", move || {
                 credential_has_group(
                     &credential_for_group_check,
-                    crate::auth::CONTROLPLANE_NODES_GROUP,
+                    klights_auth::cert::CONTROLPLANE_NODES_GROUP,
                 )
             })
             .await
@@ -375,22 +375,23 @@ async fn ensure_local_node_client_certificate(cfg: &ConfigPhase) -> Result<()> {
         .run_blocking(
             "issue-local-controlplane-client-certificate",
             move || -> Result<_> {
-                let csr = crate::auth::kubelet_client_cert::generate_kubelet_client_csr(&node_name)
-                    .context("failed to generate local node client CSR")?;
-                let signer = crate::auth::csr_signer::CaCsrSigner::new(
+                let csr =
+                    klights_auth::kubelet_client_cert::generate_kubelet_client_csr(&node_name)
+                        .context("failed to generate local node client CSR")?;
+                let signer = klights_auth::csr_signer::CaCsrSigner::new(
                     ca_cert_pem,
                     ca_key_pem,
-                    std::sync::Arc::new(crate::auth::clock::SystemClock),
+                    std::sync::Arc::new(klights_auth::clock::SystemClock),
                 );
                 let signed = signer
-                    .sign(crate::auth::csr_signer::SignRequest {
+                    .sign(klights_auth::csr_signer::SignRequest {
                         csr_pem: csr.csr_pem.clone(),
                         common_name: format!("system:node:{node_name}"),
                         // Control-plane nodes carry the authorization group
                         // required for raft consensus RPCs.
                         organizations: vec![
-                            crate::auth::NODES_GROUP.to_string(),
-                            crate::auth::CONTROLPLANE_NODES_GROUP.to_string(),
+                            klights_auth::cert::NODES_GROUP.to_string(),
+                            klights_auth::cert::CONTROLPLANE_NODES_GROUP.to_string(),
                         ],
                         usages: vec!["client auth".to_string()],
                         ttl_seconds: 31_536_000,
@@ -661,9 +662,14 @@ mod tests {
                 .await
                 .unwrap();
 
-        let (ca_cert, ca_key, ca_cert_pem, ca_key_pem) = crate::auth::generate_ca_full().unwrap();
-        let (server_cert_pem, server_key_pem) =
-            crate::auth::generate_server_cert(&ca_cert, &ca_key).unwrap();
+        let (ca_cert, ca_key, ca_cert_pem, ca_key_pem) =
+            klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+        let (server_cert_pem, server_key_pem) = klights_auth::cert::generate_server_cert_at(
+            &ca_cert,
+            &ca_key,
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
         drop((ca_cert, ca_key));
         let leader_etc_dir = leader_data_root.join("etc");
         let leader_ca_cert_path = leader_etc_dir.join("ca.crt");

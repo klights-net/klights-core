@@ -38,7 +38,7 @@ async fn list_node_metrics(
             .await?;
     let builder =
         MetricsObjectBuilder::new(klights_cluster_core::k8s_time::format_legacy_timestamp(
-            crate::auth::clock::chrono_utc(state.operational().clock.now()),
+            klights_auth::clock::chrono_utc(state.operational().clock.now()),
         ));
     let items: Vec<Value> = list
         .items()
@@ -86,7 +86,7 @@ async fn get_node_metrics(
     })?;
     let builder =
         MetricsObjectBuilder::new(klights_cluster_core::k8s_time::format_legacy_timestamp(
-            crate::auth::clock::chrono_utc(state.operational().clock.now()),
+            klights_auth::clock::chrono_utc(state.operational().clock.now()),
         ));
     Ok(Json(builder.node_metrics_object(&node.name, usage)))
 }
@@ -128,7 +128,7 @@ async fn list_pod_metrics_for_namespace(
     .await;
     let builder =
         MetricsObjectBuilder::new(klights_cluster_core::k8s_time::format_legacy_timestamp(
-            crate::auth::clock::chrono_utc(state.operational().clock.now()),
+            klights_auth::clock::chrono_utc(state.operational().clock.now()),
         ));
     let items: Vec<Value> = list
         .items
@@ -166,7 +166,7 @@ async fn get_pod_metrics(
     .await;
     let builder =
         MetricsObjectBuilder::new(klights_cluster_core::k8s_time::format_legacy_timestamp(
-            crate::auth::clock::chrono_utc(state.operational().clock.now()),
+            klights_auth::clock::chrono_utc(state.operational().clock.now()),
         ));
     let metric = PodMetric::from_resource(&pod, &snapshot).ok_or_else(|| {
         AppError::ServiceUnavailable(format!("PodMetrics \"{}\" is unavailable", pod.name))

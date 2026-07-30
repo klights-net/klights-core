@@ -125,7 +125,7 @@ async fn start_controlplane_leader_control_stream_if_needed(
             crate::api::pod_subresources::local_node_log_runtime::LocalNodeLogRuntime::new_with_pod_event_store(
                 crate::paths::pod_logs_root_path(&config.containerd_namespace),
                 task_supervisor.clone(),
-                std::sync::Arc::new(crate::auth::clock::SystemClock),
+                std::sync::Arc::new(klights_auth::clock::SystemClock),
                 crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(
                     pod_watch,
                 ),

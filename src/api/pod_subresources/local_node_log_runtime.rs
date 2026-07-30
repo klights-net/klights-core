@@ -30,7 +30,7 @@ const NODE_LOG_STREAM_FRAME_CHANNEL_CAPACITY: usize = 128;
 pub(crate) struct LocalNodeLogRuntime {
     pod_logs_root: PathBuf,
     task_supervisor: Arc<TaskSupervisor>,
-    clock: Arc<dyn crate::auth::clock::Clock>,
+    clock: Arc<dyn klights_auth::clock::Clock>,
     pod_log_follow_watch: Option<PodLogFollowWatchSource>,
 }
 
@@ -44,7 +44,7 @@ impl LocalNodeLogRuntime {
                 .join("logs")
                 .join("pods"),
             task_supervisor,
-            clock: Arc::new(crate::auth::clock::SystemClock),
+            clock: Arc::new(klights_auth::clock::SystemClock),
             pod_log_follow_watch: None,
         }
     }
@@ -52,7 +52,7 @@ impl LocalNodeLogRuntime {
     pub(crate) fn new_with_pod_event_store(
         pod_logs_root: PathBuf,
         task_supervisor: Arc<TaskSupervisor>,
-        clock: Arc<dyn crate::auth::clock::Clock>,
+        clock: Arc<dyn klights_auth::clock::Clock>,
         pod_log_follow_watch: PodLogFollowWatchSource,
     ) -> Self {
         Self {

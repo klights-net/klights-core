@@ -99,7 +99,8 @@ async fn grpc_test_server_with_signing_ca(
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
-    let (ca_cert, ca_key, ca_cert_pem, ca_key_pem) = crate::auth::generate_ca_full().unwrap();
+    let (ca_cert, ca_key, ca_cert_pem, ca_key_pem) =
+        klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
     let etc = std::path::Path::new(namespace).join("etc");
     let ca_cert_path = etc.join("ca.crt");
     let ca_key_path = etc.join("ca.key");
@@ -2949,7 +2950,7 @@ async fn sign_controlplane_csr_sends_private_key_material_to_cp_and_replica() {
         let data_root = tempfile::tempdir().unwrap();
         let namespace = data_root.path().to_string_lossy().to_string();
         let grpc = grpc_test_server_with_signing_ca(db, &namespace).await;
-        let (_, csr_pem) = crate::auth::generate_server_csr(
+        let (_, csr_pem) = klights_auth::cert::generate_server_csr(
             "10.43.0.0/16",
             "10.50.4.0/24",
             Some("10.99.0.14"),
@@ -3018,7 +3019,7 @@ async fn sign_controlplane_csr_rejects_worker_node_cert_without_controlplane_tok
     let data_root = tempfile::tempdir().unwrap();
     let namespace = data_root.path().to_string_lossy().to_string();
     let grpc = grpc_test_server_with_signing_ca(db, &namespace).await;
-    let (_, csr_pem) = crate::auth::generate_server_csr(
+    let (_, csr_pem) = klights_auth::cert::generate_server_csr(
         "10.43.0.0/16",
         "10.50.4.0/24",
         Some("10.99.0.14"),

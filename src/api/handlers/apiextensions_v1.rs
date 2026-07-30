@@ -174,7 +174,7 @@ pub async fn delete_crd_with_deregistration(
         meta.insert(
             "deletionTimestamp".to_string(),
             serde_json::Value::String(klights_cluster_core::k8s_time::format_legacy_timestamp(
-                crate::auth::clock::chrono_utc(state.operational().clock.now()),
+                klights_auth::clock::chrono_utc(state.operational().clock.now()),
             )),
         );
     }
@@ -470,7 +470,7 @@ async fn create_crd_with_registration(
     // Register the CRD in the registry immediately (so API routes are ready)
     let body_with_status = add_crd_established_condition_at(
         body.clone(),
-        crate::auth::clock::chrono_utc(state.operational().clock.now()),
+        klights_auth::clock::chrono_utc(state.operational().clock.now()),
     );
     if let Err(e) = crate::api::discovery::register_crd_from_value(
         &state.discovery().crd_registry,
@@ -731,7 +731,7 @@ async fn patch_crd_with_registration(
 
             let body_with_status = add_crd_established_condition_at(
                 admitted,
-                crate::auth::clock::chrono_utc(state.operational().clock.now()),
+                klights_auth::clock::chrono_utc(state.operational().clock.now()),
             );
             if let Err(e) = crate::api::discovery::register_crd_from_value(
                 &state.discovery().crd_registry,

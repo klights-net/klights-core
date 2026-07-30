@@ -513,13 +513,15 @@ mod tests {
             std::fs::create_dir_all(&etc_dir).expect("create namespace runtime etc directory");
 
             let (ca_cert, ca_key, ca_pem, ca_key_pem) =
-                crate::auth::generate_ca_full().expect("generate namespace fixture CA");
-            let (proxy_cert_pem, proxy_key_pem) = crate::auth::generate_apiservice_proxy_cert(
-                &ca_cert,
-                &ca_key,
-                time::OffsetDateTime::now_utc(),
-            )
-            .expect("generate APIService proxy client identity");
+                klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc())
+                    .expect("generate namespace fixture CA");
+            let (proxy_cert_pem, proxy_key_pem) =
+                klights_auth::cert::generate_apiservice_proxy_cert(
+                    &ca_cert,
+                    &ca_key,
+                    time::OffsetDateTime::now_utc(),
+                )
+                .expect("generate APIService proxy client identity");
             let ca_cert_path = etc_dir.join("ca.crt");
             std::fs::write(&ca_cert_path, &ca_pem).expect("write namespace fixture CA");
             std::fs::write(etc_dir.join("ca.key"), ca_key_pem)
@@ -529,7 +531,7 @@ mod tests {
             std::fs::write(etc_dir.join("apiservice-proxy.key"), &proxy_key_pem)
                 .expect("write APIService proxy client key");
             assert!(
-                crate::auth::cert::apiservice_proxy_cert_and_key_match_config(
+                klights_auth::cert::apiservice_proxy_cert_and_key_match_config(
                     &proxy_cert_pem,
                     &proxy_key_pem,
                 ),
@@ -540,7 +542,7 @@ mod tests {
                 .next()
                 .expect("APIService proxy certificate PEM block")
                 .expect("parse APIService proxy certificate");
-            let proxy_user = crate::auth::user_from_cert(proxy_cert_der.as_ref())
+            let proxy_user = klights_auth::user::user_from_cert(proxy_cert_der.as_ref())
                 .expect("read APIService proxy certificate identity");
 
             Self {

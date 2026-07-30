@@ -11,13 +11,13 @@ use klights_auth::{AuthenticationError, ImpersonationError};
 use klights_types::TlsClientCertificate;
 
 use super::{ApiState, AppError};
-use crate::auth::clock::SnapshotClock;
 use crate::auth::middleware::{
     AuthnRuntime, BoundTokenSubjectLookup, ServiceAccountSigningKeyProvider,
     authenticate_forwarded_client_cert, authenticate_parts, client_cert_is_trusted_proxy,
     resolve_request_identity,
 };
 use klights_auth::AuthenticatedIdentity;
+use klights_auth::clock::SnapshotClock;
 use klights_auth::impersonation::ImpersonationRequest;
 
 pub const FORWARDED_CLIENT_CERT_HEADER: &str = "x-remote-client-certificate";
@@ -266,7 +266,7 @@ pub(in crate::api) async fn authorize_request(
         .authorizer
         .authorize(&identity, &authorization)
         .await;
-    let operation_now = crate::auth::clock::chrono_utc(state.operational().clock.now());
+    let operation_now = klights_auth::clock::chrono_utc(state.operational().clock.now());
     auth_policy
         .audit_sink
         .record(crate::audit::AuditEvent::authorization(

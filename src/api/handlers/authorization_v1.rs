@@ -144,7 +144,7 @@ pub(crate) async fn create_self_subject_access_review(
         "kind": "SelfSubjectAccessReview",
         "metadata": {
             "creationTimestamp": klights_cluster_core::k8s_time::format_time(
-                crate::auth::clock::chrono_utc(state.operational().clock.now())
+                klights_auth::clock::chrono_utc(state.operational().clock.now())
             )
         },
         "spec": spec,
@@ -215,7 +215,7 @@ pub(crate) async fn create_subject_access_review(
         "kind": "SubjectAccessReview",
         "metadata": {
             "creationTimestamp": klights_cluster_core::k8s_time::format_time(
-                crate::auth::clock::chrono_utc(state.operational().clock.now())
+                klights_auth::clock::chrono_utc(state.operational().clock.now())
             )
         },
         "spec": spec,
@@ -274,7 +274,7 @@ pub(crate) async fn create_self_subject_rules_review(
         "kind": "SelfSubjectRulesReview",
         "metadata": {
             "creationTimestamp": klights_cluster_core::k8s_time::format_time(
-                crate::auth::clock::chrono_utc(state.operational().clock.now())
+                klights_auth::clock::chrono_utc(state.operational().clock.now())
             )
         },
         "spec": spec,
@@ -349,7 +349,7 @@ pub(crate) async fn create_local_subject_access_review(
         "kind": "LocalSubjectAccessReview",
         "metadata": {
             "creationTimestamp": klights_cluster_core::k8s_time::format_time(
-                crate::auth::clock::chrono_utc(state.operational().clock.now())
+                klights_auth::clock::chrono_utc(state.operational().clock.now())
             ),
             "namespace": namespace
         },

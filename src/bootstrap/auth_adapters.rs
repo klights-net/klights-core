@@ -63,17 +63,17 @@ const RBAC_API_VERSION: &str = "rbac.authorization.k8s.io/v1";
 /// Root adapter joining auth-owned CSR policy, key signing, and wall-clock
 /// capabilities behind the controller-owned issuance port.
 pub(crate) struct AuthCsrIssuer {
-    policy: crate::auth::csr_signer::KubeletCredentialPolicy,
+    policy: klights_auth::csr_signer::KubeletCredentialPolicy,
 }
 
 impl AuthCsrIssuer {
     pub(crate) fn new(
-        signer: Arc<dyn crate::auth::csr_signer::CsrSigner>,
-        clock: Arc<dyn crate::auth::clock::Clock>,
+        signer: Arc<dyn klights_auth::csr_signer::CsrSigner>,
+        clock: Arc<dyn klights_auth::clock::Clock>,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
         Self {
-            policy: crate::auth::csr_signer::KubeletCredentialPolicy::new(
+            policy: klights_auth::csr_signer::KubeletCredentialPolicy::new(
                 signer, clock, supervisor,
             ),
         }
@@ -127,13 +127,13 @@ impl CsrIssuer for AuthCsrIssuer {
 }
 
 pub(crate) struct AuthReplicationPeerAuthenticator {
-    policy: crate::auth::csr_signer::PeerCertificatePolicy,
+    policy: klights_auth::csr_signer::PeerCertificatePolicy,
 }
 
 impl AuthReplicationPeerAuthenticator {
     pub(crate) fn new(supervisor: Arc<klights_supervisor::TaskSupervisor>) -> Self {
         Self {
-            policy: crate::auth::csr_signer::PeerCertificatePolicy::new(supervisor),
+            policy: klights_auth::csr_signer::PeerCertificatePolicy::new(supervisor),
         }
     }
 }
@@ -167,16 +167,16 @@ impl ReplicationPeerAuthenticator for AuthReplicationPeerAuthenticator {
 }
 
 pub(crate) struct AuthControlplaneCredentialIssuer {
-    policy: crate::auth::csr_signer::ControlplaneCredentialPolicy,
+    policy: klights_auth::csr_signer::ControlplaneCredentialPolicy,
 }
 
 impl AuthControlplaneCredentialIssuer {
     pub(crate) fn new(
-        clock: Arc<dyn crate::auth::clock::Clock>,
+        clock: Arc<dyn klights_auth::clock::Clock>,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
         Self {
-            policy: crate::auth::csr_signer::ControlplaneCredentialPolicy::new(clock, supervisor),
+            policy: klights_auth::csr_signer::ControlplaneCredentialPolicy::new(clock, supervisor),
         }
     }
 }

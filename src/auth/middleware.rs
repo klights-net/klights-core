@@ -3,8 +3,8 @@
 //! The API layer extracts HTTP credentials and adapts failures. This module
 //! consumes only focused authentication capabilities and scalar policy input.
 
-use crate::auth::clock::Clock;
 use klights_auth::AuthenticatedIdentity;
+use klights_auth::clock::Clock;
 use klights_auth::{AuthenticationError, validate_bound_object_uid};
 use klights_supervisor::{TaskCategory, TaskSupervisor};
 use klights_types::TlsClientCertificate;
@@ -94,7 +94,7 @@ pub(crate) async fn authenticate_parts(
             .run_blocking(
                 TaskCategory::Others,
                 "authenticate-client-certificate",
-                move || crate::auth::user_from_cert(&cert.0),
+                move || klights_auth::user::user_from_cert(&cert.0),
             )
             .await
             .map_err(|error| {
@@ -545,7 +545,7 @@ pub(crate) async fn authenticate_forwarded_client_cert(
         .run_blocking(
             TaskCategory::Others,
             "authenticate-forwarded-client-certificate",
-            move || crate::auth::verify_client_cert_signed_by_ca(&cert_der, &ca_pem),
+            move || klights_auth::user::verify_client_cert_signed_by_ca(&cert_der, &ca_pem),
         )
         .await
         .map_err(|error| {
@@ -578,7 +578,7 @@ pub(crate) async fn client_cert_is_trusted_proxy(
         .run_blocking(
             TaskCategory::Others,
             "classify-api-proxy-certificate",
-            move || crate::auth::user_from_cert(&cert.0),
+            move || klights_auth::user::user_from_cert(&cert.0),
         )
         .await
         .map_err(|error| {
@@ -597,7 +597,7 @@ pub(crate) async fn client_cert_is_trusted_proxy(
 fn is_trusted_api_proxy_identity(identity: &AuthenticatedIdentity) -> bool {
     let Some(node_name) = identity
         .username
-        .strip_prefix(crate::auth::API_PROXY_COMMON_NAME_PREFIX)
+        .strip_prefix(klights_auth::cert::API_PROXY_COMMON_NAME_PREFIX)
     else {
         return false;
     };
@@ -615,10 +615,10 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::auth::clock::{FixedClock, SystemMonotonicClock};
     use crate::auth::webhook_auth::{
         TokenReviewStatus, TokenReviewUser, WebhookAuth, WebhookTokenReviewer,
     };
+    use klights_auth::clock::{FixedClock, SystemMonotonicClock};
 
     struct RejectBootstrap;
     struct AcceptBootstrap;
@@ -740,7 +740,9 @@ mod tests {
 
     #[tokio::test]
     async fn service_account_authentication_uses_injected_signer_without_host_state() {
-        let signing_key = crate::auth::generate_ca_full().unwrap().3;
+        let signing_key = klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc())
+            .unwrap()
+            .3;
         let token = crate::auth::generate_sa_token_with_sa_uid(
             &signing_key,
             "default",
@@ -763,7 +765,7 @@ mod tests {
             &subjects,
             None,
             None,
-            &crate::auth::clock::SystemClock,
+            &klights_auth::clock::SystemClock,
             &supervisor,
             false,
         );
@@ -1017,8 +1019,14 @@ mod tests {
 
     #[tokio::test]
     async fn forwarded_cert_requires_explicit_cluster_ca() {
-        let (ca_cert, ca_key, _, _) = crate::auth::generate_ca_full().unwrap();
-        let (admin_pem, _) = crate::auth::generate_admin_cert(&ca_cert, &ca_key).unwrap();
+        let (ca_cert, ca_key, _, _) =
+            klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+        let (admin_pem, _) = klights_auth::cert::generate_admin_cert_at(
+            &ca_cert,
+            &ca_key,
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
         let der = pem_to_der(&admin_pem);
         let supervisor = TaskSupervisor::new(Default::default());
         assert!(
@@ -1030,8 +1038,14 @@ mod tests {
 
     #[tokio::test]
     async fn forwarded_admin_cert_preserves_system_masters() {
-        let (ca_cert, ca_key, ca_pem, _) = crate::auth::generate_ca_full().unwrap();
-        let (admin_pem, _) = crate::auth::generate_admin_cert(&ca_cert, &ca_key).unwrap();
+        let (ca_cert, ca_key, ca_pem, _) =
+            klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+        let (admin_pem, _) = klights_auth::cert::generate_admin_cert_at(
+            &ca_cert,
+            &ca_key,
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
         let supervisor = TaskSupervisor::new(Default::default());
         let identity =
             authenticate_forwarded_client_cert(Some(&ca_pem), &pem_to_der(&admin_pem), &supervisor)
@@ -1048,8 +1062,9 @@ mod tests {
 
     #[tokio::test]
     async fn only_internal_proxy_certificate_can_delegate() {
-        let (ca_cert, ca_key, _, _) = crate::auth::generate_ca_full().unwrap();
-        let (proxy_pem, _) = crate::auth::cert::generate_api_proxy_cert(
+        let (ca_cert, ca_key, _, _) =
+            klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+        let (proxy_pem, _) = klights_auth::cert::generate_api_proxy_cert(
             &ca_cert,
             &ca_key,
             "cp1",
@@ -1064,7 +1079,12 @@ mod tests {
                 .unwrap()
         );
 
-        let (admin_pem, _) = crate::auth::generate_admin_cert(&ca_cert, &ca_key).unwrap();
+        let (admin_pem, _) = klights_auth::cert::generate_admin_cert_at(
+            &ca_cert,
+            &ca_key,
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
         let admin = TlsClientCertificate(pem_to_der(&admin_pem));
         assert!(
             !client_cert_is_trusted_proxy(Some(&admin), &supervisor)
@@ -1081,7 +1101,7 @@ mod tests {
     #[test]
     fn proxy_with_system_masters_cannot_delegate() {
         let elevated_proxy = AuthenticatedIdentity::client_cert(
-            crate::auth::cert::api_proxy_common_name("cp1"),
+            klights_auth::cert::api_proxy_common_name("cp1"),
             vec!["system:masters".to_string()],
         );
         assert!(!is_trusted_api_proxy_identity(&elevated_proxy));

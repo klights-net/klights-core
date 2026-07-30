@@ -1,7 +1,10 @@
 use std::time::Instant;
 use time::OffsetDateTime;
 
-pub use klights_auth::Clock;
+/// Object-safe wall-clock input for authentication policy.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> OffsetDateTime;
+}
 
 pub fn chrono_utc(now: OffsetDateTime) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::from(std::time::SystemTime::from(now))
@@ -20,12 +23,12 @@ impl Clock for SystemClock {
 ///
 /// Policy code can pass this through interfaces that accept [`Clock`] while
 /// guaranteeing every read in that operation observes the same instant.
-pub(crate) struct SnapshotClock {
+pub struct SnapshotClock {
     now: OffsetDateTime,
 }
 
 impl SnapshotClock {
-    pub(crate) fn new(now: OffsetDateTime) -> Self {
+    pub fn new(now: OffsetDateTime) -> Self {
         Self { now }
     }
 }
@@ -50,13 +53,11 @@ impl MonotonicClock for SystemMonotonicClock {
     }
 }
 
-/// Fixed clock for mock-backed auth tests.
-#[cfg(test)]
+/// Fixed clock for deterministic auth-policy tests and fakes.
 pub struct FixedClock {
     pub now: OffsetDateTime,
 }
 
-#[cfg(test)]
 impl Clock for FixedClock {
     fn now(&self) -> OffsetDateTime {
         self.now

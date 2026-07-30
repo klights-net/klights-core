@@ -44,7 +44,8 @@ fn generate_apiservice_ca_signed_identity(
     use base64::Engine;
     use rcgen::CertificateParams;
 
-    let (ca_cert, ca_key, ca_pem, _) = crate::auth::generate_ca_full().unwrap();
+    let (ca_cert, ca_key, ca_pem, _) =
+        klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
     let cert_params =
         CertificateParams::new(apiservice_service_dns_names(service, namespace)).unwrap();
     let key_pair = rcgen::KeyPair::generate().unwrap();
@@ -4407,7 +4408,9 @@ async fn test_tokenreview_unauthenticated_response_supports_protobuf() {
     let mut config = crate::KlightsConfig::test_default();
     config.containerd_namespace = namespace.clone();
     state.operational_mut().config = crate::api::ApiOperationalConfig::from_test(config);
-    let signing_key = crate::auth::generate_ca_full().unwrap().3;
+    let signing_key = klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc())
+        .unwrap()
+        .3;
     let signing_key_path = api_test_data_root(&namespace)
         .join("etc")
         .join("service-account-signing.key");
@@ -4718,7 +4721,7 @@ async fn test_tokenreview_uses_webhook_authenticator_for_opaque_tokens() {
         Duration::from_secs(60),
         Duration::from_secs(10),
         vec!["https://kubernetes.default.svc.cluster.local".to_string()],
-        Arc::new(crate::auth::clock::SystemMonotonicClock),
+        Arc::new(klights_auth::clock::SystemMonotonicClock),
     )));
     let app = crate::api::build_router(state);
 
@@ -5242,7 +5245,9 @@ async fn test_tokenreview_reports_oidc_internal_failure_in_status() {
     let mut config = crate::KlightsConfig::test_default();
     config.containerd_namespace = namespace.clone();
     state.operational_mut().config = crate::api::ApiOperationalConfig::from_test(config);
-    let signing_key = crate::auth::generate_ca_full().unwrap().3;
+    let signing_key = klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc())
+        .unwrap()
+        .3;
     let signing_key_path = api_test_data_root(&namespace)
         .join("etc")
         .join("service-account-signing.key");

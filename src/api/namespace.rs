@@ -233,7 +233,7 @@ pub(in crate::api) async fn create_namespace(
                 meta_obj.insert(
                     "creationTimestamp".to_string(),
                     serde_json::Value::String(klights_cluster_core::k8s_time::format_time(
-                        crate::auth::clock::chrono_utc(state.operational().clock.now()),
+                        klights_auth::clock::chrono_utc(state.operational().clock.now()),
                     )),
                 );
             }
@@ -442,7 +442,7 @@ pub(in crate::api) async fn finalize_namespace(
                 &resource.name,
                 &uid,
                 &state.controller_reconcile().metrics,
-                crate::auth::clock::chrono_utc(state.operational().clock.now()),
+                klights_auth::clock::chrono_utc(state.operational().clock.now()),
             )
             .await;
             let need_retry = match &outcome {
@@ -583,7 +583,7 @@ pub(in crate::api) async fn delete_namespace(
         ));
     }
 
-    let operation_now = crate::auth::clock::chrono_utc(state.operational().clock.now());
+    let operation_now = klights_auth::clock::chrono_utc(state.operational().clock.now());
     let mut terminating: Value = (*current.data).clone();
     set_namespace_terminating_status_at(&mut terminating, false, operation_now);
     let updated = crate::api::resource_command_ports::update_namespace(

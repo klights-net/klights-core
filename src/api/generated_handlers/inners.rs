@@ -282,7 +282,7 @@ pub(in crate::api) async fn delete_collection_listed_resource_inner(
     let delete_strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
         resource_query: state.resource_mutation().resource_query.as_ref(),
         lifecycle: state.resource_mutation().finalizer_lifecycle.as_ref(),
-        operation_now: crate::auth::clock::chrono_utc(state.operational().clock.now()),
+        operation_now: klights_auth::clock::chrono_utc(state.operational().clock.now()),
     };
     let target_identity = klights_types::ResourceKey::new(
         api_version,
@@ -874,7 +874,7 @@ impl<'a> CreateStrategy for BuiltinCreateStrategy<'a> {
             )));
         }
 
-        let operation_now = crate::auth::clock::chrono_utc(self.state.operational().clock.now());
+        let operation_now = klights_auth::clock::chrono_utc(self.state.operational().clock.now());
         crate::api::mutation::write::prepare_create_metadata(
             ns,
             &mut body,
@@ -1156,7 +1156,7 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
         );
         let apply_force = self.query.force.unwrap_or(false);
         let is_dry_run = dry_run.is_all();
-        let operation_now = crate::auth::clock::chrono_utc(self.state.operational().clock.now());
+        let operation_now = klights_auth::clock::chrono_utc(self.state.operational().clock.now());
         let api_version = self.target.api_version;
         let kind = self.target.kind;
         let ns = self.target.namespace;
@@ -1827,7 +1827,7 @@ pub(in crate::api) async fn delete_inner(
         let mut del_data: Value = (*resource.data).clone();
         set_deletion_timestamp_at(
             &mut del_data,
-            crate::auth::clock::chrono_utc(state.operational().clock.now()),
+            klights_auth::clock::chrono_utc(state.operational().clock.now()),
         );
         let result =
             crate::api::mutation::response::persisted_object(del_data, resource.resource_version);
@@ -1839,7 +1839,7 @@ pub(in crate::api) async fn delete_inner(
     let delete_strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
         resource_query: state.resource_mutation().resource_query.as_ref(),
         lifecycle: state.resource_mutation().finalizer_lifecycle.as_ref(),
-        operation_now: crate::auth::clock::chrono_utc(state.operational().clock.now()),
+        operation_now: klights_auth::clock::chrono_utc(state.operational().clock.now()),
     };
     let outcome = crate::api::mutation::delete::delete_loaded_with_strategy(
         &delete_strategy,
@@ -2138,7 +2138,7 @@ pub(in crate::api) async fn delete_collection_shared_inner(
     let delete_strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
         resource_query: state.resource_mutation().resource_query.as_ref(),
         lifecycle: state.resource_mutation().finalizer_lifecycle.as_ref(),
-        operation_now: crate::auth::clock::chrono_utc(state.operational().clock.now()),
+        operation_now: klights_auth::clock::chrono_utc(state.operational().clock.now()),
     };
 
     for resource in list.into_items() {
@@ -2328,10 +2328,10 @@ mod tests {
     #[tokio::test]
     async fn create_certificate_signing_request_dispatches_csr_signer() {
         let mut state = crate::api::test_support::build_test_app_state().await;
-        let signer = Arc::new(crate::auth::csr_signer::RecordingCsrSigner::new());
+        let signer = Arc::new(klights_auth::csr_signer::RecordingCsrSigner::new());
         let issuer = Arc::new(crate::bootstrap::auth_adapters::AuthCsrIssuer::new(
             signer.clone(),
-            Arc::new(crate::auth::clock::SystemClock),
+            Arc::new(klights_auth::clock::SystemClock),
             state.operational().task_supervisor.clone(),
         ));
         let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new_with_nodeport(

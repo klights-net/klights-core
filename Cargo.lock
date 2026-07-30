@@ -2110,18 +2110,25 @@ version = "0.0.0"
 name = "klights-auth"
 version = "0.0.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "async-trait",
+ "chrono",
  "jsonwebtoken",
+ "klights-supervisor",
  "klights-types",
  "rand_core 0.6.4",
+ "rcgen",
  "rsa",
+ "rustls-pemfile 2.2.0",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "time",
  "tokio",
  "tracing",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]

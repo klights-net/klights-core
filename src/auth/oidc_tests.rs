@@ -167,7 +167,7 @@ fn valid_claims() -> serde_json::Value {
 
 #[tokio::test]
 async fn oidc_dependency_failure_is_not_a_credential_rejection() {
-    let clock = crate::auth::clock::FixedClock {
+    let clock = klights_auth::clock::FixedClock {
         now: OffsetDateTime::UNIX_EPOCH,
     };
     let error = try_oidc_auth(
@@ -444,7 +444,7 @@ fn test_prepare_oidc_config_rejects_missing_client_id() {
 
 #[tokio::test]
 async fn test_try_oidc_auth_no_authenticator_returns_none() {
-    let clock = crate::auth::clock::FixedClock {
+    let clock = klights_auth::clock::FixedClock {
         now: OffsetDateTime::UNIX_EPOCH,
     };
     let result = try_oidc_auth(None, "some-token", &clock).await;
@@ -459,7 +459,7 @@ async fn test_try_oidc_auth_success_returns_identity() {
         uid: Some("uid-42".to_string()),
         audiences: vec!["client-id".to_string()],
     })));
-    let clock = crate::auth::clock::FixedClock {
+    let clock = klights_auth::clock::FixedClock {
         now: OffsetDateTime::UNIX_EPOCH,
     };
     let result = try_oidc_auth(Some(validator.as_ref()), "valid-oidc-token", &clock).await;
@@ -480,7 +480,7 @@ async fn test_try_oidc_auth_failure_returns_error() {
     let validator: Arc<dyn OidcValidator> = Arc::new(MockOidcValidator::new(Err(
         klights_auth::AuthenticationError::unauthenticated("invalid signature"),
     )));
-    let clock = crate::auth::clock::FixedClock {
+    let clock = klights_auth::clock::FixedClock {
         now: OffsetDateTime::UNIX_EPOCH,
     };
     let result = try_oidc_auth(Some(validator.as_ref()), "bad-token", &clock).await;

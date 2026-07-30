@@ -2,7 +2,7 @@
 //!
 //! Production signs with the cluster client CA. Tests use `RecordingCsrSigner`.
 
-use crate::auth::clock::Clock;
+use crate::clock::Clock;
 use klights_supervisor::{TaskCategory, TaskSupervisor};
 use std::sync::Arc;
 
@@ -24,10 +24,7 @@ pub struct SignResult {
 
 /// Object-safe CSR signer trait.
 pub trait CsrSigner: Send + Sync {
-    fn sign(
-        &self,
-        request: SignRequest,
-    ) -> Result<SignResult, klights_auth::CredentialOperationError>;
+    fn sign(&self, request: SignRequest) -> Result<SignResult, crate::CredentialOperationError>;
 }
 
 /// Auth-owned kubelet CSR policy. Validation, subject construction, TTL
@@ -53,9 +50,8 @@ impl KubeletCredentialPolicy {
 
     pub async fn issue(
         &self,
-        request: klights_auth::KubeletCertificateRequest,
-    ) -> Result<klights_auth::KubeletCertificateOutcome, klights_auth::CredentialOperationError>
-    {
+        request: crate::KubeletCertificateRequest,
+    ) -> Result<crate::KubeletCertificateOutcome, crate::CredentialOperationError> {
         let signer = self.signer.clone();
         let issued_at = self.clock.now();
         self.supervisor
@@ -63,8 +59,8 @@ impl KubeletCredentialPolicy {
                 TaskCategory::Others,
                 "issue-kubelet-client-certificate",
                 move || {
-                    let validation = crate::auth::csr_policy::validate_kubelet_client_csr_request(
-                        crate::auth::csr_policy::KubeletClientCsrValidationInput {
+                    let validation = crate::csr_policy::validate_kubelet_client_csr_request(
+                        crate::csr_policy::KubeletClientCsrValidationInput {
                             signer_name: &request.signer_name,
                             csr_pem: &request.csr_pem,
                             usages: &request.usages,
@@ -74,12 +70,12 @@ impl KubeletCredentialPolicy {
                         },
                     );
                     if !validation.valid {
-                        return Ok(klights_auth::KubeletCertificateOutcome::Rejected {
+                        return Ok(crate::KubeletCertificateOutcome::Rejected {
                             reason: validation.reason,
                         });
                     }
                     let node_name = validation.node_name.ok_or_else(|| {
-                        klights_auth::CredentialOperationError::internal_failure(
+                        crate::CredentialOperationError::internal_failure(
                             "CSR policy did not resolve a node identity",
                         )
                     })?;
@@ -90,7 +86,7 @@ impl KubeletCredentialPolicy {
                         usages: request.usages,
                         ttl_seconds: validation.ttl_seconds,
                     })?;
-                    Ok(klights_auth::KubeletCertificateOutcome::Issued {
+                    Ok(crate::KubeletCertificateOutcome::Issued {
                         node_name,
                         certificate_pem: signed.certificate_pem,
                         issued_at_unix_seconds: issued_at.unix_timestamp(),
@@ -99,7 +95,7 @@ impl KubeletCredentialPolicy {
             )
             .await
             .map_err(|error| {
-                klights_auth::CredentialOperationError::internal_failure(format!(
+                crate::CredentialOperationError::internal_failure(format!(
                     "supervised kubelet certificate issuance failed: {error}"
                 ))
             })?
@@ -118,14 +114,14 @@ impl PeerCertificatePolicy {
     pub async fn authenticate(
         &self,
         certificate: klights_types::TlsClientCertificate,
-    ) -> Result<klights_auth::PeerCertificateIdentity, klights_auth::AuthenticationError> {
+    ) -> Result<crate::PeerCertificateIdentity, crate::AuthenticationError> {
         self.supervisor
             .run_blocking(
                 TaskCategory::Others,
                 "authenticate-replication-peer",
                 move || {
-                    crate::auth::user_from_cert(&certificate.0).map(|user| {
-                        klights_auth::PeerCertificateIdentity {
+                    crate::user::user_from_cert(&certificate.0).map(|user| {
+                        crate::PeerCertificateIdentity {
                             username: user.username,
                             groups: user.groups,
                         }
@@ -134,11 +130,11 @@ impl PeerCertificatePolicy {
             )
             .await
             .map_err(|error| {
-                klights_auth::AuthenticationError::internal_failure(format!(
+                crate::AuthenticationError::internal_failure(format!(
                     "supervised peer authentication failed: {error}"
                 ))
             })?
-            .map_err(|error| klights_auth::AuthenticationError::unauthenticated(error.to_string()))
+            .map_err(|error| crate::AuthenticationError::unauthenticated(error.to_string()))
     }
 }
 
@@ -157,7 +153,7 @@ impl ControlplaneCredentialPolicy {
         ca_cert_pem: String,
         ca_key_pem: String,
         csr_pem: Vec<u8>,
-    ) -> Result<String, klights_auth::CredentialOperationError> {
+    ) -> Result<String, crate::CredentialOperationError> {
         let clock = self.clock.clone();
         self.supervisor
             .run_blocking(
@@ -177,7 +173,7 @@ impl ControlplaneCredentialPolicy {
             )
             .await
             .map_err(|error| {
-                klights_auth::CredentialOperationError::internal_failure(format!(
+                crate::CredentialOperationError::internal_failure(format!(
                     "supervised control-plane certificate issuance failed: {error}"
                 ))
             })?
@@ -187,24 +183,22 @@ impl ControlplaneCredentialPolicy {
         &self,
         join_token: String,
         plaintext: Vec<u8>,
-    ) -> Result<(Vec<u8>, Vec<u8>), klights_auth::CredentialOperationError> {
+    ) -> Result<(Vec<u8>, Vec<u8>), crate::CredentialOperationError> {
         self.supervisor
             .run_blocking(
                 TaskCategory::Others,
                 "encrypt-controlplane-key-material",
                 move || {
-                    crate::auth::ca_transport::encrypt_ca_key(&join_token, &plaintext)
+                    crate::ca_transport::encrypt_ca_key(&join_token, &plaintext)
                         .map(|(ciphertext, nonce)| (ciphertext, nonce.to_vec()))
                         .map_err(|error| {
-                            klights_auth::CredentialOperationError::internal_failure(
-                                error.to_string(),
-                            )
+                            crate::CredentialOperationError::internal_failure(error.to_string())
                         })
                 },
             )
             .await
             .map_err(|error| {
-                klights_auth::CredentialOperationError::internal_failure(format!(
+                crate::CredentialOperationError::internal_failure(format!(
                     "supervised control-plane key encryption failed: {error}"
                 ))
             })?
@@ -240,10 +234,7 @@ impl Default for RecordingCsrSigner {
 }
 
 impl CsrSigner for RecordingCsrSigner {
-    fn sign(
-        &self,
-        request: SignRequest,
-    ) -> Result<SignResult, klights_auth::CredentialOperationError> {
+    fn sign(&self, request: SignRequest) -> Result<SignResult, crate::CredentialOperationError> {
         self.requests.lock().unwrap().push(request);
         // Return a fake certificate
         Ok(SignResult {
@@ -274,22 +265,17 @@ impl CaCsrSigner {
 }
 
 impl CsrSigner for CaCsrSigner {
-    fn sign(
-        &self,
-        request: SignRequest,
-    ) -> Result<SignResult, klights_auth::CredentialOperationError> {
+    fn sign(&self, request: SignRequest) -> Result<SignResult, crate::CredentialOperationError> {
         use rcgen::{CertificateParams, DnType, KeyPair};
         use time::Duration;
 
         // Parse the CSR to extract the public key
         let csr_str = std::str::from_utf8(&request.csr_pem).map_err(|e| {
-            klights_auth::CredentialOperationError::rejected(format!("CSR is not valid UTF-8: {e}"))
+            crate::CredentialOperationError::rejected(format!("CSR is not valid UTF-8: {e}"))
         })?;
         let csr_params =
             rcgen::CertificateSigningRequestParams::from_pem(csr_str).map_err(|e| {
-                klights_auth::CredentialOperationError::rejected(format!(
-                    "failed to parse CSR PEM: {e}"
-                ))
+                crate::CredentialOperationError::rejected(format!("failed to parse CSR PEM: {e}"))
             })?;
 
         // Build certificate parameters from the request
@@ -339,7 +325,7 @@ impl CsrSigner for CaCsrSigner {
 
         // Parse CA key and build CA certificate for signing
         let ca_key = KeyPair::from_pem(&self.ca_key_pem).map_err(|e| {
-            klights_auth::CredentialOperationError::dependency_failure(format!(
+            crate::CredentialOperationError::dependency_failure(format!(
                 "failed to parse CA key: {e}"
             ))
         })?;
@@ -347,12 +333,12 @@ impl CsrSigner for CaCsrSigner {
         // Reconstruct CA CertificateParams from PEM, then self-sign to get a
         // Certificate object suitable for use as an issuer in signed_by.
         let ca_params = CertificateParams::from_ca_cert_pem(&self.ca_cert_pem).map_err(|e| {
-            klights_auth::CredentialOperationError::dependency_failure(format!(
+            crate::CredentialOperationError::dependency_failure(format!(
                 "failed to parse CA cert: {e}"
             ))
         })?;
         let ca_cert = ca_params.self_signed(&ca_key).map_err(|e| {
-            klights_auth::CredentialOperationError::dependency_failure(format!(
+            crate::CredentialOperationError::dependency_failure(format!(
                 "failed to reconstruct CA cert: {e}"
             ))
         })?;
@@ -361,7 +347,7 @@ impl CsrSigner for CaCsrSigner {
         let cert = params
             .signed_by(&csr_params.public_key, &ca_cert, &ca_key)
             .map_err(|e| {
-                klights_auth::CredentialOperationError::internal_failure(format!(
+                crate::CredentialOperationError::internal_failure(format!(
                     "failed to sign certificate: {e}"
                 ))
             })?;
@@ -379,7 +365,7 @@ mod tests {
     use x509_parser::prelude::FromDer;
 
     fn system_clock() -> Arc<dyn Clock> {
-        Arc::new(crate::auth::clock::SystemClock)
+        Arc::new(crate::clock::SystemClock)
     }
 
     #[test]
@@ -431,14 +417,14 @@ mod tests {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()));
         let policy = super::KubeletCredentialPolicy::new(
             signer.clone(),
-            Arc::new(crate::auth::clock::FixedClock {
+            Arc::new(crate::clock::FixedClock {
                 now: time::OffsetDateTime::UNIX_EPOCH,
             }),
             supervisor,
         );
         let csr_pem = generate_csr_pem("system:node:tokyo", &["system:nodes"]);
         let outcome = policy
-            .issue(klights_auth::KubeletCertificateRequest {
+            .issue(crate::KubeletCertificateRequest {
                 signer_name: "kubernetes.io/kube-apiserver-client-kubelet".into(),
                 csr_pem: csr_pem.clone(),
                 usages: vec!["client auth".into()],
@@ -453,7 +439,7 @@ mod tests {
             .expect("policy should run");
         assert!(matches!(
             outcome,
-            klights_auth::KubeletCertificateOutcome::Issued { .. }
+            crate::KubeletCertificateOutcome::Issued { .. }
         ));
         assert_eq!(
             signer.take_requests(),
@@ -627,7 +613,7 @@ mod tests {
         let signer = CaCsrSigner::new(
             ca_cert,
             ca_key,
-            std::sync::Arc::new(crate::auth::clock::FixedClock { now: fixed_now }),
+            std::sync::Arc::new(crate::clock::FixedClock { now: fixed_now }),
         );
 
         let result = signer

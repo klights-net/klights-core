@@ -678,10 +678,15 @@ mod tests {
 
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let (ca_cert, ca_key, ca_pem, _) = crate::auth::cert::generate_ca_full().unwrap();
-        let (server_cert_pem, server_key_pem) =
-            crate::auth::cert::generate_server_cert(&ca_cert, &ca_key).unwrap();
-        let (proxy_cert_pem, proxy_key_pem) = crate::auth::generate_api_proxy_cert(
+        let (ca_cert, ca_key, ca_pem, _) =
+            klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+        let (server_cert_pem, server_key_pem) = klights_auth::cert::generate_server_cert_at(
+            &ca_cert,
+            &ca_key,
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        let (proxy_cert_pem, proxy_key_pem) = klights_auth::cert::generate_api_proxy_cert(
             &ca_cert,
             &ca_key,
             "mn-controlplane2",
@@ -728,7 +733,11 @@ mod tests {
                 .1
                 .peer_certificates()
                 .and_then(|certs| certs.first())
-                .map(|cert| crate::auth::user_from_cert(cert.as_ref()).unwrap().username)
+                .map(|cert| {
+                    klights_auth::user::user_from_cert(cert.as_ref())
+                        .unwrap()
+                        .username
+                })
                 .unwrap_or_default();
             let _ = peer_tx.send(peer);
             let mut buf = [0u8; 1024];
@@ -761,9 +770,14 @@ mod tests {
 
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let (ca_cert, ca_key, ca_pem, _) = crate::auth::cert::generate_ca_full().unwrap();
-        let (server_cert_pem, server_key_pem) =
-            crate::auth::cert::generate_server_cert(&ca_cert, &ca_key).unwrap();
+        let (ca_cert, ca_key, ca_pem, _) =
+            klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+        let (server_cert_pem, server_key_pem) = klights_auth::cert::generate_server_cert_at(
+            &ca_cert,
+            &ca_key,
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
 
         let server_certs: Vec<rustls::pki_types::CertificateDer> =
             rustls_pemfile::certs(&mut server_cert_pem.as_bytes())

@@ -6,13 +6,6 @@
 //! - ServiceAccount JWT token generation
 //! - User identity extraction from client certificates
 
-pub use self::cert::{
-    API_PROXY_COMMON_NAME_PREFIX, APISERVICE_PROXY_GROUP, CONTROLPLANE_NODES_GROUP, NODES_GROUP,
-    api_proxy_common_name, generate_api_proxy_cert, generate_apiservice_proxy_cert,
-    generate_server_csr,
-};
-#[cfg(test)]
-pub use self::cert::{generate_admin_cert, generate_ca_full, generate_server_cert};
 #[cfg(test)]
 pub(crate) fn test_admin(username: impl Into<String>) -> klights_auth::AuthenticatedIdentity {
     klights_auth::AuthenticatedIdentity::client_cert(
@@ -37,7 +30,7 @@ pub fn decode_serviceaccount_token(
         token,
         ca_key_pem,
         requested_audiences,
-        &clock::SystemClock,
+        &klights_auth::clock::SystemClock,
     )
 }
 #[cfg(test)]
@@ -81,23 +74,14 @@ pub fn generate_sa_token_with_sa_uid(
 pub fn generate_sa_token_with_bound_pod(
     request: ServiceAccountTokenRequest<'_>,
 ) -> anyhow::Result<String> {
-    generate_sa_token_with_bound_pod_and_clock(request, &clock::SystemClock)
+    generate_sa_token_with_bound_pod_and_clock(request, &klights_auth::clock::SystemClock)
 }
-pub use self::user::user_from_cert;
-pub use self::user::verify_client_cert_signed_by_ca;
 
-pub mod ca_transport;
-pub(crate) mod cert;
-pub mod clock;
-pub mod csr_policy;
-pub mod csr_signer;
 mod kubeconfig;
-pub mod kubelet_client_cert;
 pub(crate) mod middleware;
 pub mod oidc;
 #[cfg(test)]
 mod oidc_tests;
-mod user;
 pub mod webhook_auth;
 #[cfg(test)]
 mod webhook_auth_tests;
@@ -109,9 +93,9 @@ mod object_safety_tests {
     #[test]
     fn every_substitutable_auth_port_is_object_safe() {
         assert_object_safe::<dyn klights_auth::authorizer::Authorizer>();
-        assert_object_safe::<dyn super::clock::Clock>();
-        assert_object_safe::<dyn super::clock::MonotonicClock>();
-        assert_object_safe::<dyn super::csr_signer::CsrSigner>();
+        assert_object_safe::<dyn klights_auth::clock::Clock>();
+        assert_object_safe::<dyn klights_auth::clock::MonotonicClock>();
+        assert_object_safe::<dyn klights_auth::csr_signer::CsrSigner>();
         assert_object_safe::<dyn super::middleware::BootstrapTokenAuthenticator>();
         assert_object_safe::<dyn super::middleware::BoundTokenSubjectLookup>();
         assert_object_safe::<dyn super::middleware::ServiceAccountSigningKeyProvider>();

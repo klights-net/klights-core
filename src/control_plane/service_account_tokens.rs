@@ -62,7 +62,7 @@ pub(crate) async fn authorize_projected_service_account_token(
 pub(crate) fn sign_authorized_projected_service_account_token(
     signing_key_pem: &str,
     claims: AuthorizedProjectedServiceAccountTokenClaims,
-    clock: &dyn crate::auth::clock::Clock,
+    clock: &dyn klights_auth::clock::Clock,
 ) -> Result<ProjectedServiceAccountToken, ProjectedServiceAccountTokenError> {
     let audience_refs: Vec<&str> = claims.audiences.iter().map(String::as_str).collect();
     let token = klights_auth::generate_sa_token_with_bound_pod_and_clock(
@@ -100,7 +100,7 @@ async fn issue_projected_service_account_token(
     sign_authorized_projected_service_account_token(
         signing_key_pem,
         claims,
-        &crate::auth::clock::SystemClock,
+        &klights_auth::clock::SystemClock,
     )
 }
 

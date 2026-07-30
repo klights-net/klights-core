@@ -236,7 +236,7 @@ fn build_test_server(
         ),
         Arc::new(
             crate::bootstrap::auth_adapters::AuthControlplaneCredentialIssuer::new(
-                Arc::new(crate::auth::clock::SystemClock),
+                Arc::new(klights_auth::clock::SystemClock),
                 supervisor,
             ),
         ),
@@ -441,7 +441,7 @@ fn mount_service_full_with_passive_reads(
         ),
         Arc::new(
             crate::bootstrap::auth_adapters::AuthControlplaneCredentialIssuer::new(
-                Arc::new(crate::auth::clock::SystemClock),
+                Arc::new(klights_auth::clock::SystemClock),
                 supervisor,
             ),
         ),

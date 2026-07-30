@@ -304,7 +304,7 @@ async fn compose_webhook_authenticator(
             std::time::Duration::from_secs(webhook_config.cache_authorized_ttl_secs),
             std::time::Duration::from_secs(webhook_config.cache_unauthorized_ttl_secs),
             webhook_config.audiences,
-            Arc::new(crate::auth::clock::SystemMonotonicClock),
+            Arc::new(klights_auth::clock::SystemMonotonicClock),
         ));
     Ok(Some(authenticator))
 }
@@ -447,16 +447,16 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             .await;
         match (cert_result, key_result) {
             (Ok(Ok(ca_cert)), Ok(Ok(ca_key))) => {
-                let signer: std::sync::Arc<dyn crate::auth::csr_signer::CsrSigner> =
-                    std::sync::Arc::new(crate::auth::csr_signer::CaCsrSigner::new(
+                let signer: std::sync::Arc<dyn klights_auth::csr_signer::CsrSigner> =
+                    std::sync::Arc::new(klights_auth::csr_signer::CaCsrSigner::new(
                         ca_cert,
                         ca_key,
-                        std::sync::Arc::new(crate::auth::clock::SystemClock),
+                        std::sync::Arc::new(klights_auth::clock::SystemClock),
                     ));
                 Some(
                     std::sync::Arc::new(crate::bootstrap::auth_adapters::AuthCsrIssuer::new(
                         signer,
-                        std::sync::Arc::new(crate::auth::clock::SystemClock),
+                        std::sync::Arc::new(klights_auth::clock::SystemClock),
                         supervisor.clone(),
                     ))
                         as std::sync::Arc<dyn crate::controllers::csr_signer::CsrIssuer>,
@@ -1081,7 +1081,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             api_role,
             api_replication,
             api_config,
-            Arc::new(crate::auth::clock::SystemClock),
+            Arc::new(klights_auth::clock::SystemClock),
             crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(
                 db_handle.clone(),
             ),
@@ -1771,7 +1771,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         config.anonymous_auth,
         api_runtime_inputs,
         crate::version::api_version_info(),
-        Arc::new(crate::auth::clock::SystemClock),
+        Arc::new(klights_auth::clock::SystemClock),
         crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(db_handle.clone()),
         supervisor.clone(),
         api_signing_keys,
@@ -1841,7 +1841,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 ),
                 Arc::new(
                     crate::bootstrap::auth_adapters::AuthControlplaneCredentialIssuer::new(
-                        Arc::new(crate::auth::clock::SystemClock),
+                        Arc::new(klights_auth::clock::SystemClock),
                         supervisor.clone(),
                     ),
                 ),

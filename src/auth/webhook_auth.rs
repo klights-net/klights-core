@@ -9,10 +9,10 @@
 //! - `HttpWebhookTokenReviewer` — production implementation using reqwest.
 //! - `WebhookAuth` — cached authenticator wrapping the reviewer.
 
-use crate::auth::clock::MonotonicClock;
 use anyhow::{Result, anyhow};
 use klights_auth::AuthenticatedIdentity;
 use klights_auth::AuthenticationError;
+use klights_auth::clock::MonotonicClock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};

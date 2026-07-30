@@ -12,18 +12,25 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+aes-gcm = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+chrono = { workspace = true }
 jsonwebtoken = { workspace = true }
+klights-supervisor = { workspace = true }
 klights-types = { workspace = true }
+rand_core = { workspace = true }
+rcgen = { workspace = true }
 rsa = { workspace = true }
+rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["std", "v4"] }
+x509-parser = { workspace = true }
 
 [dev-dependencies]
-rand_core = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }

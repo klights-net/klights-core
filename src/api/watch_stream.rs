@@ -698,7 +698,7 @@ pub struct LabelSelectorWatchStreamRequest<'a, S: WatchStreamSource> {
     pub stream_format: WatchStreamFormat,
     pub timeout_seconds: Option<u64>,
     pub emit_initial_state_for_resource_version_zero: bool,
-    pub wall_clock: Arc<dyn crate::auth::clock::Clock>,
+    pub wall_clock: Arc<dyn klights_auth::clock::Clock>,
 }
 
 pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
@@ -1056,7 +1056,7 @@ mod tests {
         reads: AtomicUsize,
     }
 
-    impl crate::auth::clock::Clock for AdvancingClock {
+    impl klights_auth::clock::Clock for AdvancingClock {
         fn now(&self) -> time::OffsetDateTime {
             let read = self.reads.fetch_add(1, Ordering::SeqCst);
             self.base + time::Duration::seconds(10 + 60 * read as i64)
@@ -1094,7 +1094,7 @@ mod tests {
         let base =
             time::OffsetDateTime::parse(creation, &time::format_description::well_known::Rfc3339)
                 .unwrap();
-        let wall_clock: Arc<dyn crate::auth::clock::Clock> = Arc::new(AdvancingClock {
+        let wall_clock: Arc<dyn klights_auth::clock::Clock> = Arc::new(AdvancingClock {
             base,
             reads: AtomicUsize::new(0),
         });
@@ -2017,7 +2017,7 @@ mod tests {
                 stream_format: WatchStreamFormat::Json,
                 timeout_seconds: None,
                 emit_initial_state_for_resource_version_zero: false,
-                wall_clock: Arc::new(crate::auth::clock::SystemClock),
+                wall_clock: Arc::new(klights_auth::clock::SystemClock),
             })
             .await;
 
@@ -2076,7 +2076,7 @@ mod tests {
                 stream_format: WatchStreamFormat::Json,
                 timeout_seconds: None,
                 emit_initial_state_for_resource_version_zero: false,
-                wall_clock: Arc::new(crate::auth::clock::SystemClock),
+                wall_clock: Arc::new(klights_auth::clock::SystemClock),
             })
             .await;
             let mut stream = body.into_data_stream();

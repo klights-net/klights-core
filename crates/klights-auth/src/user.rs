@@ -216,7 +216,7 @@ mod tests {
         let signer = CaCsrSigner::new(
             ca_cert_pem,
             ca_key_pem,
-            std::sync::Arc::new(crate::auth::clock::SystemClock),
+            std::sync::Arc::new(crate::clock::SystemClock),
         );
         let signed = signer
             .sign(SignRequest {

@@ -258,7 +258,7 @@ fn defaulted_config(mut config: OidcConfig) -> Option<OidcConfig> {
 pub async fn try_oidc_auth(
     authenticator: Option<&dyn OidcValidator>,
     token: &str,
-    clock: &dyn crate::auth::clock::Clock,
+    clock: &dyn klights_auth::clock::Clock,
 ) -> Option<Result<klights_auth::AuthenticatedIdentity, AuthenticationError>> {
     try_oidc_auth_with_audiences(authenticator, token, clock)
         .await
@@ -268,7 +268,7 @@ pub async fn try_oidc_auth(
 async fn try_oidc_auth_with_audiences(
     authenticator: Option<&dyn OidcValidator>,
     token: &str,
-    clock: &dyn crate::auth::clock::Clock,
+    clock: &dyn klights_auth::clock::Clock,
 ) -> Option<Result<(klights_auth::AuthenticatedIdentity, Vec<String>), AuthenticationError>> {
     let authenticator = authenticator?;
     let now = clock.now();
@@ -302,7 +302,7 @@ async fn try_oidc_auth_with_audiences(
 pub async fn try_oidc_auth_for_review(
     authenticator: Option<&dyn OidcValidator>,
     token: &str,
-    clock: &dyn crate::auth::clock::Clock,
+    clock: &dyn klights_auth::clock::Clock,
     requested_audiences: &[String],
 ) -> Option<Result<(klights_auth::AuthenticatedIdentity, Vec<String>), AuthenticationError>> {
     const DEFAULT_API_AUDIENCE: &str = "https://kubernetes.default.svc.cluster.local";

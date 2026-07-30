@@ -1452,7 +1452,7 @@ async fn delete_collection_cr_inner(
     let strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
         resource_query: state.resource_mutation().resource_query.as_ref(),
         lifecycle: state.resource_mutation().finalizer_lifecycle.as_ref(),
-        operation_now: crate::auth::clock::chrono_utc(state.operational().clock.now()),
+        operation_now: klights_auth::clock::chrono_utc(state.operational().clock.now()),
     };
     let results =
         crate::api::mutation::delete::delete_collection_items(&strategy, items, &delete_intent)
@@ -2286,7 +2286,7 @@ async fn delete_cr_inner(
     let delete_strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
         resource_query: state.resource_mutation().resource_query.as_ref(),
         lifecycle: state.resource_mutation().finalizer_lifecycle.as_ref(),
-        operation_now: crate::auth::clock::chrono_utc(state.operational().clock.now()),
+        operation_now: klights_auth::clock::chrono_utc(state.operational().clock.now()),
     };
     match crate::api::mutation::delete::delete_loaded_with_strategy(
         &delete_strategy,

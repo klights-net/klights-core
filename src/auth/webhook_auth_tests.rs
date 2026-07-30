@@ -6,9 +6,9 @@
 //! Wire format tests (TokenReview JSON round-trip) are in
 //! `src/auth/webhook_auth.rs` `#[cfg(test)] mod tests`.
 
-use crate::auth::clock::{MonotonicClock, SystemMonotonicClock};
 use crate::auth::webhook_auth::*;
 use klights_auth::AuthenticatedIdentity;
+use klights_auth::clock::{MonotonicClock, SystemMonotonicClock};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
