@@ -15,6 +15,20 @@ use crate::kubelet::cri::SharedCriClient;
 use crate::kubelet::pod_cluster_runtime::RuntimeNodeRole;
 use klights_supervisor::{SupervisedJoinHandle, TaskSupervisor};
 
+fn publish_leadership_if_changed(
+    sender: &tokio::sync::watch::Sender<bool>,
+    is_leader: bool,
+) -> bool {
+    sender.send_if_modified(|current| {
+        if *current == is_leader {
+            false
+        } else {
+            *current = is_leader;
+            true
+        }
+    })
+}
+
 pub struct BootstrapPhase {
     #[cfg(test)]
     pub _watcher_state: Arc<crate::api::ApiState>,
@@ -805,7 +819,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let initial_role_projection = initial_raft_shape
         .as_ref()
         .map(|shape| crate::authority_adapter::project_raft_shape(&initial_declared_role, shape));
-    let _ = is_leader_tx.send(initial_is_leader);
+    publish_leadership_if_changed(&is_leader_tx, initial_is_leader);
     let initial_leader_addr = raft_node
         .as_ref()
         .and_then(|n| n.current_leader_info())
@@ -1264,7 +1278,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                         // proxy update, leaving the follower's API proxy
                         // pinned to the dead leader's address.
                         let is_leader = raft_task.is_leader();
-                        let _ = is_leader_tx_task.send(is_leader);
+                        publish_leadership_if_changed(&is_leader_tx_task, is_leader);
                         if !is_leader {
                             activation_succeeded = false;
                         } else if !activation_succeeded {
@@ -2028,5 +2042,32 @@ mod tests {
         for handle in handles {
             handle.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn unchanged_raft_metrics_do_not_publish_a_false_leadership_transition() {
+        let (tx, mut rx) = tokio::sync::watch::channel(true);
+        rx.borrow_and_update();
+
+        assert!(
+            !super::publish_leadership_if_changed(&tx, true),
+            "an unchanged Raft leadership sample must not advance the watch generation"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), rx.changed())
+                .await
+                .is_err(),
+            "unchanged metrics must leave long-lived leader-proxy watches open"
+        );
+
+        assert!(
+            super::publish_leadership_if_changed(&tx, false),
+            "a real demotion must advance the watch generation"
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(100), rx.changed())
+            .await
+            .expect("real leadership transition must wake receivers")
+            .expect("leadership sender must remain open");
+        assert!(!*rx.borrow_and_update());
     }
 }
