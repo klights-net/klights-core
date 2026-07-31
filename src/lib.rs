@@ -124,13 +124,9 @@ mod leader_rpc_server_tests;
 #[cfg(test)]
 mod node_conditions_tests;
 #[cfg(test)]
-mod raft_log_storage_tests;
+mod raft_node_composition_tests;
 #[cfg(test)]
-mod raft_node_integration_tests;
-#[cfg(test)]
-mod raft_state_machine_tests;
-#[cfg(test)]
-mod replication_service_integration_tests;
+mod raft_state_machine_composition_tests;
 #[cfg(test)]
 mod resource_quota_event_driven_tests;
 #[cfg(test)]

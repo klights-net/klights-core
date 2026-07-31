@@ -395,7 +395,7 @@ mod tests {
             async fn propose_command(
                 &self,
                 command: StorageCommand,
-            ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
+            ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
                 crate::bootstrap::outbox_apply_adapter::propose_command_on_backend(
                     self.inner.as_ref(),
                     command,

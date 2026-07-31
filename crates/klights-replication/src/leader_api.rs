@@ -6,6 +6,7 @@ use klights_cluster_core::{
     OutboxApplyError, OutboxOperation, OutboxStreamWatermark, PatchKind, ResourcePreconditions,
     StorageCommand, StorageCommandRejectionCode, StorageMutationError,
 };
+use klights_cluster_store::{AppliedMutation, StorageCommandResult};
 use klights_leader_api::{
     LeaderResourceCommand, LeaderResourceQuery, OutboxDeliveryError, OutboxDeliveryOperation,
     ResourceCommandError, ResourceCommandFuture, ResourceCommandRequest, ResourceCommandResult,
@@ -14,7 +15,6 @@ use klights_leader_api::{
 use klights_types::ResourceKey;
 
 use crate::proposal::RaftProposal;
-use crate::types::{AppliedMutation, StorageCommandResult};
 
 pub struct EmbeddedLeaderResourceCommand {
     proposal: Arc<dyn RaftProposal>,

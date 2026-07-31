@@ -3,10 +3,8 @@
 use anyhow::{Context, Result};
 
 use crate::materializer::RaftCommitMaterializer;
-
-pub use klights_cluster_store::{
-    COMMAND_CODEC_ACTIVATION_VERSION_META_KEY as KEY_COMMAND_CODEC_ACTIVATION_VERSION,
-    COMMAND_CODEC_V3_ACTIVATION_VALUE as COMMAND_CODEC_ACTIVATION_VALUE,
+use klights_cluster_store::{
+    COMMAND_CODEC_ACTIVATION_VERSION_META_KEY, COMMAND_CODEC_V3_ACTIVATION_VALUE,
 };
 
 /// Process-local mirror of the Raft-committed exact-v3 activation marker.
@@ -18,15 +16,15 @@ pub struct CommandCodecV3Activation {
 impl CommandCodecV3Activation {
     pub async fn load(materializer: &dyn RaftCommitMaterializer) -> Result<Self> {
         let value = materializer
-            .read_raft_metadata(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+            .read_raft_metadata(COMMAND_CODEC_ACTIVATION_VERSION_META_KEY)
             .await
             .context("read command codec activation marker")?;
         let activated = match value.as_deref() {
             None => false,
-            Some(COMMAND_CODEC_ACTIVATION_VALUE) => true,
+            Some(COMMAND_CODEC_V3_ACTIVATION_VALUE) => true,
             Some(other) => {
                 anyhow::bail!(
-                    "unsupported persisted command codec activation version {other:?}; required exact version {COMMAND_CODEC_ACTIVATION_VALUE}"
+                    "unsupported persisted command codec activation version {other:?}; required exact version {COMMAND_CODEC_V3_ACTIVATION_VALUE}"
                 )
             }
         };

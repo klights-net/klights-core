@@ -1,9 +1,8 @@
-//! Leader-side replication service (2A-4).
+//! Leader-side authenticated node-control service.
 //!
-//! Exposes a supervised internal service that can accept replica connections
-//! and stream `StorageCommand + CommandMeta` entries. At this stage, the
-//! service starts idle and does not stream commands yet — that wiring
-//! happens in 2A-5/2A-6.
+//! Accepts worker/control-plane sessions and multiplexes focused exec, log,
+//! metrics, join, and metadata operations. Committed Raft entries travel
+//! through OpenRaft's peer RPC transport, not this node-control stream.
 //!
 //! ## Design invariants
 //! - Idle-silent when no replicas connect (zero CPU).
@@ -12,12 +11,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
 use anyhow::anyhow;
-use klights_cluster_core::ReplicationEntry;
 use klights_leader_api::{JoinRequest, JoinResponse, MetadataResponse};
 use klights_node_api::{
     BoundedByteStream, ByteStreamBounds, ByteStreamError, ByteStreamFuture, ExecSetupError,
@@ -27,17 +25,14 @@ use klights_node_api::{
     RoutedNodeExecRequest, RoutedNodeExecSyncRequest, RoutedNodeExecSyncResponse,
     RoutedNodeLogEvent, RoutedNodeLogRequest, RoutedNodeMetricsRequest, RoutedNodeMetricsResponse,
 };
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 
 use klights_node_api::{FollowerCompletionContext, NodeOperationKind};
 
-use super::fanout::FanoutPool;
 use klights_leader_api::NetworkDataplane;
-use klights_supervisor::{TaskCategory, TaskSupervisor};
+use klights_supervisor::TaskSupervisor;
 
-const STREAM_FOLLOWER_QUEUE_CAPACITY: usize = 1024;
 const FOLLOWER_CONTROL_QUEUE_CAPACITY: usize = 64;
-const FANOUT_BATCH_SIZE: usize = 64;
 const NODE_EXEC_SYNC_TIMEOUT: Duration = Duration::from_secs(300);
 const NODE_METRICS_TIMEOUT: Duration = Duration::from_secs(15);
 const NODE_EXEC_STREAM_FRAME_QUEUE_CAPACITY: usize = 128;
@@ -125,16 +120,9 @@ struct FollowerState {
 
 /// Leader-side replication service.
 ///
-/// Holds a sender end of a watch channel that receives every
-/// `ReplicationEntry` applied by the leader. Connected replicas
-/// subscribe to this channel to receive a live command stream.
+/// Owns authenticated worker/control-plane sessions and the focused node
+/// operation channels multiplexed over the leader control stream.
 pub struct ReplicationService {
-    /// Watch sender: every new command applied by the leader is sent here.
-    entry_tx: watch::Sender<Option<ReplicationEntry>>,
-    /// Loss-aware ordered stream for connected replicas.
-    stream_tx: broadcast::Sender<ReplicationEntry>,
-    /// Current replication position (resource version).
-    current_rv: AtomicI64,
     /// Canonical cluster metadata observation port.
     metadata: Arc<dyn klights_cluster_store::ClusterMetadataRead>,
     /// Bootstrap-token admission port shared by worker and control-plane joins.
@@ -150,8 +138,6 @@ pub struct ReplicationService {
     pending_pod_log_streams: PendingNodeLogStreams,
     pending_node_metrics: PendingNodeMetrics,
     pod_log_timeout: Duration,
-    fanout_pool: Mutex<FanoutPool<ReplicationEntry>>,
-    fanout_started: AtomicBool,
     observed_peer_endpoints: RwLock<HashMap<String, String>>,
 }
 
@@ -336,12 +322,7 @@ impl ReplicationService {
         bootstrap_tokens: Arc<dyn klights_leader_api::BootstrapTokenValidation>,
         supervisor: Arc<TaskSupervisor>,
     ) -> Self {
-        let (entry_tx, _) = watch::channel(None);
-        let (stream_tx, _) = broadcast::channel(1024);
         Self {
-            entry_tx,
-            stream_tx,
-            current_rv: AtomicI64::new(0),
             metadata,
             bootstrap_tokens,
             supervisor,
@@ -354,8 +335,6 @@ impl ReplicationService {
             pending_pod_log_streams: Arc::new(Mutex::new(HashMap::new())),
             pending_node_metrics: Mutex::new(HashMap::new()),
             pod_log_timeout: Duration::from_secs(30),
-            fanout_pool: Mutex::new(FanoutPool::new(FANOUT_BATCH_SIZE)),
-            fanout_started: AtomicBool::new(false),
             observed_peer_endpoints: RwLock::new(HashMap::new()),
         }
     }
@@ -470,27 +449,6 @@ impl ReplicationService {
             .cloned()
     }
 
-    /// Notify the service that a new command has been applied.
-    /// This is called after each successful write on the leader.
-    pub fn notify_entry(&self, entry: ReplicationEntry) {
-        let rv = entry.meta.resource_version;
-        let mut current = self.current_rv.load(Ordering::Acquire);
-        loop {
-            if rv <= current {
-                break;
-            }
-            match self
-                .current_rv
-                .compare_exchange(current, rv, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
-        let _ = self.stream_tx.send(entry.clone());
-        self.entry_tx.send_replace(Some(entry));
-    }
-
     /// Handle a join request from a connecting node.
     ///
     /// Validates the Kubernetes-style bootstrap token and returns accepted/rejected.
@@ -577,91 +535,6 @@ impl ReplicationService {
                 }
             }
         }
-    }
-
-    /// Subscribe to the entry watch channel.
-    /// Returns a receiver that yields `Option<ReplicationEntry>`.
-    pub fn subscribe_entries(&self) -> watch::Receiver<Option<ReplicationEntry>> {
-        self.entry_tx.subscribe()
-    }
-
-    pub fn subscribe_stream_entries(&self) -> broadcast::Receiver<ReplicationEntry> {
-        self.stream_tx.subscribe()
-    }
-
-    pub async fn register_stream_follower(
-        self: &Arc<Self>,
-        node_name: String,
-        session_id: u64,
-    ) -> Result<mpsc::Receiver<ReplicationEntry>> {
-        self.ensure_fanout_worker().await?;
-        let (tx, rx) = mpsc::channel(STREAM_FOLLOWER_QUEUE_CAPACITY);
-        self.fanout_pool
-            .lock()
-            .await
-            .add_follower(node_name, session_id, tx);
-        Ok(rx)
-    }
-
-    async fn ensure_fanout_worker(self: &Arc<Self>) -> Result<()> {
-        if self
-            .fanout_started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Ok(());
-        }
-
-        let service = Arc::clone(self);
-        let entries = self.stream_tx.subscribe();
-        if let Err(err) = self
-            .supervisor
-            .spawn_async(
-                TaskCategory::Network,
-                "replication_grpc_fanout",
-                async move {
-                    service.run_fanout_worker(entries).await;
-                },
-            )
-            .await
-        {
-            self.fanout_started.store(false, Ordering::Release);
-            return Err(err.into());
-        }
-        Ok(())
-    }
-
-    async fn run_fanout_worker(
-        self: Arc<Self>,
-        mut entries: broadcast::Receiver<ReplicationEntry>,
-    ) {
-        loop {
-            match entries.recv().await {
-                Ok(entry) => {
-                    let disconnected = self.fanout_pool.lock().await.publish(entry);
-                    for (node_name, fanout_session) in disconnected {
-                        self.unregister_follower(&node_name, fanout_session).await;
-                        tracing::debug!(
-                            node = %node_name,
-                            "replication follower disconnected from gRPC fanout"
-                        );
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(
-                        skipped,
-                        "replication gRPC fanout lagged behind leader stream"
-                    );
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        }
-        self.fanout_started.store(false, Ordering::Release);
-    }
-
-    /// Get the current replication position (resource version).
-    pub fn current_position(&self) -> i64 {
-        self.current_rv.load(Ordering::Acquire)
     }
 
     pub async fn register_follower(
@@ -1354,7 +1227,12 @@ impl ReplicationService {
     }
 
     pub async fn follower_metrics(&self) -> FollowerMetrics {
-        let current_rv = self.current_position();
+        let current_rv = self
+            .metadata
+            .read_cluster_metadata()
+            .await
+            .map(|observation| observation.into_parts().0.current_rv)
+            .unwrap_or_default();
         let followers = self.followers.read().await;
         let mut statuses: Vec<FollowerStatus> = followers
             .values()

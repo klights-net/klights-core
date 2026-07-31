@@ -10,7 +10,8 @@ use klights_leader_api::{
 };
 use openraft::Raft;
 
-use crate::types::{NodeId, TypeConfig};
+use crate::types::TypeConfig;
+use klights_cluster_core::NodeId;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AuthorityState {

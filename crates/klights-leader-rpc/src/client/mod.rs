@@ -1115,9 +1115,9 @@ impl ReplicationGrpcClient {
     /// Unlike the worker→leader [`unary_call`], raft RPCs address a fixed
     /// peer (not a leader-endpoint failover set) and have no `not raft
     /// leader` retry semantics, so this wrapper does not iterate
-    /// [`leader_endpoint_candidates`]. The caller (`GrpcRaftNetwork` in
-    /// `datastore::raft::grpc_network`) already owns the per-peer client
-    /// lifecycle and openraft's own retry/backoff drives re-sends.
+    /// [`leader_endpoint_candidates`]. The replication owner's
+    /// `GrpcRaftNetwork` already owns the per-peer client lifecycle and
+    /// OpenRaft's own retry/backoff drives re-sends.
     async fn raft_unary_call<T, F, Fut>(
         &self,
         name: &'static str,
@@ -1216,8 +1216,8 @@ impl ReplicationGrpcClient {
     /// RPCs. The payload bytes are the serde-encoded openraft RPC; the
     /// response is either the serde-encoded openraft response (Ok arm)
     /// or a server-side error message (Error arm). Used by
-    /// `ReplicationGrpcRaftRpcClient` to implement
-    /// `datastore::raft::grpc_network::GrpcRaftRpcClient`.
+    /// `ReplicationGrpcRaftRpcClient` to implement the replication owner's
+    /// focused Raft RPC client port.
     pub async fn raft_append_entries_rpc(
         &self,
         receiver: crate::raft_rpc::RaftReceiverAdmission,
@@ -2005,9 +2005,9 @@ impl ReplicationGrpcClient {
     /// never rejoins. Evicting the lane on a transport error makes the
     /// next attempt — already driven by the existing reconnect/heartbeat/
     /// dispatch loops — rebuild a fresh connection against the current (or
-    /// failover) leader endpoint. This mirrors the raft-transport
-    /// self-heal in `datastore::raft::grpc_network` and the Stream-lane
-    /// self-heal in `clear_stream`. Application-level errors (`not raft
+    /// failover) leader endpoint. This mirrors the replication-owned Raft
+    /// transport self-heal and the Stream-lane self-heal in `clear_stream`.
+    /// Application-level errors (`not raft
     /// leader`, `NotFound`, conflicts) must NOT evict.
     async fn heal_lane_on_transport(&self, lane: ChannelLane, status: &tonic::Status) {
         if is_transport_status(status) {

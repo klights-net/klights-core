@@ -12,7 +12,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use crate::types::NodeId;
+use klights_cluster_core::NodeId;
 
 /// Object-safe membership-change client. Implementations may live on a
 /// raft leader (mutating the local engine) or on a follower that
@@ -35,7 +35,8 @@ pub trait MembershipClient: Send + Sync {
 
 /// Production adapter: delegates every method to the local `RaftNode`.
 /// Only useful on a node that is the current raft leader; non-leader
-/// callers should use a forwarding client (added in a later sub-task).
+/// callers route membership changes through the authenticated leader-RPC
+/// join coordinator.
 pub struct RaftNodeMembershipClient {
     membership: Arc<crate::membership::EmbeddedRaftMembership>,
 }

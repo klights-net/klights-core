@@ -9,9 +9,7 @@ use crate::datastore::node_local::LegacyDeliveryTestStore as _;
 
 use klights_cluster_core::ResourcePreconditions;
 
-use klights_cluster_core::command::{
-    COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
-};
+use klights_cluster_core::command::StorageCommand;
 
 use klights_internal_protobuf::MetadataRequest;
 
@@ -23,8 +21,6 @@ use klights_internal_protobuf::{JoinRequest, JoinRole};
 use klights_leader_api::{ControlplaneJoinHandler, ControlplaneJoinOutcome};
 
 use klights_replication::ReplicationService;
-
-use klights_cluster_core::ReplicationEntry;
 
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
@@ -120,23 +116,6 @@ async fn grpc_test_server_with_signing_ca(
         supervisor,
     ));
     super::GrpcReplicationServer::new(service, db).with_namespace(namespace)
-}
-
-fn sample_entry(rv: i64) -> ReplicationEntry {
-    ReplicationEntry {
-        command: StorageCommand::CreateNamespace {
-            name: format!("streamed-{rv}"),
-            data: serde_json::json!({"metadata": {"name": format!("streamed-{rv}")}}),
-        },
-        meta: CommandMeta {
-            command_id: CommandId(format!("grpc-server-stream-{rv}")),
-            codec_version: COMMAND_CODEC_VERSION,
-            resource_version: rv,
-            uid: None,
-            timestamp_ms: 0,
-            authoring_node: "leader".to_string(),
-        },
-    }
 }
 
 async fn grpc_test_server(
@@ -3203,7 +3182,7 @@ async fn join_as_controlplane_accepts_valid_controlplane_token_for_first_join() 
 }
 
 fn raft_node_id_for_node_name_in_test(node_name: &str) -> u64 {
-    klights_replication::types::raft_node_id_for_node_name(node_name)
+    klights_cluster_core::raft_node_id_for_node_name(node_name)
 }
 
 #[tokio::test]
@@ -3436,7 +3415,7 @@ async fn connect_refreshes_existing_node_external_ip_from_observed_peer_ip() {
 }
 
 #[tokio::test]
-async fn connect_accepts_valid_join_and_streams_entries() {
+async fn connect_accepts_valid_join_and_returns_dataplane_peers() {
     let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
@@ -3457,7 +3436,8 @@ async fn connect_accepts_valid_join_and_streams_entries() {
     )
     .await
     .unwrap();
-    let (endpoint, service, handle) = grpc_test_server_with_node_cert(db.clone(), "worker-1").await;
+    let (endpoint, _service, handle) =
+        grpc_test_server_with_node_cert(db.clone(), "worker-1").await;
     let mut join = valid_join();
     join.token.clear();
 
@@ -3475,18 +3455,6 @@ async fn connect_accepts_valid_join_and_streams_entries() {
             assert_eq!(accepted.peers[0].endpoint, "192.0.2.1");
         }
         other => panic!("expected accepted JoinResponse, got {other:?}"),
-    }
-
-    service.notify_entry(sample_entry(10));
-    let streamed = inbound.message().await.unwrap().unwrap();
-    match streamed.payload.unwrap() {
-        klights_internal_protobuf::leader_message::Payload::StreamItem(item) => {
-            assert!(matches!(
-                item.item,
-                Some(klights_internal_protobuf::stream_item::Item::Entry(_))
-            ));
-        }
-        other => panic!("expected StreamItem, got {other:?}"),
     }
     handle.abort();
 }

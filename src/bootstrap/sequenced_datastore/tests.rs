@@ -33,7 +33,7 @@ mod cases {
             async fn propose_command(
                 &self,
                 command: StorageCommand,
-            ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
+            ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
                 self.calls
                     .lock()
                     .unwrap()
@@ -105,7 +105,7 @@ mod cases {
         async fn propose_command(
             &self,
             _command: StorageCommand,
-        ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
+        ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
             panic!("this operation must not submit a raft proposal")
         }
 
@@ -2191,7 +2191,7 @@ mod cases {
             async fn propose_command(
                 &self,
                 command: StorageCommand,
-            ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
+            ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
                 self.calls.lock().unwrap().push(command.clone());
                 crate::bootstrap::outbox_apply_adapter::propose_command_on_backend(
                     self.inner.as_ref(),
@@ -2278,9 +2278,9 @@ mod cases {
             async fn propose_command(
                 &self,
                 command: StorageCommand,
-            ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
+            ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
                 self.calls.lock().unwrap().push(command);
-                Ok(klights_replication::types::StorageCommandResult::default())
+                Ok(klights_cluster_store::StorageCommandResult::default())
             }
 
             async fn propose_outbox_command(
@@ -2360,7 +2360,7 @@ mod cases {
             async fn propose_command(
                 &self,
                 _command: StorageCommand,
-            ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
+            ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
                 unreachable!("outbox routing test should use propose_outbox_command")
             }
 
@@ -2457,7 +2457,7 @@ mod cases {
             async fn propose_command(
                 &self,
                 command: StorageCommand,
-            ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
+            ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
                 let sequence = {
                     let mut calls = self.calls.lock().unwrap();
                     calls.push(command.variant_name());
@@ -2476,7 +2476,7 @@ mod cases {
                     },
                 )
                 .await?;
-                Ok(klights_replication::types::StorageCommandResult::default())
+                Ok(klights_cluster_store::StorageCommandResult::default())
             }
 
             async fn propose_outbox_command(
@@ -2827,7 +2827,7 @@ mod cases {
             async fn propose_command(
                 &self,
                 _command: klights_cluster_core::command::StorageCommand,
-            ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
+            ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
                 Err(anyhow::anyhow!(
                     "not the leader; forward to current raft leader"
                 ))

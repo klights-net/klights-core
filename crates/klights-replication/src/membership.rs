@@ -5,18 +5,18 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use klights_cluster_core::{NodeId, RaftShape, raft_node_id_for_node_name};
+use klights_cluster_store::{
+    COMMAND_CODEC_ACTIVATION_VERSION_META_KEY, COMMAND_CODEC_V3_ACTIVATION_VALUE,
+    StorageCommandResult,
+};
 use openraft::{ChangeMembers, Raft};
 
-use crate::activation::{
-    COMMAND_CODEC_ACTIVATION_VALUE, CommandCodecV3Activation, KEY_COMMAND_CODEC_ACTIVATION_VERSION,
-};
+use crate::activation::CommandCodecV3Activation;
 use crate::flow_control::{RaftCommitFlowControl, RaftCommitFlowControlDrain};
 use crate::materializer::RaftCommitMaterializer;
 use crate::proposal::EmbeddedRaftProposal;
-use crate::types::{
-    NodeId, RaftMemberLogId, RaftMemberNode, RaftShape, StorageCommandPayload,
-    StorageCommandResult, TypeConfig, raft_node_id_for_node_name,
-};
+use crate::types::{RaftMemberLogId, RaftMemberNode, StorageCommandPayload, TypeConfig};
 
 const RAFT_MEMBER_ADMISSION_META_PREFIX: &str = "raft_member_admission/";
 
@@ -238,30 +238,30 @@ impl EmbeddedRaftMembership {
         }
         let codec_activated = self
             .materializer
-            .read_raft_metadata(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+            .read_raft_metadata(COMMAND_CODEC_ACTIVATION_VERSION_META_KEY)
             .await
             .map_err(|error| CommandCodecV3ActivationError::Apply(error.to_string()))?
             .as_deref()
-            == Some(COMMAND_CODEC_ACTIVATION_VALUE);
+            == Some(COMMAND_CODEC_V3_ACTIVATION_VALUE);
         if codec_activated {
             return Ok(());
         }
         let _preflight = self.preflight_command_codec_v3(probe).await?;
         let codec_activated = self
             .materializer
-            .read_raft_metadata(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+            .read_raft_metadata(COMMAND_CODEC_ACTIVATION_VERSION_META_KEY)
             .await
             .map_err(|error| CommandCodecV3ActivationError::Apply(error.to_string()))?
             .as_deref()
-            == Some(COMMAND_CODEC_ACTIVATION_VALUE);
+            == Some(COMMAND_CODEC_V3_ACTIVATION_VALUE);
         if codec_activated {
             return Ok(());
         }
         let commit = klights_cluster_core::LogApplyCommit::try_from_cluster_mutations(vec![
             klights_cluster_core::ClusterMutation::ClusterMeta(
                 klights_cluster_core::ClusterMetaMutation::PutKlightsMeta {
-                    key: KEY_COMMAND_CODEC_ACTIVATION_VERSION.to_string(),
-                    value: COMMAND_CODEC_ACTIVATION_VALUE.to_string(),
+                    key: COMMAND_CODEC_ACTIVATION_VERSION_META_KEY.to_string(),
+                    value: COMMAND_CODEC_V3_ACTIVATION_VALUE.to_string(),
                 },
             ),
         ])
@@ -428,25 +428,6 @@ impl EmbeddedRaftMembership {
             }
             (Some(_), Some(_)) => false,
         }
-    }
-
-    pub async fn admit_controlplane_member(
-        &self,
-        node_id: NodeId,
-        addr: String,
-        as_learner: bool,
-        storage_incarnation: String,
-        storage_log_attestation: klights_leader_api::RaftStorageAttestation,
-    ) -> Result<RaftMemberAdmissionResult> {
-        self.admit_controlplane_member_with_limit(
-            node_id,
-            addr,
-            as_learner,
-            storage_incarnation,
-            storage_log_attestation,
-            3,
-        )
-        .await
     }
 
     pub async fn admit_controlplane_member_with_limit(

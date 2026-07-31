@@ -9,7 +9,7 @@ use klights_cluster_store::{
 };
 
 use crate::state_machine::RaftCommittedApply;
-use crate::types::{AppliedMutation, StorageCommandResult};
+use klights_cluster_store::{AppliedMutation, StorageCommandResult};
 
 /// Embedded OpenRaft decorator that maps the canonical persistence receipt
 /// into its Raft response and publishes active post-commit wakeups.

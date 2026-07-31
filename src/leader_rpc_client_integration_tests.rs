@@ -15,11 +15,7 @@ mod cases {
 
     use futures::StreamExt as _;
 
-    use klights_cluster_core::command::{
-        COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
-    };
-
-    use klights_cluster_core::{ReplicationEntry, StreamItem};
+    use klights_cluster_core::command::StorageCommand;
     use klights_leader_api::JoinRole;
 
     use klights_leader_api::{OutboxDeliveryOperation, OutboxDeliveryRequest};
@@ -1110,60 +1106,11 @@ mod cases {
         (client, service, db, handle)
     }
 
-    fn sample_entry(rv: i64) -> ReplicationEntry {
-        ReplicationEntry {
-            command: StorageCommand::CreateNamespace {
-                name: format!("client-stream-{rv}"),
-                data: serde_json::json!({"metadata": {"name": format!("client-stream-{rv}")}}),
-            },
-            meta: CommandMeta {
-                command_id: CommandId(format!("grpc-client-stream-{rv}")),
-                codec_version: COMMAND_CODEC_VERSION,
-                resource_version: rv,
-                uid: None,
-                timestamp_ms: 0,
-                authoring_node: "leader".to_string(),
-            },
-        }
-    }
-
     #[tokio::test]
-    async fn client_connects_get_metadata_and_receives_stream_item() {
-        let (client, service, _db, handle) = client_and_service().await;
+    async fn client_connects_and_gets_metadata() {
+        let (client, _service, _db, handle) = client_and_service().await;
         let metadata = client.metadata().await.unwrap();
         assert!(!metadata.cluster_id.is_empty());
-
-        service.notify_entry(sample_entry(7));
-        match client.stream_next().await.unwrap() {
-            StreamItem::Entry(entry) => assert_eq!(entry.meta.resource_version, 7),
-            other => panic!("expected entry, got {other:?}"),
-        }
-        client.ack(7).await.unwrap();
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn client_reset_stream_drops_buffered_entries_before_reconnect() {
-        let (client, service, _db, handle) = client_and_service().await;
-
-        service.notify_entry(sample_entry(7));
-        service.notify_entry(sample_entry(8));
-        match client.stream_next().await.unwrap() {
-            StreamItem::Entry(entry) => assert_eq!(entry.meta.resource_version, 7),
-            other => panic!("expected entry, got {other:?}"),
-        }
-
-        client.reset_stream().await;
-        client
-            .ensure_joined_with_runtimes(unavailable_runtimes())
-            .await
-            .unwrap();
-        service.notify_entry(sample_entry(9));
-
-        match client.stream_next().await.unwrap() {
-            StreamItem::Entry(entry) => assert_eq!(entry.meta.resource_version, 9),
-            other => panic!("expected entry after reset, got {other:?}"),
-        }
         handle.abort();
     }
 
@@ -2490,7 +2437,7 @@ mod cases {
     // (watch/informers) and Status (lease/outbox) lanes must also evict on
     // a transport-level error so the existing reconnect/heartbeat/dispatch
     // loops rebuild a fresh channel and the node rejoins without a restart.
-    // Mirrors the raft-transport self-heal in datastore::raft::grpc_network.
+    // Mirrors the replication-owned Raft transport self-heal.
 
     #[tokio::test]
     async fn status_lane_self_heals_after_leader_restart() {

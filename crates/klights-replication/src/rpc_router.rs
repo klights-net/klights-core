@@ -3,7 +3,8 @@
 use async_trait::async_trait;
 use openraft::Raft;
 
-use crate::types::{NodeId, TypeConfig};
+use crate::types::TypeConfig;
+use klights_cluster_core::NodeId;
 
 /// Dispatches opaque authenticated Raft envelopes into OpenRaft while
 /// enforcing the receiver admission proof bound into current membership.

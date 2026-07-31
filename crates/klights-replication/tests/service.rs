@@ -1,8 +1,8 @@
 use klights_replication::ReplicationService;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use anyhow::Result;
-use klights_cluster_core::ReplicationEntry;
 use klights_leader_api::{JoinRequest, JoinResponse, NetworkDataplane};
 use klights_node_api::{
     FollowerCompletionContext, FollowerControlMessage, NodeExecFrame, NodeExecRequest,
@@ -14,41 +14,95 @@ use klights_node_api::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use klights_cluster_core::command::{
-        COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
-    };
+    use klights_cluster_core::command::CommandId;
     use klights_node_api::ExecStreamChannel;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
-    use serde_json::json;
 
     const EXPECTED_NODE_EXEC_STREAM_FRAME_CAPACITY: usize = 128;
+    const VALID_WORKER_TOKEN: &str = "abcdef.0123456789abcdef";
+    const CONTROLPLANE_TOKEN: &str = "controlplane.0123456789abcdef";
+    const EXPIRED_WORKER_TOKEN: &str = "expired.0123456789abcdef";
+
+    struct TestMetadata {
+        current_rv: AtomicI64,
+    }
+
+    impl TestMetadata {
+        fn new(current_rv: i64) -> Self {
+            Self {
+                current_rv: AtomicI64::new(current_rv),
+            }
+        }
+
+        fn set_current_rv(&self, current_rv: i64) {
+            self.current_rv.store(current_rv, Ordering::Release);
+        }
+    }
+
+    impl klights_cluster_store::ClusterMetadataRead for TestMetadata {
+        fn read_cluster_metadata(
+            &self,
+        ) -> klights_cluster_store::ClusterMetadataFuture<
+            '_,
+            klights_cluster_store::PersistedClusterMetadata,
+        > {
+            Box::pin(async move {
+                Ok(klights_cluster_store::PersistedClusterMetadata::new(
+                    klights_cluster_core::ClusterMetadata {
+                        cluster_id: "owner-local-cluster".to_string(),
+                        leader_epoch: 0,
+                        current_rv: self.current_rv.load(Ordering::Acquire),
+                    },
+                    klights_cluster_store::SnapshotMembership::AuthoritativeAbsent,
+                ))
+            })
+        }
+    }
+
+    struct TestBootstrapTokens;
+
+    impl klights_leader_api::BootstrapTokenValidation for TestBootstrapTokens {
+        fn validate_bootstrap_token(
+            &self,
+            request: klights_leader_api::BootstrapTokenValidationRequest,
+        ) -> klights_leader_api::BootstrapTokenValidationFuture<'_> {
+            Box::pin(async move {
+                let (token, scope) = request.into_parts();
+                match (token.as_str(), scope) {
+                    (VALID_WORKER_TOKEN, klights_leader_api::BootstrapTokenScope::Worker)
+                    | (CONTROLPLANE_TOKEN, klights_leader_api::BootstrapTokenScope::Controlplane) => {
+                        Ok(())
+                    }
+                    (CONTROLPLANE_TOKEN, klights_leader_api::BootstrapTokenScope::Worker) => {
+                        Err(klights_leader_api::BootstrapTokenValidationError::rejected(
+                            "expected worker bootstrap token",
+                        ))
+                    }
+                    (EXPIRED_WORKER_TOKEN, _) => {
+                        Err(klights_leader_api::BootstrapTokenValidationError::rejected(
+                            "bootstrap token expired",
+                        ))
+                    }
+                    _ => Err(klights_leader_api::BootstrapTokenValidationError::rejected(
+                        "bootstrap token rejected",
+                    )),
+                }
+            })
+        }
+    }
 
     fn test_network_dataplane(
         node_name: String,
-        mode: klights_networking::wireguard::DataplaneMode,
-        encryption: klights_networking::wireguard::DataplaneEncryption,
+        mode: klights_leader_api::NetworkNodeMode,
+        encryption: klights_leader_api::DataplaneEncryption,
         public_key: Option<String>,
         endpoint: Option<String>,
         port: Option<u16>,
     ) -> Result<NetworkDataplane, klights_leader_api::NetworkTopologyError> {
         NetworkDataplane::try_new(
             node_name,
-            match mode {
-                klights_networking::wireguard::DataplaneMode::Root => {
-                    klights_leader_api::NetworkNodeMode::Root
-                }
-                klights_networking::wireguard::DataplaneMode::Rootless => {
-                    klights_leader_api::NetworkNodeMode::Rootless
-                }
-            },
-            match encryption {
-                klights_networking::wireguard::DataplaneEncryption::Enabled => {
-                    klights_leader_api::DataplaneEncryption::WireGuard
-                }
-                klights_networking::wireguard::DataplaneEncryption::Disabled => {
-                    klights_leader_api::DataplaneEncryption::Direct
-                }
-            },
+            mode,
+            encryption,
             public_key.as_deref(),
             endpoint
                 .as_deref()
@@ -63,38 +117,19 @@ mod tests {
         )
     }
 
-    async fn test_service_with_db() -> (ReplicationService, Arc<crate::datastore::sqlite::Datastore>)
-    {
-        let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    fn test_service_with_metadata() -> (ReplicationService, Arc<TestMetadata>) {
+        let metadata = Arc::new(TestMetadata::new(0));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-
-        // Initialize cluster metadata (required for join validation)
-        crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
-            .await
-            .unwrap();
-
-        let service = crate::grpc_test_support::replication_service_with_metadata(
-            db.clone(),
-            db.focused_recovery_store(),
+        let service = ReplicationService::new_with_ports(
+            metadata.clone(),
+            Arc::new(TestBootstrapTokens),
             supervisor,
         );
-        (service, db)
+        (service, metadata)
     }
 
     async fn test_service() -> ReplicationService {
-        test_service_with_db().await.0
-    }
-
-    async fn create_scoped_token_for_test(
-        db: &dyn crate::datastore::backend::DatastoreBackend,
-        token: &str,
-        scope: crate::bootstrap::bootstrap_token::BootstrapTokenScope,
-    ) {
-        crate::bootstrap::bootstrap_token::create_scoped_bootstrap_token_secret_for_test(
-            db, scope, token,
-        )
-        .await
-        .unwrap();
+        test_service_with_metadata().0
     }
 
     fn sample_node_log_request(
@@ -153,170 +188,18 @@ mod tests {
         .unwrap()
     }
 
-    fn sample_entry(rv: i64) -> ReplicationEntry {
-        ReplicationEntry {
-            command: StorageCommand::CreateResource {
-                api_version: "v1".into(),
-                kind: "ConfigMap".into(),
-                namespace: Some("default".into()),
-                name: "test".into(),
-                data: json!({"metadata": {"name": "test"}}),
-            },
-            meta: CommandMeta {
-                command_id: CommandId(format!("replication-service-sample-{rv}")),
-                codec_version: COMMAND_CODEC_VERSION,
-                resource_version: rv,
-                uid: None,
-                timestamp_ms: 0,
-                authoring_node: "test".into(),
-            },
-        }
-    }
-
     #[tokio::test]
     async fn service_starts_idle_without_error() {
         let service = test_service().await;
-        assert_eq!(service.current_position(), 0);
+        assert_eq!(service.follower_metrics().await.follower_count, 0);
     }
 
     #[tokio::test]
-    async fn notify_entry_updates_position() {
+    async fn service_no_replica_connection_required() {
         let service = test_service().await;
-        service.notify_entry(sample_entry(42));
-        assert_eq!(service.current_position(), 42);
-    }
-
-    #[tokio::test]
-    async fn subscribe_receives_entries() {
-        let service = test_service().await;
-        let mut rx = service.subscribe_entries();
-
-        service.notify_entry(sample_entry(1));
-
-        // Watch channel should have the latest value
-        assert!(rx.changed().await.is_ok());
-        let entry = rx.borrow().clone();
-        assert!(entry.is_some());
-        assert_eq!(entry.unwrap().meta.resource_version, 1);
-    }
-
-    #[tokio::test]
-    async fn stream_subscription_receives_every_entry() {
-        let service = test_service().await;
-        let mut rx = service.subscribe_stream_entries();
-
-        service.notify_entry(sample_entry(1));
-        service.notify_entry(sample_entry(2));
-
-        let first = rx.recv().await.unwrap();
-        let second = rx.recv().await.unwrap();
-        assert_eq!(first.meta.resource_version, 1);
-        assert_eq!(second.meta.resource_version, 2);
-    }
-
-    #[tokio::test]
-    async fn stream_subscription_receives_out_of_order_older_entry() {
-        let service = test_service().await;
-        let mut rx = service.subscribe_stream_entries();
-
-        service.notify_entry(sample_entry(2));
-        service.notify_entry(sample_entry(1));
-
-        let first = rx.recv().await.unwrap();
-        let second = rx.recv().await.unwrap();
-        assert_eq!(first.meta.resource_version, 2);
-        assert_eq!(second.meta.resource_version, 1);
-        assert_eq!(service.current_position(), 2);
-    }
-
-    #[tokio::test]
-    async fn fanout_stream_follower_receives_live_entries_without_using_broadcast_directly() {
-        let service = Arc::new(test_service().await);
-        let mut follower = service
-            .register_stream_follower("replica-1".to_string(), 1)
-            .await
-            .unwrap();
-
-        service.notify_entry(sample_entry(1));
-        service.notify_entry(sample_entry(2));
-
-        let first = follower.recv().await.unwrap();
-        let second = follower.recv().await.unwrap();
-        assert_eq!(first.meta.resource_version, 1);
-        assert_eq!(second.meta.resource_version, 2);
-    }
-
-    #[tokio::test]
-    async fn fanout_stream_replaces_existing_node_sender_on_rejoin() {
-        let service = Arc::new(test_service().await);
-        let metadata_a = test_network_dataplane(
-            "replica-1".to_string(),
-            klights_networking::wireguard::DataplaneMode::Root,
-            klights_networking::wireguard::DataplaneEncryption::Enabled,
-            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
-            Some("127.0.0.1".to_string()),
-            Some(51_820),
-        )
-        .unwrap();
-        let metadata_b = test_network_dataplane(
-            "replica-1".to_string(),
-            klights_networking::wireguard::DataplaneMode::Root,
-            klights_networking::wireguard::DataplaneEncryption::Enabled,
-            Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".to_string()),
-            Some("127.0.0.1".to_string()),
-            Some(51_821),
-        )
-        .unwrap();
-
-        let (_control_a, session_a) = service.register_follower(metadata_a).await;
-        let mut old_stream = service
-            .register_stream_follower("replica-1".to_string(), session_a)
-            .await
-            .unwrap();
-        let (_control_b, session_b) = service.register_follower(metadata_b.clone()).await;
-        let mut new_stream = service
-            .register_stream_follower("replica-1".to_string(), session_b)
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            old_stream.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
-        ));
-
-        service.notify_entry(sample_entry(3));
-        assert_eq!(new_stream.recv().await.unwrap().meta.resource_version, 3);
-
-        let metrics = service.follower_metrics().await;
-        let expected_key = metadata_b.public_key().map(str::to_owned);
-        assert_eq!(
-            metrics.followers[0].public_key.as_deref(),
-            expected_key.as_deref()
-        );
-    }
-
-    #[tokio::test]
-    async fn fanout_delivers_to_500_followers_without_head_of_line_blocking() {
-        let service = Arc::new(test_service().await);
-        let mut followers = Vec::new();
-        for idx in 0..500 {
-            followers.push(
-                service
-                    .register_stream_follower(format!("replica-{idx}"), idx as u64)
-                    .await
-                    .unwrap(),
-            );
-        }
-
-        service.notify_entry(sample_entry(500));
-
-        for follower in &mut followers {
-            let entry = tokio::time::timeout(std::time::Duration::from_secs(1), follower.recv())
-                .await
-                .expect("fanout receiver timed out")
-                .expect("fanout sender should stay connected");
-            assert_eq!(entry.meta.resource_version, 500);
-        }
+        let metadata = service.handle_metadata().await;
+        assert_eq!(metadata.cluster_id, "owner-local-cluster");
+        assert_eq!(service.follower_metrics().await.max_lag, 0);
     }
 
     #[tokio::test]
@@ -324,8 +207,8 @@ mod tests {
         let service = Arc::new(test_service().await);
         let metadata = test_network_dataplane(
             "worker-1".to_string(),
-            klights_networking::wireguard::DataplaneMode::Root,
-            klights_networking::wireguard::DataplaneEncryption::Disabled,
+            klights_leader_api::NetworkNodeMode::Root,
+            klights_leader_api::DataplaneEncryption::Direct,
             None,
             Some("127.0.0.1".to_string()),
             None,
@@ -405,16 +288,10 @@ mod tests {
 
     #[tokio::test]
     async fn handle_join_accepts_valid_token() {
-        let (service, db) = test_service_with_db().await;
-        let token = crate::bootstrap::bootstrap_token::ensure_default_bootstrap_token(
-            db.as_ref(),
-            std::time::Duration::from_secs(3600),
-        )
-        .await
-        .unwrap();
+        let service = test_service().await;
 
         let req = JoinRequest {
-            token,
+            token: VALID_WORKER_TOKEN.to_string(),
             node_name: "worker-1".into(),
             role: klights_leader_api::JoinRole::Worker,
         };
@@ -432,23 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_authenticated_join_does_not_send_service_account_signer_to_worker() {
-        let db = Arc::new(crate::datastore::test_support::in_memory().await);
-        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
-            .await
-            .unwrap();
-        let namespace_dir = tempfile::tempdir().unwrap();
-        let namespace = namespace_dir.path().to_string_lossy().to_string();
-        let signing_key_path = crate::paths::service_account_signing_key_path(&namespace);
-        let signing_key = crate::auth::generate_ca_full().unwrap().3;
-        crate::signing_key_state_adapter::persist(&signing_key_path, &signing_key, &supervisor)
-            .await
-            .unwrap();
-        let service = crate::grpc_test_support::replication_service_with_metadata(
-            db.clone(),
-            db.focused_recovery_store(),
-            supervisor,
-        );
+        let service = test_service().await;
 
         let worker_resp = service
             .handle_authenticated_join(JoinRequest {
@@ -467,16 +328,10 @@ mod tests {
 
     #[tokio::test]
     async fn handle_join_rejects_controlplane_token_for_worker_join() {
-        let (service, db) = test_service_with_db().await;
-        create_scoped_token_for_test(
-            db.as_ref(),
-            "abcdef.0123456789abcdef",
-            crate::bootstrap::bootstrap_token::BootstrapTokenScope::Controlplane,
-        )
-        .await;
+        let service = test_service().await;
 
         let req = JoinRequest {
-            token: "abcdef.0123456789abcdef".into(),
+            token: CONTROLPLANE_TOKEN.into(),
             node_name: "worker-1".into(),
             role: klights_leader_api::JoinRole::Worker,
         };
@@ -515,18 +370,10 @@ mod tests {
 
     #[tokio::test]
     async fn handle_join_rejects_expired_bootstrap_token() {
-        let (service, db) = test_service_with_db().await;
-        crate::bootstrap::bootstrap_token::create_scoped_bootstrap_token_secret_with_ttl_for_test(
-            db.as_ref(),
-            crate::bootstrap::bootstrap_token::BootstrapTokenScope::Worker,
-            "abcdef.0123456789abcdef",
-            std::time::Duration::from_secs(0),
-        )
-        .await
-        .unwrap();
+        let service = test_service().await;
 
         let req = JoinRequest {
-            token: "abcdef.0123456789abcdef".into(),
+            token: EXPIRED_WORKER_TOKEN.into(),
             node_name: "worker-1".into(),
             role: klights_leader_api::JoinRole::Worker,
         };
@@ -572,11 +419,9 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_read_failure_preserves_rpc_and_join_error_semantics() {
-        let db: Arc<dyn crate::datastore::DatastoreBackend> =
-            Arc::new(crate::datastore::test_support::in_memory().await);
-        let service = crate::grpc_test_support::replication_service_with_metadata(
-            db,
+        let service = ReplicationService::new_with_ports(
             Arc::new(FailingMetadataRead),
+            Arc::new(TestBootstrapTokens),
             Arc::new(TaskSupervisor::new(TaskCategoryConfig::default())),
         );
 
@@ -602,23 +447,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_no_replica_connection_required() {
-        // The service starts and is fully functional without any replica.
-        let service = test_service().await;
-        // Just verify we can create and use it
-        assert_eq!(service.current_position(), 0);
-        service.notify_entry(sample_entry(5));
-        assert_eq!(service.current_position(), 5);
-    }
-
-    #[tokio::test]
     async fn follower_metrics_track_ack_lag_and_disconnect() {
-        let service = test_service().await;
-        service.notify_entry(sample_entry(10));
+        let (service, metadata_store) = test_service_with_metadata();
+        metadata_store.set_current_rv(10);
         let metadata = test_network_dataplane(
             "replica-1".to_string(),
-            klights_networking::wireguard::DataplaneMode::Root,
-            klights_networking::wireguard::DataplaneEncryption::Disabled,
+            klights_leader_api::NetworkNodeMode::Root,
+            klights_leader_api::DataplaneEncryption::Direct,
             None,
             Some("127.0.0.1".to_string()),
             None,
@@ -643,8 +478,8 @@ mod tests {
         let service = test_service().await;
         let metadata_a = test_network_dataplane(
             "replica-1".to_string(),
-            klights_networking::wireguard::DataplaneMode::Root,
-            klights_networking::wireguard::DataplaneEncryption::Enabled,
+            klights_leader_api::NetworkNodeMode::Root,
+            klights_leader_api::DataplaneEncryption::WireGuard,
             Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
             Some("127.0.0.1".to_string()),
             Some(51_820),
@@ -652,8 +487,8 @@ mod tests {
         .unwrap();
         let metadata_b = test_network_dataplane(
             "replica-1".to_string(),
-            klights_networking::wireguard::DataplaneMode::Root,
-            klights_networking::wireguard::DataplaneEncryption::Enabled,
+            klights_leader_api::NetworkNodeMode::Root,
+            klights_leader_api::DataplaneEncryption::WireGuard,
             Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".to_string()),
             Some("127.0.0.1".to_string()),
             Some(51_821),
@@ -699,8 +534,8 @@ mod tests {
         let service = Arc::new(test_service().await);
         let metadata = test_network_dataplane(
             "worker-1".to_string(),
-            klights_networking::wireguard::DataplaneMode::Root,
-            klights_networking::wireguard::DataplaneEncryption::Disabled,
+            klights_leader_api::NetworkNodeMode::Root,
+            klights_leader_api::DataplaneEncryption::Direct,
             None,
             Some("127.0.0.1".to_string()),
             None,
@@ -740,8 +575,8 @@ mod tests {
         let service = Arc::new(test_service().await);
         let metadata = test_network_dataplane(
             "worker-1".to_string(),
-            klights_networking::wireguard::DataplaneMode::Root,
-            klights_networking::wireguard::DataplaneEncryption::Disabled,
+            klights_leader_api::NetworkNodeMode::Root,
+            klights_leader_api::DataplaneEncryption::Direct,
             None,
             Some("127.0.0.1".to_string()),
             None,
@@ -784,8 +619,8 @@ mod tests {
         // Register a follower.
         let metadata = test_network_dataplane(
             "test-node".to_string(),
-            klights_networking::wireguard::DataplaneMode::Root,
-            klights_networking::wireguard::DataplaneEncryption::Enabled,
+            klights_leader_api::NetworkNodeMode::Root,
+            klights_leader_api::DataplaneEncryption::WireGuard,
             Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
             Some("127.0.0.1".to_string()),
             Some(51_820),
@@ -794,8 +629,8 @@ mod tests {
         let (mut control_rx, session_id) = service.register_follower(metadata).await;
         let other_metadata = test_network_dataplane(
             "other-node".to_string(),
-            klights_networking::wireguard::DataplaneMode::Root,
-            klights_networking::wireguard::DataplaneEncryption::Disabled,
+            klights_leader_api::NetworkNodeMode::Root,
+            klights_leader_api::DataplaneEncryption::Direct,
             None,
             Some("127.0.0.2".to_string()),
             None,
@@ -895,8 +730,8 @@ mod tests {
         let service = Arc::new(test_service().await);
         let metadata = test_network_dataplane(
             "worker-1".to_string(),
-            klights_networking::wireguard::DataplaneMode::Root,
-            klights_networking::wireguard::DataplaneEncryption::Disabled,
+            klights_leader_api::NetworkNodeMode::Root,
+            klights_leader_api::DataplaneEncryption::Direct,
             None,
             Some("127.0.0.1".to_string()),
             None,
@@ -950,8 +785,8 @@ mod tests {
         let service = Arc::new(test_service().await);
         let metadata = test_network_dataplane(
             "worker-1".to_string(),
-            klights_networking::wireguard::DataplaneMode::Root,
-            klights_networking::wireguard::DataplaneEncryption::Disabled,
+            klights_leader_api::NetworkNodeMode::Root,
+            klights_leader_api::DataplaneEncryption::Direct,
             None,
             Some("127.0.0.1".to_string()),
             None,
@@ -1010,8 +845,8 @@ mod tests {
         let worker = |name: &str| {
             test_network_dataplane(
                 name.to_string(),
-                klights_networking::wireguard::DataplaneMode::Root,
-                klights_networking::wireguard::DataplaneEncryption::Disabled,
+                klights_leader_api::NetworkNodeMode::Root,
+                klights_leader_api::DataplaneEncryption::Direct,
                 None,
                 Some("127.0.0.1".to_string()),
                 None,
@@ -1107,8 +942,8 @@ mod tests {
         let service = Arc::new(test_service().await);
         let metadata = test_network_dataplane(
             "worker-1".to_string(),
-            klights_networking::wireguard::DataplaneMode::Root,
-            klights_networking::wireguard::DataplaneEncryption::Disabled,
+            klights_leader_api::NetworkNodeMode::Root,
+            klights_leader_api::DataplaneEncryption::Direct,
             None,
             Some("127.0.0.1".to_string()),
             None,
@@ -1191,8 +1026,8 @@ mod tests {
         let service = Arc::new(test_service().await);
         let metadata = test_network_dataplane(
             "worker-1".to_string(),
-            klights_networking::wireguard::DataplaneMode::Root,
-            klights_networking::wireguard::DataplaneEncryption::Disabled,
+            klights_leader_api::NetworkNodeMode::Root,
+            klights_leader_api::DataplaneEncryption::Direct,
             None,
             Some("127.0.0.1".to_string()),
             None,
@@ -1236,8 +1071,8 @@ mod tests {
         let service = Arc::new(test_service().await);
         let metadata = test_network_dataplane(
             "worker-1".to_string(),
-            klights_networking::wireguard::DataplaneMode::Root,
-            klights_networking::wireguard::DataplaneEncryption::Disabled,
+            klights_leader_api::NetworkNodeMode::Root,
+            klights_leader_api::DataplaneEncryption::Direct,
             None,
             Some("127.0.0.1".to_string()),
             None,

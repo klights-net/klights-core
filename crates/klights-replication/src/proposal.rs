@@ -6,10 +6,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use klights_cluster_core::{
-    BuildOutboxOutcome, OutboxApplyError, OutboxApplyOutcome, OutboxOperation,
+    BuildOutboxOutcome, NodeId, OutboxApplyError, OutboxApplyOutcome, OutboxOperation,
     OutboxStreamWatermark, PodEndpointEffect, Resource, ResourceMutationEffect, StorageCommand,
     StorageCommandRejectionCode, StorageMutationError,
 };
+use klights_cluster_store::{AppliedMutation, StorageCommandResult};
 use openraft::Raft;
 use openraft::error::{ClientWriteError, RaftError};
 
@@ -17,9 +18,7 @@ use crate::activation::CommandCodecV3Activation;
 use crate::flow_control::RaftCommitFlowControl;
 use crate::log_apply_wire;
 use crate::materializer::RaftCommitMaterializer;
-use crate::types::{
-    AppliedMutation, NodeId, StorageCommandPayload, StorageCommandResult, TypeConfig,
-};
+use crate::types::{StorageCommandPayload, TypeConfig};
 
 pub const RAFT_MAX_INFLIGHT_PROPOSALS: usize = 32;
 

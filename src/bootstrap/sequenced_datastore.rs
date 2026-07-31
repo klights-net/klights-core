@@ -90,7 +90,7 @@ impl SequencedDatastore {
     async fn propose_command(
         &self,
         command: StorageCommand,
-    ) -> Result<klights_replication::types::StorageCommandResult> {
+    ) -> Result<klights_cluster_store::StorageCommandResult> {
         self.proposal.propose_command(command).await
     }
 }

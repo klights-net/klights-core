@@ -281,7 +281,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         leader_node_local.as_ref(),
     ) {
         (r, Some(stores)) if uses_leader_runtime(r) => {
-            let node_id = klights_replication::types::raft_node_id_for_node_name(&config.node_name);
+            let node_id = klights_cluster_core::raft_node_id_for_node_name(&config.node_name);
             if r.is_learner_join() && stores.raft_log.reset_orphaned_learner_log().await? {
                 tracing::warn!(
                     node_id,

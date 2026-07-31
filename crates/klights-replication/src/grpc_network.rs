@@ -1,10 +1,8 @@
-//! Phase 3 production Raft network: carries openraft AppendEntries /
-//! Vote / InstallSnapshot RPCs over the existing replication gRPC
-//! transport (`src/replication/grpc/client/`).
+//! Production Raft network: carries OpenRaft AppendEntries, Vote, and
+//! InstallSnapshot RPCs over the focused leader-RPC transport client.
 //!
-//! Server side: `src/replication/grpc/server.rs::raft_append_entries` /
-//! `raft_vote` / `raft_install_snapshot` dispatch through the optional
-//! `RaftRpcRouter` (`src/replication/grpc/raft_rpc.rs`).
+//! The leader-RPC server dispatches the three opaque RPCs through its injected
+//! `RaftRpcRouter`.
 //!
 //! The wire envelope is intentionally opaque: each request carries
 //! `bytes` (serde-encoded openraft RPC payload). Encoder/decoder live in
@@ -23,7 +21,8 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 
-use crate::types::{NodeId, TypeConfig};
+use crate::types::TypeConfig;
+use klights_cluster_core::NodeId;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PeerRaftRpcMetricsSnapshot {

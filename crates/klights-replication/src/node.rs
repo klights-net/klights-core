@@ -2,7 +2,7 @@
 //!
 //! Holds the long-lived Raft instance plus the storage/state-machine
 //! handles. Exposes `bootstrap_single_voter` (manual promotion entry
-//! point), `propose` (mutating writes), and `metrics` (election state).
+//! point), typed command proposal methods, and metrics (election state).
 //!
 //! Unified-apply-path invariant: `bootstrap_single_voter` calls
 //! `Raft::initialize` against the existing data root. This is the same
@@ -13,20 +13,19 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use klights_cluster_core::{OutboxApplyError, OutboxApplyOutcome, StorageCommand};
+use klights_cluster_core::{
+    NodeId, OutboxApplyError, OutboxApplyOutcome, RaftShape, StorageCommand,
+};
 use klights_node_store::{RaftAppliedStateDurability, RaftLogDurability};
-use openraft::error::{ClientWriteError, RaftError};
 use openraft::{Config, Raft};
 
 use openraft::network::RaftNetworkFactory;
 
-use super::network::LeaderForwarder;
 use crate::activation::CommandCodecV3Activation;
 use crate::log_storage::SqliteRaftLogStorage;
 use crate::materializer::RaftCommitMaterializer;
 use crate::state_machine::{RaftStateMachineStorePorts, SqliteRaftStateMachine};
-use crate::types::StorageCommandPayload;
-use crate::types::{NodeId, RaftShape, TypeConfig};
+use crate::types::TypeConfig;
 use klights_cluster_store::BackendLifecycleStore;
 
 /// Lossy-link transport sizing (finding.md H3). `max_payload_entries` keeps each
@@ -42,7 +41,7 @@ pub const RAFT_MAX_PAYLOAD_ENTRIES: u64 = 16;
 /// Coupling both to 3 capped leader commit concurrency at 3 — at ~200 ms quorum
 /// RTT a hard ~15 commits/sec ceiling. Default 16 keeps the cap in the measured
 /// safe range 8..=32.
-pub use crate::proposal::RAFT_MAX_INFLIGHT_PROPOSALS;
+use crate::proposal::RAFT_MAX_INFLIGHT_PROPOSALS;
 
 pub struct RaftStorePorts {
     materializer: Arc<dyn RaftCommitMaterializer>,
@@ -74,7 +73,6 @@ pub struct RaftNode {
     pub node_id: NodeId,
     pub raft: Raft<TypeConfig>,
     storage_incarnation: String,
-    forwarder: Option<Arc<dyn LeaderForwarder>>,
     membership: Arc<crate::membership::EmbeddedRaftMembership>,
     materializer: Arc<dyn RaftCommitMaterializer>,
     /// T1.4: node name used by `build_log_apply_commit_for_command` to
@@ -203,20 +201,12 @@ impl RaftNode {
             node_id,
             raft,
             storage_incarnation,
-            forwarder: None,
             membership,
             materializer: stores.materializer,
             authoring_node: node_name,
             flow_control,
             command_codec_v3_activation,
         })
-    }
-
-    /// Attach a `LeaderForwarder` so `propose` can transparently redirect
-    /// writes to the current leader when this node is a follower.
-    pub fn with_forwarder(mut self, forwarder: Arc<dyn LeaderForwarder>) -> Self {
-        self.forwarder = Some(forwarder);
-        self
     }
 
     pub fn proposal(&self) -> Arc<crate::proposal::EmbeddedRaftProposal> {
@@ -233,7 +223,7 @@ impl RaftNode {
     pub async fn propose_command(
         &self,
         command: StorageCommand,
-    ) -> Result<crate::types::StorageCommandResult> {
+    ) -> Result<klights_cluster_store::StorageCommandResult> {
         crate::proposal::RaftProposal::propose_command(self.proposal().as_ref(), command).await
     }
 
@@ -284,35 +274,6 @@ impl RaftNode {
     /// initialized (matches openraft's `NotAllowed` no-op).
     pub async fn bootstrap_single_voter(&self, advertise_addr: String) -> Result<()> {
         self.membership.bootstrap_single_voter(advertise_addr).await
-    }
-
-    /// Propose a mutating write through Raft. The payload is the
-    /// serialized `StorageCommand` (protobuf) that will be replicated and
-    /// then applied via `RaftStateMachine::apply`.
-    ///
-    /// On a non-leader voter, openraft returns `ForwardToLeader`; if a
-    /// `LeaderForwarder` was attached via `with_forwarder` the proposal is
-    /// transparently re-dispatched to the current leader.
-    pub async fn propose(&self, payload: StorageCommandPayload) -> Result<()> {
-        self.command_codec_v3_activation
-            .ensure_command_codec_v3_activated()?;
-        match self.raft.client_write(payload.clone()).await {
-            Ok(_) => Ok(()),
-            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
-                let Some(leader_id) = forward.leader_id else {
-                    return Err(anyhow::anyhow!(
-                        "Raft::client_write: ForwardToLeader without leader_id (no leader currently)"
-                    ));
-                };
-                let forwarder = self.forwarder.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Raft::client_write: ForwardToLeader({leader_id}) but no LeaderForwarder configured"
-                    )
-                })?;
-                forwarder.forward_propose(leader_id, payload).await
-            }
-            Err(e) => Err(anyhow::anyhow!("Raft::client_write: {e}")),
-        }
     }
 
     /// Add a new voter to the running cluster. Wraps openraft's two-step
@@ -389,25 +350,6 @@ impl RaftNode {
         self.membership.add_learner_only(node_id, addr).await
     }
 
-    pub async fn admit_controlplane_member(
-        &self,
-        node_id: NodeId,
-        addr: String,
-        as_learner: bool,
-        storage_incarnation: String,
-        storage_log_attestation: klights_leader_api::RaftStorageAttestation,
-    ) -> Result<crate::membership::RaftMemberAdmissionResult> {
-        self.membership
-            .admit_controlplane_member(
-                node_id,
-                addr,
-                as_learner,
-                storage_incarnation,
-                storage_log_attestation,
-            )
-            .await
-    }
-
     pub fn membership(&self) -> Arc<crate::membership::EmbeddedRaftMembership> {
         self.membership.clone()
     }
@@ -475,10 +417,6 @@ impl RaftNode {
 
     pub fn local_commit_materialization_ready(&self) -> bool {
         self.proposal().is_local_leader()
-    }
-
-    pub fn storage_incarnation(&self) -> &str {
-        &self.storage_incarnation
     }
 
     pub async fn shutdown(self) -> Result<()> {

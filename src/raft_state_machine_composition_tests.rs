@@ -7,11 +7,10 @@ mod tests {
     use crate::datastore::node_local::NodeLocalStores;
     use klights_replication::activation::CommandCodecV3Activation;
     use klights_replication::state_machine::SqliteRaftStateMachine;
-    use klights_replication::types::{NodeId, RaftMemberNode, TypeConfig};
+    use klights_replication::types::TypeConfig;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
-    use openraft::{Entry, EntryPayload, LeaderId, LogId, Membership};
-    use std::collections::BTreeSet;
+    use openraft::{Entry, EntryPayload, LeaderId, LogId};
 
     type TestRaftStateMachine =
         SqliteRaftStateMachine<klights_replication::snapshot::SqliteRaftSnapshotBuilder>;
@@ -130,84 +129,6 @@ mod tests {
         let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         state_machine(backend, applied_durability(&node_local), supervisor).await
-    }
-
-    #[tokio::test]
-    async fn applied_state_starts_empty() {
-        let mut sm = fresh_sm().await;
-        let (last, m) = sm.applied_state().await.unwrap();
-        assert!(last.is_none());
-        assert!(m.log_id().is_none());
-    }
-
-    #[tokio::test]
-    async fn apply_blank_entry_advances_last_applied() {
-        let mut sm = fresh_sm().await;
-        let entry = Entry::<TypeConfig> {
-            log_id: LogId::new(LeaderId::new(1, 10), 1),
-            payload: EntryPayload::Blank,
-        };
-        let out = sm.apply(vec![entry]).await.unwrap();
-        assert_eq!(out.len(), 1);
-        assert!(!out[0].public_resource_changed);
-        let (last, _) = sm.applied_state().await.unwrap();
-        assert_eq!(last.unwrap().index, 1);
-    }
-
-    #[tokio::test]
-    async fn apply_rejects_entry_with_lower_term_than_last_applied() {
-        // P3-8: defensive fence so a stale leader cannot rewrite history
-        // even if the consensus layer failed to filter it out.
-        let mut sm = fresh_sm().await;
-        let high_term_entry = Entry::<TypeConfig> {
-            log_id: LogId::new(LeaderId::new(5, 10), 1),
-            payload: EntryPayload::Blank,
-        };
-        sm.apply(vec![high_term_entry])
-            .await
-            .expect("first apply at term 5 succeeds");
-        let stale_entry = Entry::<TypeConfig> {
-            log_id: LogId::new(LeaderId::new(3, 10), 2),
-            payload: EntryPayload::Blank,
-        };
-        let err = sm
-            .apply(vec![stale_entry])
-            .await
-            .expect_err("stale-term entry must be rejected");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("stale-term apply rejected"),
-            "error should mention stale-term fence, got: {msg}"
-        );
-        // last_applied remains at the term-5 entry.
-        let (last, _) = sm.applied_state().await.unwrap();
-        assert_eq!(last.unwrap().leader_id.term, 5);
-    }
-
-    #[tokio::test]
-    async fn apply_accepts_same_or_higher_term_entries() {
-        let mut sm = fresh_sm().await;
-        let t1 = Entry::<TypeConfig> {
-            log_id: LogId::new(LeaderId::new(2, 10), 1),
-            payload: EntryPayload::Blank,
-        };
-        sm.apply(vec![t1]).await.unwrap();
-        let t1_same = Entry::<TypeConfig> {
-            log_id: LogId::new(LeaderId::new(2, 10), 2),
-            payload: EntryPayload::Blank,
-        };
-        sm.apply(vec![t1_same])
-            .await
-            .expect("same-term entry must be accepted");
-        let t1_higher = Entry::<TypeConfig> {
-            log_id: LogId::new(LeaderId::new(7, 20), 3),
-            payload: EntryPayload::Blank,
-        };
-        sm.apply(vec![t1_higher])
-            .await
-            .expect("higher-term entry must be accepted");
-        let (last, _) = sm.applied_state().await.unwrap();
-        assert_eq!(last.unwrap().leader_id.term, 7);
     }
 
     async fn build_sm_with_backend(
@@ -345,9 +266,7 @@ mod tests {
             .expect("install snapshot");
         assert_eq!(
             backend_dst
-                .get_klights_meta(
-                    klights_replication::activation::KEY_COMMAND_CODEC_ACTIVATION_VERSION,
-                )
+                .get_klights_meta(klights_cluster_store::COMMAND_CODEC_ACTIVATION_VERSION_META_KEY,)
                 .await
                 .expect("read restored codec activation marker")
                 .as_deref(),
@@ -1363,7 +1282,7 @@ mod tests {
             "state machine must return the commit's resource_version as applied_rv"
         );
         let applied_resource = match results[0].applied_mutation.as_ref() {
-            Some(klights_replication::types::AppliedMutation::Resource(resource)) => resource,
+            Some(klights_cluster_store::AppliedMutation::Resource(resource)) => resource,
             None => panic!("state machine must return the exact committed resource"),
         };
         assert_eq!(applied_resource.name, "from-raft");
@@ -1551,7 +1470,7 @@ mod tests {
             "real committed-Raft apply must carry the transaction-derived endpoint effect"
         );
         let applied_resource = match result[0].applied_mutation.as_ref() {
-            Some(klights_replication::types::AppliedMutation::Resource(resource)) => resource,
+            Some(klights_cluster_store::AppliedMutation::Resource(resource)) => resource,
             None => panic!("visible status update must return its exact committed resource"),
         };
         assert_eq!(applied_resource.name, "guestbook-0");
@@ -1577,22 +1496,5 @@ mod tests {
                     .and_then(|v| v.as_str())
                     == Some("True")
         }));
-    }
-
-    #[tokio::test]
-    async fn apply_membership_entry_stores_membership() {
-        let mut sm = fresh_sm().await;
-        let voters: BTreeSet<NodeId> = [10u64, 20, 30].into_iter().collect();
-        let m: Membership<NodeId, RaftMemberNode> = Membership::new(vec![voters], None);
-        let entry = Entry::<TypeConfig> {
-            log_id: LogId::new(LeaderId::new(2, 10), 7),
-            payload: EntryPayload::Membership(m),
-        };
-        let out = sm.apply(vec![entry]).await.unwrap();
-        assert!(!out[0].public_resource_changed);
-        let (last, stored_m) = sm.applied_state().await.unwrap();
-        assert_eq!(last.unwrap().index, 7);
-        assert_eq!(stored_m.membership().voter_ids().count(), 3);
-        assert_eq!(stored_m.log_id().unwrap().index, 7);
     }
 }

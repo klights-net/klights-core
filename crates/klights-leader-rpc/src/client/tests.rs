@@ -792,7 +792,7 @@ mod cases {
     // (watch/informers) and Status (lease/outbox) lanes must also evict on
     // a transport-level error so the existing reconnect/heartbeat/dispatch
     // loops rebuild a fresh channel and the node rejoins without a restart.
-    // Mirrors the raft-transport self-heal in datastore::raft::grpc_network.
+    // Mirrors the replication-owned Raft transport self-heal.
 
     #[test]
     fn is_transport_status_classifies_connection_failures_only() {
@@ -828,8 +828,8 @@ mod cases {
         // strictly below the election timeout minimum so a wedged peer cannot
         // prevent the cluster from electing a new leader.
         //
-        // Compile-time assertion (RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS <
-        // RAFT_ELECTION_TIMEOUT_MIN_MS) lives in datastore::raft::node.
+        // The replication owner keeps the matching compile-time assertion
+        // beside its OpenRaft configuration.
         // This runtime test records the same invariant for the transport layer.
         let policy = klights_leader_rpc::transport_policy::GrpcTransportPolicy::shared_default();
         let raft_deadline_ms = policy.raft_unary_deadline.as_millis() as u64;

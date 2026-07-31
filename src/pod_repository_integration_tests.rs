@@ -2619,7 +2619,7 @@ impl klights_replication::proposal::RaftProposal for StatusRacingRaftProposal {
     async fn propose_command(
         &self,
         command: klights_cluster_core::command::StorageCommand,
-    ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
+    ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
         let key = format!("status-race-{}", uuid::Uuid::new_v4());
         let outcome = self
             .apply_command(
@@ -2637,12 +2637,12 @@ impl klights_replication::proposal::RaftProposal for StatusRacingRaftProposal {
             crate::node_outbox::OutboxApplyResult::Applied { applied_rv } => Some(applied_rv),
             crate::node_outbox::OutboxApplyResult::AlreadyApplied { applied_rv } => applied_rv,
         };
-        Ok(klights_replication::types::StorageCommandResult::new(
+        Ok(klights_cluster_store::StorageCommandResult::new(
             applied_rv,
             None,
             None,
             resource_effect == klights_cluster_core::ResourceMutationEffect::Changed,
-            committed_resource.map(klights_replication::types::AppliedMutation::Resource),
+            committed_resource.map(klights_cluster_store::AppliedMutation::Resource),
             pod_endpoint_effect,
         ))
     }
@@ -13143,12 +13143,12 @@ impl klights_replication::proposal::RaftProposal for DeleteCasRacingRaftProposal
     async fn propose_command(
         &self,
         command: klights_cluster_core::command::StorageCommand,
-    ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
+    ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
         if self.targets_delete_of_pod(&command) {
             self.race_before_delete().await;
         }
         self.apply_command_to_inner(command).await?;
-        Ok(klights_replication::types::StorageCommandResult::default())
+        Ok(klights_cluster_store::StorageCommandResult::default())
     }
 
     async fn propose_outbox_command(

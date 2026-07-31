@@ -220,7 +220,7 @@ impl GrpcRaftClientFactory for ReplicationGrpcRaftClientFactory {
 pub struct ReplicationGrpcMemberFeatureProbe {
     supervisor: Arc<TaskSupervisor>,
     template: ReplicationGrpcRaftClientTemplate,
-    local_node_id: klights_replication::types::NodeId,
+    local_node_id: klights_cluster_core::NodeId,
 }
 
 impl ReplicationGrpcMemberFeatureProbe {
@@ -228,8 +228,7 @@ impl ReplicationGrpcMemberFeatureProbe {
         supervisor: Arc<TaskSupervisor>,
         template: ReplicationGrpcRaftClientTemplate,
     ) -> Self {
-        let local_node_id =
-            klights_replication::types::raft_node_id_for_node_name(&template.node_name);
+        let local_node_id = klights_cluster_core::raft_node_id_for_node_name(&template.node_name);
         Self {
             supervisor,
             template,
@@ -238,8 +237,8 @@ impl ReplicationGrpcMemberFeatureProbe {
     }
 
     fn local_metadata_for_member(
-        local_node_id: klights_replication::types::NodeId,
-        node_id: klights_replication::types::NodeId,
+        local_node_id: klights_cluster_core::NodeId,
+        node_id: klights_cluster_core::NodeId,
     ) -> Option<klights_leader_api::MetadataResponse> {
         (node_id == local_node_id).then(|| klights_leader_api::MetadataResponse {
             cluster_id: String::new(),
@@ -255,7 +254,7 @@ impl ReplicationGrpcMemberFeatureProbe {
 impl klights_replication::membership::MemberFeatureProbe for ReplicationGrpcMemberFeatureProbe {
     async fn metadata_for_member(
         &self,
-        node_id: klights_replication::types::NodeId,
+        node_id: klights_cluster_core::NodeId,
         addr: &str,
     ) -> anyhow::Result<klights_leader_api::MetadataResponse> {
         if let Some(metadata) = Self::local_metadata_for_member(self.local_node_id, node_id) {
@@ -288,7 +287,7 @@ mod tests {
 
     #[test]
     fn local_member_feature_probe_shortcuts_to_local_capabilities() {
-        let local = klights_replication::types::raft_node_id_for_node_name("cp-1");
+        let local = klights_cluster_core::raft_node_id_for_node_name("cp-1");
         let metadata = ReplicationGrpcMemberFeatureProbe::local_metadata_for_member(local, local)
             .expect("the local member must not require a self gRPC connection");
         assert_eq!(

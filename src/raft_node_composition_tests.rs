@@ -2,34 +2,11 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use anyhow::Result;
-use klights_cluster_core::{OutboxApplyOutcome, OutboxOperation, StorageCommand};
+use klights_cluster_core::NodeId;
+use klights_cluster_core::{OutboxApplyOutcome, OutboxOperation};
 use klights_replication::activation::CommandCodecV3Activation;
 use klights_replication::node::*;
-use klights_replication::types::{NodeId, RaftMemberNode, StorageCommandPayload, TypeConfig};
-
-fn local_commit_materialization_allowed(
-    node_id: NodeId,
-    current_leader: Option<NodeId>,
-    voter_ids: &BTreeSet<NodeId>,
-) -> bool {
-    klights_replication::proposal::local_commit_materialization_allowed(
-        node_id,
-        current_leader,
-        voter_ids,
-    )
-}
-
-fn derive_operation_label(command: &StorageCommand) -> OutboxOperation {
-    klights_replication::proposal::derive_operation_label(command)
-}
-
-fn outbox_operation_uses_priority_permit(operation: &str) -> bool {
-    klights_replication::proposal::outbox_operation_uses_priority_permit(operation)
-}
-
-fn outbox_operation_waits_for_permit(operation: &str) -> bool {
-    klights_replication::proposal::outbox_operation_waits_for_permit(operation)
-}
+use klights_replication::types::{RaftMemberNode, TypeConfig};
 
 fn test_unproven_member(addr: impl Into<String>) -> RaftMemberNode {
     RaftMemberNode::new(addr.into(), uuid::Uuid::nil().to_string(), None)
@@ -46,15 +23,15 @@ mod tests {
     use crate::datastore::DatastoreBackend;
     use crate::datastore::node_local::NodeLocalStores;
     use async_trait::async_trait;
+    use klights_cluster_store::{
+        COMMAND_CODEC_ACTIVATION_VERSION_META_KEY as KEY_COMMAND_CODEC_ACTIVATION_VERSION,
+        COMMAND_CODEC_V3_ACTIVATION_VALUE as COMMAND_CODEC_ACTIVATION_VALUE,
+    };
     use klights_leader_api::{
         LeaderResourceCommand, LeaderResourceQuery, ResourceCommandError, ResourceCommandRequest,
         ResourceGetRequest, ResourceListRequest, ResourceListResult, ResourceQueryError,
         ResourceQueryFuture,
     };
-    use klights_replication::activation::{
-        COMMAND_CODEC_ACTIVATION_VALUE, KEY_COMMAND_CODEC_ACTIVATION_VERSION,
-    };
-    use klights_replication::join::validate_command_codec_v3_join;
     use klights_replication::membership::{
         CommandCodecV3ActivationError, CommandCodecV3PreflightError, MemberFeatureProbe,
         RaftMemberAdmissionResult,
@@ -154,26 +131,6 @@ mod tests {
 
         fn lookup(&self, node_id: NodeId) -> Option<LoopbackRegistryEntry> {
             self.inner.read().unwrap().get(&node_id).cloned()
-        }
-    }
-
-    #[async_trait]
-    impl klights_replication::LeaderForwarder for LoopbackRegistry {
-        async fn forward_propose(
-            &self,
-            leader_id: NodeId,
-            payload: StorageCommandPayload,
-        ) -> anyhow::Result<()> {
-            let raft = self
-                .lookup(leader_id)
-                .map(|entry| entry.raft)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("consumer-local loopback leader {leader_id} is absent")
-                })?;
-            raft.client_write(payload)
-                .await
-                .map(|_| ())
-                .map_err(|error| anyhow::anyhow!("loopback forward to {leader_id}: {error}"))
         }
     }
 
@@ -319,6 +276,86 @@ mod tests {
         )
     }
 
+    struct TestRaftNode {
+        node: RaftNode,
+        storage_incarnation: String,
+    }
+
+    impl std::ops::Deref for TestRaftNode {
+        type Target = RaftNode;
+
+        fn deref(&self) -> &Self::Target {
+            &self.node
+        }
+    }
+
+    impl TestRaftNode {
+        fn storage_incarnation(&self) -> &str {
+            &self.storage_incarnation
+        }
+
+        async fn shutdown(self) -> Result<()> {
+            self.node.shutdown().await
+        }
+
+        fn into_node(self) -> RaftNode {
+            self.node
+        }
+
+        async fn admit_controlplane_member(
+            &self,
+            node_id: NodeId,
+            addr: String,
+            as_learner: bool,
+            storage_incarnation: String,
+            storage_log_attestation: klights_leader_api::RaftStorageAttestation,
+        ) -> Result<klights_replication::membership::RaftMemberAdmissionResult> {
+            self.node
+                .membership()
+                .admit_controlplane_member_with_limit(
+                    node_id,
+                    addr,
+                    as_learner,
+                    storage_incarnation,
+                    storage_log_attestation,
+                    3,
+                )
+                .await
+        }
+    }
+
+    async fn start_test_node<N>(
+        node_id: NodeId,
+        node_name: String,
+        stores: RaftStorePorts,
+        log_durability: Arc<dyn klights_node_store::RaftLogDurability>,
+        applied_state_durability: Arc<dyn klights_node_store::RaftAppliedStateDurability>,
+        supervisor: Arc<TaskSupervisor>,
+        network: N,
+    ) -> Result<TestRaftNode>
+    where
+        N: RaftNetworkFactory<TypeConfig>,
+    {
+        let storage_incarnation = log_durability
+            .load_or_create_storage_incarnation()
+            .await
+            .expect("load test storage incarnation");
+        let node = RaftNode::start_with_network(
+            node_id,
+            node_name,
+            stores,
+            log_durability,
+            applied_state_durability,
+            supervisor,
+            network,
+        )
+        .await?;
+        Ok(TestRaftNode {
+            node,
+            storage_incarnation,
+        })
+    }
+
     struct BackendResourceQuery {
         backend: Arc<crate::datastore::sqlite::Datastore>,
     }
@@ -367,18 +404,20 @@ mod tests {
     }
 
     async fn admit_member(
-        leader: &RaftNode,
-        member: &RaftNode,
+        leader: &TestRaftNode,
+        member: &TestRaftNode,
         addr: impl Into<String>,
         as_learner: bool,
     ) -> Result<klights_replication::membership::RaftMemberAdmissionResult> {
         leader
-            .admit_controlplane_member(
+            .membership()
+            .admit_controlplane_member_with_limit(
                 member.node_id,
                 addr.into(),
                 as_learner,
                 member.storage_incarnation().to_string(),
                 storage_attestation(None),
+                3,
             )
             .await
     }
@@ -584,14 +623,6 @@ mod tests {
         incompatible_voter.shutdown().await.unwrap();
     }
 
-    #[test]
-    fn member_join_gate_requires_exact_codec_v3() {
-        assert!(validate_command_codec_v3_join(0).is_err());
-        assert!(validate_command_codec_v3_join(2).is_err());
-        assert!(validate_command_codec_v3_join(3).is_ok());
-        assert!(validate_command_codec_v3_join(4).is_err());
-    }
-
     /// Test-only helper: poll metrics until this node is the leader.
     /// Production should wait on `raft.metrics()` via TaskSupervisor.
     async fn wait_for_leader(node: &RaftNode, timeout: std::time::Duration) -> Result<()> {
@@ -608,7 +639,9 @@ mod tests {
         }
     }
 
-    async fn fresh_node(node_id: NodeId) -> (RaftNode, Arc<crate::datastore::sqlite::Datastore>) {
+    async fn fresh_node(
+        node_id: NodeId,
+    ) -> (TestRaftNode, Arc<crate::datastore::sqlite::Datastore>) {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let node_executor = klights_node_datastore::open::open_with_opts(
             klights_node_datastore::open::in_memory_opts(),
@@ -622,7 +655,7 @@ mod tests {
         let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let backend_for_caller = backend.clone();
-        let raft_node = RaftNode::start_with_network(
+        let raft_node = start_test_node(
             node_id,
             format!("n{node_id}"),
             raft_store_ports(backend),
@@ -634,34 +667,6 @@ mod tests {
         .await
         .expect("RaftNode::start");
         (raft_node, backend_for_caller)
-    }
-
-    #[test]
-    fn direct_node_resource_update_is_not_classified_as_node_status() {
-        let command = klights_cluster_core::command::StorageCommand::UpdateResource {
-            api_version: "v1".to_string(),
-            kind: "Node".to_string(),
-            namespace: None,
-            name: "mn-controlplane1".to_string(),
-            data: serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "Node",
-                "metadata": {
-                    "name": "mn-controlplane1",
-                    "labels": {}
-                },
-                "spec": {},
-                "status": {}
-            }),
-            expected_rv: 1,
-            preconditions: crate::datastore::ResourcePreconditions::resource_version(1),
-        };
-
-        assert_ne!(
-            derive_operation_label(&command),
-            OutboxOperation::NodeStatus,
-            "direct API Node updates must not use the kubelet NodeStatus outbox operation"
-        );
     }
 
     #[tokio::test]
@@ -726,7 +731,7 @@ mod tests {
     /// Build a 3-voter loopback cluster. Returns the three RaftNodes plus
     /// the shared registry so the test can hold and shut them down cleanly.
     async fn fresh_three_voter_cluster() -> (
-        Vec<RaftNode>,
+        Vec<TestRaftNode>,
         Vec<Arc<crate::datastore::sqlite::Datastore>>,
         LoopbackRegistry,
     ) {
@@ -747,7 +752,7 @@ mod tests {
             let backend: Arc<crate::datastore::sqlite::Datastore> =
                 Arc::new(crate::datastore::test_support::in_memory().await);
             let factory = LoopbackRaftNetworkFactory::new(registry.clone());
-            let n = RaftNode::start_with_network(
+            let n = start_test_node(
                 id,
                 format!("n{id}"),
                 raft_store_ports(backend.clone()),
@@ -893,114 +898,6 @@ mod tests {
         }
     }
 
-    /// Mock forwarder that records every `forward_propose` invocation so
-    /// the follower-forwarding test can assert the leader was contacted
-    /// with the expected payload.
-    #[derive(Default)]
-    struct CapturingForwarder {
-        calls: std::sync::Mutex<Vec<(NodeId, StorageCommandPayload)>>,
-    }
-
-    #[async_trait::async_trait]
-    impl klights_replication::LeaderForwarder for CapturingForwarder {
-        async fn forward_propose(
-            &self,
-            leader_id: NodeId,
-            payload: StorageCommandPayload,
-        ) -> Result<()> {
-            self.calls.lock().unwrap().push((leader_id, payload));
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn write_on_follower_forwards_to_leader() {
-        let registry = LoopbackRegistry::new();
-        let mut nodes = Vec::new();
-        let mut mocks = Vec::new();
-        for id in [10u64, 20, 30] {
-            let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-            let exec = klights_node_datastore::open::open_with_opts(
-                klights_node_datastore::open::in_memory_opts(),
-                supervisor.clone(),
-                "sqlite:raft-forward-test",
-            )
-            .await
-            .expect("open node-local executor");
-            let node_local =
-                Arc::new(NodeLocalStores::from_executor(exec).expect("create node-local db"));
-            let backend: Arc<crate::datastore::sqlite::Datastore> =
-                Arc::new(crate::datastore::test_support::in_memory().await);
-            let factory = LoopbackRaftNetworkFactory::new(registry.clone());
-            let mock = Arc::new(CapturingForwarder::default());
-            let n = RaftNode::start_with_network(
-                id,
-                format!("n{id}"),
-                raft_store_ports(backend),
-                node_durability(&node_local),
-                node_durability(&node_local),
-                supervisor,
-                factory,
-            )
-            .await
-            .expect("RaftNode::start_with_network")
-            .with_forwarder(mock.clone());
-            registry.register(id, n.raft.clone(), n.storage_incarnation().to_string());
-            nodes.push(n);
-            mocks.push(mock);
-        }
-        let mut members = std::collections::BTreeMap::new();
-        for n in &nodes {
-            members.insert(
-                n.node_id,
-                super::test_unproven_member(format!("https://localhost:{}", 7679 + n.node_id)),
-            );
-        }
-        nodes[0]
-            .raft
-            .initialize(members)
-            .await
-            .expect("initialize cluster");
-        // Wait until every node has observed the same leader. Seeing a leader
-        // on one member does not imply that a selected follower has received
-        // the corresponding metrics update yet.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut leader_id: Option<NodeId> = None;
-        while std::time::Instant::now() < deadline {
-            let observed = nodes
-                .iter()
-                .map(|node| node.raft.metrics().borrow().current_leader)
-                .collect::<Vec<_>>();
-            if let Some(Some(candidate)) = observed.first()
-                && observed
-                    .iter()
-                    .all(|observed_leader| *observed_leader == Some(*candidate))
-            {
-                leader_id = Some(*candidate);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        let leader_id = leader_id.expect("all members observed the elected leader");
-        let follower_idx = nodes
-            .iter()
-            .position(|n| n.node_id != leader_id)
-            .expect("at least one follower");
-        let payload = StorageCommandPayload::from_bytes(vec![0xAB, 0xCD, 0xEF]);
-        nodes[follower_idx]
-            .propose(payload.clone())
-            .await
-            .expect("propose on follower forwards to leader");
-        let calls = mocks[follower_idx].calls.lock().unwrap();
-        assert_eq!(calls.len(), 1, "follower forwarder called exactly once");
-        assert_eq!(calls[0].0, leader_id, "forwarded to current leader");
-        assert_eq!(calls[0].1, payload, "payload preserved verbatim");
-        drop(calls);
-        for n in nodes {
-            n.shutdown().await.unwrap();
-        }
-    }
-
     #[tokio::test]
     async fn follower_raft_proposer_refuses_before_local_commit_materialization() {
         let registry = LoopbackRegistry::new();
@@ -1020,7 +917,7 @@ mod tests {
             let backend: Arc<crate::datastore::sqlite::Datastore> =
                 Arc::new(crate::datastore::test_support::in_memory().await);
             let factory = LoopbackRaftNetworkFactory::new(registry.clone());
-            let node = RaftNode::start_with_network(
+            let node = start_test_node(
                 id,
                 format!("n{id}"),
                 raft_store_ports(backend.clone()),
@@ -1134,7 +1031,7 @@ mod tests {
             Arc::new(NodeLocalStores::from_executor(exec).expect("create node-local db"));
         let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
-        let node = RaftNode::start_with_network(
+        let node = start_test_node(
             10,
             "n10".to_string(),
             raft_store_ports(backend.clone()),
@@ -1197,64 +1094,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn local_commit_materialization_allows_solo_self_voter_before_leader_metric() {
-        let voter_ids = std::collections::BTreeSet::from([10]);
-
-        assert!(
-            super::local_commit_materialization_allowed(10, None, &voter_ids),
-            "solo seed bootstrap may propose before current_leader is published"
-        );
-    }
-
-    #[test]
-    fn local_commit_materialization_rejects_no_leader_multi_voter_reconfig_window() {
-        let voter_ids = std::collections::BTreeSet::from([10, 20]);
-
-        assert!(
-            !super::local_commit_materialization_allowed(10, None, &voter_ids),
-            "no-leader local materialization carve-out must only apply to N=1 membership"
-        );
-    }
-
-    #[test]
-    fn local_commit_materialization_rejects_no_leader_when_self_is_not_solo_voter() {
-        let voter_ids = std::collections::BTreeSet::from([20]);
-
-        assert!(
-            !super::local_commit_materialization_allowed(10, None, &voter_ids),
-            "a node outside the solo voter set must not self-authorize local materialization"
-        );
-    }
-
-    #[test]
-    fn local_commit_materialization_rejects_self_leader_metric_when_self_is_not_voter() {
-        let voter_ids = std::collections::BTreeSet::from([20]);
-
-        assert!(
-            !super::local_commit_materialization_allowed(10, Some(10), &voter_ids),
-            "learner/replica must not materialize proposals even if metrics are inconsistent"
-        );
-    }
-
-    #[test]
-    fn local_commit_materialization_rejects_known_other_leader() {
-        let voter_ids = std::collections::BTreeSet::from([10, 20]);
-
-        assert!(
-            !super::local_commit_materialization_allowed(10, Some(20), &voter_ids),
-            "known non-self leader must reject local materialization"
-        );
-    }
-
-    async fn fresh_voter_in_registry(id: NodeId, registry: &LoopbackRegistry) -> RaftNode {
+    async fn fresh_voter_in_registry(id: NodeId, registry: &LoopbackRegistry) -> TestRaftNode {
         fresh_voter_in_registry_with_backend(id, registry).await.0
     }
 
     async fn fresh_voter_in_registry_with_backend(
         id: NodeId,
         registry: &LoopbackRegistry,
-    ) -> (RaftNode, Arc<crate::datastore::sqlite::Datastore>) {
+    ) -> (TestRaftNode, Arc<crate::datastore::sqlite::Datastore>) {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let exec = klights_node_datastore::open::open_with_opts(
             klights_node_datastore::open::in_memory_opts(),
@@ -1268,7 +1115,7 @@ mod tests {
         let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let factory = LoopbackRaftNetworkFactory::new(registry.clone());
-        let node = RaftNode::start_with_network(
+        let node = start_test_node(
             id,
             format!("n{id}"),
             raft_store_ports(backend.clone()),
@@ -1671,7 +1518,7 @@ mod tests {
     async fn join_handler_on_leader_runs_add_voter_and_reports_count() {
         use klights_leader_api::ControlplaneJoinOutcome;
         let registry = LoopbackRegistry::new();
-        let leader = Arc::new(fresh_voter_in_registry(50, &registry).await);
+        let leader = Arc::new(fresh_voter_in_registry(50, &registry).await.into_node());
         let follower = fresh_voter_in_registry(51, &registry).await;
         leader
             .bootstrap_single_voter("https://10.99.0.50:7679".into())
@@ -1794,7 +1641,7 @@ mod tests {
     async fn join_handler_voter_admission_updates_cluster_membership_metadata() {
         use klights_leader_api::ControlplaneJoinOutcome;
         let registry = LoopbackRegistry::new();
-        let leader = Arc::new(fresh_voter_in_registry(52, &registry).await);
+        let leader = Arc::new(fresh_voter_in_registry(52, &registry).await.into_node());
         let follower = fresh_voter_in_registry(53, &registry).await;
         leader
             .bootstrap_single_voter("https://10.99.0.52:7679".into())
@@ -1855,7 +1702,7 @@ mod tests {
     async fn join_handler_returns_no_leader_when_uninitialized() {
         use klights_leader_api::ControlplaneJoinOutcome;
         let (node, _) = fresh_node(60).await;
-        let arc = Arc::new(node);
+        let arc = Arc::new(node.into_node());
         let handler = build_controlplane_join_handler(arc, test_db().await);
         let outcome = handler
             .join(test_controlplane_join_request(
@@ -1893,7 +1740,7 @@ mod tests {
         wait_for_leader(&leader, std::time::Duration::from_secs(5))
             .await
             .unwrap();
-        let leader = Arc::new(leader);
+        let leader = Arc::new(leader.into_node());
 
         let handler = build_controlplane_join_handler(leader.clone(), test_db().await);
         let outcome = handler
@@ -1966,7 +1813,7 @@ mod tests {
         wait_for_leader(&leader, std::time::Duration::from_secs(5))
             .await
             .unwrap();
-        let leader = Arc::new(leader);
+        let leader = Arc::new(leader.into_node());
 
         let leader_db = test_db().await;
         let handler = build_controlplane_join_handler(leader.clone(), leader_db.clone());
@@ -2017,7 +1864,7 @@ mod tests {
     async fn join_handler_registers_internal_ip_separate_from_external_addr() {
         use klights_leader_api::ControlplaneJoinOutcome;
         let registry = LoopbackRegistry::new();
-        let leader = Arc::new(fresh_voter_in_registry(80, &registry).await);
+        let leader = Arc::new(fresh_voter_in_registry(80, &registry).await.into_node());
         let follower = fresh_voter_in_registry(81, &registry).await;
         leader
             .bootstrap_single_voter("https://10.99.0.80:7679".into())
@@ -2226,7 +2073,7 @@ mod tests {
         ));
         let metrics_network = network.clone();
         let leader = Arc::new(
-            RaftNode::start_with_network(
+            start_test_node(
                 77,
                 "n77".into(),
                 raft_store_ports(backend),
@@ -2677,7 +2524,7 @@ mod tests {
         let be1: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let leader_network = LoopbackRaftNetworkFactory::new(registry.clone());
-        let leader = RaftNode::start_with_network(
+        let leader = start_test_node(
             leader_id,
             "n70".into(),
             raft_store_ports(be1),
@@ -2711,7 +2558,7 @@ mod tests {
         let be2: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let voter_network = LoopbackRaftNetworkFactory::new(registry.clone());
-        let voter_node = RaftNode::start_with_network(
+        let voter_node = start_test_node(
             voter_id,
             "n80".into(),
             raft_store_ports(be2),
@@ -2982,56 +2829,6 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    #[test]
-    fn outbox_priority_permit_classifier_is_explicit() {
-        use OutboxOperation;
-
-        let cases = [
-            (OutboxOperation::NodeRegistration, true),
-            (OutboxOperation::NodeDataplane, true),
-            (OutboxOperation::NodeStatus, true),
-            (OutboxOperation::PodStatus, false),
-            (OutboxOperation::EventCreate, false),
-        ];
-        for (operation, expected) in cases {
-            assert_eq!(
-                outbox_operation_uses_priority_permit(operation.as_str()),
-                expected,
-                "{operation:?} priority classification mismatch"
-            );
-        }
-    }
-
-    #[test]
-    fn outbox_waiting_permit_classifier_is_explicit() {
-        use OutboxOperation;
-
-        let cases = [
-            (OutboxOperation::PodStatus, true),
-            (OutboxOperation::RuntimeReconcile, true),
-            (OutboxOperation::ProbeReadiness, true),
-            (OutboxOperation::DeadlineExceeded, true),
-            (OutboxOperation::ContainerStatusSnapshot, true),
-            (OutboxOperation::EphemeralContainerStatuses, true),
-            // PodMetadata (controller ownerRef adoption/release, label merges,
-            // deletion finalization) must WAIT for a general permit (FIFO) rather
-            // than best-effort `try_acquire`. Under parallel e2e load, best-effort
-            // rejection + retry backoff starves controller reconciliation past the
-            // suite's adoption/release timeouts. FIFO guarantees progress without a
-            // retry storm and without borrowing the node-liveness reserved permit.
-            (OutboxOperation::PodMetadata, true),
-            (OutboxOperation::NodeStatus, false),
-            (OutboxOperation::EventCreate, false),
-        ];
-        for (operation, expected) in cases {
-            assert_eq!(
-                outbox_operation_waits_for_permit(operation.as_str()),
-                expected,
-                "{operation:?} waiting classification mismatch"
-            );
-        }
-    }
-
     /// Integration test: at most `max_in_flight()` unacknowledged propose_command calls
     /// may be in flight. Holds all general permits, then verifies the next propose
     /// call is blocked. The cap is DECOUPLED from `RAFT_MAX_PAYLOAD_ENTRIES` (T1):
@@ -3050,7 +2847,7 @@ mod tests {
         // the openraft payload cap.
         assert_eq!(
             node.proposal().flow_control().max_in_flight(),
-            super::RAFT_MAX_INFLIGHT_PROPOSALS,
+            klights_replication::proposal::RAFT_MAX_INFLIGHT_PROPOSALS,
             "flow-control cap must be the decoupled RAFT_MAX_INFLIGHT_PROPOSALS, \
              not RAFT_MAX_PAYLOAD_ENTRIES"
         );
@@ -3386,34 +3183,5 @@ mod tests {
                 .is_none()
         );
         node.shutdown().await.unwrap();
-    }
-
-    /// T1: the leader proposal flow-control gate must be DECOUPLED from the
-    /// openraft `max_payload_entries`. These solve different problems: payload
-    /// entries bounds AppendEntries **retransmit cost** (leader→follower), while
-    /// the in-flight permit count bounds **RV backlog ahead of acknowledged raft
-    /// progress** at the leader. Coupling both to 3 caps leader commit concurrency
-    /// at 3 — at ~200 ms quorum RTT that is a hard ~15 commits/sec ceiling. The two
-    /// constants must be independently bounded, and the flow-control gate must be
-    /// wired to the larger in-flight value, not the payload value.
-    #[test]
-    fn raft_flow_control_cap_is_decoupled_from_payload_entries() {
-        use klights_replication::node::{RAFT_MAX_INFLIGHT_PROPOSALS, RAFT_MAX_PAYLOAD_ENTRIES};
-
-        // payload stays small for lossy AppendEntries retransmit cost.
-        assert!(
-            RAFT_MAX_PAYLOAD_ENTRIES <= 16,
-            "RAFT_MAX_PAYLOAD_ENTRIES must stay small for lossy retransmit"
-        );
-        // in-flight is independently bounded in the measured safe range.
-        assert!(
-            (8..=32).contains(&RAFT_MAX_INFLIGHT_PROPOSALS),
-            "RAFT_MAX_INFLIGHT_PROPOSALS must be a swept value in 8..=32"
-        );
-        // The core decoupling: the gate must not equal the payload cap.
-        assert_ne!(
-            RAFT_MAX_INFLIGHT_PROPOSALS as u64, RAFT_MAX_PAYLOAD_ENTRIES,
-            "in-flight proposal gate must be decoupled from payload entries"
-        );
     }
 }

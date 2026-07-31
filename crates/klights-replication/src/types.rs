@@ -21,13 +21,12 @@
 
 use std::io::Cursor;
 
+use klights_cluster_core::NodeId;
+use klights_cluster_store::StorageCommandResult;
 use openraft::TokioRuntime;
 use openraft::declare_raft_types;
 use openraft::impls::OneshotResponder;
 use serde::{Deserialize, Serialize};
-
-pub use klights_cluster_core::{NodeId, RaftShape, raft_node_id_for_node_name};
-pub use klights_cluster_store::{AppliedMutation, StorageCommandResult};
 
 /// Receiver admission proof captured by each OpenRaft replication worker.
 ///
@@ -148,24 +147,5 @@ mod tests {
         let decoded: StorageCommandPayload = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(payload, decoded);
         assert_eq!(decoded.as_slice(), &[1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn storage_command_result_decodes_legacy_payload_without_change_signal() {
-        let decoded: StorageCommandResult = serde_json::from_value(serde_json::json!({
-            "applied_rv": 7,
-            "error_message": null,
-            "applied_mutation": null
-        }))
-        .unwrap();
-
-        assert!(!decoded.public_resource_changed);
-        assert!(
-            serde_json::to_value(StorageCommandResult::default())
-                .unwrap()
-                .get("public_resource_changed")
-                .is_none(),
-            "false change signals must keep the legacy serialized shape"
-        );
     }
 }

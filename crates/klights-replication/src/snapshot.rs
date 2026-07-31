@@ -29,7 +29,8 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::types::{NodeId, RaftMemberNode, TypeConfig};
+use crate::types::{RaftMemberNode, TypeConfig};
+use klights_cluster_core::NodeId;
 
 /// Self-describing snapshot envelope. Carries the `last_applied`
 /// log-id, the membership configuration, and an ordered list of

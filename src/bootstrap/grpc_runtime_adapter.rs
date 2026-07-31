@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use klights_cluster_core::{CommandId, ReplicationEntry};
+use klights_cluster_core::CommandId;
 use klights_leader_api::{JoinRequest, JoinResponse, MetadataResponse};
 use klights_leader_rpc::server::{
     GrpcBootstrapRuntime, GrpcFollowerCompletionRuntime, GrpcFollowerSessionRuntime,
@@ -114,19 +114,6 @@ impl GrpcFollowerSessionRuntime for GrpcReplicationRuntimeAdapter {
         dataplane: klights_leader_api::NetworkDataplane,
     ) -> (tokio::sync::mpsc::Receiver<FollowerControlMessage>, u64) {
         self.service.register_follower(dataplane).await
-    }
-
-    async fn register_stream_follower(
-        &self,
-        node_name: String,
-        session_id: u64,
-    ) -> Result<tokio::sync::mpsc::Receiver<ReplicationEntry>, GrpcRuntimeError> {
-        self.service
-            .register_stream_follower(node_name, session_id)
-            .await
-            .map_err(|error| {
-                GrpcRuntimeError::unavailable("register follower stream", error.to_string())
-            })
     }
 
     async fn update_follower_ack(&self, node_name: &str, applied_rv: i64) {

@@ -108,7 +108,7 @@ impl BackendProposalFixture {
 pub(crate) async fn propose_command_on_backend(
     backend: &dyn DatastoreBackend,
     command: StorageCommand,
-) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
+) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
     let return_key = command_return_key(&command);
     let operation = klights_replication::proposal::derive_operation_label(&command);
     let commit = backend
@@ -130,9 +130,7 @@ pub(crate) async fn propose_command_on_backend(
             .get_resource(&api_version, &kind, namespace.as_deref(), &name)
             .await?
     {
-        result.applied_mutation = Some(klights_replication::types::AppliedMutation::Resource(
-            resource,
-        ));
+        result.applied_mutation = Some(klights_cluster_store::AppliedMutation::Resource(resource));
     }
     Ok(result)
 }
@@ -232,7 +230,7 @@ impl RaftProposal for BackendProposalFixture {
     async fn propose_command(
         &self,
         command: StorageCommand,
-    ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
+    ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
         propose_command_on_backend(self.backend.as_ref(), command).await
     }
 

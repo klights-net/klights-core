@@ -55,3 +55,27 @@ impl StorageCommandResult {
 const fn is_false(value: &bool) -> bool {
     !*value
 }
+
+#[cfg(test)]
+mod tests {
+    use super::StorageCommandResult;
+
+    #[test]
+    fn storage_command_result_decodes_legacy_payload_without_change_signal() {
+        let decoded: StorageCommandResult = serde_json::from_value(serde_json::json!({
+            "applied_rv": 7,
+            "error_message": null,
+            "applied_mutation": null
+        }))
+        .unwrap();
+
+        assert!(!decoded.public_resource_changed);
+        assert!(
+            serde_json::to_value(StorageCommandResult::default())
+                .unwrap()
+                .get("public_resource_changed")
+                .is_none(),
+            "false change signals must keep the legacy serialized shape"
+        );
+    }
+}

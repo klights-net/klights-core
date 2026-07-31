@@ -17,13 +17,13 @@ use super::ca_files::ReplicationRuntimeFiles;
 
 use crate::protocol::{
     FollowerCompletionContext, FollowerControlMessage, JoinRequest, JoinResponse, JoinRole,
-    MetadataResponse, NodeOperationKind, ReplicationEntry, RoutedNodeExecFrame,
-    RoutedNodeExecRequest, RoutedNodeExecSyncRequest, RoutedNodeExecSyncResponse,
-    RoutedNodeLogEvent, RoutedNodeLogRequest, RoutedNodeMetricsRequest, RoutedNodeMetricsResponse,
+    MetadataResponse, NodeOperationKind, RoutedNodeExecFrame, RoutedNodeExecRequest,
+    RoutedNodeExecSyncRequest, RoutedNodeExecSyncResponse, RoutedNodeLogEvent,
+    RoutedNodeLogRequest, RoutedNodeMetricsRequest, RoutedNodeMetricsResponse,
 };
 use crate::{
-    JOIN_TOKEN_METADATA_KEY, entry_to_proto, resource_command_request_from_proto,
-    watch_replay_position_from_proto, watch_replay_position_to_proto,
+    JOIN_TOKEN_METADATA_KEY, resource_command_request_from_proto, watch_replay_position_from_proto,
+    watch_replay_position_to_proto,
 };
 
 /// Focused application handler used by the authenticated gRPC transport.
@@ -87,11 +87,6 @@ pub trait GrpcFollowerSessionRuntime: Send + Sync {
         &self,
         dataplane: klights_leader_api::NetworkDataplane,
     ) -> (tokio::sync::mpsc::Receiver<FollowerControlMessage>, u64);
-    async fn register_stream_follower(
-        &self,
-        node_name: String,
-        session_id: u64,
-    ) -> std::result::Result<tokio::sync::mpsc::Receiver<ReplicationEntry>, GrpcRuntimeError>;
     async fn update_follower_ack(&self, node_name: &str, applied_rv: i64);
     async fn unregister_follower(&self, node_name: &str, session_id: u64);
 }
@@ -1206,19 +1201,6 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
         let local_node_name_for_observed_endpoint = self.local_node_name.clone();
         let node_self_query_for_observed_endpoint = self.node_self_query.clone();
         let node_self_status_for_observed_endpoint = self.node_self_status.clone();
-        let mut entries = if accepted {
-            Some(
-                follower_sessions
-                    .register_stream_follower(
-                        joined_node_name.clone(),
-                        follower_session.expect("session must be set when accepted"),
-                    )
-                    .await
-                    .map_err(|err| Status::internal(err.to_string()))?,
-            )
-        } else {
-            None
-        };
         let stream = async_stream::stream! {
             yield Ok(klights_internal_protobuf::LeaderMessage {
                 payload: Some(klights_internal_protobuf::leader_message::Payload::JoinResponse(first_response)),
@@ -1249,10 +1231,6 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                         }
                     }
                 }
-                let Some(mut entries) = entries.take() else {
-                    yield Err(Status::internal("accepted replication stream missing fanout receiver"));
-                    return;
-                };
                 let Some(mut control_rx) = control_rx.take() else {
                     yield Err(Status::internal("accepted replication stream missing control receiver"));
                     return;
@@ -1401,25 +1379,6 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                                     });
                                 }
                             }
-                        }
-                        entry = entries.recv() => {
-                            let Some(entry) = entry else {
-                                break;
-                            };
-                            let entry = match entry_to_proto(&entry) {
-                                Ok(entry) => entry,
-                                Err(err) => {
-                                    yield Err(Status::internal(err.to_string()));
-                                    break;
-                                }
-                            };
-                            yield Ok(klights_internal_protobuf::LeaderMessage {
-                                payload: Some(klights_internal_protobuf::leader_message::Payload::StreamItem(
-                                    klights_internal_protobuf::StreamItem {
-                                        item: Some(klights_internal_protobuf::stream_item::Item::Entry(entry)),
-                                    }
-                                )),
-                            });
                         }
                     }
                 }

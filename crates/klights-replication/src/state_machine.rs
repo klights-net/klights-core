@@ -18,7 +18,11 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use klights_cluster_store::BackendLifecycleStore;
+use klights_cluster_core::NodeId;
+use klights_cluster_store::{
+    BackendLifecycleStore, COMMAND_CODEC_ACTIVATION_VERSION_META_KEY,
+    COMMAND_CODEC_V3_ACTIVATION_VALUE, StorageCommandResult,
+};
 use klights_node_store::{OpaqueRaftBytes, RaftAppliedStateDurability, RaftAppliedStateWrite};
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{
@@ -26,11 +30,9 @@ use openraft::{
     StoredMembership,
 };
 
-use crate::activation::{
-    COMMAND_CODEC_ACTIVATION_VALUE, CommandCodecV3Activation, KEY_COMMAND_CODEC_ACTIVATION_VERSION,
-};
+use crate::activation::CommandCodecV3Activation;
 use crate::materializer::RaftCommitMaterializer;
-use crate::types::{NodeId, RaftMemberNode, StorageCommandResult, TypeConfig};
+use crate::types::{RaftMemberNode, TypeConfig};
 
 #[async_trait]
 pub trait RaftCommittedApply: Send + Sync {
@@ -106,8 +108,8 @@ fn commit_activates_command_codec_v3(commit: &klights_cluster_core::LogApplyComm
         matches!(
             mutation,
             klights_cluster_core::LogApplyMutation::PutKlightsMeta { key, value }
-                if key == KEY_COMMAND_CODEC_ACTIVATION_VERSION
-                    && value == COMMAND_CODEC_ACTIVATION_VALUE
+                if key == COMMAND_CODEC_ACTIVATION_VERSION_META_KEY
+                    && value == COMMAND_CODEC_V3_ACTIVATION_VALUE
         )
     })
 }
@@ -280,10 +282,10 @@ where
                     if activates_command_codec_v3 {
                         let persisted = self
                             .metadata
-                            .read_raft_metadata(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+                            .read_raft_metadata(COMMAND_CODEC_ACTIVATION_VERSION_META_KEY)
                             .await
                             .map_err(|error| apply_err(log_id, error))?;
-                        if persisted.as_deref() != Some(COMMAND_CODEC_ACTIVATION_VALUE) {
+                        if persisted.as_deref() != Some(COMMAND_CODEC_V3_ACTIVATION_VALUE) {
                             return Err(apply_err(
                                 log_id,
                                 "exact-v3 activation mutation did not persist its marker",
@@ -341,12 +343,12 @@ where
             })?;
         match self
             .metadata
-            .read_raft_metadata(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+            .read_raft_metadata(COMMAND_CODEC_ACTIVATION_VERSION_META_KEY)
             .await
             .map_err(ioerr_read)?
             .as_deref()
         {
-            Some(COMMAND_CODEC_ACTIVATION_VALUE) => self
+            Some(COMMAND_CODEC_V3_ACTIVATION_VALUE) => self
                 .command_codec_v3_activation
                 .mark_command_codec_v3_activated(),
             None => self

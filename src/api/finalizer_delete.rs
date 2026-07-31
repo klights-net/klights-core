@@ -806,7 +806,7 @@ mod tests {
         async fn apply_inline(
             &self,
             command: StorageCommand,
-        ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
+        ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
             if matches!(command, StorageCommand::DeleteResourceWithTombstone { .. }) {
                 let commit = self
                     .inner
@@ -858,7 +858,7 @@ mod tests {
         async fn propose_command(
             &self,
             command: StorageCommand,
-        ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
+        ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
             let should_reinject = Self::should_reinject_orphan_finalizer(&command)
                 && !self.reinjected.swap(true, Ordering::SeqCst);
             let result = self.apply_inline(command).await?;
