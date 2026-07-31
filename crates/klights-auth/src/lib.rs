@@ -7,7 +7,6 @@ pub mod bootstrap_authorizer;
 pub mod ca_transport;
 pub mod cert;
 pub mod clock;
-pub mod cluster_identity;
 pub mod csr_policy;
 pub mod csr_signer;
 pub mod identity;
@@ -25,13 +24,21 @@ pub mod service_account;
 pub mod user;
 pub mod webhook_auth;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 #[cfg(test)]
 mod oidc_tests;
 #[cfg(test)]
 mod webhook_auth_tests;
 
-pub use clock::Clock;
+pub use authorizer::Authorizer;
+pub use clock::{Clock, MonotonicClock};
+pub use csr_signer::CsrSigner;
 pub use identity::AuthenticatedIdentity;
+pub use node_policy_store::NodePolicyStore;
+pub use oidc::{OidcDiscovery, OidcValidator};
+pub use rbac_policy_store::{RbacPolicyStore, RbacResourceReader};
 pub use service_account::{
     BoundServiceAccountToken, SaKubernetesIoClaims, SaObjectClaims, SaServiceAccountClaims,
     SaTokenClaims, ServiceAccountTokenRequest, decode_serviceaccount_token_with_clock,
@@ -39,6 +46,7 @@ pub use service_account::{
     serviceaccount_groups_from_claims, serviceaccount_uid_from_claims,
     validate_service_account_uid,
 };
+pub use webhook_auth::{WebhookAuthenticator, WebhookTokenReviewer};
 
 /// Authentication failed without selecting an HTTP status or response shape.
 #[derive(Clone, Debug, PartialEq, Eq)]

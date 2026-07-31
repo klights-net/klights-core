@@ -54,10 +54,12 @@ impl MonotonicClock for SystemMonotonicClock {
 }
 
 /// Fixed clock for deterministic auth-policy tests and fakes.
-pub struct FixedClock {
-    pub now: OffsetDateTime,
+#[cfg(test)]
+pub(crate) struct FixedClock {
+    pub(crate) now: OffsetDateTime,
 }
 
+#[cfg(test)]
 impl Clock for FixedClock {
     fn now(&self) -> OffsetDateTime {
         self.now

@@ -5,10 +5,12 @@
 
 use crate::AuthenticatedIdentity;
 use crate::clock::Clock;
-use crate::cluster_identity::{
-    BootstrapTokenAuthenticator, BoundTokenSubjectLookup, ServiceAccountSigningKeyProvider,
-};
 use crate::{AuthenticationError, validate_bound_object_uid};
+use klights_leader_api::{
+    ClusterIdentityError, LeaderBootstrapTokenAuthentication as BootstrapTokenAuthenticator,
+    LeaderBoundTokenSubjectLookup as BoundTokenSubjectLookup,
+    LeaderServiceAccountSigningKeyState as ServiceAccountSigningKeyProvider,
+};
 use klights_supervisor::{TaskCategory, TaskSupervisor};
 use klights_types::TlsClientCertificate;
 
@@ -116,8 +118,12 @@ async fn authenticate_bearer_token(
             .authenticate_bootstrap_token(token)
             .await
         {
-            Ok(identity) => Ok(identity),
+            Ok(identity) => Ok(AuthenticatedIdentity::bootstrap(
+                identity.token_id(),
+                identity.extra_groups(),
+            )),
             Err(bootstrap_error) => {
+                let bootstrap_error = authentication_error_from_cluster_identity(bootstrap_error);
                 if let Some(result) =
                     crate::webhook_auth::try_webhook_auth(runtime.webhook_authenticator, token)
                         .await
@@ -194,6 +200,21 @@ fn preferred_authentication_error(
     }
 }
 
+fn authentication_error_from_cluster_identity(error: ClusterIdentityError) -> AuthenticationError {
+    match error {
+        ClusterIdentityError::Rejected { message } => AuthenticationError::unauthenticated(message),
+        ClusterIdentityError::DependencyFailure { message } => {
+            AuthenticationError::dependency_failure(message)
+        }
+        ClusterIdentityError::InternalFailure { message } => {
+            AuthenticationError::internal_failure(message)
+        }
+        _ => {
+            AuthenticationError::internal_failure("unsupported cluster identity capability failure")
+        }
+    }
+}
+
 async fn validate_sa_token(
     runtime: &AuthnRuntime<'_>,
     token: &str,
@@ -211,7 +232,9 @@ async fn validate_sa_token_claims(
     let signing_key_pem = runtime
         .service_account_signing_keys
         .service_account_signing_key_pem()
-        .await?;
+        .await
+        .map_err(authentication_error_from_cluster_identity)?
+        .into_string();
     let audiences = audiences.to_vec();
     let token = token.to_string();
     let now = runtime.clock.now();
@@ -311,7 +334,12 @@ pub async fn authenticate_token_for_review(
                 .bootstrap_tokens
                 .authenticate_bootstrap_token(token)
                 .await
+                .map_err(authentication_error_from_cluster_identity)
                 .and_then(|identity| {
+                    let identity = AuthenticatedIdentity::bootstrap(
+                        identity.token_id(),
+                        identity.extra_groups(),
+                    );
                     intersect_requested_audiences(
                         audiences,
                         &[DEFAULT_API_AUDIENCE.to_string()],
@@ -450,7 +478,8 @@ pub async fn validate_sa_token_bindings(
     if let Some(token_uid) = crate::serviceaccount_uid_from_claims(claims) {
         let stored_uid = subjects
             .service_account_uid(namespace, service_account_name)
-            .await?;
+            .await
+            .map_err(authentication_error_from_cluster_identity)?;
         crate::validate_service_account_uid(Some(&token_uid), stored_uid.as_deref()).map_err(
             |error| {
                 AuthenticationError::unauthenticated(format!(
@@ -464,19 +493,28 @@ pub async fn validate_sa_token_bindings(
         if let Some(pod) = kubernetes.pod.as_ref()
             && let Some(name) = pod.name.as_deref().filter(|name| !name.is_empty())
         {
-            let stored_uid = subjects.pod_uid(namespace, name).await?;
+            let stored_uid = subjects
+                .pod_uid(namespace, name)
+                .await
+                .map_err(authentication_error_from_cluster_identity)?;
             validate_bound_object_uid("pod", name, pod.uid.as_deref(), stored_uid.as_deref())?;
         }
         if let Some(node) = kubernetes.node.as_ref()
             && let Some(name) = node.name.as_deref().filter(|name| !name.is_empty())
         {
-            let stored_uid = subjects.node_uid(name).await?;
+            let stored_uid = subjects
+                .node_uid(name)
+                .await
+                .map_err(authentication_error_from_cluster_identity)?;
             validate_bound_object_uid("node", name, node.uid.as_deref(), stored_uid.as_deref())?;
         }
         if let Some(secret) = kubernetes.secret.as_ref()
             && let Some(name) = secret.name.as_deref().filter(|name| !name.is_empty())
         {
-            let stored_uid = subjects.secret_uid(namespace, name).await?;
+            let stored_uid = subjects
+                .secret_uid(namespace, name)
+                .await
+                .map_err(authentication_error_from_cluster_identity)?;
             validate_bound_object_uid(
                 "secret",
                 name,
@@ -597,44 +635,56 @@ mod tests {
         pods: HashMap<(String, String), String>,
         nodes: HashMap<String, String>,
         secrets: HashMap<(String, String), String>,
-        failure: Option<AuthenticationError>,
+        failure: Option<ClusterIdentityError>,
     }
 
-    #[async_trait::async_trait]
     impl BootstrapTokenAuthenticator for RejectBootstrap {
-        async fn authenticate_bootstrap_token(
-            &self,
-            _token: &str,
-        ) -> Result<AuthenticatedIdentity, AuthenticationError> {
-            Err(AuthenticationError::unauthenticated(
-                "not a bootstrap token",
-            ))
+        fn authenticate_bootstrap_token<'a>(
+            &'a self,
+            _token: &'a str,
+        ) -> klights_leader_api::ClusterIdentityFuture<'a, klights_leader_api::BootstrapTokenIdentity>
+        {
+            Box::pin(async { Err(ClusterIdentityError::rejected("not a bootstrap token")) })
         }
     }
 
-    #[async_trait::async_trait]
     impl BootstrapTokenAuthenticator for AcceptBootstrap {
-        async fn authenticate_bootstrap_token(
-            &self,
-            _token: &str,
-        ) -> Result<AuthenticatedIdentity, AuthenticationError> {
-            Ok(AuthenticatedIdentity::bootstrap("abcdef", &[]))
+        fn authenticate_bootstrap_token<'a>(
+            &'a self,
+            _token: &'a str,
+        ) -> klights_leader_api::ClusterIdentityFuture<'a, klights_leader_api::BootstrapTokenIdentity>
+        {
+            Box::pin(async {
+                klights_leader_api::BootstrapTokenIdentity::try_new("abcdef", Vec::new())
+            })
         }
     }
 
-    #[async_trait::async_trait]
     impl ServiceAccountSigningKeyProvider for RejectSigningKey {
-        async fn service_account_signing_key_pem(&self) -> Result<String, AuthenticationError> {
-            Err(AuthenticationError::dependency_failure(
-                "signing key unavailable",
-            ))
+        fn service_account_signing_key_pem(
+            &self,
+        ) -> klights_leader_api::ClusterIdentityFuture<
+            '_,
+            klights_leader_api::ServiceAccountSigningKeyPem,
+        > {
+            Box::pin(async {
+                Err(ClusterIdentityError::dependency_failure(
+                    "signing key unavailable",
+                ))
+            })
         }
     }
 
-    #[async_trait::async_trait]
     impl ServiceAccountSigningKeyProvider for StaticSigningKey {
-        async fn service_account_signing_key_pem(&self) -> Result<String, AuthenticationError> {
-            Ok(self.0.clone())
+        fn service_account_signing_key_pem(
+            &self,
+        ) -> klights_leader_api::ClusterIdentityFuture<
+            '_,
+            klights_leader_api::ServiceAccountSigningKeyPem,
+        > {
+            Box::pin(async move {
+                klights_leader_api::ServiceAccountSigningKeyPem::try_new(self.0.clone())
+            })
         }
     }
 
@@ -649,55 +699,65 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
     impl BoundTokenSubjectLookup for Subjects {
-        async fn service_account_uid(
-            &self,
-            namespace: &str,
-            name: &str,
-        ) -> Result<Option<String>, AuthenticationError> {
-            if let Some(error) = &self.failure {
-                return Err(error.clone());
-            }
-            Ok(self
-                .service_accounts
-                .get(&(namespace.to_string(), name.to_string()))
-                .cloned())
+        fn service_account_uid<'a>(
+            &'a self,
+            namespace: &'a str,
+            name: &'a str,
+        ) -> klights_leader_api::ClusterIdentityFuture<'a, Option<String>> {
+            Box::pin(async move {
+                if let Some(error) = &self.failure {
+                    return Err(error.clone());
+                }
+                Ok(self
+                    .service_accounts
+                    .get(&(namespace.to_string(), name.to_string()))
+                    .cloned())
+            })
         }
 
-        async fn pod_uid(
-            &self,
-            namespace: &str,
-            name: &str,
-        ) -> Result<Option<String>, AuthenticationError> {
-            if let Some(error) = &self.failure {
-                return Err(error.clone());
-            }
-            Ok(self
-                .pods
-                .get(&(namespace.to_string(), name.to_string()))
-                .cloned())
+        fn pod_uid<'a>(
+            &'a self,
+            namespace: &'a str,
+            name: &'a str,
+        ) -> klights_leader_api::ClusterIdentityFuture<'a, Option<String>> {
+            Box::pin(async move {
+                if let Some(error) = &self.failure {
+                    return Err(error.clone());
+                }
+                Ok(self
+                    .pods
+                    .get(&(namespace.to_string(), name.to_string()))
+                    .cloned())
+            })
         }
 
-        async fn node_uid(&self, name: &str) -> Result<Option<String>, AuthenticationError> {
-            if let Some(error) = &self.failure {
-                return Err(error.clone());
-            }
-            Ok(self.nodes.get(name).cloned())
+        fn node_uid<'a>(
+            &'a self,
+            name: &'a str,
+        ) -> klights_leader_api::ClusterIdentityFuture<'a, Option<String>> {
+            Box::pin(async move {
+                if let Some(error) = &self.failure {
+                    return Err(error.clone());
+                }
+                Ok(self.nodes.get(name).cloned())
+            })
         }
 
-        async fn secret_uid(
-            &self,
-            namespace: &str,
-            name: &str,
-        ) -> Result<Option<String>, AuthenticationError> {
-            if let Some(error) = &self.failure {
-                return Err(error.clone());
-            }
-            Ok(self
-                .secrets
-                .get(&(namespace.to_string(), name.to_string()))
-                .cloned())
+        fn secret_uid<'a>(
+            &'a self,
+            namespace: &'a str,
+            name: &'a str,
+        ) -> klights_leader_api::ClusterIdentityFuture<'a, Option<String>> {
+            Box::pin(async move {
+                if let Some(error) = &self.failure {
+                    return Err(error.clone());
+                }
+                Ok(self
+                    .secrets
+                    .get(&(namespace.to_string(), name.to_string()))
+                    .cloned())
+            })
         }
     }
 
@@ -797,7 +857,7 @@ mod tests {
     #[tokio::test]
     async fn bound_subject_dependency_failure_is_not_credential_rejection() {
         let subjects = Subjects {
-            failure: Some(AuthenticationError::dependency_failure(
+            failure: Some(ClusterIdentityError::dependency_failure(
                 "subject store unavailable",
             )),
             ..Default::default()

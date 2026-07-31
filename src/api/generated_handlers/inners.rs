@@ -2328,7 +2328,7 @@ mod tests {
     #[tokio::test]
     async fn create_certificate_signing_request_dispatches_csr_signer() {
         let mut state = crate::api::test_support::build_test_app_state().await;
-        let signer = Arc::new(klights_auth::csr_signer::RecordingCsrSigner::new());
+        let signer = Arc::new(crate::api::test_support::RecordingCsrSigner::new());
         let issuer = Arc::new(crate::bootstrap::auth_adapters::AuthCsrIssuer::new(
             signer.clone(),
             Arc::new(klights_auth::clock::SystemClock),

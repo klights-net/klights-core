@@ -210,7 +210,7 @@ async fn crd_allowed_identity_gets_normal_response() {
     use tower::ServiceExt;
 
     let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
-        std::sync::Arc::new(klights_auth::authorizer::AllowAllAuthorizer);
+        std::sync::Arc::new(crate::api::test_support::AllowAllAuthorizer);
     let state = crate::api::test_support::build_test_app_state_with_authorizer(authorizer).await;
 
     // Register a CRD
@@ -315,7 +315,7 @@ async fn crd_list_authorization_preserves_field_and_label_selectors() {
     use serde_json::json;
     use tower::ServiceExt;
 
-    let recording = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
+    let recording = std::sync::Arc::new(crate::api::test_support::RecordingAuthorizer::allow());
     let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
         recording.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>;
     let state =
@@ -459,7 +459,7 @@ async fn crd_rbac_resource_names_uses_field_selector() {
     use serde_json::json;
     use tower::ServiceExt;
 
-    let recording = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
+    let recording = std::sync::Arc::new(crate::api::test_support::RecordingAuthorizer::allow());
     let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
         recording.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>;
     let state =

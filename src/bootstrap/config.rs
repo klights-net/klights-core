@@ -398,15 +398,6 @@ impl KlightsConfig {
     }
 }
 
-fn parse_pod_subnet(raw: &str) -> anyhow::Result<String> {
-    use anyhow::anyhow;
-    use klights_types::PodSubnet;
-
-    PodSubnet::parse(raw)
-        .map(|subnet| subnet.to_string())
-        .map_err(|e| anyhow!("invalid KLIGHTS_POD_SUBNET '{}': {}", raw, e))
-}
-
 fn parse_datastore_backend_env() -> anyhow::Result<BackendKind> {
     match std::env::var("KLIGHTS_DATASTORE_BACKEND") {
         Ok(value) => BackendKind::parse(&value),

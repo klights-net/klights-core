@@ -3,6 +3,7 @@
 //! Concrete Pod repository adapters are composed by the root bootstrap owner.
 
 use async_trait::async_trait;
+#[cfg(test)]
 use std::collections::HashMap;
 
 /// Object-safe trait for node-scoped access decisions.
@@ -31,13 +32,15 @@ pub trait NodePolicyStore: Send + Sync {
 ///
 /// Stores pod-to-node mappings and pod-to-referenced-object mappings.
 /// Does not implement any authorization logic.
-pub struct InMemoryNodePolicyStore {
+#[cfg(test)]
+pub(crate) struct InMemoryNodePolicyStore {
     /// (namespace, pod_name) -> node_name
     pod_node: HashMap<(String, String), String>,
     /// (namespace, pod_name, resource_kind) -> object_names
     references: HashMap<(String, String, String), Vec<String>>,
 }
 
+#[cfg(test)]
 impl InMemoryNodePolicyStore {
     pub fn new() -> Self {
         Self {
@@ -73,6 +76,7 @@ impl InMemoryNodePolicyStore {
     }
 }
 
+#[cfg(test)]
 impl Default for InMemoryNodePolicyStore {
     fn default() -> Self {
         Self::new()
@@ -80,6 +84,7 @@ impl Default for InMemoryNodePolicyStore {
 }
 
 #[async_trait]
+#[cfg(test)]
 impl NodePolicyStore for InMemoryNodePolicyStore {
     async fn get_pod_node(&self, namespace: &str, name: &str) -> Option<String> {
         self.pod_node

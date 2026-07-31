@@ -17,8 +17,11 @@ use klights_auth::authentication::{
     client_cert_is_trusted_proxy, resolve_request_identity,
 };
 use klights_auth::clock::SnapshotClock;
-use klights_auth::cluster_identity::{BoundTokenSubjectLookup, ServiceAccountSigningKeyProvider};
 use klights_auth::impersonation::ImpersonationRequest;
+use klights_leader_api::{
+    ClusterIdentityError, ClusterIdentityFuture, LeaderBoundTokenSubjectLookup,
+    LeaderServiceAccountSigningKeyState, ServiceAccountSigningKeyPem,
+};
 
 pub const FORWARDED_CLIENT_CERT_HEADER: &str = "x-remote-client-certificate";
 const IMPERSONATE_USER: &str = "impersonate-user";
@@ -37,7 +40,7 @@ impl ApiAuthResources<'_> {
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-    ) -> Result<Option<String>, AuthenticationError> {
+    ) -> Result<Option<String>, ClusterIdentityError> {
         crate::api::resource_query_ports::get_resource(
             self.state.resource_mutation().resource_query.as_ref(),
             api_version,
@@ -47,7 +50,7 @@ impl ApiAuthResources<'_> {
         )
         .await
         .map_err(|error| {
-            AuthenticationError::dependency_failure(format!(
+            ClusterIdentityError::dependency_failure(format!(
                 "credential subject lookup failed: {error:?}"
             ))
         })
@@ -63,56 +66,63 @@ impl ApiAuthResources<'_> {
     }
 }
 
-#[async_trait::async_trait]
-impl ServiceAccountSigningKeyProvider for ApiAuthResources<'_> {
-    async fn service_account_signing_key_pem(&self) -> Result<String, AuthenticationError> {
+impl LeaderServiceAccountSigningKeyState for ApiAuthResources<'_> {
+    fn service_account_signing_key_pem(
+        &self,
+    ) -> ClusterIdentityFuture<'_, ServiceAccountSigningKeyPem> {
         self.state
             .operational()
             .signing_keys
             .service_account_signing_key_pem()
-            .await
     }
 }
 
-#[async_trait::async_trait]
-impl BoundTokenSubjectLookup for ApiAuthResources<'_> {
-    async fn service_account_uid(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> Result<Option<String>, AuthenticationError> {
-        self.resource_uid("v1", "ServiceAccount", Some(namespace), name)
-            .await
-    }
-
-    async fn pod_uid(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> Result<Option<String>, AuthenticationError> {
-        crate::api::pod_repository_ports::get_pod(
-            self.state.resource_mutation().pod_repository.as_ref(),
-            namespace,
-            name,
-        )
-        .await
-        .map(|pod| pod.map(|pod| pod.uid))
-        .map_err(|error| {
-            AuthenticationError::dependency_failure(format!("bound Pod lookup failed: {error}"))
+impl LeaderBoundTokenSubjectLookup for ApiAuthResources<'_> {
+    fn service_account_uid<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+    ) -> ClusterIdentityFuture<'a, Option<String>> {
+        Box::pin(async move {
+            self.resource_uid("v1", "ServiceAccount", Some(namespace), name)
+                .await
         })
     }
 
-    async fn node_uid(&self, name: &str) -> Result<Option<String>, AuthenticationError> {
-        self.resource_uid("v1", "Node", None, name).await
+    fn pod_uid<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+    ) -> ClusterIdentityFuture<'a, Option<String>> {
+        Box::pin(async move {
+            crate::api::pod_repository_ports::get_pod(
+                self.state.resource_mutation().pod_repository.as_ref(),
+                namespace,
+                name,
+            )
+            .await
+            .map(|pod| pod.map(|pod| pod.uid))
+            .map_err(|error| {
+                ClusterIdentityError::dependency_failure(format!(
+                    "bound Pod lookup failed: {error}"
+                ))
+            })
+        })
     }
 
-    async fn secret_uid(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> Result<Option<String>, AuthenticationError> {
-        self.resource_uid("v1", "Secret", Some(namespace), name)
-            .await
+    fn node_uid<'a>(&'a self, name: &'a str) -> ClusterIdentityFuture<'a, Option<String>> {
+        Box::pin(async move { self.resource_uid("v1", "Node", None, name).await })
+    }
+
+    fn secret_uid<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+    ) -> ClusterIdentityFuture<'a, Option<String>> {
+        Box::pin(async move {
+            self.resource_uid("v1", "Secret", Some(namespace), name)
+                .await
+        })
     }
 }
 
@@ -700,7 +710,7 @@ mod tests {
     async fn authorization_denial_writes_structured_audit_event() {
         let audit_sink = Arc::new(crate::audit::MemoryAuditSink::default());
         let authorizer: Arc<dyn klights_auth::authorizer::Authorizer> = Arc::new(
-            klights_auth::authorizer::RecordingAuthorizer::deny("policy denied secret read"),
+            crate::api::test_support::RecordingAuthorizer::deny("policy denied secret read"),
         );
         let mut state =
             crate::api::test_support::build_test_app_state_with_authorizer(authorizer).await;
@@ -743,7 +753,7 @@ mod tests {
     async fn pod_exec_authorization_writes_high_value_audit_event() {
         let audit_sink = Arc::new(crate::audit::MemoryAuditSink::default());
         let authorizer: Arc<dyn klights_auth::authorizer::Authorizer> =
-            Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
+            Arc::new(crate::api::test_support::RecordingAuthorizer::allow());
         let mut state =
             crate::api::test_support::build_test_app_state_with_authorizer(authorizer).await;
         state.audit_sink = audit_sink.clone();
@@ -836,7 +846,7 @@ mod tests {
                 let state = match failure.failure {
                     Failure::ForbiddenImpersonation => {
                         let authorizer: Arc<dyn klights_auth::authorizer::Authorizer> =
-                            Arc::new(klights_auth::authorizer::RecordingAuthorizer::deny(
+                            Arc::new(crate::api::test_support::RecordingAuthorizer::deny(
                                 "impersonation denied",
                             ));
                         crate::api::test_support::build_test_app_state_with_authorizer(authorizer)
@@ -844,7 +854,7 @@ mod tests {
                     }
                     Failure::AuthorizationDenied => {
                         let authorizer: Arc<dyn klights_auth::authorizer::Authorizer> =
-                            Arc::new(klights_auth::authorizer::RecordingAuthorizer::deny(
+                            Arc::new(crate::api::test_support::RecordingAuthorizer::deny(
                                 "authorization denied",
                             ));
                         crate::api::test_support::build_test_app_state_with_authorizer(authorizer)

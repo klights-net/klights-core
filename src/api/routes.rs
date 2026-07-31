@@ -593,7 +593,7 @@ async fn openid_jwks(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, 
         klights_supervisor::CryptoExecutor::new(state.operational().task_supervisor.clone());
     let jwks = crypto
         .run_blocking("build-openid-jwks", move || {
-            build_openid_jwks(&signing_key_pem)
+            build_openid_jwks(signing_key_pem.as_str())
         })
         .await
         .map_err(|error| AppError::InternalError(format!("OpenID JWK worker failed: {error}")))??;
@@ -819,8 +819,7 @@ mod status_tests {
         let mut config = crate::KlightsConfig::test_default();
         config.anonymous_auth = false;
         state.operational_mut().config = crate::api::ApiOperationalConfig::from_test(config);
-        state.authorizer =
-            std::sync::Arc::new(klights_auth::authorizer::AuthorizerChain::test_allow_all());
+        state.authorizer = std::sync::Arc::new(crate::api::test_support::AllowAllAuthorizer);
         let app = crate::api::build_router(state);
 
         let response = app

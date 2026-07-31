@@ -679,13 +679,15 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let (ca_cert, ca_key, ca_pem, _) =
-            klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
-        let (server_cert_pem, server_key_pem) = klights_auth::cert::generate_server_cert_at(
-            &ca_cert,
-            &ca_key,
-            time::OffsetDateTime::now_utc(),
-        )
-        .unwrap();
+            klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc())
+                .unwrap();
+        let (server_cert_pem, server_key_pem) =
+            klights_auth::test_support::generate_server_cert_at(
+                &ca_cert,
+                &ca_key,
+                time::OffsetDateTime::now_utc(),
+            )
+            .unwrap();
         let (proxy_cert_pem, proxy_key_pem) = klights_auth::cert::generate_api_proxy_cert(
             &ca_cert,
             &ca_key,
@@ -771,13 +773,15 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let (ca_cert, ca_key, ca_pem, _) =
-            klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
-        let (server_cert_pem, server_key_pem) = klights_auth::cert::generate_server_cert_at(
-            &ca_cert,
-            &ca_key,
-            time::OffsetDateTime::now_utc(),
-        )
-        .unwrap();
+            klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc())
+                .unwrap();
+        let (server_cert_pem, server_key_pem) =
+            klights_auth::test_support::generate_server_cert_at(
+                &ca_cert,
+                &ca_key,
+                time::OffsetDateTime::now_utc(),
+            )
+            .unwrap();
 
         let server_certs: Vec<rustls::pki_types::CertificateDer> =
             rustls_pemfile::certs(&mut server_cert_pem.as_bytes())

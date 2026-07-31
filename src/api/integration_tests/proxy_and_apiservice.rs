@@ -45,7 +45,7 @@ fn generate_apiservice_ca_signed_identity(
     use rcgen::CertificateParams;
 
     let (ca_cert, ca_key, ca_pem, _) =
-        klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+        klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
     let cert_params =
         CertificateParams::new(apiservice_service_dns_names(service, namespace)).unwrap();
     let key_pair = rcgen::KeyPair::generate().unwrap();
@@ -4410,13 +4410,14 @@ async fn test_tokenreview_unauthenticated_response_supports_protobuf() {
     let mut config = crate::KlightsConfig::test_default();
     config.containerd_namespace = namespace.clone();
     state.operational_mut().config = crate::api::ApiOperationalConfig::from_test(config);
-    let signing_key = klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc())
-        .unwrap()
-        .3;
+    let signing_key =
+        klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc())
+            .unwrap()
+            .3;
     let signing_key_path = api_test_data_root(&namespace)
         .join("etc")
         .join("service-account-signing.key");
-    crate::signing_key_state_adapter::persist(
+    klights_cluster_datastore::signing_key_state::persist(
         &signing_key_path,
         &signing_key,
         state.operational().task_supervisor.as_ref(),
@@ -5078,14 +5079,20 @@ async fn test_tokenreview_reports_signing_key_dependency_failure_in_status() {
         }
     }
     struct MissingSigningKey;
-    #[async_trait::async_trait]
-    impl klights_auth::cluster_identity::ServiceAccountSigningKeyProvider for MissingSigningKey {
-        async fn service_account_signing_key_pem(
+    impl klights_leader_api::LeaderServiceAccountSigningKeyState for MissingSigningKey {
+        fn service_account_signing_key_pem(
             &self,
-        ) -> Result<String, klights_auth::AuthenticationError> {
-            Err(klights_auth::AuthenticationError::dependency_failure(
-                "ServiceAccount signing key is unavailable",
-            ))
+        ) -> klights_leader_api::ClusterIdentityFuture<
+            '_,
+            klights_leader_api::ServiceAccountSigningKeyPem,
+        > {
+            Box::pin(async {
+                Err(
+                    klights_leader_api::ClusterIdentityError::dependency_failure(
+                        "ServiceAccount signing key is unavailable",
+                    ),
+                )
+            })
         }
     }
 
@@ -5248,13 +5255,14 @@ async fn test_tokenreview_reports_oidc_internal_failure_in_status() {
     let mut config = crate::KlightsConfig::test_default();
     config.containerd_namespace = namespace.clone();
     state.operational_mut().config = crate::api::ApiOperationalConfig::from_test(config);
-    let signing_key = klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc())
-        .unwrap()
-        .3;
+    let signing_key =
+        klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc())
+            .unwrap()
+            .3;
     let signing_key_path = api_test_data_root(&namespace)
         .join("etc")
         .join("service-account-signing.key");
-    crate::signing_key_state_adapter::persist(
+    klights_cluster_datastore::signing_key_state::persist(
         &signing_key_path,
         &signing_key,
         state.operational().task_supervisor.as_ref(),
@@ -5278,16 +5286,19 @@ async fn test_tokenreview_reports_bootstrap_store_failure_in_status() {
     use std::sync::Arc;
 
     struct FailingBootstrapStore;
-    #[async_trait::async_trait]
-    impl klights_auth::cluster_identity::BootstrapTokenAuthenticator for FailingBootstrapStore {
-        async fn authenticate_bootstrap_token(
-            &self,
-            _token: &str,
-        ) -> Result<klights_auth::AuthenticatedIdentity, klights_auth::AuthenticationError>
+    impl klights_leader_api::LeaderBootstrapTokenAuthentication for FailingBootstrapStore {
+        fn authenticate_bootstrap_token<'a>(
+            &'a self,
+            _token: &'a str,
+        ) -> klights_leader_api::ClusterIdentityFuture<'a, klights_leader_api::BootstrapTokenIdentity>
         {
-            Err(klights_auth::AuthenticationError::dependency_failure(
-                "bootstrap datastore unavailable",
-            ))
+            Box::pin(async {
+                Err(
+                    klights_leader_api::ClusterIdentityError::dependency_failure(
+                        "bootstrap datastore unavailable",
+                    ),
+                )
+            })
         }
     }
 
@@ -10073,7 +10084,7 @@ async fn apiservice_proxy_forwards_real_caller_identity_headers() {
         .unwrap();
 
     let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
-        std::sync::Arc::new(klights_auth::authorizer::AllowAllAuthorizer);
+        std::sync::Arc::new(crate::api::test_support::AllowAllAuthorizer);
     let mut test_state = build_test_app_state().await;
     test_state.resource_mutation_mut().db = state.resource_mutation().db.clone();
     test_state.authorizer = authorizer;
@@ -10253,7 +10264,7 @@ async fn custom_resource_allowed_identity_gets_normal_response() {
     use tower::ServiceExt;
 
     let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
-        std::sync::Arc::new(klights_auth::authorizer::AllowAllAuthorizer);
+        std::sync::Arc::new(crate::api::test_support::AllowAllAuthorizer);
     let state = build_test_app_state_with_authorizer(authorizer).await;
 
     // Register a CRD

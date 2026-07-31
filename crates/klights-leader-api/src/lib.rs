@@ -4360,6 +4360,152 @@ pub trait BootstrapTokenValidation: Send + Sync {
     ) -> BootstrapTokenValidationFuture<'_>;
 }
 
+/// Failure returned by focused cluster identity and signing-state reads.
+///
+/// The contract preserves the caller-visible failure class without exposing a
+/// datastore, filesystem, authentication-framework, or transport error.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClusterIdentityError {
+    Rejected { message: String },
+    DependencyFailure { message: String },
+    InternalFailure { message: String },
+}
+
+impl ClusterIdentityError {
+    pub fn rejected(message: impl Into<String>) -> Self {
+        Self::Rejected {
+            message: message.into(),
+        }
+    }
+
+    pub fn dependency_failure(message: impl Into<String>) -> Self {
+        Self::DependencyFailure {
+            message: message.into(),
+        }
+    }
+
+    pub fn internal_failure(message: impl Into<String>) -> Self {
+        Self::InternalFailure {
+            message: message.into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Rejected { message }
+            | Self::DependencyFailure { message }
+            | Self::InternalFailure { message } => message,
+        }
+    }
+}
+
+impl fmt::Display for ClusterIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl std::error::Error for ClusterIdentityError {}
+
+/// Validated bootstrap identity projected from durable leader-owned state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BootstrapTokenIdentity {
+    token_id: String,
+    extra_groups: Vec<String>,
+}
+
+impl BootstrapTokenIdentity {
+    pub fn try_new(
+        token_id: impl Into<String>,
+        extra_groups: Vec<String>,
+    ) -> Result<Self, ClusterIdentityError> {
+        let token_id = token_id.into();
+        if token_id.is_empty() {
+            return Err(ClusterIdentityError::internal_failure(
+                "bootstrap identity token ID must not be empty",
+            ));
+        }
+        Ok(Self {
+            token_id,
+            extra_groups,
+        })
+    }
+
+    pub fn token_id(&self) -> &str {
+        &self.token_id
+    }
+
+    pub fn extra_groups(&self) -> &[String] {
+        &self.extra_groups
+    }
+}
+
+/// Validated PEM projection of the current durable ServiceAccount signer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceAccountSigningKeyPem(String);
+
+impl ServiceAccountSigningKeyPem {
+    pub fn try_new(pem: impl Into<String>) -> Result<Self, ClusterIdentityError> {
+        let pem = pem.into();
+        if pem.trim().is_empty() {
+            return Err(ClusterIdentityError::internal_failure(
+                "ServiceAccount signing key PEM must not be empty",
+            ));
+        }
+        Ok(Self(pem))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+pub type ClusterIdentityFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, ClusterIdentityError>> + Send + 'a>>;
+
+/// Authenticate one bootstrap credential against durable leader-owned state.
+pub trait LeaderBootstrapTokenAuthentication: Send + Sync {
+    fn authenticate_bootstrap_token<'a>(
+        &'a self,
+        token: &'a str,
+    ) -> ClusterIdentityFuture<'a, BootstrapTokenIdentity>;
+}
+
+/// Read the current durable ServiceAccount signing authority.
+pub trait LeaderServiceAccountSigningKeyState: Send + Sync {
+    fn service_account_signing_key_pem(
+        &self,
+    ) -> ClusterIdentityFuture<'_, ServiceAccountSigningKeyPem>;
+}
+
+/// Resolve current UIDs used by projected ServiceAccount token binding policy.
+pub trait LeaderBoundTokenSubjectLookup: Send + Sync {
+    fn service_account_uid<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+    ) -> ClusterIdentityFuture<'a, Option<String>>;
+
+    fn pod_uid<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+    ) -> ClusterIdentityFuture<'a, Option<String>>;
+
+    fn node_uid<'a>(&'a self, name: &'a str) -> ClusterIdentityFuture<'a, Option<String>>;
+
+    fn secret_uid<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+    ) -> ClusterIdentityFuture<'a, Option<String>>;
+}
+
 fn require_delivery_nonempty(value: &str, field: &'static str) -> Result<(), OutboxDeliveryError> {
     if value.is_empty() {
         Err(OutboxDeliveryError::invalid(field, "must not be empty"))

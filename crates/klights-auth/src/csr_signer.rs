@@ -207,10 +207,12 @@ impl ControlplaneCredentialPolicy {
 
 /// Recording signer for tests. Records all sign requests and returns
 /// a fixed certificate. Never calls real TLS.
-pub struct RecordingCsrSigner {
+#[cfg(test)]
+pub(crate) struct RecordingCsrSigner {
     requests: std::sync::Mutex<Vec<SignRequest>>,
 }
 
+#[cfg(test)]
 impl RecordingCsrSigner {
     pub fn new() -> Self {
         Self {
@@ -227,12 +229,14 @@ impl RecordingCsrSigner {
     }
 }
 
+#[cfg(test)]
 impl Default for RecordingCsrSigner {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl CsrSigner for RecordingCsrSigner {
     fn sign(&self, request: SignRequest) -> Result<SignResult, crate::CredentialOperationError> {
         self.requests.lock().unwrap().push(request);

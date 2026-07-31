@@ -163,7 +163,7 @@ fn generate_rsa_key_pair() -> Result<KeyPair> {
 /// Returns: (cert, key, cert_pem, key_pem)
 /// - `cert` and `key`: rcgen objects for signing
 /// - `cert_pem` and `key_pem`: PEM strings for file I/O
-pub fn generate_ca_full_at(
+pub(crate) fn generate_ca_full_at(
     valid_at: OffsetDateTime,
 ) -> Result<(rcgen::Certificate, KeyPair, String, String)> {
     let params = generate_ca_params_at(valid_at);
@@ -220,7 +220,8 @@ fn generate_server_cert_from_config(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn generate_server_cert_with_config_at(
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn generate_server_cert_with_config_at(
     ca_cert: &rcgen::Certificate,
     ca_key: &KeyPair,
     service_cidr: &str,
@@ -268,7 +269,8 @@ pub fn generate_server_cert_with_config(
 
 /// Generate a server certificate with deterministic fixture defaults at a
 /// caller-selected time.
-pub fn generate_server_cert_at(
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn generate_server_cert_at(
     ca_cert: &rcgen::Certificate,
     ca_key: &KeyPair,
     valid_at: OffsetDateTime,
@@ -296,7 +298,7 @@ pub fn generate_server_cert(
 }
 
 /// Generate an admin certificate signed by the CA.
-pub fn generate_admin_cert_at(
+pub(crate) fn generate_admin_cert_at(
     ca_cert: &rcgen::Certificate,
     ca_key: &KeyPair,
     valid_at: OffsetDateTime,

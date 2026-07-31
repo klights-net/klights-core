@@ -1,4 +1,116 @@
 #[cfg(test)]
+mod auth_fakes {
+    use std::sync::Mutex;
+
+    pub(crate) struct AllowAllAuthorizer;
+
+    #[async_trait::async_trait]
+    impl klights_auth::authorizer::Authorizer for AllowAllAuthorizer {
+        async fn authorize(
+            &self,
+            _identity: &klights_auth::AuthenticatedIdentity,
+            _request: &klights_auth::request_attributes::AuthorizationRequest,
+        ) -> klights_auth::authorizer::AuthorizationDecision {
+            klights_auth::authorizer::AuthorizationDecision::allow("test allow-all")
+        }
+    }
+
+    pub(crate) struct RecordingAuthorizer {
+        requests: tokio::sync::Mutex<
+            Vec<(
+                klights_auth::AuthenticatedIdentity,
+                klights_auth::request_attributes::AuthorizationRequest,
+            )>,
+        >,
+        decision: tokio::sync::Mutex<klights_auth::authorizer::AuthorizationDecision>,
+    }
+
+    impl RecordingAuthorizer {
+        pub(crate) fn allow() -> Self {
+            Self::new(klights_auth::authorizer::AuthorizationDecision::allow(
+                "recording allow",
+            ))
+        }
+
+        pub(crate) fn deny(reason: &str) -> Self {
+            Self::new(klights_auth::authorizer::AuthorizationDecision::deny(
+                reason,
+            ))
+        }
+
+        fn new(decision: klights_auth::authorizer::AuthorizationDecision) -> Self {
+            Self {
+                requests: tokio::sync::Mutex::new(Vec::new()),
+                decision: tokio::sync::Mutex::new(decision),
+            }
+        }
+
+        pub(crate) async fn take_requests(
+            &self,
+        ) -> Vec<(
+            klights_auth::AuthenticatedIdentity,
+            klights_auth::request_attributes::AuthorizationRequest,
+        )> {
+            std::mem::take(&mut *self.requests.lock().await)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl klights_auth::authorizer::Authorizer for RecordingAuthorizer {
+        async fn authorize(
+            &self,
+            identity: &klights_auth::AuthenticatedIdentity,
+            request: &klights_auth::request_attributes::AuthorizationRequest,
+        ) -> klights_auth::authorizer::AuthorizationDecision {
+            self.requests
+                .lock()
+                .await
+                .push((identity.clone(), request.clone()));
+            self.decision.lock().await.clone()
+        }
+    }
+
+    pub(crate) struct RecordingCsrSigner {
+        requests: Mutex<Vec<klights_auth::csr_signer::SignRequest>>,
+    }
+
+    impl RecordingCsrSigner {
+        pub(crate) fn new() -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub(crate) fn request_count(&self) -> usize {
+            self.requests
+                .lock()
+                .expect("recording CSR signer lock")
+                .len()
+        }
+    }
+
+    impl klights_auth::csr_signer::CsrSigner for RecordingCsrSigner {
+        fn sign(
+            &self,
+            request: klights_auth::csr_signer::SignRequest,
+        ) -> Result<klights_auth::csr_signer::SignResult, klights_auth::CredentialOperationError>
+        {
+            self.requests
+                .lock()
+                .expect("recording CSR signer lock")
+                .push(request);
+            Ok(klights_auth::csr_signer::SignResult {
+                certificate_pem: "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n"
+                    .to_string(),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) use auth_fakes::{AllowAllAuthorizer, RecordingAuthorizer, RecordingCsrSigner};
+
+#[cfg(test)]
 pub(crate) fn test_admin(username: impl Into<String>) -> klights_auth::AuthenticatedIdentity {
     klights_auth::AuthenticatedIdentity::client_cert(
         username.into(),
@@ -132,7 +244,7 @@ pub(crate) async fn build_test_app_state_with_db(
     );
     crate::api::ApiState::new(
         crate::api::ApiAuthPolicy::new(
-            std::sync::Arc::new(klights_auth::authorizer::AuthorizerChain::test_allow_all()),
+            std::sync::Arc::new(AllowAllAuthorizer),
             crate::audit::default_audit_sink(),
             std::sync::Arc::new(crate::api::priority_fairness::ApiPriorityFairness::new()),
             std::sync::Arc::new(

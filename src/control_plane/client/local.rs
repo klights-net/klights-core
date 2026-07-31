@@ -501,7 +501,7 @@ impl LocalApiClient {
             if let Some(probe) = projected_token_issue_test_probe(&self.containerd_namespace) {
                 (probe.async_boundary)().await;
             }
-            let signing_key_pem = crate::signing_key_state_adapter::read_with_executor(
+            let signing_key_pem = klights_cluster_datastore::signing_key_state::read_with_executor(
                 &self.service_account_signing_key_path,
                 &self.file_process,
             )
@@ -2659,9 +2659,10 @@ mod inner_gate_tests {
         let namespace = data_root.path().to_str().unwrap().to_string();
         let signing_key_path = data_root.path().join("etc/service-account-signing.key");
         klights_supervisor::runtime_fs::create_dir_all(signing_key_path.parent().unwrap()).unwrap();
-        let signing_key = klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc())
-            .unwrap()
-            .3;
+        let signing_key =
+            klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc())
+                .unwrap()
+                .3;
         std::fs::write(&signing_key_path, &signing_key).unwrap();
         let local = Arc::new(
             LocalApiClient::new_with_node_lease_tracker_namespace_signing_key_and_file_process(

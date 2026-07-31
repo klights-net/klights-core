@@ -819,7 +819,7 @@ async fn create_serviceaccount_token(
                 .collect::<Vec<_>>();
             klights_auth::generate_sa_token_with_bound_pod_at(
                 klights_auth::ServiceAccountTokenRequest {
-                    ca_key_pem: &signing_key_pem,
+                    ca_key_pem: signing_key_pem.as_str(),
                     service_account: &signing_name,
                     namespace: &signing_namespace,
                     audiences: &audience_refs,

@@ -30,33 +30,35 @@ impl DatastoreBootstrapTokenAuthenticator {
     }
 }
 
-#[async_trait]
-impl klights_auth::cluster_identity::BootstrapTokenAuthenticator
+impl klights_leader_api::LeaderBootstrapTokenAuthentication
     for DatastoreBootstrapTokenAuthenticator
 {
-    async fn authenticate_bootstrap_token(
-        &self,
-        token: &str,
-    ) -> Result<klights_auth::AuthenticatedIdentity, klights_auth::AuthenticationError> {
-        crate::bootstrap::bootstrap_token::validate_bootstrap_token(self.db.as_ref(), token)
-            .await
-            .map(|identity| {
-                klights_auth::AuthenticatedIdentity::bootstrap(
-                    &identity.token_id,
-                    &identity.extra_groups,
-                )
-            })
-            .map_err(|error| match error {
-                crate::bootstrap::bootstrap_token::BootstrapTokenAuthenticationError::Rejected {
-                    message,
-                } => klights_auth::AuthenticationError::unauthenticated(message),
-                crate::bootstrap::bootstrap_token::BootstrapTokenAuthenticationError::DependencyFailure {
-                    message,
-                } => klights_auth::AuthenticationError::dependency_failure(message),
-                crate::bootstrap::bootstrap_token::BootstrapTokenAuthenticationError::InternalFailure {
-                    message,
-                } => klights_auth::AuthenticationError::internal_failure(message),
-            })
+    fn authenticate_bootstrap_token<'a>(
+        &'a self,
+        token: &'a str,
+    ) -> klights_leader_api::ClusterIdentityFuture<'a, klights_leader_api::BootstrapTokenIdentity>
+    {
+        Box::pin(async move {
+            crate::bootstrap::bootstrap_token::validate_bootstrap_token(self.db.as_ref(), token)
+                .await
+                .map_err(|error| match error {
+                    crate::bootstrap::bootstrap_token::BootstrapTokenAuthenticationError::Rejected {
+                        message,
+                    } => klights_leader_api::ClusterIdentityError::rejected(message),
+                    crate::bootstrap::bootstrap_token::BootstrapTokenAuthenticationError::DependencyFailure {
+                        message,
+                    } => klights_leader_api::ClusterIdentityError::dependency_failure(message),
+                    crate::bootstrap::bootstrap_token::BootstrapTokenAuthenticationError::InternalFailure {
+                        message,
+                    } => klights_leader_api::ClusterIdentityError::internal_failure(message),
+                })
+                .and_then(|identity| {
+                    klights_leader_api::BootstrapTokenIdentity::try_new(
+                        identity.token_id,
+                        identity.extra_groups,
+                    )
+                })
+        })
     }
 }
 

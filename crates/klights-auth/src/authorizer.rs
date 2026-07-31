@@ -95,11 +95,6 @@ impl AuthorizerChain {
         ])
     }
 
-    /// Create a permissive chain for tests (allow everything).
-    pub fn test_allow_all() -> Self {
-        Self::new(vec![Box::new(AllowAllAuthorizer)])
-    }
-
     /// Create the full production chain with RBAC.
     ///
     /// Order: system:masters bypass → bootstrap CSR → RBAC → Node authorizer → deny.
@@ -177,67 +172,6 @@ impl Authorizer for DenyAuthorizer {
         _request: &AuthorizationRequest,
     ) -> AuthorizationDecision {
         AuthorizationDecision::deny("RBAC denial")
-    }
-}
-
-/// Allow-all authorizer for tests.
-pub struct AllowAllAuthorizer;
-
-#[async_trait]
-impl Authorizer for AllowAllAuthorizer {
-    async fn authorize(
-        &self,
-        _identity: &AuthenticatedIdentity,
-        _request: &AuthorizationRequest,
-    ) -> AuthorizationDecision {
-        AuthorizationDecision::allow("test allow-all")
-    }
-}
-
-/// Recording authorizer for tests — records every authorization request and returns a
-/// configurable decision.
-pub struct RecordingAuthorizer {
-    pub requests: tokio::sync::Mutex<Vec<(AuthenticatedIdentity, AuthorizationRequest)>>,
-    pub decision: tokio::sync::Mutex<AuthorizationDecision>,
-}
-
-impl RecordingAuthorizer {
-    pub fn new(decision: AuthorizationDecision) -> Self {
-        Self {
-            requests: tokio::sync::Mutex::new(Vec::new()),
-            decision: tokio::sync::Mutex::new(decision),
-        }
-    }
-
-    pub fn allow() -> Self {
-        Self::new(AuthorizationDecision::allow("recording allow"))
-    }
-
-    pub fn deny(reason: &str) -> Self {
-        Self::new(AuthorizationDecision::deny(reason))
-    }
-
-    pub async fn set_decision(&self, decision: AuthorizationDecision) {
-        *self.decision.lock().await = decision;
-    }
-
-    pub async fn take_requests(&self) -> Vec<(AuthenticatedIdentity, AuthorizationRequest)> {
-        std::mem::take(&mut *self.requests.lock().await)
-    }
-}
-
-#[async_trait]
-impl Authorizer for RecordingAuthorizer {
-    async fn authorize(
-        &self,
-        identity: &AuthenticatedIdentity,
-        request: &AuthorizationRequest,
-    ) -> AuthorizationDecision {
-        self.requests
-            .lock()
-            .await
-            .push((identity.clone(), request.clone()));
-        self.decision.lock().await.clone()
     }
 }
 

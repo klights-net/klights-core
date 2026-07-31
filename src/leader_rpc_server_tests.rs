@@ -100,7 +100,7 @@ async fn grpc_test_server_with_signing_ca(
         .await
         .unwrap();
     let (ca_cert, ca_key, ca_cert_pem, ca_key_pem) =
-        klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+        klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
     let etc = std::path::Path::new(namespace).join("etc");
     let ca_cert_path = etc.join("ca.crt");
     let ca_key_path = etc.join("ca.key");

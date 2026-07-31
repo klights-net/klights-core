@@ -3034,7 +3034,7 @@ async fn pod_and_node_proxy_use_method_specific_rbac_verbs() {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    let recorder = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
+    let recorder = std::sync::Arc::new(crate::api::test_support::RecordingAuthorizer::allow());
     let state = crate::api::test_support::build_test_app_state_with_authorizer(
         recorder.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>
     )
@@ -3267,7 +3267,7 @@ async fn tokenrequest_authorization_has_correct_verb_and_resource() {
     use serde_json::json;
     use tower::ServiceExt;
 
-    let recording = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
+    let recording = std::sync::Arc::new(crate::api::test_support::RecordingAuthorizer::allow());
     let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
         recording.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>;
     let app = crate::api::test_support::build_test_router_with_authorizer(authorizer.clone()).await;
@@ -3310,7 +3310,7 @@ async fn pod_log_authorization_has_correct_subresource() {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    let recording = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
+    let recording = std::sync::Arc::new(crate::api::test_support::RecordingAuthorizer::allow());
     let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
         recording.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>;
     let app = crate::api::test_support::build_test_router_with_authorizer(authorizer.clone()).await;
@@ -3345,7 +3345,7 @@ async fn handwritten_routes_emit_exact_rbac_attributes() {
     use serde_json::json;
     use tower::ServiceExt;
 
-    let recording = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
+    let recording = std::sync::Arc::new(crate::api::test_support::RecordingAuthorizer::allow());
     let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
         recording.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>;
     let app = crate::api::test_support::build_test_router_with_authorizer(authorizer.clone()).await;
@@ -4196,7 +4196,7 @@ async fn pod_list_authorization_attributes_recorded_by_middleware() {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    let recording = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
+    let recording = std::sync::Arc::new(crate::api::test_support::RecordingAuthorizer::allow());
     let authorizer: std::sync::Arc<dyn klights_auth::authorizer::Authorizer> =
         recording.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>;
     let app = crate::api::test_support::build_test_router_with_authorizer(authorizer).await;

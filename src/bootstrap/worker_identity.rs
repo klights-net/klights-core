@@ -1244,7 +1244,8 @@ mod tests {
 
     fn generate_csr_bootstrap_tls_identity() -> (String, String, String) {
         let (ca_cert, ca_key, ca_cert_pem, _) =
-            klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+            klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc())
+                .unwrap();
         let server_key = rcgen::KeyPair::generate().unwrap();
         let mut server_params =
             rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
@@ -1357,7 +1358,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let (_, _, stale_ca_pem, _) =
-            klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+            klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc())
+                .unwrap();
         let stale_ca_path = dir.path().join("stale-system-ca.crt");
         let empty_ca_dir = dir.path().join("empty-ca-dir");
         std::fs::write(&stale_ca_path, stale_ca_pem).unwrap();

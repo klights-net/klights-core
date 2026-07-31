@@ -5242,7 +5242,7 @@ async fn test_api_accepts_valid_serviceaccount_bearer_token() {
     )
     .expect("fixed authentication time");
     state.operational_mut().clock =
-        std::sync::Arc::new(klights_auth::clock::FixedClock { now: fixed_now });
+        std::sync::Arc::new(klights_auth::clock::SnapshotClock::new(fixed_now));
 
     // Phase 2B: SA must exist for UID validation.
     // Create the ServiceAccount before generating the token.
@@ -5314,7 +5314,7 @@ async fn serviceaccount_token_request_uses_injected_api_wall_clock() {
     )
     .expect("fixed API wall clock");
     state.operational_mut().clock =
-        std::sync::Arc::new(klights_auth::clock::FixedClock { now: fixed_now });
+        std::sync::Arc::new(klights_auth::clock::SnapshotClock::new(fixed_now));
     state
         .resource_mutation()
         .db
@@ -5400,8 +5400,8 @@ async fn test_task_supervisor_accepts_admin_client_certificate_identity() {
     use tower::ServiceExt;
 
     let (ca_cert, ca_key, _, _) =
-        klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
-    let (admin_cert_pem, _) = klights_auth::cert::generate_admin_cert_at(
+        klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+    let (admin_cert_pem, _) = klights_auth::test_support::generate_admin_cert_at(
         &ca_cert,
         &ca_key,
         time::OffsetDateTime::now_utc(),
@@ -5433,8 +5433,8 @@ async fn test_task_supervisor_rejects_non_admin_client_certificate_identity() {
     use tower::ServiceExt;
 
     let (ca_cert, ca_key, _, _) =
-        klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
-    let (server_cert_pem, _) = klights_auth::cert::generate_server_cert_at(
+        klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+    let (server_cert_pem, _) = klights_auth::test_support::generate_server_cert_at(
         &ca_cert,
         &ca_key,
         time::OffsetDateTime::now_utc(),
@@ -5497,14 +5497,14 @@ async fn test_trusted_api_proxy_identity_is_authorized_as_delegated_user() {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let recording = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
+    let recording = std::sync::Arc::new(crate::api::test_support::RecordingAuthorizer::allow());
     let mut state = crate::api::test_support::build_test_app_state().await;
     state.authorizer =
         recording.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>;
     let app = crate::api::build_router(state);
 
     let (ca_cert, ca_key, _, _) =
-        klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+        klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
     let proxy_cert_pem = generate_test_client_cert(
         &ca_cert,
         &ca_key,
@@ -5551,15 +5551,15 @@ async fn test_server_cert_identity_cannot_delegate_requestheaders() {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let recording = std::sync::Arc::new(klights_auth::authorizer::RecordingAuthorizer::allow());
+    let recording = std::sync::Arc::new(crate::api::test_support::RecordingAuthorizer::allow());
     let mut state = crate::api::test_support::build_test_app_state().await;
     state.authorizer =
         recording.clone() as std::sync::Arc<dyn klights_auth::authorizer::Authorizer>;
     let app = crate::api::build_router(state);
 
     let (ca_cert, ca_key, _, _) =
-        klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
-    let (server_cert_pem, _) = klights_auth::cert::generate_server_cert_at(
+        klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+    let (server_cert_pem, _) = klights_auth::test_support::generate_server_cert_at(
         &ca_cert,
         &ca_key,
         time::OffsetDateTime::now_utc(),
@@ -5630,8 +5630,8 @@ async fn test_raft_follower_proxy_forwards_authenticated_client_cert_identity_he
     let app = crate::api_server_shell::build_router_with_authority(state, authority_router);
 
     let (ca_cert, ca_key, _, _) =
-        klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
-    let (admin_cert_pem, _) = klights_auth::cert::generate_admin_cert_at(
+        klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+    let (admin_cert_pem, _) = klights_auth::test_support::generate_admin_cert_at(
         &ca_cert,
         &ca_key,
         time::OffsetDateTime::now_utc(),

@@ -513,7 +513,7 @@ mod tests {
             std::fs::create_dir_all(&etc_dir).expect("create namespace runtime etc directory");
 
             let (ca_cert, ca_key, ca_pem, ca_key_pem) =
-                klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc())
+                klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc())
                     .expect("generate namespace fixture CA");
             let (proxy_cert_pem, proxy_key_pem) =
                 klights_auth::cert::generate_apiservice_proxy_cert(

@@ -60,7 +60,7 @@ pub async fn setup_leader(
                 .context("Failed to resolve server cert CSR via leader RPC")?;
         }
     }
-    crate::signing_key_state_adapter::ensure(
+    klights_cluster_datastore::signing_key_state::ensure(
         &std::path::Path::new(&cfg.etc_dir).join("service-account-signing.key"),
         role_allows_local_ca_generation(role),
         cfg.supervisor.as_ref(),
@@ -189,7 +189,7 @@ async fn resolve_csr_via_rpc(
         let service_account_signing_key_pem = String::from_utf8(service_account_signing_key_bytes)
             .context("ServiceAccount signing key from CSR response is not UTF-8 PEM")?;
         let service_account_signing_key_path = pending.etc_dir.join("service-account-signing.key");
-        crate::signing_key_state_adapter::persist(
+        klights_cluster_datastore::signing_key_state::persist(
             &service_account_signing_key_path,
             &service_account_signing_key_pem,
             cfg.supervisor.as_ref(),
@@ -663,13 +663,15 @@ mod tests {
                 .unwrap();
 
         let (ca_cert, ca_key, ca_cert_pem, ca_key_pem) =
-            klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
-        let (server_cert_pem, server_key_pem) = klights_auth::cert::generate_server_cert_at(
-            &ca_cert,
-            &ca_key,
-            time::OffsetDateTime::now_utc(),
-        )
-        .unwrap();
+            klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc())
+                .unwrap();
+        let (server_cert_pem, server_key_pem) =
+            klights_auth::test_support::generate_server_cert_at(
+                &ca_cert,
+                &ca_key,
+                time::OffsetDateTime::now_utc(),
+            )
+            .unwrap();
         drop((ca_cert, ca_key));
         let leader_etc_dir = leader_data_root.join("etc");
         let leader_ca_cert_path = leader_etc_dir.join("ca.crt");

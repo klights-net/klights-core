@@ -263,13 +263,15 @@ mod cases {
         std::fs::create_dir_all(&etc_dir).unwrap();
 
         let (ca_cert, ca_key, ca_cert_pem, _ca_key_pem) =
-            klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
-        let (server_cert_pem, server_key_pem) = klights_auth::cert::generate_server_cert_at(
-            &ca_cert,
-            &ca_key,
-            time::OffsetDateTime::now_utc(),
-        )
-        .unwrap();
+            klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc())
+                .unwrap();
+        let (server_cert_pem, server_key_pem) =
+            klights_auth::test_support::generate_server_cert_at(
+                &ca_cert,
+                &ca_key,
+                time::OffsetDateTime::now_utc(),
+            )
+            .unwrap();
         let (node_cert_pem, node_key_pem) =
             generate_node_client_cert(&ca_cert, &ca_key, "worker-1");
         let ca_cert_path = crate::paths::ca_cert_path(namespace);
@@ -278,7 +280,8 @@ mod cases {
         std::fs::write(crate::paths::server_key_path(namespace), server_key_pem).unwrap();
 
         let (_, _, wrong_ca_cert_pem, _) =
-            klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+            klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc())
+                .unwrap();
         let wrong_ca_cert_path = etc_dir.join("wrong-ca.crt");
         std::fs::write(&wrong_ca_cert_path, wrong_ca_cert_pem).unwrap();
 
