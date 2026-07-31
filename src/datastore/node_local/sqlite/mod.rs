@@ -168,53 +168,6 @@ impl super::NodeLocalStores {
     }
 
     #[cfg(test)]
-    pub async fn clear_outbox_stream_identity_for_test(&self, idempotency_key: &str) -> Result<()> {
-        let idempotency_key = idempotency_key.to_string();
-        self.with_test_connection("node_local:outbox_legacy_stream_test", move |conn| {
-            let tx = conn.transaction()?;
-            let changed = tx.execute(
-                "UPDATE outbox SET client_id = '', stream_id = 0, stream_seq = 0 \
-                 WHERE idempotency_key = ?1",
-                [&idempotency_key],
-            )?;
-            if changed != 1 {
-                return Err(tokio_rusqlite::Error::Other(Box::new(
-                    std::io::Error::other(format!(
-                        "test legacy identity mutation changed {changed} rows instead of exactly one"
-                    )),
-                )));
-            }
-            tx.execute("DELETE FROM outbox_stream_sequences", [])?;
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-        .map_err(|error| anyhow!("outbox legacy stream test mutation failed: {error}"))
-    }
-
-    #[cfg(test)]
-    pub async fn clear_all_outbox_stream_identity_for_test(&self) -> Result<()> {
-        self.with_test_connection("node_local:outbox_legacy_stream_all_test", move |conn| {
-            let tx = conn.transaction()?;
-            tx.execute(
-                "UPDATE outbox SET client_id = '', stream_id = 0, stream_seq = 0 \
-                 WHERE operation != 'LeaseRenew'",
-                [],
-            )?;
-            tx.execute(
-                "UPDATE outbox_dead_letter SET client_id = '', stream_id = 0, stream_seq = 0 \
-                 WHERE operation != 'LeaseRenew'",
-                [],
-            )?;
-            tx.execute("DELETE FROM outbox_stream_sequences", [])?;
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-        .map_err(|error| anyhow!("outbox legacy stream test mutation failed: {error}"))
-    }
-
-    #[cfg(test)]
     pub async fn set_outbox_operation_for_test(
         &self,
         idempotency_key: &str,
@@ -257,31 +210,6 @@ impl super::NodeLocalStores {
         })
         .await
         .map_err(|error| anyhow!("outbox operation test read failed: {error}"))
-    }
-
-    #[cfg(test)]
-    pub async fn set_outbox_attempt_for_test(
-        &self,
-        idempotency_key: &str,
-        attempt: i64,
-    ) -> Result<()> {
-        let idempotency_key = idempotency_key.to_string();
-        self.with_test_connection("node_local:outbox_attempt_test_update", move |conn| {
-            let changed = conn.execute(
-                "UPDATE outbox SET attempt = ?2 WHERE idempotency_key = ?1",
-                rusqlite::params![idempotency_key, attempt],
-            )?;
-            if changed != 1 {
-                return Err(tokio_rusqlite::Error::Other(Box::new(
-                    std::io::Error::other(format!(
-                        "test attempt mutation changed {changed} rows instead of exactly one"
-                    )),
-                )));
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|error| anyhow!("outbox attempt test update failed: {error}"))
     }
 
     #[cfg(test)]
@@ -333,81 +261,6 @@ impl super::NodeLocalStores {
         .await
         .map_err(|error| anyhow!("dead letter test insert failed: {error}"))
     }
-
-    #[cfg(test)]
-    pub async fn table_names_for_test(&self) -> Result<Vec<String>> {
-        self.with_test_connection("node_local:test_table_names", move |conn| {
-            let rows = conn
-                .prepare(
-                    "SELECT name FROM sqlite_master \
-                     WHERE type='table' AND name NOT LIKE 'sqlite_%' \
-                     ORDER BY name",
-                )?
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await
-        .map_err(|e| anyhow!("test table names failed: {e}"))
-    }
-
-    #[cfg(test)]
-    pub async fn table_has_not_null_column_for_test(
-        &self,
-        table: &str,
-        column: &str,
-    ) -> Result<bool> {
-        let table = table.to_string();
-        let column = column.to_string();
-        self.with_test_connection("node_local:test_not_null_column", move |conn| {
-            let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", quote_ident(&table)))?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let name: String = row.get(1)?;
-                let ty: String = row.get(2)?;
-                let not_null: i64 = row.get(3)?;
-                if name == column {
-                    return Ok(not_null == 1 && ty.eq_ignore_ascii_case("TEXT"));
-                }
-            }
-            Ok(false)
-        })
-        .await
-        .map_err(|e| anyhow!("test column check failed: {e}"))
-    }
-
-    #[cfg(test)]
-    pub async fn schema_contains_full_resource_body_column_for_test(&self) -> Result<bool> {
-        self.with_test_connection("node_local:test_body_column", move |conn| {
-            let tables = conn
-                .prepare(
-                    "SELECT name FROM sqlite_master \
-                     WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-                )?
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            for table in tables {
-                let mut stmt =
-                    conn.prepare(&format!("PRAGMA table_info({})", quote_ident(&table)))?;
-                let mut rows = stmt.query([])?;
-                while let Some(row) = rows.next()? {
-                    let name: String = row.get(1)?;
-                    let ty: String = row.get(2)?;
-                    if name == "data" && ty.eq_ignore_ascii_case("BLOB") {
-                        return Ok(true);
-                    }
-                }
-            }
-            Ok(false)
-        })
-        .await
-        .map_err(|e| anyhow!("test body column check failed: {e}"))
-    }
-}
-
-#[cfg(test)]
-fn quote_ident(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 #[cfg(test)]

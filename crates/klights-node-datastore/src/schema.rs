@@ -710,4 +710,15 @@ mod tests {
             .unwrap();
         assert_eq!(index_count, 3);
     }
+
+    #[test]
+    fn node_local_outbox_hash_reserves_zero_for_unsequenced_ops() {
+        for index in 0..4096 {
+            let subject_key = format!("v1/Pod/default/web-{index}/uid-{index}");
+            assert!(
+                super::outbox_stream_id(&subject_key) > 0,
+                "normal hashed subject {subject_key} must use a positive stream id"
+            );
+        }
+    }
 }
