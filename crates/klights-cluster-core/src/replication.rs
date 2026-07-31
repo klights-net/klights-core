@@ -18,11 +18,13 @@ pub struct StreamRequest {
     pub start_rv: i64,
 }
 
-/// A single item in the command stream.
+/// A single liveness item in the leader control stream.
+///
+/// Command-entry fanout was retired with the Phase 12F ownership close. The
+/// current stream carries control traffic plus this progress heartbeat; durable
+/// resource delivery uses committed Raft apply and positioned watches.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StreamItem {
-    /// A replicated command with metadata.
-    Entry(Box<ReplicationEntry>),
     /// A keep-alive / heartbeat when no commands have been produced.
     Heartbeat { current_rv: i64 },
 }
@@ -69,18 +71,6 @@ mod tests {
             serde_json::from_slice::<StreamRequest>(&serde_json::to_vec(&request).unwrap())
                 .unwrap(),
             request
-        );
-
-        let entry = StreamItem::Entry(Box::new(ReplicationEntry {
-            command: StorageCommand::CreateNamespace {
-                name: "test".into(),
-                data: serde_json::json!({}),
-            },
-            meta: sample_meta(),
-        }));
-        assert_eq!(
-            serde_json::from_slice::<StreamItem>(&serde_json::to_vec(&entry).unwrap()).unwrap(),
-            entry
         );
 
         let heartbeat = StreamItem::Heartbeat { current_rv: 42 };

@@ -13,12 +13,18 @@ pub(crate) struct WatchCommitWiring {
     pub(crate) sink: Arc<dyn CommitObservationSink>,
     pub(crate) signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     pub(crate) wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>,
+    pub(crate) follower_progress: Arc<klights_replication::FollowerProgressHub>,
 }
 
 pub(crate) fn new_wiring() -> WatchCommitWiring {
     let hub = Arc::new(klights_watch::WatchSignalHub::new(1024));
-    let wakeups: Arc<dyn klights_leader_api::PostCommitWakeup> =
+    let watch_wakeups: Arc<dyn klights_leader_api::PostCommitWakeup> =
         Arc::new(WatchPostCommitWakeup::new(hub.clone()));
+    let follower_progress = Arc::new(klights_replication::FollowerProgressHub::new(0));
+    let wakeups: Arc<dyn klights_leader_api::PostCommitWakeup> = Arc::new(ActivePostCommitWakeup {
+        watch: watch_wakeups,
+        follower_progress: follower_progress.clone(),
+    });
     WatchCommitWiring {
         #[cfg(test)]
         sink: Arc::new(WatchCommitObservationSink::new(
@@ -27,6 +33,7 @@ pub(crate) fn new_wiring() -> WatchCommitWiring {
         )),
         signals: hub,
         wakeups,
+        follower_progress,
     }
 }
 
@@ -190,6 +197,30 @@ impl klights_leader_api::PostCommitWakeup for WatchPostCommitWakeup {
     }
 }
 
+struct ActivePostCommitWakeup {
+    watch: Arc<dyn klights_leader_api::PostCommitWakeup>,
+    follower_progress: Arc<klights_replication::FollowerProgressHub>,
+}
+
+impl klights_leader_api::PostCommitWakeup for ActivePostCommitWakeup {
+    fn wake(&self, observations: &[klights_leader_api::PostCommitAdvance]) {
+        self.watch.wake(observations);
+        if let Some(resource_version) = observations
+            .iter()
+            .map(klights_leader_api::PostCommitAdvance::resource_version)
+            .max()
+        {
+            self.follower_progress.advance(resource_version);
+        }
+    }
+
+    fn wake_namespace_contents(&self, namespace: &str, resource_version: i64) {
+        self.watch
+            .wake_namespace_contents(namespace, resource_version);
+        self.follower_progress.advance(resource_version);
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn publish_test_events(
     sink: &dyn CommitObservationSink,
@@ -260,6 +291,46 @@ mod tests {
             "metadata": {"name": "observed", "namespace": "default"},
             "data": {"key": "value"}
         })
+    }
+
+    #[test]
+    fn durable_visible_commit_wakeup_advances_follower_progress_without_idle_work() {
+        let wiring = new_wiring();
+        let mut progress = wiring.follower_progress.subscribe();
+        assert_eq!(*progress.borrow_and_update(), 0);
+        assert!(!progress.has_changed().unwrap());
+
+        wiring.wakeups.wake(&[
+            klights_leader_api::PostCommitAdvance::new(
+                "v1",
+                "ConfigMap",
+                Some("default".to_string()),
+                12,
+            ),
+            klights_leader_api::PostCommitAdvance::new(
+                "v1",
+                "Secret",
+                Some("default".to_string()),
+                8,
+            ),
+        ]);
+        assert!(progress.has_changed().unwrap());
+        assert_eq!(*progress.borrow_and_update(), 12);
+
+        wiring
+            .wakeups
+            .wake(&[klights_leader_api::PostCommitAdvance::new(
+                "v1",
+                "ConfigMap",
+                Some("default".to_string()),
+                12,
+            )]);
+        assert!(!progress.has_changed().unwrap());
+
+        wiring.wakeups.wake_namespace_contents("default", 13);
+        assert!(progress.has_changed().unwrap());
+        assert_eq!(*progress.borrow_and_update(), 13);
+        assert!(!progress.has_changed().unwrap());
     }
 
     async fn assert_success_only(store: &dyn DatastoreBackend, sink: &RecordingSink) {

@@ -3115,7 +3115,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raft_outbox_effect_preserves_committed_actor_delete_receipt() {
+    async fn actor_finalization_persists_exact_receipt_for_durable_cascade_replay() {
         let (node, backend) = fresh_node(77).await;
         node.bootstrap_single_voter("https://10.99.0.77:7679".into())
             .await
@@ -3145,17 +3145,18 @@ mod tests {
             .await
             .expect("create terminating Pod");
 
+        let command = klights_cluster_core::command::StorageCommand::FinalizeBoundPod {
+            namespace: "default".to_string(),
+            name: "receipt".to_string(),
+            pod_uid: "receipt-uid".to_string(),
+            node_name: "worker-a".to_string(),
+            observed_resource_version: observed.resource_version,
+        };
         let effect = node
             .propose_outbox_command_effect(
                 "raft-actor-delete-receipt",
                 OutboxOperation::PodMetadata.as_str(),
-                klights_cluster_core::command::StorageCommand::FinalizeBoundPod {
-                    namespace: "default".to_string(),
-                    name: "receipt".to_string(),
-                    pod_uid: "receipt-uid".to_string(),
-                    node_name: "worker-a".to_string(),
-                    observed_resource_version: observed.resource_version,
-                },
+                command.clone(),
                 "worker-a",
                 None,
             )
@@ -3181,6 +3182,34 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+
+        let replay = node
+            .propose_outbox_command_effect(
+                "raft-actor-delete-receipt",
+                OutboxOperation::PodMetadata.as_str(),
+                command,
+                "worker-a",
+                None,
+            )
+            .await
+            .expect("same-id actor finalization must replay its durable result");
+        let (replayed, replay_effect, _, replay_receipt) = replay.into_parts();
+        assert!(matches!(
+            replayed,
+            klights_cluster_core::OutboxApplyOutcome::AlreadyApplied {
+                applied_rv: Some(_)
+            }
+        ));
+        assert_eq!(
+            replay_effect,
+            klights_cluster_core::ResourceMutationEffect::Unchanged,
+            "same-id replay must not execute the finalization twice"
+        );
+        assert_eq!(
+            replay_receipt.as_ref(),
+            Some(&receipt),
+            "same-id replay must surface the byte-equivalent durable delete receipt"
         );
         node.shutdown().await.unwrap();
     }

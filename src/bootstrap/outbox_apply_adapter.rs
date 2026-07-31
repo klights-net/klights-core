@@ -274,3 +274,104 @@ impl RaftProposal for BackendProposalFixture {
         .await
     }
 }
+
+#[cfg(test)]
+mod review_regressions {
+    use klights_cluster_core::{
+        OutboxApplyError, OutboxOperation, OutboxStreamWatermark, ResourcePreconditions,
+        StorageCommand,
+    };
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn watermarked_stale_uid_bound_pod_row_advances_stream_without_side_effect_command() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Namespace",
+            None,
+            "legacy-rv-seed",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "legacy-rv-seed"}
+            }),
+        )
+        .await
+        .unwrap();
+        let rv_before = db.get_current_resource_version().await.unwrap();
+        let watch_before = db.current_watch_replay_position().await.unwrap();
+        let watermark = OutboxStreamWatermark {
+            client_id: "worker-client".to_string(),
+            stream_id: 11,
+            stream_seq: 1,
+        };
+
+        let result = super::propose_outbox_command_on_backend(
+            &db,
+            "missing-pod-status",
+            OutboxOperation::PodStatus,
+            StorageCommand::UpdateStatus {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: "already-gone".to_string(),
+                status: json!({"phase": "Running"}),
+                expected_rv: None,
+                preconditions: ResourcePreconditions {
+                    uid: Some("gone-uid".to_string()),
+                    resource_version: None,
+                },
+                observed_status_stamp: Some(42),
+            },
+            "worker-a",
+            Some(watermark.clone()),
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("missing UID-bound Pod status must return its typed durable decision")
+        };
+        assert!(
+            matches!(&error, OutboxApplyError::NotFound(_)),
+            "unexpected stale UID decision: {error:?}"
+        );
+        assert_eq!(
+            db.list_outbox_stream_watermarks().await.unwrap(),
+            vec![watermark]
+        );
+        assert_eq!(db.get_current_resource_version().await.unwrap(), rv_before);
+        assert_eq!(
+            db.current_watch_replay_position().await.unwrap(),
+            watch_before,
+            "ledger/watermark-only terminal decisions must not append public watch history"
+        );
+
+        super::propose_outbox_command_on_backend(
+            &db,
+            "next-stream-entry",
+            OutboxOperation::PodMetadata,
+            StorageCommand::CreateNamespace {
+                name: "after-stale-gap".to_string(),
+                data: json!({
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": {"name": "after-stale-gap"}
+                }),
+            },
+            "worker-a",
+            Some(OutboxStreamWatermark {
+                client_id: "worker-client".to_string(),
+                stream_id: 11,
+                stream_seq: 2,
+            }),
+        )
+        .await
+        .expect("the next ordered entry must not wedge behind a stale Pod decision");
+
+        assert!(db.get_namespace("after-stale-gap").await.unwrap().is_some());
+        assert_eq!(
+            db.list_outbox_stream_watermarks().await.unwrap()[0].stream_seq,
+            2
+        );
+    }
+}

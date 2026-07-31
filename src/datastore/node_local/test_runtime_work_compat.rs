@@ -122,7 +122,7 @@ pub struct PodWorkqueueEntry {
 #[cfg(test)]
 pub use super::sqlite::{
     DeadLetterRow, OutboxInsert, OutboxRow, OutboxStats, PodStatusCheckpoint,
-    ReplicationCheckpoint, RuntimeObservationCheckpoint,
+    RuntimeObservationCheckpoint,
 };
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PodRuntimeOwnershipError {

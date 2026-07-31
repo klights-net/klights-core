@@ -9,7 +9,7 @@ mod pod_endpoint_resolver_integration_tests;
 mod rootless_plane_integration_tests;
 #[cfg(test)]
 #[path = "service_routing/tests.rs"]
-mod service_routing_tests;
+mod service_routing_adapter_tests;
 #[cfg(test)]
 pub mod test_support;
 

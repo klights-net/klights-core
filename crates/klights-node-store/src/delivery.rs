@@ -1414,41 +1414,6 @@ impl RuntimeObservationCheckpoint {
     }
 }
 
-/// Neutral node-local replay checkpoint retained for the transitional
-/// replication surface. It carries no OpenRaft or cluster-datastore type.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReplicationCheckpoint {
-    last_applied_rv: i64,
-    leader_epoch: i64,
-    cluster_id: String,
-}
-
-impl ReplicationCheckpoint {
-    pub fn new(last_applied_rv: i64, leader_epoch: i64, cluster_id: impl Into<String>) -> Self {
-        Self {
-            last_applied_rv,
-            leader_epoch,
-            cluster_id: cluster_id.into(),
-        }
-    }
-
-    pub const fn last_applied_rv(&self) -> i64 {
-        self.last_applied_rv
-    }
-
-    pub const fn leader_epoch(&self) -> i64 {
-        self.leader_epoch
-    }
-
-    pub fn cluster_id(&self) -> &str {
-        &self.cluster_id
-    }
-
-    pub fn into_parts(self) -> (i64, i64, String) {
-        (self.last_applied_rv, self.leader_epoch, self.cluster_id)
-    }
-}
-
 /// Heap-erased future used at the coarse node-persistence boundary.
 pub type DeliveryFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, DeliveryError>> + Send + 'a>>;
@@ -1573,18 +1538,5 @@ pub trait RuntimeObservationCheckpointStore: Send + Sync {
     fn delete_runtime_observation_checkpoint(
         &self,
         key: PodCheckpointKey,
-    ) -> DeliveryFuture<'_, ()>;
-}
-
-/// Surface-only node-local replication checkpoint persistence.
-///
-/// No production consumer remains after removal of the legacy backup applier;
-/// the exact persisted surface stays explicit until broad node-local storage
-/// removal can prove it is safe to delete.
-pub trait ReplicationCheckpointStore: Send + Sync {
-    fn read_replication_checkpoint(&self) -> DeliveryFuture<'_, Option<ReplicationCheckpoint>>;
-    fn write_replication_checkpoint(
-        &self,
-        checkpoint: ReplicationCheckpoint,
     ) -> DeliveryFuture<'_, ()>;
 }

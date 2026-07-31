@@ -83,14 +83,6 @@ pub struct OutboxRow {
 }
 
 #[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplicationCheckpoint {
-    pub last_applied_rv: i64,
-    pub leader_epoch: i64,
-    pub cluster_id: String,
-}
-
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DeadLetterRow {
     pub id: i64,

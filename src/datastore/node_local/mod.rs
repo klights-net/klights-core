@@ -1,7 +1,5 @@
 #[cfg(test)]
 mod delivery_composition;
-#[cfg(test)]
-mod identity_adapter;
 pub mod redb;
 #[cfg(test)]
 mod runtime_work_composition;
@@ -24,7 +22,7 @@ pub use test_runtime_work_compat::{
     DeadLetterRow, DeadLetterTestInsert, OutboxFailureDisposition, OutboxInsert, OutboxRow,
     OutboxStats, PodRuntimeOwnershipError, PodSlotAdmissionEvent, PodSlotAdmissionResult,
     PodSlotAdmissionState, PodSlotClearResult, PodSlotMutationResult, PodStatusCheckpoint,
-    PodWorkqueueEntry, PodWorkqueueKind, ReplicationCheckpoint, SandboxRef,
+    PodWorkqueueEntry, PodWorkqueueKind, SandboxRef,
 };
 
 pub use klights_node_datastore::schema;

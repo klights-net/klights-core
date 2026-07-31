@@ -3,8 +3,6 @@ pub mod bus;
 pub mod events;
 mod filter;
 mod selection;
-#[cfg(test)]
-mod selector_membership;
 
 pub use bus::WatchBus;
 #[cfg(test)]
@@ -14,8 +12,6 @@ pub use events::{
 };
 pub use filter::WatchEventFilter;
 pub use selection::WatchEventSelection;
-#[cfg(test)]
-pub(crate) use selector_membership::{SelectorMembership, event_key, resource_key};
 
 #[cfg(test)]
 mod tests;

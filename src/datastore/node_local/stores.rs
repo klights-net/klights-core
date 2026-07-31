@@ -129,11 +129,6 @@ impl NodeLocalStores {
     }
 
     #[cfg(test)]
-    pub(crate) fn identity_ref(&self) -> &SqliteNodeIdentity {
-        &self.identity
-    }
-
-    #[cfg(test)]
     pub(crate) fn delivery_ref(&self) -> &SqliteDeliveryStore {
         &self.delivery
     }

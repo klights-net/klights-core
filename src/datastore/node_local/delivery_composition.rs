@@ -7,8 +7,7 @@ use klights_node_store::{
     OutboxDispatcherStore, OutboxEnqueue, OutboxFailureDisposition, OutboxLease, OutboxNow,
     OutboxProducerStore, OutboxRecord, OutboxStats, OutboxStatusStampStore, OutboxSupersedeRequest,
     PodCheckpointKey, PodStatusCheckpoint, PodStatusCheckpointApplied, PodStatusCheckpointStore,
-    PodStatusCheckpointUpsert, ReplicationCheckpoint, ReplicationCheckpointStore,
-    RuntimeObservationCheckpoint, RuntimeObservationCheckpointStore,
+    PodStatusCheckpointUpsert, RuntimeObservationCheckpoint, RuntimeObservationCheckpointStore,
 };
 
 use super::NodeLocalStores;
@@ -168,18 +167,5 @@ impl RuntimeObservationCheckpointStore for NodeLocalStores {
     ) -> DeliveryFuture<'_, ()> {
         self.delivery_ref()
             .delete_runtime_observation_checkpoint(key)
-    }
-}
-
-impl ReplicationCheckpointStore for NodeLocalStores {
-    fn read_replication_checkpoint(&self) -> DeliveryFuture<'_, Option<ReplicationCheckpoint>> {
-        self.delivery_ref().read_replication_checkpoint()
-    }
-
-    fn write_replication_checkpoint(
-        &self,
-        checkpoint: ReplicationCheckpoint,
-    ) -> DeliveryFuture<'_, ()> {
-        self.delivery_ref().write_replication_checkpoint(checkpoint)
     }
 }

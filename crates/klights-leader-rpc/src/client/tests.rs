@@ -50,6 +50,34 @@ mod cases {
     }
 
     #[test]
+    fn legacy_entry_wire_item_projects_to_progress_heartbeat() {
+        let entry = klights_cluster_core::ReplicationEntry {
+            command: klights_cluster_core::StorageCommand::CreateNamespace {
+                name: "legacy".to_string(),
+                data: serde_json::json!({"metadata": {"name": "legacy"}}),
+            },
+            meta: klights_cluster_core::CommandMeta {
+                command_id: klights_cluster_core::CommandId("legacy-entry".to_string()),
+                codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
+                resource_version: 37,
+                uid: None,
+                timestamp_ms: 0,
+                authoring_node: "leader-a".to_string(),
+            },
+        };
+        let item = klights_internal_protobuf::StreamItem {
+            item: Some(klights_internal_protobuf::stream_item::Item::Entry(
+                klights_leader_rpc::conversions::entry_to_proto(&entry).unwrap(),
+            )),
+        };
+
+        assert_eq!(
+            super::super::stream_item_from_proto(item).unwrap(),
+            klights_cluster_core::StreamItem::Heartbeat { current_rv: 37 }
+        );
+    }
+
+    #[test]
     fn resource_command_already_exists_survives_grpc_decode() {
         let error = super::super::resource_command_rpc_error(super::super::UnaryRpcError::Status(
             tonic::Status::already_exists("duplicate RuntimeClass"),

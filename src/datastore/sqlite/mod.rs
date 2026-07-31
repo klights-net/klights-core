@@ -253,6 +253,7 @@ use resource_shape::{
 pub(crate) enum ResourceMutationPauseOperation {
     MainUpdate,
     PatchLatest,
+    BuildPatchCommand,
 }
 
 #[cfg(test)]
@@ -2131,6 +2132,24 @@ impl Datastore {
         operation: &str,
         authoring_node: &str,
     ) -> Result<klights_cluster_core::LogApplyCommit> {
+        #[cfg(test)]
+        if let klights_cluster_core::command::StorageCommand::PatchResource {
+            api_version,
+            kind,
+            namespace,
+            name,
+            ..
+        } = &command
+        {
+            self.pause_resource_mutation_if_requested(
+                ResourceMutationPauseOperation::BuildPatchCommand,
+                api_version,
+                kind,
+                namespace.as_deref(),
+                name,
+            )
+            .await;
+        }
         let operation = operation.to_string();
         let authoring_node_owned = authoring_node.to_string();
         let operation_now = self.wall_clock.now_utc();

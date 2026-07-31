@@ -137,15 +137,23 @@ async fn grpc_test_server_full(
     controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
     controlplane_join_handler: Option<Arc<dyn ControlplaneJoinHandler>>,
 ) -> (String, Arc<ReplicationService>, tokio::task::JoinHandle<()>) {
-    grpc_test_server_full_with_node_cert(db, controller_dispatcher, controlplane_join_handler, None)
-        .await
+    let (endpoint, service, _progress, handle) = grpc_test_server_full_with_node_cert(
+        db,
+        controller_dispatcher,
+        controlplane_join_handler,
+        None,
+    )
+    .await;
+    (endpoint, service, handle)
 }
 
 async fn grpc_test_server_with_node_cert(
     db: DatastoreHandle,
     node_name: &str,
 ) -> (String, Arc<ReplicationService>, tokio::task::JoinHandle<()>) {
-    grpc_test_server_full_with_node_cert(db, None, None, Some(node_name.to_string())).await
+    let (endpoint, service, _progress, handle) =
+        grpc_test_server_full_with_node_cert(db, None, None, Some(node_name.to_string())).await;
+    (endpoint, service, handle)
 }
 
 async fn grpc_test_server_full_with_node_cert(
@@ -153,14 +161,44 @@ async fn grpc_test_server_full_with_node_cert(
     controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
     controlplane_join_handler: Option<Arc<dyn ControlplaneJoinHandler>>,
     injected_node_cert: Option<String>,
-) -> (String, Arc<ReplicationService>, tokio::task::JoinHandle<()>) {
+) -> (
+    String,
+    Arc<ReplicationService>,
+    Arc<klights_replication::FollowerProgressHub>,
+    tokio::task::JoinHandle<()>,
+) {
+    grpc_test_server_full_with_node_cert_and_current_rv(
+        db,
+        controller_dispatcher,
+        controlplane_join_handler,
+        injected_node_cert,
+        0,
+    )
+    .await
+}
+
+async fn grpc_test_server_full_with_node_cert_and_current_rv(
+    db: DatastoreHandle,
+    controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
+    controlplane_join_handler: Option<Arc<dyn ControlplaneJoinHandler>>,
+    injected_node_cert: Option<String>,
+    current_rv: i64,
+) -> (
+    String,
+    Arc<ReplicationService>,
+    Arc<klights_replication::FollowerProgressHub>,
+    tokio::task::JoinHandle<()>,
+) {
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let service = Arc::new(crate::grpc_test_support::replication_service(
+    let follower_progress = Arc::new(klights_replication::FollowerProgressHub::new(0));
+    let service = Arc::new(crate::grpc_test_support::replication_service_with_progress(
         db.clone(),
         supervisor,
+        follower_progress.clone(),
+        current_rv,
     ));
     let node_status = Arc::new(crate::control_plane::client::local::LocalApiClient::new(
         db.clone(),
@@ -221,7 +259,7 @@ async fn grpc_test_server_full_with_node_cert(
             });
         }
     });
-    (endpoint, service, handle)
+    (endpoint, service, follower_progress, handle)
 }
 
 /// bug-grpc A1/B2: serve the replication gRPC service built with an
@@ -3461,12 +3499,77 @@ async fn connect_accepts_valid_join_and_returns_dataplane_peers() {
 }
 
 #[tokio::test]
+async fn connect_follower_progress_heartbeats_never_regress_below_initial_rv() {
+    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
+        .await
+        .unwrap();
+    let (endpoint, _service, follower_progress, handle) =
+        grpc_test_server_full_with_node_cert_and_current_rv(
+            db.clone(),
+            None,
+            None,
+            Some("worker-1".to_string()),
+            100,
+        )
+        .await;
+    let mut join = valid_join();
+    join.token.clear();
+
+    let (_tx, mut inbound) = open_connect(&endpoint, join).await;
+    let first = inbound.message().await.unwrap().unwrap();
+    let accepted_rv = match first.payload.unwrap() {
+        klights_internal_protobuf::leader_message::Payload::JoinResponse(
+            klights_internal_protobuf::JoinResponse {
+                result: Some(klights_internal_protobuf::join_response::Result::Accepted(accepted)),
+            },
+        ) => accepted.current_rv,
+        other => panic!("expected accepted JoinResponse, got {other:?}"),
+    };
+
+    let initial = inbound.message().await.unwrap().unwrap();
+    let initial_rv = match initial.payload.unwrap() {
+        klights_internal_protobuf::leader_message::Payload::StreamItem(
+            klights_internal_protobuf::StreamItem {
+                item: Some(klights_internal_protobuf::stream_item::Item::Heartbeat(heartbeat)),
+            },
+        ) => heartbeat.current_rv,
+        other => panic!("expected initial follower progress heartbeat, got {other:?}"),
+    };
+    assert_eq!(initial_rv, accepted_rv);
+    assert!(
+        accepted_rv > 1,
+        "seeded datastore must start above the progress hub"
+    );
+
+    follower_progress.advance(accepted_rv - 1);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), inbound.message())
+            .await
+            .is_err(),
+        "a progress wake below the initial accepted RV must not emit a regressing heartbeat"
+    );
+    follower_progress.advance(accepted_rv + 1);
+    let advanced = inbound.message().await.unwrap().unwrap();
+    let advanced_rv = match advanced.payload.unwrap() {
+        klights_internal_protobuf::leader_message::Payload::StreamItem(
+            klights_internal_protobuf::StreamItem {
+                item: Some(klights_internal_protobuf::stream_item::Item::Heartbeat(heartbeat)),
+            },
+        ) => heartbeat.current_rv,
+        other => panic!("expected advanced follower progress heartbeat, got {other:?}"),
+    };
+    assert_eq!(advanced_rv, accepted_rv + 1);
+    handle.abort();
+}
+
+#[tokio::test]
 async fn accepted_legacy_controlplane_rejoin_without_snapshot_persists_dataplane_metadata() {
     let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
-    let (endpoint, _service, handle) = grpc_test_server_full_with_node_cert(
+    let (endpoint, _service, _progress, handle) = grpc_test_server_full_with_node_cert(
         db.clone(),
         None,
         Some(Arc::new(AcceptingControlplaneJoinHandler)),
@@ -3523,7 +3626,7 @@ async fn accepted_controlplane_join_uses_observed_peer_ip_for_dataplane_and_raft
         .await
         .unwrap();
     let join_handler = Arc::new(RecordingControlplaneJoinHandler::default());
-    let (endpoint, _service, handle) = grpc_test_server_full_with_node_cert(
+    let (endpoint, _service, _progress, handle) = grpc_test_server_full_with_node_cert(
         db.clone(),
         None,
         Some(join_handler.clone()),

@@ -1,8 +1,8 @@
 //! Cluster-domain/internal-wire conversions for the root-owned gRPC adapter.
 //!
 //! Wire values are owned by `klights-internal-protobuf`; domain policy stays
-//! in focused lower contracts. Phase 12 moves this adapter mechanically with
-//! the reusable leader RPC transport; it does not own persistence or Raft.
+//! in focused lower contracts. The reusable transport owns this adapter and
+//! remains independent of persistence and Raft.
 
 use anyhow::Result;
 use klights_cluster_core::WatchReplayPosition;

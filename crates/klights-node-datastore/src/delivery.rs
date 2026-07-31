@@ -11,9 +11,8 @@ use klights_node_store::{
     OutboxFailureDisposition, OutboxLease, OutboxNow, OutboxProducerStore, OutboxRecord,
     OutboxSequence, OutboxSequencePolicy, OutboxStats, OutboxStatusStampStore,
     OutboxSupersedability, PodCheckpointKey, PodStatusCheckpoint, PodStatusCheckpointApplied,
-    PodStatusCheckpointStore, PodStatusCheckpointUpsert, ReplicationCheckpoint,
-    ReplicationCheckpointStore, RuntimeObservationCheckpoint, RuntimeObservationCheckpointStore,
-    RuntimeObservationGeneration, TerminalDeleteClassification,
+    PodStatusCheckpointStore, PodStatusCheckpointUpsert, RuntimeObservationCheckpoint,
+    RuntimeObservationCheckpointStore, RuntimeObservationGeneration, TerminalDeleteClassification,
 };
 use klights_supervisor::{DbExecutor, WallClock};
 use klights_types::{PodIdentity, ResourceKey};
@@ -801,38 +800,6 @@ impl SqliteDeliveryStore {
         .await
         .map_err(|error| anyhow::anyhow!("outbox stats failed: {error}"))
     }
-
-    async fn read_replication_checkpoint(&self) -> anyhow::Result<Option<ReplicationCheckpoint>> {
-        self.call("node_local:checkpoint_get", move |conn| {
-            conn.query_row(queries::REPLICATION_CHECKPOINT_GET, [], |row| {
-                Ok(ReplicationCheckpoint::new(
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .optional()
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("replication checkpoint get failed: {error}"))
-    }
-
-    async fn write_replication_checkpoint(
-        &self,
-        checkpoint: ReplicationCheckpoint,
-    ) -> anyhow::Result<()> {
-        let (last_applied_rv, leader_epoch, cluster_id) = checkpoint.into_parts();
-        self.call("node_local:checkpoint_set", move |conn| {
-            conn.execute(
-                queries::REPLICATION_CHECKPOINT_SET,
-                rusqlite::params![last_applied_rv, leader_epoch, cluster_id],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("replication checkpoint set failed: {error}"))
-    }
 }
 
 fn row_to_outbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawOutboxRow> {
@@ -1385,27 +1352,6 @@ impl RuntimeObservationCheckpointStore for SqliteDeliveryStore {
     ) -> DeliveryFuture<'_, ()> {
         Box::pin(async move {
             self.delete_runtime_observation_checkpoint(key.pod_uid())
-                .await
-                .map_err(persistence)
-        })
-    }
-}
-
-impl ReplicationCheckpointStore for SqliteDeliveryStore {
-    fn read_replication_checkpoint(&self) -> DeliveryFuture<'_, Option<ReplicationCheckpoint>> {
-        Box::pin(async move {
-            self.read_replication_checkpoint()
-                .await
-                .map_err(persistence)
-        })
-    }
-
-    fn write_replication_checkpoint(
-        &self,
-        checkpoint: ReplicationCheckpoint,
-    ) -> DeliveryFuture<'_, ()> {
-        Box::pin(async move {
-            self.write_replication_checkpoint(checkpoint)
                 .await
                 .map_err(persistence)
         })

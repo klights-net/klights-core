@@ -807,12 +807,14 @@ async fn pod_status_checkpoint_is_uid_bound_and_status_only() {
 #[tokio::test]
 async fn node_meta_mismatch_refuses_boot() {
     let db = open_node_local_in_memory().await;
+    let identity = db.identity();
 
-    db.ensure_node_identity("cluster-a", "node-a")
+    identity
+        .ensure_node_identity("cluster-a", "node-a")
         .await
         .expect("initial identity write");
 
-    let err = db
+    let err = identity
         .ensure_node_identity("cluster-b", "node-a")
         .await
         .expect_err("cluster id change must refuse boot");
@@ -932,15 +934,16 @@ async fn pod_slot_persistence_preserves_uid_cas_outcomes_and_monotonic_versions(
 async fn sqlite_store_implements_focused_node_identity() {
     let handle = open_sqlite_node_local_store().await;
     fn assert_identity_trait(_: &dyn NodeIdentity) {}
-    assert_identity_trait(handle.as_ref());
-    assert_eq!(handle.backend_name(), "sqlite");
+    let identity = handle.identity();
+    assert_identity_trait(identity.as_ref());
+    assert_eq!(identity.backend_name(), "sqlite");
 
-    handle
+    identity
         .set_node_meta("node_uid", "node-a")
         .await
         .expect("write meta through trait object");
     assert_eq!(
-        handle.get_node_meta("node_uid").await.expect("read meta"),
+        identity.get_node_meta("node_uid").await.expect("read meta"),
         Some("node-a".to_string())
     );
 }
@@ -964,14 +967,15 @@ async fn selector_creates_sqlite_node_db_and_node_local_schema() {
     .await
     .expect("open sqlite node-local");
 
-    assert_eq!(handle.backend_name(), "sqlite");
+    let identity = handle.identity();
+    assert_eq!(identity.backend_name(), "sqlite");
     assert!(path.is_file(), "node-local selector must create node.db");
-    handle
+    identity
         .set_node_meta("schema-owner", "node-local")
         .await
         .expect("node-local selector must initialize the node metadata table");
     assert_eq!(
-        handle
+        identity
             .get_node_meta("schema-owner")
             .await
             .expect("read initialized node metadata table")
@@ -991,10 +995,7 @@ async fn redb_node_local_selector_fails_fast_until_backend_lands() {
     )
     .await;
     let err = match result {
-        Ok(handle) => panic!(
-            "redb node-local unexpectedly opened {}",
-            handle.backend_name()
-        ),
+        Ok(_) => panic!("redb node-local unexpectedly opened"),
         Err(err) => err,
     };
 

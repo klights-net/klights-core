@@ -22,7 +22,7 @@ pub mod snapshot;
 pub mod state_machine;
 pub mod types;
 
-pub use service::{FollowerMetrics, FollowerStatus, ReplicationService};
+pub use service::{FollowerMetrics, FollowerProgressHub, FollowerStatus, ReplicationService};
 
 #[cfg(test)]
 pub(crate) fn test_unproven_member(addr: impl Into<String>) -> types::RaftMemberNode {

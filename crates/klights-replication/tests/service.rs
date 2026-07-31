@@ -1,4 +1,4 @@
-use klights_replication::ReplicationService;
+use klights_replication::{FollowerProgressHub, ReplicationService};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -470,6 +470,44 @@ mod tests {
 
         service.unregister_follower("replica-1", session_id).await;
         assert_eq!(service.follower_metrics().await.follower_count, 0);
+    }
+
+    #[test]
+    fn follower_progress_is_event_driven_monotonic_and_idle_silent() {
+        let progress = FollowerProgressHub::new(4);
+        let mut subscription = progress.subscribe();
+
+        assert_eq!(*subscription.borrow_and_update(), 4);
+        assert!(!subscription.has_changed().unwrap());
+
+        progress.advance(4);
+        progress.advance(3);
+        assert!(
+            !subscription.has_changed().unwrap(),
+            "duplicate or stale commit positions must not wake an idle follower"
+        );
+
+        progress.advance(7);
+        assert!(subscription.has_changed().unwrap());
+        assert_eq!(*subscription.borrow_and_update(), 7);
+        assert!(!subscription.has_changed().unwrap());
+    }
+
+    #[test]
+    fn replication_service_subscribes_to_the_injected_progress_owner() {
+        let progress = Arc::new(FollowerProgressHub::new(11));
+        let service = ReplicationService::new_with_ports_and_progress(
+            Arc::new(TestMetadata::new(11)),
+            Arc::new(TestBootstrapTokens),
+            Arc::new(TaskSupervisor::new(TaskCategoryConfig::default())),
+            progress.clone(),
+        );
+        let mut subscription = service.subscribe_follower_progress();
+
+        assert_eq!(*subscription.borrow_and_update(), 11);
+        progress.advance(12);
+        assert!(subscription.has_changed().unwrap());
+        assert_eq!(*subscription.borrow_and_update(), 12);
     }
 
     /// Old-session unregister must never remove a reconnected follower.

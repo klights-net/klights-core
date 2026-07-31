@@ -59,6 +59,8 @@ pub use state_source::{
 };
 
 #[cfg(test)]
+mod routing_state_tests;
+#[cfg(test)]
 mod tests_integration;
 #[cfg(test)]
 mod tests_unit;

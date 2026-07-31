@@ -3545,8 +3545,14 @@ fn join_response_from_leader_message(
 
 fn stream_item_from_proto(item: klights_internal_protobuf::StreamItem) -> Result<StreamItem> {
     match item.item {
+        // Wire tag 1 remains decodable for rolling compatibility with a
+        // pre-Phase-12F leader. Entry fanout is no longer a domain behavior;
+        // only its progress position is relevant to the current ACK protocol.
         Some(klights_internal_protobuf::stream_item::Item::Entry(entry)) => {
-            Ok(StreamItem::Entry(Box::new(entry_from_proto(entry)?)))
+            let entry = entry_from_proto(entry)?;
+            Ok(StreamItem::Heartbeat {
+                current_rv: entry.meta.resource_version,
+            })
         }
         Some(klights_internal_protobuf::stream_item::Item::Heartbeat(heartbeat)) => {
             Ok(StreamItem::Heartbeat {

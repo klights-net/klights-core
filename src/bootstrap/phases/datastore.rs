@@ -925,10 +925,11 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         ),
     );
     let replication_service = Some(Arc::new(
-        klights_replication::ReplicationService::new_with_ports(
+        klights_replication::ReplicationService::new_with_ports_and_progress(
             replication_metadata,
             replication_bootstrap_tokens,
             supervisor.clone(),
+            watch_commit_wiring.follower_progress.clone(),
         ),
     ));
 

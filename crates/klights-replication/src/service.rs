@@ -25,7 +25,7 @@ use klights_node_api::{
     RoutedNodeExecRequest, RoutedNodeExecSyncRequest, RoutedNodeExecSyncResponse,
     RoutedNodeLogEvent, RoutedNodeLogRequest, RoutedNodeMetricsRequest, RoutedNodeMetricsResponse,
 };
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
 
 use klights_node_api::{FollowerCompletionContext, NodeOperationKind};
 
@@ -86,6 +86,40 @@ pub struct FollowerStatus {
     pub public_key: Option<String>,
 }
 
+/// Monotonic, event-driven public resource-version progress for connected
+/// follower control streams.
+///
+/// Root committed-apply composition advances this hub only after a durable
+/// visible commit. Each gRPC stream owns a `watch` subscription, so idle
+/// clusters have no task, timer, polling loop, or periodic wakeup.
+pub struct FollowerProgressHub {
+    progress: watch::Sender<i64>,
+}
+
+impl FollowerProgressHub {
+    pub fn new(initial_resource_version: i64) -> Self {
+        let (progress, _) = watch::channel(initial_resource_version.max(0));
+        Self { progress }
+    }
+
+    pub fn advance(&self, resource_version: i64) {
+        if resource_version <= 0 {
+            return;
+        }
+        self.progress.send_if_modified(|current| {
+            if resource_version <= *current {
+                return false;
+            }
+            *current = resource_version;
+            true
+        });
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<i64> {
+        self.progress.subscribe()
+    }
+}
+
 impl klights_leader_api::LeaderFollowerDiagnostics for ReplicationService {
     fn follower_diagnostics(&self) -> klights_leader_api::FollowerDiagnosticsFuture<'_> {
         Box::pin(async move {
@@ -138,6 +172,7 @@ pub struct ReplicationService {
     pending_pod_log_streams: PendingNodeLogStreams,
     pending_node_metrics: PendingNodeMetrics,
     pod_log_timeout: Duration,
+    follower_progress: Arc<FollowerProgressHub>,
     observed_peer_endpoints: RwLock<HashMap<String, String>>,
 }
 
@@ -322,6 +357,20 @@ impl ReplicationService {
         bootstrap_tokens: Arc<dyn klights_leader_api::BootstrapTokenValidation>,
         supervisor: Arc<TaskSupervisor>,
     ) -> Self {
+        Self::new_with_ports_and_progress(
+            metadata,
+            bootstrap_tokens,
+            supervisor,
+            Arc::new(FollowerProgressHub::new(0)),
+        )
+    }
+
+    pub fn new_with_ports_and_progress(
+        metadata: Arc<dyn klights_cluster_store::ClusterMetadataRead>,
+        bootstrap_tokens: Arc<dyn klights_leader_api::BootstrapTokenValidation>,
+        supervisor: Arc<TaskSupervisor>,
+        follower_progress: Arc<FollowerProgressHub>,
+    ) -> Self {
         Self {
             metadata,
             bootstrap_tokens,
@@ -335,12 +384,17 @@ impl ReplicationService {
             pending_pod_log_streams: Arc::new(Mutex::new(HashMap::new())),
             pending_node_metrics: Mutex::new(HashMap::new()),
             pod_log_timeout: Duration::from_secs(30),
+            follower_progress,
             observed_peer_endpoints: RwLock::new(HashMap::new()),
         }
     }
 
     pub fn task_supervisor(&self) -> Arc<TaskSupervisor> {
         self.supervisor.clone()
+    }
+
+    pub fn subscribe_follower_progress(&self) -> watch::Receiver<i64> {
+        self.follower_progress.subscribe()
     }
 
     pub async fn open_node_exec_with_command_id(

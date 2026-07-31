@@ -116,6 +116,10 @@ impl GrpcFollowerSessionRuntime for GrpcReplicationRuntimeAdapter {
         self.service.register_follower(dataplane).await
     }
 
+    fn subscribe_follower_progress(&self) -> tokio::sync::watch::Receiver<i64> {
+        self.service.subscribe_follower_progress()
+    }
+
     async fn update_follower_ack(&self, node_name: &str, applied_rv: i64) {
         self.service
             .update_follower_ack(node_name, applied_rv)

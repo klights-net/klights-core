@@ -15,6 +15,10 @@ pub(crate) type GrpcReplicationServer = klights_leader_rpc::server::GrpcReplicat
 
 struct TestClusterMetadataRead;
 
+struct FixedRvTestClusterMetadataRead {
+    current_rv: i64,
+}
+
 impl klights_cluster_store::ClusterMetadataRead for TestClusterMetadataRead {
     fn read_cluster_metadata(
         &self,
@@ -22,17 +26,31 @@ impl klights_cluster_store::ClusterMetadataRead for TestClusterMetadataRead {
         '_,
         klights_cluster_store::PersistedClusterMetadata,
     > {
-        Box::pin(async {
-            Ok(klights_cluster_store::PersistedClusterMetadata::new(
-                klights_cluster_core::ClusterMetadata {
-                    cluster_id: "klights-test-cluster".to_string(),
-                    leader_epoch: 0,
-                    current_rv: 0,
-                },
-                klights_cluster_store::SnapshotMembership::LegacyOmitted,
-            ))
-        })
+        Box::pin(async { Ok(test_cluster_metadata(0)) })
     }
+}
+
+impl klights_cluster_store::ClusterMetadataRead for FixedRvTestClusterMetadataRead {
+    fn read_cluster_metadata(
+        &self,
+    ) -> klights_cluster_store::ClusterMetadataFuture<
+        '_,
+        klights_cluster_store::PersistedClusterMetadata,
+    > {
+        let current_rv = self.current_rv;
+        Box::pin(async move { Ok(test_cluster_metadata(current_rv)) })
+    }
+}
+
+fn test_cluster_metadata(current_rv: i64) -> klights_cluster_store::PersistedClusterMetadata {
+    klights_cluster_store::PersistedClusterMetadata::new(
+        klights_cluster_core::ClusterMetadata {
+            cluster_id: "klights-test-cluster".to_string(),
+            leader_epoch: 0,
+            current_rv,
+        },
+        klights_cluster_store::SnapshotMembership::LegacyOmitted,
+    )
 }
 
 pub(crate) fn replication_service(
@@ -51,6 +69,20 @@ pub(crate) fn replication_service_with_metadata(
         metadata,
         Arc::new(crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new(db)),
         supervisor,
+    )
+}
+
+pub(crate) fn replication_service_with_progress(
+    db: DatastoreHandle,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    follower_progress: Arc<klights_replication::FollowerProgressHub>,
+    current_rv: i64,
+) -> ReplicationService {
+    ReplicationService::new_with_ports_and_progress(
+        Arc::new(FixedRvTestClusterMetadataRead { current_rv }),
+        Arc::new(crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new(db)),
+        supervisor,
+        follower_progress,
     )
 }
 

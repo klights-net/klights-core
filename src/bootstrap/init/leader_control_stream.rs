@@ -48,13 +48,6 @@ async fn run_worker_leader_control_stream(
                         _ = cancel.cancelled() => return,
                         next = client.stream_next() => {
                             match next {
-                                Ok(klights_cluster_core::StreamItem::Entry(entry)) => {
-                                    observed_rv = observed_rv.max(entry.meta.resource_version);
-                                    if let Err(err) = client.ack(observed_rv).await {
-                                        tracing::debug!(error = %err, "failed to ACK worker leader stream entry");
-                                        break;
-                                    }
-                                }
                                 Ok(klights_cluster_core::StreamItem::Heartbeat { current_rv }) => {
                                     observed_rv = observed_rv.max(current_rv);
                                     if let Err(err) = client.ack(observed_rv).await {

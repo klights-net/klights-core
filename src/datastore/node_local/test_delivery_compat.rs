@@ -12,15 +12,14 @@ use klights_node_store::{
     OutboxClaimRequest, OutboxCompletion, OutboxDispatcherStore, OutboxEnqueue, OutboxLease,
     OutboxNow, OutboxProducerStore, OutboxRecord, OutboxStatusStampStore, OutboxSupersedeRequest,
     PodCheckpointKey, PodStatusCheckpointApplied, PodStatusCheckpointStore,
-    PodStatusCheckpointUpsert, ReplicationCheckpointStore, RuntimeObservationCheckpointStore,
-    RuntimeObservationGeneration,
+    PodStatusCheckpointUpsert, RuntimeObservationCheckpointStore, RuntimeObservationGeneration,
 };
 use klights_types::{PodIdentity, ResourceKey};
 
 use super::sqlite::RuntimeObservationCheckpoint;
 use super::{
     DeadLetterRow, OutboxFailureDisposition, OutboxInsert, OutboxRow, OutboxStats,
-    PodStatusCheckpoint, ReplicationCheckpoint,
+    PodStatusCheckpoint,
 };
 
 fn persistence(error: impl std::fmt::Display) -> anyhow::Error {
@@ -119,7 +118,6 @@ pub trait LegacyDeliveryTestStore:
     + DeadLetterStore
     + PodStatusCheckpointStore
     + RuntimeObservationCheckpointStore
-    + ReplicationCheckpointStore
     + Send
     + Sync
 {
@@ -416,37 +414,6 @@ pub trait LegacyDeliveryTestStore:
             .await
             .map_err(persistence)
     }
-
-    async fn legacy_read_replication_checkpoint(&self) -> Result<Option<ReplicationCheckpoint>> {
-        ReplicationCheckpointStore::read_replication_checkpoint(self)
-            .await
-            .map(|checkpoint| {
-                checkpoint.map(|checkpoint| ReplicationCheckpoint {
-                    last_applied_rv: checkpoint.last_applied_rv(),
-                    leader_epoch: checkpoint.leader_epoch(),
-                    cluster_id: checkpoint.cluster_id().to_string(),
-                })
-            })
-            .map_err(persistence)
-    }
-
-    async fn legacy_write_replication_checkpoint(
-        &self,
-        last_applied_rv: i64,
-        leader_epoch: i64,
-        cluster_id: &str,
-    ) -> Result<()> {
-        ReplicationCheckpointStore::write_replication_checkpoint(
-            self,
-            klights_node_store::ReplicationCheckpoint::new(
-                last_applied_rv,
-                leader_epoch,
-                cluster_id,
-            ),
-        )
-        .await
-        .map_err(persistence)
-    }
 }
 
 impl<T> LegacyDeliveryTestStore for T where
@@ -456,7 +423,6 @@ impl<T> LegacyDeliveryTestStore for T where
         + DeadLetterStore
         + PodStatusCheckpointStore
         + RuntimeObservationCheckpointStore
-        + ReplicationCheckpointStore
         + Send
         + Sync
         + ?Sized

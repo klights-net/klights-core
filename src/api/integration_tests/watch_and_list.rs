@@ -9224,8 +9224,54 @@ async fn test_crd_watch_protobuf_accept_uses_json_fallback_or_406() {
     );
 }
 
+struct ToggleFailingWatchHistory {
+    delegate: std::sync::Arc<klights_cluster_datastore::sqlite::SqliteReadStore>,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl ToggleFailingWatchHistory {
+    fn new(delegate: std::sync::Arc<klights_cluster_datastore::sqlite::SqliteReadStore>) -> Self {
+        Self {
+            delegate,
+            fail: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn fail_subsequent_reads(&self) {
+        self.fail.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl klights_cluster_store::DurableWatchHistoryRead for ToggleFailingWatchHistory {
+    fn replay_watch_history(
+        &self,
+        request: klights_cluster_store::WatchHistoryRequest,
+    ) -> klights_cluster_store::WatchHistoryFuture<'_, klights_cluster_store::WatchHistoryRead>
+    {
+        if self.fail.load(std::sync::atomic::Ordering::Acquire) {
+            return Box::pin(async {
+                Err(
+                    klights_cluster_store::WatchHistoryError::PersistenceFailed {
+                        message: "injected live replay read failure".to_string(),
+                    },
+                )
+            });
+        }
+        klights_cluster_store::DurableWatchHistoryRead::replay_watch_history(
+            self.delegate.as_ref(),
+            request,
+        )
+    }
+
+    fn list_replay_floors(
+        &self,
+    ) -> klights_cluster_store::WatchHistoryFuture<'_, Vec<klights_cluster_store::DurableReplayFloor>>
+    {
+        klights_cluster_store::DurableWatchHistoryRead::list_replay_floors(self.delegate.as_ref())
+    }
+}
+
 #[tokio::test]
-#[ignore = "experimental redb backend does not implement the embedded Raft materializer"]
 async fn test_crd_live_replay_failure_emits_terminal_error() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -9233,12 +9279,15 @@ async fn test_crd_live_replay_failure_emits_terminal_error() {
     use std::time::Duration;
     use tower::ServiceExt;
 
-    // Redb has a deterministic close boundary used to inject the replay read
-    // failure; the default SQLite test handle remains callable after close.
-    let concrete_db = crate::datastore::redb::RedbDatastore::new_in_memory()
-        .await
-        .unwrap();
-    let passive_reads = concrete_db.passive_read_ports_for_test();
+    let concrete_db = crate::datastore::sqlite::test_support::in_memory().await;
+    let focused_reads = concrete_db.focused_read_store();
+    let failing_history =
+        std::sync::Arc::new(ToggleFailingWatchHistory::new(focused_reads.clone()));
+    let passive_reads = crate::datastore::selector::PassiveReadPorts::new(
+        focused_reads.clone(),
+        failing_history.clone(),
+        focused_reads,
+    );
     let db: crate::datastore::DatastoreHandle = std::sync::Arc::new(concrete_db);
     let state =
         crate::api::test_support::build_test_app_state_with_db(db.clone(), passive_reads).await;
@@ -9300,8 +9349,10 @@ async fn test_crd_live_replay_failure_emits_terminal_error() {
     let live: serde_json::Value = serde_json::from_slice(&live).unwrap();
     assert_eq!(live["object"]["metadata"]["name"], "live-ok");
 
-    // Queue a matching wakeup, then make its replay read fail. The watch must
-    // send one protocol ERROR and terminate instead of waiting for another write.
+    // Arm the focused history-port failure before queueing the matching wakeup.
+    // This gives the race a deterministic boundary without breaking the write
+    // path that publishes the wakeup.
+    failing_history.fail_subsequent_reads();
     db.create_resource(
         "selwatch.example.com/v1",
         "Selw",
@@ -9311,7 +9362,6 @@ async fn test_crd_live_replay_failure_emits_terminal_error() {
     )
     .await
     .unwrap();
-    db.close();
     let terminal = tokio::time::timeout(Duration::from_secs(1), stream.next())
         .await
         .expect("CR live replay failure must not park")

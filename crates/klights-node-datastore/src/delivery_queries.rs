@@ -154,15 +154,6 @@ pub(super) const OUTBOX_NEXT_WAKE: &str = "WITH wake_candidates AS ( \
              )) \
      )";
 
-pub(super) const REPLICATION_CHECKPOINT_GET: &str = "SELECT last_applied_rv, leader_epoch, cluster_id \
-     FROM replication_checkpoint WHERE singleton_key = 0";
-pub(super) const REPLICATION_CHECKPOINT_SET: &str = "INSERT INTO replication_checkpoint \
-     (singleton_key, last_applied_rv, leader_epoch, cluster_id) VALUES (0, ?1, ?2, ?3) \
-     ON CONFLICT(singleton_key) DO UPDATE SET \
-       last_applied_rv = excluded.last_applied_rv, \
-       leader_epoch = excluded.leader_epoch, \
-       cluster_id = excluded.cluster_id";
-
 pub(super) const DEAD_LETTER_INSERT: &str = "INSERT INTO outbox_dead_letter \
      (original_id, client_id, idempotency_key, enqueued_ms, subject_key, subject_api_version, \
       subject_kind, subject_namespace, subject_name, subject_uid, pod_uid, \

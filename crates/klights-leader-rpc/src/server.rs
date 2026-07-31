@@ -29,7 +29,7 @@ use crate::{
 /// Focused application handler used by the authenticated gRPC transport.
 ///
 /// The transport owns no concrete replication application service. This
-/// contract moves with the transport in Phase 12A; the embedded replication
+/// contract is owned with the transport; the embedded replication
 /// adapter remains the implementation owner.
 pub trait GrpcRuntimeSupervision: Send + Sync {
     fn task_supervisor(&self) -> Arc<klights_supervisor::TaskSupervisor>;
@@ -39,7 +39,7 @@ pub trait GrpcRuntimeSupervision: Send + Sync {
 /// authenticated leader RPC boundary.
 ///
 /// The transport owns the skew policy but must not discover wall time itself.
-/// This port moves with the reusable leader RPC transport in Phase 12A while
+/// This port belongs to the reusable leader RPC transport while
 /// runtime composition remains responsible for selecting the system clock.
 pub trait GrpcWallClock: Send + Sync {
     fn now(&self) -> chrono::DateTime<chrono::Utc>;
@@ -87,6 +87,7 @@ pub trait GrpcFollowerSessionRuntime: Send + Sync {
         &self,
         dataplane: klights_leader_api::NetworkDataplane,
     ) -> (tokio::sync::mpsc::Receiver<FollowerControlMessage>, u64);
+    fn subscribe_follower_progress(&self) -> tokio::sync::watch::Receiver<i64>;
     async fn update_follower_ack(&self, node_name: &str, applied_rv: i64);
     async fn unregister_follower(&self, node_name: &str, session_id: u64);
 }
@@ -1167,7 +1168,11 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
             },
         };
 
-        let accepted = matches!(response, JoinResponse::Accepted { .. });
+        let accepted_current_rv = match &response {
+            JoinResponse::Accepted { current_rv, .. } => Some(*current_rv),
+            JoinResponse::Rejected { .. } => None,
+        };
+        let accepted = accepted_current_rv.is_some();
         if accepted {
             self.ports
                 .topology_command
@@ -1201,6 +1206,8 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
         let local_node_name_for_observed_endpoint = self.local_node_name.clone();
         let node_self_query_for_observed_endpoint = self.node_self_query.clone();
         let node_self_status_for_observed_endpoint = self.node_self_status.clone();
+        let mut follower_progress =
+            accepted.then(|| follower_sessions.subscribe_follower_progress());
         let stream = async_stream::stream! {
             yield Ok(klights_internal_protobuf::LeaderMessage {
                 payload: Some(klights_internal_protobuf::leader_message::Payload::JoinResponse(first_response)),
@@ -1235,6 +1242,15 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                     yield Err(Status::internal("accepted replication stream missing control receiver"));
                     return;
                 };
+                let Some(mut follower_progress) = follower_progress.take() else {
+                    yield Err(Status::internal("accepted replication stream missing progress receiver"));
+                    return;
+                };
+                let initial_progress = accepted_current_rv
+                    .expect("accepted stream has an initial resource version")
+                    .max(*follower_progress.borrow_and_update());
+                let mut last_emitted_progress = initial_progress;
+                yield Ok(follower_progress_message(initial_progress));
                 loop {
                     tokio::select! {
                         message = inbound.message() => {
@@ -1378,6 +1394,16 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                                         )),
                                     });
                                 }
+                            }
+                        }
+                        progress = follower_progress.changed() => {
+                            if progress.is_err() {
+                                break;
+                            }
+                            let current_rv = *follower_progress.borrow_and_update();
+                            if current_rv > last_emitted_progress {
+                                last_emitted_progress = current_rv;
+                                yield Ok(follower_progress_message(current_rv));
                             }
                         }
                     }
@@ -2587,6 +2613,20 @@ fn pod_cleanup_intent_error_to_status(error: klights_leader_api::PodCleanupInten
         Error::Timeout => Status::deadline_exceeded(message),
         Error::Cancelled => Status::cancelled(message),
         _ => Status::internal(message),
+    }
+}
+
+fn follower_progress_message(current_rv: i64) -> klights_internal_protobuf::LeaderMessage {
+    klights_internal_protobuf::LeaderMessage {
+        payload: Some(
+            klights_internal_protobuf::leader_message::Payload::StreamItem(
+                klights_internal_protobuf::StreamItem {
+                    item: Some(klights_internal_protobuf::stream_item::Item::Heartbeat(
+                        klights_internal_protobuf::Heartbeat { current_rv },
+                    )),
+                },
+            ),
+        ),
     }
 }
 
