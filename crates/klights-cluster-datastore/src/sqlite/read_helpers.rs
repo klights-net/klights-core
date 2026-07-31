@@ -46,3 +46,40 @@ pub fn row_to_cluster_resource(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reso
         data: std::sync::Arc::new(data),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{event_read_api_versions, needs_event_v1_compat};
+
+    #[test]
+    fn event_read_api_versions_expands_for_core_v1_event() {
+        let v = event_read_api_versions("v1", "Event");
+        assert_eq!(v, vec!["v1", "events.k8s.io/v1"]);
+        assert!(needs_event_v1_compat("v1", "Event"));
+    }
+
+    #[test]
+    fn event_read_api_versions_expands_for_events_k8s_io_v1_event() {
+        let v = event_read_api_versions("events.k8s.io/v1", "Event");
+        assert_eq!(v, vec!["v1", "events.k8s.io/v1"]);
+        assert!(needs_event_v1_compat("events.k8s.io/v1", "Event"));
+    }
+
+    #[test]
+    fn event_read_api_versions_does_not_expand_for_non_event_resource() {
+        assert!(event_read_api_versions("v1", "Pod").is_empty());
+        assert!(event_read_api_versions("v1", "ConfigMap").is_empty());
+        assert!(event_read_api_versions("apps/v1", "Deployment").is_empty());
+        assert!(!needs_event_v1_compat("v1", "Pod"));
+    }
+
+    #[test]
+    fn event_read_api_versions_does_not_expand_for_event_in_unrelated_group() {
+        // A custom kind that happens to be named "Event" but lives outside the
+        // K8s Events compat envelope (e.g., a CRD called Event in some.group/v1)
+        // must not pick up the cross-version compat behavior — that would
+        // randomly merge unrelated rows.
+        assert!(event_read_api_versions("some.group/v1", "Event").is_empty());
+        assert!(!needs_event_v1_compat("some.group/v1", "Event"));
+    }
+}
