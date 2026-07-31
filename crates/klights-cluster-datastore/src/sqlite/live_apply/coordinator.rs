@@ -1,4 +1,4 @@
-use super::state::{ApplyEffects, RaftClusterStateApplier};
+use super::state::{ApplyEffects, RaftClusterStateApplier, resolve_noop_put_resource_in_tx};
 use super::{queries, transaction_primitives};
 use klights_cluster_core::{
     ClusterMutation, LogApplyCommit, LogApplyMutation, OutboxStreamWatermark, Resource,
@@ -487,6 +487,17 @@ fn apply_commit_in_tx_with_watch_events(
             .mutations
             .iter()
             .any(|mutation| matches!(mutation, LogApplyMutation::PutWatchEvent(_)));
+    // Watermark gaps and duplicates retain precedence over resource CAS. Only
+    // an applicable stream position may inspect and collapse a resource put.
+    let watermark_decision = outbox_watermark_decision_in_tx(tx, commit.outbox_watermark.as_ref())?;
+    let commit = if matches!(
+        watermark_decision,
+        klights_cluster_core::OutboxWatermarkDecision::Apply
+    ) {
+        resolve_noop_put_resources_in_tx(tx, commit)?
+    } else {
+        commit
+    };
     let commit = stamp_provisional_resource_version_in_tx(tx, commit, context)?;
     let applied_rv = commit.resource_version;
     let watermark = commit.outbox_watermark.clone();
@@ -498,7 +509,7 @@ fn apply_commit_in_tx_with_watch_events(
         advance_metadata_rv_to_at_least_tx(tx, commit.resource_version)?;
         return Ok((applied_rv, Vec::new(), None));
     }
-    match outbox_watermark_decision_in_tx(tx, watermark.as_ref())? {
+    match watermark_decision {
         klights_cluster_core::OutboxWatermarkDecision::Duplicate => {
             advance_metadata_rv_to_at_least_tx(tx, commit.resource_version)?;
             return Ok((applied_rv, Vec::new(), None));
@@ -545,6 +556,41 @@ fn apply_commit_in_tx_with_watch_events(
         emit_watch_events,
     );
     Ok((applied_rv, pending, applied_mutation))
+}
+
+fn resolve_noop_put_resources_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    mut commit: ApplyCommit,
+) -> tokio_rusqlite::Result<ApplyCommit> {
+    if commit.preserve_historical_bytes {
+        return Ok(commit);
+    }
+    let mutations = std::mem::take(&mut commit.mutations);
+    let mut resolved = Vec::with_capacity(mutations.len());
+    let mut removed_noop = false;
+    for mutation in mutations {
+        match mutation {
+            LogApplyMutation::PutResource(row) => {
+                if let Some(row) = resolve_noop_put_resource_in_tx(tx, row)? {
+                    resolved.push(LogApplyMutation::PutResource(row));
+                } else {
+                    removed_noop = true;
+                }
+            }
+            mutation => resolved.push(mutation),
+        }
+    }
+    if removed_noop
+        && resolved
+            .iter()
+            .all(|mutation| matches!(mutation, LogApplyMutation::PutAppliedOutbox(_)))
+    {
+        // Ledger/watermark durability records the already-visible RV without
+        // consuming another public RV for the removed resource no-op.
+        commit.resource_version = transaction_primitives::current_resource_version(tx)?;
+    }
+    commit.mutations = resolved;
+    Ok(commit)
 }
 
 fn resolve_bound_pod_finalizations_in_tx(

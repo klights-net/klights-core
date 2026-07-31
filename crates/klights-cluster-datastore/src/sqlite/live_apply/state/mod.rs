@@ -6,6 +6,8 @@ mod pod_cleanup;
 mod resource;
 pub(super) mod watch_history;
 
+pub(super) use resource::resolve_noop_put_resource_in_tx;
+
 use klights_cluster_core::ClusterMutation;
 use klights_cluster_store::StagedPostCommit;
 

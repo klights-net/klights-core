@@ -999,6 +999,255 @@ async fn sqlite_stale_and_equal_status_stamps_persist_ledgers_without_public_cha
 }
 
 #[tokio::test]
+async fn sqlite_noop_put_preserves_rv_while_committing_outbox_ledger_and_watermark() {
+    let executor = sqlite::open_in_memory(supervisor(), "noop-put-ledger")
+        .await
+        .unwrap();
+    let read_executor = executor.read_lane_clone();
+    let codec: Arc<dyn OutboxResponseCodec> = Arc::new(JsonCodec);
+    let reads = SqliteReadStore::new(read_executor.clone());
+    let apply = SqliteLiveCommittedApplyStore::new(executor.clone(), codec.clone());
+    let ledger = SqliteApplyLedgerRead::new(read_executor.clone());
+    let recovery = SqliteRecoveryStore::new(
+        executor,
+        read_executor,
+        None,
+        Arc::new(tokio::sync::RwLock::new(())),
+        codec.clone(),
+    );
+    let mut config_map = resource_row(
+        "ConfigMap",
+        Some("default"),
+        "certified-noop-put",
+        "certified-noop-put-uid",
+        1,
+        serde_json::json!({"example.test/value": "unchanged"}),
+    );
+    config_map.data["data"] = serde_json::json!({"value": "before"});
+    recovery
+        .restore_snapshot_parts(
+            vec![SnapshotRestoreOperation::new(
+                1,
+                None,
+                vec![LogApplyMutation::PutResource(config_map.clone())],
+            )],
+            1,
+            Some(0),
+            Some(Vec::new()),
+            Some(SnapshotMetadata {
+                cluster_id: "noop-put-cluster".to_string(),
+                leader_epoch: 1,
+                membership: SnapshotMembership::AuthoritativeAbsent,
+                command_codec_activation_version: Some(3),
+            }),
+        )
+        .await
+        .unwrap();
+    let before_position = ledger.current_apply_position().await.unwrap();
+
+    let mut noop_put = config_map;
+    noop_put.resource_version = 0;
+    noop_put.data["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("resourceVersion");
+    noop_put.require_existing = true;
+    noop_put.precondition_uid = Some("certified-noop-put-uid".to_string());
+    noop_put.precondition_resource_version = Some(1);
+    let watermark = OutboxStreamWatermark {
+        client_id: "worker-noop".to_string(),
+        stream_id: 17,
+        stream_seq: 1,
+    };
+    let commit = LogApplyCommit::try_new_with_watermark(
+        vec![
+            LogApplyMutation::PutResource(noop_put),
+            LogApplyMutation::PutAppliedOutbox(LogApplyAppliedOutboxRow {
+                idempotency_key: "certified-noop-put".to_string(),
+                subject_key: "v1/ConfigMap/default/certified-noop-put".to_string(),
+                operation: "PatchResource".to_string(),
+                first_seen_ms: 11,
+                applied_rv: None,
+                result_proto: codec
+                    .encode(&StorageResponse::Ack {
+                        resource_version: 0,
+                    })
+                    .unwrap(),
+                status_stamp: None,
+            }),
+        ],
+        Some(watermark.clone()),
+    )
+    .unwrap();
+
+    let receipt = apply
+        .apply_committed_raft(CommittedRaftApplyRequest::new(commit))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        receipt.outcome(),
+        klights_cluster_core::CommittedApplyOutcome::NoPublicChange {
+            resource_version: 1,
+            reason: NoPublicChangeReason::LedgerOnly,
+        }
+    ));
+    assert_eq!(
+        ledger.current_apply_position().await.unwrap(),
+        before_position
+    );
+    let applied = ledger
+        .get_applied_outbox(AppliedOutboxLookup::new("certified-noop-put"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(applied.applied_rv, Some(1));
+    assert_eq!(
+        ledger.list_outbox_watermarks().await.unwrap(),
+        vec![watermark.clone()]
+    );
+    let stored = ClusterResourceRead::get_resource(
+        &reads,
+        ResourceGetRequest::new(
+            "v1",
+            "ConfigMap",
+            Some("default".to_string()),
+            "certified-noop-put",
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(stored.resource_version, 1);
+    assert_eq!(
+        stored.data.pointer("/data/value"),
+        Some(&serde_json::json!("before"))
+    );
+    assert_eq!(
+        stored.data.pointer("/metadata/resourceVersion"),
+        Some(&serde_json::json!("1"))
+    );
+
+    let mut stale_put = resource_row(
+        "ConfigMap",
+        Some("default"),
+        "certified-noop-put",
+        "certified-noop-put-uid",
+        0,
+        serde_json::json!({"example.test/value": "unchanged"}),
+    );
+    stale_put.data["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("resourceVersion");
+    stale_put.data["data"] = serde_json::json!({"value": "before"});
+    stale_put.require_existing = true;
+    stale_put.precondition_uid = Some("certified-noop-put-uid".to_string());
+    stale_put.precondition_resource_version = Some(99);
+    let gap_commit = LogApplyCommit::try_new_with_watermark(
+        vec![
+            LogApplyMutation::PutResource(stale_put),
+            LogApplyMutation::PutAppliedOutbox(LogApplyAppliedOutboxRow {
+                idempotency_key: "certified-noop-put-gap".to_string(),
+                subject_key: "v1/ConfigMap/default/certified-noop-put".to_string(),
+                operation: "PatchResource".to_string(),
+                first_seen_ms: 12,
+                applied_rv: None,
+                result_proto: codec
+                    .encode(&StorageResponse::Ack {
+                        resource_version: 0,
+                    })
+                    .unwrap(),
+                status_stamp: None,
+            }),
+        ],
+        Some(OutboxStreamWatermark {
+            stream_seq: 3,
+            ..watermark.clone()
+        }),
+    )
+    .unwrap();
+
+    let gap_error = apply
+        .apply_committed_raft(CommittedRaftApplyRequest::new(gap_commit))
+        .await
+        .expect_err("a watermark gap must take precedence over stale resource CAS");
+    assert!(
+        gap_error.to_string().contains("outbox stream gap"),
+        "unexpected gap error: {gap_error}"
+    );
+    assert_eq!(
+        ledger.current_apply_position().await.unwrap(),
+        before_position
+    );
+    assert!(
+        ledger
+            .get_applied_outbox(AppliedOutboxLookup::new("certified-noop-put-gap"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        ledger.list_outbox_watermarks().await.unwrap(),
+        vec![watermark.clone()]
+    );
+}
+
+#[tokio::test]
+async fn sqlite_watermark_only_snapshot_restore_preserves_exact_public_rv() {
+    let executor = sqlite::open_in_memory(supervisor(), "watermark-only-restore")
+        .await
+        .unwrap();
+    let read_executor = executor.read_lane_clone();
+    let ledger = SqliteApplyLedgerRead::new(read_executor.clone());
+    let recovery = SqliteRecoveryStore::new(
+        executor,
+        read_executor,
+        None,
+        Arc::new(tokio::sync::RwLock::new(())),
+        Arc::new(JsonCodec),
+    );
+    let watermark = OutboxStreamWatermark {
+        client_id: "restored-worker".to_string(),
+        stream_id: 29,
+        stream_seq: 41,
+    };
+
+    recovery
+        .restore_snapshot_parts(
+            vec![SnapshotRestoreOperation::new(
+                7,
+                Some(watermark.clone()),
+                Vec::new(),
+            )],
+            7,
+            Some(0),
+            Some(Vec::new()),
+            Some(SnapshotMetadata {
+                cluster_id: "watermark-restore-cluster".to_string(),
+                leader_epoch: 1,
+                membership: SnapshotMembership::AuthoritativeAbsent,
+                command_codec_activation_version: Some(3),
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ledger.current_apply_position().await.unwrap(),
+        WatchReplayPosition {
+            resource_version: 7,
+            event_id: 0,
+            resource_version_filter_through_event_id: 0,
+        }
+    );
+    assert_eq!(
+        ledger.list_outbox_watermarks().await.unwrap(),
+        vec![watermark]
+    );
+}
+
+#[tokio::test]
 async fn sqlite_recovery_preserves_metadata_codec_and_restore_rollback() {
     let executor = sqlite::open_in_memory(supervisor(), "phase10e:recovery")
         .await

@@ -16,6 +16,52 @@ use klights_cluster_core::{LogApplyResourceKey, LogApplyResourcePatch, LogApplyR
 use klights_cluster_store::StagedPostCommit;
 use rusqlite::OptionalExtension;
 
+pub(in crate::sqlite::live_apply) fn resolve_noop_put_resource_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    row: LogApplyResourceRow,
+) -> tokio_rusqlite::Result<Option<LogApplyResourceRow>> {
+    let mut namespace_owned = String::new();
+    let applier = ClusterStateApplier::new(tx);
+    let identity = resource_identity(
+        &row.api_version,
+        &row.kind,
+        row.namespace.as_deref(),
+        &row.name,
+        &mut namespace_owned,
+    );
+    let existing = applier.get_existing_resource(identity)?;
+    let Some(existing) = existing else {
+        return Ok(Some(row));
+    };
+
+    let mut existing_data: serde_json::Value =
+        serde_json::from_slice(&existing.2).map_err(serde_to_sqlite_error)?;
+    clear_metadata_resource_version(&mut existing_data);
+    // Keep changed writes on the original single-normalization path. Only an
+    // already-equal body pays for the cloned normalization proof below.
+    if row.data != existing_data {
+        return Ok(Some(row));
+    }
+
+    validate_put_resource_apply_preconditions(&row, Some(&existing))?;
+    let mut normalized = row.clone();
+    normalize_committed_resource_for_apply(&mut normalized, Some(&existing))?;
+    clear_metadata_resource_version(&mut normalized.data);
+    if normalized.data == existing_data {
+        return Ok(None);
+    }
+    Ok(Some(row))
+}
+
+fn clear_metadata_resource_version(data: &mut serde_json::Value) {
+    if let Some(metadata) = data
+        .pointer_mut("/metadata")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        metadata.remove("resourceVersion");
+    }
+}
+
 pub(super) struct ClusterStateApplier<'tx, 'conn> {
     tx: &'tx rusqlite::Transaction<'conn>,
 }

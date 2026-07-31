@@ -2732,6 +2732,95 @@ mod cases {
         );
     }
 
+    #[tokio::test]
+    async fn raft_mode_identical_normal_patch_does_not_advance_rv_or_watch() {
+        let (ds, calls) = make_ds_with_inline_proposer().await;
+        let created = ds
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "raft-identical-patch",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "raft-identical-patch",
+                        "namespace": "default",
+                        "uid": "raft-identical-patch-uid",
+                        "annotations": {"example.test/value": "unchanged"}
+                    },
+                    "data": {"value": "before"}
+                }),
+            )
+            .await
+            .unwrap();
+        let before_rv = ds.passive.get_current_resource_version().await.unwrap();
+        let before_events = ds.list_all_watch_events_since(0).await.unwrap();
+        calls.lock().unwrap().clear();
+
+        let unchanged = ds
+            .patch_resource_latest_with_preconditions(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "raft-identical-patch",
+                ResourcePatchRequest::new(
+                    PatchKind::Merge,
+                    json!({
+                        "metadata": {
+                            "annotations": {"example.test/value": "unchanged"}
+                        }
+                    }),
+                    ResourcePreconditions::from_resource(&created),
+                ),
+            )
+            .await
+            .unwrap()
+            .expect("ConfigMap must remain present");
+
+        assert_eq!(calls.lock().unwrap().as_slice(), &["PatchResource"]);
+        assert_eq!(
+            unchanged.resource_version, created.resource_version,
+            "an identical normalized patch must preserve the live resourceVersion"
+        );
+        assert_eq!(unchanged.data, created.data);
+        assert_eq!(
+            ds.passive.get_current_resource_version().await.unwrap(),
+            before_rv,
+            "an identical normalized patch must not consume a public resourceVersion"
+        );
+        assert_eq!(
+            ds.list_all_watch_events_since(0).await.unwrap().len(),
+            before_events.len(),
+            "an identical normalized patch must not append a MODIFIED watch event"
+        );
+
+        let changed = ds
+            .patch_resource_latest_with_preconditions(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "raft-identical-patch",
+                ResourcePatchRequest::new(
+                    PatchKind::Merge,
+                    json!({"data": {"value": "after"}}),
+                    ResourcePreconditions::from_resource(&unchanged),
+                ),
+            )
+            .await
+            .unwrap()
+            .expect("ConfigMap must remain present");
+
+        assert_eq!(changed.resource_version, before_rv + 1);
+        assert_eq!(changed.data.pointer("/data/value"), Some(&json!("after")));
+        assert_eq!(
+            ds.list_all_watch_events_since(0).await.unwrap().len(),
+            before_events.len() + 1,
+            "a real patch must append exactly one MODIFIED watch event"
+        );
+    }
+
     // ── T7.1: EnsureClusterMetadata command ──
 
     #[tokio::test]
