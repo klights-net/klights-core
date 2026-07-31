@@ -13,6 +13,10 @@ workspace = true
 
 [dependencies]
 klights-leader-api = { workspace = true }
+klights-cluster-core = { workspace = true }
 klights-network-api = { workspace = true }
 klights-node-store = { workspace = true }
+klights-pod-api = { workspace = true }
 klights-supervisor = { workspace = true }
+klights-types = { workspace = true }
+serde_json = { workspace = true }

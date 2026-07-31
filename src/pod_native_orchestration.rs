@@ -2414,15 +2414,23 @@ impl klights_pod_api::PodApiMutation for PodNativeOrchestration {
     }
 }
 
+impl klights_kubelet::pod_repository::PodTerminationPort for PodNativeOrchestration {
+    fn mark_terminating(
+        &self,
+        target: klights_pod_api::PodMutationTarget,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
+        Box::pin(async move { self.mark_pod_terminating_for_repository(&target).await })
+    }
+}
+
 impl klights_pod_api::PodMarkTerminating for PodNativeOrchestration {
     fn mark_pod_terminating(
         &self,
         request: klights_pod_api::PodMarkTerminatingRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
-        Box::pin(async move {
-            let target = request.into_target();
-            self.mark_pod_terminating_for_repository(&target).await
-        })
+        klights_kubelet::pod_repository::PodRepositoryService::mark_pod_terminating_from(
+            self, request,
+        )
     }
 }
 

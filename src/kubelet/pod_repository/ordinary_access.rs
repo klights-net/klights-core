@@ -7,12 +7,10 @@ use klights_pod_api::{
     PodEvictionDeleteRequest, PodMarkTerminating, PodMarkTerminatingRequest,
 };
 use klights_pod_api::{
-    PodGetRequest, PodLifecycleFuture, PodLifecycleWakeup, PodLifecycleWakeupRequest,
-    PodListRequest, PodListResult, PodOwnerListRequest, PodQuery, PodRepositoryError,
-    PodRepositoryFuture, PodRoutingError, PodSnapshotListRequest, PodSnapshotQuery, PodUpdate,
-    PodUpdateOperation, PodUpdateRequest,
+    PodGetRequest, PodLifecycleFuture, PodListRequest, PodListResult, PodOwnerListRequest,
+    PodQuery, PodRepositoryError, PodRepositoryFuture, PodRoutingError, PodSnapshotListRequest,
+    PodSnapshotQuery, PodUpdate, PodUpdateRequest,
 };
-use serde_json::{Map, Value};
 
 use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
@@ -21,31 +19,36 @@ use super::{PodObjectWriter, PodReader, PodRepository, store::PodStore};
 
 macro_rules! impl_pod_query_via_reader {
     ($type:ty) => {
-        impl PodQuery for $type {
-            fn get_pod(
-                &self,
-                request: PodGetRequest,
-            ) -> PodRepositoryFuture<'_, Option<klights_cluster_core::Resource>> {
+        impl klights_kubelet::pod_repository::PodQueryPort for $type {
+            fn read_pod<'a>(
+                &'a self,
+                namespace: &'a str,
+                name: &'a str,
+            ) -> PodRepositoryFuture<'a, Option<klights_cluster_core::Resource>> {
                 Box::pin(async move {
-                    let pod = match request.uid() {
-                        Some(uid) => {
-                            PodReader::get_pod_for_uid(
-                                self,
-                                request.namespace(),
-                                request.name(),
-                                uid,
-                            )
-                            .await
-                        }
-                        None => PodReader::get_pod(self, request.namespace(), request.name()).await,
-                    };
-                    pod.map_err(|error| {
-                        map_repository_error(error, request.namespace(), request.name())
-                    })
+                    PodReader::get_pod(self, namespace, name)
+                        .await
+                        .map_err(|error| map_repository_error(error, namespace, name))
                 })
             }
 
-            fn list_pods(&self, request: PodListRequest) -> PodRepositoryFuture<'_, PodListResult> {
+            fn read_pod_for_uid<'a>(
+                &'a self,
+                namespace: &'a str,
+                name: &'a str,
+                uid: &'a str,
+            ) -> PodRepositoryFuture<'a, Option<klights_cluster_core::Resource>> {
+                Box::pin(async move {
+                    PodReader::get_pod_for_uid(self, namespace, name, uid)
+                        .await
+                        .map_err(|error| map_repository_error(error, namespace, name))
+                })
+            }
+
+            fn list_pod_page<'a>(
+                &'a self,
+                request: &'a PodListRequest,
+            ) -> PodRepositoryFuture<'a, klights_kubelet::pod_repository::PodRepositoryList> {
                 Box::pin(async move {
                     let list = PodReader::list_pods(
                         self,
@@ -57,28 +60,47 @@ macro_rules! impl_pod_query_via_reader {
                     )
                     .await
                     .map_err(|error| PodRepositoryError::unavailable(error.to_string()))?;
-                    PodListResult::try_new(
+                    Ok(klights_kubelet::pod_repository::PodRepositoryList::new(
                         list.items,
                         list.resource_version,
                         list.continue_token,
                         list.remaining_item_count,
-                    )
+                    ))
                 })
+            }
+
+            fn list_pods_by_owner_uid<'a>(
+                &'a self,
+                namespace: &'a str,
+                owner_uid: &'a str,
+            ) -> PodRepositoryFuture<'a, Vec<klights_cluster_core::Resource>> {
+                Box::pin(async move {
+                    PodReader::list_pods_by_owner_uid(self, namespace, owner_uid)
+                        .await
+                        .map_err(|error| PodRepositoryError::unavailable(error.to_string()))
+                })
+            }
+        }
+
+        impl PodQuery for $type {
+            fn get_pod(
+                &self,
+                request: PodGetRequest,
+            ) -> PodRepositoryFuture<'_, Option<klights_cluster_core::Resource>> {
+                klights_kubelet::pod_repository::PodRepositoryService::get_pod_from(self, request)
+            }
+
+            fn list_pods(&self, request: PodListRequest) -> PodRepositoryFuture<'_, PodListResult> {
+                klights_kubelet::pod_repository::PodRepositoryService::list_pods_from(self, request)
             }
 
             fn list_pods_by_owner_uid(
                 &self,
                 request: PodOwnerListRequest,
             ) -> PodRepositoryFuture<'_, Vec<klights_cluster_core::Resource>> {
-                Box::pin(async move {
-                    PodReader::list_pods_by_owner_uid(
-                        self,
-                        request.namespace(),
-                        request.owner_uid(),
-                    )
-                    .await
-                    .map_err(|error| PodRepositoryError::unavailable(error.to_string()))
-                })
+                klights_kubelet::pod_repository::PodRepositoryService::list_pods_by_owner_uid_from(
+                    self, request,
+                )
             }
         }
     };
@@ -86,52 +108,99 @@ macro_rules! impl_pod_query_via_reader {
 
 impl_pod_query_via_reader!(PodStore);
 impl_pod_query_via_reader!(dyn PodReader + '_);
+impl_pod_query_via_reader!(PodRepository);
 
-impl PodQuery for PodRepository {
-    fn get_pod(
-        &self,
-        request: PodGetRequest,
-    ) -> PodRepositoryFuture<'_, Option<klights_cluster_core::Resource>> {
+impl klights_kubelet::pod_repository::PodUpdatePort for PodRepository {
+    fn merge_pod_labels<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+        labels: Vec<(String, String)>,
+    ) -> PodRepositoryFuture<'a, klights_cluster_core::Resource> {
         Box::pin(async move {
-            let pod = match request.uid() {
-                Some(uid) => {
-                    PodReader::get_pod_for_uid(self, request.namespace(), request.name(), uid).await
-                }
-                None => PodReader::get_pod(self, request.namespace(), request.name()).await,
-            };
-            pod.map_err(|error| map_repository_error(error, request.namespace(), request.name()))
+            PodObjectWriter::merge_pod_labels(self, namespace, name, labels)
+                .await
+                .map_err(|error| map_repository_error(error, namespace, name))
         })
     }
 
-    fn list_pods(&self, request: PodListRequest) -> PodRepositoryFuture<'_, PodListResult> {
+    fn merge_pod_labels_for_uid<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+        uid: &'a str,
+        labels: Vec<(String, String)>,
+    ) -> PodRepositoryFuture<'a, klights_cluster_core::Resource> {
         Box::pin(async move {
-            let list = PodReader::list_pods(
+            PodObjectWriter::merge_pod_labels_for_uid(self, namespace, name, uid, labels)
+                .await
+                .map_err(|error| map_repository_error(error, namespace, name))
+        })
+    }
+
+    fn replace_pod_owner_references<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+        owner_references: Vec<serde_json::Value>,
+    ) -> PodRepositoryFuture<'a, klights_cluster_core::Resource> {
+        Box::pin(async move {
+            PodObjectWriter::update_pod_owner_references(self, namespace, name, owner_references)
+                .await
+                .map_err(|error| map_repository_error(error, namespace, name))
+        })
+    }
+
+    fn replace_pod_owner_references_for_uid<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+        uid: &'a str,
+        owner_references: Vec<serde_json::Value>,
+    ) -> PodRepositoryFuture<'a, klights_cluster_core::Resource> {
+        Box::pin(async move {
+            PodObjectWriter::update_pod_owner_references_for_uid(
                 self,
-                request.namespace(),
-                request.label_selector(),
-                request.field_selector(),
-                request.limit(),
-                request.continue_token(),
+                namespace,
+                name,
+                uid,
+                owner_references,
             )
             .await
-            .map_err(|error| PodRepositoryError::unavailable(error.to_string()))?;
-            PodListResult::try_new(
-                list.items,
-                list.resource_version,
-                list.continue_token,
-                list.remaining_item_count,
-            )
+            .map_err(|error| map_repository_error(error, namespace, name))
         })
     }
 
-    fn list_pods_by_owner_uid(
-        &self,
-        request: PodOwnerListRequest,
-    ) -> PodRepositoryFuture<'_, Vec<klights_cluster_core::Resource>> {
+    fn record_pod_sandbox_id<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+        sandbox_id: String,
+    ) -> PodRepositoryFuture<'a, klights_cluster_core::Resource> {
         Box::pin(async move {
-            PodReader::list_pods_by_owner_uid(self, request.namespace(), request.owner_uid())
+            super::PodMetadataWriter::record_sandbox_id(self, namespace, name, &sandbox_id)
                 .await
-                .map_err(|error| PodRepositoryError::unavailable(error.to_string()))
+                .map_err(|error| map_repository_error(error, namespace, name))
+        })
+    }
+
+    fn record_pod_sandbox_id_for_uid<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+        uid: &'a str,
+        sandbox_id: String,
+    ) -> PodRepositoryFuture<'a, klights_cluster_core::Resource> {
+        Box::pin(async move {
+            super::PodMetadataWriter::record_sandbox_id_for_uid(
+                self,
+                namespace,
+                name,
+                uid,
+                &sandbox_id,
+            )
+            .await
+            .map_err(|error| map_repository_error(error, namespace, name))
         })
     }
 }
@@ -141,120 +210,22 @@ impl PodUpdate for PodRepository {
         &self,
         request: PodUpdateRequest,
     ) -> PodRepositoryFuture<'_, klights_cluster_core::Resource> {
-        Box::pin(async move {
-            let (target, operation) = request.into_parts();
-            let result = match operation {
-                PodUpdateOperation::MergeLabels(labels) => {
-                    let labels = labels
-                        .into_iter()
-                        .map(klights_pod_api::PodLabel::into_parts)
-                        .collect();
-                    match target.uid() {
-                        Some(uid) => {
-                            PodObjectWriter::merge_pod_labels_for_uid(
-                                self,
-                                target.namespace(),
-                                target.name(),
-                                uid,
-                                labels,
-                            )
-                            .await
-                        }
-                        None => {
-                            PodObjectWriter::merge_pod_labels(
-                                self,
-                                target.namespace(),
-                                target.name(),
-                                labels,
-                            )
-                            .await
-                        }
-                    }
-                }
-                PodUpdateOperation::ReplaceOwnerReferences(owner_references) => {
-                    let owner_references = owner_references
-                        .into_iter()
-                        .map(|owner| {
-                            let (api_version, kind, name, uid, controller, block_owner_deletion) =
-                                owner.into_parts();
-                            let mut value = Map::new();
-                            value.insert("apiVersion".to_string(), Value::String(api_version));
-                            value.insert("kind".to_string(), Value::String(kind));
-                            value.insert("name".to_string(), Value::String(name));
-                            value.insert("uid".to_string(), Value::String(uid));
-                            if let Some(controller) = controller {
-                                value.insert("controller".to_string(), Value::Bool(controller));
-                            }
-                            if let Some(block_owner_deletion) = block_owner_deletion {
-                                value.insert(
-                                    "blockOwnerDeletion".to_string(),
-                                    Value::Bool(block_owner_deletion),
-                                );
-                            }
-                            Value::Object(value)
-                        })
-                        .collect();
-                    match target.uid() {
-                        Some(uid) => {
-                            PodObjectWriter::update_pod_owner_references_for_uid(
-                                self,
-                                target.namespace(),
-                                target.name(),
-                                uid,
-                                owner_references,
-                            )
-                            .await
-                        }
-                        None => {
-                            PodObjectWriter::update_pod_owner_references(
-                                self,
-                                target.namespace(),
-                                target.name(),
-                                owner_references,
-                            )
-                            .await
-                        }
-                    }
-                }
-                PodUpdateOperation::RecordSandboxId(sandbox_id) => match target.uid() {
-                    Some(uid) => {
-                        super::PodMetadataWriter::record_sandbox_id_for_uid(
-                            self,
-                            target.namespace(),
-                            target.name(),
-                            uid,
-                            &sandbox_id,
-                        )
-                        .await
-                    }
-                    None => {
-                        super::PodMetadataWriter::record_sandbox_id(
-                            self,
-                            target.namespace(),
-                            target.name(),
-                            &sandbox_id,
-                        )
-                        .await
-                    }
-                },
-            };
-            result.map_err(|error| map_repository_error(error, target.namespace(), target.name()))
-        })
+        klights_kubelet::pod_repository::PodRepositoryService::update_pod_from(self, request)
     }
 }
 
 #[cfg(test)]
-impl PodMarkTerminating for PodRepository {
-    fn mark_pod_terminating(
+impl klights_kubelet::pod_repository::PodTerminationPort for PodRepository {
+    fn mark_terminating(
         &self,
-        request: PodMarkTerminatingRequest,
+        target: klights_pod_api::PodMutationTarget,
     ) -> PodRepositoryFuture<'_, klights_cluster_core::Resource> {
         Box::pin(async move {
             let resource = self
                 .test_mark_terminating
                 .as_deref()
                 .expect("test termination requires the neutral Pod termination port")
-                .mark_pod_terminating(request)
+                .mark_pod_terminating(PodMarkTerminatingRequest::new(target))
                 .await?;
 
             let _ = self
@@ -269,6 +240,18 @@ impl PodMarkTerminating for PodRepository {
                 .await;
             Ok(resource)
         })
+    }
+}
+
+#[cfg(test)]
+impl PodMarkTerminating for PodRepository {
+    fn mark_pod_terminating(
+        &self,
+        request: PodMarkTerminatingRequest,
+    ) -> PodRepositoryFuture<'_, klights_cluster_core::Resource> {
+        klights_kubelet::pod_repository::PodRepositoryService::mark_pod_terminating_from(
+            self, request,
+        )
     }
 }
 
@@ -404,8 +387,11 @@ impl klights_reconcile_api::NamespaceTerminationQueueSink for PodRepository {
     }
 }
 
-impl PodLifecycleWakeup for PodLifecycleRouter {
-    fn wake_pod_lifecycle(&self, request: PodLifecycleWakeupRequest) -> PodLifecycleFuture<'_> {
+impl klights_kubelet::pod_repository::PodLifecycleRouteSink for PodLifecycleRouter {
+    fn route_pod_lifecycle(
+        &self,
+        request: klights_kubelet::pod_repository::PodLifecycleRouteRequest,
+    ) -> PodLifecycleFuture<'_> {
         Box::pin(async move {
             let (identity, resource_version, pod) = request.into_parts();
             self.route(LifecycleMessage::WatchModified {

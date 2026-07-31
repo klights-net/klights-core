@@ -2225,10 +2225,14 @@ dependencies = [
 name = "klights-kubelet"
 version = "0.0.0"
 dependencies = [
+ "klights-cluster-core",
  "klights-leader-api",
  "klights-network-api",
  "klights-node-store",
+ "klights-pod-api",
  "klights-supervisor",
+ "klights-types",
+ "serde_json",
 ]
 
 [[package]]

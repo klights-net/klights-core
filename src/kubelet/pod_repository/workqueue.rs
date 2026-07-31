@@ -341,12 +341,17 @@ impl PodWorkqueue {
         })
     }
 
-    pub(super) fn set_lifecycle_router_for_node(
+    pub(super) fn set_lifecycle_router_for_node<Route>(
         &self,
-        router: Arc<dyn PodLifecycleWakeup>,
+        router: Arc<Route>,
         local_node_name: String,
-    ) {
-        *self.lifecycle_router.lock().unwrap() = Some(router);
+    ) where
+        Route: klights_kubelet::pod_repository::PodLifecycleRouteSink + 'static,
+    {
+        let route: Arc<dyn klights_kubelet::pod_repository::PodLifecycleRouteSink> = router;
+        let wakeup: Arc<dyn PodLifecycleWakeup> =
+            Arc::new(klights_kubelet::pod_repository::PodLifecycleWakeupService::new(route));
+        *self.lifecycle_router.lock().unwrap() = Some(wakeup);
         *self.local_node_name.lock().unwrap() = Some(local_node_name);
     }
 
