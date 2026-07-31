@@ -494,6 +494,27 @@ mod tests {
     }
 
     #[test]
+    fn follower_progress_reaches_500_subscribers_without_slow_receiver_backpressure() {
+        let progress = FollowerProgressHub::new(0);
+        let mut slow_subscriptions = (0..499).map(|_| progress.subscribe()).collect::<Vec<_>>();
+        let mut fast_subscription = progress.subscribe();
+
+        for resource_version in 1..=1_024 {
+            progress.advance(resource_version);
+        }
+        assert!(fast_subscription.has_changed().unwrap());
+        assert_eq!(*fast_subscription.borrow_and_update(), 1_024);
+
+        progress.advance(1_025);
+        assert!(fast_subscription.has_changed().unwrap());
+        assert_eq!(*fast_subscription.borrow_and_update(), 1_025);
+        for subscription in &mut slow_subscriptions {
+            assert!(subscription.has_changed().unwrap());
+            assert_eq!(*subscription.borrow_and_update(), 1_025);
+        }
+    }
+
+    #[test]
     fn replication_service_subscribes_to_the_injected_progress_owner() {
         let progress = Arc::new(FollowerProgressHub::new(11));
         let service = ReplicationService::new_with_ports_and_progress(
