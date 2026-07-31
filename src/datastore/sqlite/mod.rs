@@ -237,7 +237,7 @@ use klights_cluster_datastore::sqlite::filters::filter_by_field_selector;
 #[cfg(test)]
 use klights_cluster_datastore::sqlite::filters::parse_label_selector;
 #[cfg(test)]
-use klights_cluster_datastore::sqlite::filters::{resolve_field_path, split_selector};
+use klights_cluster_datastore::sqlite::filters::split_selector;
 use klights_cluster_datastore::sqlite::scope::use_namespaced_table;
 use resource_shape::hydrate_watch_event_data;
 use resource_shape::{
