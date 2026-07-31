@@ -272,7 +272,7 @@ pub trait DatastoreBackend: Send + Sync {
     async fn apply_raft_log_apply_commit(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_replication::types::StorageCommandResult>;
+    ) -> Result<klights_cluster_store::StorageCommandResult>;
 
     /// Apply one committed Raft entry and return the canonical outcome derived
     /// inside the same datastore transaction. Backends must fail before
@@ -1703,7 +1703,7 @@ pub trait ReplicationStore: Send + Sync {
     async fn apply_raft_log_apply_commit(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_replication::types::StorageCommandResult>;
+    ) -> Result<klights_cluster_store::StorageCommandResult>;
     async fn apply_raft_log_apply_commit_receipt(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
@@ -1760,7 +1760,7 @@ impl<T: ReplicationStore + ?Sized> ReplicationStore for std::sync::Arc<T> {
     async fn apply_raft_log_apply_commit(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_replication::types::StorageCommandResult> {
+    ) -> Result<klights_cluster_store::StorageCommandResult> {
         self.as_ref().apply_raft_log_apply_commit(commit).await
     }
 

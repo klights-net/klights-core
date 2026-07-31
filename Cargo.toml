@@ -295,7 +295,6 @@ tikv-jemalloc-ctl = { workspace = true }
 debug = 1
 
 [dev-dependencies]
-klights-replication = { workspace = true, features = ["test-support"] }
 klights-cluster-datastore = { workspace = true, features = ["test-support"] }
 klights-cluster-store = { workspace = true, features = ["test-support"] }
 klights-networking = { workspace = true, features = ["test-support"] }

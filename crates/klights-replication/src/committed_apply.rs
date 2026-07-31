@@ -68,24 +68,24 @@ pub fn storage_command_result_from_committed_outcome(
     match receipt.outcome() {
         CommittedApplyOutcome::Visible {
             resource_version, ..
-        } => StorageCommandResult {
-            applied_rv: Some(*resource_version),
-            error_message: None,
-            rejection_code: None,
-            public_resource_changed: true,
+        } => StorageCommandResult::new(
+            Some(*resource_version),
+            None,
+            None,
+            true,
             applied_mutation,
-            pod_endpoint_effect: receipt.pod_endpoint_effect(),
-        },
+            receipt.pod_endpoint_effect(),
+        ),
         CommittedApplyOutcome::NoPublicChange {
             resource_version, ..
-        } => StorageCommandResult {
-            applied_rv: Some(*resource_version),
-            error_message: None,
-            rejection_code: None,
-            public_resource_changed: false,
+        } => StorageCommandResult::new(
+            Some(*resource_version),
+            None,
+            None,
+            false,
             applied_mutation,
-            pod_endpoint_effect: receipt.pod_endpoint_effect(),
-        },
+            receipt.pod_endpoint_effect(),
+        ),
         CommittedApplyOutcome::Rejected(rejection) => {
             use klights_cluster_core::{CommittedApplyRejection, StorageCommandRejectionCode};
             let rejection_code = match rejection {
@@ -102,23 +102,23 @@ pub fn storage_command_result_from_committed_outcome(
                 }
                 _ => StorageCommandRejectionCode::InvalidCommit,
             };
-            StorageCommandResult {
-                applied_rv: None,
-                error_message: Some(rejection.message().to_string()),
-                rejection_code: Some(rejection_code),
-                public_resource_changed: false,
-                applied_mutation: None,
-                pod_endpoint_effect: receipt.pod_endpoint_effect(),
-            }
+            StorageCommandResult::new(
+                None,
+                Some(rejection.message().to_string()),
+                Some(rejection_code),
+                false,
+                None,
+                receipt.pod_endpoint_effect(),
+            )
         }
-        _ => StorageCommandResult {
-            applied_rv: None,
-            error_message: Some("unsupported canonical committed-apply outcome".to_string()),
-            rejection_code: Some(klights_cluster_core::StorageCommandRejectionCode::InvalidCommit),
-            public_resource_changed: false,
-            applied_mutation: None,
-            pod_endpoint_effect: receipt.pod_endpoint_effect(),
-        },
+        _ => StorageCommandResult::new(
+            None,
+            Some("unsupported canonical committed-apply outcome".to_string()),
+            Some(klights_cluster_core::StorageCommandRejectionCode::InvalidCommit),
+            false,
+            None,
+            receipt.pod_endpoint_effect(),
+        ),
     }
 }
 

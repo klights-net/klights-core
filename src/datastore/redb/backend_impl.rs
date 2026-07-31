@@ -190,7 +190,7 @@ impl DatastoreBackend for RedbDatastore {
     async fn apply_raft_log_apply_commit(
         &self,
         _commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_replication::types::StorageCommandResult> {
+    ) -> Result<klights_cluster_store::StorageCommandResult> {
         self.live_committed_apply.apply_raft_log_apply_commit()
     }
 
@@ -1550,7 +1550,7 @@ impl crate::datastore::ReplicationStore for RedbDatastore {
     async fn apply_raft_log_apply_commit(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_replication::types::StorageCommandResult> {
+    ) -> Result<klights_cluster_store::StorageCommandResult> {
         crate::datastore::DatastoreBackend::apply_raft_log_apply_commit(self, commit).await
     }
 

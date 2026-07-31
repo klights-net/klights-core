@@ -11,7 +11,7 @@ mod cases {
 
     use crate::datastore::backend::DatastoreHandle;
 
-    use klights_replication::service::ReplicationService;
+    use klights_replication::ReplicationService;
 
     use futures::StreamExt as _;
 
@@ -2253,7 +2253,10 @@ mod cases {
             300,
         )
         .unwrap();
-        let response = service.exec_sync(request).await.unwrap();
+        let runtime = crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(
+            service.clone(),
+        );
+        let response = runtime.exec_sync(request).await.unwrap();
 
         assert_eq!(response.stdout(), b"worker-stdout\n");
         assert_eq!(response.exit_code(), 0);
@@ -2307,7 +2310,10 @@ mod cases {
             .await
             .unwrap();
 
-        let response = service
+        let runtime = crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(
+            service.clone(),
+        );
+        let response = runtime
             .collect_metrics(NodeMetricsRequest::new(
                 NodeMetricsTarget::try_new("worker-1").unwrap(),
                 Vec::new(),
@@ -2423,7 +2429,10 @@ mod cases {
             vec!["/bin/sh".to_string()],
             ExecStreamOptions::new(true, true, true, true),
         );
-        let session = service.open_exec(request).await.unwrap();
+        let runtime = crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(
+            service.clone(),
+        );
+        let session = runtime.open_exec(request).await.unwrap();
         session
             .send_frame(NodeExecFrame::new(
                 ExecStreamChannel::Stdin,

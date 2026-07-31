@@ -21,10 +21,9 @@ use klights_cluster_core::ReplicationEntry;
 use klights_leader_api::{JoinRequest, JoinResponse, MetadataResponse};
 use klights_node_api::{
     BoundedByteStream, ByteStreamBounds, ByteStreamError, ByteStreamFuture, ExecSetupError,
-    FollowerControlMessage, NodeExec, NodeExecFrame, NodeExecFuture, NodeExecRequest,
-    NodeExecSession, NodeExecSyncRequest, NodeExecSyncResult, NodeLog, NodeLogEvent, NodeLogFuture,
-    NodeLogRequest, NodeLogResult, NodeLogSetupError, NodeMetrics, NodeMetricsError,
-    NodeMetricsFuture, NodeMetricsRequest, NodeMetricsResult, RoutedNodeExecFrame,
+    FollowerControlMessage, NodeExecFrame, NodeExecRequest, NodeExecSession, NodeExecSyncRequest,
+    NodeExecSyncResult, NodeLogEvent, NodeLogRequest, NodeLogResult, NodeLogSetupError,
+    NodeMetricsError, NodeMetricsRequest, NodeMetricsResult, RoutedNodeExecFrame,
     RoutedNodeExecRequest, RoutedNodeExecSyncRequest, RoutedNodeExecSyncResponse,
     RoutedNodeLogEvent, RoutedNodeLogRequest, RoutedNodeMetricsRequest, RoutedNodeMetricsResponse,
 };
@@ -35,10 +34,6 @@ use klights_node_api::{FollowerCompletionContext, NodeOperationKind};
 use super::fanout::FanoutPool;
 use klights_leader_api::NetworkDataplane;
 use klights_supervisor::{TaskCategory, TaskSupervisor};
-
-fn new_command_id() -> klights_cluster_core::CommandId {
-    klights_cluster_core::CommandId(uuid::Uuid::new_v4().to_string())
-}
 
 const STREAM_FOLLOWER_QUEUE_CAPACITY: usize = 1024;
 const FOLLOWER_CONTROL_QUEUE_CAPACITY: usize = 64;
@@ -369,151 +364,52 @@ impl ReplicationService {
         self.supervisor.clone()
     }
 
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub async fn open_node_exec_stream_for_test(
+    pub async fn open_node_exec_with_command_id(
         &self,
-        request_id: String,
+        request_id: klights_cluster_core::CommandId,
         request: NodeExecRequest,
     ) -> Result<Box<dyn NodeExecSession>, ExecSetupError> {
         Ok(Box::new(
-            self.open_node_exec_stream(request_id, request).await?,
+            self.open_node_exec_stream(request_id.to_string(), request)
+                .await?,
         ))
     }
 
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub async fn open_node_log_stream_for_test(
+    pub async fn open_node_logs_with_command_id(
         &self,
-        request_id: String,
+        request_id: klights_cluster_core::CommandId,
         request: NodeLogRequest,
     ) -> Result<Box<dyn BoundedByteStream<Frame = NodeLogEvent>>, NodeLogSetupError> {
         Ok(Box::new(
-            self.open_node_log_stream(request_id, request).await?,
+            self.open_node_log_stream(request_id.to_string(), request)
+                .await?,
         ))
     }
 
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub async fn request_node_metrics_for_test(
+    pub async fn collect_node_metrics_with_command_id(
         &self,
-        request_id: String,
+        request_id: klights_cluster_core::CommandId,
         request: NodeMetricsRequest,
     ) -> Result<NodeMetricsResult, NodeMetricsError> {
-        self.request_node_metrics(request_id, request).await
+        self.request_node_metrics(request_id.to_string(), request)
+            .await
     }
 
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub async fn pending_operation_exists_for_test(
+    pub async fn execute_node_sync_with_command_id(
         &self,
-        kind: PendingOperationKindForTest,
-        request_id: &str,
-    ) -> bool {
-        match kind {
-            PendingOperationKindForTest::ExecSync => {
-                self.pending_node_exec.lock().await.contains_key(request_id)
-            }
-            PendingOperationKindForTest::LogSync => {
-                self.pending_pod_log.lock().await.contains_key(request_id)
-            }
-            PendingOperationKindForTest::Metrics => self
-                .pending_node_metrics
-                .lock()
-                .await
-                .contains_key(request_id),
-            PendingOperationKindForTest::ExecStream => self
-                .pending_node_exec_streams
-                .lock()
-                .await
-                .contains_key(request_id),
-            PendingOperationKindForTest::LogStream => self
-                .pending_pod_log_streams
-                .lock()
-                .await
-                .contains_key(request_id),
-        }
+        request_id: klights_cluster_core::CommandId,
+        request: NodeExecSyncRequest,
+    ) -> Result<NodeExecSyncResult, ExecSetupError> {
+        self.request_node_exec_sync(request_id.to_string(), request)
+            .await
     }
 
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub async fn insert_pending_exec_for_test(
+    pub async fn read_node_logs_with_command_id(
         &self,
-        request_id: String,
-        node_name: String,
-        follower_session: u64,
-        generation: u64,
-    ) -> oneshot::Receiver<Result<NodeExecSyncResult, ExecSetupError>> {
-        let (sender, receiver) = oneshot::channel();
-        self.pending_node_exec.lock().await.insert(
-            request_id,
-            PendingNodeOperation {
-                node_name,
-                follower_session,
-                kind: NodeOperationKind::ExecSync,
-                generation,
-                sink: sender,
-            },
-        );
-        receiver
-    }
-
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub async fn insert_pending_log_for_test(
-        &self,
-        request_id: String,
-        node_name: String,
-        follower_session: u64,
-        generation: u64,
-    ) -> oneshot::Receiver<Result<NodeLogResult, NodeLogSetupError>> {
-        let (sender, receiver) = oneshot::channel();
-        self.pending_pod_log.lock().await.insert(
-            request_id,
-            PendingNodeOperation {
-                node_name,
-                follower_session,
-                kind: NodeOperationKind::Log,
-                generation,
-                sink: sender,
-            },
-        );
-        receiver
-    }
-
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub async fn insert_pending_metrics_for_test(
-        &self,
-        request_id: String,
-        node_name: String,
-        follower_session: u64,
-        generation: u64,
-    ) -> oneshot::Receiver<Result<NodeMetricsResult, NodeMetricsError>> {
-        let (sender, receiver) = oneshot::channel();
-        self.pending_node_metrics.lock().await.insert(
-            request_id,
-            PendingNodeOperation {
-                node_name,
-                follower_session,
-                kind: NodeOperationKind::Metrics,
-                generation,
-                sink: sender,
-            },
-        );
-        receiver
-    }
-
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn next_operation_generation_for_test(&self) -> u64 {
-        self.next_operation_generation()
-    }
-
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub const fn node_exec_stream_frame_capacity_for_test() -> usize {
-        NODE_EXEC_STREAM_FRAME_QUEUE_CAPACITY
+        request_id: klights_cluster_core::CommandId,
+        request: NodeLogRequest,
+    ) -> Result<NodeLogResult, NodeLogSetupError> {
+        self.request_node_log(request_id.to_string(), request).await
     }
 
     fn next_operation_generation(&self) -> u64 {
@@ -1488,65 +1384,5 @@ impl ReplicationService {
             max_lag: statuses.iter().map(|status| status.lag).max().unwrap_or(0),
             followers: statuses,
         }
-    }
-}
-
-#[cfg(feature = "test-support")]
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug)]
-pub enum PendingOperationKindForTest {
-    ExecSync,
-    LogSync,
-    Metrics,
-    ExecStream,
-    LogStream,
-}
-
-impl NodeExec for ReplicationService {
-    fn exec_sync(&self, request: NodeExecSyncRequest) -> NodeExecFuture<'_, NodeExecSyncResult> {
-        Box::pin(async move {
-            let request_id = new_command_id().to_string();
-            self.request_node_exec_sync(request_id, request).await
-        })
-    }
-
-    fn open_exec(&self, request: NodeExecRequest) -> NodeExecFuture<'_, Box<dyn NodeExecSession>> {
-        Box::pin(async move {
-            let request_id = new_command_id().to_string();
-            let session = self.open_node_exec_stream(request_id, request).await?;
-            Ok(Box::new(session) as Box<dyn NodeExecSession>)
-        })
-    }
-}
-
-impl NodeLog for ReplicationService {
-    fn read_logs(&self, request: NodeLogRequest) -> NodeLogFuture<'_, NodeLogResult> {
-        Box::pin(async move {
-            let request_id = new_command_id().to_string();
-            self.request_node_log(request_id, request).await
-        })
-    }
-
-    fn open_logs(
-        &self,
-        request: NodeLogRequest,
-    ) -> NodeLogFuture<'_, Box<dyn BoundedByteStream<Frame = NodeLogEvent>>> {
-        Box::pin(async move {
-            let request_id = new_command_id().to_string();
-            let stream = self.open_node_log_stream(request_id, request).await?;
-            Ok(Box::new(stream) as Box<dyn BoundedByteStream<Frame = NodeLogEvent>>)
-        })
-    }
-}
-
-impl NodeMetrics for ReplicationService {
-    fn collect_metrics(
-        &self,
-        request: NodeMetricsRequest,
-    ) -> NodeMetricsFuture<'_, NodeMetricsResult> {
-        Box::pin(async move {
-            let request_id = new_command_id().to_string();
-            self.request_node_metrics(request_id, request).await
-        })
     }
 }

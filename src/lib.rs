@@ -13,6 +13,7 @@ pub mod audit;
 pub mod auth;
 mod authority_adapter;
 pub mod cli;
+pub(crate) mod cluster_store_replication_adapter;
 mod cni_socket_adapter;
 pub mod control_plane;
 mod controller_pod_adapters;

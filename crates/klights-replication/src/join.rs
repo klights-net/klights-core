@@ -305,7 +305,7 @@ mod coordinator_tests {
             addr: "https://10.0.0.2:7679".to_string(),
             node_name: "cp2".to_string(),
             as_learner: false,
-            storage_incarnation: uuid::Uuid::new_v4().to_string(),
+            storage_incarnation: "00000000-0000-4000-8000-000000000002".to_string(),
             storage_log_attestation: RaftStorageAttestation {
                 high_watermark: None,
                 current_boundary: None,

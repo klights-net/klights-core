@@ -15,20 +15,16 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use klights_cluster_core::{OutboxApplyError, OutboxApplyOutcome, StorageCommand};
 use klights_node_store::{RaftAppliedStateDurability, RaftLogDurability};
-#[cfg(any(test, feature = "test-support"))]
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::{Config, Raft};
 
 use openraft::network::RaftNetworkFactory;
 
 use super::network::LeaderForwarder;
-#[cfg(any(test, feature = "test-support"))]
-use super::network::StubRaftNetwork;
 use crate::activation::CommandCodecV3Activation;
 use crate::log_storage::SqliteRaftLogStorage;
 use crate::materializer::RaftCommitMaterializer;
 use crate::state_machine::{RaftStateMachineStorePorts, SqliteRaftStateMachine};
-#[cfg(any(test, feature = "test-support"))]
 use crate::types::StorageCommandPayload;
 use crate::types::{NodeId, RaftShape, TypeConfig};
 use klights_cluster_store::BackendLifecycleStore;
@@ -94,36 +90,7 @@ pub struct RaftNode {
 }
 
 impl RaftNode {
-    /// Construct a Raft node bound to the given cluster backend +
-    /// node-local SQLite handle. The Raft engine starts in Learner state;
-    /// call `bootstrap_single_voter` (manual promote) or wait for an
-    /// `add_learner` + `change_membership` from a peer (Step 6) to join.
-    /// Single-voter convenience constructor that wires a StubRaftNetwork
-    /// (no peer RPCs ever issued).
-    #[cfg(any(test, feature = "test-support"))]
-    pub async fn start(
-        node_id: NodeId,
-        node_name: String,
-        stores: RaftStorePorts,
-        log_durability: Arc<dyn RaftLogDurability>,
-        applied_state_durability: Arc<dyn RaftAppliedStateDurability>,
-        supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    ) -> Result<Self> {
-        Self::start_with_network(
-            node_id,
-            node_name,
-            stores,
-            log_durability,
-            applied_state_durability,
-            supervisor,
-            StubRaftNetwork,
-        )
-        .await
-    }
-
-    /// General constructor that accepts a caller-supplied
-    /// `RaftNetworkFactory`. Use for multi-voter clusters (Step 6) and
-    /// for the gRPC production transport (later).
+    /// Construct a Raft node with a caller-supplied network factory.
     pub async fn start_with_network<N>(
         node_id: NodeId,
         node_name: String,
@@ -246,8 +213,7 @@ impl RaftNode {
     }
 
     /// Attach a `LeaderForwarder` so `propose` can transparently redirect
-    /// writes to the current leader when this node is a follower. Tests
-    /// use `LoopbackRegistry`; production will use a gRPC client.
+    /// writes to the current leader when this node is a follower.
     pub fn with_forwarder(mut self, forwarder: Arc<dyn LeaderForwarder>) -> Self {
         self.forwarder = Some(forwarder);
         self
@@ -327,7 +293,6 @@ impl RaftNode {
     /// On a non-leader voter, openraft returns `ForwardToLeader`; if a
     /// `LeaderForwarder` was attached via `with_forwarder` the proposal is
     /// transparently re-dispatched to the current leader.
-    #[cfg(any(test, feature = "test-support"))]
     pub async fn propose(&self, payload: StorageCommandPayload) -> Result<()> {
         self.command_codec_v3_activation
             .ensure_command_codec_v3_activated()?;
@@ -424,7 +389,6 @@ impl RaftNode {
         self.membership.add_learner_only(node_id, addr).await
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub async fn admit_controlplane_member(
         &self,
         node_id: NodeId,
@@ -513,22 +477,8 @@ impl RaftNode {
         self.proposal().is_local_leader()
     }
 
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn storage_incarnation_for_test(&self) -> &str {
+    pub fn storage_incarnation(&self) -> &str {
         &self.storage_incarnation
-    }
-
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn materializer_for_test(&self) -> Arc<dyn RaftCommitMaterializer> {
-        self.materializer.clone()
-    }
-
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub fn flow_control_for_test(&self) -> Arc<crate::flow_control::RaftCommitFlowControl> {
-        self.flow_control.clone()
     }
 
     pub async fn shutdown(self) -> Result<()> {

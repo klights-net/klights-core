@@ -81,8 +81,7 @@ pub struct BootstrapRunArgs<'a> {
     pub pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
     pub pod_endpoint_store: Arc<dyn klights_node_store::PodEndpointStore>,
     pub assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
-    pub replication_service_for_router:
-        Option<Arc<klights_replication::service::ReplicationService>>,
+    pub replication_service_for_router: Option<Arc<klights_replication::ReplicationService>>,
     pub outbox_runtime: Arc<crate::node_outbox::Outbox>,
     pub node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
     pub node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
@@ -484,9 +483,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         Arc::new(crate::node_metrics_adapter::RootNodeMetrics::new(
             config.node_name.clone(),
             local_node_metrics,
-            replication_service_for_router
-                .clone()
-                .map(|service| service as Arc<dyn klights_node_api::NodeMetrics>),
+            replication_service_for_router.clone().map(|service| {
+                crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(service)
+                    as Arc<dyn klights_node_api::NodeMetrics>
+            }),
             supervisor.clone(),
         ));
 
@@ -910,11 +910,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     };
     #[cfg(test)]
     let api_replication = replication_service_for_router.clone().map(|replication| {
-        crate::api::ApiRemoteNodeServices::new(
+        let runtime = crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(
             replication.clone(),
-            replication.clone(),
-            replication,
-        )
+        );
+        crate::api::ApiRemoteNodeServices::new(runtime.clone(), runtime, replication)
     });
     #[cfg(test)]
     let api_config = Arc::new(crate::api::ApiOperationalConfig::new(
@@ -1672,9 +1671,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     };
     #[cfg(not(test))]
     let root_api_replication = replication_service_for_router.clone().map(|replication| {
+        let runtime = crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(
+            replication.clone(),
+        );
         (
-            replication.clone() as Arc<dyn klights_node_api::NodeExec>,
-            replication.clone() as Arc<dyn klights_node_api::NodeLog>,
+            runtime.clone() as Arc<dyn klights_node_api::NodeExec>,
+            runtime as Arc<dyn klights_node_api::NodeLog>,
             replication as Arc<dyn klights_leader_api::LeaderFollowerDiagnostics>,
         )
     });

@@ -11,9 +11,6 @@ publish.workspace = true
 [lints]
 workspace = true
 
-[features]
-test-support = []
-
 [dependencies]
 klights-types = { workspace = true }
 klights-cluster-core = { workspace = true }
@@ -35,4 +32,4 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 tonic = { workspace = true }
 zstd = { workspace = true }
-uuid = { workspace = true, features = ["std", "v4"] }
+uuid = { workspace = true, features = ["std"] }

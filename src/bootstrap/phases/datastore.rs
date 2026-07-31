@@ -39,6 +39,44 @@ fn validate_raft_backend_capability(
     }
 }
 
+struct LeaderNodeLocalStores {
+    node: crate::datastore::node_local::NodeLocalStores,
+    raft_log: Arc<dyn klights_node_store::RaftLogDurability>,
+    raft_applied_state: Arc<dyn klights_node_store::RaftAppliedStateDurability>,
+}
+
+async fn open_leader_node_local(
+    kind: BackendKind,
+    path: Option<&std::path::Path>,
+    supervisor: Arc<TaskSupervisor>,
+    key_file: Option<&std::path::Path>,
+    connection_key: &'static str,
+) -> Result<LeaderNodeLocalStores> {
+    anyhow::ensure!(
+        kind == BackendKind::Sqlite,
+        "the redb node-local backend does not implement Raft durability"
+    );
+    let node = crate::datastore::node_local::selector::open_node_local(
+        kind,
+        path,
+        supervisor,
+        key_file,
+        connection_key,
+    )
+    .await?;
+    let raft = Arc::new(
+        klights_replication::node_durability::OpenRaftNodeDurabilityAdapter::new(
+            node.raft_log_persistence(),
+            node.raft_applied_state_persistence(),
+        ),
+    );
+    Ok(LeaderNodeLocalStores {
+        node,
+        raft_log: raft.clone(),
+        raft_applied_state: raft,
+    })
+}
+
 pub struct OpenLeaderArgs<'a> {
     pub config: &'a Arc<KlightsConfig>,
     pub runtime_paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
@@ -67,7 +105,7 @@ pub struct DatastorePhase {
     pub local_api_client: Arc<crate::control_plane::client::local::LocalApiClient>,
     pub authenticated_outbox_delivery:
         Arc<dyn klights_leader_api::LeaderAuthenticatedOutboxDelivery>,
-    pub replication_service: Option<Arc<klights_replication::service::ReplicationService>>,
+    pub replication_service: Option<Arc<klights_replication::ReplicationService>>,
     pub node_local: crate::datastore::node_local::NodeLocalStores,
     pub outbox: Arc<crate::node_outbox::Outbox>,
     pub node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
@@ -199,7 +237,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     };
     let leader_node_local = if uses_leader_runtime(role) {
         Some(
-            crate::datastore::node_local::selector::open_leader_node_local(
+            open_leader_node_local(
                 config.node_local_backend,
                 node_local_db_path,
                 supervisor.clone(),
@@ -322,7 +360,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             let raft_network =
                 klights_replication::grpc_network::GrpcRaftNetwork::new(raft_factory);
             let materializer = Arc::new(
-                crate::datastore::cluster_store_adapter::DatastoreRaftCommitMaterializer::new(
+                crate::cluster_store_replication_adapter::DatastoreRaftCommitMaterializer::new(
                     passive_backend.clone(),
                 ),
             );
@@ -887,7 +925,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         ),
     );
     let replication_service = Some(Arc::new(
-        klights_replication::service::ReplicationService::new_with_ports(
+        klights_replication::ReplicationService::new_with_ports(
             replication_metadata,
             replication_bootstrap_tokens,
             supervisor.clone(),

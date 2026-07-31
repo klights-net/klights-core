@@ -2,7 +2,8 @@
 
 use tokio::sync::mpsc;
 
-pub struct FanoutPool<T> {
+pub(crate) struct FanoutPool<T> {
+    #[cfg(test)]
     batch_size: usize,
     followers: Vec<Follower<T>>,
 }
@@ -17,14 +18,17 @@ impl<T> FanoutPool<T>
 where
     T: Clone,
 {
-    pub fn new(batch_size: usize) -> Self {
+    pub(crate) fn new(batch_size: usize) -> Self {
+        #[cfg(not(test))]
+        let _ = batch_size;
         Self {
+            #[cfg(test)]
             batch_size: batch_size.max(1),
             followers: Vec::new(),
         }
     }
 
-    pub fn add_follower(&mut self, id: String, session_id: u64, sender: mpsc::Sender<T>) {
+    pub(crate) fn add_follower(&mut self, id: String, session_id: u64, sender: mpsc::Sender<T>) {
         self.followers.retain(|follower| follower.id != id);
         self.followers.push(Follower {
             id,
@@ -33,11 +37,13 @@ where
         });
     }
 
-    pub fn follower_count(&self) -> usize {
+    #[cfg(test)]
+    fn follower_count(&self) -> usize {
         self.followers.len()
     }
 
-    pub fn worker_count(&self) -> usize {
+    #[cfg(test)]
+    fn worker_count(&self) -> usize {
         self.followers.len().div_ceil(self.batch_size)
     }
 
@@ -50,7 +56,7 @@ where
     ///   lossless, so a follower that cannot accept the next item must
     ///   reconnect and catch up through a snapshot instead of silently
     ///   dropping the item while staying connected.
-    pub fn publish(&mut self, item: T) -> Vec<(String, u64)> {
+    pub(crate) fn publish(&mut self, item: T) -> Vec<(String, u64)> {
         let mut disconnected = Vec::new();
         self.followers
             .retain(|follower| match follower.sender.try_send(item.clone()) {

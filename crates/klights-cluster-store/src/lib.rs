@@ -9,6 +9,7 @@ pub const COMMAND_CODEC_ACTIVATION_VERSION_META_KEY: &str = "command_codec_activ
 /// The only accepted persisted command codec activation value.
 pub const COMMAND_CODEC_V3_ACTIVATION_VALUE: &str = "3";
 
+mod apply_result;
 mod backend_snapshot;
 mod committed_apply;
 mod durable_recovery;
@@ -25,6 +26,7 @@ mod response_codec;
 mod topology;
 mod watch_range;
 
+pub use apply_result::{AppliedMutation, StorageCommandResult};
 pub use backend_snapshot::{
     BackendLifecycleStore, DatastoreSnapshotter, SnapshotEntry, SnapshotEnvelope,
     SnapshotExclusiveFence, SnapshotMutationFence, SnapshotRestoreError, SnapshotTable,

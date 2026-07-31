@@ -26,9 +26,8 @@ use openraft::declare_raft_types;
 use openraft::impls::OneshotResponder;
 use serde::{Deserialize, Serialize};
 
-use klights_cluster_core::Resource;
-
 pub use klights_cluster_core::{NodeId, RaftShape, raft_node_id_for_node_name};
+pub use klights_cluster_store::{AppliedMutation, StorageCommandResult};
 
 /// Receiver admission proof captured by each OpenRaft replication worker.
 ///
@@ -102,58 +101,6 @@ impl StorageCommandPayload {
     pub fn as_slice(&self) -> &[u8] {
         &self.0
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum AppliedMutation {
-    Resource(Resource),
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct StorageCommandResult {
-    pub applied_rv: Option<i64>,
-    pub error_message: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rejection_code: Option<klights_cluster_core::StorageCommandRejectionCode>,
-    /// True only when this state-machine invocation newly committed a
-    /// Kubernetes-visible resource change. This is deliberately independent
-    /// of `applied_mutation`, which carries delete tombstones rather than a
-    /// general-purpose change signal.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub public_resource_changed: bool,
-    pub applied_mutation: Option<AppliedMutation>,
-    /// Ephemeral local handoff from committed SQLite apply to the leader-side
-    /// side-effect dispatcher. It is never serialized into a Raft response.
-    #[serde(skip)]
-    pub(crate) pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
-}
-
-impl StorageCommandResult {
-    pub fn new(
-        applied_rv: Option<i64>,
-        error_message: Option<String>,
-        rejection_code: Option<klights_cluster_core::StorageCommandRejectionCode>,
-        public_resource_changed: bool,
-        applied_mutation: Option<AppliedMutation>,
-        pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
-    ) -> Self {
-        Self {
-            applied_rv,
-            error_message,
-            rejection_code,
-            public_resource_changed,
-            applied_mutation,
-            pod_endpoint_effect,
-        }
-    }
-
-    pub fn pod_endpoint_effect(&self) -> klights_cluster_core::PodEndpointEffect {
-        self.pod_endpoint_effect
-    }
-}
-
-const fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 declare_raft_types!(

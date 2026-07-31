@@ -43,7 +43,7 @@ mod tests {
         supervisor: Arc<TaskSupervisor>,
     ) -> (TestRaftStateMachine, Arc<CommandCodecV3Activation>) {
         let materializer =
-            crate::datastore::cluster_store_adapter::DatastoreRaftCommitMaterializer::new(
+            crate::cluster_store_replication_adapter::DatastoreRaftCommitMaterializer::new(
                 backend.clone(),
             );
         let activation = Arc::new(
@@ -52,7 +52,7 @@ mod tests {
                 .expect("load command codec activation"),
         );
         let stores =
-            crate::datastore::cluster_store_adapter::raft_state_machine_store_ports_for_test(
+            crate::cluster_store_replication_adapter::raft_state_machine_store_ports_for_test(
                 backend.clone(),
             );
         let snapshot_builder = klights_replication::snapshot::SqliteRaftSnapshotBuilder::new(
@@ -624,7 +624,7 @@ mod tests {
         let applied_state = applied_durability(&node_local);
         let paused_applied_state = Arc::new(PausedAppliedState::new(applied_state.clone()));
         let materializer =
-            crate::datastore::cluster_store_adapter::DatastoreRaftCommitMaterializer::new(
+            crate::cluster_store_replication_adapter::DatastoreRaftCommitMaterializer::new(
                 backend.clone(),
             );
         let activation = Arc::new(
@@ -633,7 +633,7 @@ mod tests {
                 .expect("load command codec activation"),
         );
         let stores =
-            crate::datastore::cluster_store_adapter::raft_state_machine_store_ports_for_test(
+            crate::cluster_store_replication_adapter::raft_state_machine_store_ports_for_test(
                 backend.clone(),
             );
         let snapshot_builder = klights_replication::snapshot::SqliteRaftSnapshotBuilder::new(

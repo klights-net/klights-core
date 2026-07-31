@@ -22,7 +22,7 @@ use klights_internal_protobuf::{JoinRequest, JoinRole};
 
 use klights_leader_api::{ControlplaneJoinHandler, ControlplaneJoinOutcome};
 
-use klights_replication::service::ReplicationService;
+use klights_replication::ReplicationService;
 
 use klights_cluster_core::ReplicationEntry;
 

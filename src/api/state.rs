@@ -349,10 +349,11 @@ impl ApiRemoteNodeServices {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_test(
-        replication: Arc<klights_replication::service::ReplicationService>,
-    ) -> Self {
-        Self::new(replication.clone(), replication.clone(), replication)
+    pub(crate) fn from_test(replication: Arc<klights_replication::ReplicationService>) -> Self {
+        let runtime = crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(
+            replication.clone(),
+        );
+        Self::new(runtime.clone(), runtime, replication)
     }
 }
 

@@ -371,8 +371,6 @@ pub fn insert_tonic_tcp_connect_info<B>(
 /// result as an `Arc<Vec<LogApplyCommit>>`. P1 supersedes that: the serve
 /// path now STREAMS the snapshot through a bounded channel and never
 /// materializes a `Vec` at all, so no cache is held on the server struct.
-/// The `SnapshotCache` type itself is kept (in `snapshot_cache.rs`) for its
-/// unit tests and any future callers that want the Arc-sharing semantics.
 #[derive(Clone)]
 pub struct ReplicationServerPorts {
     resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,

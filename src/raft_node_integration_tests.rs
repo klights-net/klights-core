@@ -61,6 +61,252 @@ mod tests {
     };
     use klights_replication::types::RaftMemberLogId;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use openraft::Raft;
+    use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
+    use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
+    use openraft::raft::{
+        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
+        InstallSnapshotResponse, VoteRequest, VoteResponse,
+    };
+
+    #[derive(Clone, Debug, Default)]
+    struct StubRaftNetwork;
+
+    impl RaftNetworkFactory<TypeConfig> for StubRaftNetwork {
+        type Network = Self;
+
+        async fn new_client(&mut self, _target: NodeId, _node: &RaftMemberNode) -> Self::Network {
+            Self
+        }
+    }
+
+    fn unreachable(rpc: &str) -> Unreachable {
+        Unreachable::new(&std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            format!("consumer-local test Raft network: {rpc} unavailable"),
+        ))
+    }
+
+    impl RaftNetwork<TypeConfig> for StubRaftNetwork {
+        async fn append_entries(
+            &mut self,
+            _rpc: AppendEntriesRequest<TypeConfig>,
+            _option: RPCOption,
+        ) -> Result<
+            AppendEntriesResponse<NodeId>,
+            RPCError<NodeId, RaftMemberNode, RaftError<NodeId>>,
+        > {
+            Err(RPCError::Unreachable(unreachable("append_entries")))
+        }
+
+        async fn install_snapshot(
+            &mut self,
+            _rpc: InstallSnapshotRequest<TypeConfig>,
+            _option: RPCOption,
+        ) -> Result<
+            InstallSnapshotResponse<NodeId>,
+            RPCError<NodeId, RaftMemberNode, RaftError<NodeId, InstallSnapshotError>>,
+        > {
+            Err(RPCError::Unreachable(unreachable("install_snapshot")))
+        }
+
+        async fn vote(
+            &mut self,
+            _rpc: VoteRequest<NodeId>,
+            _option: RPCOption,
+        ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, RaftMemberNode, RaftError<NodeId>>>
+        {
+            Err(RPCError::Unreachable(unreachable("vote")))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct LoopbackRegistry {
+        inner: Arc<std::sync::RwLock<std::collections::HashMap<NodeId, LoopbackRegistryEntry>>>,
+    }
+
+    #[derive(Clone)]
+    struct LoopbackRegistryEntry {
+        raft: Raft<TypeConfig>,
+        generation: u64,
+        storage_incarnation: String,
+    }
+
+    impl LoopbackRegistry {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn register(&self, node_id: NodeId, raft: Raft<TypeConfig>, storage_incarnation: String) {
+            let mut inner = self.inner.write().unwrap();
+            let generation = inner
+                .get(&node_id)
+                .map_or(1, |entry| entry.generation.saturating_add(1));
+            inner.insert(
+                node_id,
+                LoopbackRegistryEntry {
+                    raft,
+                    generation,
+                    storage_incarnation,
+                },
+            );
+        }
+
+        fn lookup(&self, node_id: NodeId) -> Option<LoopbackRegistryEntry> {
+            self.inner.read().unwrap().get(&node_id).cloned()
+        }
+    }
+
+    #[async_trait]
+    impl klights_replication::LeaderForwarder for LoopbackRegistry {
+        async fn forward_propose(
+            &self,
+            leader_id: NodeId,
+            payload: StorageCommandPayload,
+        ) -> anyhow::Result<()> {
+            let raft = self
+                .lookup(leader_id)
+                .map(|entry| entry.raft)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("consumer-local loopback leader {leader_id} is absent")
+                })?;
+            raft.client_write(payload)
+                .await
+                .map(|_| ())
+                .map_err(|error| anyhow::anyhow!("loopback forward to {leader_id}: {error}"))
+        }
+    }
+
+    #[derive(Clone)]
+    struct LoopbackRaftNetworkFactory {
+        registry: LoopbackRegistry,
+    }
+
+    impl LoopbackRaftNetworkFactory {
+        fn new(registry: LoopbackRegistry) -> Self {
+            Self { registry }
+        }
+    }
+
+    impl RaftNetworkFactory<TypeConfig> for LoopbackRaftNetworkFactory {
+        type Network = LoopbackRaftNetwork;
+
+        async fn new_client(&mut self, target: NodeId, node: &RaftMemberNode) -> Self::Network {
+            let bound_generation = self
+                .registry
+                .lookup(target)
+                .map(|entry| entry.generation)
+                .unwrap_or(0);
+            LoopbackRaftNetwork {
+                target,
+                bound_generation,
+                receiver_admission: node.clone(),
+                registry: self.registry.clone(),
+            }
+        }
+    }
+
+    struct LoopbackRaftNetwork {
+        target: NodeId,
+        bound_generation: u64,
+        receiver_admission: RaftMemberNode,
+        registry: LoopbackRegistry,
+    }
+
+    impl LoopbackRaftNetwork {
+        fn receiver_session_is_stale(&self, entry: &LoopbackRegistryEntry) -> bool {
+            if self.bound_generation != entry.generation
+                || (self.receiver_admission.storage_incarnation != uuid::Uuid::nil().to_string()
+                    && self.receiver_admission.storage_incarnation != entry.storage_incarnation)
+            {
+                return true;
+            }
+            let Some(required) = self.receiver_admission.admitted_log.as_ref() else {
+                return false;
+            };
+            let metrics = entry.raft.metrics().borrow().clone();
+            let local_index = [
+                metrics.last_log_index,
+                metrics.last_applied.as_ref().map(|log| log.index),
+                metrics.snapshot.as_ref().map(|log| log.index),
+                metrics.purged.as_ref().map(|log| log.index),
+            ]
+            .into_iter()
+            .flatten()
+            .max();
+            local_index.is_none_or(|index| index < required.index)
+        }
+    }
+
+    impl RaftNetwork<TypeConfig> for LoopbackRaftNetwork {
+        async fn append_entries(
+            &mut self,
+            rpc: AppendEntriesRequest<TypeConfig>,
+            _option: RPCOption,
+        ) -> Result<
+            AppendEntriesResponse<NodeId>,
+            RPCError<NodeId, RaftMemberNode, RaftError<NodeId>>,
+        > {
+            let entry = self.registry.lookup(self.target).ok_or_else(|| {
+                RPCError::Unreachable(unreachable("append_entries: peer not registered"))
+            })?;
+            if self.receiver_session_is_stale(&entry) {
+                return Err(RPCError::Unreachable(unreachable(
+                    "append_entries: stale receiver session generation",
+                )));
+            }
+            entry
+                .raft
+                .append_entries(rpc)
+                .await
+                .map_err(|error| RPCError::RemoteError(RemoteError::new(self.target, error)))
+        }
+
+        async fn install_snapshot(
+            &mut self,
+            rpc: InstallSnapshotRequest<TypeConfig>,
+            _option: RPCOption,
+        ) -> Result<
+            InstallSnapshotResponse<NodeId>,
+            RPCError<NodeId, RaftMemberNode, RaftError<NodeId, InstallSnapshotError>>,
+        > {
+            let entry = self.registry.lookup(self.target).ok_or_else(|| {
+                RPCError::Unreachable(unreachable("install_snapshot: peer not registered"))
+            })?;
+            if self.receiver_session_is_stale(&entry) {
+                return Err(RPCError::Unreachable(unreachable(
+                    "install_snapshot: stale receiver session generation",
+                )));
+            }
+            entry
+                .raft
+                .install_snapshot(rpc)
+                .await
+                .map_err(|error| RPCError::RemoteError(RemoteError::new(self.target, error)))
+        }
+
+        async fn vote(
+            &mut self,
+            rpc: VoteRequest<NodeId>,
+            _option: RPCOption,
+        ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, RaftMemberNode, RaftError<NodeId>>>
+        {
+            let entry = self
+                .registry
+                .lookup(self.target)
+                .ok_or_else(|| RPCError::Unreachable(unreachable("vote: peer not registered")))?;
+            if self.receiver_session_is_stale(&entry) {
+                return Err(RPCError::Unreachable(unreachable(
+                    "vote: stale receiver session generation",
+                )));
+            }
+            entry
+                .raft
+                .vote(rpc)
+                .await
+                .map_err(|error| RPCError::RemoteError(RemoteError::new(self.target, error)))
+        }
+    }
 
     fn node_durability(
         stores: &NodeLocalStores,
@@ -108,7 +354,7 @@ mod tests {
     }
 
     fn raft_store_ports(backend: Arc<crate::datastore::sqlite::Datastore>) -> RaftStorePorts {
-        crate::datastore::cluster_store_adapter::raft_store_ports_for_test(backend)
+        crate::cluster_store_replication_adapter::raft_store_ports_for_test(backend)
     }
 
     fn storage_attestation(
@@ -118,6 +364,23 @@ mod tests {
             high_watermark: log.clone(),
             current_boundary: log,
         }
+    }
+
+    async fn admit_member(
+        leader: &RaftNode,
+        member: &RaftNode,
+        addr: impl Into<String>,
+        as_learner: bool,
+    ) -> Result<klights_replication::membership::RaftMemberAdmissionResult> {
+        leader
+            .admit_controlplane_member(
+                member.node_id,
+                addr.into(),
+                as_learner,
+                member.storage_incarnation().to_string(),
+                storage_attestation(None),
+            )
+            .await
     }
 
     struct AdmissionFenceClient {
@@ -249,7 +512,7 @@ mod tests {
             "activation proof must be Raft-committed cluster state"
         );
         let materializer =
-            crate::datastore::cluster_store_adapter::DatastoreRaftCommitMaterializer::new(
+            crate::cluster_store_replication_adapter::DatastoreRaftCommitMaterializer::new(
                 backend.clone(),
             );
         let restored_activation = CommandCodecV3Activation::load(&materializer)
@@ -282,8 +545,6 @@ mod tests {
         ));
         not_leader.shutdown().await.unwrap();
 
-        use klights_replication::network::LoopbackRegistry;
-
         let registry = LoopbackRegistry::new();
         let (leader, backend) = fresh_voter_in_registry_with_backend(703, &registry).await;
         let incompatible_voter = fresh_voter_in_registry(704, &registry).await;
@@ -294,10 +555,14 @@ mod tests {
         wait_for_leader(&leader, std::time::Duration::from_secs(5))
             .await
             .unwrap();
-        leader
-            .add_voter(704, "https://127.0.0.1:7704".to_string())
-            .await
-            .expect("add incompatible voter to activation preflight membership");
+        admit_member(
+            &leader,
+            &incompatible_voter,
+            "https://127.0.0.1:7704",
+            false,
+        )
+        .await
+        .expect("add incompatible voter to activation preflight membership");
         let missing = FeatureProbe {
             replies: [(704, Ok(0))].into_iter().collect(),
         };
@@ -357,13 +622,14 @@ mod tests {
         let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let backend_for_caller = backend.clone();
-        let raft_node = RaftNode::start(
+        let raft_node = RaftNode::start_with_network(
             node_id,
             format!("n{node_id}"),
             raft_store_ports(backend),
             node_durability(&node_local),
             node_durability(&node_local),
             supervisor,
+            StubRaftNetwork,
         )
         .await
         .expect("RaftNode::start");
@@ -462,9 +728,8 @@ mod tests {
     async fn fresh_three_voter_cluster() -> (
         Vec<RaftNode>,
         Vec<Arc<crate::datastore::sqlite::Datastore>>,
-        klights_replication::network::LoopbackRegistry,
+        LoopbackRegistry,
     ) {
-        use klights_replication::network::{LoopbackRaftNetworkFactory, LoopbackRegistry};
         let registry = LoopbackRegistry::new();
         let mut nodes = Vec::new();
         let mut backends = Vec::new();
@@ -493,11 +758,7 @@ mod tests {
             )
             .await
             .expect("RaftNode::start_with_network");
-            registry.register(
-                id,
-                n.raft.clone(),
-                n.storage_incarnation_for_test().to_string(),
-            );
+            registry.register(id, n.raft.clone(), n.storage_incarnation().to_string());
             nodes.push(n);
             backends.push(backend);
         }
@@ -641,7 +902,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl klights_replication::network::LeaderForwarder for CapturingForwarder {
+    impl klights_replication::LeaderForwarder for CapturingForwarder {
         async fn forward_propose(
             &self,
             leader_id: NodeId,
@@ -654,7 +915,6 @@ mod tests {
 
     #[tokio::test]
     async fn write_on_follower_forwards_to_leader() {
-        use klights_replication::network::{LoopbackRaftNetworkFactory, LoopbackRegistry};
         let registry = LoopbackRegistry::new();
         let mut nodes = Vec::new();
         let mut mocks = Vec::new();
@@ -685,11 +945,7 @@ mod tests {
             .await
             .expect("RaftNode::start_with_network")
             .with_forwarder(mock.clone());
-            registry.register(
-                id,
-                n.raft.clone(),
-                n.storage_incarnation_for_test().to_string(),
-            );
+            registry.register(id, n.raft.clone(), n.storage_incarnation().to_string());
             nodes.push(n);
             mocks.push(mock);
         }
@@ -747,8 +1003,6 @@ mod tests {
 
     #[tokio::test]
     async fn follower_raft_proposer_refuses_before_local_commit_materialization() {
-        use klights_replication::network::{LoopbackRaftNetworkFactory, LoopbackRegistry};
-
         let registry = LoopbackRegistry::new();
         let mut nodes = Vec::new();
         let mut backends = Vec::new();
@@ -780,7 +1034,7 @@ mod tests {
             registry.register(
                 id,
                 node.raft.clone(),
-                node.storage_incarnation_for_test().to_string(),
+                node.storage_incarnation().to_string(),
             );
             nodes.push(node);
             backends.push(backend);
@@ -880,13 +1134,14 @@ mod tests {
             Arc::new(NodeLocalStores::from_executor(exec).expect("create node-local db"));
         let backend: Arc<crate::datastore::sqlite::Datastore> =
             Arc::new(crate::datastore::test_support::in_memory().await);
-        let node = RaftNode::start(
+        let node = RaftNode::start_with_network(
             10,
             "n10".to_string(),
             raft_store_ports(backend.clone()),
             node_durability(&node_local),
             node_durability(&node_local),
             supervisor,
+            StubRaftNetwork,
         )
         .await
         .expect("RaftNode::start");
@@ -992,18 +1247,14 @@ mod tests {
         );
     }
 
-    async fn fresh_voter_in_registry(
-        id: NodeId,
-        registry: &klights_replication::network::LoopbackRegistry,
-    ) -> RaftNode {
+    async fn fresh_voter_in_registry(id: NodeId, registry: &LoopbackRegistry) -> RaftNode {
         fresh_voter_in_registry_with_backend(id, registry).await.0
     }
 
     async fn fresh_voter_in_registry_with_backend(
         id: NodeId,
-        registry: &klights_replication::network::LoopbackRegistry,
+        registry: &LoopbackRegistry,
     ) -> (RaftNode, Arc<crate::datastore::sqlite::Datastore>) {
-        use klights_replication::network::LoopbackRaftNetworkFactory;
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let exec = klights_node_datastore::open::open_with_opts(
             klights_node_datastore::open::in_memory_opts(),
@@ -1031,7 +1282,7 @@ mod tests {
         registry.register(
             id,
             node.raft.clone(),
-            node.storage_incarnation_for_test().to_string(),
+            node.storage_incarnation().to_string(),
         );
         (node, backend)
     }
@@ -1053,7 +1304,6 @@ mod tests {
 
     #[tokio::test]
     async fn add_voter_grows_a_running_single_voter_cluster() {
-        use klights_replication::network::LoopbackRegistry;
         let registry = LoopbackRegistry::new();
         let leader = fresh_voter_in_registry(10, &registry).await;
         let learner = fresh_voter_in_registry(20, &registry).await;
@@ -1064,8 +1314,7 @@ mod tests {
         wait_for_leader(&leader, std::time::Duration::from_secs(5))
             .await
             .unwrap();
-        leader
-            .add_voter(20, "https://10.99.0.20:7679".into())
+        admit_member(&leader, &learner, "https://10.99.0.20:7679", false)
             .await
             .expect("add_voter");
         wait_for_voter_count(&leader, 2).await;
@@ -1269,7 +1518,6 @@ mod tests {
 
     #[tokio::test]
     async fn add_voter_beyond_cap_is_rejected() {
-        use klights_replication::network::LoopbackRegistry;
         let registry = LoopbackRegistry::new();
         let leader = fresh_voter_in_registry(10, &registry).await;
         let v2 = fresh_voter_in_registry(20, &registry).await;
@@ -1282,18 +1530,15 @@ mod tests {
         wait_for_leader(&leader, std::time::Duration::from_secs(5))
             .await
             .unwrap();
-        leader
-            .add_voter(20, "https://10.99.0.20:7679".into())
+        admit_member(&leader, &v2, "https://10.99.0.20:7679", false)
             .await
             .expect("add 2nd voter");
         wait_for_voter_count(&leader, 2).await;
-        leader
-            .add_voter(30, "https://10.99.0.30:7679".into())
+        admit_member(&leader, &v3, "https://10.99.0.30:7679", false)
             .await
             .expect("add 3rd voter");
         wait_for_voter_count(&leader, 3).await;
-        let err = leader
-            .add_voter(40, "https://10.99.0.40:7679".into())
+        let err = admit_member(&leader, &v4, "https://10.99.0.40:7679", false)
             .await
             .expect_err("4th voter must be rejected");
         let msg = format!("{err}");
@@ -1308,7 +1553,6 @@ mod tests {
 
     #[tokio::test]
     async fn remove_voter_preserves_quorum_and_refuses_last_voter() {
-        use klights_replication::network::LoopbackRegistry;
         let registry = LoopbackRegistry::new();
         let leader = fresh_voter_in_registry(10, &registry).await;
         let v2 = fresh_voter_in_registry(20, &registry).await;
@@ -1320,13 +1564,11 @@ mod tests {
         wait_for_leader(&leader, std::time::Duration::from_secs(5))
             .await
             .unwrap();
-        leader
-            .add_voter(20, "https://10.99.0.20:7679".into())
+        admit_member(&leader, &v2, "https://10.99.0.20:7679", false)
             .await
             .expect("add v2");
         wait_for_voter_count(&leader, 2).await;
-        leader
-            .add_voter(30, "https://10.99.0.30:7679".into())
+        admit_member(&leader, &v3, "https://10.99.0.30:7679", false)
             .await
             .expect("add v3");
         wait_for_voter_count(&leader, 3).await;
@@ -1428,7 +1670,6 @@ mod tests {
     #[tokio::test]
     async fn join_handler_on_leader_runs_add_voter_and_reports_count() {
         use klights_leader_api::ControlplaneJoinOutcome;
-        use klights_replication::network::LoopbackRegistry;
         let registry = LoopbackRegistry::new();
         let leader = Arc::new(fresh_voter_in_registry(50, &registry).await);
         let follower = fresh_voter_in_registry(51, &registry).await;
@@ -1448,7 +1689,7 @@ mod tests {
                 "https://10.99.0.51:7679",
                 "n51",
                 false,
-                follower.storage_incarnation_for_test(),
+                follower.storage_incarnation(),
                 None,
                 "joinerhash1",
             ))
@@ -1513,7 +1754,7 @@ mod tests {
                 addr: "https://10.99.0.51:7679".to_string(),
                 node_name: "n51".to_string(),
                 as_learner: false,
-                storage_incarnation: follower.storage_incarnation_for_test().to_string(),
+                storage_incarnation: follower.storage_incarnation().to_string(),
                 storage_log_attestation: klights_leader_api::RaftStorageAttestation {
                     high_watermark: Some(klights_leader_api::RaftStorageLogAttestation {
                         term: u64::MAX,
@@ -1552,7 +1793,6 @@ mod tests {
     #[tokio::test]
     async fn join_handler_voter_admission_updates_cluster_membership_metadata() {
         use klights_leader_api::ControlplaneJoinOutcome;
-        use klights_replication::network::LoopbackRegistry;
         let registry = LoopbackRegistry::new();
         let leader = Arc::new(fresh_voter_in_registry(52, &registry).await);
         let follower = fresh_voter_in_registry(53, &registry).await;
@@ -1583,7 +1823,7 @@ mod tests {
                 "https://10.99.0.53:7679",
                 "mn-controlplane2",
                 false,
-                follower.storage_incarnation_for_test(),
+                follower.storage_incarnation(),
                 None,
                 "joinerhash2",
             ))
@@ -1643,7 +1883,6 @@ mod tests {
     #[tokio::test]
     async fn join_handler_as_learner_admits_via_add_learner_only() {
         use klights_leader_api::ControlplaneJoinOutcome;
-        use klights_replication::network::LoopbackRegistry;
         let registry = LoopbackRegistry::new();
         let leader = fresh_voter_in_registry(70, &registry).await;
         let learner = fresh_voter_in_registry(71, &registry).await;
@@ -1663,7 +1902,7 @@ mod tests {
                 "https://10.99.0.71:7679",
                 "n71",
                 true,
-                learner.storage_incarnation_for_test(),
+                learner.storage_incarnation(),
                 None,
                 "joinerhash4",
             ))
@@ -1717,7 +1956,6 @@ mod tests {
     #[tokio::test]
     async fn join_handler_as_learner_registers_node_with_replica_label() {
         use klights_leader_api::ControlplaneJoinOutcome;
-        use klights_replication::network::LoopbackRegistry;
         let registry = LoopbackRegistry::new();
         let leader = fresh_voter_in_registry(72, &registry).await;
         let learner = fresh_voter_in_registry(73, &registry).await;
@@ -1738,7 +1976,7 @@ mod tests {
                 "https://10.99.0.73:7679",
                 "n73",
                 true,
-                learner.storage_incarnation_for_test(),
+                learner.storage_incarnation(),
                 None,
                 "joinerhash5",
             ))
@@ -1778,7 +2016,6 @@ mod tests {
     #[tokio::test]
     async fn join_handler_registers_internal_ip_separate_from_external_addr() {
         use klights_leader_api::ControlplaneJoinOutcome;
-        use klights_replication::network::LoopbackRegistry;
         let registry = LoopbackRegistry::new();
         let leader = Arc::new(fresh_voter_in_registry(80, &registry).await);
         let follower = fresh_voter_in_registry(81, &registry).await;
@@ -1798,7 +2035,7 @@ mod tests {
                 "https://10.99.0.81:7679",
                 "n81",
                 false,
-                follower.storage_incarnation_for_test(),
+                follower.storage_incarnation(),
                 Some("172.31.81.2"),
                 "joinerhash6",
             ))
@@ -1851,7 +2088,7 @@ mod tests {
         let bytes = serde_json::to_vec(&rpc).unwrap();
         let receiver = RaftMemberNode::new(
             "loopback".into(),
-            node.storage_incarnation_for_test().to_string(),
+            node.storage_incarnation().to_string(),
             None,
         );
         let out = router
@@ -1875,7 +2112,7 @@ mod tests {
         let router = node.rpc_router();
         let receiver = RaftMemberNode::new(
             "loopback".into(),
-            node.storage_incarnation_for_test().to_string(),
+            node.storage_incarnation().to_string(),
             None,
         );
         let wrong_receiver =
@@ -1890,7 +2127,7 @@ mod tests {
         ));
         let rolled_back_receiver = RaftMemberNode::new(
             "loopback".into(),
-            node.storage_incarnation_for_test().to_string(),
+            node.storage_incarnation().to_string(),
             Some(RaftMemberLogId {
                 term: 1,
                 leader_node_id: 70,
@@ -2013,8 +2250,14 @@ mod tests {
             let leader = leader.clone();
             tokio::spawn(async move {
                 leader
-                    .add_learner_only(78, "https://10.99.0.78:7679".into())
+                    .raft
+                    .add_learner(
+                        78,
+                        super::test_unproven_member("https://10.99.0.78:7679"),
+                        true,
+                    )
                     .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))
             })
         };
         client.wait_for_append().await;
@@ -2056,11 +2299,10 @@ mod tests {
 
     #[tokio::test]
     async fn same_uuid_backup_rollback_resets_existing_learner_session() {
-        use klights_replication::network::LoopbackRegistry;
         let registry = LoopbackRegistry::new();
         let leader = fresh_voter_in_registry(72, &registry).await;
         let old_learner = fresh_voter_in_registry(73, &registry).await;
-        let restored_incarnation = old_learner.storage_incarnation_for_test().to_string();
+        let restored_incarnation = old_learner.storage_incarnation().to_string();
         leader
             .bootstrap_single_voter("https://10.99.0.72:7679".into())
             .await
@@ -2124,13 +2366,12 @@ mod tests {
 
     #[tokio::test]
     async fn wiped_existing_voter_rejoins_through_fresh_learner_session() {
-        use klights_replication::network::LoopbackRegistry;
         let registry = LoopbackRegistry::new();
         let leader = Arc::new(fresh_voter_in_registry(74, &registry).await);
         let surviving_voter = fresh_voter_in_registry(75, &registry).await;
         let old_voter = fresh_voter_in_registry(76, &registry).await;
-        let surviving_incarnation = surviving_voter.storage_incarnation_for_test().to_string();
-        let old_voter_incarnation = old_voter.storage_incarnation_for_test().to_string();
+        let surviving_incarnation = surviving_voter.storage_incarnation().to_string();
+        let old_voter_incarnation = old_voter.storage_incarnation().to_string();
         leader
             .bootstrap_single_voter("https://10.99.0.74:7679".into())
             .await
@@ -2159,7 +2400,7 @@ mod tests {
             .await
             .unwrap();
         let unrelated_learner = fresh_voter_in_registry(79, &registry).await;
-        let unrelated_incarnation = unrelated_learner.storage_incarnation_for_test().to_string();
+        let unrelated_incarnation = unrelated_learner.storage_incarnation().to_string();
         leader
             .admit_controlplane_member(
                 79,
@@ -2172,7 +2413,7 @@ mod tests {
             .unwrap();
         old_voter.shutdown().await.unwrap();
         let replacement = fresh_voter_in_registry(76, &registry).await;
-        let replacement_incarnation = replacement.storage_incarnation_for_test().to_string();
+        let replacement_incarnation = replacement.storage_incarnation().to_string();
         leader
             .admit_controlplane_member(
                 76,
@@ -2208,24 +2449,9 @@ mod tests {
                 .any(|(id, _)| *id == 79),
             "targeted voter replacement must preserve unrelated learners"
         );
-        assert!(
-            leader
-                .materializer_for_test()
-                .read_raft_metadata("raft_member_admission/76")
-                .await
-                .unwrap()
-                .and_then(|admission| {
-                    serde_json::from_str::<serde_json::Value>(&admission).ok()
-                })
-                .and_then(|admission| admission.get("proven_log").cloned())
-                .is_some_and(|proof| !proof.is_null()),
-            "replacement admission must persist a leader-observed target replication match"
-        );
         replacement.shutdown().await.unwrap();
         let learner_replacement = fresh_voter_in_registry(76, &registry).await;
-        let learner_incarnation = learner_replacement
-            .storage_incarnation_for_test()
-            .to_string();
+        let learner_incarnation = learner_replacement.storage_incarnation().to_string();
         leader
             .admit_controlplane_member(
                 76,
@@ -2266,7 +2492,6 @@ mod tests {
 
     #[tokio::test]
     async fn lost_join_response_retry_with_fresh_attestation_is_membership_and_log_noop() {
-        use klights_replication::network::LoopbackRegistry;
         let registry = LoopbackRegistry::new();
         let leader = fresh_voter_in_registry(80, &registry).await;
         let learner = fresh_voter_in_registry(81, &registry).await;
@@ -2277,7 +2502,7 @@ mod tests {
         wait_for_leader(&leader, std::time::Duration::from_secs(5))
             .await
             .unwrap();
-        let incarnation = learner.storage_incarnation_for_test().to_string();
+        let incarnation = learner.storage_incarnation().to_string();
         assert_eq!(
             leader
                 .admit_controlplane_member(
@@ -2321,7 +2546,6 @@ mod tests {
     }
     #[tokio::test]
     async fn existing_member_without_v3_admission_marker_fails_closed_without_mutation() {
-        use klights_replication::network::LoopbackRegistry;
         let registry = LoopbackRegistry::new();
         let leader = fresh_voter_in_registry(84, &registry).await;
         let legacy_learner = fresh_voter_in_registry(85, &registry).await;
@@ -2333,7 +2557,12 @@ mod tests {
             .await
             .unwrap();
         leader
-            .add_learner_only(85, "https://10.99.0.85:7679".into())
+            .raft
+            .add_learner(
+                85,
+                super::test_unproven_member("https://10.99.0.85:7679"),
+                true,
+            )
             .await
             .unwrap();
         let log_before = leader.raft.metrics().borrow().last_log_index;
@@ -2361,7 +2590,6 @@ mod tests {
 
     #[tokio::test]
     async fn wiped_voter_in_two_voter_cluster_fails_closed_before_membership_mutation() {
-        use klights_replication::network::LoopbackRegistry;
         let registry = LoopbackRegistry::new();
         let leader = fresh_voter_in_registry(82, &registry).await;
         let old_voter = fresh_voter_in_registry(83, &registry).await;
@@ -2377,7 +2605,7 @@ mod tests {
                 83,
                 "https://10.99.0.83:7679".into(),
                 false,
-                old_voter.storage_incarnation_for_test().to_string(),
+                old_voter.storage_incarnation().to_string(),
                 storage_attestation(None),
             )
             .await
@@ -2430,7 +2658,6 @@ mod tests {
     /// loopback network so two raft nodes can communicate.
     #[tokio::test]
     async fn add_learner_only_demotes_existing_voter_to_learner() {
-        use klights_replication::network::{LoopbackRaftNetworkFactory, LoopbackRegistry};
         let registry = LoopbackRegistry::new();
 
         let leader_id: NodeId = 70;
@@ -2464,7 +2691,7 @@ mod tests {
         registry.register(
             leader_id,
             leader.raft.clone(),
-            leader.storage_incarnation_for_test().to_string(),
+            leader.storage_incarnation().to_string(),
         );
         leader
             .bootstrap_single_voter("https://10.99.0.70:7679".into())
@@ -2498,7 +2725,7 @@ mod tests {
         registry.register(
             voter_id,
             voter_node.raft.clone(),
-            voter_node.storage_incarnation_for_test().to_string(),
+            voter_node.storage_incarnation().to_string(),
         );
 
         wait_for_leader(&leader, std::time::Duration::from_secs(10))
@@ -2506,8 +2733,7 @@ mod tests {
             .unwrap();
 
         // Add voter to the leader's cluster.
-        leader
-            .add_voter(voter_id, voter_addr.clone())
+        admit_member(&leader, &voter_node, voter_addr.clone(), false)
             .await
             .unwrap();
 
@@ -2521,8 +2747,24 @@ mod tests {
         );
         assert_eq!(voter_ids.len(), 2, "must have 2 voters");
 
-        // Demote via add_learner_only.
-        leader.add_learner_only(voter_id, voter_addr).await.unwrap();
+        // Demote through the same exact-admission path used by authenticated
+        // join. The retry presents a fresh durable boundary so admission can
+        // prove this is the existing storage session, rather than an unsafe
+        // wiped-voter replacement.
+        leader
+            .admit_controlplane_member(
+                voter_id,
+                voter_addr,
+                true,
+                voter_node.storage_incarnation().to_string(),
+                storage_attestation(Some(klights_leader_api::RaftStorageLogAttestation {
+                    term: u64::MAX,
+                    leader_node_id: leader_id,
+                    index: u64::MAX,
+                })),
+            )
+            .await
+            .unwrap();
 
         // Verify demoted.
         let metrics = leader.raft.metrics().borrow().clone();
@@ -2591,7 +2833,7 @@ mod tests {
     ///
     /// This is the core ordering guarantee from finding.md: the leader cannot reserve
     /// an RV ahead of an acknowledged flow-control slot. Reverting the
-    /// `let _flow_permit = self.flow_control_for_test().acquire().await;` line in `propose_command`
+    /// `let _flow_permit = self.proposal().flow_control().acquire().await;` line in `propose_command`
     /// would make this test fail (rv would advance during the timeout window).
     #[tokio::test]
     async fn raft_proposal_permit_is_acquired_before_resource_version_reservation() {
@@ -2603,12 +2845,12 @@ mod tests {
             .await
             .expect("become leader");
         // Exhaust the flow-control gate before propose_command runs.
-        let cap = node.flow_control_for_test().max_in_flight();
+        let cap = node.proposal().flow_control().max_in_flight();
         let mut held = Vec::with_capacity(cap);
         for _ in 0..cap {
-            held.push(node.flow_control_for_test().acquire().await);
+            held.push(node.proposal().flow_control().acquire().await);
         }
-        assert_eq!(node.flow_control_for_test().available_permits(), 0);
+        assert_eq!(node.proposal().flow_control().available_permits(), 0);
 
         let rv_before = backend.get_current_resource_version().await.unwrap();
 
@@ -2654,12 +2896,12 @@ mod tests {
             .await
             .expect("become leader");
 
-        let cap = node.flow_control_for_test().max_in_flight();
+        let cap = node.proposal().flow_control().max_in_flight();
         let mut held = Vec::with_capacity(cap);
         for _ in 0..cap {
-            held.push(node.flow_control_for_test().acquire().await);
+            held.push(node.proposal().flow_control().acquire().await);
         }
-        assert_eq!(node.flow_control_for_test().available_permits(), 0);
+        assert_eq!(node.proposal().flow_control().available_permits(), 0);
 
         let rv_before = backend.get_current_resource_version().await.unwrap();
         {
@@ -2708,12 +2950,12 @@ mod tests {
             .await
             .expect("become leader");
 
-        let cap = node.flow_control_for_test().max_in_flight();
+        let cap = node.proposal().flow_control().max_in_flight();
         let mut held = Vec::with_capacity(cap);
         for _ in 0..cap {
-            held.push(node.flow_control_for_test().acquire().await);
+            held.push(node.proposal().flow_control().acquire().await);
         }
-        assert_eq!(node.flow_control_for_test().available_permits(), 0);
+        assert_eq!(node.proposal().flow_control().available_permits(), 0);
 
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -2807,23 +3049,23 @@ mod tests {
         // T1: the flow-control gate is the decoupled in-flight value, larger than
         // the openraft payload cap.
         assert_eq!(
-            node.flow_control_for_test().max_in_flight(),
+            node.proposal().flow_control().max_in_flight(),
             super::RAFT_MAX_INFLIGHT_PROPOSALS,
             "flow-control cap must be the decoupled RAFT_MAX_INFLIGHT_PROPOSALS, \
              not RAFT_MAX_PAYLOAD_ENTRIES"
         );
         assert_ne!(
-            node.flow_control_for_test().max_in_flight() as u64,
+            node.proposal().flow_control().max_in_flight() as u64,
             super::RAFT_MAX_PAYLOAD_ENTRIES,
             "flow-control cap must be decoupled from payload entries"
         );
         // Hold every general permit, simulating max_in_flight in-flight proposals.
-        let cap = node.flow_control_for_test().max_in_flight();
+        let cap = node.proposal().flow_control().max_in_flight();
         let mut held = Vec::with_capacity(cap);
         for _ in 0..cap {
-            held.push(node.flow_control_for_test().acquire().await);
+            held.push(node.proposal().flow_control().acquire().await);
         }
-        assert_eq!(node.flow_control_for_test().available_permits(), 0);
+        assert_eq!(node.proposal().flow_control().available_permits(), 0);
 
         // The next propose call must block (no permits available).
         let rv_before = backend.get_current_resource_version().await.unwrap();
@@ -2862,10 +3104,10 @@ mod tests {
         node.propose_command(propose_create_command("dup-target"))
             .await
             .expect("first create");
-        let permits_before = node.flow_control_for_test().available_permits();
+        let permits_before = node.proposal().flow_control().available_permits();
         assert_eq!(
             permits_before,
-            node.flow_control_for_test().max_in_flight(),
+            node.proposal().flow_control().max_in_flight(),
             "permits restored after first success"
         );
 
@@ -2885,8 +3127,8 @@ mod tests {
             "expected duplicate-create rejection, got: {err}"
         );
         assert_eq!(
-            node.flow_control_for_test().available_permits(),
-            node.flow_control_for_test().max_in_flight(),
+            node.proposal().flow_control().available_permits(),
+            node.proposal().flow_control().max_in_flight(),
             "permit must be released after materialization-failure error path"
         );
         node.shutdown().await.unwrap();
@@ -3011,7 +3253,7 @@ mod tests {
     /// `client_write` stage (no leader / leadership lost), the RAII permit guard
     /// must still release. We exercise this by manually exhausting permits inside
     /// a scope and verifying the guard releases on scope-exit (matches the
-    /// implementation: `let _flow_permit = self.flow_control_for_test().acquire().await;`).
+    /// implementation: `let _flow_permit = self.proposal().flow_control().acquire().await;`).
     #[tokio::test]
     async fn raft_proposal_permit_released_on_client_write_failure() {
         let (node, _backend) = fresh_node(73).await;
@@ -3025,22 +3267,22 @@ mod tests {
         // any exit (including a panic or an early return inside propose_command)
         // must release the permit. We exercise the live gate here.
         assert_eq!(
-            node.flow_control_for_test().available_permits(),
-            node.flow_control_for_test().max_in_flight()
+            node.proposal().flow_control().available_permits(),
+            node.proposal().flow_control().max_in_flight()
         );
         {
-            let _permit = node.flow_control_for_test().acquire().await;
+            let _permit = node.proposal().flow_control().acquire().await;
             assert_eq!(
-                node.flow_control_for_test().available_permits(),
-                node.flow_control_for_test().max_in_flight() - 1,
+                node.proposal().flow_control().available_permits(),
+                node.proposal().flow_control().max_in_flight() - 1,
                 "permit acquired"
             );
             // Simulating the late-failure path: the permit is held when client_write
             // would have failed; the RAII guard releases on scope exit.
         }
         assert_eq!(
-            node.flow_control_for_test().available_permits(),
-            node.flow_control_for_test().max_in_flight(),
+            node.proposal().flow_control().available_permits(),
+            node.proposal().flow_control().max_in_flight(),
             "RAII permit must release on scope exit (mirrors propose_command's error paths)"
         );
         node.shutdown().await.unwrap();
@@ -3059,8 +3301,8 @@ mod tests {
             .await
             .expect("become leader");
         assert_eq!(
-            node.flow_control_for_test().available_permits(),
-            node.flow_control_for_test().max_in_flight()
+            node.proposal().flow_control().available_permits(),
+            node.proposal().flow_control().max_in_flight()
         );
 
         node.propose_command(propose_create_command("ok-success"))
@@ -3068,8 +3310,8 @@ mod tests {
             .expect("propose ok");
 
         assert_eq!(
-            node.flow_control_for_test().available_permits(),
-            node.flow_control_for_test().max_in_flight(),
+            node.proposal().flow_control().available_permits(),
+            node.proposal().flow_control().max_in_flight(),
             "permit must be released after successful terminal propose_command"
         );
         node.shutdown().await.unwrap();

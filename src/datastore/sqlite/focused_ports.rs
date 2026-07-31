@@ -543,7 +543,7 @@ impl crate::datastore::ReplicationStore for Datastore {
     async fn apply_raft_log_apply_commit(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
-    ) -> anyhow::Result<klights_replication::types::StorageCommandResult> {
+    ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
         crate::datastore::DatastoreBackend::apply_raft_log_apply_commit(self, commit).await
     }
 

@@ -2,17 +2,24 @@
 
 use std::sync::Arc;
 
-use klights_cluster_core::ReplicationEntry;
+use klights_cluster_core::{CommandId, ReplicationEntry};
 use klights_leader_api::{JoinRequest, JoinResponse, MetadataResponse};
 use klights_leader_rpc::server::{
     GrpcBootstrapRuntime, GrpcFollowerCompletionRuntime, GrpcFollowerSessionRuntime,
     GrpcMetadataRuntime, GrpcRuntimeError, GrpcRuntimeSupervision,
 };
 use klights_node_api::{
-    FollowerCompletionContext, FollowerControlMessage, RoutedNodeExecFrame,
-    RoutedNodeExecSyncResponse, RoutedNodeLogEvent, RoutedNodeMetricsResponse,
+    BoundedByteStream, FollowerCompletionContext, FollowerControlMessage, NodeExec, NodeExecFuture,
+    NodeExecRequest, NodeExecSession, NodeExecSyncRequest, NodeExecSyncResult, NodeLog,
+    NodeLogEvent, NodeLogFuture, NodeLogRequest, NodeLogResult, NodeMetrics, NodeMetricsFuture,
+    NodeMetricsRequest, NodeMetricsResult, RoutedNodeExecFrame, RoutedNodeExecSyncResponse,
+    RoutedNodeLogEvent, RoutedNodeMetricsResponse,
 };
-use klights_replication::service::ReplicationService;
+use klights_replication::ReplicationService;
+
+fn new_command_id() -> klights_cluster_core::CommandId {
+    CommandId(uuid::Uuid::new_v4().to_string())
+}
 
 /// Embedded replication application adapter for the reusable authenticated
 /// gRPC transport contracts.
@@ -23,6 +30,58 @@ pub(crate) struct GrpcReplicationRuntimeAdapter {
 impl GrpcReplicationRuntimeAdapter {
     pub(crate) fn new(service: Arc<ReplicationService>) -> Arc<Self> {
         Arc::new(Self { service })
+    }
+}
+
+impl NodeExec for GrpcReplicationRuntimeAdapter {
+    fn exec_sync(&self, request: NodeExecSyncRequest) -> NodeExecFuture<'_, NodeExecSyncResult> {
+        Box::pin(async move {
+            self.service
+                .execute_node_sync_with_command_id(new_command_id(), request)
+                .await
+        })
+    }
+
+    fn open_exec(&self, request: NodeExecRequest) -> NodeExecFuture<'_, Box<dyn NodeExecSession>> {
+        Box::pin(async move {
+            self.service
+                .open_node_exec_with_command_id(new_command_id(), request)
+                .await
+        })
+    }
+}
+
+impl NodeLog for GrpcReplicationRuntimeAdapter {
+    fn read_logs(&self, request: NodeLogRequest) -> NodeLogFuture<'_, NodeLogResult> {
+        Box::pin(async move {
+            self.service
+                .read_node_logs_with_command_id(new_command_id(), request)
+                .await
+        })
+    }
+
+    fn open_logs(
+        &self,
+        request: NodeLogRequest,
+    ) -> NodeLogFuture<'_, Box<dyn BoundedByteStream<Frame = NodeLogEvent>>> {
+        Box::pin(async move {
+            self.service
+                .open_node_logs_with_command_id(new_command_id(), request)
+                .await
+        })
+    }
+}
+
+impl NodeMetrics for GrpcReplicationRuntimeAdapter {
+    fn collect_metrics(
+        &self,
+        request: NodeMetricsRequest,
+    ) -> NodeMetricsFuture<'_, NodeMetricsResult> {
+        Box::pin(async move {
+            self.service
+                .collect_node_metrics_with_command_id(new_command_id(), request)
+                .await
+        })
     }
 }
 

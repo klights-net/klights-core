@@ -173,43 +173,6 @@ impl EmbeddedRaftMembership {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub async fn add_voter(&self, node_id: NodeId, addr: String) -> Result<()> {
-        let _guard = self.membership_mutex.lock().await;
-        if node_id == self.node_id {
-            anyhow::bail!("add_voter: node id {node_id} is this node and is already a voter");
-        }
-        let current = self.raft.metrics().borrow().clone();
-        let voters_now: BTreeSet<NodeId> =
-            current.membership_config.membership().voter_ids().collect();
-        if voters_now.contains(&node_id) {
-            return Ok(());
-        }
-        const TEST_VOTER_LIMIT: usize = 3;
-        if voters_now.len() >= TEST_VOTER_LIMIT {
-            anyhow::bail!(
-                "add_voter: cluster already at controlplane limit ({}); refusing to add voter {node_id}",
-                TEST_VOTER_LIMIT
-            );
-        }
-        self.raft
-            .add_learner(
-                node_id,
-                RaftMemberNode::new(addr, uuid::Uuid::nil().to_string(), None),
-                true,
-            )
-            .await
-            .map_err(|error| anyhow::anyhow!("Raft::add_learner({node_id}): {error}"))?;
-        let mut new_voters = voters_now;
-        new_voters.insert(node_id);
-        self.raft
-            .change_membership(new_voters, true)
-            .await
-            .map_err(|error| anyhow::anyhow!("Raft::change_membership({node_id}): {error}"))?;
-        Ok(())
-    }
-
-    #[cfg(not(any(test, feature = "test-support")))]
     pub async fn add_voter(&self, node_id: NodeId, addr: String) -> Result<()> {
         let _ = (node_id, addr);
         anyhow::bail!(
@@ -315,57 +278,6 @@ impl EmbeddedRaftMembership {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub async fn add_learner_only(&self, node_id: NodeId, addr: String) -> Result<()> {
-        let _guard = self.membership_mutex.lock().await;
-        if node_id == self.node_id {
-            anyhow::bail!("add_learner_only: node id {node_id} is this node");
-        }
-        let current = self.raft.metrics().borrow().clone();
-        let voters_now: BTreeSet<NodeId> =
-            current.membership_config.membership().voter_ids().collect();
-        if voters_now.contains(&node_id) {
-            if voters_now.len() <= 1 {
-                anyhow::bail!(
-                    "add_learner_only: refusing to demote last voter {node_id} (would break quorum)"
-                );
-            }
-            let mut new_voters = voters_now;
-            new_voters.remove(&node_id);
-            tracing::info!(
-                node_id,
-                voters_after = ?new_voters,
-                "add_learner_only: demoting voter to learner (retain=true)"
-            );
-            return self
-                .raft
-                .change_membership(new_voters, true)
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!("Raft::change_membership(demote {node_id}): {error}")
-                })
-                .map(|_| ());
-        }
-        if current
-            .membership_config
-            .membership()
-            .nodes()
-            .any(|(id, _)| *id == node_id)
-        {
-            return Ok(());
-        }
-        self.raft
-            .add_learner(
-                node_id,
-                RaftMemberNode::new(addr, uuid::Uuid::nil().to_string(), None),
-                true,
-            )
-            .await
-            .map_err(|error| anyhow::anyhow!("Raft::add_learner({node_id}): {error}"))?;
-        Ok(())
-    }
-
-    #[cfg(not(any(test, feature = "test-support")))]
     pub async fn add_learner_only(&self, node_id: NodeId, addr: String) -> Result<()> {
         let _ = (node_id, addr);
         anyhow::bail!(
@@ -518,7 +430,6 @@ impl EmbeddedRaftMembership {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub async fn admit_controlplane_member(
         &self,
         node_id: NodeId,

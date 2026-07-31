@@ -2,7 +2,7 @@
 
 use klights_cluster_core::LogApplyCommit;
 
-use super::DatastoreHandle;
+use crate::datastore::DatastoreHandle;
 
 pub(crate) struct DatastoreRaftCommitMaterializer {
     db: DatastoreHandle,
@@ -114,7 +114,7 @@ impl klights_leader_api::PostCommitWakeup for TestNoopPostCommitWakeup {
 
 #[cfg(test)]
 pub(crate) fn raft_state_machine_store_ports_for_test(
-    db: std::sync::Arc<super::sqlite::Datastore>,
+    db: std::sync::Arc<crate::datastore::sqlite::Datastore>,
 ) -> klights_replication::state_machine::RaftStateMachineStorePorts {
     let db_handle: DatastoreHandle = db.clone();
     let materializer = std::sync::Arc::new(DatastoreRaftCommitMaterializer::new(db_handle.clone()));
@@ -141,7 +141,7 @@ pub(crate) fn raft_state_machine_store_ports_for_test(
 
 #[cfg(test)]
 pub(crate) fn raft_store_ports_for_test(
-    db: std::sync::Arc<super::sqlite::Datastore>,
+    db: std::sync::Arc<crate::datastore::sqlite::Datastore>,
 ) -> klights_replication::node::RaftStorePorts {
     let db_handle: DatastoreHandle = db.clone();
     let materializer = std::sync::Arc::new(DatastoreRaftCommitMaterializer::new(db_handle));
@@ -159,7 +159,7 @@ pub(crate) fn raft_store_ports_for_test(
     )
 }
 
-impl super::sqlite::Datastore {
+impl crate::datastore::sqlite::Datastore {
     pub async fn apply_raft_log_apply_commit(
         &self,
         commit: LogApplyCommit,

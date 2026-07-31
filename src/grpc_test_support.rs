@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::datastore::backend::DatastoreHandle;
-use klights_replication::service::ReplicationService;
+use klights_replication::ReplicationService;
 
 pub(crate) type GrpcReplicationServer = klights_leader_rpc::server::GrpcReplicationServer;
 

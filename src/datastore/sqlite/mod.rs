@@ -3132,7 +3132,7 @@ impl Datastore {
                         .applied_mutation
                         .as_ref()
                         .map(|mutation| match mutation {
-                            klights_replication::types::AppliedMutation::Resource(resource) => {
+                            klights_cluster_store::AppliedMutation::Resource(resource) => {
                                 resource.clone()
                             }
                         });
@@ -3983,7 +3983,7 @@ impl DatastoreBackend for Datastore {
     async fn apply_raft_log_apply_commit(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_replication::types::StorageCommandResult> {
+    ) -> Result<klights_cluster_store::StorageCommandResult> {
         Datastore::apply_raft_log_apply_commit(self, commit).await
     }
 

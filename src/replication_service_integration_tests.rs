@@ -1,4 +1,4 @@
-use klights_replication::service::*;
+use klights_replication::ReplicationService;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -6,8 +6,9 @@ use klights_cluster_core::ReplicationEntry;
 use klights_leader_api::{JoinRequest, JoinResponse, NetworkDataplane};
 use klights_node_api::{
     FollowerCompletionContext, FollowerControlMessage, NodeExecFrame, NodeExecRequest,
-    NodeLogEvent, NodeLogRequest, NodeMetricsError, NodeMetricsRequest, NodeMetricsResult,
-    NodeOperationKind, RoutedNodeExecFrame, RoutedNodeLogEvent, RoutedNodeMetricsResponse,
+    NodeExecSyncRequest, NodeLogEvent, NodeLogRequest, NodeMetricsError, NodeMetricsRequest,
+    NodeMetricsResult, NodeOperationKind, RoutedNodeExecFrame, RoutedNodeLogEvent,
+    RoutedNodeMetricsResponse,
 };
 
 #[cfg(test)]
@@ -19,6 +20,8 @@ mod tests {
     use klights_node_api::ExecStreamChannel;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use serde_json::json;
+
+    const EXPECTED_NODE_EXEC_STREAM_FRAME_CAPACITY: usize = 128;
 
     fn test_network_dataplane(
         node_name: String,
@@ -133,6 +136,21 @@ mod tests {
             vec!["sh".to_string()],
             klights_node_api::ExecStreamOptions::new(false, true, false, false),
         )
+    }
+
+    fn sample_node_exec_sync_request(node_name: &str) -> NodeExecSyncRequest {
+        NodeExecSyncRequest::try_new(
+            klights_node_api::NodeExecTarget::try_new(
+                node_name,
+                "default",
+                "test-pod",
+                "containerd://abc",
+            )
+            .unwrap(),
+            vec!["true".to_string()],
+            300,
+        )
+        .unwrap()
     }
 
     fn sample_entry(rv: i64) -> ReplicationEntry {
@@ -316,8 +334,8 @@ mod tests {
         let (mut follower_rx, follower_session) = service.register_follower(metadata).await;
 
         let session = service
-            .open_node_log_stream_for_test(
-                "log-stream-1".to_string(),
+            .open_node_logs_with_command_id(
+                CommandId("log-stream-1".to_string()),
                 sample_node_log_request("worker-1", true, Some(200)),
             )
             .await
@@ -688,40 +706,32 @@ mod tests {
             None,
         )
         .unwrap();
-        let (_control_rx, _session_id) = service.register_follower(metadata).await;
+        let (mut control_rx, _session_id) = service.register_follower(metadata).await;
 
         let session = service
-            .open_node_exec_stream_for_test(
-                "drop-test-1".to_string(),
+            .open_node_exec_with_command_id(
+                CommandId("drop-test-1".to_string()),
                 sample_node_exec_request("worker-1"),
             )
             .await
             .unwrap();
 
-        // Verify the session was registered.
-        assert!(
-            service
-                .pending_operation_exists_for_test(
-                    PendingOperationKindForTest::ExecStream,
-                    "drop-test-1",
-                )
-                .await,
-            "pending entry must exist before drop"
-        );
+        assert!(matches!(
+            control_rx.recv().await,
+            Some(FollowerControlMessage::NodeExec(_))
+        ));
 
         // Drop the session without calling close().
         drop(session);
 
-        // The pending entry must be gone.
-        assert!(
-            !service
-                .pending_operation_exists_for_test(
-                    PendingOperationKindForTest::ExecStream,
-                    "drop-test-1",
-                )
-                .await,
-            "pending entry must be removed on drop"
-        );
+        let replacement = service
+            .open_node_exec_with_command_id(
+                CommandId("drop-test-1".to_string()),
+                sample_node_exec_request("worker-1"),
+            )
+            .await
+            .expect("drop must release the correlation ID");
+        drop(replacement);
     }
 
     /// Same drop-safety for the replication node-log stream.
@@ -737,37 +747,31 @@ mod tests {
             None,
         )
         .unwrap();
-        let (_control_rx, _session_id) = service.register_follower(metadata).await;
+        let (mut control_rx, _session_id) = service.register_follower(metadata).await;
 
         let session = service
-            .open_node_log_stream_for_test(
-                "log-drop-1".to_string(),
+            .open_node_logs_with_command_id(
+                CommandId("log-drop-1".to_string()),
                 sample_node_log_request("worker-1", true, None),
             )
             .await
             .unwrap();
 
-        assert!(
-            service
-                .pending_operation_exists_for_test(
-                    PendingOperationKindForTest::LogStream,
-                    "log-drop-1",
-                )
-                .await,
-            "pending pod log entry must exist before drop"
-        );
+        assert!(matches!(
+            control_rx.recv().await,
+            Some(FollowerControlMessage::PodLog(_))
+        ));
 
         drop(session);
 
-        assert!(
-            !service
-                .pending_operation_exists_for_test(
-                    PendingOperationKindForTest::LogStream,
-                    "log-drop-1",
-                )
-                .await,
-            "pending pod log entry must be removed on drop"
-        );
+        let replacement = service
+            .open_node_logs_with_command_id(
+                CommandId("log-drop-1".to_string()),
+                sample_node_log_request("worker-1", true, None),
+            )
+            .await
+            .expect("drop must release the correlation ID");
+        drop(replacement);
     }
 
     /// When a follower disconnects, unregister_follower must sweep the pending
@@ -775,7 +779,7 @@ mod tests {
     /// Without this, callers block until timeout.
     #[tokio::test]
     async fn unregister_follower_completes_pending_requests() {
-        let service = test_service().await;
+        let service = Arc::new(test_service().await);
 
         // Register a follower.
         let metadata = test_network_dataplane(
@@ -787,75 +791,82 @@ mod tests {
             Some(51_820),
         )
         .unwrap();
-        let (_control_rx, session_id) = service.register_follower(metadata).await;
+        let (mut control_rx, session_id) = service.register_follower(metadata).await;
+        let other_metadata = test_network_dataplane(
+            "other-node".to_string(),
+            klights_networking::wireguard::DataplaneMode::Root,
+            klights_networking::wireguard::DataplaneEncryption::Disabled,
+            None,
+            Some("127.0.0.2".to_string()),
+            None,
+        )
+        .unwrap();
+        let (mut other_control_rx, other_session_id) =
+            service.register_follower(other_metadata).await;
 
-        // Manually insert a pending node-exec sync request for this node.
-        let mut exec_rx = service
-            .insert_pending_exec_for_test(
-                "exec-req-1".to_string(),
-                "test-node".to_string(),
-                session_id,
-                1,
-            )
-            .await;
+        let exec_service = service.clone();
+        let exec = tokio::spawn(async move {
+            exec_service
+                .execute_node_sync_with_command_id(
+                    CommandId("exec-req-1".to_string()),
+                    sample_node_exec_sync_request("test-node"),
+                )
+                .await
+        });
+        let log_service = service.clone();
+        let log = tokio::spawn(async move {
+            log_service
+                .read_node_logs_with_command_id(
+                    CommandId("log-req-1".to_string()),
+                    sample_node_log_request("test-node", false, None),
+                )
+                .await
+        });
+        let metrics_service = service.clone();
+        let metrics = tokio::spawn(async move {
+            metrics_service
+                .collect_node_metrics_with_command_id(
+                    CommandId("metrics-req-1".to_string()),
+                    NodeMetricsRequest::new(
+                        klights_node_api::NodeMetricsTarget::try_new("test-node").unwrap(),
+                        Vec::new(),
+                    ),
+                )
+                .await
+        });
+        let other_service = service.clone();
+        let other = tokio::spawn(async move {
+            other_service
+                .execute_node_sync_with_command_id(
+                    CommandId("exec-req-2".to_string()),
+                    sample_node_exec_sync_request("other-node"),
+                )
+                .await
+        });
 
-        // Manually insert a pending pod-log request for this node.
-        let mut log_rx = service
-            .insert_pending_log_for_test(
-                "log-req-1".to_string(),
-                "test-node".to_string(),
-                session_id,
-                2,
-            )
-            .await;
-
-        // Manually insert a pending node metrics request for this node.
-        let mut metrics_rx = service
-            .insert_pending_metrics_for_test(
-                "metrics-req-1".to_string(),
-                "test-node".to_string(),
-                session_id,
-                3,
-            )
-            .await;
-
-        // Also register a request for a DIFFERENT node — it must survive.
-        let mut other_rx = service
-            .insert_pending_exec_for_test(
-                "exec-req-2".to_string(),
-                "other-node".to_string(),
-                999,
-                4,
-            )
-            .await;
+        for _ in 0..3 {
+            control_rx.recv().await.expect("test-node request routed");
+        }
+        other_control_rx
+            .recv()
+            .await
+            .expect("other-node request routed");
 
         // Unregister the follower for test-node.
         service.unregister_follower("test-node", session_id).await;
 
-        // The pending requests for test-node MUST be completed with an error.
-        let exec_result = exec_rx.try_recv().expect("exec oneshot must be resolved");
-        assert!(
-            exec_result.is_err(),
-            "pending exec must fail on follower disconnect"
-        );
-        let exec_err = exec_result.unwrap_err().to_string();
+        let exec_err = exec.await.unwrap().unwrap_err().to_string();
         assert!(
             exec_err.contains("test-node"),
             "exec error must mention the disconnected node: {exec_err}"
         );
 
-        let log_result = log_rx.try_recv().expect("pod log oneshot must be resolved");
-        assert!(
-            log_result.is_err(),
-            "pending pod log must fail on follower disconnect"
-        );
+        let log_result = log.await.unwrap();
         assert!(
             log_result.unwrap_err().to_string().contains("test-node"),
             "pod log error must mention the disconnected node"
         );
-        let metrics_result = metrics_rx
-            .try_recv()
-            .expect("node metrics oneshot must be resolved");
+        let metrics_result = metrics.await.unwrap();
         assert!(
             metrics_result.is_err(),
             "pending node metrics must fail on follower disconnect"
@@ -868,49 +879,15 @@ mod tests {
             "node metrics error must mention the disconnected node"
         );
 
-        // The request for other-node must NOT be affected.
+        tokio::task::yield_now().await;
         assert!(
-            other_rx.try_recv().is_err(),
+            !other.is_finished(),
             "other-node request must survive unregister of a different follower"
         );
-        assert!(
-            service
-                .pending_operation_exists_for_test(
-                    PendingOperationKindForTest::ExecSync,
-                    "exec-req-2",
-                )
-                .await,
-            "other-node pending entry must not be removed"
-        );
-
-        // The pending maps must NOT contain the test-node entries anymore.
-        assert!(
-            !service
-                .pending_operation_exists_for_test(
-                    PendingOperationKindForTest::ExecSync,
-                    "exec-req-1",
-                )
-                .await,
-            "test-node exec entry must be removed"
-        );
-        assert!(
-            !service
-                .pending_operation_exists_for_test(
-                    PendingOperationKindForTest::LogSync,
-                    "log-req-1",
-                )
-                .await,
-            "test-node log entry must be removed"
-        );
-        assert!(
-            !service
-                .pending_operation_exists_for_test(
-                    PendingOperationKindForTest::Metrics,
-                    "metrics-req-1",
-                )
-                .await,
-            "test-node metrics entry must be removed"
-        );
+        service
+            .unregister_follower("other-node", other_session_id)
+            .await;
+        assert!(other.await.unwrap().is_err());
     }
 
     #[tokio::test]
@@ -930,8 +907,8 @@ mod tests {
         let service_for_request = service.clone();
         let request_task = tokio::spawn(async move {
             service_for_request
-                .request_node_metrics_for_test(
-                    "metrics-1".to_string(),
+                .collect_node_metrics_with_command_id(
+                    CommandId("metrics-1".to_string()),
                     NodeMetricsRequest::new(
                         klights_node_api::NodeMetricsTarget::try_new("worker-1").unwrap(),
                         Vec::new(),
@@ -980,19 +957,25 @@ mod tests {
             None,
         )
         .unwrap();
-        let (_control_rx, session_id) = service.register_follower(metadata).await;
-        let original_rx = service
-            .insert_pending_metrics_for_test(
-                "metrics-duplicate".to_string(),
-                "worker-1".to_string(),
-                session_id,
-                service.next_operation_generation_for_test(),
-            )
-            .await;
+        let (mut control_rx, session_id) = service.register_follower(metadata).await;
+        let original_service = service.clone();
+        let original = tokio::spawn(async move {
+            original_service
+                .collect_node_metrics_with_command_id(
+                    CommandId("metrics-duplicate".to_string()),
+                    NodeMetricsRequest::new(
+                        klights_node_api::NodeMetricsTarget::try_new("worker-1").unwrap(),
+                        Vec::new(),
+                    ),
+                )
+                .await
+        });
+        let routed = control_rx.recv().await.expect("original request routed");
+        assert!(matches!(routed, FollowerControlMessage::NodeMetrics(_)));
 
         let error = service
-            .request_node_metrics_for_test(
-                "metrics-duplicate".to_string(),
+            .collect_node_metrics_with_command_id(
+                CommandId("metrics-duplicate".to_string()),
                 NodeMetricsRequest::new(
                     klights_node_api::NodeMetricsTarget::try_new("worker-1").unwrap(),
                     Vec::new(),
@@ -1018,7 +1001,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(original_rx.await.unwrap().unwrap(), expected);
+        assert_eq!(original.await.unwrap().unwrap(), expected);
     }
 
     #[tokio::test]
@@ -1043,8 +1026,8 @@ mod tests {
         let request_service = service.clone();
         let request = tokio::spawn(async move {
             request_service
-                .request_node_metrics_for_test(
-                    "shared-metrics-id".to_string(),
+                .collect_node_metrics_with_command_id(
+                    CommandId("shared-metrics-id".to_string()),
                     NodeMetricsRequest::new(
                         klights_node_api::NodeMetricsTarget::try_new("worker-1").unwrap(),
                         Vec::new(),
@@ -1083,14 +1066,6 @@ mod tests {
                     .await
                     .is_err()
             );
-            assert!(
-                service
-                    .pending_operation_exists_for_test(
-                        PendingOperationKindForTest::Metrics,
-                        "shared-metrics-id",
-                    )
-                    .await
-            );
         }
 
         let mismatched_payload = RoutedNodeMetricsResponse {
@@ -1110,15 +1085,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(
-            service
-                .pending_operation_exists_for_test(
-                    PendingOperationKindForTest::Metrics,
-                    "shared-metrics-id",
-                )
-                .await
-        );
-
         service
             .complete_node_metrics(
                 FollowerCompletionContext::new(
@@ -1150,8 +1116,8 @@ mod tests {
         .unwrap();
         let (mut control_rx, follower_session) = service.register_follower(metadata).await;
         let old_session = service
-            .open_node_exec_stream_for_test(
-                "reused-exec-id".to_string(),
+            .open_node_exec_with_command_id(
+                CommandId("reused-exec-id".to_string()),
                 sample_node_exec_request("worker-1"),
             )
             .await
@@ -1165,7 +1131,7 @@ mod tests {
             follower_session,
             NodeOperationKind::ExecStream,
         );
-        for _ in 0..ReplicationService::node_exec_stream_frame_capacity_for_test() {
+        for _ in 0..EXPECTED_NODE_EXEC_STREAM_FRAME_CAPACITY {
             service
                 .complete_node_exec_stream_frame(
                     context,
@@ -1192,8 +1158,8 @@ mod tests {
         tokio::task::yield_now().await;
         drop(old_session);
         let replacement = service
-            .open_node_exec_stream_for_test(
-                "reused-exec-id".to_string(),
+            .open_node_exec_with_command_id(
+                CommandId("reused-exec-id".to_string()),
                 sample_node_exec_request("worker-1"),
             )
             .await
@@ -1235,8 +1201,8 @@ mod tests {
         let (mut control_rx, session_id) = service.register_follower(metadata).await;
 
         let session = service
-            .open_node_exec_stream_for_test(
-                "exec-stream-disconnect-1".to_string(),
+            .open_node_exec_with_command_id(
+                CommandId("exec-stream-disconnect-1".to_string()),
                 sample_node_exec_request("worker-1"),
             )
             .await
@@ -1263,16 +1229,6 @@ mod tests {
             closed.is_none(),
             "disconnect must close the exec stream receiver"
         );
-
-        assert!(
-            !service
-                .pending_operation_exists_for_test(
-                    PendingOperationKindForTest::ExecStream,
-                    "exec-stream-disconnect-1",
-                )
-                .await,
-            "pending exec stream entry must be swept"
-        );
     }
 
     #[tokio::test]
@@ -1290,8 +1246,8 @@ mod tests {
         let (mut control_rx, session_id) = service.register_follower(metadata).await;
 
         let session = service
-            .open_node_log_stream_for_test(
-                "pod-log-stream-disconnect-1".to_string(),
+            .open_node_logs_with_command_id(
+                CommandId("pod-log-stream-disconnect-1".to_string()),
                 sample_node_log_request("worker-1", true, None),
             )
             .await
@@ -1317,16 +1273,6 @@ mod tests {
         assert!(
             closed.is_none(),
             "disconnect must close the pod log stream receiver"
-        );
-
-        assert!(
-            !service
-                .pending_operation_exists_for_test(
-                    PendingOperationKindForTest::LogStream,
-                    "pod-log-stream-disconnect-1",
-                )
-                .await,
-            "pending pod log stream entry must be swept"
         );
     }
 }

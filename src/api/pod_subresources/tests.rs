@@ -1931,7 +1931,9 @@ async fn test_remote_exec_sync_websocket_closes_after_terminal_status_without_cl
     let server = tokio::spawn(handle_remote_exec_websocket_sync(
         server_ws,
         RemoteExecWebSocketSyncRequest {
-            node_exec: replication as Arc<dyn NodeExec>,
+            node_exec: crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(
+                replication,
+            ) as Arc<dyn NodeExec>,
             target: ExecTarget {
                 namespace: "default".to_string(),
                 pod_name: "worker-pod".to_string(),
@@ -2046,7 +2048,9 @@ async fn test_remote_exec_sync_websocket_waits_for_peer_close_reply() {
     let mut server = tokio::spawn(handle_remote_exec_websocket_sync(
         server_ws,
         RemoteExecWebSocketSyncRequest {
-            node_exec: replication as Arc<dyn NodeExec>,
+            node_exec: crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(
+                replication,
+            ) as Arc<dyn NodeExec>,
             target: ExecTarget {
                 namespace: "default".to_string(),
                 pod_name: "worker-pod".to_string(),
