@@ -12,8 +12,8 @@ use super::PodLifecycleRouteBackend;
 use super::PodLifecycleRouteError;
 use super::PodLifecycleRouteMode;
 use super::executor::PodWorkExecutor;
-use crate::kubelet::pod_lifecycle_actor::message::{LifecycleMessage, PodLifecycleKey};
-use crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry;
+use crate::pod_lifecycle_actor::message::{LifecycleMessage, PodLifecycleKey};
+use crate::pod_lifecycle_actor::registry::PodLifecycleRegistry;
 
 /// Actor backend wrapping the real `PodLifecycleRegistry`.
 pub struct ActorPodLifecycleBackend {

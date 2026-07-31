@@ -7,14 +7,7 @@ use crate::kubelet::pod_runtime::store::PodSlotAdmission;
 use tokio_util::sync::CancellationToken;
 
 /// Request object for UID-qualified pod slot admission checks.
-#[derive(Clone, Debug)]
-pub struct PodSlotAdmissionRequest {
-    pub key: PodRuntimeKey,
-    pub pod: serde_json::Value,
-    pub resource_version: Option<i64>,
-    pub start_after_admit: bool,
-    pub operation_id: u64,
-}
+pub use klights_kubelet::runtime::PodSlotAdmissionRequest;
 
 fn lifecycle_key_from_runtime_key(key: &PodRuntimeKey) -> PodLifecycleKey {
     PodLifecycleKey::new(&key.namespace, &key.name, &key.uid)

@@ -6,9 +6,9 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::kubelet::outbox::Outbox;
-use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
-use crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor;
+use crate::pod_lifecycle_router::LifecycleReplyHandle;
+use crate::pod_lifecycle_router::executor::PodWorkExecutor;
+use klights_leader_api::NodeOutbox;
 use klights_supervisor::{TaskCategory, TaskSupervisor};
 
 use super::actor::{PodLifecycleActor, PodLifecycleActorRuntime};
@@ -131,8 +131,8 @@ pub struct PodLifecycleRegistry {
     executor_holder: Arc<std::sync::Mutex<Arc<dyn PodWorkExecutor>>>,
     reply_handle: std::sync::Mutex<Option<LifecycleReplyHandle>>,
     idle_grace: Duration,
-    runtime_observation_store: Option<Arc<Outbox>>,
-    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    runtime_observation_store: Option<Arc<dyn NodeOutbox>>,
+    wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
 #[derive(Clone, Debug)]
@@ -150,7 +150,7 @@ pub struct PodLifecycleActorState {
 }
 
 impl PodLifecycleRegistry {
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn new(
         supervisor: Arc<TaskSupervisor>,
         config: PodLifecycleConcurrencyConfig,
@@ -161,7 +161,7 @@ impl PodLifecycleRegistry {
             config,
             executor_holder,
             super::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            Arc::new(klights_supervisor::SystemWallClock),
         )
     }
 
@@ -170,7 +170,7 @@ impl PodLifecycleRegistry {
         config: PodLifecycleConcurrencyConfig,
         executor_holder: Arc<std::sync::Mutex<Arc<dyn PodWorkExecutor>>>,
         idle_grace: Duration,
-        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+        wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Self {
         Self {
             supervisor,
@@ -188,13 +188,13 @@ impl PodLifecycleRegistry {
 
     pub fn with_runtime_observation_store(
         mut self,
-        runtime_observation_store: Option<Arc<Outbox>>,
+        runtime_observation_store: Option<Arc<dyn NodeOutbox>>,
     ) -> Self {
         self.runtime_observation_store = runtime_observation_store;
         self
     }
 
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn new_with_idle_grace_for_test(
         supervisor: Arc<TaskSupervisor>,
         config: PodLifecycleConcurrencyConfig,
@@ -206,7 +206,7 @@ impl PodLifecycleRegistry {
             config,
             executor_holder,
             idle_grace,
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            Arc::new(klights_supervisor::SystemWallClock),
         )
     }
 

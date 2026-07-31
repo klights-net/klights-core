@@ -12,8 +12,8 @@ use executor::NoopExecutor;
 use multiplex::MultiplexPodLifecycleBackend;
 use tokio::sync::mpsc;
 
-use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
-use crate::kubelet::pod_lifecycle_core::trace::LifecycleTraceEntry;
+use crate::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
+use crate::pod_lifecycle_core::trace::LifecycleTraceEntry;
 
 use super::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
 use super::pod_lifecycle_actor::registry::{PodLifecycleActorState, PodLifecycleRegistry};
@@ -148,6 +148,24 @@ pub struct PodLifecycleRouter {
     backend: Arc<dyn PodLifecycleRouteBackend>,
 }
 
+impl crate::pod_repository::PodLifecycleRouteSink for PodLifecycleRouter {
+    fn route_pod_lifecycle(
+        &self,
+        request: crate::pod_repository::PodLifecycleRouteRequest,
+    ) -> klights_pod_api::PodLifecycleFuture<'_> {
+        Box::pin(async move {
+            let (identity, resource_version, pod) = request.into_parts();
+            self.route(LifecycleMessage::WatchModified {
+                key: PodLifecycleKey::new(&identity.namespace, &identity.name, &identity.uid),
+                resource_version: Some(resource_version),
+                pod: Arc::unwrap_or_clone(pod.data),
+            })
+            .await
+            .map_err(|error| klights_pod_api::PodRoutingError::unavailable(error.to_string()))
+        })
+    }
+}
+
 impl std::fmt::Debug for PodLifecycleRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PodLifecycleRouter")
@@ -157,8 +175,8 @@ impl std::fmt::Debug for PodLifecycleRouter {
 }
 
 impl PodLifecycleRouter {
-    #[cfg(test)]
-    pub(crate) fn new_test_backend(backend: Arc<dyn PodLifecycleRouteBackend>) -> Self {
+    #[doc(hidden)]
+    pub fn new_test_backend(backend: Arc<dyn PodLifecycleRouteBackend>) -> Self {
         Self { backend }
     }
 
@@ -175,7 +193,7 @@ impl PodLifecycleRouter {
     }
 
     /// Create a router with a pre-built executor holder (for production wiring).
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn new_actor_with_executor(
         registry: Arc<PodLifecycleRegistry>,
         executor: Arc<dyn executor::PodWorkExecutor>,
@@ -195,7 +213,7 @@ impl PodLifecycleRouter {
         config: PodLifecycleConcurrencyConfig,
         mode: PodLifecycleRouteMode,
         actor_idle_grace: std::time::Duration,
-        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+        wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Self {
         let backend: Arc<dyn PodLifecycleRouteBackend> = match mode {
             PodLifecycleRouteMode::Actor => {
@@ -221,8 +239,8 @@ impl PodLifecycleRouter {
         Self { backend }
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_env(
+    #[doc(hidden)]
+    pub fn new_test_default(
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
         config: PodLifecycleConcurrencyConfig,
     ) -> Self {
@@ -230,8 +248,8 @@ impl PodLifecycleRouter {
             supervisor,
             config,
             PodLifecycleRouteMode::Actor,
-            crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            crate::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            Arc::new(klights_supervisor::SystemWallClock),
         )
     }
 
@@ -312,7 +330,7 @@ impl klights_pod_api::PodLifecycleDiagnosticsQuery for PodLifecycleRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
+    use crate::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     fn test_supervisor() -> Arc<TaskSupervisor> {
@@ -347,8 +365,8 @@ mod tests {
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Actor,
-            crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            crate::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            Arc::new(klights_supervisor::SystemWallClock),
         );
         assert_eq!(router.mode(), PodLifecycleRouteMode::Actor);
     }
@@ -359,8 +377,8 @@ mod tests {
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Multiplex,
-            crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            crate::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            Arc::new(klights_supervisor::SystemWallClock),
         );
         assert_eq!(router.mode(), PodLifecycleRouteMode::Multiplex);
     }
@@ -458,8 +476,8 @@ mod tests {
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Multiplex,
-            crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            crate::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            Arc::new(klights_supervisor::SystemWallClock),
         );
 
         let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -474,8 +492,8 @@ mod tests {
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Multiplex,
-            crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            crate::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            Arc::new(klights_supervisor::SystemWallClock),
         );
 
         let diag = router.diagnostics().await;
@@ -494,8 +512,8 @@ mod tests {
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Multiplex,
-            crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            crate::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            Arc::new(klights_supervisor::SystemWallClock),
         );
 
         // Mode selection works.
@@ -548,10 +566,8 @@ mod tests {
 
     // ── lifecycle event type routing ──
 
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::pod_lifecycle_core::message::{
-        PodLifecycleWorkKind, PodProbeKind, PodProbeResult,
-    };
+    use crate::cri_events::KubeletEventKind;
+    use crate::pod_lifecycle_core::message::{PodLifecycleWorkKind, PodProbeKind, PodProbeResult};
     use serde_json::json;
 
     #[tokio::test]
@@ -644,7 +660,7 @@ mod tests {
         let result = router
             .route(LifecycleMessage::LifecycleCommand {
                 key,
-                command: crate::kubelet::lifecycle::LifecycleCommand::ReadinessChanged {
+                command: crate::lifecycle::LifecycleCommand::ReadinessChanged {
                     pod_uid: "uid-a".to_string(),
                     namespace: "default".to_string(),
                     pod_name: "pod-a".to_string(),
@@ -798,8 +814,8 @@ mod tests {
     /// correct namespace, name, and UID.
     #[tokio::test]
     async fn actor_backend_routes_uid_keyed_watch_added_to_configured_executor() {
-        use crate::kubelet::pod_lifecycle_core::action::PodAction;
-        use crate::kubelet::pod_lifecycle_router::executor::RecordingExecutor;
+        use crate::pod_lifecycle_core::action::PodAction;
+        use crate::pod_lifecycle_router::executor::RecordingExecutor;
 
         let recorder = RecordingExecutor::new();
         let registry = test_registry_with_executor(recorder.clone());
@@ -862,8 +878,8 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_orphan_finalize_is_idempotent_on_uid() {
-        use crate::kubelet::pod_lifecycle_core::action::PodAction;
-        use crate::kubelet::pod_lifecycle_router::executor::RecordingExecutor;
+        use crate::pod_lifecycle_core::action::PodAction;
+        use crate::pod_lifecycle_router::executor::RecordingExecutor;
 
         let recorder = RecordingExecutor::new();
         let registry = test_registry_with_executor(recorder.clone());
@@ -909,7 +925,7 @@ mod tests {
     /// `remove_pod_state` cleans up actor state and returns true.
     #[tokio::test]
     async fn actor_backend_routes_watch_added_to_configured_executor() {
-        use crate::kubelet::pod_lifecycle_router::executor::RecordingExecutor;
+        use crate::pod_lifecycle_router::executor::RecordingExecutor;
 
         let recorder = RecordingExecutor::new();
         let registry = test_registry_with_executor(recorder.clone());
@@ -960,9 +976,9 @@ mod tests {
 
     // ── Task 13.4: backend pluggability seam ──
 
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
-    use crate::kubelet::pod_runtime::service::{PodRuntimeKey, PodRuntimeService};
-    use crate::kubelet::pod_runtime::test_support::MockPodRuntimeService;
+    use crate::pod_lifecycle_core::action::PodAction;
+    use crate::runtime::{PodRuntimeKey, PodRuntimeService};
+    use crate::test_support::MockPodRuntimeService;
     use tokio_util::sync::CancellationToken;
 
     /// Test-only backend that proves a third backend can be added without
@@ -1098,7 +1114,7 @@ mod tests {
         let calls = mock_runtime.recorded_calls();
         assert_eq!(calls.len(), 1, "runtime must receive exactly one call");
         match &calls[0] {
-            super::super::pod_runtime::test_support::MockRuntimeCall::StartPod {
+            crate::test_support::MockRuntimeCall::StartPod {
                 namespace,
                 name,
                 uid,
@@ -1167,8 +1183,8 @@ mod tests {
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Multiplex,
-            crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            crate::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            Arc::new(klights_supervisor::SystemWallClock),
         );
 
         assert_eq!(mux_router.mode(), PodLifecycleRouteMode::Multiplex);

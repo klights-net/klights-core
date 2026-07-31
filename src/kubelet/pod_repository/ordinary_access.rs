@@ -7,13 +7,10 @@ use klights_pod_api::{
     PodEvictionDeleteRequest, PodMarkTerminating, PodMarkTerminatingRequest,
 };
 use klights_pod_api::{
-    PodGetRequest, PodLifecycleFuture, PodListRequest, PodListResult, PodOwnerListRequest,
-    PodQuery, PodRepositoryError, PodRepositoryFuture, PodRoutingError, PodSnapshotListRequest,
-    PodSnapshotQuery, PodUpdate, PodUpdateRequest,
+    PodGetRequest, PodListRequest, PodListResult, PodOwnerListRequest, PodQuery,
+    PodRepositoryError, PodRepositoryFuture, PodSnapshotListRequest, PodSnapshotQuery, PodUpdate,
+    PodUpdateRequest,
 };
-
-use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
-use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
 
 use super::{PodObjectWriter, PodReader, PodRepository, store::PodStore};
 
@@ -383,24 +380,6 @@ impl klights_reconcile_api::NamespaceTerminationQueueSink for PodRepository {
                 .map_err(|error| {
                     klights_reconcile_api::ReconcileSinkError::unavailable(error.to_string())
                 })
-        })
-    }
-}
-
-impl klights_kubelet::pod_repository::PodLifecycleRouteSink for PodLifecycleRouter {
-    fn route_pod_lifecycle(
-        &self,
-        request: klights_kubelet::pod_repository::PodLifecycleRouteRequest,
-    ) -> PodLifecycleFuture<'_> {
-        Box::pin(async move {
-            let (identity, resource_version, pod) = request.into_parts();
-            self.route(LifecycleMessage::WatchModified {
-                key: PodLifecycleKey::new(&identity.namespace, &identity.name, &identity.uid),
-                resource_version: Some(resource_version),
-                pod: std::sync::Arc::unwrap_or_clone(pod.data),
-            })
-            .await
-            .map_err(|error| PodRoutingError::unavailable(error.to_string()))
         })
     }
 }

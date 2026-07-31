@@ -2225,14 +2225,20 @@ dependencies = [
 name = "klights-kubelet"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "klights-cluster-core",
  "klights-leader-api",
  "klights-network-api",
  "klights-node-store",
  "klights-pod-api",
+ "klights-reconcile-api",
  "klights-supervisor",
  "klights-types",
  "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

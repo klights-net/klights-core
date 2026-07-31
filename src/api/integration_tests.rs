@@ -1681,7 +1681,7 @@ async fn test_pod_lifecycle_debug_endpoint_returns_snapshot_shape() {
         "uid-123",
     );
     let router = std::sync::Arc::new(
-        crate::kubelet::pod_lifecycle_router::PodLifecycleRouter::from_env(
+        crate::kubelet::pod_lifecycle_router::PodLifecycleRouter::new_test_default(
             app_state.operational().task_supervisor.clone(),
             crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
         ),

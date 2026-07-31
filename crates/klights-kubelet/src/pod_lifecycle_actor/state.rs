@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use super::message::PodLifecycleKey;
 
 // Re-export the canonical types from core.
-pub use crate::kubelet::pod_lifecycle_core::state::PodLifecycleState;
+pub use crate::pod_lifecycle_core::state::PodLifecycleState;
 
 /// Side-table keyed by `PodLifecycleKey` for actor cleanup.
 pub type PodLifecycleStateTracker = Arc<Mutex<HashMap<PodLifecycleKey, PodLifecycleState>>>;

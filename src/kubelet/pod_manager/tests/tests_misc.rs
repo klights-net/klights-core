@@ -25,7 +25,7 @@ fn pod_watcher_limits_pod_events_to_local_node_field_selector() {
 async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_aware_handler() {
     let mut state = crate::api::test_support::build_test_app_state().await;
     state.pod_node_subresources_mut().pod_lifecycle_router = Some(std::sync::Arc::new(
-        crate::kubelet::pod_lifecycle_router::PodLifecycleRouter::from_env(
+        crate::kubelet::pod_lifecycle_router::PodLifecycleRouter::new_test_default(
             state.operational().task_supervisor.clone(),
             crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
         ),

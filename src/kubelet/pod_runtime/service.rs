@@ -6,6 +6,7 @@ pub use crate::kubelet::pod_runtime::types::{
     PodDeletionFinalizeResult, PodFinalizeStartupResult, PodOwnershipError, PodRuntimeKey,
     PodStartResult, pod_volume_dir_id,
 };
+pub use klights_kubelet::runtime::{PodRuntimeService, RuntimeReconcileHint};
 use tokio_util::sync::CancellationToken;
 
 fn append_service_envs(
@@ -18,85 +19,6 @@ fn append_service_envs(
             value: value.clone(),
         });
     }
-}
-
-/// Hint carried from a CRI container event into deferred runtime reconcile.
-///
-/// Extracted into `reconcile_hint` to keep this hub under its size cap; the
-/// type is re-exported here so the public path
-/// `crate::kubelet::pod_runtime::service::RuntimeReconcileHint` stays stable.
-pub use crate::kubelet::pod_runtime::reconcile_hint::RuntimeReconcileHint;
-
-/// Backend-neutral lifecycle runtime trait.
-/// Every lifecycle operation below `PodWorkExecutor` takes `PodRuntimeKey`
-/// or another UID-bearing command object.
-#[async_trait::async_trait]
-pub trait PodRuntimeService: Send + Sync {
-    async fn start_pod(
-        &self,
-        key: PodRuntimeKey,
-        pod: Option<serde_json::Value>,
-        cancel: CancellationToken,
-    ) -> anyhow::Result<PodStartResult>;
-
-    async fn stop_pod(
-        &self,
-        key: PodRuntimeKey,
-        pod: Option<serde_json::Value>,
-        // Sandbox ID to clean up. `None` means resolve via store → annotation → CRI.
-        sandbox_id: Option<String>,
-    ) -> anyhow::Result<()>;
-
-    async fn finalize_startup(
-        &self,
-        key: PodRuntimeKey,
-        pod: Option<serde_json::Value>,
-        sandbox_id_hint: Option<String>,
-    ) -> anyhow::Result<PodFinalizeStartupResult>;
-
-    async fn finalize_deletion(
-        &self,
-        key: PodRuntimeKey,
-    ) -> anyhow::Result<PodDeletionFinalizeResult>;
-
-    async fn reconcile_runtime(
-        &self,
-        key: PodRuntimeKey,
-        hint: RuntimeReconcileHint,
-    ) -> anyhow::Result<()>;
-
-    async fn reconcile_cri_leftovers(&self, key: PodRuntimeKey) -> anyhow::Result<()>;
-
-    async fn reconcile_ephemeral(
-        &self,
-        key: PodRuntimeKey,
-        pod: Option<serde_json::Value>,
-    ) -> anyhow::Result<()>;
-
-    async fn handle_lifecycle_command(&self, command: LifecycleCommand) -> anyhow::Result<()>;
-
-    async fn check_slot_admission(
-        &self,
-        request: PodSlotAdmissionRequest,
-        reply_to: LifecycleReplyHandle,
-        cancel: CancellationToken,
-    ) -> anyhow::Result<()>;
-
-    async fn schedule_retry(
-        &self,
-        key: PodRuntimeKey,
-        delay: std::time::Duration,
-        reply_to: LifecycleReplyHandle,
-    ) -> anyhow::Result<()>;
-
-    async fn schedule_start_pod_retry(
-        &self,
-        key: PodRuntimeKey,
-        delay: std::time::Duration,
-        error_message: String,
-        attempt: u32,
-        reply_to: LifecycleReplyHandle,
-    ) -> anyhow::Result<()>;
 }
 
 // --- Runtime configuration ---

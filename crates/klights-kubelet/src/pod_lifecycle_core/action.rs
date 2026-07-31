@@ -12,7 +12,7 @@ use super::concurrency::WorkPermit;
 use super::message::{
     LifecycleMessage, PodLifecycleKey, PodLifecycleWorkFailure, PodLifecycleWorkKind,
 };
-use crate::kubelet::lifecycle::LifecycleCommand;
+use crate::lifecycle::LifecycleCommand;
 
 /// Synthesizes a `PodWorkFailed` message from an executor dispatch error.
 /// Shared by actor backend, multiplex adapter, and `PodDemuxEngine::spawn_work`.
@@ -70,7 +70,7 @@ pub enum PodAction {
     /// so fast-exit and multi-container pods are not hidden by empty/stale listings.
     ReconcileRuntime {
         key: PodLifecycleKey,
-        hint: crate::kubelet::pod_runtime::service::RuntimeReconcileHint,
+        hint: crate::runtime::RuntimeReconcileHint,
         operation_id: u64,
         permit: Option<WorkPermit>,
     },
@@ -297,7 +297,7 @@ mod tests {
     fn reconcile_runtime_accessors() {
         let action = PodAction::ReconcileRuntime {
             key: test_key(),
-            hint: crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
+            hint: crate::runtime::RuntimeReconcileHint::none(),
             operation_id: 45,
             permit: None,
         };

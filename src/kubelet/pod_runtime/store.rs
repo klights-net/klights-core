@@ -23,6 +23,12 @@ impl RuntimeClock for SystemRuntimeClock {
     }
 }
 
+impl klights_supervisor::WallClock for SystemRuntimeClock {
+    fn now(&self) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(self.now_ms().max(0) as u64)
+    }
+}
+
 /// Node-local runtime persistence port for sandbox rows, pod network rows,
 /// and pod slot admission.
 #[async_trait::async_trait]

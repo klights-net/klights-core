@@ -68,11 +68,11 @@ pub enum LifecycleMessage {
     CriEvent {
         key: PodLifecycleKey,
         container_id: String,
-        kind: crate::kubelet::cri_events::KubeletEventKind,
+        kind: crate::cri_events::KubeletEventKind,
     },
     LifecycleCommand {
         key: PodLifecycleKey,
-        command: crate::kubelet::lifecycle::LifecycleCommand,
+        command: crate::lifecycle::LifecycleCommand,
     },
     NetworkAssigned {
         key: PodLifecycleKey,
@@ -122,7 +122,7 @@ pub enum LifecycleMessage {
     },
     OrphanFinalize {
         key: PodLifecycleKey,
-        reason: crate::kubelet::pod_lifecycle_router::OrphanReason,
+        reason: crate::pod_lifecycle_router::OrphanReason,
     },
     ActiveDeadlineDue {
         key: PodLifecycleKey,
@@ -266,14 +266,14 @@ pub enum PodLifecycleWorkFailure {
     /// itself fails (e.g. executor error, spawn rejection).
     DispatchFailed(String),
     /// The local kubelet does not own this Pod's runtime. Produced when
-    /// [`crate::kubelet::pod_runtime::service::PodRuntimeService::stop_pod`]
+    /// [`crate::runtime::PodRuntimeService::stop_pod`]
     /// refuses cleanup for a Pod whose `spec.nodeName` is absent
     /// (`target_node == None`) or names another node.
     ///
     /// This is terminal on the local actor: retrying can never succeed
     /// because the local node holds no CRI/CNI/volume state for the Pod.
     /// Row cleanup is owned by
-    /// `PodStore::delete_unscheduled_with_uid` (unscheduled) or the
+    /// the leader-only unscheduled-Pod CAS or the
     /// owning node's lifecycle actor.
     NotOwned {
         local_node: String,

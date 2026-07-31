@@ -10,7 +10,7 @@ use super::PodLifecycleDiagnostics;
 use super::PodLifecycleRouteBackend;
 use super::PodLifecycleRouteError;
 use super::PodLifecycleRouteMode;
-use crate::kubelet::pod_lifecycle_actor::message::{LifecycleMessage, PodLifecycleKey};
+use crate::pod_lifecycle_actor::message::{LifecycleMessage, PodLifecycleKey};
 
 /// Multiplex backend placeholder.
 #[derive(Debug)]

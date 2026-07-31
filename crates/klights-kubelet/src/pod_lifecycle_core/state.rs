@@ -4,7 +4,7 @@
 //! and sandbox identity so both actor and multiplex can share state-machine logic.
 
 use super::message::{PodLifecycleKey, PodLifecycleWorkKind};
-use crate::kubelet::pod_runtime::observations::RuntimeReconcileObservations;
+use crate::runtime_observations::RuntimeReconcileObservations;
 
 /// Phases a pod transitions through during its lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -317,7 +317,7 @@ impl PodLifecycleState {
 
     pub fn next_start_retry_delay(&mut self) -> std::time::Duration {
         self.retry_attempts = self.retry_attempts.saturating_add(1);
-        crate::kubelet::pod_creation_state::retry_backoff(self.retry_attempts)
+        crate::runtime::retry_backoff(self.retry_attempts)
     }
 
     pub fn reset_start_retry_attempts(&mut self) {
@@ -401,7 +401,7 @@ impl PodLifecycleState {
     pub fn defer_runtime_reconcile_event(
         &mut self,
         container_id: &str,
-        kind: crate::kubelet::cri_events::KubeletEventKind,
+        kind: crate::cri_events::KubeletEventKind,
     ) {
         self.pending_runtime_reconcile = true;
         self.runtime_reconcile_observations
@@ -439,15 +439,13 @@ impl PodLifecycleState {
     /// Drain all deferred runtime reconcile observations into a `RuntimeReconcileHint`.
     /// Clears both the boolean flag and the accumulated container IDs. Returns
     /// an empty hint when nothing was deferred.
-    pub fn take_runtime_reconcile_hint(
-        &mut self,
-    ) -> crate::kubelet::pod_runtime::service::RuntimeReconcileHint {
+    pub fn take_runtime_reconcile_hint(&mut self) -> crate::runtime::RuntimeReconcileHint {
         if !self.pending_runtime_reconcile {
-            return crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none();
+            return crate::runtime::RuntimeReconcileHint::none();
         }
         self.pending_runtime_reconcile = false;
         let events = self.runtime_reconcile_observations.drain();
-        let mut hint = crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none();
+        let mut hint = crate::runtime::RuntimeReconcileHint::none();
         for (container_id, kind) in events {
             hint = hint.with_container_event(container_id, kind);
         }

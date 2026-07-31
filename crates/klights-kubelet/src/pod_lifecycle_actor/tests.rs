@@ -2,39 +2,39 @@ use super::message::{LifecycleMessage, PodLifecycleKey};
 use super::state::PodLifecycleState;
 use super::test_harness::{LifecycleEvent, LifecycleOrderCase, PodLifecycleHarness};
 use super::trace::{LifecycleTraceEntry, LifecycleTraceRing};
-use crate::kubelet::pod_lifecycle_core::state::FinalizationAction;
-use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
-use crate::kubelet::pod_lifecycle_router::executor::NoopExecutor;
+use crate::pod_lifecycle_core::state::FinalizationAction;
+use crate::pod_lifecycle_router::LifecycleReplyHandle;
+use crate::pod_lifecycle_router::executor::NoopExecutor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 fn dummy_reply_handle() -> LifecycleReplyHandle {
-    use crate::kubelet::pod_lifecycle_router::multiplex::MultiplexPodLifecycleBackend;
+    use crate::pod_lifecycle_router::multiplex::MultiplexPodLifecycleBackend;
     LifecycleReplyHandle::new(std::sync::Arc::new(MultiplexPodLifecycleBackend))
 }
 
-fn test_executor() -> Arc<dyn crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor> {
+fn test_executor() -> Arc<dyn crate::pod_lifecycle_router::executor::PodWorkExecutor> {
     Arc::new(NoopExecutor)
 }
 
 fn test_executor_holder()
--> Arc<std::sync::Mutex<Arc<dyn crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor>>> {
+-> Arc<std::sync::Mutex<Arc<dyn crate::pod_lifecycle_router::executor::PodWorkExecutor>>> {
     Arc::new(std::sync::Mutex::new(test_executor()))
 }
 
 fn recording_executor_holder() -> (
-    Arc<crate::kubelet::pod_lifecycle_router::executor::RecordingExecutor>,
-    Arc<std::sync::Mutex<Arc<dyn crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor>>>,
+    Arc<crate::pod_lifecycle_router::executor::RecordingExecutor>,
+    Arc<std::sync::Mutex<Arc<dyn crate::pod_lifecycle_router::executor::PodWorkExecutor>>>,
 ) {
-    let recorder = crate::kubelet::pod_lifecycle_router::executor::RecordingExecutor::new();
-    let executor: Arc<dyn crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor> =
+    let recorder = crate::pod_lifecycle_router::executor::RecordingExecutor::new();
+    let executor: Arc<dyn crate::pod_lifecycle_router::executor::PodWorkExecutor> =
         recorder.clone();
     (recorder, Arc::new(std::sync::Mutex::new(executor)))
 }
 
 struct BlockingStartExecutor {
-    actions: std::sync::Mutex<Vec<crate::kubelet::pod_lifecycle_core::action::PodAction>>,
+    actions: std::sync::Mutex<Vec<crate::pod_lifecycle_core::action::PodAction>>,
     start_seen: tokio::sync::Notify,
     start_cancelled: tokio::sync::Notify,
     release_start: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -66,20 +66,20 @@ impl BlockingStartExecutor {
         self.actions.lock().unwrap().iter().any(|action| {
             matches!(
                 action,
-                crate::kubelet::pod_lifecycle_core::action::PodAction::StopPod { .. }
+                crate::pod_lifecycle_core::action::PodAction::StopPod { .. }
             )
         })
     }
 }
 
 #[async_trait::async_trait]
-impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor for BlockingStartExecutor {
+impl crate::pod_lifecycle_router::executor::PodWorkExecutor for BlockingStartExecutor {
     async fn dispatch(
         &self,
-        action: crate::kubelet::pod_lifecycle_core::action::PodAction,
+        action: crate::pod_lifecycle_core::action::PodAction,
         reply_to: LifecycleReplyHandle,
-    ) -> Result<(), crate::kubelet::pod_lifecycle_router::executor::ExecutorError> {
-        if let crate::kubelet::pod_lifecycle_core::action::PodAction::CheckSlotAdmission {
+    ) -> Result<(), crate::pod_lifecycle_router::executor::ExecutorError> {
+        if let crate::pod_lifecycle_core::action::PodAction::CheckSlotAdmission {
             key,
             pod,
             resource_version,
@@ -99,7 +99,7 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor for Blockin
                 .await;
             return Ok(());
         }
-        if let crate::kubelet::pod_lifecycle_core::action::PodAction::ReconcileCriLeftovers {
+        if let crate::pod_lifecycle_core::action::PodAction::ReconcileCriLeftovers {
             key,
             operation_id,
             ..
@@ -120,7 +120,7 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor for Blockin
         }
         let is_start = matches!(
             action,
-            crate::kubelet::pod_lifecycle_core::action::PodAction::StartPod { .. }
+            crate::pod_lifecycle_core::action::PodAction::StartPod { .. }
         );
         self.actions.lock().unwrap().push(action);
         if is_start {
@@ -135,11 +135,11 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor for Blockin
 
     async fn dispatch_with_cancel(
         &self,
-        action: crate::kubelet::pod_lifecycle_core::action::PodAction,
+        action: crate::pod_lifecycle_core::action::PodAction,
         reply_to: LifecycleReplyHandle,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<(), crate::kubelet::pod_lifecycle_router::executor::ExecutorError> {
-        if let crate::kubelet::pod_lifecycle_core::action::PodAction::CheckSlotAdmission {
+    ) -> Result<(), crate::pod_lifecycle_router::executor::ExecutorError> {
+        if let crate::pod_lifecycle_core::action::PodAction::CheckSlotAdmission {
             key,
             pod,
             resource_version,
@@ -159,7 +159,7 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor for Blockin
                 .await;
             return Ok(());
         }
-        if let crate::kubelet::pod_lifecycle_core::action::PodAction::ReconcileCriLeftovers {
+        if let crate::pod_lifecycle_core::action::PodAction::ReconcileCriLeftovers {
             key,
             operation_id,
             ..
@@ -180,7 +180,7 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor for Blockin
         }
         let is_start = matches!(
             action,
-            crate::kubelet::pod_lifecycle_core::action::PodAction::StartPod { .. }
+            crate::pod_lifecycle_core::action::PodAction::StartPod { .. }
         );
         self.actions.lock().unwrap().push(action);
         if is_start {
@@ -202,13 +202,13 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor for Blockin
 struct CompletingExecutor;
 
 #[async_trait::async_trait]
-impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor for CompletingExecutor {
+impl crate::pod_lifecycle_router::executor::PodWorkExecutor for CompletingExecutor {
     async fn dispatch(
         &self,
-        action: crate::kubelet::pod_lifecycle_core::action::PodAction,
+        action: crate::pod_lifecycle_core::action::PodAction,
         reply_to: LifecycleReplyHandle,
-    ) -> Result<(), crate::kubelet::pod_lifecycle_router::executor::ExecutorError> {
-        if let crate::kubelet::pod_lifecycle_core::action::PodAction::CheckSlotAdmission {
+    ) -> Result<(), crate::pod_lifecycle_router::executor::ExecutorError> {
+        if let crate::pod_lifecycle_core::action::PodAction::CheckSlotAdmission {
             key,
             pod,
             resource_version,
@@ -228,10 +228,8 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor for Complet
                 .await;
             return Ok(());
         }
-        if let crate::kubelet::pod_lifecycle_core::action::PodAction::StartPod {
-            key,
-            operation_id,
-            ..
+        if let crate::pod_lifecycle_core::action::PodAction::StartPod {
+            key, operation_id, ..
         } = action
         {
             let _ = reply_to
@@ -270,16 +268,14 @@ impl CompletingStartStopExecutor {
 }
 
 #[async_trait::async_trait]
-impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor
-    for CompletingStartStopExecutor
-{
+impl crate::pod_lifecycle_router::executor::PodWorkExecutor for CompletingStartStopExecutor {
     async fn dispatch(
         &self,
-        action: crate::kubelet::pod_lifecycle_core::action::PodAction,
+        action: crate::pod_lifecycle_core::action::PodAction,
         reply_to: LifecycleReplyHandle,
-    ) -> Result<(), crate::kubelet::pod_lifecycle_router::executor::ExecutorError> {
+    ) -> Result<(), crate::pod_lifecycle_router::executor::ExecutorError> {
         match action {
-            crate::kubelet::pod_lifecycle_core::action::PodAction::CheckSlotAdmission {
+            crate::pod_lifecycle_core::action::PodAction::CheckSlotAdmission {
                 key,
                 pod,
                 resource_version,
@@ -297,7 +293,7 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor
                     })
                     .await;
             }
-            crate::kubelet::pod_lifecycle_core::action::PodAction::ReconcileCriLeftovers {
+            crate::pod_lifecycle_core::action::PodAction::ReconcileCriLeftovers {
                 key,
                 operation_id,
                 ..
@@ -311,10 +307,8 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor
                     })
                     .await;
             }
-            crate::kubelet::pod_lifecycle_core::action::PodAction::StartPod {
-                key,
-                operation_id,
-                ..
+            crate::pod_lifecycle_core::action::PodAction::StartPod {
+                key, operation_id, ..
             } => {
                 self.start_seen.notify_waiters();
                 let _ = reply_to
@@ -326,10 +320,8 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor
                     })
                     .await;
             }
-            crate::kubelet::pod_lifecycle_core::action::PodAction::StopPod {
-                key,
-                operation_id,
-                ..
+            crate::pod_lifecycle_core::action::PodAction::StopPod {
+                key, operation_id, ..
             } => {
                 self.stop_seen.notify_waiters();
                 let _ = reply_to
@@ -341,7 +333,7 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor
                     })
                     .await;
             }
-            crate::kubelet::pod_lifecycle_core::action::PodAction::FinalizePodDeletion {
+            crate::pod_lifecycle_core::action::PodAction::FinalizePodDeletion {
                 key,
                 operation_id,
                 ..
@@ -399,16 +391,14 @@ impl FinalizationPendingExecutor {
 }
 
 #[async_trait::async_trait]
-impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor
-    for FinalizationPendingExecutor
-{
+impl crate::pod_lifecycle_router::executor::PodWorkExecutor for FinalizationPendingExecutor {
     async fn dispatch(
         &self,
-        action: crate::kubelet::pod_lifecycle_core::action::PodAction,
+        action: crate::pod_lifecycle_core::action::PodAction,
         reply_to: LifecycleReplyHandle,
-    ) -> Result<(), crate::kubelet::pod_lifecycle_router::executor::ExecutorError> {
+    ) -> Result<(), crate::pod_lifecycle_router::executor::ExecutorError> {
         match action {
-            crate::kubelet::pod_lifecycle_core::action::PodAction::CheckSlotAdmission {
+            crate::pod_lifecycle_core::action::PodAction::CheckSlotAdmission {
                 key,
                 pod,
                 resource_version,
@@ -426,7 +416,7 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor
                     })
                     .await;
             }
-            crate::kubelet::pod_lifecycle_core::action::PodAction::ReconcileCriLeftovers {
+            crate::pod_lifecycle_core::action::PodAction::ReconcileCriLeftovers {
                 key,
                 operation_id,
                 ..
@@ -440,10 +430,8 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor
                     })
                     .await;
             }
-            crate::kubelet::pod_lifecycle_core::action::PodAction::StartPod {
-                key,
-                operation_id,
-                ..
+            crate::pod_lifecycle_core::action::PodAction::StartPod {
+                key, operation_id, ..
             } => {
                 self.start_seen.notify_waiters();
                 let _ = reply_to
@@ -455,7 +443,7 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor
                     })
                     .await;
             }
-            crate::kubelet::pod_lifecycle_core::action::PodAction::FinalizeStartup {
+            crate::pod_lifecycle_core::action::PodAction::FinalizeStartup {
                 key,
                 operation_id,
                 ..
@@ -469,10 +457,8 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor
                     })
                     .await;
             }
-            crate::kubelet::pod_lifecycle_core::action::PodAction::StopPod {
-                key,
-                operation_id,
-                ..
+            crate::pod_lifecycle_core::action::PodAction::StopPod {
+                key, operation_id, ..
             } => {
                 self.stop_count.fetch_add(1, Ordering::SeqCst);
                 let _ = reply_to
@@ -484,7 +470,7 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor
                     })
                     .await;
             }
-            crate::kubelet::pod_lifecycle_core::action::PodAction::FinalizePodDeletion {
+            crate::pod_lifecycle_core::action::PodAction::FinalizePodDeletion {
                 key,
                 operation_id,
                 ..
@@ -500,7 +486,7 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor
                     })
                     .await;
             }
-            crate::kubelet::pod_lifecycle_core::action::PodAction::ScheduleRetry { .. } => {}
+            crate::pod_lifecycle_core::action::PodAction::ScheduleRetry { .. } => {}
             _ => {}
         }
         Ok(())
@@ -561,16 +547,14 @@ impl FirstAdmissionReconcileExecutor {
 }
 
 #[async_trait::async_trait]
-impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor
-    for FirstAdmissionReconcileExecutor
-{
+impl crate::pod_lifecycle_router::executor::PodWorkExecutor for FirstAdmissionReconcileExecutor {
     async fn dispatch(
         &self,
-        action: crate::kubelet::pod_lifecycle_core::action::PodAction,
+        action: crate::pod_lifecycle_core::action::PodAction,
         reply_to: LifecycleReplyHandle,
-    ) -> Result<(), crate::kubelet::pod_lifecycle_router::executor::ExecutorError> {
+    ) -> Result<(), crate::pod_lifecycle_router::executor::ExecutorError> {
         match action {
-            crate::kubelet::pod_lifecycle_core::action::PodAction::CheckSlotAdmission {
+            crate::pod_lifecycle_core::action::PodAction::CheckSlotAdmission {
                 key,
                 pod,
                 resource_version,
@@ -588,7 +572,7 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor
                     })
                     .await;
             }
-            crate::kubelet::pod_lifecycle_core::action::PodAction::ReconcileCriLeftovers {
+            crate::pod_lifecycle_core::action::PodAction::ReconcileCriLeftovers {
                 key,
                 operation_id,
                 ..
@@ -625,10 +609,8 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor
                         .await;
                 }
             }
-            crate::kubelet::pod_lifecycle_core::action::PodAction::StartPod {
-                key,
-                operation_id,
-                ..
+            crate::pod_lifecycle_core::action::PodAction::StartPod {
+                key, operation_id, ..
             } => {
                 self.actions
                     .lock()
@@ -655,11 +637,11 @@ struct CountingReplyBackend {
 }
 
 #[async_trait::async_trait]
-impl crate::kubelet::pod_lifecycle_router::PodLifecycleRouteBackend for CountingReplyBackend {
+impl crate::pod_lifecycle_router::PodLifecycleRouteBackend for CountingReplyBackend {
     async fn route(
         &self,
         _message: LifecycleMessage,
-    ) -> Result<(), crate::kubelet::pod_lifecycle_router::PodLifecycleRouteError> {
+    ) -> Result<(), crate::pod_lifecycle_router::PodLifecycleRouteError> {
         self.routes.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -668,17 +650,17 @@ impl crate::kubelet::pod_lifecycle_router::PodLifecycleRouteBackend for Counting
         self.routes.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn mode(&self) -> crate::kubelet::pod_lifecycle_router::PodLifecycleRouteMode {
-        crate::kubelet::pod_lifecycle_router::PodLifecycleRouteMode::Actor
+    fn mode(&self) -> crate::pod_lifecycle_router::PodLifecycleRouteMode {
+        crate::pod_lifecycle_router::PodLifecycleRouteMode::Actor
     }
 
     async fn remove_pod_state(&self, _key: &PodLifecycleKey) -> bool {
         false
     }
 
-    async fn diagnostics(&self) -> crate::kubelet::pod_lifecycle_router::PodLifecycleDiagnostics {
-        crate::kubelet::pod_lifecycle_router::PodLifecycleDiagnostics {
-            mode: crate::kubelet::pod_lifecycle_router::PodLifecycleRouteMode::Actor,
+    async fn diagnostics(&self) -> crate::pod_lifecycle_router::PodLifecycleDiagnostics {
+        crate::pod_lifecycle_router::PodLifecycleDiagnostics {
+            mode: crate::pod_lifecycle_router::PodLifecycleRouteMode::Actor,
             actor_states: Vec::new(),
             recent_trace: Vec::new(),
             active_pod_count: 0,
@@ -778,7 +760,7 @@ fn direct_test_actor() -> super::actor::PodLifecycleActor {
 
 #[test]
 fn startable_pod_checks_slot_admission_before_startpod() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     actor.enable_slot_admission_gate_for_test();
@@ -810,7 +792,7 @@ fn startable_pod_checks_slot_admission_before_startpod() {
 
 #[test]
 fn slot_admission_blocked_parks_start_without_startpod() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     actor.enable_slot_admission_gate_for_test();
@@ -845,7 +827,7 @@ fn slot_admission_blocked_parks_start_without_startpod() {
 
 #[test]
 fn slot_admission_wake_rechecks_before_startpod() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     actor.enable_slot_admission_gate_for_test();
@@ -875,7 +857,7 @@ fn slot_admission_wake_rechecks_before_startpod() {
 
 #[test]
 fn blocked_slot_uses_single_waiter_for_repeated_watch_events() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     actor.enable_slot_admission_gate_for_test();
@@ -917,7 +899,7 @@ fn blocked_slot_uses_single_waiter_for_repeated_watch_events() {
 
 #[test]
 fn stale_slot_wake_for_old_uid_ignored() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     actor.enable_slot_admission_gate_for_test();
@@ -954,8 +936,8 @@ fn stale_slot_wake_for_old_uid_ignored() {
 
 #[test]
 fn stale_lifecycle_command_for_old_uid_ignored() {
-    use crate::kubelet::lifecycle::{LifecycleCommand, RestartReason};
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::lifecycle::{LifecycleCommand, RestartReason};
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let current_key = PodLifecycleKey::new("default", "same-name", "uid-new");
@@ -988,8 +970,8 @@ fn stale_lifecycle_command_for_old_uid_ignored() {
 
 #[test]
 fn active_uid_mismatch_workflows_emit_warning_records() {
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::lifecycle::LifecycleCommand;
+    use crate::cri_events::KubeletEventKind;
+    use crate::lifecycle::LifecycleCommand;
 
     fn actor_with_active_uid() -> super::actor::PodLifecycleActor {
         let mut actor = direct_test_actor();
@@ -1073,7 +1055,7 @@ fn active_uid_mismatch_workflows_emit_warning_records() {
 
 #[test]
 fn slot_admission_clear_after_stop_completion_admits_replacement() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     actor.enable_slot_admission_gate_for_test();
@@ -1160,7 +1142,7 @@ fn slot_admission_clear_after_stop_completion_admits_replacement() {
 
 #[test]
 fn slot_admission_not_cleared_after_retryable_stop_failure() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     actor.enable_slot_admission_gate_for_test();
@@ -1223,8 +1205,8 @@ fn slot_admission_not_cleared_after_retryable_stop_failure() {
 
 #[test]
 fn stop_pod_unscheduled_not_owned_failure_does_not_retry() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
-    use crate::kubelet::pod_lifecycle_core::message::PodLifecycleWorkFailure;
+    use crate::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::message::PodLifecycleWorkFailure;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -1288,8 +1270,8 @@ fn stop_pod_unscheduled_not_owned_failure_does_not_retry() {
 
 #[test]
 fn stop_pod_other_node_not_owned_failure_does_not_retry() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
-    use crate::kubelet::pod_lifecycle_core::message::PodLifecycleWorkFailure;
+    use crate::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::message::PodLifecycleWorkFailure;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-b", "uid-b");
@@ -1346,7 +1328,7 @@ fn stop_pod_other_node_not_owned_failure_does_not_retry() {
 
 #[test]
 fn running_pod_observation_seeds_slot_admission_without_startpod() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     actor.enable_slot_admission_gate_for_test();
@@ -1374,7 +1356,7 @@ fn running_pod_observation_seeds_slot_admission_without_startpod() {
 #[tokio::test]
 async fn actor_records_messages_in_receive_order() {
     use super::actor::PodLifecycleActor;
-    use crate::kubelet::cri_events::KubeletEventKind;
+    use crate::cri_events::KubeletEventKind;
 
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
     let (tx, rx) = tokio::sync::mpsc::channel(256);
@@ -1418,8 +1400,11 @@ async fn actor_processes_watch_deleted_while_start_pod_is_in_flight() {
 
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
     let (executor, release_start) = BlockingStartExecutor::new();
-    let executor_holder = Arc::new(std::sync::Mutex::new(executor.clone()
-        as Arc<dyn crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor>));
+    let executor_holder =
+        Arc::new(std::sync::Mutex::new(executor.clone()
+            as Arc<
+                dyn crate::pod_lifecycle_router::executor::PodWorkExecutor,
+            >));
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     let (seen_tx, _seen_rx) = tokio::sync::mpsc::channel(8);
     let actor = PodLifecycleActor::new_with_event_sink_for_test(
@@ -1469,7 +1454,7 @@ async fn completion_does_not_route_through_router() {
     let reply_handle = LifecycleReplyHandle::new(Arc::new(CountingReplyBackend {
         routes: public_routes.clone(),
     }));
-    let executor: Arc<dyn crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor> =
+    let executor: Arc<dyn crate::pod_lifecycle_router::executor::PodWorkExecutor> =
         Arc::new(CompletingExecutor);
     let executor_holder = Arc::new(std::sync::Mutex::new(executor));
     let (tx, rx) = tokio::sync::mpsc::channel(256);
@@ -1500,8 +1485,11 @@ async fn stop_pod_cancels_in_flight_start_pod() {
 
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
     let (executor, _release_start) = BlockingStartExecutor::new();
-    let executor_holder = Arc::new(std::sync::Mutex::new(executor.clone()
-        as Arc<dyn crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor>));
+    let executor_holder =
+        Arc::new(std::sync::Mutex::new(executor.clone()
+            as Arc<
+                dyn crate::pod_lifecycle_router::executor::PodWorkExecutor,
+            >));
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     let (seen_tx, _seen_rx) = tokio::sync::mpsc::channel(8);
     let actor = PodLifecycleActor::new_with_event_sink_for_test(
@@ -1539,7 +1527,7 @@ async fn stop_pod_cancels_in_flight_start_pod() {
 
 #[test]
 fn stale_completion_with_wrong_operation_id_ignored() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -1565,7 +1553,7 @@ fn stale_completion_with_wrong_operation_id_ignored() {
 
 #[test]
 fn stale_completion_with_wrong_uid_ignored() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key_a = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -1596,7 +1584,7 @@ fn stale_completion_with_wrong_uid_ignored() {
 
 #[test]
 fn stale_stop_completion_with_wrong_uid_ignored_at_actor_level() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key_a = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -1646,7 +1634,7 @@ fn stale_stop_completion_with_wrong_uid_ignored_at_actor_level() {
 
 #[test]
 fn matching_reconcile_runtime_completion_clears_in_flight() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -1680,8 +1668,8 @@ fn matching_reconcile_runtime_completion_clears_in_flight() {
 
 #[test]
 fn cri_event_during_runtime_reconcile_dispatches_followup_after_completion() {
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::cri_events::KubeletEventKind;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -1764,9 +1752,9 @@ fn cri_event_during_runtime_reconcile_dispatches_followup_after_completion() {
 
 #[test]
 fn cri_event_during_startup_finalization_preserves_container_id_hint() {
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
-    use crate::kubelet::pod_runtime::service::RuntimeReconcileHint;
+    use crate::cri_events::KubeletEventKind;
+    use crate::pod_lifecycle_core::action::PodAction;
+    use crate::runtime::RuntimeReconcileHint;
 
     // A fast-exit pod (ConfigMap-volume / ReplicaSet-adoption) can stop while
     // startup finalization is still in flight. The actor defers the CRI stop
@@ -1847,8 +1835,8 @@ fn cri_event_during_startup_finalization_preserves_container_id_hint() {
 
 #[test]
 fn runtime_reconcile_after_unconfirmed_startup_finalization_retries_finalization() {
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::cri_events::KubeletEventKind;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -1921,8 +1909,8 @@ fn runtime_reconcile_after_unconfirmed_startup_finalization_retries_finalization
 
 #[test]
 fn running_watch_after_runtime_reconcile_retry_preserves_finalization_in_flight() {
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::cri_events::KubeletEventKind;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -2017,8 +2005,8 @@ fn running_watch_after_runtime_reconcile_retry_preserves_finalization_in_flight(
 
 #[test]
 fn running_watch_during_unconfirmed_finalization_retry_runs_after_completion() {
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::cri_events::KubeletEventKind;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -2123,8 +2111,8 @@ fn running_watch_during_unconfirmed_finalization_retry_runs_after_completion() {
 
 #[test]
 fn successful_finalization_retry_clears_running_watch_pending_retry() {
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::cri_events::KubeletEventKind;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -2216,8 +2204,8 @@ fn successful_finalization_retry_clears_running_watch_pending_retry() {
 
 #[test]
 fn equal_rv_running_watch_after_runtime_reconcile_retry_preserves_finalization_in_flight() {
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::cri_events::KubeletEventKind;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -2309,8 +2297,8 @@ fn equal_rv_running_watch_after_runtime_reconcile_retry_preserves_finalization_i
 
 #[test]
 fn running_watch_echo_during_runtime_reconcile_preserves_deferred_followup() {
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::cri_events::KubeletEventKind;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -2417,8 +2405,8 @@ fn running_watch_echo_during_runtime_reconcile_preserves_deferred_followup() {
 
 #[test]
 fn pending_running_status_with_pod_ip_during_runtime_reconcile_dispatches_followup() {
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::cri_events::KubeletEventKind;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -2522,8 +2510,8 @@ fn pending_running_status_with_pod_ip_during_runtime_reconcile_dispatches_follow
 
 #[test]
 fn start_failure_with_deferred_cri_event_reconciles_runtime_then_retries_if_still_pending() {
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::cri_events::KubeletEventKind;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -2579,8 +2567,8 @@ fn start_failure_with_deferred_cri_event_reconciles_runtime_then_retries_if_stil
 
 #[test]
 fn start_completion_without_sandbox_but_deferred_cri_event_reconciles_runtime() {
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::cri_events::KubeletEventKind;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("kube-system", "coredns", "uid-coredns");
@@ -2629,8 +2617,8 @@ fn start_completion_without_sandbox_but_deferred_cri_event_reconciles_runtime() 
 #[test]
 fn retryable_start_pod_failure_produces_schedule_start_pod_retry_with_error_message() {
     use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
-    use crate::kubelet::pod_creation_state::retry_backoff;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
+    use crate::runtime::retry_backoff;
 
     let mut actor = direct_test_actor();
     actor.enable_slot_admission_gate_for_test();
@@ -2681,8 +2669,8 @@ fn retryable_start_pod_failure_produces_schedule_start_pod_retry_with_error_mess
 #[test]
 fn retryable_start_pod_failures_use_exponential_backoff() {
     use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
-    use crate::kubelet::pod_creation_state::retry_backoff;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
+    use crate::runtime::retry_backoff;
 
     let mut actor = direct_test_actor();
     actor.enable_slot_admission_gate_for_test();
@@ -2737,7 +2725,7 @@ fn retryable_start_pod_failures_use_exponential_backoff() {
 
 #[test]
 fn matching_stop_pod_failure_clears_in_flight_and_schedules_retry() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -2779,7 +2767,7 @@ fn matching_stop_pod_failure_clears_in_flight_and_schedules_retry() {
 #[test]
 fn stop_pod_container_not_found_failure_moves_to_finalize() {
     use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -2826,7 +2814,7 @@ fn stop_pod_container_not_found_failure_moves_to_finalize() {
 #[test]
 fn retry_due_after_stop_pod_failure_retries_stop_with_snapshot() {
     use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -2879,7 +2867,7 @@ fn retry_due_after_stop_pod_failure_retries_stop_with_snapshot() {
 #[test]
 fn same_rv_terminating_watch_after_stop_failure_retries_stop() {
     use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -2926,7 +2914,7 @@ fn same_rv_terminating_watch_after_stop_failure_retries_stop() {
 #[test]
 fn terminating_watch_with_stale_rv_after_status_echo_inflation_still_stops() {
     use super::message::PodLifecycleWorkKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     // Regression for the multinode worker-pod GC stall: under WAN latency +
     // leader load, worker status echoes carry a *synthetic* resourceVersion
@@ -2984,7 +2972,7 @@ fn terminating_watch_with_stale_rv_after_status_echo_inflation_still_stops() {
 
 #[test]
 fn terminating_watch_added_from_reconnect_snapshot_stops_instead_of_starting() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     // WorkerStoreAdapter republishes the initial list snapshot as ADDED on
     // watch reconnect. If the leader stamped deletionTimestamp while the
@@ -3011,7 +2999,7 @@ fn terminating_watch_added_from_reconnect_snapshot_stops_instead_of_starting() {
 #[test]
 fn node_lost_terminal_watch_dispatches_stop_without_deletion_timestamp() {
     use super::message::PodLifecycleWorkKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -3104,7 +3092,7 @@ async fn spawn_failure_synthesizes_pod_work_failed() {
 #[test]
 fn watch_added_uid_b_during_stopping_uid_a_stores_pending_no_dispatch() {
     use super::message::PodLifecycleWorkKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key_a = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -3143,7 +3131,7 @@ fn watch_added_uid_b_during_stopping_uid_a_stores_pending_no_dispatch() {
 #[test]
 fn watch_added_uid_b_during_stopping_does_not_cancel_stop_pod() {
     use super::message::PodLifecycleWorkKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key_a = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -3176,7 +3164,7 @@ fn watch_added_uid_b_during_stopping_does_not_cancel_stop_pod() {
 
 #[test]
 fn watch_modified_uid_b_during_stopping_updates_pending_snapshot() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key_a = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -3225,7 +3213,7 @@ fn watch_modified_uid_b_during_stopping_updates_pending_snapshot() {
 #[test]
 fn watch_deleted_uid_b_during_stopping_drops_pending_no_interrupt() {
     use super::message::PodLifecycleWorkKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key_a = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -3266,7 +3254,7 @@ fn watch_deleted_uid_b_during_stopping_drops_pending_no_interrupt() {
 #[test]
 fn stop_pod_completion_finalizes_delete_before_admitting_pending_replacement() {
     use super::message::PodLifecycleWorkKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key_a = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -3334,7 +3322,7 @@ fn stop_pod_completion_finalizes_delete_before_admitting_pending_replacement() {
 #[test]
 fn late_finalizer_removal_reissues_semantic_delete_and_stale_retry_cannot_readmit_uid() {
     use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -3390,10 +3378,10 @@ fn late_finalizer_removal_reissues_semantic_delete_and_stale_retry_cannot_readmi
 
 #[test]
 fn stale_old_uid_messages_do_not_mutate_active_replacement() {
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::lifecycle::LifecycleCommand;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
-    use crate::kubelet::pod_lifecycle_router::OrphanReason;
+    use crate::cri_events::KubeletEventKind;
+    use crate::lifecycle::LifecycleCommand;
+    use crate::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_router::OrphanReason;
 
     let mut actor = direct_test_actor();
     // Admit a replacement UID as the active pod.
@@ -3474,8 +3462,8 @@ fn stale_old_uid_messages_do_not_mutate_active_replacement() {
 #[test]
 fn stale_orphan_finalize_for_old_uid_does_not_steal_active_replacement() {
     use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
-    use crate::kubelet::pod_lifecycle_router::OrphanReason;
+    use crate::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_router::OrphanReason;
 
     let mut actor = direct_test_actor();
     actor.enable_slot_admission_gate_for_test();
@@ -3558,7 +3546,7 @@ fn stale_orphan_finalize_for_old_uid_does_not_steal_active_replacement() {
 #[test]
 fn stop_pod_failure_keeps_pending_replacement_parked() {
     use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key_a = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -3599,7 +3587,7 @@ fn stop_pod_failure_keeps_pending_replacement_parked() {
 #[test]
 fn start_pod_nonretryable_failure_allows_scheduled_snapshot_to_retry() {
     use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -3661,7 +3649,7 @@ fn start_pod_nonretryable_failure_allows_scheduled_snapshot_to_retry() {
 #[test]
 fn pending_start_config_error_retries_when_pod_fingerprint_changes() {
     use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -3789,7 +3777,7 @@ fn pending_start_config_error_retries_when_pod_fingerprint_changes() {
 #[tokio::test]
 async fn watch_deleted_active_uid_with_stop_in_flight_is_noop() {
     use super::actor::PodLifecycleActor;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
     let pod = test_pod("default", "pod-a", "uid-a");
@@ -3839,7 +3827,7 @@ async fn watch_deleted_active_uid_with_stop_in_flight_is_noop() {
 #[tokio::test]
 async fn stale_watch_deleted_for_old_uid_after_admission_ignored() {
     use super::actor::PodLifecycleActor;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let key_a = PodLifecycleKey::new("default", "pod-a", "uid-a");
     let key_b = PodLifecycleKey::new("default", "pod-a", "uid-b");
@@ -3895,8 +3883,8 @@ async fn stale_watch_deleted_for_old_uid_after_admission_ignored() {
 #[tokio::test]
 async fn stale_cri_event_for_old_uid_after_admission_ignored() {
     use super::actor::PodLifecycleActor;
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::cri_events::KubeletEventKind;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let key_a = PodLifecycleKey::new("default", "pod-a", "uid-a");
     let key_b = PodLifecycleKey::new("default", "pod-a", "uid-b");
@@ -3951,7 +3939,7 @@ async fn stale_cri_event_for_old_uid_after_admission_ignored() {
 #[tokio::test]
 async fn operation_id_monotonic_per_slot() {
     use super::actor::PodLifecycleActor;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let (recorder, executor_holder) = recording_executor_holder();
     let (tx, rx) = tokio::sync::mpsc::channel(256);
@@ -3994,7 +3982,7 @@ async fn operation_id_monotonic_per_slot() {
 #[tokio::test]
 async fn watch_deleted_dispatches_stop_with_deleted_pod_snapshot() {
     use super::actor::PodLifecycleActor;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let key = PodLifecycleKey::new("hostport-3612", "pod1", "old-uid");
     let deleted = serde_json::json!({
@@ -4050,7 +4038,7 @@ async fn watch_deleted_dispatches_stop_with_deleted_pod_snapshot() {
 async fn skipped_start_completion_allows_scheduled_watch_modified_to_start() {
     use super::actor::PodLifecycleActor;
     use super::message::PodLifecycleWorkKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let key = PodLifecycleKey::new("default", "late-bound", "uid-late-bound");
     let (recorder, executor_holder) = recording_executor_holder();
@@ -4107,7 +4095,7 @@ async fn skipped_start_completion_allows_scheduled_watch_modified_to_start() {
 async fn queued_scheduled_watch_modified_runs_after_skipped_start_completion() {
     use super::actor::PodLifecycleActor;
     use super::message::PodLifecycleWorkKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let key = PodLifecycleKey::new("default", "queued-bind", "uid-queued-bind");
     let (recorder, executor_holder) = recording_executor_holder();
@@ -4164,7 +4152,7 @@ async fn queued_scheduled_watch_modified_runs_after_skipped_start_completion() {
 async fn watch_modified_with_ephemeral_container_dispatches_reconcile_after_start() {
     use super::actor::PodLifecycleActor;
     use super::message::PodLifecycleWorkKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
     let (recorder, executor_holder) = recording_executor_holder();
@@ -4245,7 +4233,7 @@ async fn watch_modified_with_ephemeral_container_dispatches_reconcile_after_star
 
 #[test]
 fn ephemeral_update_during_startup_finalization_reconciles_after_finalization() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -4333,7 +4321,7 @@ fn ephemeral_update_during_startup_finalization_reconciles_after_finalization() 
 #[tokio::test]
 async fn watch_modified_running_echo_does_not_start_pod_again_before_completion() {
     use super::actor::PodLifecycleActor;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
     let (recorder, executor_holder) = recording_executor_holder();
@@ -4387,8 +4375,8 @@ async fn watch_modified_running_echo_does_not_start_pod_again_before_completion(
 async fn cri_event_does_not_dispatch_runtime_reconcile_before_start_completion() {
     use super::actor::PodLifecycleActor;
     use super::message::PodLifecycleWorkKind;
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::cri_events::KubeletEventKind;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
     let (recorder, executor_holder) = recording_executor_holder();
@@ -4443,8 +4431,8 @@ async fn cri_event_does_not_dispatch_runtime_reconcile_before_start_completion()
 async fn cri_event_during_start_dispatches_runtime_reconcile_after_startup_finalization() {
     use super::actor::PodLifecycleActor;
     use super::message::PodLifecycleWorkKind;
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::cri_events::KubeletEventKind;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
     let (recorder, executor_holder) = recording_executor_holder();
@@ -4514,7 +4502,7 @@ async fn cri_event_during_start_dispatches_runtime_reconcile_after_startup_final
 
 #[test]
 fn successful_start_dispatches_runtime_reconcile_without_cri_event() {
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -4566,8 +4554,8 @@ fn successful_start_dispatches_runtime_reconcile_without_cri_event() {
 
 #[test]
 fn cri_event_during_startup_finalization_preserves_finalizer_in_flight() {
-    use crate::kubelet::cri_events::KubeletEventKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::cri_events::KubeletEventKind;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let mut actor = direct_test_actor();
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -4644,7 +4632,7 @@ fn cri_event_during_startup_finalization_preserves_finalizer_in_flight() {
 #[tokio::test]
 async fn running_watch_echo_with_sandbox_dispatches_startup_finalization() {
     use super::actor::PodLifecycleActor;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
     let (recorder, executor_holder) = recording_executor_holder();
@@ -4699,7 +4687,7 @@ async fn running_watch_echo_with_sandbox_dispatches_startup_finalization() {
 async fn watch_modified_pending_config_error_retries_start_after_update() {
     use super::actor::PodLifecycleActor;
     use super::message::PodLifecycleWorkKind;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::pod_lifecycle_core::action::PodAction;
 
     let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
     let (recorder, executor_holder) = recording_executor_holder();
@@ -4870,7 +4858,7 @@ fn test_actor_registry() -> PodLifecycleRegistry {
 }
 
 fn test_actor_registry_with_executor_and_idle_grace(
-    executor: Arc<dyn crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor>,
+    executor: Arc<dyn crate::pod_lifecycle_router::executor::PodWorkExecutor>,
     idle_grace: Duration,
 ) -> PodLifecycleRegistry {
     let registry = PodLifecycleRegistry::new_with_idle_grace_for_test(

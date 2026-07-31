@@ -775,13 +775,15 @@ fn compose_pod_deletion_finalizer(
     let runtime_deletion_finalizer =
         crate::kubelet::pod_runtime::deletion_finalizer::compose_real_pod_deletion_finalizer(
             crate::kubelet::pod_runtime::deletion_finalizer::RealPodDeletionFinalizerDependencies {
-                store: dependencies.store,
+                pod_query: dependencies.store,
                 gc_pod_delete_sink: dependencies.gc_pod_delete_sink,
                 gc_reconcile: dependencies.gc_reconcile,
                 pdb_reconcile: dependencies.pdb_reconcile,
                 namespace_termination: dependencies.namespace_termination,
                 cluster_api: dependencies.cluster_api,
-                outbox: dependencies.outbox,
+                outbox: dependencies
+                    .outbox
+                    .map(|outbox| outbox as Arc<dyn klights_leader_api::NodeOutbox>),
                 bound_pod_finalization: dependencies.bound_pod_finalization,
                 mutation_reconcile: dependencies.mutation_reconcile,
                 metrics: dependencies.metrics,

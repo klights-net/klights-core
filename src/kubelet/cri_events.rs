@@ -15,6 +15,7 @@
 
 use bytes::Buf;
 use k8s_cri::v1::{ContainerEventType, GetEventsRequest};
+pub use klights_kubelet::cri_events::KubeletEventKind;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::{Code, Status};
 
@@ -302,33 +303,12 @@ fn encode_string_field(out: &mut Vec<u8>, field: u64, value: &str) {
     encode_bytes_field(out, field, value.as_bytes());
 }
 
-/// Kind of container-lifecycle transition we react to.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum KubeletEventKind {
-    Created,
-    Started,
-    Stopped,
-    Deleted,
-}
-
-impl KubeletEventKind {
-    fn from_raw(raw: i32) -> Option<Self> {
-        match ContainerEventType::try_from(raw).ok()? {
-            ContainerEventType::ContainerCreatedEvent => Some(Self::Created),
-            ContainerEventType::ContainerStartedEvent => Some(Self::Started),
-            ContainerEventType::ContainerStoppedEvent => Some(Self::Stopped),
-            ContainerEventType::ContainerDeletedEvent => Some(Self::Deleted),
-        }
-    }
-
-    /// Short label for tracing.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Created => "created",
-            Self::Started => "started",
-            Self::Stopped => "stopped",
-            Self::Deleted => "deleted",
-        }
+fn kubelet_event_kind_from_raw(raw: i32) -> Option<KubeletEventKind> {
+    match ContainerEventType::try_from(raw).ok()? {
+        ContainerEventType::ContainerCreatedEvent => Some(KubeletEventKind::Created),
+        ContainerEventType::ContainerStartedEvent => Some(KubeletEventKind::Started),
+        ContainerEventType::ContainerStoppedEvent => Some(KubeletEventKind::Stopped),
+        ContainerEventType::ContainerDeletedEvent => Some(KubeletEventKind::Deleted),
     }
 }
 
@@ -363,7 +343,7 @@ impl KubeletEvent {
     /// Returns `None` for event types we don't react to (so the
     /// caller can drop them silently without per-event branching).
     pub fn from_cri(raw: CriContainerEventResponse) -> Option<Self> {
-        let kind = KubeletEventKind::from_raw(raw.container_event_type)?;
+        let kind = kubelet_event_kind_from_raw(raw.container_event_type)?;
         let (pod_namespace, pod_name, pod_uid) = match raw.pod_metadata() {
             Some(meta) => (
                 non_empty(meta.namespace),

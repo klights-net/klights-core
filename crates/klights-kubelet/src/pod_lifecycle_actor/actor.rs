@@ -5,15 +5,15 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::kubelet::outbox::Outbox;
-use crate::kubelet::pod_lifecycle_core::action::PodAction;
-use crate::kubelet::pod_lifecycle_core::message::{
+use crate::pod_lifecycle_core::action::PodAction;
+use crate::pod_lifecycle_core::message::{
     LifecycleMessage, PodLifecycleKey, PodLifecycleWorkFailure, PodLifecycleWorkKind, PodSlotKey,
 };
-use crate::kubelet::pod_lifecycle_core::state::{FinalizationAction, PodPhase};
-use crate::kubelet::pod_lifecycle_core::trace::{LifecycleTraceEntry, LifecycleTraceRing};
-use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
-use crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor;
+use crate::pod_lifecycle_core::state::{FinalizationAction, PodPhase};
+use crate::pod_lifecycle_core::trace::{LifecycleTraceEntry, LifecycleTraceRing};
+use crate::pod_lifecycle_router::LifecycleReplyHandle;
+use crate::pod_lifecycle_router::executor::PodWorkExecutor;
+use klights_leader_api::NodeOutbox;
 #[cfg(test)]
 use klights_supervisor::TaskCategoryConfig;
 use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
@@ -46,7 +46,7 @@ fn task_category_for_action(action: &PodAction) -> TaskCategory {
 #[cfg(test)]
 mod task_category_tests {
     use super::*;
-    use crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey;
+    use crate::pod_lifecycle_core::message::PodLifecycleKey;
 
     fn test_key() -> PodLifecycleKey {
         PodLifecycleKey::new("default", "test-pod", "uid-1")
@@ -92,8 +92,8 @@ pub struct PodLifecycleActorRuntime {
     pub shutdown_token: CancellationToken,
     pub instance: ActorInstanceToken,
     pub idle_grace: Duration,
-    pub runtime_observation_store: Option<Arc<Outbox>>,
-    pub wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    pub runtime_observation_store: Option<Arc<dyn NodeOutbox>>,
+    pub wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
 fn pod_has_ephemeral_containers(pod: &serde_json::Value) -> bool {
@@ -210,8 +210,8 @@ pub struct PodLifecycleActor {
     idle_generation: u64,
     idle_timer_armed_generation: Option<u64>,
     last_key: Option<PodLifecycleKey>,
-    runtime_observation_store: Option<Arc<Outbox>>,
-    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    runtime_observation_store: Option<Arc<dyn NodeOutbox>>,
+    wall_clock: Arc<dyn klights_supervisor::WallClock>,
     runtime_observation_checkpoint_loaded_for: Option<String>,
     #[cfg(test)]
     event_sink: Option<mpsc::Sender<&'static str>>,
@@ -249,7 +249,7 @@ impl PodLifecycleActor {
             idle_timer_armed_generation: None,
             last_key: None,
             runtime_observation_store: None,
-            wall_clock: Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            wall_clock: Arc::new(klights_supervisor::SystemWallClock),
             runtime_observation_checkpoint_loaded_for: None,
             event_sink: Some(event_sink),
             uid_mismatch_warnings: Vec::new(),
@@ -589,7 +589,12 @@ impl PodLifecycleActor {
                 &key.uid,
                 ids,
                 generation.max(1),
-                self.wall_clock.now_ms(),
+                self.wall_clock
+                    .now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(i64::MAX as u128) as i64,
             )
             .await
         {
@@ -762,12 +767,11 @@ impl PodLifecycleActor {
         pod: Option<serde_json::Value>,
         sandbox_id: String,
     ) -> PodAction {
-        self.state.pending_stop_pod =
-            Some(crate::kubelet::pod_lifecycle_core::state::PendingStopPod {
-                key: key.clone(),
-                pod: pod.clone(),
-                sandbox_id: sandbox_id.clone(),
-            });
+        self.state.pending_stop_pod = Some(crate::pod_lifecycle_core::state::PendingStopPod {
+            key: key.clone(),
+            pod: pod.clone(),
+            sandbox_id: sandbox_id.clone(),
+        });
         let operation_id = self.next_work_operation(&key, PodLifecycleWorkKind::StopPod);
         PodAction::StopPod {
             key,
@@ -819,7 +823,7 @@ impl PodLifecycleActor {
     fn reconcile_runtime_action(
         &mut self,
         key: PodLifecycleKey,
-        hint: crate::kubelet::pod_runtime::service::RuntimeReconcileHint,
+        hint: crate::runtime::RuntimeReconcileHint,
     ) -> PodAction {
         let operation_id = self.next_work_operation(&key, PodLifecycleWorkKind::ReconcileRuntime);
         tracing::info!(
@@ -840,7 +844,7 @@ impl PodLifecycleActor {
         &mut self,
         key: PodLifecycleKey,
         container_id: Option<&str>,
-        event_kind: Option<crate::kubelet::cri_events::KubeletEventKind>,
+        event_kind: Option<crate::cri_events::KubeletEventKind>,
     ) -> PodAction {
         let in_flight = self.state.in_flight_kind_for_uid(&key.uid);
         let defer = in_flight.is_some()
@@ -864,12 +868,12 @@ impl PodLifecycleActor {
         } else {
             let hint = match (container_id, event_kind) {
                 (Some(container_id), Some(event_kind)) => {
-                    crate::kubelet::pod_runtime::service::RuntimeReconcileHint::from_container_event(
+                    crate::runtime::RuntimeReconcileHint::from_container_event(
                         container_id,
                         event_kind,
                     )
                 }
-                _ => crate::kubelet::pod_runtime::service::RuntimeReconcileHint::from_container_id(
+                _ => crate::runtime::RuntimeReconcileHint::from_container_id(
                     container_id.unwrap_or(""),
                 ),
             };
@@ -989,7 +993,7 @@ impl PodLifecycleActor {
     fn handle_command_action(
         &mut self,
         key: PodLifecycleKey,
-        command: crate::kubelet::lifecycle::LifecycleCommand,
+        command: crate::lifecycle::LifecycleCommand,
     ) -> PodAction {
         let operation_id = self.next_work_operation(&key, PodLifecycleWorkKind::HandleCommand);
         PodAction::HandleCommand {
@@ -1799,7 +1803,7 @@ impl PodLifecycleActor {
                     // there is no local CRI/CNI/volume state to clean. This is
                     // terminal on the local actor — retrying can never succeed
                     // and would spin the actor forever. The Pod row is owned by
-                    // `PodStore::delete_unscheduled_with_uid` (unscheduled) or
+                    // the leader-only unscheduled-Pod CAS or
                     // the owning node's lifecycle actor. Cancel the in-flight
                     // stop and drop the pending snapshot without finalizing a
                     // hard delete on a row this node does not own.

@@ -9,9 +9,9 @@ use super::LifecycleReplyHandle;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-use crate::kubelet::pod_lifecycle_core::action::PodAction;
-use crate::kubelet::pod_lifecycle_core::message::LifecycleMessage;
-use crate::kubelet::pod_runtime::service::PodRuntimeService;
+use crate::pod_lifecycle_core::action::PodAction;
+use crate::pod_lifecycle_core::message::LifecycleMessage;
+use crate::runtime::PodRuntimeService;
 
 /// Error type for actor-mode executor dispatch.
 pub type ExecutorError = anyhow::Error;
@@ -56,12 +56,11 @@ impl PodWorkExecutor for NoopExecutor {
 }
 
 /// Test-only executor that records dispatched actions.
-#[cfg(test)]
+#[doc(hidden)]
 pub struct RecordingExecutor {
     pub actions: std::sync::Mutex<Vec<PodAction>>,
 }
 
-#[cfg(test)]
 impl RecordingExecutor {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -78,7 +77,6 @@ impl RecordingExecutor {
     }
 }
 
-#[cfg(test)]
 #[async_trait::async_trait]
 impl PodWorkExecutor for RecordingExecutor {
     async fn dispatch(
@@ -209,10 +207,8 @@ async fn dispatch_via_runtime(
     reply_to: LifecycleReplyHandle,
     cancel: CancellationToken,
 ) -> Result<(), ExecutorError> {
-    use crate::kubelet::pod_lifecycle_core::message::{
-        PodLifecycleWorkFailure, PodLifecycleWorkKind,
-    };
-    use crate::kubelet::pod_runtime::service::{
+    use crate::pod_lifecycle_core::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
+    use crate::runtime::{
         PodDeletionFinalizeResult, PodFinalizeStartupResult, PodRuntimeKey,
         PodSlotAdmissionRequest, PodStartResult,
     };
@@ -340,31 +336,30 @@ async fn dispatch_via_runtime(
                         .await;
                 }
                 Err(e) => {
-                    let (retryable, failure) = if let Some(own) =
-                        e.downcast_ref::<crate::kubelet::pod_runtime::service::PodOwnershipError>()
-                    {
-                        // HR#11 / P0 StopPod loop: a Pod the local node
-                        // does not own (unscheduled or assigned to another
-                        // node) can never be cleaned up locally. Mark it
-                        // terminal so the actor no-ops instead of retrying
-                        // forever at 1 Hz.
-                        (
-                            false,
-                            PodLifecycleWorkFailure::NotOwned {
-                                local_node: own.local_node.clone(),
-                                target_node: own.target_node.clone(),
-                            },
-                        )
-                    } else if is_container_not_found_runtime_error(&e) {
-                        (false, PodLifecycleWorkFailure::ContainerNotFound)
-                    } else if e.to_string().to_ascii_lowercase().contains("timed out") {
-                        (true, PodLifecycleWorkFailure::DeadlineExceeded)
-                    } else {
-                        (
-                            true,
-                            PodLifecycleWorkFailure::DispatchFailed(format!("{e:#}")),
-                        )
-                    };
+                    let (retryable, failure) =
+                        if let Some(own) = e.downcast_ref::<crate::runtime::PodOwnershipError>() {
+                            // HR#11 / P0 StopPod loop: a Pod the local node
+                            // does not own (unscheduled or assigned to another
+                            // node) can never be cleaned up locally. Mark it
+                            // terminal so the actor no-ops instead of retrying
+                            // forever at 1 Hz.
+                            (
+                                false,
+                                PodLifecycleWorkFailure::NotOwned {
+                                    local_node: own.local_node.clone(),
+                                    target_node: own.target_node.clone(),
+                                },
+                            )
+                        } else if is_container_not_found_runtime_error(&e) {
+                            (false, PodLifecycleWorkFailure::ContainerNotFound)
+                        } else if e.to_string().to_ascii_lowercase().contains("timed out") {
+                            (true, PodLifecycleWorkFailure::DeadlineExceeded)
+                        } else {
+                            (
+                                true,
+                                PodLifecycleWorkFailure::DispatchFailed(format!("{e:#}")),
+                            )
+                        };
                     let _ = reply_to
                         .route(LifecycleMessage::PodWorkFailed {
                             key,
@@ -587,7 +582,7 @@ async fn dispatch_via_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey;
+    use crate::pod_lifecycle_core::message::PodLifecycleKey;
 
     /// Task 15.1: executor stores individual component fields directly
     /// without depending on the bundled context type.
@@ -604,7 +599,7 @@ mod tests {
     async fn pod_lifecycle_executor_constructor_accepts_runtime_service_object() {
         use std::sync::Arc;
 
-        use crate::kubelet::pod_runtime::test_support::MockPodRuntimeService;
+        use crate::test_support::MockPodRuntimeService;
 
         let mock_runtime: Arc<dyn PodRuntimeService> = Arc::new(MockPodRuntimeService::new());
 
@@ -615,8 +610,8 @@ mod tests {
 
     #[test]
     fn expected_completion_covers_every_runtime_routed_action_kind() {
-        use crate::kubelet::lifecycle::LifecycleCommand;
-        use crate::kubelet::pod_lifecycle_core::message::PodLifecycleWorkKind;
+        use crate::lifecycle::LifecycleCommand;
+        use crate::pod_lifecycle_core::message::PodLifecycleWorkKind;
 
         let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
         let actions = vec![
@@ -652,7 +647,7 @@ mod tests {
             (
                 PodAction::ReconcileRuntime {
                     key: key.clone(),
-                    hint: crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
+                    hint: crate::runtime::RuntimeReconcileHint::none(),
                     operation_id: 4,
                     permit: None,
                 },
@@ -701,7 +696,7 @@ mod tests {
 
     // ── Task 7.3: dispatch_via_runtime tests ──
 
-    use crate::kubelet::pod_runtime::test_support::MockPodRuntimeService;
+    use crate::test_support::MockPodRuntimeService;
 
     fn dummy_reply_handle() -> LifecycleReplyHandle {
         let (tx, _rx) = tokio::sync::mpsc::channel::<LifecycleMessage>(64);
@@ -740,7 +735,7 @@ mod tests {
         let calls = mock.recorded_calls();
         assert_eq!(calls.len(), 1, "exactly one runtime call");
         match &calls[0] {
-            crate::kubelet::pod_runtime::test_support::MockRuntimeCall::StartPod {
+            crate::test_support::MockRuntimeCall::StartPod {
                 namespace,
                 name,
                 uid,
@@ -816,7 +811,7 @@ mod tests {
         assert_eq!(calls.len(), 3, "three runtime calls");
         assert!(matches!(
             &calls[0],
-            crate::kubelet::pod_runtime::test_support::MockRuntimeCall::StopPod {
+            crate::test_support::MockRuntimeCall::StopPod {
                 namespace,
                 name,
                 uid,
@@ -825,7 +820,7 @@ mod tests {
         ));
         assert!(matches!(
             &calls[1],
-            crate::kubelet::pod_runtime::test_support::MockRuntimeCall::FinalizeStartup {
+            crate::test_support::MockRuntimeCall::FinalizeStartup {
                 namespace,
                 name,
                 uid,
@@ -834,7 +829,7 @@ mod tests {
         ));
         assert!(matches!(
             &calls[2],
-            crate::kubelet::pod_runtime::test_support::MockRuntimeCall::FinalizeDeletion {
+            crate::test_support::MockRuntimeCall::FinalizeDeletion {
                 namespace,
                 name,
                 uid,
@@ -845,9 +840,7 @@ mod tests {
     #[tokio::test]
     async fn queued_actor_delete_waits_for_watch_without_scheduling_retry() {
         let mock = std::sync::Arc::new(MockPodRuntimeService::new());
-        mock.set_finalize_result(
-            crate::kubelet::pod_runtime::service::PodDeletionFinalizeResult::Queued,
-        );
+        mock.set_finalize_result(crate::runtime::PodDeletionFinalizeResult::Queued);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<LifecycleMessage>(4);
         let _keepalive = tx.clone();
         dispatch_via_runtime(
@@ -941,25 +934,25 @@ mod tests {
 
         for call in mock.recorded_calls() {
             let (ns, name, uid) = match &call {
-                crate::kubelet::pod_runtime::test_support::MockRuntimeCall::StartPod {
+                crate::test_support::MockRuntimeCall::StartPod {
                     namespace,
                     name,
                     uid,
                     ..
                 } => (namespace, name, uid),
-                crate::kubelet::pod_runtime::test_support::MockRuntimeCall::StopPod {
+                crate::test_support::MockRuntimeCall::StopPod {
                     namespace,
                     name,
                     uid,
                     ..
                 } => (namespace, name, uid),
-                crate::kubelet::pod_runtime::test_support::MockRuntimeCall::FinalizeStartup {
+                crate::test_support::MockRuntimeCall::FinalizeStartup {
                     namespace,
                     name,
                     uid,
                     ..
                 } => (namespace, name, uid),
-                crate::kubelet::pod_runtime::test_support::MockRuntimeCall::FinalizeDeletion {
+                crate::test_support::MockRuntimeCall::FinalizeDeletion {
                     namespace,
                     name,
                     uid,
@@ -988,7 +981,7 @@ mod tests {
             mock.as_ref() as &dyn PodRuntimeService,
             PodAction::ReconcileRuntime {
                 key: PodLifecycleKey::new("ns", "rec-runtime", "uid-rr"),
-                hint: crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
+                hint: crate::runtime::RuntimeReconcileHint::none(),
                 operation_id: 1,
                 permit: None,
             },
@@ -1032,7 +1025,7 @@ mod tests {
             mock.as_ref() as &dyn PodRuntimeService,
             PodAction::HandleCommand {
                 key: PodLifecycleKey::new("ns", "handle-cmd", "uid-hc"),
-                command: crate::kubelet::lifecycle::LifecycleCommand::ReadinessChanged {
+                command: crate::lifecycle::LifecycleCommand::ReadinessChanged {
                     pod_uid: "uid-hc".into(),
                     namespace: "ns".into(),
                     pod_name: "handle-cmd".into(),
@@ -1051,23 +1044,23 @@ mod tests {
         let calls = mock.recorded_calls();
         assert_eq!(calls.len(), 4, "four runtime calls");
         assert!(matches!(&calls[0],
-            crate::kubelet::pod_runtime::test_support::MockRuntimeCall::ReconcileRuntime {
+            crate::test_support::MockRuntimeCall::ReconcileRuntime {
                 namespace, name, uid, ..
             } if namespace == "ns" && name == "rec-runtime" && uid == "uid-rr"
         ));
         assert!(matches!(&calls[1],
-            crate::kubelet::pod_runtime::test_support::MockRuntimeCall::ReconcileCriLeftovers {
+            crate::test_support::MockRuntimeCall::ReconcileCriLeftovers {
                 namespace, name, uid
             } if namespace == "ns" && name == "rec-cri" && uid == "uid-rc"
         ));
         assert!(matches!(&calls[2],
-            crate::kubelet::pod_runtime::test_support::MockRuntimeCall::ReconcileEphemeral {
+            crate::test_support::MockRuntimeCall::ReconcileEphemeral {
                 namespace, name, uid
             } if namespace == "ns" && name == "rec-eph" && uid == "uid-re"
         ));
         assert!(matches!(
             &calls[3],
-            crate::kubelet::pod_runtime::test_support::MockRuntimeCall::HandleCommand { .. }
+            crate::test_support::MockRuntimeCall::HandleCommand { .. }
         ));
     }
 
@@ -1108,7 +1101,7 @@ mod tests {
         assert_eq!(calls.len(), 2, "two runtime retry calls");
         assert!(matches!(
             &calls[0],
-            crate::kubelet::pod_runtime::test_support::MockRuntimeCall::ScheduleRetry {
+            crate::test_support::MockRuntimeCall::ScheduleRetry {
                 namespace,
                 name,
                 uid,
@@ -1120,7 +1113,7 @@ mod tests {
         ));
         assert!(matches!(
             &calls[1],
-            crate::kubelet::pod_runtime::test_support::MockRuntimeCall::ScheduleStartPodRetry {
+            crate::test_support::MockRuntimeCall::ScheduleStartPodRetry {
                 namespace,
                 name,
                 uid,
@@ -1175,7 +1168,7 @@ mod tests {
         );
         assert!(matches!(
             &calls[0],
-            crate::kubelet::pod_runtime::test_support::MockRuntimeCall::CheckSlotAdmission {
+            crate::test_support::MockRuntimeCall::CheckSlotAdmission {
                 namespace,
                 name,
                 uid,
@@ -1231,7 +1224,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert!(matches!(
             &calls[0],
-            crate::kubelet::pod_runtime::test_support::MockRuntimeCall::FinalizeStartup {
+            crate::test_support::MockRuntimeCall::FinalizeStartup {
                 namespace,
                 name,
                 uid,
@@ -1256,7 +1249,7 @@ mod tests {
             mock.as_ref() as &dyn PodRuntimeService,
             PodAction::HandleCommand {
                 key: PodLifecycleKey::new("ns", "pod-name-may-differ", command_uid),
-                command: crate::kubelet::lifecycle::LifecycleCommand::StartupPassed {
+                command: crate::lifecycle::LifecycleCommand::StartupPassed {
                     pod_uid: command_uid.into(),
                     namespace: "ns".into(),
                     pod_name: "pod-name-may-differ".into(),
@@ -1274,9 +1267,7 @@ mod tests {
         let calls = mock.recorded_calls();
         assert_eq!(calls.len(), 1);
         match &calls[0] {
-            crate::kubelet::pod_runtime::test_support::MockRuntimeCall::HandleCommand {
-                command_name,
-            } => {
+            crate::test_support::MockRuntimeCall::HandleCommand { command_name } => {
                 assert!(
                     command_name.contains(command_uid),
                     "command must carry UID {command_uid}, got: {command_name}"
@@ -1313,7 +1304,7 @@ mod tests {
     /// generic retryable `DispatchFailed`.
     #[tokio::test]
     async fn stop_pod_ownership_error_is_classified_not_owned_and_non_retryable() {
-        use crate::kubelet::pod_lifecycle_core::message::PodLifecycleWorkFailure;
+        use crate::pod_lifecycle_core::message::PodLifecycleWorkFailure;
 
         let mock = std::sync::Arc::new(MockPodRuntimeService::new());
 

@@ -7,9 +7,9 @@
 
 use std::sync::Arc;
 
-use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
-use crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor;
-use crate::kubelet::pod_lifecycle_router::{
+use crate::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
+use crate::pod_lifecycle_router::executor::PodWorkExecutor;
+use crate::pod_lifecycle_router::{
     PodLifecycleDiagnostics, PodLifecycleRouteError, PodLifecycleRouteMode, PodLifecycleRouter,
 };
 
@@ -63,9 +63,9 @@ impl PodLifecycleService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
-    use crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry;
-    use crate::kubelet::pod_lifecycle_router::executor::NoopExecutor;
+    use crate::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
+    use crate::pod_lifecycle_actor::registry::PodLifecycleRegistry;
+    use crate::pod_lifecycle_router::executor::NoopExecutor;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     fn test_supervisor() -> Arc<TaskSupervisor> {

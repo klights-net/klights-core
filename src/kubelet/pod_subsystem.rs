@@ -23,6 +23,17 @@ use crate::kubelet::pod_runtime::service::{
 use crate::kubelet::pod_runtime::store::{PodRuntimeStore, PodSlotAdmission};
 use klights_supervisor::TaskSupervisor;
 
+struct LifecycleWallClock {
+    runtime_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+}
+
+impl klights_supervisor::WallClock for LifecycleWallClock {
+    fn now(&self) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH
+            + std::time::Duration::from_millis(self.runtime_clock.now_ms().max(0) as u64)
+    }
+}
+
 /// Wiring inputs for PodSubsystem construction.
 pub struct PodSubsystemConfig {
     pub repository_parts: PodRepositoryParts,
@@ -125,6 +136,10 @@ impl PodSubsystem {
         let (repository, repository_background, deletion_finalizer) =
             parts.into_pod_subsystem_parts();
 
+        let lifecycle_wall_clock: Arc<dyn klights_supervisor::WallClock> =
+            Arc::new(LifecycleWallClock {
+                runtime_clock: config.wall_clock.clone(),
+            });
         let registry = Arc::new(
             PodLifecycleRegistry::new_with_idle_grace(
                 config.supervisor.clone(),
@@ -133,7 +148,7 @@ impl PodSubsystem {
                     crate::kubelet::pod_lifecycle_router::executor::NoopExecutor,
                 ))),
                 config.pod_actor_idle_grace,
-                config.wall_clock.clone(),
+                lifecycle_wall_clock.clone(),
             )
             .with_runtime_observation_store(outbox.clone()),
         );
@@ -144,7 +159,7 @@ impl PodSubsystem {
                 lifecycle_concurrency,
                 PodLifecycleRouteMode::Multiplex,
                 config.pod_actor_idle_grace,
-                config.wall_clock.clone(),
+                lifecycle_wall_clock,
             )),
         };
         let lifecycle_service = PodLifecycleService::new(lifecycle_router.clone());
