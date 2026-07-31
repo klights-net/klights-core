@@ -2032,6 +2032,7 @@ dependencies = [
  "klights-cluster-store",
  "klights-internal-protobuf",
  "klights-kube-protobuf",
+ "klights-kubelet",
  "klights-leader-api",
  "klights-leader-rpc",
  "klights-network-api",
@@ -2223,6 +2224,12 @@ dependencies = [
 [[package]]
 name = "klights-kubelet"
 version = "0.0.0"
+dependencies = [
+ "klights-leader-api",
+ "klights-network-api",
+ "klights-node-store",
+ "klights-supervisor",
+]
 
 [[package]]
 name = "klights-leader-api"

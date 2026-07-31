@@ -1101,7 +1101,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         runtime_paths,
     )
     .context("kubelet configuration")?;
-    let kubelet_services = Arc::new(crate::kubelet::context::KubeletServices::new(
+    let kubelet_services = Arc::new(crate::kubelet::context::KubeletContext::new(
         crate::kubelet::context::KubeletLifecycleServices::new(
             pod_repository.clone(),
             pod_lifecycle_router.clone(),

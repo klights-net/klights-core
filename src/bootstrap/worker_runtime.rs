@@ -568,7 +568,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         runtime_paths,
     )
     .context("worker kubelet configuration")?;
-    let kctx = std::sync::Arc::new(crate::kubelet::context::KubeletServices::new(
+    let kctx = std::sync::Arc::new(crate::kubelet::context::KubeletContext::new(
         crate::kubelet::context::KubeletLifecycleServices::new(
             pod_repository.clone(),
             plr,

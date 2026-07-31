@@ -68,6 +68,7 @@ klights-pod-api = { path = "crates/klights-pod-api" }
 klights-reconcile-api = { path = "crates/klights-reconcile-api" }
 klights-network-api = { path = "crates/klights-network-api" }
 klights-networking = { path = "crates/klights-networking" }
+klights-kubelet = { path = "crates/klights-kubelet" }
 klights-auth = { path = "crates/klights-auth" }
 klights-supervisor = { path = "crates/klights-supervisor" }
 klights-internal-protobuf = { path = "crates/klights-internal-protobuf" }
@@ -214,6 +215,7 @@ klights-pod-api = { workspace = true }
 klights-reconcile-api = { workspace = true }
 klights-network-api = { workspace = true }
 klights-networking = { workspace = true }
+klights-kubelet = { workspace = true }
 klights-auth = { workspace = true }
 klights-supervisor = { workspace = true }
 klights-internal-protobuf = { workspace = true }
