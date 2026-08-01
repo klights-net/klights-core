@@ -439,6 +439,8 @@ fn pod_has_controller_owner(pod: &Value) -> bool {
         })
 }
 
+const GENERATED_POD_CREATE_MAX_ATTEMPTS: usize = 8;
+
 async fn create_pod(
     pod_writer: &(impl ReplicaSetPodMutation + ?Sized),
     rs_name: &str,
@@ -447,34 +449,59 @@ async fn create_pod(
     node_name: &str,
     template: &Value,
 ) -> Result<()> {
-    let pod_name = format!(
-        "{}-{}",
+    let prefix = format!("{rs_name}-");
+    create_pod_with_name_generator(
+        pod_writer,
         rs_name,
-        uuid::Uuid::new_v4()
-            .to_string()
-            .chars()
-            .take(5)
-            .collect::<String>()
-    );
-    let pod = crate::controllers::common::build_child_pod(
-        template,
-        &pod_name,
+        rs_uid,
         namespace,
-        "",
-        crate::controllers::common::OwnerInfo {
-            api_version: "apps/v1",
-            kind: "ReplicaSet",
-            name: rs_name,
-            uid: rs_uid,
-        },
-        &[],
-        &[],
-    )?;
+        node_name,
+        template,
+        || crate::resource_name::generate(&prefix),
+    )
+    .await
+}
 
-    pod_writer
-        .create_replicaset_pod(namespace, &pod_name, node_name, pod)
-        .await?;
-    Ok(())
+async fn create_pod_with_name_generator(
+    pod_writer: &(impl ReplicaSetPodMutation + ?Sized),
+    rs_name: &str,
+    rs_uid: &str,
+    namespace: &str,
+    node_name: &str,
+    template: &Value,
+    mut generate_name: impl FnMut() -> String,
+) -> Result<()> {
+    let mut final_collision = None;
+    for _ in 0..GENERATED_POD_CREATE_MAX_ATTEMPTS {
+        let pod_name = generate_name();
+        let pod = crate::controllers::common::build_child_pod(
+            template,
+            &pod_name,
+            namespace,
+            "",
+            crate::controllers::common::OwnerInfo {
+                api_version: "apps/v1",
+                kind: "ReplicaSet",
+                name: rs_name,
+                uid: rs_uid,
+            },
+            &[],
+            &[],
+        )?;
+
+        match pod_writer
+            .create_replicaset_pod(namespace, &pod_name, node_name, pod)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(error) if error.is_already_exists() => final_collision = Some(error),
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Err(final_collision
+        .expect("generated Pod retry budget is non-zero")
+        .into())
 }
 
 #[cfg(test)]

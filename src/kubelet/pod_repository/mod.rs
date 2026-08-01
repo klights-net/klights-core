@@ -1687,7 +1687,7 @@ impl PodObjectWriter for PodRepository {
                     dry_run: false,
                 })
                 .await
-                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                .map_err(anyhow::Error::new)?;
             let created = result.resource.ok_or_else(|| {
                 anyhow::anyhow!("controller pod {ns}/{name} create returned dry-run")
             })?;
