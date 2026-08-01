@@ -327,7 +327,7 @@ enum BuildOutboxTxnOutcome {
 
 #[cfg(test)]
 #[async_trait::async_trait]
-impl crate::kubelet::volume_sources::VolumeSourceReader for Datastore {
+impl klights_kubelet::volume_sources::VolumeSourceReader for Datastore {
     async fn config_map(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
         self.get_resource("v1", "ConfigMap", Some(namespace), name)
             .await

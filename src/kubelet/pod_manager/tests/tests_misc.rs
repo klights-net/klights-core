@@ -162,7 +162,7 @@ async fn lifecycle_message_from_command_uses_command_uid_not_live_pod_uid() {
 
     let message = lifecycle_message_from_command(
         &pod_repo,
-        crate::kubelet::lifecycle::LifecycleCommand::ReadinessChanged {
+        klights_kubelet::lifecycle::LifecycleCommand::ReadinessChanged {
             pod_uid: "uid-old".to_string(),
             namespace: "default".to_string(),
             pod_name: "same-name".to_string(),

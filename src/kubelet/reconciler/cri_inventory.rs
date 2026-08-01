@@ -254,7 +254,7 @@ pub async fn sweep_orphan_pod_artifacts(
     for dir_id in &orphans {
         let pod_root = pods_root.join(dir_id);
         let volumes_dir = pod_root.join("volumes");
-        if let Err(e) = crate::kubelet::volumes::unmount_volume_mounts_under(
+        if let Err(e) = klights_kubelet::volumes::unmount_volume_mounts_under(
             file_process,
             &volumes_dir.to_string_lossy(),
         )

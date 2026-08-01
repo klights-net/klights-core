@@ -476,11 +476,8 @@ async fn test_refresh_downward_api_updates_annotation_file() {
 
     // Create downward API volume with initial annotations.
     let items = pod_json["spec"]["volumes"][0]["downwardAPI"]["items"].clone();
-    let pod_dir_id = crate::kubelet::pod_runtime::service::pod_volume_dir_id(
-        "default",
-        "test-pod",
-        "uid-test-pod",
-    );
+    let pod_dir_id =
+        klights_kubelet::volumes::pod_volume_dir_id("default", "test-pod", "uid-test-pod");
     create_downward_api_volume_at_with_db_name(DownwardApiVolumeWithDbNameRequest {
         file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root,
@@ -491,7 +488,7 @@ async fn test_refresh_downward_api_updates_annotation_file() {
         volume_name: "podinfo",
         default_mode: None,
         items: &items,
-        node_capacity: crate::kubelet::node::NodeCapacity::default(),
+        node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
     })
     .await
     .unwrap();
@@ -549,7 +546,7 @@ async fn test_refresh_downward_api_updates_annotation_file() {
         &crate::kubelet::file_blocking::test_file_process_executor(),
         &pod_for_refresh.data,
         volumes_root,
-        crate::kubelet::node::NodeCapacity::default(),
+        klights_kubelet::node_capacity::NodeCapacity::default(),
     )
     .await
     .unwrap();
@@ -623,14 +620,13 @@ async fn test_refresh_downward_api_skips_projected_volumes() {
         &crate::kubelet::file_blocking::test_file_process_executor(),
         &pod_resource.data,
         volumes_root,
-        crate::kubelet::node::NodeCapacity::default(),
+        klights_kubelet::node_capacity::NodeCapacity::default(),
     )
     .await
     .unwrap();
 
     // The volumes/downward-api/ directory must NOT exist
-    let pod_dir_id =
-        crate::kubelet::pod_runtime::service::pod_volume_dir_id("default", "sa-pod", "uid-sa-pod");
+    let pod_dir_id = klights_kubelet::volumes::pod_volume_dir_id("default", "sa-pod", "uid-sa-pod");
     let phantom_dir = format!("{}/{pod_dir_id}/volumes/downward-api", volumes_root);
     assert!(
         !std::path::Path::new(&phantom_dir).exists(),
@@ -688,11 +684,8 @@ async fn test_refresh_projected_downward_api_updates_labels_file() {
         .unwrap();
 
     // Simulate pod startup: create the projected volume directory with initial content.
-    let pod_dir_id = crate::kubelet::pod_runtime::service::pod_volume_dir_id(
-        "default",
-        "label-pod",
-        "uid-label-pod",
-    );
+    let pod_dir_id =
+        klights_kubelet::volumes::pod_volume_dir_id("default", "label-pod", "uid-label-pod");
     let vol_dir = format!("{}/{pod_dir_id}/volumes/projected/podinfo", volumes_root);
     std::fs::create_dir_all(&vol_dir).unwrap();
     std::fs::write(format!("{}/labels", vol_dir), "app=\"initial\"\n").unwrap();
@@ -733,7 +726,7 @@ async fn test_refresh_projected_downward_api_updates_labels_file() {
         &crate::kubelet::file_blocking::test_file_process_executor(),
         &updated_pod,
         volumes_root,
-        crate::kubelet::node::NodeCapacity::default(),
+        klights_kubelet::node_capacity::NodeCapacity::default(),
     )
     .await
     .unwrap();

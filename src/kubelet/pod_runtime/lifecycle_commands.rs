@@ -1,4 +1,3 @@
-use crate::kubelet::lifecycle::LifecycleCommand;
 use crate::kubelet::pod_runtime::service::{
     ContainerConfigBuildRequest, PodRuntimeKey, RealPodRuntimeService,
 };
@@ -8,6 +7,7 @@ use crate::kubelet::pod_runtime::status_helpers::{
 };
 use crate::kubelet::pod_sandbox_config::build_sandbox_config_with_runtime_inputs;
 use crate::kubelet::pod_termination::find_pod_container_spec;
+use klights_kubelet::lifecycle::LifecycleCommand;
 
 pub(super) async fn handle_lifecycle_command(
     service: &RealPodRuntimeService,

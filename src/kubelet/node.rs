@@ -34,35 +34,6 @@ pub use crate::kubelet::node_status_projection::{
     set_node_pod_cidr,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NodeCapacity {
-    memory_ki: u64,
-    cpu_cores: u64,
-}
-
-impl NodeCapacity {
-    pub fn new(memory_ki: u64, cpu_cores: u64) -> Self {
-        Self {
-            memory_ki,
-            cpu_cores: cpu_cores.max(1),
-        }
-    }
-
-    pub fn memory_ki(self) -> u64 {
-        self.memory_ki
-    }
-
-    pub fn cpu_cores(self) -> u64 {
-        self.cpu_cores
-    }
-}
-
-impl Default for NodeCapacity {
-    fn default() -> Self {
-        Self::new(8 * 1024 * 1024, 1)
-    }
-}
-
 pub(super) fn parse_memory_ki(content: &str) -> Option<u64> {
     content
         .lines()
@@ -86,7 +57,7 @@ pub struct OutboxNodeSelfStatusPublisher {
     node_name: String,
     query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
     outbox: std::sync::Arc<Outbox>,
-    wall_clock: std::sync::Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    wall_clock: std::sync::Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 }
 
 impl OutboxNodeSelfStatusPublisher {
@@ -94,7 +65,7 @@ impl OutboxNodeSelfStatusPublisher {
         node_name: impl Into<String>,
         query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
         outbox: std::sync::Arc<Outbox>,
-        wall_clock: std::sync::Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+        wall_clock: std::sync::Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     ) -> Self {
         Self {
             node_name: node_name.into(),
@@ -2011,7 +1982,7 @@ mod tests {
             "worker-a",
             leader_query,
             outbox,
-            std::sync::Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            std::sync::Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
         let command = StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
@@ -2082,7 +2053,7 @@ mod tests {
             "worker-a",
             leader_query,
             std::sync::Arc::new(crate::node_outbox::Outbox::new(node_local.clone())),
-            std::sync::Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            std::sync::Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
         let request =
             klights_leader_api::NodeSelfStatusRequest::try_new(StorageCommand::UpdateStatus {

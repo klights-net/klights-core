@@ -87,7 +87,7 @@ impl RealPodDeletionFinalizer {
             store.clone(),
             cluster_api.clone(),
             outbox.clone(),
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
         let mutation_reconcile = Arc::new(crate::pod_reconcile_adapter::PodReconcileAdapter::new(
             store.db().clone(),

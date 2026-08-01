@@ -26,7 +26,7 @@ pub(super) struct PodObjectService {
     mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
     outbox: Option<Arc<Outbox>>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
-    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 }
 
 impl PodObjectService {
@@ -35,7 +35,7 @@ impl PodObjectService {
         mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
         outbox: Option<Arc<Outbox>>,
         cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
-        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+        wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     ) -> Self {
         Self {
             store,

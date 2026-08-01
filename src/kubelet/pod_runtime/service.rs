@@ -1,11 +1,11 @@
-use crate::kubelet::lifecycle::LifecycleCommand;
 use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
 pub use crate::kubelet::pod_runtime::service_dependencies::RealPodRuntimeServiceDependencies;
 pub use crate::kubelet::pod_runtime::slot_admission::PodSlotAdmissionRequest;
 pub use crate::kubelet::pod_runtime::types::{
     PodDeletionFinalizeResult, PodFinalizeStartupResult, PodOwnershipError, PodRuntimeKey,
-    PodStartResult, pod_volume_dir_id,
+    PodStartResult,
 };
+use klights_kubelet::lifecycle::LifecycleCommand;
 pub use klights_kubelet::runtime::{PodRuntimeService, RuntimeReconcileHint};
 use tokio_util::sync::CancellationToken;
 
@@ -31,7 +31,7 @@ pub struct RuntimeConfig {
     pub service_cidr: String,
     pub containerd_namespace: String,
     pub sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs,
-    pub node_capacity: crate::kubelet::node::NodeCapacity,
+    pub node_capacity: klights_kubelet::node_capacity::NodeCapacity,
     pub paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
 }
 
@@ -165,7 +165,7 @@ pub struct RealPodRuntimeService {
     pub(super) container_control: Arc<dyn ContainerRuntimeControl>,
     pub(super) network: Arc<dyn PodNetworkRuntime>,
     pub(super) store: Arc<dyn PodRuntimeStore>,
-    pub(super) clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    pub(super) clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     pub(super) slot_admission: Arc<dyn PodSlotAdmission>,
     pub(super) repository: Arc<dyn PodRuntimeRepository>,
     pub(super) filesystem: Arc<dyn PodFilesystem>,
@@ -277,7 +277,7 @@ impl RealPodRuntimeService {
         .await;
         append_service_envs(&mut container_config, &service_envs);
 
-        match crate::kubelet::pod_volume_manager::PodVolumeManager::build_mounts(
+        match klights_kubelet::pod_volume_manager::PodVolumeManager::build_mounts(
             request.container,
             request.volume_paths,
             &subpath_env,

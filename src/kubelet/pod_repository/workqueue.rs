@@ -290,7 +290,7 @@ pub(crate) struct PodWorkqueue {
     persistence: Arc<dyn PodWorkqueuePersistence>,
     supervisor: Arc<TaskSupervisor>,
     metrics: Arc<dyn ReconcileFailureMetrics>,
-    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     wake: Arc<Notify>,
     lifecycle_router: std::sync::Mutex<Option<Arc<dyn PodLifecycleWakeup>>>,
     local_node_name: std::sync::Mutex<Option<String>>,
@@ -308,7 +308,7 @@ impl PodWorkqueue {
         persistence: impl PodWorkqueuePersistence + 'static,
         supervisor: Arc<TaskSupervisor>,
         metrics: Arc<dyn ReconcileFailureMetrics>,
-        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+        wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     ) -> Arc<Self> {
         Self::new_with_unscheduled_deletion(
             store,
@@ -327,7 +327,7 @@ impl PodWorkqueue {
         supervisor: Arc<TaskSupervisor>,
         metrics: Arc<dyn ReconcileFailureMetrics>,
         leader_coordination: Arc<dyn ControllerCoordination>,
-        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+        wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     ) -> Arc<Self> {
         let unscheduled_deletion = compose_leader_unscheduled_deletion(store.clone());
         Self::new_with_unscheduled_deletion(
@@ -346,7 +346,7 @@ impl PodWorkqueue {
         persistence: impl PodWorkqueuePersistence + 'static,
         supervisor: Arc<TaskSupervisor>,
         metrics: Arc<dyn ReconcileFailureMetrics>,
-        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+        wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
         unscheduled_deletion: Option<Arc<dyn UnscheduledPodDeletion>>,
         leader_coordination: Option<Arc<dyn ControllerCoordination>>,
     ) -> Arc<Self> {
@@ -1416,7 +1416,7 @@ mod tests {
             supervisor,
             metrics,
             coordination,
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
         *workqueue.local_node_name.lock().unwrap() = Some("node-a".to_string());
         (workqueue, db, node_local)
@@ -1439,7 +1439,7 @@ mod tests {
             node_local.clone(),
             supervisor,
             metrics,
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
         *workqueue.local_node_name.lock().unwrap() = Some("node-a".to_string());
         (workqueue, db, node_local)
@@ -1460,7 +1460,7 @@ mod tests {
             supervisor.clone(),
             SideEffectMetrics::new(),
             coordination,
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
         db.create_resource(
             "v1",
@@ -2779,7 +2779,7 @@ mod tests {
             node_local,
             supervisor.clone(),
             metrics,
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
 
         // Enqueue a deferred delete to trigger reconciler start.

@@ -2566,7 +2566,7 @@ async fn observe_peer_endpoint_records_authenticated_node_remote_ip() {
 async fn node_effect_observed_leader_endpoint_enqueues_external_ip_status() {
     struct TestWallClock;
 
-    impl crate::kubelet::pod_runtime::store::RuntimeClock for TestWallClock {
+    impl klights_kubelet::runtime_clock::RuntimeClock for TestWallClock {
         fn now_ms(&self) -> i64 {
             1_704_164_645_000
         }

@@ -1,10 +1,10 @@
-use crate::kubelet::pod_env::expand_env_var_references;
 use crate::kubelet::pod_field_ref::{resolve_field_ref, resolve_resource_field_ref_with_capacity};
 use crate::kubelet::pod_resources::{parse_cpu_resource, parse_memory_resource};
 use k8s_cri::v1::{
     ContainerConfig, ContainerMetadata, ImageSpec, KeyValue, LinuxContainerConfig,
     LinuxContainerResources,
 };
+use klights_kubelet::env::expand_env_var_references;
 use serde_json::Value;
 
 /// Check runAsNonRoot constraint. Returns Ok(()) if the container is allowed
@@ -54,7 +54,7 @@ pub fn build_container_config_with_capacity(
     kubernetes_service_ip: &str,
     resolved_env_from: &[(String, String)],
     resolved_env: &std::collections::HashMap<String, String>,
-    node_capacity: crate::kubelet::node::NodeCapacity,
+    node_capacity: klights_kubelet::node_capacity::NodeCapacity,
 ) -> ContainerConfig {
     let image = container_spec
         .get("image")
@@ -363,7 +363,7 @@ pub fn build_container_config(
         kubernetes_service_ip,
         resolved_env_from,
         resolved_env,
-        crate::kubelet::node::NodeCapacity::default(),
+        klights_kubelet::node_capacity::NodeCapacity::default(),
     )
 }
 

@@ -1,4 +1,4 @@
-use crate::kubelet::probes::{HttpProbe, check_http_probe as run_http_probe};
+use crate::probes::{HttpProbe, check_http_probe as run_http_probe};
 use reqwest::Client;
 use std::time::Duration;
 

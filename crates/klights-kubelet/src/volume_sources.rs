@@ -72,15 +72,15 @@ impl LocalCacheVolumeSourceReader {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn empty_volume_source_reader_for_tests() -> Arc<dyn VolumeSourceReader> {
     Arc::new(EmptyVolumeSourceReader)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct EmptyVolumeSourceReader;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait]
 impl VolumeSourceReader for EmptyVolumeSourceReader {
     async fn config_map(&self, _namespace: &str, _name: &str) -> Result<Option<Resource>> {

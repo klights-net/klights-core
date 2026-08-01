@@ -663,11 +663,8 @@ async fn test_downward_api_refresh_uses_keyed_blocking_boundary() {
         .unwrap();
 
     let items = pod["spec"]["volumes"][0]["downwardAPI"]["items"].clone();
-    let pod_dir_id = crate::kubelet::pod_runtime::service::pod_volume_dir_id(
-        "default",
-        "pod-refresh",
-        "uid-pod-refresh",
-    );
+    let pod_dir_id =
+        klights_kubelet::volumes::pod_volume_dir_id("default", "pod-refresh", "uid-pod-refresh");
     create_downward_api_volume_at_with_db_name(DownwardApiVolumeWithDbNameRequest {
         file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
@@ -678,7 +675,7 @@ async fn test_downward_api_refresh_uses_keyed_blocking_boundary() {
         volume_name: "podinfo",
         default_mode: None,
         items: &items,
-        node_capacity: crate::kubelet::node::NodeCapacity::default(),
+        node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
     })
     .await
     .unwrap();
@@ -693,7 +690,7 @@ async fn test_downward_api_refresh_uses_keyed_blocking_boundary() {
         &crate::kubelet::file_blocking::test_file_process_executor(),
         &pod_for_refresh.data,
         root,
-        crate::kubelet::node::NodeCapacity::default(),
+        klights_kubelet::node_capacity::NodeCapacity::default(),
     )
     .await
     .unwrap();

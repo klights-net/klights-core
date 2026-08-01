@@ -65,8 +65,8 @@ impl BuiltinAdmissionDefaultsPort for GeneratedHandlerAdapter {
     }
 
     fn validate_pod_volume_paths(&self, pod: &Value) -> Result<(), AppError> {
-        crate::kubelet::volumes::validate_volume_subpaths(pod)
-            .and_then(|()| crate::kubelet::volumes::validate_volume_projection_paths(pod))
+        klights_kubelet::volumes::validate_volume_subpaths(pod)
+            .and_then(|()| klights_kubelet::volumes::validate_volume_projection_paths(pod))
             .map_err(AppError::UnprocessableEntity)
     }
 

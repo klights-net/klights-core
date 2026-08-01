@@ -20,12 +20,8 @@ impl PodRuntimeKey {
     }
 
     pub fn volume_dir_id(&self) -> String {
-        pod_volume_dir_id(&self.namespace, &self.name, &self.uid)
+        crate::volumes::pod_volume_dir_id(&self.namespace, &self.name, &self.uid)
     }
-}
-
-pub fn pod_volume_dir_id(namespace: &str, name: &str, uid: &str) -> String {
-    format!("{namespace}_{name}_{uid}")
 }
 
 impl From<&PodLifecycleKey> for PodRuntimeKey {
@@ -140,7 +136,10 @@ mod tests {
         assert_eq!(key.name, "web");
         assert_eq!(key.uid, "uid-1");
         assert_eq!(key.volume_dir_id(), "default_web_uid-1");
-        assert_eq!(pod_volume_dir_id("ns", "pod", "uid"), "ns_pod_uid");
+        assert_eq!(
+            crate::volumes::pod_volume_dir_id("ns", "pod", "uid"),
+            "ns_pod_uid"
+        );
     }
 
     #[test]

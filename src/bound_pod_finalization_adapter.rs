@@ -26,7 +26,7 @@ pub(crate) struct RootBoundPodFinalization {
     store: Arc<PodStore>,
     cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     outbox: Option<Arc<Outbox>>,
-    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 }
 
 impl RootBoundPodFinalization {
@@ -34,7 +34,7 @@ impl RootBoundPodFinalization {
         store: Arc<PodStore>,
         cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
         outbox: Option<Arc<Outbox>>,
-        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+        wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -124,7 +124,7 @@ pub(crate) fn new_for_root(
     store: Arc<PodStore>,
     cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     outbox: Option<Arc<Outbox>>,
-    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 ) -> Arc<dyn BoundPodFinalization> {
     RootBoundPodFinalization::new(store, cluster_api, outbox, wall_clock)
 }

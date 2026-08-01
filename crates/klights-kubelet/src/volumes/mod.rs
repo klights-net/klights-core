@@ -5,16 +5,9 @@ mod downward_api;
 mod projected;
 pub(crate) mod shared;
 
-#[cfg(test)]
-mod tests_core;
-#[cfg(test)]
-mod tests_downward;
-#[cfg(test)]
-mod tests_projected_a;
-#[cfg(test)]
-mod tests_projected_b;
-#[cfg(test)]
-mod tests_refresh_subpath;
+pub fn pod_volume_dir_id(namespace: &str, name: &str, uid: &str) -> String {
+    format!("{namespace}_{name}_{uid}")
+}
 
 pub use basics::unmount_volume_mounts_under;
 pub use basics::{
@@ -31,26 +24,26 @@ pub use downward_api::{DownwardApiVolumeNsRequest, create_downward_api_volume_ns
 pub use projected::{ProjectedVolumeNsRequest, create_projected_volume_ns};
 pub(crate) use projected::{ProjectedVolumeRootRequest, create_projected_volume_under_root};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub use basics::parse_mountinfo_entry;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub use basics::{
     create_empty_dir, create_empty_dir_for_namespace, empty_dir_volume_path,
     empty_dir_volume_path_for_namespace, volumes_root,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub use blocking::blocking_fs_keyed_call_count;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub use blocking::blocking_fs_keyed_call_count_for;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub use configmap_secret::{
     ConfigMapVolumeAtRequest, SecretVolumeAtRequest, create_config_map_volume_at,
     create_secret_volume_at,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub use downward_api::{
     DownwardApiVolumeWithDbNameRequest, create_downward_api_volume_at,
     create_downward_api_volume_at_with_db_name, extract_field_ref, extract_resource_field_ref,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub use projected::{ProjectedVolumeAtRequest, create_projected_volume_at};

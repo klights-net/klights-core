@@ -151,7 +151,7 @@ pub struct PodDeleteCoordinator {
     queue: Arc<dyn PodDeleteQueuePort>,
     sleeper: Arc<dyn PodDeleteSleeperPort>,
     metrics: Arc<dyn ReconcileFailureMetrics>,
-    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 }
 
 impl PodDeleteCoordinator {
@@ -160,7 +160,7 @@ impl PodDeleteCoordinator {
         workqueue: Arc<PodWorkqueue>,
         supervisor: Arc<TaskSupervisor>,
         metrics: Arc<dyn ReconcileFailureMetrics>,
-        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+        wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     ) -> Self {
         Self::new_with_ports(
             store,
@@ -176,7 +176,7 @@ impl PodDeleteCoordinator {
         queue: Arc<dyn PodDeleteQueuePort>,
         sleeper: Arc<dyn PodDeleteSleeperPort>,
         metrics: Arc<dyn ReconcileFailureMetrics>,
-        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+        wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     ) -> Self {
         Self {
             store,
@@ -702,7 +702,7 @@ mod tests {
             queue.clone(),
             Arc::new(NoopDeleteSleeper),
             metrics.clone(),
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
 
         let err = coordinator

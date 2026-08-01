@@ -403,7 +403,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             config.node_name.clone(),
             query_for_peer_watch.clone(),
             outbox.clone(),
-            std::sync::Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            std::sync::Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         ));
         let readiness_publisher =
             crate::node_subnet_controller_adapter::KubeletNodeReadinessPublisher::new(
@@ -437,7 +437,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
 
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let (pod_lifecycle_tx, pod_lifecycle_rx) =
-        tokio::sync::mpsc::channel::<crate::kubelet::lifecycle::LifecycleCommand>(128);
+        tokio::sync::mpsc::channel::<klights_kubelet::lifecycle::LifecycleCommand>(128);
     let pod_lifecycle_rx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(pod_lifecycle_rx)));
     let pod_watcher_runtime_ports = cri_for_pod_watcher.clone().map(|cri| {
         let runtime = std::sync::Arc::new(crate::kubelet::pod_runtime::cri::SharedCriRuntime::new(
@@ -519,12 +519,12 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                     pod_runtime_store.clone(),
                     config.node_name.clone(),
                     std::sync::Arc::new(
-                        crate::kubelet::pod_runtime::store::SystemRuntimeClock,
+                        klights_kubelet::runtime_clock::SystemRuntimeClock,
                     ),
                 ),
             ),
             wall_clock: std::sync::Arc::new(
-                crate::kubelet::pod_runtime::store::SystemRuntimeClock,
+                klights_kubelet::runtime_clock::SystemRuntimeClock,
             ),
             slot_admission: std::sync::Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
@@ -582,7 +582,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         crate::kubelet::context::KubeletLocalExecutionServices::new(
             pod_runtime_store,
             pod_endpoint_store,
-            std::sync::Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            std::sync::Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             task_supervisor.clone(),
             file_process.clone(),
             kubelet_config,

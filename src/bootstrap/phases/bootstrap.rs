@@ -525,7 +525,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         RuntimeNodeRole::Leader
     };
     let (pod_lifecycle_tx, pod_lifecycle_rx) =
-        tokio::sync::mpsc::channel::<crate::kubelet::lifecycle::LifecycleCommand>(128);
+        tokio::sync::mpsc::channel::<klights_kubelet::lifecycle::LifecycleCommand>(128);
     let pod_lifecycle_rx = Arc::new(tokio::sync::Mutex::new(Some(pod_lifecycle_rx)));
     let pod_watcher_runtime_ports = cri_for_pod_watcher.clone().map(|cri| {
         let runtime = Arc::new(crate::kubelet::pod_runtime::cri::SharedCriRuntime::new(
@@ -641,10 +641,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(
                     node_pod_runtime_store.clone(),
                     config.node_name.clone(),
-                    Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+                    Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
                 ),
             ),
-            wall_clock: Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            wall_clock: Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             slot_admission: Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
                     pod_slot_store,
@@ -1113,7 +1113,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         crate::kubelet::context::KubeletLocalExecutionServices::new(
             node_pod_runtime_store,
             node_pod_endpoint_store,
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             supervisor.clone(),
             kubelet_file_process,
             kubelet_config,
@@ -1183,7 +1183,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 config.node_name.clone(),
                 endpoint_query.clone(),
                 outbox_runtime.clone(),
-                Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+                Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             ));
         match crate::bootstrap::observed_endpoint::start_leader_peer_endpoint_observer(
             db_handle.clone(),
@@ -1558,7 +1558,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 config.node_name.clone(),
                 query.clone(),
                 kubelet_services.status_delivery().outbox.clone(),
-                Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+                Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             ));
         let readiness_publisher =
             crate::node_subnet_controller_adapter::KubeletNodeReadinessPublisher::new(
@@ -1815,7 +1815,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 config.node_name.clone(),
                 grpc_node_query.clone(),
                 outbox_runtime.clone(),
-                Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+                Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             ));
         {
             let authenticated_projected_token = Arc::new(

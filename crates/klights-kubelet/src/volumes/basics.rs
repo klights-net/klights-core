@@ -3,27 +3,27 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn volumes_root() -> String {
     let runtime_ns = test_runtime_namespace();
     volumes_root_for_namespace(&runtime_ns)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn volumes_root_for_namespace(runtime_ns: &str) -> String {
-    crate::kubelet::runtime_paths::for_test(runtime_ns)
+    crate::phase15d_test_support::runtime_paths_for_test(runtime_ns)
         .volumes_root()
         .to_string_lossy()
         .into_owned()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn empty_dir_volume_path(pod_name: &str, volume_name: &str) -> String {
     let runtime_ns = test_runtime_namespace();
     empty_dir_volume_path_for_namespace(&runtime_ns, pod_name, volume_name)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn empty_dir_volume_path_for_namespace(
     runtime_ns: &str,
     pod_name: &str,
@@ -202,7 +202,7 @@ fn check_projection_path(vol_name: &str, source: &str, path: &str) -> Result<(),
 
 /// Creates an emptyDir volume for a pod with world-writable permissions.
 /// K8s spec requires emptyDir to be writable by the pod's fsGroup if set.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn create_empty_dir(
     pod_name: &str,
     volume_name: &str,
@@ -213,12 +213,12 @@ pub fn create_empty_dir(
     create_empty_dir_for_namespace(&runtime_ns, pod_name, volume_name, medium, size_limit)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn test_runtime_namespace() -> String {
-    std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string())
+    "klights".to_string()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn create_empty_dir_for_namespace(
     runtime_ns: &str,
     pod_name: &str,
@@ -679,7 +679,7 @@ pub fn resolve_host_path(host_path: &str, host_type: Option<&str>) -> Result<Str
 /// block the tokio runtime (HR2: the event loop must never block).
 #[cfg(test)]
 async fn cleanup_volumes_under(volumes_root: &std::path::Path, pod_name: &str) -> Result<()> {
-    let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+    let file_process = crate::phase15d_test_support::file_process_executor();
     let pod_volumes_path = volumes_root.join(pod_name).join("volumes");
     let pod_volumes_path_string = pod_volumes_path.to_string_lossy().into_owned();
     // Best-effort unmount first to prevent recursive tmpfs stacking leaks
@@ -755,7 +755,7 @@ mod tests {
     fn test_collect_mount_targets_under_sorts_deepest_first_and_dedupes() {
         let root = format!(
             "{}/pods/default_pod/volumes",
-            crate::kubelet::runtime_paths::for_test("klights")
+            crate::runtime_paths::KubeletRuntimePaths::for_test("klights")
                 .data_root()
                 .to_path_buf()
                 .display()
@@ -779,7 +779,7 @@ mod tests {
     fn test_collect_mount_targets_under_excludes_similar_prefixes() {
         let root = format!(
             "{}/pods/default_pod/volumes",
-            crate::kubelet::runtime_paths::for_test("klights")
+            crate::runtime_paths::KubeletRuntimePaths::for_test("klights")
                 .data_root()
                 .to_path_buf()
                 .display()

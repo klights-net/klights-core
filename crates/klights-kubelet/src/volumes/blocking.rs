@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static FILE_BLOCKING_KEYED_CALLS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static FILE_BLOCKING_KEYED_CALLS_BY_KEY: std::sync::OnceLock<
     std::sync::Mutex<HashMap<String, usize>>,
 > = std::sync::OnceLock::new();
@@ -19,9 +19,9 @@ pub async fn run_blocking_fs_keyed<T>(
 where
     T: Send + 'static,
 {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     FILE_BLOCKING_KEYED_CALLS.fetch_add(1, Ordering::SeqCst);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         let counters =
             FILE_BLOCKING_KEYED_CALLS_BY_KEY.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
@@ -36,12 +36,12 @@ where
         .with_context(|| format!("blocking keyed fs task '{label}' failed"))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn blocking_fs_keyed_call_count() -> usize {
     FILE_BLOCKING_KEYED_CALLS.load(Ordering::SeqCst)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn blocking_fs_keyed_call_count_for(label: &str, key: &str) -> usize {
     let Some(counters) = FILE_BLOCKING_KEYED_CALLS_BY_KEY.get() else {
         return 0;
@@ -64,7 +64,7 @@ mod tests {
         let barrier = Arc::new(Barrier::new(2));
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
-        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        let file_process = crate::phase15d_test_support::file_process_executor();
 
         let run_one = |file_process: klights_supervisor::FileProcessExecutor,
                        barrier: Arc<Barrier>,

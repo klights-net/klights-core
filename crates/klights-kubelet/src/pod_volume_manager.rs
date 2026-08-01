@@ -5,17 +5,17 @@ use std::collections::HashMap;
 
 pub struct PodVolumeManager<'a> {
     file_process: &'a klights_supervisor::FileProcessExecutor,
-    sources: &'a dyn crate::kubelet::volume_sources::VolumeSourceReader,
-    paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
-    node_capacity: crate::kubelet::node::NodeCapacity,
+    sources: &'a dyn crate::volume_sources::VolumeSourceReader,
+    paths: &'a crate::runtime_paths::KubeletRuntimePaths,
+    node_capacity: crate::node_capacity::NodeCapacity,
 }
 
 impl<'a> PodVolumeManager<'a> {
     pub fn new(
         file_process: &'a klights_supervisor::FileProcessExecutor,
-        sources: &'a dyn crate::kubelet::volume_sources::VolumeSourceReader,
-        paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
-        node_capacity: crate::kubelet::node::NodeCapacity,
+        sources: &'a dyn crate::volume_sources::VolumeSourceReader,
+        paths: &'a crate::runtime_paths::KubeletRuntimePaths,
+        node_capacity: crate::node_capacity::NodeCapacity,
     ) -> Self {
         Self {
             file_process,
@@ -32,10 +32,10 @@ impl<'a> PodVolumeManager<'a> {
         namespace: &str,
         pod: &Value,
     ) -> Result<HashMap<String, String>> {
-        let registry = crate::kubelet::volume_registry::VolumeRegistry::with_defaults();
+        let registry = crate::volume_registry::VolumeRegistry::with_defaults();
         let volumes_root_path = self.paths.volumes_root();
         let volumes_root = volumes_root_path.to_string_lossy();
-        let ctx = crate::kubelet::volume_registry::VolumeContext {
+        let ctx = crate::volume_registry::VolumeContext {
             file_process: self.file_process,
             sources: self.sources,
             namespace,
@@ -112,8 +112,7 @@ impl<'a> PodVolumeManager<'a> {
                     .unwrap_or(false);
                 let sub_path_expr = vm.get("subPathExpr").and_then(|s| s.as_str());
                 let sub_path = if let Some(expr) = sub_path_expr {
-                    let expanded =
-                        crate::kubelet::pod_env::expand_env_var_references(expr, &env_map);
+                    let expanded = crate::env::expand_env_var_references(expr, &env_map);
                     if expanded.starts_with('/') {
                         return Err(format!(
                             "invalid subPath \"{}\": must not be an absolute path",

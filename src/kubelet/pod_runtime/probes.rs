@@ -49,12 +49,12 @@ struct StartedSandboxFinalization {
 
 /// Production probe runtime adapter wrapping `ProbeManager`.
 pub struct RealProbeRuntime {
-    probe_manager: Arc<crate::kubelet::ProbeManager>,
+    probe_manager: Arc<klights_kubelet::probe_manager::ProbeManager>,
     started_sandboxes: Mutex<HashMap<PodRuntimeKey, StartedSandboxFinalization>>,
 }
 
 impl RealProbeRuntime {
-    pub fn new(probe_manager: Arc<crate::kubelet::ProbeManager>) -> Self {
+    pub fn new(probe_manager: Arc<klights_kubelet::probe_manager::ProbeManager>) -> Self {
         Self {
             probe_manager,
             started_sandboxes: Mutex::new(HashMap::new()),

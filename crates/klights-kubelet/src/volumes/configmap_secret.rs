@@ -3,8 +3,9 @@ use super::shared::{
     build_projection_paths, clear_volume_dir_contents_blocking, remove_projection_path_blocking,
     remove_stale_projection_files, resolve_projection_mode, write_projection_file_blocking,
 };
-use crate::kubelet::volume_sources::VolumeSourceReader;
+use crate::volume_sources::VolumeSourceReader;
 use anyhow::{Context, Result};
+use klights_pod_api::{PodListRequest, PodQuery};
 
 #[derive(Clone)]
 struct ProjectionFileWrite {
@@ -355,7 +356,7 @@ pub async fn refresh_secret_configmap_volumes_from_event(
     name: &str,
     event_resource: &serde_json::Value,
     volumes_root: &str,
-    pod_reader: &dyn crate::kubelet::pod_repository::PodReader,
+    pod_reader: &dyn PodQuery,
 ) -> Result<()> {
     refresh_secret_configmap_volumes_inner(
         file_process,
@@ -375,7 +376,7 @@ pub async fn refresh_secret_configmap_volumes_after_delete(
     namespace: &str,
     name: &str,
     volumes_root: &str,
-    pod_reader: &dyn crate::kubelet::pod_repository::PodReader,
+    pod_reader: &dyn PodQuery,
 ) -> Result<()> {
     refresh_secret_configmap_volumes_inner(
         file_process,
@@ -396,7 +397,7 @@ async fn refresh_secret_configmap_volumes_inner(
     name: &str,
     source: RefreshResourceSource<'_>,
     volumes_root: &str,
-    pod_reader: &dyn crate::kubelet::pod_repository::PodReader,
+    pod_reader: &dyn PodQuery,
 ) -> Result<()> {
     let latest_resource = match source {
         RefreshResourceSource::Event(resource) => Some(resource),
@@ -407,10 +408,16 @@ async fn refresh_secret_configmap_volumes_inner(
     // List all pods in this namespace through the pod repository so the
     // v1/Pod read boundary stays inside `PodStore`.
     let pods = pod_reader
-        .list_pods(Some(namespace), None, None, None, None)
+        .list_pods(PodListRequest::try_new(
+            Some(namespace.to_string()),
+            None,
+            None,
+            None,
+            None,
+        )?)
         .await?;
 
-    for pod_resource in &pods.items {
+    for pod_resource in pods.items() {
         let pod = &pod_resource.data;
         let pod_name = pod
             .pointer("/metadata/name")
@@ -429,8 +436,7 @@ async fn refresh_secret_configmap_volumes_inner(
             );
             continue;
         };
-        let pod_dir_id =
-            crate::kubelet::pod_runtime::service::pod_volume_dir_id(pod_ns, pod_name, pod_uid);
+        let pod_dir_id = crate::volumes::pod_volume_dir_id(pod_ns, pod_name, pod_uid);
 
         let volumes = match pod.pointer("/spec/volumes").and_then(|v| v.as_array()) {
             Some(v) => v,

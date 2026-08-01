@@ -13,7 +13,6 @@ pub mod cri_events {
 }
 pub(crate) mod cri_exec;
 pub mod file_blocking;
-pub mod lifecycle;
 pub mod log_rotation {
     pub use klights_kubelet::log_rotation::*;
 }
@@ -69,12 +68,10 @@ pub mod pod_status_test;
 pub mod pod_status_writer;
 pub mod pod_subsystem;
 pub mod pod_termination;
-pub mod pod_volume_manager;
 pub mod pod_watch_handlers;
 pub mod pod_watch_source;
-pub mod probe_manager;
-pub mod probes;
-pub mod projected_sa_token_refresh;
+#[cfg(test)]
+mod probe_manager_integration;
 pub mod reconciler;
 pub mod registry_proxy {
     pub use klights_kubelet::registry_proxy::*;
@@ -108,13 +105,12 @@ pub mod runtime_paths {
         .expect("kubelet test runtime path must be absolute")
     }
 }
-pub mod volume_registry;
-pub mod volume_sources;
-pub mod volumes;
+#[cfg(test)]
+mod volume_integration_tests;
 
 pub use containerd_manager::ContainerdManager;
 pub use cri::CriClient;
-pub use probe_manager::ProbeManager;
+pub use klights_kubelet::probe_manager::ProbeManager;
 
 pub mod pod_lifecycle_actor;
 pub mod pod_lifecycle_core;

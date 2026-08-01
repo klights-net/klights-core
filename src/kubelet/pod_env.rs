@@ -144,53 +144,6 @@ impl EnvSourceReader for DatastoreEnvSourceReader<'_> {
     }
 }
 
-/// Expand `$(VAR_NAME)` references in an env var value using previously-resolved env vars.
-/// Per K8s spec: references to undefined vars are left as-is (literal `$(VAR_NAME)`).
-/// Only vars that appear earlier in the env list are in scope.
-pub fn expand_env_var_references(
-    value: &str,
-    resolved: &std::collections::HashMap<String, String>,
-) -> String {
-    if !value.contains("$(") {
-        return value.to_string();
-    }
-    let mut result = String::with_capacity(value.len());
-    let mut chars = value.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '$' && chars.peek() == Some(&'(') {
-            chars.next(); // consume '('
-            let mut var_name = String::new();
-            let mut closed = false;
-            for inner in chars.by_ref() {
-                if inner == ')' {
-                    closed = true;
-                    break;
-                }
-                var_name.push(inner);
-            }
-            if closed {
-                if let Some(replacement) = resolved.get(&var_name) {
-                    result.push_str(replacement);
-                } else {
-                    // Undefined — leave literal
-                    result.push('$');
-                    result.push('(');
-                    result.push_str(&var_name);
-                    result.push(')');
-                }
-            } else {
-                // Unclosed `$(` — leave as-is
-                result.push('$');
-                result.push('(');
-                result.push_str(&var_name);
-            }
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
-
 /// Collect env vars that have a literal `value` field (not `valueFrom`).
 /// Needed for subPathExpr expansion, which must see all env vars.
 pub fn collect_literal_env_vars(
@@ -216,7 +169,7 @@ pub fn collect_literal_env_vars(
 pub fn collect_value_from_env_vars_for_subpath_with_capacity(
     container_spec: &Value,
     pod_data: &Value,
-    node_capacity: crate::kubelet::node::NodeCapacity,
+    node_capacity: klights_kubelet::node_capacity::NodeCapacity,
 ) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     let Some(env_array) = container_spec.get("env").and_then(|e| e.as_array()) else {
@@ -526,7 +479,7 @@ pub fn build_subpath_env_with_capacity(
     pod_data: &Value,
     resolved_env_from: &[(String, String)],
     resolved_env: &std::collections::HashMap<String, String>,
-    node_capacity: crate::kubelet::node::NodeCapacity,
+    node_capacity: klights_kubelet::node_capacity::NodeCapacity,
 ) -> std::collections::HashMap<String, String> {
     let mut subpath_env: std::collections::HashMap<String, String> =
         resolved_env_from.iter().cloned().collect();
@@ -554,7 +507,7 @@ pub fn collect_value_from_env_vars_for_subpath(
     collect_value_from_env_vars_for_subpath_with_capacity(
         container_spec,
         pod_data,
-        crate::kubelet::node::NodeCapacity::default(),
+        klights_kubelet::node_capacity::NodeCapacity::default(),
     )
 }
 
@@ -570,7 +523,7 @@ pub fn build_subpath_env(
         pod_data,
         resolved_env_from,
         resolved_env,
-        crate::kubelet::node::NodeCapacity::default(),
+        klights_kubelet::node_capacity::NodeCapacity::default(),
     )
 }
 

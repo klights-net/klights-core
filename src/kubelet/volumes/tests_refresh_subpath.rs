@@ -2,7 +2,7 @@ use super::*;
 
 fn make_pod_reader(
     db: &crate::datastore::sqlite::Datastore,
-) -> std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader> {
+) -> std::sync::Arc<dyn klights_pod_api::PodQuery> {
     use crate::side_effects::SideEffectMetrics;
     use crate::side_effects::SideEffectRegistry;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
@@ -18,7 +18,7 @@ fn make_pod_reader(
 }
 
 fn test_pod_dir_id(namespace: &str, pod_name: &str, uid: &str) -> String {
-    crate::kubelet::pod_runtime::service::pod_volume_dir_id(namespace, pod_name, uid)
+    klights_kubelet::volumes::pod_volume_dir_id(namespace, pod_name, uid)
 }
 
 fn test_volume_path(

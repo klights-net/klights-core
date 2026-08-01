@@ -30,7 +30,7 @@ pub(super) struct WatchEventHandlerContext<'a> {
     pub file_process: klights_supervisor::FileProcessExecutor,
     pub deadline_timers: super::deadline_timers::DeadlineTimerRegistry,
     pub now_unix_seconds: i64,
-    pub node_capacity: crate::kubelet::node::NodeCapacity,
+    pub node_capacity: klights_kubelet::node_capacity::NodeCapacity,
     pub paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
 }
 
@@ -92,7 +92,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
             .unwrap_or("default");
         let volumes_root = paths.volumes_root().to_string_lossy().into_owned();
         let refresh_result = if event.event_type == EventType::Deleted {
-            crate::kubelet::volumes::refresh_secret_configmap_volumes_after_delete(
+            klights_kubelet::volumes::refresh_secret_configmap_volumes_after_delete(
                 &file_process,
                 event_kind,
                 event_ns,
@@ -102,7 +102,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
             )
             .await
         } else {
-            crate::kubelet::volumes::refresh_secret_configmap_volumes_from_event(
+            klights_kubelet::volumes::refresh_secret_configmap_volumes_from_event(
                 &file_process,
                 event_kind,
                 event_ns,
@@ -223,7 +223,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
 
         // Refresh downwardAPI volumes to reflect metadata changes (labels/annotations)
         let volumes_root = paths.volumes_root().to_string_lossy().into_owned();
-        if let Err(e) = crate::kubelet::volumes::refresh_downward_api_volumes(
+        if let Err(e) = klights_kubelet::volumes::refresh_downward_api_volumes(
             &file_process,
             &event.object,
             &volumes_root,
@@ -908,11 +908,8 @@ mod tests {
         .await
         .expect("create pod");
 
-        let pod_dir_id = crate::kubelet::pod_runtime::service::pod_volume_dir_id(
-            "default",
-            "cm-pod",
-            "uid-cm-pod",
-        );
+        let pod_dir_id =
+            klights_kubelet::volumes::pod_volume_dir_id("default", "cm-pod", "uid-cm-pod");
         let paths =
             crate::kubelet::runtime_paths::KubeletRuntimePaths::new(temp.path().to_path_buf())
                 .unwrap();
@@ -940,7 +937,7 @@ mod tests {
                 task_supervisor: supervisor,
                 deadline_timers: super::deadline_timers::DeadlineTimerRegistry::default(),
                 now_unix_seconds: 1_777_334_400,
-                node_capacity: crate::kubelet::node::NodeCapacity::default(),
+                node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
                 paths,
             },
             WatchEvent::modified(json!({

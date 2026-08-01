@@ -115,7 +115,7 @@ pub(crate) struct RootPodRepositoryParts {
 struct RootPodWorkqueuePersistence {
     node_local: Option<Arc<dyn klights_node_store::PodWorkqueueStore>>,
     #[cfg(test)]
-    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     #[cfg(test)]
     test_rows: Arc<std::sync::Mutex<Vec<crate::datastore::node_local::PodWorkqueueEntry>>>,
     #[cfg(test)]
@@ -415,7 +415,7 @@ pub(crate) fn new_pod_store(
 ) -> crate::kubelet::pod_repository::store::PodStore {
     crate::kubelet::pod_repository::store::PodStore::from_persistence(
         Arc::new(RootPodPersistence { db }),
-        Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+        Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
     )
 }
 
@@ -1050,8 +1050,8 @@ pub(crate) fn build_pod_repository_parts(
             crate::control_plane::client::local::always_leader_watch(),
         ))
     });
-    let wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock> =
-        Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock);
+    let wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock> =
+        Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock);
     let store = Arc::new(PodStore::from_persistence(
         Arc::new(RootPodPersistence { db: db.clone() }),
         wall_clock.clone(),
@@ -1148,8 +1148,8 @@ pub(crate) fn build_pod_repository_parts(
 pub(crate) fn build_worker_pod_repository_parts(
     config: WorkerPodRepositoryBuildConfig,
 ) -> crate::kubelet::pod_repository::facade::PodRepositoryParts {
-    let wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock> =
-        Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock);
+    let wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock> =
+        Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock);
     let store = Arc::new(PodStore::from_persistence(
         Arc::new(WorkerPodPersistence {
             resource_query: config.resource_query.clone(),

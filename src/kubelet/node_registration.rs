@@ -73,8 +73,8 @@ pub(crate) struct NodeRegistrationHostFacts {
 }
 
 impl NodeRegistrationHostFacts {
-    pub fn node_capacity(&self) -> crate::kubelet::node::NodeCapacity {
-        crate::kubelet::node::NodeCapacity::new(self.memory_ki, u64::from(self.cpu_count))
+    pub fn node_capacity(&self) -> klights_kubelet::node_capacity::NodeCapacity {
+        klights_kubelet::node_capacity::NodeCapacity::new(self.memory_ki, u64::from(self.cpu_count))
     }
 
     pub async fn capture_local(

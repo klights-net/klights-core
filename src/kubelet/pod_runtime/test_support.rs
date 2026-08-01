@@ -8,7 +8,7 @@ use super::service::{
     PodDeletionFinalizeResult, PodFinalizeStartupResult, PodRuntimeKey, PodRuntimeService,
     PodStartResult, RealPodRuntimeServiceDependencies,
 };
-use crate::kubelet::lifecycle::LifecycleCommand;
+use klights_kubelet::lifecycle::LifecycleCommand;
 
 /// Conventional non-system namespaces these runtime tests place pods in. The
 /// API create path enforces the upstream NamespaceLifecycle rule (target
@@ -1623,7 +1623,7 @@ impl PodRuntimeHarness {
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: "klights-test".into(),
             sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
-            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
             paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
             )
@@ -1701,9 +1701,7 @@ impl PodRuntimeHarness {
                     container_control: container_control.clone(),
                     network: network.clone(),
                     store: store.clone(),
-                    clock: std::sync::Arc::new(
-                        crate::kubelet::pod_runtime::store::SystemRuntimeClock,
-                    ),
+                    clock: std::sync::Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
                     slot_admission: slot_admission.clone(),
                     repository: repo.clone(),
                     filesystem: filesystem.clone(),

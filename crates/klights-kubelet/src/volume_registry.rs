@@ -1,4 +1,4 @@
-use crate::kubelet::volumes;
+use crate::volumes;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -7,13 +7,13 @@ use std::sync::Arc;
 
 pub struct VolumeContext<'a> {
     pub file_process: &'a klights_supervisor::FileProcessExecutor,
-    pub sources: &'a dyn crate::kubelet::volume_sources::VolumeSourceReader,
+    pub sources: &'a dyn crate::volume_sources::VolumeSourceReader,
     pub namespace: &'a str,
     pub pod_name: &'a str,
     pub pod_dir_id: &'a str,
     pub pod: &'a Value,
     pub volumes_root: &'a str,
-    pub node_capacity: crate::kubelet::node::NodeCapacity,
+    pub node_capacity: crate::node_capacity::NodeCapacity,
 }
 
 #[async_trait]
@@ -386,7 +386,7 @@ impl VolumeHandler for ProjectedHandler {
             .ok_or_else(|| anyhow::anyhow!("projected volume missing sources"))?;
 
         let sources_for_write =
-            crate::kubelet::projected_sa_token_refresh::projected_sources_with_fresh_service_account_token_values(
+            crate::projected_sa_token_refresh::projected_sources_with_fresh_service_account_token_values(
                 ctx.sources,
                 ctx.pod,
                 default_mode,
@@ -492,12 +492,7 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use serde_json::{Value, json};
-    use std::sync::{Arc, Mutex, OnceLock};
-
-    fn env_lock() -> &'static tokio::sync::Mutex<()> {
-        static ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        ENV_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
+    use std::sync::{Arc, Mutex};
 
     fn isolated_volumes_root(key: &str) -> String {
         std::env::temp_dir()
@@ -534,8 +529,7 @@ mod tests {
     struct RecordingVolumeSourceReader {
         resources: Vec<klights_cluster_core::Resource>,
         token: String,
-        token_requests:
-            Mutex<Vec<crate::kubelet::volume_sources::ProjectedServiceAccountTokenRequest>>,
+        token_requests: Mutex<Vec<crate::volume_sources::ProjectedServiceAccountTokenRequest>>,
     }
 
     impl RecordingVolumeSourceReader {
@@ -549,7 +543,7 @@ mod tests {
 
         fn token_requests(
             &self,
-        ) -> Vec<crate::kubelet::volume_sources::ProjectedServiceAccountTokenRequest> {
+        ) -> Vec<crate::volume_sources::ProjectedServiceAccountTokenRequest> {
             self.token_requests.lock().unwrap().clone()
         }
 
@@ -573,7 +567,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::kubelet::volume_sources::VolumeSourceReader for RecordingVolumeSourceReader {
+    impl crate::volume_sources::VolumeSourceReader for RecordingVolumeSourceReader {
         async fn config_map(
             &self,
             namespace: &str,
@@ -627,13 +621,11 @@ mod tests {
 
         async fn projected_service_account_token(
             &self,
-            request: crate::kubelet::volume_sources::ProjectedServiceAccountTokenRequest,
-        ) -> Result<crate::kubelet::volume_sources::ProjectedServiceAccountToken> {
+            request: crate::volume_sources::ProjectedServiceAccountTokenRequest,
+        ) -> Result<crate::volume_sources::ProjectedServiceAccountToken> {
             self.token_requests.lock().unwrap().push(request);
-            crate::kubelet::volume_sources::ProjectedServiceAccountToken::try_new(
-                self.token.clone(),
-            )
-            .map_err(anyhow::Error::new)
+            crate::volume_sources::ProjectedServiceAccountToken::try_new(self.token.clone())
+                .map_err(anyhow::Error::new)
         }
     }
 
@@ -725,7 +717,7 @@ mod tests {
             "leader-issued-token",
         );
 
-        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        let file_process = crate::phase15d_test_support::file_process_executor();
         let volumes_root = isolated_volumes_root(&runtime_ns);
         let ctx = VolumeContext {
             file_process: &file_process,
@@ -735,7 +727,7 @@ mod tests {
             pod_dir_id: "default_sa-pod",
             pod: &pod,
             volumes_root: &volumes_root,
-            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            node_capacity: crate::node_capacity::NodeCapacity::default(),
         };
 
         let resolved = registry
@@ -760,9 +752,7 @@ mod tests {
         assert_eq!(request.bound_node_name(), "node-a");
 
         let _ = std::fs::remove_dir_all(
-            crate::kubelet::runtime_paths::for_test(&runtime_ns)
-                .data_root()
-                .to_path_buf(),
+            crate::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns).data_root(),
         );
     }
 
@@ -831,7 +821,7 @@ mod tests {
         );
 
         let volume = pod["spec"]["volumes"][0].clone();
-        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        let file_process = crate::phase15d_test_support::file_process_executor();
         let volumes_root = isolated_volumes_root(&runtime_ns);
         let ctx = VolumeContext {
             file_process: &file_process,
@@ -841,7 +831,7 @@ mod tests {
             pod_dir_id: "default_sa-pod",
             pod: &pod,
             volumes_root: &volumes_root,
-            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            node_capacity: crate::node_capacity::NodeCapacity::default(),
         };
 
         let resolved = registry
@@ -866,9 +856,7 @@ mod tests {
         assert_eq!(sources.token_requests().len(), 1);
 
         let _ = std::fs::remove_dir_all(
-            crate::kubelet::runtime_paths::for_test(&runtime_ns)
-                .data_root()
-                .to_path_buf(),
+            crate::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns).data_root(),
         );
     }
 
@@ -926,7 +914,7 @@ mod tests {
         );
 
         let volume = pod["spec"]["volumes"][0].clone();
-        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        let file_process = crate::phase15d_test_support::file_process_executor();
         let volumes_root = isolated_volumes_root(&runtime_ns);
         let ctx = VolumeContext {
             file_process: &file_process,
@@ -936,7 +924,7 @@ mod tests {
             pod_dir_id: "default_downwardapi-volume-test",
             pod: &pod,
             volumes_root: &volumes_root,
-            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            node_capacity: crate::node_capacity::NodeCapacity::default(),
         };
 
         let resolved = registry
@@ -951,16 +939,13 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(
-            crate::kubelet::runtime_paths::for_test(&runtime_ns)
-                .data_root()
-                .to_path_buf(),
+            crate::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns).data_root(),
         );
     }
 
     #[tokio::test]
     async fn test_optional_configmap_missing_creates_placeholder_path() {
-        let _env_guard = env_lock().lock().await;
-        let db = crate::datastore::test_support::in_memory().await;
+        let sources = crate::volume_sources::empty_volume_source_reader_for_tests();
         let registry = VolumeRegistry::with_defaults();
 
         let suffix = std::time::SystemTime::now()
@@ -968,9 +953,6 @@ mod tests {
             .unwrap()
             .as_nanos();
         let runtime_ns = format!("volreg-test-cm-{}", suffix);
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("KLIGHTS_CONTAINERD_NAMESPACE", &runtime_ns) };
-
         let pod_dir_id = "default_optional-cm";
         let volume_name = "cfg";
         let volumes_root = isolated_volumes_root(&runtime_ns);
@@ -995,16 +977,16 @@ mod tests {
             "name": volume_name,
             "configMap": {"name": "missing-cm", "optional": true}
         });
-        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        let file_process = crate::phase15d_test_support::file_process_executor();
         let ctx = VolumeContext {
             file_process: &file_process,
-            sources: &db,
+            sources: sources.as_ref(),
             namespace: "default",
             pod_name: "optional-cm",
             pod_dir_id,
             pod: &pod,
             volumes_root: &volumes_root,
-            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            node_capacity: crate::node_capacity::NodeCapacity::default(),
         };
 
         let resolved = registry
@@ -1016,17 +998,13 @@ mod tests {
         assert!(std::path::Path::new(&expected_path).exists());
 
         let _ = std::fs::remove_dir_all(
-            crate::kubelet::runtime_paths::for_test(&runtime_ns)
-                .data_root()
-                .to_path_buf(),
+            crate::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns).data_root(),
         );
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("KLIGHTS_CONTAINERD_NAMESPACE") };
     }
 
     #[tokio::test]
     async fn test_empty_dir_setup_uses_keyed_filesystem_task() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let sources = crate::volume_sources::empty_volume_source_reader_for_tests();
         let registry = VolumeRegistry::with_defaults();
 
         let suffix = std::time::SystemTime::now()
@@ -1045,20 +1023,20 @@ mod tests {
             }
         });
         let volume = json!({"name": "work", "emptyDir": {}});
-        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        let file_process = crate::phase15d_test_support::file_process_executor();
         let volumes_root = isolated_volumes_root(&format!("volreg-emptydir-{suffix}"));
         let ctx = VolumeContext {
             file_process: &file_process,
-            sources: &db,
+            sources: sources.as_ref(),
             namespace: "default",
             pod_name: "emptydir-pod",
             pod_dir_id: &pod_dir_id,
             pod: &pod,
             volumes_root: &volumes_root,
-            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            node_capacity: crate::node_capacity::NodeCapacity::default(),
         };
 
-        let key = volumes::empty_dir_volume_path_under_root(&ctx.volumes_root, &pod_dir_id, "work");
+        let key = volumes::empty_dir_volume_path_under_root(ctx.volumes_root, &pod_dir_id, "work");
         let before = volumes::blocking_fs_keyed_call_count_for("create_empty_dir", &key);
         let resolved = registry
             .resolve_path(&volume, "work", &ctx)
@@ -1132,7 +1110,7 @@ mod tests {
                 ]
             }
         });
-        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        let file_process = crate::phase15d_test_support::file_process_executor();
         let volumes_root = isolated_volumes_root(&runtime_ns);
         let ctx = VolumeContext {
             file_process: &file_process,
@@ -1142,7 +1120,7 @@ mod tests {
             pod_dir_id: "default_sa-pod",
             pod: &pod,
             volumes_root: &volumes_root,
-            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            node_capacity: crate::node_capacity::NodeCapacity::default(),
         };
 
         let resolved = registry
@@ -1165,9 +1143,7 @@ mod tests {
         assert_eq!(requests[0].bound_node_uid(), None);
 
         let _ = std::fs::remove_dir_all(
-            crate::kubelet::runtime_paths::for_test(&runtime_ns)
-                .data_root()
-                .to_path_buf(),
+            crate::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns).data_root(),
         );
     }
 
@@ -1214,7 +1190,7 @@ mod tests {
                 ]
             }
         });
-        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        let file_process = crate::phase15d_test_support::file_process_executor();
         let volumes_root = isolated_volumes_root(&runtime_ns);
         let ctx = VolumeContext {
             file_process: &file_process,
@@ -1224,7 +1200,7 @@ mod tests {
             pod_dir_id: "default_sa-pod",
             pod: &pod,
             volumes_root: &volumes_root,
-            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            node_capacity: crate::node_capacity::NodeCapacity::default(),
         };
 
         let resolved = registry
@@ -1244,9 +1220,7 @@ mod tests {
         assert_eq!(requests[0].bound_pod_uid(), "pod-uid-a");
 
         let _ = std::fs::remove_dir_all(
-            crate::kubelet::runtime_paths::for_test(&runtime_ns)
-                .data_root()
-                .to_path_buf(),
+            crate::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns).data_root(),
         );
     }
 
@@ -1293,7 +1267,7 @@ mod tests {
                 ]
             }
         });
-        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        let file_process = crate::phase15d_test_support::file_process_executor();
         let volumes_root = isolated_volumes_root(&runtime_ns);
         let ctx = VolumeContext {
             file_process: &file_process,
@@ -1303,7 +1277,7 @@ mod tests {
             pod_dir_id: "default_empty-sa-pod",
             pod: &pod,
             volumes_root: &volumes_root,
-            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            node_capacity: crate::node_capacity::NodeCapacity::default(),
         };
 
         let resolved = registry
@@ -1325,9 +1299,7 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(
-            crate::kubelet::runtime_paths::for_test(&runtime_ns)
-                .data_root()
-                .to_path_buf(),
+            crate::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns).data_root(),
         );
     }
 
@@ -1339,7 +1311,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let runtime_ns = format!("volreg-test-sa-signer-{}", suffix);
-        let etc_dir = crate::kubelet::runtime_paths::for_test(&runtime_ns)
+        let etc_dir = crate::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
             .etc_dir()
             .to_string_lossy()
             .into_owned();
@@ -1370,7 +1342,7 @@ mod tests {
                 ]
             }
         });
-        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        let file_process = crate::phase15d_test_support::file_process_executor();
         let volumes_root = isolated_volumes_root(&runtime_ns);
         let ctx = VolumeContext {
             file_process: &file_process,
@@ -1380,7 +1352,7 @@ mod tests {
             pod_dir_id: "default_sa-pod",
             pod: &pod,
             volumes_root: &volumes_root,
-            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            node_capacity: crate::node_capacity::NodeCapacity::default(),
         };
 
         let resolved = registry
@@ -1395,9 +1367,7 @@ mod tests {
         assert_eq!(sources.token_requests().len(), 1);
 
         let _ = std::fs::remove_dir_all(
-            crate::kubelet::runtime_paths::for_test(&runtime_ns)
-                .data_root()
-                .to_path_buf(),
+            crate::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns).data_root(),
         );
     }
 }

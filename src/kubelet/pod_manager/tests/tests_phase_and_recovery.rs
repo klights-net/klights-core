@@ -1,7 +1,7 @@
 use super::*;
 
 async fn process_volumes(
-    sources: &dyn crate::kubelet::volume_sources::VolumeSourceReader,
+    sources: &dyn klights_kubelet::volume_sources::VolumeSourceReader,
     pod_dir_id: &str,
     pod_name: &str,
     namespace: &str,
@@ -15,11 +15,11 @@ async fn process_volumes(
             .to_path_buf(),
     )
     .unwrap();
-    let manager = crate::kubelet::pod_volume_manager::PodVolumeManager::new(
+    let manager = klights_kubelet::pod_volume_manager::PodVolumeManager::new(
         &file_process,
         sources,
         &paths,
-        crate::kubelet::node::NodeCapacity::default(),
+        klights_kubelet::node_capacity::NodeCapacity::default(),
     );
     manager
         .process_volumes(pod_dir_id, pod_name, namespace, pod)

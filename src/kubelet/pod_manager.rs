@@ -134,7 +134,7 @@ async fn spawn_cri_event_forwarder(
     lifecycle_tx: Option<
         tokio::sync::mpsc::Sender<crate::kubelet::reconciler::cri_reconnect::CriStreamLifecycle>,
     >,
-    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 ) -> CriEventReceiver {
     event_forwarder::spawn_cri_event_forwarder(
         cri,
@@ -674,14 +674,14 @@ async fn pod_lifecycle_key_for_cri_event(
 }
 
 fn lifecycle_command_target(
-    command: &crate::kubelet::lifecycle::LifecycleCommand,
+    command: &klights_kubelet::lifecycle::LifecycleCommand,
 ) -> (&str, &str, &str) {
     command.target()
 }
 
 pub(crate) async fn lifecycle_message_from_command(
     _pod_repo: &Arc<crate::kubelet::pod_repository::PodRepository>,
-    command: crate::kubelet::lifecycle::LifecycleCommand,
+    command: klights_kubelet::lifecycle::LifecycleCommand,
 ) -> Option<LifecycleMessage> {
     let (namespace, pod_name, pod_uid) = lifecycle_command_target(&command);
     if pod_uid.is_empty() {

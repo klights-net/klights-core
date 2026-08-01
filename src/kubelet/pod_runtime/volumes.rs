@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::kubelet::pod_runtime::service::PodRuntimeKey;
-use crate::kubelet::volume_sources::VolumeSourceReader;
+use klights_kubelet::volume_sources::VolumeSourceReader;
 use klights_supervisor::TaskSupervisor;
 use tokio_util::sync::CancellationToken;
 
@@ -32,7 +32,7 @@ pub struct RealPodVolumeRuntime {
     _containerd_namespace: String,
     supervisor: Arc<TaskSupervisor>,
     file_process: klights_supervisor::FileProcessExecutor,
-    node_capacity: crate::kubelet::node::NodeCapacity,
+    node_capacity: klights_kubelet::node_capacity::NodeCapacity,
     paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
     projected_sa_refresh_cancellations: Arc<Mutex<HashMap<PodRuntimeKey, CancellationToken>>>,
 }
@@ -42,7 +42,7 @@ impl RealPodVolumeRuntime {
         sources: Arc<dyn VolumeSourceReader>,
         containerd_namespace: String,
         supervisor: Arc<TaskSupervisor>,
-        node_capacity: crate::kubelet::node::NodeCapacity,
+        node_capacity: klights_kubelet::node_capacity::NodeCapacity,
         paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
     ) -> Self {
         Self {
@@ -72,7 +72,7 @@ impl RealPodVolumeRuntime {
         key: &PodRuntimeKey,
         pod: &serde_json::Value,
     ) -> anyhow::Result<()> {
-        if !crate::kubelet::projected_sa_token_refresh::pod_has_projected_service_account_tokens(
+        if !klights_kubelet::projected_sa_token_refresh::pod_has_projected_service_account_tokens(
             pod,
         ) {
             self.cancel_projected_sa_refresh(key);
@@ -86,12 +86,12 @@ impl RealPodVolumeRuntime {
             .expect("projected SA refresh cancellation map poisoned")
             .insert(key.clone(), cancel.clone());
         let volumes_root = self.paths.volumes_root().to_string_lossy().into_owned();
-        crate::kubelet::projected_sa_token_refresh::schedule_projected_service_account_token_refresh(
-            crate::kubelet::projected_sa_token_refresh::ProjectedSaTokenRefreshRequest {
+        klights_kubelet::projected_sa_token_refresh::schedule_projected_service_account_token_refresh(
+            klights_kubelet::projected_sa_token_refresh::ProjectedSaTokenRefreshRequest {
                 file_process: self.file_process.clone(),
                 sources: self.sources.clone(),
                 volumes_root,
-                key: key.clone(),
+                key: klights_types::PodIdentity::new(&key.namespace, &key.name, &key.uid),
                 node_capacity: self.node_capacity,
             },
             pod,
@@ -110,7 +110,7 @@ impl PodVolumeRuntime for RealPodVolumeRuntime {
         pod: &serde_json::Value,
     ) -> anyhow::Result<HashMap<String, String>> {
         let pod_dir_id = key.volume_dir_id();
-        let manager = crate::kubelet::pod_volume_manager::PodVolumeManager::new(
+        let manager = klights_kubelet::pod_volume_manager::PodVolumeManager::new(
             &self.file_process,
             self.sources.as_ref(),
             &self.paths,
@@ -129,8 +129,11 @@ impl PodVolumeRuntime for RealPodVolumeRuntime {
         let pod_dir_id = key.volume_dir_id();
         let pod_volumes_dir = self.paths.volumes_root().join(&pod_dir_id).join("volumes");
         let pod_volumes_path = pod_volumes_dir.to_string_lossy().into_owned();
-        crate::kubelet::volumes::unmount_volume_mounts_under(&self.file_process, &pod_volumes_path)
-            .await?;
+        klights_kubelet::volumes::unmount_volume_mounts_under(
+            &self.file_process,
+            &pod_volumes_path,
+        )
+        .await?;
         klights_supervisor::runtime_fs::remove_dir_all_if_exists_async(
             &self.file_process,
             &pod_volumes_dir,
@@ -160,12 +163,12 @@ mod tests {
                 .unwrap();
 
         let runtime = RealPodVolumeRuntime::new(
-            crate::kubelet::volume_sources::empty_volume_source_reader_for_tests(),
+            klights_kubelet::volume_sources::empty_volume_source_reader_for_tests(),
             containerd_ns.to_string(),
             Arc::new(klights_supervisor::TaskSupervisor::new(
                 klights_supervisor::TaskCategoryConfig::default(),
             )),
-            crate::kubelet::node::NodeCapacity::default(),
+            klights_kubelet::node_capacity::NodeCapacity::default(),
             runtime_paths.clone(),
         );
         let key = PodRuntimeKey {
@@ -197,12 +200,12 @@ mod tests {
         let temp = tempfile::tempdir().expect("create kubelet test fixture");
 
         let runtime = RealPodVolumeRuntime::new(
-            crate::kubelet::volume_sources::empty_volume_source_reader_for_tests(),
+            klights_kubelet::volume_sources::empty_volume_source_reader_for_tests(),
             containerd_ns.to_string(),
             Arc::new(klights_supervisor::TaskSupervisor::new(
                 klights_supervisor::TaskCategoryConfig::default(),
             )),
-            crate::kubelet::node::NodeCapacity::default(),
+            klights_kubelet::node_capacity::NodeCapacity::default(),
             crate::kubelet::runtime_paths::KubeletRuntimePaths::new(temp.path().to_path_buf())
                 .unwrap(),
         );

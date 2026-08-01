@@ -7,7 +7,7 @@ use crate::kubelet::pod_repository::PodRepository;
 
 pub(crate) type PodLifecycleReceiver = Arc<
     tokio::sync::Mutex<
-        Option<tokio::sync::mpsc::Receiver<crate::kubelet::lifecycle::LifecycleCommand>>,
+        Option<tokio::sync::mpsc::Receiver<klights_kubelet::lifecycle::LifecycleCommand>>,
     >,
 >;
 
@@ -35,7 +35,7 @@ impl HostIpState {
 
 pub(crate) type KubeletConfig = klights_kubelet::context::KubeletConfig<
     crate::kubelet::log_rotation::LogRotationPolicy,
-    crate::kubelet::node::NodeCapacity,
+    klights_kubelet::node_capacity::NodeCapacity,
     crate::kubelet::runtime_paths::KubeletRuntimePaths,
 >;
 
@@ -52,7 +52,7 @@ pub(crate) type KubeletStatusDeliveryServices =
     klights_kubelet::context::StatusDeliveryServices<Outbox>;
 
 pub(crate) type KubeletLocalExecutionServices = klights_kubelet::context::LocalExecutionServices<
-    dyn crate::kubelet::pod_runtime::store::RuntimeClock,
+    dyn klights_kubelet::runtime_clock::RuntimeClock,
     KubeletConfig,
 >;
 

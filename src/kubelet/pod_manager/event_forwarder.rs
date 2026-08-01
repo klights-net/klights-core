@@ -7,7 +7,7 @@ pub(super) async fn spawn_cri_event_forwarder(
     lifecycle_tx: Option<
         tokio::sync::mpsc::Sender<crate::kubelet::reconciler::cri_reconnect::CriStreamLifecycle>,
     >,
-    wall_clock: std::sync::Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    wall_clock: std::sync::Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 ) -> CriEventReceiver {
     use crate::kubelet::cri_events::{KubeletEvent, KubeletEventKind};
     use crate::kubelet::pod_runtime::cri::CriRuntimeContainerEventKind;
@@ -280,7 +280,7 @@ mod tests {
             cancel.clone(),
             supervisor(),
             Some(_tx),
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         )
         .await;
 
@@ -312,7 +312,7 @@ mod tests {
             cancel.clone(),
             supervisor(),
             Some(tx),
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         )
         .await;
 

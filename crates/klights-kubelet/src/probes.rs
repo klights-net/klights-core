@@ -400,7 +400,7 @@ async fn check_grpc_probe_once(
 
 /// Check exec probe via CRI ExecSync
 pub async fn check_exec_probe(
-    cri: &dyn crate::kubelet::pod_runtime::cri::CriRuntime,
+    cri: &dyn crate::runtime::cri::CriRuntime,
     container_id: &str,
     probe: &ExecProbe,
     timeout: u64,

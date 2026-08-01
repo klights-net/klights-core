@@ -1,17 +1,10 @@
-#[cfg(test)]
-use crate::datastore::DatastoreHandle;
-use crate::kubelet::lifecycle::LifecycleCommand;
-#[cfg(test)]
-use crate::kubelet::pod_repository::{PodRepository, PodStatusWriter};
-use crate::kubelet::probes::parse_probe_for_container;
+use crate::lifecycle::LifecycleCommand;
+use crate::probes::parse_probe_for_container;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
-#[cfg(test)]
-mod tests;
-
 mod exec;
 mod grpc;
 mod http;
@@ -74,46 +67,20 @@ pub struct ProbeManager {
     /// Tracks readiness/liveness gating once startup probe has passed.
     /// Key format: namespace/name/uid/container when UID is known.
     startup_completed: Arc<RwLock<HashSet<String>>>,
-    pod_reader: Arc<dyn crate::kubelet::pod_repository::PodReader>,
-    cri: Option<Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>>,
+    pod_reader: Arc<dyn klights_pod_api::PodQuery>,
+    cri: Option<Arc<dyn crate::runtime::cri::CriRuntime>>,
     lifecycle_tx: mpsc::Sender<LifecycleCommand>,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    wall_clock: Arc<dyn crate::runtime_clock::RuntimeClock>,
 }
 
 impl ProbeManager {
-    #[cfg(test)]
-    pub fn new(db_handle: DatastoreHandle, _containerd_namespace: String) -> Self {
-        let (lifecycle_tx, _rx) = mpsc::channel(1);
-        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
-            klights_supervisor::TaskCategoryConfig::default(),
-        ));
-        let metrics = crate::side_effects::SideEffectMetrics::new();
-        let side_effects = Arc::new(crate::side_effects::SideEffectRegistry::new());
-        let pod_reader: Arc<dyn crate::kubelet::pod_repository::PodReader> =
-            Arc::new(crate::kubelet::pod_repository::PodRepository::new(
-                db_handle.clone(),
-                supervisor.clone(),
-                side_effects,
-                metrics,
-            ));
-        Self::new_with_lifecycle(
-            supervisor,
-            pod_reader,
-            Some(Arc::new(
-                crate::kubelet::pod_runtime::test_support::MockCriRuntime::new(),
-            )),
-            lifecycle_tx,
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
-        )
-    }
-
     pub fn new_with_lifecycle(
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-        pod_reader: Arc<dyn crate::kubelet::pod_repository::PodReader>,
-        cri: Option<Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>>,
+        pod_reader: Arc<dyn klights_pod_api::PodQuery>,
+        cri: Option<Arc<dyn crate::runtime::cri::CriRuntime>>,
         lifecycle_tx: mpsc::Sender<LifecycleCommand>,
-        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+        wall_clock: Arc<dyn crate::runtime_clock::RuntimeClock>,
     ) -> Self {
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
@@ -353,6 +320,11 @@ impl ProbeManager {
         )
         .await
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn task_count_for_test(&self, key: &str) -> Option<usize> {
+        self.tasks.read().await.get(key).map(Vec::len)
+    }
 }
 
 fn probe_task_key(namespace: &str, name: &str, uid: &str) -> String {
@@ -363,154 +335,59 @@ fn probe_task_key(namespace: &str, name: &str, uid: &str) -> String {
     }
 }
 
-/// Update pod Ready condition based on readiness probe result.
-/// Also updates containerStatuses[].ready for the specific container so the
-/// monitor loop's extract_ready_containers_from_pod_condition sees the change.
-/// Note: Liveness probes do NOT update conditions - they trigger container restarts
 #[cfg(test)]
-pub struct PodConditionProbeUpdate<'a> {
-    pub namespace: &'a str,
-    pub name: &'a str,
-    pub pod_uid: &'a str,
-    pub container_name: &'a str,
-    pub probe_type: ProbeType,
-    pub success: bool,
-}
+mod tests {
+    use super::parse_probe_params;
+    use serde_json::json;
 
-#[cfg(test)]
-pub async fn update_pod_condition(
-    db_handle: &DatastoreHandle,
-    pod_repo: &Arc<PodRepository>,
-    pod_key: &str,
-    container_name: &str,
-    probe_type: ProbeType,
-    success: bool,
-) -> Result<()> {
-    update_pod_condition_with_supervisor(
-        db_handle,
-        pod_repo,
-        pod_key,
-        container_name,
-        probe_type,
-        success,
-        std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
-            klights_supervisor::TaskCategoryConfig::default(),
-        )),
-    )
-    .await
-}
+    #[test]
+    fn probe_params_preserve_explicit_values() {
+        let params = parse_probe_params(&json!({
+            "initialDelaySeconds": 5,
+            "periodSeconds": 15,
+            "timeoutSeconds": 3,
+            "failureThreshold": 5,
+            "successThreshold": 2
+        }));
 
-#[cfg(test)]
-pub async fn update_pod_condition_for_uid(
-    db_handle: &DatastoreHandle,
-    pod_repo: &Arc<PodRepository>,
-    update: PodConditionProbeUpdate<'_>,
-) -> Result<()> {
-    update_pod_condition_for_uid_with_supervisor(
-        db_handle,
-        pod_repo,
-        update,
-        std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
-            klights_supervisor::TaskCategoryConfig::default(),
-        )),
-    )
-    .await
-}
-
-#[cfg(test)]
-pub async fn update_pod_condition_with_supervisor(
-    db_handle: &DatastoreHandle,
-    pod_repo: &Arc<PodRepository>,
-    pod_key: &str,
-    container_name: &str,
-    probe_type: ProbeType,
-    success: bool,
-    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
-) -> Result<()> {
-    let parts: Vec<&str> = pod_key.split('/').collect();
-    if parts.len() != 2 {
-        anyhow::bail!("Invalid pod key: {}", pod_key);
-    }
-    let namespace = parts[0];
-    let name = parts[1];
-
-    use crate::kubelet::pod_repository::PodReader;
-    let Some(pod_resource) = pod_repo.get_pod(namespace, name).await? else {
-        return Ok(());
-    };
-
-    update_pod_condition_for_uid_with_supervisor(
-        db_handle,
-        pod_repo,
-        PodConditionProbeUpdate {
-            namespace,
-            name,
-            pod_uid: &pod_resource.uid,
-            container_name,
-            probe_type,
-            success,
-        },
-        task_supervisor,
-    )
-    .await
-}
-
-#[cfg(test)]
-pub async fn update_pod_condition_for_uid_with_supervisor(
-    _db_handle: &DatastoreHandle,
-    pod_repo: &Arc<PodRepository>,
-    update: PodConditionProbeUpdate<'_>,
-    _task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
-) -> Result<()> {
-    let PodConditionProbeUpdate {
-        namespace,
-        name,
-        pod_uid,
-        container_name,
-        probe_type,
-        success,
-    } = update;
-    // Only readiness probes update conditions
-    if !matches!(probe_type, ProbeType::Readiness) {
-        return Ok(());
+        assert_eq!(params.initial_delay, 5);
+        assert_eq!(params.interval_secs, 15);
+        assert_eq!(params.timeout_secs, 3);
+        assert_eq!(params.failure_threshold, 5);
+        assert_eq!(params.success_threshold, 2);
     }
 
-    // Centralized probe-readiness write. Persists `containerStatuses[name].ready`,
-    // refreshes `Ready` and `ContainersReady` conditions (with the correct
-    // `ReadinessProbe{Succeeded,Failed}` reason), and only bumps
-    // `lastTransitionTime` on an actual flip.
-    //
-    // Preserve historical semantics: a probe firing against a pod that has
-    // been deleted in the meantime is not an error — the caller logs at
-    // warn level and we want this path to no-op gracefully.
-    use crate::kubelet::pod_repository::PodReader;
-    let pod_resource = match pod_repo.get_pod_for_uid(namespace, name, pod_uid).await? {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-    let updated = pod_repo
-        .set_probe_readiness_for_uid(
-            namespace,
-            name,
-            &pod_resource.uid,
-            container_name,
-            success,
-            None,
-        )
-        .await?;
-
-    let pod = updated.data;
-
-    let node_name = pod
-        .pointer("/spec/nodeName")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-
-    // Readiness updates refresh the pod's containerStatuses; PodRepository
-    // centralizes the owner status refresh and bounded rollout enqueue.
-    if let Some(node_name) = node_name.as_deref() {
-        let _ = node_name; // keep for future status dispatcher
+    #[test]
+    fn probe_params_apply_kubernetes_defaults_to_missing_and_zero_values() {
+        for spec in [
+            json!({}),
+            json!({
+                "periodSeconds": 0,
+                "timeoutSeconds": 0,
+                "failureThreshold": 0,
+                "successThreshold": 0
+            }),
+        ] {
+            let params = parse_probe_params(&spec);
+            assert_eq!(params.initial_delay, 0);
+            assert_eq!(params.interval_secs, 10);
+            assert_eq!(params.timeout_secs, 1);
+            assert_eq!(params.failure_threshold, 3);
+            assert_eq!(params.success_threshold, 1);
+        }
     }
 
-    Ok(())
+    #[test]
+    fn probe_params_default_only_missing_values() {
+        let params = parse_probe_params(&json!({
+            "periodSeconds": 20,
+            "failureThreshold": 10
+        }));
+
+        assert_eq!(params.initial_delay, 0);
+        assert_eq!(params.interval_secs, 20);
+        assert_eq!(params.timeout_secs, 1);
+        assert_eq!(params.failure_threshold, 10);
+        assert_eq!(params.success_threshold, 1);
+    }
 }

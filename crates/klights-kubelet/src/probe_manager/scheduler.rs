@@ -1,8 +1,8 @@
-use crate::kubelet::lifecycle::{LifecycleCommand, RestartReason};
-use crate::kubelet::pod_repository::PodReader;
-use crate::kubelet::probe_manager::{exec, grpc, http, tcp};
-use crate::kubelet::probes::Probe;
+use crate::lifecycle::{LifecycleCommand, RestartReason};
+use crate::probe_manager::{exec, grpc, http, tcp};
+use crate::probes::Probe;
 use anyhow::{Result, anyhow};
+use klights_pod_api::{PodGetRequest, PodQuery};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
@@ -17,11 +17,11 @@ pub enum ProbeType {
 
 pub struct ProbeTaskRuntime {
     pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    pub pod_reader: Arc<dyn PodReader>,
-    pub cri: Option<Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>>,
+    pub pod_reader: Arc<dyn PodQuery>,
+    pub cri: Option<Arc<dyn crate::runtime::cri::CriRuntime>>,
     pub startup_completed: Arc<RwLock<HashSet<String>>>,
     pub lifecycle_tx: mpsc::Sender<LifecycleCommand>,
-    pub wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    pub wall_clock: Arc<dyn crate::runtime_clock::RuntimeClock>,
 }
 
 pub struct ProbeTaskTiming {
@@ -115,6 +115,7 @@ pub async fn spawn_probe_task_with_params(
     let mut split = pod_key.splitn(2, '/');
     let namespace = split.next().unwrap_or("").to_string();
     let pod_name = split.next().unwrap_or("").to_string();
+    let pod_request = PodGetRequest::try_by_name(&namespace, &pod_name)?;
 
     let startup_gate_key = if pod_uid.is_empty() {
         format!("{}/{}", pod_key, container_name)
@@ -128,7 +129,7 @@ pub async fn spawn_probe_task_with_params(
             klights_supervisor::TaskCategory::PodProbe,
             format!("probe_task_{probe_type:?}_{pod_key}_{container_name}"),
             async move {
-                let http_client = crate::kubelet::probes::build_probe_http_client().ok();
+                let http_client = crate::probes::build_probe_http_client().ok();
 
                 let interval_duration = Duration::from_secs(interval_secs);
                 let mut consecutive_failures = 0u32;
@@ -154,7 +155,7 @@ pub async fn spawn_probe_task_with_params(
                         continue;
                     }
 
-                    let res = match pod_reader.get_pod(&namespace, &pod_name).await {
+                    let res = match pod_reader.get_pod(pod_request.clone()).await {
                         Ok(Some(res)) => res,
                         Ok(None) => {
                             tracing::debug!(
@@ -361,9 +362,40 @@ pub async fn spawn_probe_task_with_params(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kubelet::probes::TcpProbe;
+    use crate::probes::TcpProbe;
+    use klights_pod_api::{
+        PodListRequest, PodListResult, PodOwnerListRequest, PodRepositoryError, PodRepositoryFuture,
+    };
     use serde_json::json;
     use std::sync::Arc;
+
+    struct StaticPodQuery(klights_cluster_core::Resource);
+
+    impl PodQuery for StaticPodQuery {
+        fn get_pod(
+            &self,
+            _request: PodGetRequest,
+        ) -> PodRepositoryFuture<'_, Option<klights_cluster_core::Resource>> {
+            Box::pin(async { Ok(Some(self.0.clone())) })
+        }
+
+        fn list_pods(&self, _request: PodListRequest) -> PodRepositoryFuture<'_, PodListResult> {
+            Box::pin(async { Err(PodRepositoryError::unavailable("unused list operation")) })
+        }
+
+        fn list_pods_by_owner_uid(
+            &self,
+            _request: PodOwnerListRequest,
+        ) -> PodRepositoryFuture<'_, Vec<klights_cluster_core::Resource>> {
+            Box::pin(async { Err(PodRepositoryError::unavailable("unused owner query")) })
+        }
+    }
+
+    fn static_pod_query(pod: serde_json::Value) -> Arc<dyn PodQuery> {
+        Arc::new(StaticPodQuery(
+            klights_cluster_core::Resource::try_from_data(Arc::new(pod)).unwrap(),
+        ))
+    }
 
     #[test]
     fn initial_delay_elapsed_uses_container_started_at() {
@@ -414,42 +446,30 @@ mod tests {
 
     #[tokio::test]
     async fn probe_task_exits_without_command_when_pod_uid_changes() {
-        let db = crate::datastore::test_support::in_memory().await;
-        let pod_reader: Arc<dyn PodReader> =
-            crate::controllers::test_utils::pod_repository_for_test(&db);
-
-        db.create_resource(
-            "v1",
-            "Pod",
-            Some("default"),
-            "probed",
-            json!({
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": {
-                    "namespace": "default",
-                    "name": "probed",
-                    "uid": "new-uid"
-                },
-                "spec": {"containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10.1"}]},
-                "status": {
-                    "phase": "Running",
-                    "podIP": "127.0.0.1",
-                    "conditions": [{"type": "Ready", "status": "True"}],
-                    "containerStatuses": [{
-                        "name": "app",
-                        "containerID": "containerd://new-container",
-                        "ready": true,
-                        "state": {"running": {"startedAt": "2026-05-01T05:12:39Z"}}
-                    }]
-                }
-            }),
-        )
-        .await
-        .unwrap();
+        let pod_reader = static_pod_query(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": "probed",
+                "uid": "new-uid"
+            },
+            "spec": {"containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10.1"}]},
+            "status": {
+                "phase": "Running",
+                "podIP": "127.0.0.1",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{
+                    "name": "app",
+                    "containerID": "containerd://new-container",
+                    "ready": true,
+                    "state": {"running": {"startedAt": "2026-05-01T05:12:39Z"}}
+                }]
+            }
+        }));
 
         let stored = pod_reader
-            .get_pod("default", "probed")
+            .get_pod(PodGetRequest::try_by_name("default", "probed").unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -474,7 +494,7 @@ mod tests {
                 cri: None,
                 startup_completed,
                 lifecycle_tx: tx,
-                wall_clock: Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+                wall_clock: Arc::new(crate::runtime_clock::SystemRuntimeClock),
             },
             ProbeTaskSpec {
                 pod_key: "default/probed".to_string(),
@@ -512,39 +532,27 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let accept_task = tokio::spawn(async move { while listener.accept().await.is_ok() {} });
 
-        let db = crate::datastore::test_support::in_memory().await;
-        let pod_reader: Arc<dyn PodReader> =
-            crate::controllers::test_utils::pod_repository_for_test(&db);
-
-        db.create_resource(
-            "v1",
-            "Pod",
-            Some("default"),
-            "probed",
-            json!({
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": {
-                    "namespace": "default",
-                    "name": "probed",
-                    "uid": "uid-ready"
-                },
-                "spec": {"containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10.1"}]},
-                "status": {
-                    "phase": "Running",
-                    "podIP": "127.0.0.1",
-                    "conditions": [{"type": "Ready", "status": "True"}],
-                    "containerStatuses": [{
-                        "name": "app",
-                        "containerID": "containerd://ready-container",
-                        "ready": true,
-                        "state": {"running": {"startedAt": "2026-05-01T05:12:39Z"}}
-                    }]
-                }
-            }),
-        )
-        .await
-        .unwrap();
+        let pod_reader = static_pod_query(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": "probed",
+                "uid": "uid-ready"
+            },
+            "spec": {"containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10.1"}]},
+            "status": {
+                "phase": "Running",
+                "podIP": "127.0.0.1",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{
+                    "name": "app",
+                    "containerID": "containerd://ready-container",
+                    "ready": true,
+                    "state": {"running": {"startedAt": "2026-05-01T05:12:39Z"}}
+                }]
+            }
+        }));
 
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
@@ -559,7 +567,7 @@ mod tests {
                 cri: None,
                 startup_completed,
                 lifecycle_tx: tx,
-                wall_clock: Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+                wall_clock: Arc::new(crate::runtime_clock::SystemRuntimeClock),
             },
             ProbeTaskSpec {
                 pod_key: "default/probed".to_string(),

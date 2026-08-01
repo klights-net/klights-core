@@ -31,7 +31,7 @@ pub(super) struct PodStatusService {
     outbox: Option<Arc<Outbox>>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     host_ip: HostIpState,
-    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     deferred_runtime: DeferredRuntimeReducerHandle,
 }
 
@@ -189,7 +189,7 @@ impl PodStatusService {
         outbox: Option<Arc<Outbox>>,
         cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
         host_ip: HostIpState,
-        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+        wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     ) -> Self {
         Self {
             store,

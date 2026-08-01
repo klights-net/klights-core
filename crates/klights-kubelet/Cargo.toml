@@ -18,8 +18,11 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true, features = ["clock", "oldtime"] }
+h2 = { workspace = true }
+hyper = { workspace = true }
 inotify = { workspace = true }
 k8s-cri = { workspace = true }
 klights-leader-api = { workspace = true }

@@ -547,7 +547,7 @@ async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_matc
         crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(
             pod_runtime_store,
             "node-1",
-            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         ),
     );
     let runtime = crate::kubelet::pod_runtime::network::RealPodNetworkRuntime::new(
@@ -1173,7 +1173,7 @@ async fn real_pod_runtime_service_constructor_requires_all_object_ports() {
         service_cidr: "10.43.128.0/17".into(),
         containerd_namespace: "klights-test".into(),
         sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
-        node_capacity: crate::kubelet::node::NodeCapacity::default(),
+        node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
         paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
             "/tmp/klights-runtime-test",
         ))
@@ -1193,7 +1193,7 @@ async fn real_pod_runtime_service_constructor_requires_all_object_ports() {
             container_control,
             network,
             store,
-            clock: Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            clock: Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             slot_admission,
             repository: repo,
             filesystem,
@@ -1507,7 +1507,7 @@ async fn real_runtime_start_pod_uses_provided_snapshot_without_fresh_liveness_re
             container_control: harness.container_control.clone(),
             network: harness.network.clone(),
             store: harness.store.clone(),
-            clock: Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            clock: Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             slot_admission: harness.slot_admission.clone(),
             repository: Arc::new(SnapshotOnlyStartRepository {
                 inner: harness.repo.clone(),
@@ -1526,7 +1526,7 @@ async fn real_runtime_start_pod_uses_provided_snapshot_without_fresh_liveness_re
                 service_cidr: "10.43.128.0/17".to_string(),
                 containerd_namespace: "klights-test".to_string(),
                 sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
-                node_capacity: crate::kubelet::node::NodeCapacity::default(),
+                node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
                 paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
                     std::path::PathBuf::from("/tmp/klights-runtime-test"),
                 )
@@ -3962,7 +3962,7 @@ async fn fixture_runtime_with_node(
         service_cidr: "10.43.128.0/17".into(),
         containerd_namespace: "klights-test".into(),
         sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
-        node_capacity: crate::kubelet::node::NodeCapacity::default(),
+        node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
         paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
             "/tmp/klights-runtime-test",
         ))
@@ -3985,7 +3985,7 @@ async fn fixture_runtime_with_node(
                 container_control,
                 network,
                 store,
-                clock: std::sync::Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+                clock: std::sync::Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
                 slot_admission,
                 repository: repo.clone(),
                 filesystem,
@@ -4163,7 +4163,7 @@ async fn fixture_runtime_with_cluster(
         service_cidr: "10.43.128.0/17".into(),
         containerd_namespace: "klights-test".into(),
         sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
-        node_capacity: crate::kubelet::node::NodeCapacity::default(),
+        node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
         paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
             "/tmp/klights-runtime-test",
         ))
@@ -4178,7 +4178,7 @@ async fn fixture_runtime_with_cluster(
                 container_control,
                 network,
                 store,
-                clock: std::sync::Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+                clock: std::sync::Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
                 slot_admission,
                 repository: repo.clone(),
                 filesystem,
@@ -4949,7 +4949,7 @@ async fn shared_cri_runtime_implements_container_runtime_control_with_parity() {
 
 struct FixedRuntimeClock(i64);
 
-impl crate::kubelet::pod_runtime::store::RuntimeClock for FixedRuntimeClock {
+impl klights_kubelet::runtime_clock::RuntimeClock for FixedRuntimeClock {
     fn now_ms(&self) -> i64 {
         self.0
     }
@@ -5275,7 +5275,7 @@ async fn readiness_lifecycle_command_persists_probe_result_with_parity() {
         .await
         .unwrap();
 
-    let cmd = crate::kubelet::lifecycle::LifecycleCommand::ReadinessChanged {
+    let cmd = klights_kubelet::lifecycle::LifecycleCommand::ReadinessChanged {
         pod_uid: "uid-netserver-0".into(),
         namespace: "pod-network-test".into(),
         pod_name: "netserver-0".into(),
@@ -5316,7 +5316,7 @@ async fn readiness_lifecycle_command_persists_probe_result_with_parity() {
 #[tokio::test]
 async fn real_runtime_handle_lifecycle_command_startup_passed() {
     let harness = PodRuntimeHarness::new().await;
-    let cmd = crate::kubelet::lifecycle::LifecycleCommand::StartupPassed {
+    let cmd = klights_kubelet::lifecycle::LifecycleCommand::StartupPassed {
         pod_uid: "uid-sp".into(),
         namespace: "ns".into(),
         pod_name: "startup-pod".into(),
@@ -5328,9 +5328,9 @@ async fn real_runtime_handle_lifecycle_command_startup_passed() {
 
 #[tokio::test]
 async fn liveness_restart_uses_runtime_container_id_with_parity() {
-    use crate::kubelet::lifecycle::{LifecycleCommand, RestartReason};
     use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
+    use klights_kubelet::lifecycle::{LifecycleCommand, RestartReason};
 
     let harness = PodRuntimeHarness::new().await;
     let pod = serde_json::json!({
@@ -5475,9 +5475,9 @@ async fn liveness_restart_uses_runtime_container_id_with_parity() {
 
 #[tokio::test]
 async fn liveness_restart_publishes_replacement_container_status_immediately() {
-    use crate::kubelet::lifecycle::{LifecycleCommand, RestartReason};
     use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
+    use klights_kubelet::lifecycle::{LifecycleCommand, RestartReason};
 
     let harness = PodRuntimeHarness::new().await;
     let pod = serde_json::json!({
@@ -5629,7 +5629,7 @@ async fn reconcile_ephemeral_full_sequence_with_parity() {
         service_cidr: "10.96.0.0/12".into(),
         containerd_namespace: "klights-test".into(),
         sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
-        node_capacity: crate::kubelet::node::NodeCapacity::default(),
+        node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
         paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
             "/tmp/klights-runtime-test",
         ))
@@ -9132,7 +9132,7 @@ async fn mocked_runtime_does_not_create_termination_log_file_directly() {
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: runtime_namespace.into(),
             sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
-            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
             paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
             )
@@ -9205,7 +9205,7 @@ async fn mocked_runtime_does_not_read_termination_message_file_directly() {
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: runtime_namespace.into(),
             sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
-            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
             paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
             )
@@ -9319,7 +9319,7 @@ async fn termination_message_mount_path_with_parity() {
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: runtime_namespace.into(),
             sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
-            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
             paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
             )
@@ -9395,7 +9395,7 @@ async fn hosts_file_mount_path_with_parity() {
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: runtime_namespace.into(),
             sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
-            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
             paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
             )
@@ -9475,7 +9475,7 @@ async fn termination_message_file_handling_with_parity() {
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: runtime_namespace.into(),
             sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
-            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
             paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
             )
@@ -9878,7 +9878,7 @@ async fn kubernetes_service_envs_with_parity() {
             service_cidr: "10.96.0.0/12".into(),
             containerd_namespace: "klights-test".into(),
             sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
-            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
             paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
             )
@@ -10588,7 +10588,7 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
             container_control: std::sync::Arc::new(MockContainerRuntimeControl::new()),
             network: std::sync::Arc::new(MockPodNetworkRuntime::new()),
             store: std::sync::Arc::new(MockPodRuntimeStore::new()),
-            clock: std::sync::Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+            clock: std::sync::Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             slot_admission: std::sync::Arc::new(MockPodSlotAdmission::new()),
             repository: repo.clone(),
             filesystem: std::sync::Arc::new(MockPodFilesystem::new()),
@@ -10605,7 +10605,7 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
                 service_cidr: "10.43.128.0/17".into(),
                 containerd_namespace: "klights-test".into(),
                 sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
-                node_capacity: crate::kubelet::node::NodeCapacity::default(),
+                node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
                 paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
                     std::path::PathBuf::from("/tmp/klights-runtime-test"),
                 )

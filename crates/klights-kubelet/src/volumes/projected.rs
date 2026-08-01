@@ -4,7 +4,7 @@ use super::shared::{
     build_projection_paths, remove_stale_projection_files, resolve_projection_mode,
     write_projection_file_blocking,
 };
-use crate::kubelet::volume_sources::VolumeSourceReader;
+use crate::volume_sources::VolumeSourceReader;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 
@@ -23,7 +23,7 @@ struct ProjectedRenderPlanRequest<'a> {
     default_mode: Option<u32>,
     sources: &'a serde_json::Value,
     token: Option<&'a str>,
-    node_capacity: crate::kubelet::node::NodeCapacity,
+    node_capacity: crate::node_capacity::NodeCapacity,
 }
 
 struct ProjectedVolumePathRequest<'a> {
@@ -38,7 +38,7 @@ struct ProjectedVolumePathRequest<'a> {
     default_mode: Option<u32>,
     sources: &'a serde_json::Value,
     token: Option<&'a str>,
-    node_capacity: crate::kubelet::node::NodeCapacity,
+    node_capacity: crate::node_capacity::NodeCapacity,
 }
 
 pub struct ProjectedVolumeNsRequest<'a> {
@@ -53,7 +53,7 @@ pub struct ProjectedVolumeNsRequest<'a> {
     pub default_mode: Option<u32>,
     pub sources: &'a serde_json::Value,
     pub token: Option<&'a str>,
-    pub node_capacity: crate::kubelet::node::NodeCapacity,
+    pub node_capacity: crate::node_capacity::NodeCapacity,
 }
 
 pub(crate) struct ProjectedVolumeRootRequest<'a> {
@@ -68,10 +68,10 @@ pub(crate) struct ProjectedVolumeRootRequest<'a> {
     pub default_mode: Option<u32>,
     pub sources: &'a serde_json::Value,
     pub token: Option<&'a str>,
-    pub node_capacity: crate::kubelet::node::NodeCapacity,
+    pub node_capacity: crate::node_capacity::NodeCapacity,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct ProjectedVolumeAtRequest<'a> {
     pub file_process: &'a klights_supervisor::FileProcessExecutor,
     pub volumes_root: &'a str,
@@ -472,7 +472,7 @@ pub(crate) async fn create_projected_volume_under_root(
     .await
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn create_projected_volume_at(request: ProjectedVolumeAtRequest<'_>) -> Result<String> {
     create_projected_volume_at_impl(ProjectedVolumePathRequest {
         file_process: request.file_process,
@@ -486,7 +486,7 @@ pub async fn create_projected_volume_at(request: ProjectedVolumeAtRequest<'_>) -
         default_mode: request.default_mode,
         sources: request.sources,
         token: request.token,
-        node_capacity: crate::kubelet::node::NodeCapacity::default(),
+        node_capacity: crate::node_capacity::NodeCapacity::default(),
     })
     .await
 }

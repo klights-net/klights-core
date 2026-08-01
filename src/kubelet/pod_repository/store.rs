@@ -121,7 +121,7 @@ pub(crate) trait PodPersistence: Send + Sync {
 
 pub struct PodStore {
     persistence: Arc<dyn PodPersistence>,
-    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     /// Incremented on every pod create/delete to signal sandbox GC that a sweep may be needed.
     pub(super) sandbox_gc_dirty: Arc<AtomicUsize>,
 }
@@ -129,7 +129,7 @@ pub struct PodStore {
 impl PodStore {
     pub(crate) fn from_persistence(
         persistence: Arc<dyn PodPersistence>,
-        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+        wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     ) -> Self {
         Self {
             persistence,

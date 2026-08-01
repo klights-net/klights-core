@@ -1,4 +1,4 @@
-use crate::kubelet::probes::{TcpProbe, check_tcp_probe as run_tcp_probe};
+use crate::probes::{TcpProbe, check_tcp_probe as run_tcp_probe};
 use std::time::Duration;
 
 pub async fn check_tcp_probe(

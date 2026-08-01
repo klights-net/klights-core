@@ -256,7 +256,7 @@ pub(crate) struct PodRepositoryAdapterDependencies {
 pub(crate) struct PodRepositoryRuntimeDependencies {
     pub supervisor: Arc<TaskSupervisor>,
     pub metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
-    pub wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    pub wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 }
 
 pub(crate) struct PodRepositoryCoreDependencies {

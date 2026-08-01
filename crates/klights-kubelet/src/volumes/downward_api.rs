@@ -1,7 +1,7 @@
 use super::basics::parse_k8s_quantity;
 use super::run_blocking_fs_keyed;
 use super::shared::write_projection_file_blocking;
-use crate::kubelet::volume_sources::VolumeSourceReader;
+use crate::volume_sources::VolumeSourceReader;
 use anyhow::{Context, Result};
 
 #[derive(Clone)]
@@ -21,7 +21,7 @@ pub struct DownwardApiVolumeNsRequest<'a> {
     pub volume_name: &'a str,
     pub default_mode: Option<u32>,
     pub items: &'a serde_json::Value,
-    pub node_capacity: crate::kubelet::node::NodeCapacity,
+    pub node_capacity: crate::node_capacity::NodeCapacity,
 }
 
 pub struct DownwardApiVolumeWithDbNameRequest<'a> {
@@ -34,7 +34,7 @@ pub struct DownwardApiVolumeWithDbNameRequest<'a> {
     pub volume_name: &'a str,
     pub default_mode: Option<u32>,
     pub items: &'a serde_json::Value,
-    pub node_capacity: crate::kubelet::node::NodeCapacity,
+    pub node_capacity: crate::node_capacity::NodeCapacity,
 }
 
 fn render_downward_api_volume_blocking(
@@ -53,7 +53,7 @@ fn build_downward_api_writes(
     pod_resource: &serde_json::Value,
     default_mode: Option<u32>,
     items: &serde_json::Value,
-    node_capacity: crate::kubelet::node::NodeCapacity,
+    node_capacity: crate::node_capacity::NodeCapacity,
 ) -> Result<Vec<DownwardFileWrite>> {
     let default_mode = default_mode.unwrap_or(420); // 0o644
     let items_array = items
@@ -125,7 +125,7 @@ pub async fn refresh_downward_api_volumes(
     file_process: &klights_supervisor::FileProcessExecutor,
     pod: &serde_json::Value,
     volumes_root: &str,
-    node_capacity: crate::kubelet::node::NodeCapacity,
+    node_capacity: crate::node_capacity::NodeCapacity,
 ) -> Result<()> {
     let namespace = pod
         .get("metadata")
@@ -145,8 +145,7 @@ pub async fn refresh_downward_api_volumes(
         .and_then(|n| n.as_str())
         .ok_or_else(|| anyhow::anyhow!("Pod missing metadata.uid"))?;
 
-    let pod_dir_id =
-        crate::kubelet::pod_runtime::service::pod_volume_dir_id(namespace, pod_name, pod_uid);
+    let pod_dir_id = crate::volumes::pod_volume_dir_id(namespace, pod_name, pod_uid);
 
     let volumes = pod
         .get("spec")
@@ -276,7 +275,7 @@ pub async fn create_downward_api_volume_ns(
     .await
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn create_downward_api_volume_at(
     volumes_root: &str,
     sources: &dyn VolumeSourceReader,
@@ -286,7 +285,7 @@ pub async fn create_downward_api_volume_at(
     default_mode: Option<u32>,
     items: &serde_json::Value,
 ) -> Result<String> {
-    let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+    let file_process = crate::phase15d_test_support::file_process_executor();
     let pod_resource = sources
         .pod(namespace, pod_name)
         .await?
@@ -300,7 +299,7 @@ pub async fn create_downward_api_volume_at(
         &pod_resource.data,
         default_mode,
         items,
-        crate::kubelet::node::NodeCapacity::default(),
+        crate::node_capacity::NodeCapacity::default(),
     )?;
     render_downward_api_volume_keyed(
         &file_process,
@@ -434,7 +433,7 @@ pub fn extract_resource_field_ref_with_capacity(
     pod_data: &serde_json::Value,
     container_name: Option<&str>,
     resource: &str,
-    node_capacity: crate::kubelet::node::NodeCapacity,
+    node_capacity: crate::node_capacity::NodeCapacity,
 ) -> Result<String> {
     // Get containers array
     let containers = pod_data
@@ -525,7 +524,7 @@ pub fn extract_resource_field_ref_with_capacity(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn extract_resource_field_ref(
     pod_data: &serde_json::Value,
     container_name: Option<&str>,
@@ -535,6 +534,6 @@ pub fn extract_resource_field_ref(
         pod_data,
         container_name,
         resource,
-        crate::kubelet::node::NodeCapacity::default(),
+        crate::node_capacity::NodeCapacity::default(),
     )
 }

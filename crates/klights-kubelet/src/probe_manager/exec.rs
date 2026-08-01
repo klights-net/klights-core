@@ -1,7 +1,7 @@
-use crate::kubelet::probes::{ExecProbe, check_exec_probe as run_exec_probe};
+use crate::probes::{ExecProbe, check_exec_probe as run_exec_probe};
 
 pub async fn check_exec_probe(
-    cri: &dyn crate::kubelet::pod_runtime::cri::CriRuntime,
+    cri: &dyn crate::runtime::cri::CriRuntime,
     container_id: &str,
     probe: &ExecProbe,
     timeout_secs: u64,

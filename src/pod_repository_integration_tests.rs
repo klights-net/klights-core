@@ -3908,7 +3908,7 @@ async fn set_pod_status_retries_implicit_rv_conflict_after_scheduler_update() {
         None,
         None,
         crate::kubelet::context::HostIpState::default(),
-        Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+        Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
     );
 
     let updated = status_service
@@ -6168,7 +6168,7 @@ async fn set_probe_readiness_retries_unpinned_rv_conflict() {
         None,
         None,
         crate::kubelet::context::HostIpState::default(),
-        Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+        Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
     );
 
     let updated = status_service
@@ -6221,7 +6221,7 @@ async fn set_probe_readiness_exhausts_unpinned_conflict_retries() {
         None,
         None,
         crate::kubelet::context::HostIpState::default(),
-        Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+        Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
     );
 
     let err = match status_service
@@ -6268,7 +6268,7 @@ async fn set_probe_readiness_pinned_rv_conflict_does_not_retry() {
         None,
         None,
         crate::kubelet::context::HostIpState::default(),
-        Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+        Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
     );
 
     let err = match status_service
@@ -12260,7 +12260,7 @@ async fn deletion_finalizer_reissues_missing_delete_mark_through_outbox() {
         store.clone(),
         Some(cluster_api.clone()),
         Some(outbox.clone()),
-        Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+        Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
     );
     let gc_pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink> = root_deletion;
     let finalizer = RealPodDeletionFinalizer::new(

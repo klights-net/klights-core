@@ -5,9 +5,9 @@ use anyhow::Result;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::kubelet::pod_runtime::service::PodRuntimeKey;
-use crate::kubelet::volume_sources::VolumeSourceReader;
+use crate::volume_sources::VolumeSourceReader;
 use klights_supervisor::TaskSupervisor;
+use klights_types::PodIdentity;
 
 const DEFAULT_SERVICE_ACCOUNT_AUDIENCE: &str = "https://kubernetes.default.svc.cluster.local";
 const MAX_PROJECTED_TOKEN_REFRESH_DELAY: std::time::Duration =
@@ -23,12 +23,12 @@ struct ProjectedServiceAccountTokenRef {
 }
 
 #[derive(Clone)]
-pub(crate) struct ProjectedSaTokenRefreshRequest {
+pub struct ProjectedSaTokenRefreshRequest {
     pub file_process: klights_supervisor::FileProcessExecutor,
     pub sources: Arc<dyn VolumeSourceReader>,
     pub volumes_root: String,
-    pub key: PodRuntimeKey,
-    pub node_capacity: crate::kubelet::node::NodeCapacity,
+    pub key: PodIdentity,
+    pub node_capacity: crate::node_capacity::NodeCapacity,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,7 +140,7 @@ pub(crate) async fn projected_sources_with_fresh_service_account_token_values(
     Ok(sources_for_write)
 }
 
-pub(crate) fn pod_has_projected_service_account_tokens(pod: &Value) -> bool {
+pub fn pod_has_projected_service_account_tokens(pod: &Value) -> bool {
     !projected_service_account_token_refs(pod).is_empty()
 }
 
@@ -207,7 +207,7 @@ async fn mint_projected_service_account_token(
     let node_name = pod_node_name(pod)
         .ok_or_else(|| anyhow::anyhow!("projected token request is missing bound_node_name"))?;
     let service_account = pod_service_account_name(pod);
-    let request = crate::kubelet::volume_sources::ProjectedServiceAccountTokenRequest::try_new(
+    let request = crate::volume_sources::ProjectedServiceAccountTokenRequest::try_new(
         namespace,
         service_account,
         vec![token_ref.audience.clone()],
@@ -234,12 +234,12 @@ async fn write_projected_service_account_token_file(
         anyhow::bail!("projected volume path {} no longer exists", volume_path);
     }
     let key = volume_path.clone();
-    crate::kubelet::volumes::run_blocking_fs_keyed(
+    crate::volumes::run_blocking_fs_keyed(
         file_process,
         "refresh_projected_sa_token_file",
         &key,
         move || {
-            crate::kubelet::volumes::shared::write_projection_file_blocking(
+            crate::volumes::shared::write_projection_file_blocking(
                 &volume_path,
                 &token_ref.token_path,
                 token.as_bytes(),
@@ -286,9 +286,13 @@ async fn recreate_projected_service_account_token_volume(
         sources,
     )
     .await?;
-    let pod_dir_id = request.key.volume_dir_id();
-    crate::kubelet::volumes::create_projected_volume_under_root(
-        crate::kubelet::volumes::ProjectedVolumeRootRequest {
+    let pod_dir_id = crate::volumes::pod_volume_dir_id(
+        &request.key.namespace,
+        &request.key.name,
+        &request.key.uid,
+    );
+    crate::volumes::create_projected_volume_under_root(
+        crate::volumes::ProjectedVolumeRootRequest {
             file_process: &request.file_process,
             volumes_root: &request.volumes_root,
             source_reader: request.sources.as_ref(),
@@ -327,7 +331,11 @@ pub(crate) async fn refresh_projected_service_account_tokens_once(
         return Ok(ProjectedSaTokenRefreshOutcome::Stop);
     }
 
-    let pod_dir_id = request.key.volume_dir_id();
+    let pod_dir_id = crate::volumes::pod_volume_dir_id(
+        &request.key.namespace,
+        &request.key.name,
+        &request.key.uid,
+    );
     let mut recreated_volumes = HashSet::new();
     for token_ref in refs.iter().cloned() {
         let volume_path = format!(
@@ -428,7 +436,7 @@ fn schedule_projected_service_account_token_refresh_after(
     })
 }
 
-pub(crate) async fn schedule_projected_service_account_token_refresh(
+pub async fn schedule_projected_service_account_token_refresh(
     request: ProjectedSaTokenRefreshRequest,
     pod: &Value,
     supervisor: Arc<TaskSupervisor>,
@@ -448,9 +456,9 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::{Value, json};
 
-    use crate::kubelet::pod_runtime::service::PodRuntimeKey;
-    use crate::kubelet::volume_sources::VolumeSourceReader;
+    use crate::volume_sources::VolumeSourceReader;
     use klights_cluster_core::Resource;
+    use klights_types::PodIdentity;
     use std::os::unix::fs::PermissionsExt;
 
     fn resource(
@@ -480,8 +488,7 @@ mod tests {
         pod: Resource,
         service_account: Resource,
         node: Resource,
-        token_requests:
-            Mutex<Vec<crate::kubelet::volume_sources::ProjectedServiceAccountTokenRequest>>,
+        token_requests: Mutex<Vec<crate::volume_sources::ProjectedServiceAccountTokenRequest>>,
     }
 
     #[async_trait]
@@ -527,13 +534,11 @@ mod tests {
 
         async fn projected_service_account_token(
             &self,
-            request: crate::kubelet::volume_sources::ProjectedServiceAccountTokenRequest,
-        ) -> Result<crate::kubelet::volume_sources::ProjectedServiceAccountToken> {
+            request: crate::volume_sources::ProjectedServiceAccountTokenRequest,
+        ) -> Result<crate::volume_sources::ProjectedServiceAccountToken> {
             self.token_requests.lock().unwrap().push(request);
-            crate::kubelet::volume_sources::ProjectedServiceAccountToken::try_new(
-                "refreshed-from-leader",
-            )
-            .map_err(anyhow::Error::new)
+            crate::volume_sources::ProjectedServiceAccountToken::try_new("refreshed-from-leader")
+                .map_err(anyhow::Error::new)
         }
     }
 
@@ -656,20 +661,24 @@ mod tests {
         });
 
         let volumes_root = temp.path().join("pods");
-        let key = PodRuntimeKey::new("kube-system", "coredns", "pod-uid");
+        let key = PodIdentity::new("kube-system", "coredns", "pod-uid");
         let token_dir = volumes_root
-            .join(key.volume_dir_id())
+            .join(crate::volumes::pod_volume_dir_id(
+                &key.namespace,
+                &key.name,
+                &key.uid,
+            ))
             .join("volumes/projected/kube-api-access-x");
         std::fs::create_dir_all(&token_dir).expect("create projected dir");
         std::fs::write(token_dir.join("token"), "expired").expect("write old token");
 
         let outcome = super::refresh_projected_service_account_tokens_once(
             super::ProjectedSaTokenRefreshRequest {
-                file_process: crate::kubelet::file_blocking::test_file_process_executor(),
+                file_process: crate::phase15d_test_support::file_process_executor(),
                 sources: sources.clone(),
                 volumes_root: volumes_root.to_string_lossy().into_owned(),
                 key,
-                node_capacity: crate::kubelet::node::NodeCapacity::default(),
+                node_capacity: crate::node_capacity::NodeCapacity::default(),
             },
         )
         .await
@@ -767,18 +776,22 @@ mod tests {
         });
 
         let volumes_root = temp.path().join("pods");
-        let key = PodRuntimeKey::new("kube-system", "coredns", "pod-uid");
+        let key = PodIdentity::new("kube-system", "coredns", "pod-uid");
         let token_dir = volumes_root
-            .join(key.volume_dir_id())
+            .join(crate::volumes::pod_volume_dir_id(
+                &key.namespace,
+                &key.name,
+                &key.uid,
+            ))
             .join("volumes/projected/kube-api-access-x");
 
         let outcome = super::refresh_projected_service_account_tokens_once(
             super::ProjectedSaTokenRefreshRequest {
-                file_process: crate::kubelet::file_blocking::test_file_process_executor(),
+                file_process: crate::phase15d_test_support::file_process_executor(),
                 sources: sources.clone(),
                 volumes_root: volumes_root.to_string_lossy().into_owned(),
                 key,
-                node_capacity: crate::kubelet::node::NodeCapacity::default(),
+                node_capacity: crate::node_capacity::NodeCapacity::default(),
             },
         )
         .await

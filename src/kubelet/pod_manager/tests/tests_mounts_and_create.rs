@@ -8,7 +8,7 @@ fn build_mounts(
     volume_paths: &std::collections::HashMap<String, String>,
     resolved_envs: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<(Vec<k8s_cri::v1::Mount>, Vec<std::path::PathBuf>)> {
-    crate::kubelet::pod_volume_manager::PodVolumeManager::build_mounts(
+    klights_kubelet::pod_volume_manager::PodVolumeManager::build_mounts(
         container,
         volume_paths,
         resolved_envs,

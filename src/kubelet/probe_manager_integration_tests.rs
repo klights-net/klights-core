@@ -1,6 +1,6 @@
 use super::*;
 use crate::datastore::DatastoreBackend;
-use serde_json::json;
+use serde_json::{Value, json};
 
 /// Build a `PodRepository` Arc from an existing `DatastoreHandle` for tests
 /// that exercise `update_pod_condition` after the kubelet migration to the
@@ -505,7 +505,7 @@ async fn test_update_pod_condition_for_uid_updates_matching_pod_uid() {
 async fn test_start_probes_missing_metadata_returns_error() {
     let db = crate::datastore::test_support::in_memory().await;
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
-    let pm = ProbeManager::new(db_handle, "klights".to_string());
+    let pm = probe_manager_for_test(&db_handle);
     let pod = json!({"spec": {"containers": []}});
     let result = pm.start_probes(&pod).await;
     assert!(result.is_err());
@@ -516,7 +516,7 @@ async fn test_start_probes_missing_metadata_returns_error() {
 async fn test_start_probes_missing_spec_returns_error() {
     let db = crate::datastore::test_support::in_memory().await;
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
-    let pm = ProbeManager::new(db_handle, "klights".to_string());
+    let pm = probe_manager_for_test(&db_handle);
     let pod = json!({"metadata": {"name": "p", "namespace": "ns"}});
     let result = pm.start_probes(&pod).await;
     assert!(result.is_err());
@@ -527,7 +527,7 @@ async fn test_start_probes_missing_spec_returns_error() {
 async fn test_start_probes_missing_pod_ip_returns_error() {
     let db = crate::datastore::test_support::in_memory().await;
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
-    let pm = ProbeManager::new(db_handle, "klights".to_string());
+    let pm = probe_manager_for_test(&db_handle);
     let pod = json!({
         "metadata": {"name": "p", "namespace": "ns"},
         "spec": {"containers": [{"name": "c", "image": "nginx"}]},
@@ -542,17 +542,16 @@ async fn test_start_probes_missing_pod_ip_returns_error() {
 async fn test_start_probes_no_probes_defined_succeeds_with_no_tasks() {
     let db = crate::datastore::test_support::in_memory().await;
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
-    let pm = ProbeManager::new(db_handle, "klights".to_string());
+    let pm = probe_manager_for_test(&db_handle);
     let pod = json!({
         "metadata": {"name": "simple", "namespace": "default"},
         "spec": {"containers": [{"name": "app", "image": "nginx"}]},
         "status": {"phase": "Running", "podIP": "10.43.0.5"}
     });
     pm.start_probes(&pod).await.unwrap();
-    let tasks = pm.tasks.read().await;
-    let handles = tasks.get("default/simple").unwrap();
-    assert!(
-        handles.is_empty(),
+    assert_eq!(
+        pm.task_count_for_test("default/simple").await,
+        Some(0),
         "No probes defined means no probe tasks spawned"
     );
 }
@@ -561,7 +560,7 @@ async fn test_start_probes_no_probes_defined_succeeds_with_no_tasks() {
 async fn test_start_probes_spawns_tasks_for_readiness_and_liveness() {
     let db = crate::datastore::test_support::in_memory().await;
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
-    let pm = ProbeManager::new(db_handle, "klights".to_string());
+    let pm = probe_manager_for_test(&db_handle);
     let pod = json!({
         "metadata": {"name": "probed", "namespace": "default"},
         "spec": {"containers": [{
@@ -577,15 +576,11 @@ async fn test_start_probes_spawns_tasks_for_readiness_and_liveness() {
         }
     });
     pm.start_probes(&pod).await.unwrap();
-    let tasks = pm.tasks.read().await;
-    let handles = tasks.get("default/probed").unwrap();
     assert_eq!(
-        handles.len(),
-        2,
+        pm.task_count_for_test("default/probed").await,
+        Some(2),
         "Should have 1 readiness + 1 liveness task"
     );
-    // Clean up spawned tasks
-    drop(tasks);
     pm.stop_probes("default", "probed").await;
 }
 
@@ -593,7 +588,7 @@ async fn test_start_probes_spawns_tasks_for_readiness_and_liveness() {
 async fn test_stop_probes_removes_tasks() {
     let db = crate::datastore::test_support::in_memory().await;
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
-    let pm = ProbeManager::new(db_handle, "klights".to_string());
+    let pm = probe_manager_for_test(&db_handle);
     let pod = json!({
         "metadata": {"name": "stopping", "namespace": "ns1"},
         "spec": {"containers": [{
@@ -610,17 +605,13 @@ async fn test_stop_probes_removes_tasks() {
     pm.start_probes(&pod).await.unwrap();
 
     // Verify task exists
-    {
-        let tasks = pm.tasks.read().await;
-        assert!(tasks.contains_key("ns1/stopping"));
-    }
+    assert!(pm.task_count_for_test("ns1/stopping").await.is_some());
 
     pm.stop_probes("ns1", "stopping").await;
 
     // Verify task removed
-    let tasks = pm.tasks.read().await;
     assert!(
-        !tasks.contains_key("ns1/stopping"),
+        pm.task_count_for_test("ns1/stopping").await.is_none(),
         "stop_probes must remove entry from tasks map"
     );
 }
@@ -629,7 +620,7 @@ async fn test_stop_probes_removes_tasks() {
 async fn test_stop_probes_for_uid_leaves_recreated_same_name_pod_tasks() {
     let db = crate::datastore::test_support::in_memory().await;
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
-    let pm = ProbeManager::new(db_handle, "klights".to_string());
+    let pm = probe_manager_for_test(&db_handle);
 
     let pod_for_uid = |uid: &str, container_id: &str| {
         json!({
@@ -657,16 +648,18 @@ async fn test_stop_probes_for_uid_leaves_recreated_same_name_pod_tasks() {
     pm.stop_probes_for_uid("statefulset-ns", "ordinal-0", "old-uid")
         .await;
 
-    let tasks = pm.tasks.read().await;
     assert!(
-        !tasks.contains_key("statefulset-ns/ordinal-0/old-uid"),
+        pm.task_count_for_test("statefulset-ns/ordinal-0/old-uid")
+            .await
+            .is_none(),
         "old UID probe tasks must be removed"
     );
     assert!(
-        tasks.contains_key("statefulset-ns/ordinal-0/new-uid"),
+        pm.task_count_for_test("statefulset-ns/ordinal-0/new-uid")
+            .await
+            .is_some(),
         "new UID probe tasks must not be stopped by old pod deletion"
     );
-    drop(tasks);
 
     pm.stop_probes_for_uid("statefulset-ns", "ordinal-0", "new-uid")
         .await;
@@ -676,7 +669,7 @@ async fn test_stop_probes_for_uid_leaves_recreated_same_name_pod_tasks() {
 async fn test_stop_probes_nonexistent_pod_is_noop() {
     let db = crate::datastore::test_support::in_memory().await;
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
-    let pm = ProbeManager::new(db_handle, "klights".to_string());
+    let pm = probe_manager_for_test(&db_handle);
     // Should not panic or error
     pm.stop_probes("default", "nonexistent").await;
 }
@@ -685,7 +678,7 @@ async fn test_stop_probes_nonexistent_pod_is_noop() {
 async fn test_start_probes_multiple_containers_each_with_probes() {
     let db = crate::datastore::test_support::in_memory().await;
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
-    let pm = ProbeManager::new(db_handle, "klights".to_string());
+    let pm = probe_manager_for_test(&db_handle);
     let pod = json!({
         "metadata": {"name": "multi", "namespace": "default"},
         "spec": {"containers": [
@@ -710,14 +703,11 @@ async fn test_start_probes_multiple_containers_each_with_probes() {
         }
     });
     pm.start_probes(&pod).await.unwrap();
-    let tasks = pm.tasks.read().await;
-    let handles = tasks.get("default/multi").unwrap();
     assert_eq!(
-        handles.len(),
-        2,
+        pm.task_count_for_test("default/multi").await,
+        Some(2),
         "Should have 1 readiness (web) + 1 liveness (sidecar)"
     );
-    drop(tasks);
     pm.stop_probes("default", "multi").await;
 }
 
@@ -795,7 +785,7 @@ async fn test_update_pod_condition_startup_probe_is_noop() {
 async fn test_start_probes_with_startup_probe_spawns_task() {
     let db = crate::datastore::test_support::in_memory().await;
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
-    let pm = ProbeManager::new(db_handle.clone(), "klights-test".to_string());
+    let pm = probe_manager_for_test(&db_handle.clone());
 
     let pod = json!({
         "metadata": {"name": "probe-pod", "namespace": "default"},
@@ -828,122 +818,16 @@ async fn test_start_probes_with_startup_probe_spawns_task() {
     );
 
     // Verify tasks were spawned
-    let tasks = pm.tasks.read().await;
     assert!(
-        tasks.contains_key("default/probe-pod"),
+        pm.task_count_for_test("default/probe-pod").await.is_some(),
         "Tasks should be registered for the pod"
     );
-    let handles = tasks.get("default/probe-pod").unwrap();
     assert!(
-        !handles.is_empty(),
+        pm.task_count_for_test("default/probe-pod")
+            .await
+            .is_some_and(|count| count > 0),
         "At least one probe task should be spawned for startup probe"
     );
 
-    // Clean up
-    drop(tasks);
     pm.stop_probes("default", "probe-pod").await;
-}
-
-#[test]
-fn test_parse_probe_params_with_all_values() {
-    let probe_spec = json!({
-        "initialDelaySeconds": 5,
-        "periodSeconds": 15,
-        "timeoutSeconds": 3,
-        "failureThreshold": 5,
-        "successThreshold": 2
-    });
-
-    let params = parse_probe_params(&probe_spec);
-
-    assert_eq!(params.initial_delay, 5);
-    assert_eq!(params.interval_secs, 15);
-    assert_eq!(params.timeout_secs, 3);
-    assert_eq!(params.failure_threshold, 5);
-    assert_eq!(params.success_threshold, 2);
-}
-
-#[test]
-fn test_parse_probe_params_with_defaults() {
-    let probe_spec = json!({});
-
-    let params = parse_probe_params(&probe_spec);
-
-    assert_eq!(
-        params.initial_delay, 0,
-        "Default initialDelaySeconds should be 0"
-    );
-    assert_eq!(
-        params.interval_secs, 10,
-        "Default periodSeconds should be 10"
-    );
-    assert_eq!(params.timeout_secs, 1, "Default timeoutSeconds should be 1");
-    assert_eq!(
-        params.failure_threshold, 3,
-        "Default failureThreshold should be 3"
-    );
-    assert_eq!(
-        params.success_threshold, 1,
-        "Default successThreshold should be 1"
-    );
-}
-
-#[test]
-fn test_parse_probe_params_with_partial_values() {
-    let probe_spec = json!({
-        "periodSeconds": 20,
-        "failureThreshold": 10
-    });
-
-    let params = parse_probe_params(&probe_spec);
-
-    assert_eq!(
-        params.initial_delay, 0,
-        "Missing initialDelaySeconds should default to 0"
-    );
-    assert_eq!(
-        params.interval_secs, 20,
-        "Specified periodSeconds should be 20"
-    );
-    assert_eq!(
-        params.timeout_secs, 1,
-        "Missing timeoutSeconds should default to 1"
-    );
-    assert_eq!(
-        params.failure_threshold, 10,
-        "Specified failureThreshold should be 10"
-    );
-    assert_eq!(
-        params.success_threshold, 1,
-        "Missing successThreshold should default to 1"
-    );
-}
-
-#[test]
-fn test_parse_probe_params_zero_values_use_k8s_defaults() {
-    let probe_spec = json!({
-        "periodSeconds": 0,
-        "timeoutSeconds": 0,
-        "failureThreshold": 0,
-        "successThreshold": 0
-    });
-
-    let params = parse_probe_params(&probe_spec);
-
-    assert_eq!(
-        params.interval_secs, 10,
-        "periodSeconds=0 should be treated as unset and default to 10"
-    );
-    assert_eq!(
-        params.timeout_secs, 1,
-        "timeoutSeconds=0 should be treated as unset and default to 1"
-    );
-    assert_eq!(
-        params.failure_threshold, 3,
-        "failureThreshold=0 should be treated as unset and default to 3"
-    );
-    assert_eq!(
-        params.success_threshold, 1,
-        "successThreshold=0 should be treated as unset and default to 1"
-    );
 }
