@@ -570,15 +570,8 @@ async fn sync_active_status_at<S: CronJobStore + ?Sized>(
             .or_insert_with(|| json!(now_str));
     }
 
-    // T6.2: gate on actual status change. An identical status write would still
-    // propose a no-op raft entry (bumping resourceVersion and fanning out a
-    // watch event) on every redundant reconcile — the raft apply path does not
-    // dedupe like the direct sqlite status path does. Skip the write entirely
-    // when the computed status matches the existing one.
-    if cj.get("status") == Some(&status) {
-        return Ok(());
-    }
-
+    // The shared writer owns the no-op gate because it validates an apparently
+    // unchanged observed status against a live reread before skipping the CAS.
     crate::controllers::common::write_status_for_resource(store, cj_resource, &status).await?;
 
     Ok(())
@@ -1690,7 +1683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cronjob_sync_active_status_rejects_stale_status_overlap() {
+    async fn test_cronjob_sync_active_status_validates_unchanged_stale_status_against_live_row() {
         let db = make_raft_cronjob_datastore().await;
         let cj = json!({
             "apiVersion": "batch/v1",
@@ -1712,6 +1705,7 @@ mod tests {
             },
             "status": {
                 "active": [],
+                "observedGeneration": 1,
                 "lastSuccessfulTime": "2026-01-01T00:00:00Z"
             },
         });
@@ -1733,6 +1727,7 @@ mod tests {
             "test-cj-stale-status",
             json!({
                 "active": [],
+                "observedGeneration": 1,
                 "lastSuccessfulTime": "2026-01-02T00:00:00Z"
             }),
             Some(created.resource_version),
@@ -1741,9 +1736,15 @@ mod tests {
         .unwrap();
 
         let result = super::sync_active_status(&db, &created, None).await;
-        let err = result.expect_err("stale CronJob status overlap must be rejected");
+        let err = result.expect_err(
+            "an unchanged status computed from a stale CronJob must be validated against the live row",
+        );
         assert!(
-            klights_cluster_datastore::errors::is_conflict_error(&err),
+            err.chain().any(|cause| {
+                cause
+                    .downcast_ref::<klights_reconcile_api::ControllerStoreError>()
+                    .is_some_and(klights_reconcile_api::ControllerStoreError::is_conflict)
+            }),
             "expected status conflict, got {err:#}"
         );
 
