@@ -891,7 +891,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 api_pod_repository.clone(),
             ),
         );
-    let node_port_forward = crate::portforward::local_node_port_forward(supervisor.clone());
+    let node_port_forward =
+        klights_kubelet::node_api::port_forward::local_node_port_forward(supervisor.clone());
     #[cfg(test)]
     let api_role = match &cli.role {
         crate::bootstrap::NodeRole::Leader { .. } => crate::api::ApiNodeRole::Leader,
@@ -1061,7 +1062,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     services.clone(),
                 ),
             ),
-            crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
+            klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(Arc::new(
                 crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
                     leader_ports.watch.clone(),
                 ),
@@ -1648,10 +1649,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
 
     let local_node_exec = cri_for_api.map(|cri| {
         let runtime: Arc<dyn klights_node_api::NodeExecRuntime> = Arc::new(
-            crate::kubelet::remote_runtime::CriNodeExecRuntime::new(cri, supervisor.clone()),
+            klights_kubelet::node_api::exec::CriNodeExecRuntime::new(cri, supervisor.clone()),
         );
-        crate::bootstrap::operational_adapters::InProcessNodeExec::new(runtime, supervisor.clone())
-            as Arc<dyn klights_node_api::NodeExec>
+        klights_kubelet::node_api::in_process_exec::InProcessNodeExec::new(
+            runtime,
+            supervisor.clone(),
+        ) as Arc<dyn klights_node_api::NodeExec>
     });
     #[cfg(not(test))]
     let root_api_role = match &cli.role {
@@ -1752,7 +1755,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         Arc::new(
             crate::bootstrap::network_adapters::ApiServiceRoutingSyncAdapter::new(services.clone()),
         ),
-        crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
+        klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(Arc::new(
             crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
                 leader_ports.watch.clone(),
             ),

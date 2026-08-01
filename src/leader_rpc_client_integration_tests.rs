@@ -7,7 +7,7 @@ mod cases {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::api::pod_subresources::local_node_log_runtime::LocalNodeLogRuntime;
+    use klights_kubelet::node_api::logs::LocalNodeLogRuntime;
 
     use crate::datastore::backend::DatastoreHandle;
 
@@ -1971,7 +1971,11 @@ mod cases {
     #[tokio::test]
     async fn local_node_log_runtime_previous_is_empty_for_finite_and_follow() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let runtime = LocalNodeLogRuntime::new("previous-log-test".to_string(), supervisor.clone());
+        let runtime = LocalNodeLogRuntime::new_for_test(
+            crate::paths::pod_logs_root_path("previous-log-test"),
+            supervisor.clone(),
+            Arc::new(klights_supervisor::SystemWallClock),
+        );
         let target =
             NodeLogTarget::try_new("worker-1", "default", "logger", "pod-uid", "main").unwrap();
         let request = NodeLogRequest::new(
@@ -2044,8 +2048,8 @@ mod cases {
         let handler = LocalNodeLogRuntime::new_with_pod_event_store(
             crate::paths::pod_logs_root_path(&runtime_ns),
             supervisor.clone(),
-            Arc::new(klights_auth::clock::SystemClock),
-            crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
+            Arc::new(klights_supervisor::SystemWallClock),
+            klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(Arc::new(
                 crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
                     positioned_watch,
                 )),

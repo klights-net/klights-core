@@ -21,7 +21,16 @@ mod portforward_tests {
 }
 
 use super::*;
+use klights_kubelet::node_api::logs::{
+    LogQuery, PodLogFollowTermination, build_log_output, build_log_output_bytes,
+    follow_log_file_with_initial_query, follow_log_file_with_termination_watch,
+    is_log_line_after_cutoff, log_query_since_cutoff_at, parse_cri_log_line,
+};
 use serde_json::json;
+
+fn log_test_now() -> time::OffsetDateTime {
+    time::OffsetDateTime::UNIX_EPOCH
+}
 
 // --- parse_cri_log_line tests ---
 
@@ -758,6 +767,7 @@ async fn test_build_log_output_waits_for_eventual_write() {
             insecure_skip_tls_verify_backend: false,
         },
         &task_supervisor,
+        log_test_now(),
     )
     .await
     .unwrap();
@@ -791,6 +801,7 @@ async fn test_build_log_output_bytes_preserves_non_utf8_cri_payload() {
             insecure_skip_tls_verify_backend: false,
         },
         &task_supervisor,
+        log_test_now(),
     )
     .await
     .unwrap();
@@ -832,6 +843,7 @@ async fn test_follow_log_file_with_initial_query_applies_tail_before_following()
         std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         )),
+        log_test_now(),
     );
     futures::pin_mut!(stream);
 
@@ -894,6 +906,7 @@ async fn test_follow_log_file_waits_for_late_log_file_creation() {
         std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         )),
+        log_test_now(),
     );
     futures::pin_mut!(stream);
 
@@ -957,10 +970,13 @@ async fn test_follow_log_file_closes_if_pod_deleted_before_log_file_exists() {
             "main".to_string(),
             false,
         ),
+        log_test_now(),
     );
     futures::pin_mut!(stream);
 
-    tx.send(crate::watch::WatchEvent::deleted(json!({
+    let event = klights_leader_api::ResourceEvent::try_new(
+        klights_leader_api::WatchEventType::Deleted,
+        klights_cluster_core::Resource::try_from_data(std::sync::Arc::new(json!({
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": {
@@ -970,8 +986,12 @@ async fn test_follow_log_file_closes_if_pod_deleted_before_log_file_exists() {
         },
         "spec": {"containers": [{"name": "main"}]},
         "status": {"phase": "Pending"}
-    })))
+        })))
+        .unwrap(),
+        None,
+    )
     .unwrap();
+    tx.send(event).unwrap();
 
     let item = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
         .await
@@ -1009,6 +1029,7 @@ async fn test_follow_log_file_strips_cri_prefix_from_initial_and_live_lines() {
         std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         )),
+        log_test_now(),
     );
     futures::pin_mut!(stream);
 
@@ -1061,6 +1082,7 @@ async fn test_follow_log_file_without_pod_watch_exits_after_close_write() {
         std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         )),
+        log_test_now(),
     );
     futures::pin_mut!(stream);
 
@@ -1111,7 +1133,7 @@ async fn test_follow_log_file_exits_after_matching_pod_deleted_event() {
     let task_supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let watch_bus = crate::watch::WatchBus::new(8);
+    let (pod_event_tx, watch_rx) = tokio::sync::broadcast::channel(8);
     let stream = follow_log_file_with_termination_watch(
         log_path_str,
         LogQuery {
@@ -1127,13 +1149,14 @@ async fn test_follow_log_file_exits_after_matching_pod_deleted_event() {
         },
         task_supervisor,
         PodLogFollowTermination::new_for_test(
-            watch_bus.subscribe(klights_watch::WatchTopic::new("v1", "Pod")),
+            watch_rx,
             "default".to_string(),
             "done".to_string(),
             "uid-1".to_string(),
             "main".to_string(),
             false,
         ),
+        log_test_now(),
     );
     futures::pin_mut!(stream);
 
@@ -1144,7 +1167,9 @@ async fn test_follow_log_file_exits_after_matching_pod_deleted_event() {
         .unwrap();
     assert_eq!(first.as_ref(), b"finished\n");
 
-    watch_bus.publish(crate::watch::WatchEvent::deleted(json!({
+    let event = klights_leader_api::ResourceEvent::try_new(
+        klights_leader_api::WatchEventType::Deleted,
+        klights_cluster_core::Resource::try_from_data(std::sync::Arc::new(json!({
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": {
@@ -1155,7 +1180,12 @@ async fn test_follow_log_file_exits_after_matching_pod_deleted_event() {
         "status": {
             "phase": "Succeeded"
         }
-    })));
+        })))
+        .unwrap(),
+        None,
+    )
+    .unwrap();
+    pod_event_tx.send(event).unwrap();
 
     let done = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
         .await
@@ -1200,6 +1230,7 @@ async fn test_follow_log_file_since_time_then_follows_new_inotify_writes() {
         std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         )),
+        log_test_now(),
     );
     futures::pin_mut!(stream);
 
@@ -1261,6 +1292,7 @@ async fn test_follow_log_file_since_time_respects_limit_bytes() {
         std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         )),
+        log_test_now(),
     );
     futures::pin_mut!(stream);
 

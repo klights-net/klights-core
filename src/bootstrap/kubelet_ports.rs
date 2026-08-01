@@ -294,7 +294,7 @@ impl PodWatchSource for DatastorePodWatchSource {
     }
 }
 
-impl crate::api::pod_subresources::logs::PodLogFollowWatchPort for DatastorePodWatchSource {
+impl klights_kubelet::node_api::logs::PodLogFollowWatchPort for DatastorePodWatchSource {
     fn open_pod_watch(&self) -> klights_leader_api::LeaderWatchFuture<'_> {
         let request =
             klights_leader_api::WatchRequest::try_new("v1", "Pod", None, None, None, None, None)

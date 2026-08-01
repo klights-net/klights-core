@@ -10,6 +10,7 @@ pub mod lifecycle;
 pub mod log_rotation;
 pub mod metrics;
 pub mod node;
+pub mod node_api;
 pub mod node_capacity;
 pub mod node_config;
 pub mod node_heartbeat;

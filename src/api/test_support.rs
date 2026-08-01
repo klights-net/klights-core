@@ -324,14 +324,16 @@ pub(crate) async fn build_test_app_state_with_db(
                     network.services().clone(),
                 ),
             ),
-            crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
+            klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(Arc::new(
                 crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
                     positioned_watch,
                 )),
             )),
             None,
             Arc::new(crate::node_metrics_adapter::UnavailableNodeMetrics),
-            crate::portforward::local_node_port_forward(task_supervisor.clone()),
+            klights_kubelet::node_api::port_forward::local_node_port_forward(
+                task_supervisor.clone(),
+            ),
             None,
             None,
             None,

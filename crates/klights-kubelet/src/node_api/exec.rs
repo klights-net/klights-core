@@ -8,14 +8,14 @@ use klights_node_api::{
 };
 use klights_supervisor::TaskSupervisor;
 
-pub(crate) struct CriNodeExecRuntime {
-    pub(crate) cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
+pub struct CriNodeExecRuntime {
+    pub(crate) cri: Arc<tokio::sync::Mutex<crate::cri::CriClient>>,
     pub(crate) task_supervisor: Arc<TaskSupervisor>,
 }
 
 impl CriNodeExecRuntime {
-    pub(crate) fn new(
-        cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
+    pub fn new(
+        cri: Arc<tokio::sync::Mutex<crate::cri::CriClient>>,
         task_supervisor: Arc<TaskSupervisor>,
     ) -> Self {
         Self {
@@ -25,12 +25,12 @@ impl CriNodeExecRuntime {
     }
 }
 
-pub(crate) struct CriNodeMetricsRuntime {
+pub struct CriNodeMetricsRuntime {
     sampler: Arc<dyn klights_node_api::NodeMetricsSampler>,
 }
 
 impl CriNodeMetricsRuntime {
-    pub(crate) fn new(sampler: Arc<dyn klights_node_api::NodeMetricsSampler>) -> Self {
+    pub fn new(sampler: Arc<dyn klights_node_api::NodeMetricsSampler>) -> Self {
         Self { sampler }
     }
 }
@@ -44,7 +44,7 @@ impl NodeExecRuntime for CriNodeExecRuntime {
             let (target, command, timeout_seconds) = request.into_parts();
             let result = {
                 let mut cri = self.cri.lock().await;
-                crate::kubelet::cri_exec::exec_sync_with_created_state_retry(
+                super::cri_exec::exec_sync_with_created_state_retry(
                     &mut cri,
                     self.task_supervisor.as_ref(),
                     target.container_id(),
@@ -117,23 +117,23 @@ fn node_exec_error_frame(message: String) -> NodeExecFrame {
 }
 
 async fn run_cri_node_exec_stream(
-    cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
+    cri: Arc<tokio::sync::Mutex<crate::cri::CriClient>>,
     task_supervisor: Arc<TaskSupervisor>,
     request: NodeExecRequest,
     session: &mut dyn NodeExecSession,
 ) -> Result<()> {
-    use crate::kubelet::containerd_streaming::{SpdyExec, SpdyFrame, StreamType};
+    use super::containerd_streaming::{SpdyExec, SpdyFrame, StreamType};
 
     let (target, command, options, attach) = request.into_parts();
     let streaming_url = {
         let mut cri_client = cri.lock().await;
         if attach {
-            crate::kubelet::cri_exec::attach_with_created_state_retry(
+            super::cri_exec::attach_with_created_state_retry(
                 &mut cri_client,
                 task_supervisor.as_ref(),
-                crate::kubelet::cri_exec::AttachRequest {
+                super::cri_exec::AttachRequest {
                     container_id: target.container_id(),
-                    stream_options: crate::kubelet::cri_exec::ExecStreamOptions {
+                    stream_options: super::cri_exec::ExecStreamOptions {
                         tty: options.tty(),
                         stdin: options.stdin(),
                         stdout: options.stdout(),
@@ -144,13 +144,13 @@ async fn run_cri_node_exec_stream(
             .await?
             .url
         } else {
-            crate::kubelet::cri_exec::exec_with_created_state_retry(
+            super::cri_exec::exec_with_created_state_retry(
                 &mut cri_client,
                 task_supervisor.as_ref(),
-                crate::kubelet::cri_exec::ExecRequest {
+                super::cri_exec::ExecRequest {
                     container_id: target.container_id(),
                     command: &command,
-                    stream_options: crate::kubelet::cri_exec::ExecStreamOptions {
+                    stream_options: super::cri_exec::ExecStreamOptions {
                         tty: options.tty(),
                         stdin: options.stdin(),
                         stdout: options.stdout(),

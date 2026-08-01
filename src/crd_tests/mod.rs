@@ -196,14 +196,16 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
                     network.services().clone(),
                 ),
             ),
-            crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(std::sync::Arc::new(
+            klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(std::sync::Arc::new(
                 crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(std::sync::Arc::new(
                     positioned_watch,
                 )),
             )),
             None,
             std::sync::Arc::new(crate::node_metrics_adapter::UnavailableNodeMetrics),
-            crate::portforward::local_node_port_forward(task_supervisor.clone()),
+            klights_kubelet::node_api::port_forward::local_node_port_forward(
+                task_supervisor.clone(),
+            ),
             None,
             None,
             None,

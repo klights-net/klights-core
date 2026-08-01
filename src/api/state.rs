@@ -168,7 +168,7 @@ impl ApiControllerReconcileServices {
 #[derive(Clone)]
 pub(crate) struct ApiPodNodeSubresourceServices {
     pub(crate) services: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
-    pub(crate) pod_log_follow_watch: crate::api::pod_subresources::logs::PodLogFollowWatchSource,
+    pub(crate) pod_log_follow_watch: klights_kubelet::node_api::logs::PodLogFollowWatchSource,
     pub(crate) local_node_exec: Option<Arc<dyn klights_node_api::NodeExec>>,
     pub(crate) node_metrics: Arc<dyn klights_node_api::NodeMetrics>,
     pub(crate) node_port_forward: Arc<dyn klights_node_api::NodePortForward>,
@@ -184,7 +184,7 @@ impl ApiPodNodeSubresourceServices {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         services: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
-        pod_log_follow_watch: crate::api::pod_subresources::logs::PodLogFollowWatchSource,
+        pod_log_follow_watch: klights_kubelet::node_api::logs::PodLogFollowWatchSource,
         local_node_exec: Option<Arc<dyn klights_node_api::NodeExec>>,
         node_metrics: Arc<dyn klights_node_api::NodeMetrics>,
         node_port_forward: Arc<dyn klights_node_api::NodePortForward>,
@@ -454,7 +454,7 @@ pub(crate) fn build_router_from_root(
     metrics: Arc<dyn crate::api::state_ports::ApiFailureMetrics>,
     node_lease_tracker: Arc<dyn crate::api::state_ports::ApiNodeLeaseObservations>,
     services: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
-    pod_log_follow_watch: crate::api::pod_subresources::logs::PodLogFollowWatchSource,
+    pod_log_follow_watch: klights_kubelet::node_api::logs::PodLogFollowWatchSource,
     local_node_exec: Option<Arc<dyn klights_node_api::NodeExec>>,
     node_metrics: Arc<dyn klights_node_api::NodeMetrics>,
     node_port_forward: Arc<dyn klights_node_api::NodePortForward>,

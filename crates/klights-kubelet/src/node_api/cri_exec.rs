@@ -27,7 +27,7 @@ fn is_created_state_error<T>(result: &anyhow::Result<T>) -> bool {
 }
 
 pub async fn exec_sync_with_created_state_retry(
-    cri_client: &mut crate::kubelet::cri::CriClient,
+    cri_client: &mut crate::cri::CriClient,
     task_supervisor: &klights_supervisor::TaskSupervisor,
     container_id: &str,
     command: &[String],
@@ -65,7 +65,7 @@ pub async fn exec_sync_with_created_state_retry(
 }
 
 pub async fn exec_with_created_state_retry(
-    cri_client: &mut crate::kubelet::cri::CriClient,
+    cri_client: &mut crate::cri::CriClient,
     task_supervisor: &klights_supervisor::TaskSupervisor,
     request: ExecRequest<'_>,
 ) -> anyhow::Result<k8s_cri::v1::ExecResponse> {
@@ -121,7 +121,7 @@ pub async fn exec_with_created_state_retry(
 }
 
 pub async fn attach_with_created_state_retry(
-    cri_client: &mut crate::kubelet::cri::CriClient,
+    cri_client: &mut crate::cri::CriClient,
     task_supervisor: &klights_supervisor::TaskSupervisor,
     request: AttachRequest<'_>,
 ) -> anyhow::Result<k8s_cri::v1::AttachResponse> {

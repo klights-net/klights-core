@@ -16,7 +16,7 @@ const PORT_FORWARD_BYTE_CAPACITY: usize = 256 * 1024;
 const PORT_FORWARD_READ_BUFFER_SIZE: usize = 4096;
 
 /// Build the local control-plane port from its private TCP runtime adapter.
-pub(crate) fn local_node_port_forward(
+pub fn local_node_port_forward(
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
 ) -> Arc<dyn NodePortForward> {
     Arc::new(LocalNodePortForward {

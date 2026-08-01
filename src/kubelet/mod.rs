@@ -2,7 +2,6 @@ pub mod cgroup_cleanup;
 pub mod containerd_manager {
     pub use klights_kubelet::containerd_manager::*;
 }
-mod containerd_streaming;
 pub mod context;
 pub mod cri {
     pub use klights_kubelet::cri::*;
@@ -10,7 +9,6 @@ pub mod cri {
 pub mod cri_events {
     pub use klights_kubelet::cri_events::*;
 }
-pub(crate) mod cri_exec;
 pub mod file_blocking;
 pub mod log_rotation {
     pub use klights_kubelet::log_rotation::*;
@@ -64,7 +62,6 @@ pub mod reconciler;
 pub mod registry_proxy {
     pub use klights_kubelet::registry_proxy::*;
 }
-pub(crate) mod remote_runtime;
 pub mod rootless_runc_wrapper {
     pub use klights_kubelet::rootless_runc_wrapper::*;
 }

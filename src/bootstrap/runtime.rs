@@ -88,7 +88,7 @@ async fn start_controlplane_leader_control_stream_if_needed(
     client: Option<std::sync::Arc<klights_leader_rpc::client::ReplicationGrpcClient>>,
     cri_for_api: Option<&std::sync::Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
     config: &std::sync::Arc<crate::KlightsConfig>,
-    pod_watch: std::sync::Arc<dyn crate::api::pod_subresources::logs::PodLogFollowWatchPort>,
+    pod_watch: std::sync::Arc<dyn klights_kubelet::node_api::logs::PodLogFollowWatchPort>,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<Option<klights_supervisor::SupervisedJoinHandle<()>>> {
@@ -100,13 +100,13 @@ async fn start_controlplane_leader_control_stream_if_needed(
     let (exec_runtime, metrics_runtime) = match cri_for_api {
         Some(cri) => (
             klights_leader_rpc::client::NodeExecCapability::Available(std::sync::Arc::new(
-                crate::kubelet::remote_runtime::CriNodeExecRuntime::new(
+                klights_kubelet::node_api::exec::CriNodeExecRuntime::new(
                     cri.clone(),
                     task_supervisor.clone(),
                 ),
             )),
             klights_leader_rpc::client::NodeMetricsCapability::Available(std::sync::Arc::new(
-                crate::kubelet::remote_runtime::CriNodeMetricsRuntime::new(std::sync::Arc::new(
+                klights_kubelet::node_api::exec::CriNodeMetricsRuntime::new(std::sync::Arc::new(
                     klights_kubelet::metrics::CriNodeMetricsSampler::new(
                         cri.clone(),
                         task_supervisor.clone(),
@@ -122,13 +122,11 @@ async fn start_controlplane_leader_control_stream_if_needed(
     let control_runtimes = klights_leader_rpc::client::NodeControlRuntimes::new(
         exec_runtime,
         klights_leader_rpc::client::NodeLogCapability::Available(std::sync::Arc::new(
-            crate::api::pod_subresources::local_node_log_runtime::LocalNodeLogRuntime::new_with_pod_event_store(
+            klights_kubelet::node_api::logs::LocalNodeLogRuntime::new_with_pod_event_store(
                 crate::paths::pod_logs_root_path(&config.containerd_namespace),
                 task_supervisor.clone(),
-                std::sync::Arc::new(klights_auth::clock::SystemClock),
-                crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(
-                    pod_watch,
-                ),
+                std::sync::Arc::new(klights_supervisor::SystemWallClock),
+                klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(pod_watch),
             ),
         )),
         metrics_runtime,
@@ -341,7 +339,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
                         ),
                     )
                         as std::sync::Arc<
-                            dyn crate::api::pod_subresources::logs::PodLogFollowWatchPort,
+                            dyn klights_kubelet::node_api::logs::PodLogFollowWatchPort,
                         >
                 })
                 .unwrap_or_else(|| {
