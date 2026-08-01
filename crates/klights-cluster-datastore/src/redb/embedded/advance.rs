@@ -5,8 +5,8 @@ use std::sync::Arc;
 use ::redb::ReadableTable;
 use anyhow::Result;
 
-use klights_cluster_datastore::redb::RedbAccessor;
-use klights_cluster_datastore::redb::tables;
+use crate::redb::RedbAccessor;
+use crate::redb::tables;
 
 pub struct RedbRvStore {
     accessor: Arc<RedbAccessor>,
