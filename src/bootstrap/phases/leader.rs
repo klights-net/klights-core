@@ -283,7 +283,7 @@ async fn start_leader_scoped_tasks(
         "Controller workqueue worker pool started"
     );
 
-    let scheduler_runtime: Arc<dyn crate::controllers::scheduler::SchedulerRuntime> = Arc::new(
+    let scheduler_runtime: Arc<dyn klights_controllers::scheduler::SchedulerRuntime> = Arc::new(
         crate::bootstrap::scheduler_adapter::LeaderSchedulerRuntime::new(
             positioned_watch,
             pod_scheduling,
@@ -300,7 +300,7 @@ async fn start_leader_scoped_tasks(
                 scheduler_coordination,
                 scheduler_lease,
                 async move {
-                    crate::controllers::scheduler::run_scheduler_watch(
+                    klights_controllers::scheduler::run_scheduler_watch(
                         scheduler_runtime,
                         scheduler_cancel,
                     )

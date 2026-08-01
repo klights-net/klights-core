@@ -380,7 +380,7 @@ impl SchedulingDecision {
 /// - `"500m"` → 500m
 /// - `"2"` → 2000m
 pub fn parse_cpu_quantity(s: &str) -> i64 {
-    crate::controllers::resource_quota::parse_resource_quantity("cpu", s).unwrap_or(0)
+    klights_types::parse_resource_quantity("cpu", s).unwrap_or(0)
 }
 
 /// Parse a memory quantity string to bytes.
@@ -390,13 +390,13 @@ pub fn parse_cpu_quantity(s: &str) -> i64 {
 /// - `"1Gi"` → 1073741824
 /// - `"512Mi"` → 536870912
 pub fn parse_memory_quantity(s: &str) -> i64 {
-    crate::controllers::resource_quota::parse_resource_quantity("memory", s).unwrap_or(0)
+    klights_types::parse_resource_quantity("memory", s).unwrap_or(0)
 }
 
 /// Parse a scalar/extended resource quantity string to an integer.
 /// Uses decimal SI parsing for non-CPU, non-memory resources.
 pub fn parse_scalar_quantity(key: &str, s: &str) -> i64 {
-    crate::controllers::resource_quota::parse_resource_quantity(key, s).unwrap_or(0)
+    klights_types::parse_resource_quantity(key, s).unwrap_or(0)
 }
 
 #[cfg(test)]

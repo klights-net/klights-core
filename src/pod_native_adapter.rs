@@ -18,12 +18,52 @@ use crate::kubelet::pod_repository::delete_coordinator::PodDeleteCoordinator;
 use crate::kubelet::pod_repository::state_only_writer::StateOnlyWriter;
 use crate::kubelet::pod_repository::store::PodStore;
 
+#[cfg(test)]
+pub(crate) struct SchedulerBindGateForTest {
+    entered: std::sync::atomic::AtomicUsize,
+    entered_notify: tokio::sync::Notify,
+    release_notify: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl SchedulerBindGateForTest {
+    pub fn new() -> Self {
+        Self {
+            entered: std::sync::atomic::AtomicUsize::new(0),
+            entered_notify: tokio::sync::Notify::new(),
+            release_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub async fn wait_for_entered_at_least(&self, target: usize) {
+        loop {
+            if self.entered.load(std::sync::atomic::Ordering::SeqCst) >= target {
+                return;
+            }
+            self.entered_notify.notified().await;
+        }
+    }
+
+    pub fn release_all(&self) {
+        self.release_notify.notify_waiters();
+    }
+
+    async fn enter_and_wait(&self) {
+        self.entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.entered_notify.notify_waiters();
+        self.release_notify.notified().await;
+    }
+}
+
 pub(crate) struct RootPodNativeAdapter {
     store: Arc<PodStore>,
     status_only: Arc<dyn StateOnlyWriter>,
     delete_coordinator: Arc<PodDeleteCoordinator>,
     db: DatastoreHandle,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
+    #[cfg(test)]
+    scheduler_bind_gate: Option<Arc<SchedulerBindGateForTest>>,
 }
 
 impl RootPodNativeAdapter {
@@ -33,6 +73,7 @@ impl RootPodNativeAdapter {
         delete_coordinator: Arc<PodDeleteCoordinator>,
         db: DatastoreHandle,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
+        #[cfg(test)] scheduler_bind_gate: Option<Arc<SchedulerBindGateForTest>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -40,6 +81,8 @@ impl RootPodNativeAdapter {
             delete_coordinator,
             db,
             wall_clock,
+            #[cfg(test)]
+            scheduler_bind_gate,
         })
     }
 }
@@ -111,7 +154,13 @@ impl PodPersistence for RootPodNativeAdapter {
         &self,
         request: PodPersistenceReplaceRequest,
     ) -> PodRepositoryFuture<'_, Resource> {
+        #[cfg(test)]
+        let scheduler_bind_gate = self.scheduler_bind_gate.clone();
         Box::pin(async move {
+            #[cfg(test)]
+            if let Some(gate) = scheduler_bind_gate {
+                gate.enter_and_wait().await;
+            }
             self.store
                 .update_including_status_for_scheduler(
                     &request.namespace,
@@ -275,47 +324,5 @@ impl AdmissionResourceStore for RootPodNativeAdapter {
                     "Pod admission resource list failed: {error}"
                 ))
             })
-    }
-}
-
-impl klights_pod_api::PodPlacement for RootPodNativeAdapter {
-    fn place_pod(
-        &self,
-        request: klights_pod_api::PodPlacementRequest,
-    ) -> Result<klights_pod_api::PodPlacementDecision, PodRepositoryError> {
-        let nodes: Vec<&serde_json::Value> = request.nodes.iter().map(AsRef::as_ref).collect();
-        let namespaces: Vec<&serde_json::Value> =
-            request.namespaces.iter().map(AsRef::as_ref).collect();
-        let disruption_budgets: Vec<&serde_json::Value> = request
-            .disruption_budgets
-            .iter()
-            .map(AsRef::as_ref)
-            .collect();
-        let existing: Vec<(&str, Vec<&serde_json::Value>)> = request
-            .existing_pods_by_node
-            .iter()
-            .map(|(node, pods)| {
-                (
-                    node.as_str(),
-                    pods.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
-                )
-            })
-            .collect();
-        let existing_refs: Vec<(&str, &[&serde_json::Value])> = existing
-            .iter()
-            .map(|(node, pods)| (*node, pods.as_slice()))
-            .collect();
-        let decision = crate::scheduler::engine::schedule_from_json_with_policy(
-            &nodes,
-            request.incoming_pod.as_ref(),
-            &existing_refs,
-            &namespaces,
-            &disruption_budgets,
-        );
-        Ok(klights_pod_api::PodPlacementDecision {
-            selected_node: decision.selected_node,
-            unschedulable_message: decision.unschedulable_message,
-            preemption_victims: decision.preemption_victims,
-        })
     }
 }

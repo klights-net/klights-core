@@ -15,7 +15,16 @@
 
 pub mod adapter;
 pub mod engine;
+mod placement;
 pub mod predicates;
 pub mod preemption;
+mod runtime;
 pub mod scoring;
+mod service;
 pub mod types;
+
+pub use placement::SchedulerPlacement;
+pub use runtime::{
+    SchedulerControllerConfig, SchedulerRuntime, run_scheduler_watch, should_wake_scheduler,
+};
+pub use service::{SCHED_BIND_CONCURRENCY, SchedulerService, SchedulerServiceDependencies};

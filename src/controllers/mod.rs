@@ -36,7 +36,6 @@ pub mod replicationcontroller;
 pub(crate) mod resource_projection;
 pub mod resource_quota;
 mod runtime;
-pub mod scheduler;
 pub mod service;
 pub mod service_controller;
 pub mod statefulset;

@@ -2773,7 +2773,7 @@ async fn build_repo_with_scheduling_mode(
 
 async fn build_repo_with_scheduling_mode_and_gate(
     scheduling_mode: crate::pod_repository_composition::PodSchedulingMode,
-    gate: Arc<crate::pod_native_orchestration::SchedulerBindGateForTest>,
+    gate: Arc<crate::pod_native_adapter::SchedulerBindGateForTest>,
 ) -> super::PodRepository {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
@@ -7695,7 +7695,7 @@ async fn leader_scheduler_concurrent_wave_reserves_node_capacity_once() {
 async fn leader_scheduler_starts_bounded_bind_wave_concurrently() {
     use super::PodReader;
 
-    let gate = Arc::new(crate::pod_native_orchestration::SchedulerBindGateForTest::new());
+    let gate = Arc::new(crate::pod_native_adapter::SchedulerBindGateForTest::new());
     let repo = Arc::new(
         build_repo_with_scheduling_mode_and_gate(
             crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
@@ -7725,7 +7725,7 @@ async fn leader_scheduler_starts_bounded_bind_wave_concurrently() {
         .await
         .unwrap();
 
-    for idx in 0..crate::pod_native_orchestration::SCHED_BIND_CONCURRENCY {
+    for idx in 0..klights_controllers::scheduler::SCHED_BIND_CONCURRENCY {
         let name = format!("parallel-{idx}");
         repo.store
             .create("default", &name, pending_pod(&name))
@@ -7739,7 +7739,7 @@ async fn leader_scheduler_starts_bounded_bind_wave_concurrently() {
 
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        gate.wait_for_entered_at_least(crate::pod_native_orchestration::SCHED_BIND_CONCURRENCY),
+        gate.wait_for_entered_at_least(klights_controllers::scheduler::SCHED_BIND_CONCURRENCY),
     )
     .await
     .expect("the whole first scheduling wave should reach the bind gate concurrently");
@@ -7759,7 +7759,7 @@ async fn leader_scheduler_starts_bounded_bind_wave_concurrently() {
         .count();
     assert_eq!(
         bound,
-        crate::pod_native_orchestration::SCHED_BIND_CONCURRENCY
+        klights_controllers::scheduler::SCHED_BIND_CONCURRENCY
     );
 }
 

@@ -3,6 +3,7 @@
 mod coordination;
 mod dispatcher;
 mod lease_loop;
+pub mod scheduler;
 pub mod side_effects;
 pub mod workqueue;
 

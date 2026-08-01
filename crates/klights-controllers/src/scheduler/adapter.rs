@@ -171,9 +171,7 @@ pub fn extract_existing_pod_resources(pod_value: &serde_json::Value) -> PodResou
 }
 
 /// Extract `ExistingPod` (for preemption) from a JSON Pod object.
-pub fn extract_existing_pod(
-    pod_value: &serde_json::Value,
-) -> crate::scheduler::preemption::ExistingPod {
+pub fn extract_existing_pod(pod_value: &serde_json::Value) -> super::preemption::ExistingPod {
     let namespace = pod_value
         .pointer("/metadata/namespace")
         .and_then(|v| v.as_str())
@@ -191,7 +189,7 @@ pub fn extract_existing_pod(
     let resources = extract_pod_resources(pod_value);
     let labels = extract_labels(pod_value, "/metadata/labels");
 
-    crate::scheduler::preemption::ExistingPod {
+    super::preemption::ExistingPod {
         namespace,
         name,
         priority,
@@ -497,12 +495,10 @@ fn extract_node_resources(node_value: &serde_json::Value, pointer: &str) -> Node
 
 /// Extract pod resource requests including overhead.
 fn extract_pod_resources(pod_value: &serde_json::Value) -> PodResources {
-    let cpu_milli = crate::controllers::resource_quota::calculate_pod_effective_resource_for_key(
-        pod_value, "requests", "cpu",
-    );
-    let memory_bytes = crate::controllers::resource_quota::calculate_pod_effective_resource_for_key(
-        pod_value, "requests", "memory",
-    );
+    let cpu_milli =
+        klights_types::calculate_pod_effective_resource_for_key(pod_value, "requests", "cpu");
+    let memory_bytes =
+        klights_types::calculate_pod_effective_resource_for_key(pod_value, "requests", "memory");
     let memory_ki = memory_bytes / 1024;
 
     // Extract overhead
@@ -593,10 +589,9 @@ fn extract_pod_extended_resources(pod_value: &serde_json::Value) -> HashMap<Stri
 
     keys.into_keys()
         .map(|key| {
-            let value =
-                crate::controllers::resource_quota::calculate_pod_effective_resource_for_key(
-                    pod_value, "requests", &key,
-                );
+            let value = klights_types::calculate_pod_effective_resource_for_key(
+                pod_value, "requests", &key,
+            );
             (key, value)
         })
         .filter(|(_, value)| *value > 0)

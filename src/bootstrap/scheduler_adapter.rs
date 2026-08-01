@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 
-use crate::controllers::scheduler::SchedulerRuntime;
+use klights_controllers::scheduler::SchedulerRuntime;
 use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest, WatchStream};
 
 pub(crate) struct LeaderSchedulerRuntime {

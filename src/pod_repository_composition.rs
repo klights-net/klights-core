@@ -77,7 +77,7 @@ pub struct PodRepositoryBuildConfig {
     pub cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     #[cfg(test)]
     pub(crate) scheduler_bind_gate:
-        Option<Arc<crate::pod_native_orchestration::SchedulerBindGateForTest>>,
+        Option<Arc<crate::pod_native_adapter::SchedulerBindGateForTest>>,
     #[cfg(not(test))]
     pub gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
 }
@@ -101,7 +101,7 @@ struct RootPodRepositoryComposition {
     gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
     #[cfg(test)]
-    scheduler_bind_gate: Option<Arc<crate::pod_native_orchestration::SchedulerBindGateForTest>>,
+    scheduler_bind_gate: Option<Arc<crate::pod_native_adapter::SchedulerBindGateForTest>>,
 }
 
 pub(crate) struct RootPodRepositoryParts {
@@ -938,10 +938,21 @@ impl RootPodRepositoryComposition {
             dependencies.delete_coordinator.clone(),
             self.db.clone(),
             self.wall_clock.clone(),
+            #[cfg(test)]
+            self.scheduler_bind_gate.clone(),
         );
         let pod_query: Arc<dyn klights_pod_api::PodQuery> = native.clone();
         let persistence: Arc<dyn klights_pod_api::PodPersistence> = native.clone();
         let status_persistence: Arc<dyn klights_pod_api::PodStatusPersistence> = native.clone();
+        let deletion: Arc<dyn klights_pod_api::PodDeleteOrchestration> = native.clone();
+        let event_sink: Arc<dyn klights_pod_api::PodControlPlaneEventSink> = native.clone();
+        let placement: Arc<dyn klights_pod_api::PodPlacement> =
+            Arc::new(klights_controllers::scheduler::SchedulerPlacement::new());
+        let mutation_effects: Arc<dyn klights_reconcile_api::ResourceMutationEffectsPort> =
+            crate::resource_mutation_effects_adapter::ResourceMutationEffectsAdapter::new(
+                self.side_effects.clone(),
+                self.metrics.clone(),
+            );
         let subresource = Arc::new(crate::pod_subresource_service::PodSubresourceService::new(
             pod_query.clone(),
             persistence.clone(),
@@ -950,14 +961,11 @@ impl RootPodRepositoryComposition {
         ));
         let native_orchestration = Arc::new(PodNativeOrchestration::new(
             PodNativeOrchestrationDependencies {
-                pod_query,
-                persistence,
-                status_persistence,
-                deletion: native.clone(),
-                event_sink: native.clone(),
-                placement: native.clone(),
+                pod_query: pod_query.clone(),
+                persistence: persistence.clone(),
+                deletion: deletion.clone(),
                 admission_resources: native.clone(),
-                spec_validation: native,
+                spec_validation: native.clone(),
                 admission: crate::resource_admission_adapter::ResourceAdmissionAdapter::new(
                     self.db.clone(),
                 ),
@@ -966,22 +974,13 @@ impl RootPodRepositoryComposition {
                     crate::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
                         self.db.clone(),
                     ),
-                supervisor: dependencies.supervisor,
+                supervisor: dependencies.supervisor.clone(),
                 gc_reconcile: pod_reconcile.clone(),
                 service_reconcile: pod_reconcile.clone(),
-                mutation_effects:
-                    crate::resource_mutation_effects_adapter::ResourceMutationEffectsAdapter::new(
-                        self.side_effects.clone(),
-                        self.metrics.clone(),
-                    ),
                 metrics: self.metrics.clone(),
                 wall_clock: self.wall_clock.clone(),
             },
         ));
-        #[cfg(test)]
-        if let Some(gate) = self.scheduler_bind_gate.clone() {
-            native_orchestration.set_scheduler_bind_gate_for_test(gate);
-        }
         let mutation: Arc<dyn klights_pod_api::PodApiMutation> = native_orchestration.clone();
         let gc_delete: Arc<dyn klights_reconcile_api::GcPodDeleteSink> =
             native_orchestration.clone();
@@ -990,7 +989,20 @@ impl RootPodRepositoryComposition {
             gc_delete,
         }));
         let scheduling: Arc<dyn klights_pod_api::PodScheduling> =
-            crate::pod_scheduler_service::PodSchedulerService::new(native_orchestration.clone());
+            klights_controllers::scheduler::SchedulerService::new(
+                klights_controllers::scheduler::SchedulerServiceDependencies {
+                    pod_query,
+                    persistence,
+                    status_persistence,
+                    deletion,
+                    event_sink,
+                    placement,
+                    resource_query: self.resource_query.clone(),
+                    supervisor: dependencies.supervisor,
+                    mutation_effects,
+                    wall_clock: self.wall_clock.clone(),
+                },
+            );
         #[cfg(test)]
         let mark_terminating: Arc<dyn klights_pod_api::PodMarkTerminating> = native_orchestration;
         let adapters = PodRepositoryAdapters {

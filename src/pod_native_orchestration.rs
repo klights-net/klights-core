@@ -11,7 +11,6 @@
 //! Implementations land in Tasks 11 (create), 12 (update/patch), and 13
 //! (delete + delete-collection).
 
-use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,11 +29,10 @@ use crate::api::{AppError, DeleteOptions};
 use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_pod_api::{
     PodActorFinalizeRequest, PodApiCreateResult, PodApiDeleteOutcome, PodApiWriteOutcome,
-    PodControlPlaneEventRequest, PodControlPlaneEventSink, PodDeleteMarkRequest, PodDeleteOptions,
-    PodDeleteOrchestration, PodDeletePreconditions, PodGetRequest, PodListRequest,
-    PodMutationTarget, PodPersistence, PodPersistenceCreateRequest, PodPersistenceReplaceRequest,
-    PodQuery, PodRepositoryError, PodSpecValidation, PodStatusPatchKind, PodStatusPersistence,
-    PodStatusWriteRequest, preserve_pod_status_from_current,
+    PodDeleteMarkRequest, PodDeleteOptions, PodDeleteOrchestration, PodDeletePreconditions,
+    PodGetRequest, PodListRequest, PodMutationTarget, PodPersistence, PodPersistenceCreateRequest,
+    PodPersistenceReplaceRequest, PodQuery, PodRepositoryError, PodSpecValidation,
+    PodStatusPatchKind, preserve_pod_status_from_current,
 };
 use klights_reconcile_api::{
     GcPodDeleteError, GcPodDeleteFuture, GcPodDeleteRequest, GcPodDeleteSink, PodGcReconcileSink,
@@ -66,46 +64,6 @@ impl From<DeleteOptions> for PodDeleteOptions {
     }
 }
 
-pub(crate) const SCHED_BIND_CONCURRENCY: usize = 8;
-
-#[cfg(test)]
-pub(crate) struct SchedulerBindGateForTest {
-    entered: std::sync::atomic::AtomicUsize,
-    entered_notify: tokio::sync::Notify,
-    release_notify: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-impl SchedulerBindGateForTest {
-    pub fn new() -> Self {
-        Self {
-            entered: std::sync::atomic::AtomicUsize::new(0),
-            entered_notify: tokio::sync::Notify::new(),
-            release_notify: tokio::sync::Notify::new(),
-        }
-    }
-
-    pub async fn wait_for_entered_at_least(&self, target: usize) {
-        loop {
-            if self.entered.load(std::sync::atomic::Ordering::SeqCst) >= target {
-                return;
-            }
-            self.entered_notify.notified().await;
-        }
-    }
-
-    pub fn release_all(&self) {
-        self.release_notify.notify_waiters();
-    }
-
-    async fn enter_and_wait(&self) {
-        self.entered
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.entered_notify.notify_waiters();
-        self.release_notify.notified().await;
-    }
-}
-
 fn ensure_resource_preconditions_match(
     resource: &Resource,
     preconditions: &ResourcePreconditions,
@@ -131,24 +89,6 @@ fn pod_list_request(
         None,
     )
     .map_err(AppError::from)
-}
-
-async fn list_controller_resources(
-    query: &dyn klights_leader_api::LeaderResourceQuery,
-    api_version: &str,
-    kind: &str,
-) -> Result<Vec<Resource>, AppError> {
-    let request = klights_leader_api::ResourceListRequest::try_new(
-        api_version,
-        kind,
-        None,
-        None,
-        None,
-        None,
-        None,
-        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
-    )?;
-    Ok(query.list_resources(request).await?.into_items())
 }
 
 async fn apply_pod_service_account_admission(
@@ -205,37 +145,15 @@ async fn apply_pod_service_account_admission(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PodSchedulingDecision {
+struct InitialPodSchedulingState {
     node_name: Option<String>,
     pending: bool,
-    unschedulable_message: Option<String>,
-    preemption_victims: Vec<PodPreemptionCandidate>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PodPreemptionCandidate {
-    namespace: String,
-    name: String,
-    resource_version: i64,
-    data: Value,
-}
-
-struct PodPreemptionContext<'a> {
-    query: &'a dyn PodQuery,
-    persistence: &'a dyn PodPersistence,
-    deletion: &'a dyn PodDeleteOrchestration,
-    mutation_effects: &'a dyn klights_reconcile_api::ResourceMutationEffectsPort,
-    preemptor_namespace: &'a str,
-    preemptor_name: &'a str,
 }
 
 pub struct PodNativeOrchestration {
     pod_query: Arc<dyn PodQuery>,
     persistence: Arc<dyn PodPersistence>,
-    status_persistence: Arc<dyn PodStatusPersistence>,
     deletion: Arc<dyn PodDeleteOrchestration>,
-    event_sink: Arc<dyn PodControlPlaneEventSink>,
-    placement: Arc<dyn klights_pod_api::PodPlacement>,
     admission_resources: Arc<dyn AdmissionResourceStore>,
     spec_validation: Arc<dyn PodSpecValidation>,
     admission: Arc<dyn crate::api::admission_ports::ResourceAdmissionPort>,
@@ -244,20 +162,14 @@ pub struct PodNativeOrchestration {
     supervisor: Arc<TaskSupervisor>,
     gc_reconcile: Arc<dyn PodGcReconcileSink>,
     service_reconcile: Arc<dyn PodServiceReconcileSink>,
-    mutation_effects: Arc<dyn klights_reconcile_api::ResourceMutationEffectsPort>,
     metrics: Arc<dyn ReconcileFailureMetrics>,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
-    #[cfg(test)]
-    scheduler_bind_gate: std::sync::Mutex<Option<Arc<SchedulerBindGateForTest>>>,
 }
 
 pub struct PodNativeOrchestrationDependencies {
     pub pod_query: Arc<dyn PodQuery>,
     pub persistence: Arc<dyn PodPersistence>,
-    pub status_persistence: Arc<dyn PodStatusPersistence>,
     pub deletion: Arc<dyn PodDeleteOrchestration>,
-    pub event_sink: Arc<dyn PodControlPlaneEventSink>,
-    pub placement: Arc<dyn klights_pod_api::PodPlacement>,
     pub admission_resources: Arc<dyn AdmissionResourceStore>,
     pub spec_validation: Arc<dyn PodSpecValidation>,
     pub admission: Arc<dyn crate::api::admission_ports::ResourceAdmissionPort>,
@@ -266,7 +178,6 @@ pub struct PodNativeOrchestrationDependencies {
     pub supervisor: Arc<TaskSupervisor>,
     pub gc_reconcile: Arc<dyn PodGcReconcileSink>,
     pub service_reconcile: Arc<dyn PodServiceReconcileSink>,
-    pub mutation_effects: Arc<dyn klights_reconcile_api::ResourceMutationEffectsPort>,
     pub metrics: Arc<dyn ReconcileFailureMetrics>,
     pub wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
@@ -276,10 +187,7 @@ impl PodNativeOrchestration {
         let PodNativeOrchestrationDependencies {
             pod_query,
             persistence,
-            status_persistence,
             deletion,
-            event_sink,
-            placement,
             admission_resources,
             spec_validation,
             admission,
@@ -288,17 +196,13 @@ impl PodNativeOrchestration {
             supervisor,
             gc_reconcile,
             service_reconcile,
-            mutation_effects,
             metrics,
             wall_clock,
         } = dependencies;
         Self {
             pod_query,
             persistence,
-            status_persistence,
             deletion,
-            event_sink,
-            placement,
             admission_resources,
             spec_validation,
             admission,
@@ -307,29 +211,10 @@ impl PodNativeOrchestration {
             supervisor,
             gc_reconcile,
             service_reconcile,
-            mutation_effects,
             metrics,
             wall_clock,
-            #[cfg(test)]
-            scheduler_bind_gate: std::sync::Mutex::new(None),
         }
     }
-
-    #[cfg(test)]
-    pub(super) fn set_scheduler_bind_gate_for_test(&self, gate: Arc<SchedulerBindGateForTest>) {
-        *self.scheduler_bind_gate.lock().unwrap() = Some(gate);
-    }
-
-    #[cfg(test)]
-    async fn wait_scheduler_bind_gate_for_test(&self) {
-        let gate = self.scheduler_bind_gate.lock().unwrap().clone();
-        if let Some(gate) = gate {
-            gate.enter_and_wait().await;
-        }
-    }
-
-    #[cfg(not(test))]
-    async fn wait_scheduler_bind_gate_for_test(&self) {}
 
     /// Body of `src/pod_create.rs::create_pod_through_pipeline`, moved
     /// into the repository. The single `("v1","Pod",...)` DB call is the
@@ -477,7 +362,7 @@ impl PodNativeOrchestration {
         apply_priority_class_to_pod(self.admission_resources.as_ref(), &mut body).await?;
 
         let qos_class = compute_qos_class(&body);
-        let scheduling_decision = initial_create_scheduling_decision(&body);
+        let scheduling_state = initial_create_scheduling_state(&body);
         if let Some(obj) = body.as_object_mut() {
             let spec = obj.entry("spec".to_string()).or_insert_with(|| json!({}));
             if let Some(spec_obj) = spec.as_object_mut() {
@@ -487,27 +372,19 @@ impl PodNativeOrchestration {
                     .map(|v| v.as_str().map(|s| s.is_empty()).unwrap_or(v.is_null()))
                     .unwrap_or(true);
                 if needs_node_name {
-                    if let Some(scheduled_node) = scheduling_decision.node_name.as_deref() {
+                    if let Some(scheduled_node) = scheduling_state.node_name.as_deref() {
                         spec_obj.insert("nodeName".to_string(), json!(scheduled_node));
                     } else {
                         spec_obj.remove("nodeName");
                     }
                 }
             }
-            let pod_scheduled_condition = if scheduling_decision.pending {
+            let pod_scheduled_condition = if scheduling_state.pending {
                 json!({
                     "type": "PodScheduled",
                     "status": "False",
                     "lastTransitionTime": transition_time.clone(),
                     "reason": "SchedulingPending",
-                })
-            } else if let Some(message) = scheduling_decision.unschedulable_message.as_deref() {
-                json!({
-                    "type": "PodScheduled",
-                    "status": "False",
-                    "lastTransitionTime": transition_time.clone(),
-                    "reason": "Unschedulable",
-                    "message": message,
                 })
             } else {
                 json!({
@@ -587,301 +464,6 @@ impl PodNativeOrchestration {
             resource: Some(resource),
             body: response_body,
         })
-    }
-
-    pub async fn schedule_all_unbound_pods(self: &Arc<Self>) -> Result<(), AppError> {
-        let initial = self
-            .pod_query
-            .list_pods(pod_list_request(None, None, None)?)
-            .await?;
-        let candidates = sorted_unbound_pods(initial.into_parts().0);
-
-        for wave in candidates.chunks(SCHED_BIND_CONCURRENCY) {
-            let snapshot = self.scheduler_snapshot().await?;
-            let mut reservations = Vec::new();
-            let mut handles = Vec::with_capacity(wave.len());
-
-            for pod in wave {
-                let namespace = pod_namespace(pod);
-                let name = pod.name.clone();
-                let decision = schedule_pod_from_snapshot(
-                    self.pod_query.as_ref(),
-                    self.placement.as_ref(),
-                    &snapshot,
-                    &pod.data,
-                    &namespace,
-                    &name,
-                    &reservations,
-                )
-                .await?;
-                if let Some(node_name) = decision.node_name.as_deref() {
-                    reservations.push(reserved_pod_body(pod, node_name));
-                }
-
-                let api = self.clone();
-                let handle = self
-                    .supervisor
-                    .spawn_async(
-                        klights_supervisor::TaskCategory::Background,
-                        format!("scheduler_bind/{namespace}/{name}"),
-                        async move {
-                            api.schedule_pending_pod_with_decision(&namespace, &name, decision)
-                                .await
-                        },
-                    )
-                    .await
-                    .map_err(|e| AppError::Internal(e.to_string()))?;
-                handles.push(handle);
-            }
-
-            for handle in handles {
-                handle.join().await.map_err(|e| {
-                    AppError::Internal(format!("scheduler bind task failed: {e}"))
-                })??;
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn scheduler_snapshot(&self) -> Result<PodSchedulingView, AppError> {
-        let nodes = list_controller_resources(self.resource_query.as_ref(), "v1", "Node").await?;
-        let pods = self
-            .pod_query
-            .list_pods(pod_list_request(None, None, None)?)
-            .await?;
-        let namespaces =
-            list_controller_resources(self.resource_query.as_ref(), "v1", "Namespace").await?;
-        let pdbs = list_controller_resources(
-            self.resource_query.as_ref(),
-            "policy/v1",
-            "PodDisruptionBudget",
-        )
-        .await?;
-        Ok(PodSchedulingView {
-            nodes,
-            pods: pods.into_parts().0,
-            namespaces,
-            pdbs,
-        })
-    }
-
-    pub async fn schedule_pending_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> Result<Option<Resource>, AppError> {
-        let Some(current) = self
-            .pod_query
-            .get_pod(pod_get_request(namespace, name)?)
-            .await?
-        else {
-            return Ok(None);
-        };
-        if current
-            .data
-            .pointer("/spec/nodeName")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.is_empty())
-        {
-            return Ok(Some(current));
-        }
-
-        let decision = schedule_pod_on_available_nodes(
-            self.pod_query.as_ref(),
-            self.resource_query.as_ref(),
-            self.placement.as_ref(),
-            &current.data,
-            namespace,
-            name,
-        )
-        .await?;
-
-        self.apply_scheduling_decision_to_pod(namespace, name, current, decision)
-            .await
-    }
-
-    async fn schedule_pending_pod_with_decision(
-        &self,
-        namespace: &str,
-        name: &str,
-        decision: PodSchedulingDecision,
-    ) -> Result<Option<Resource>, AppError> {
-        let Some(current) = self
-            .pod_query
-            .get_pod(pod_get_request(namespace, name)?)
-            .await?
-        else {
-            return Ok(None);
-        };
-        if current
-            .data
-            .pointer("/spec/nodeName")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.is_empty())
-        {
-            return Ok(Some(current));
-        }
-        self.apply_scheduling_decision_to_pod(namespace, name, current, decision)
-            .await
-    }
-
-    async fn apply_scheduling_decision_to_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        current: Resource,
-        mut decision: PodSchedulingDecision,
-    ) -> Result<Option<Resource>, AppError> {
-        let transition_time =
-            klights_cluster_core::k8s_time::format_legacy_timestamp(self.wall_clock.now_utc());
-        if let Some(node_name) = decision.node_name.as_deref()
-            && !self
-                .planned_node_still_fits(namespace, name, &current.data, node_name)
-                .await?
-        {
-            decision = PodSchedulingDecision {
-                node_name: None,
-                pending: false,
-                unschedulable_message: Some(
-                    "node allocation changed before scheduler bind".to_string(),
-                ),
-                preemption_victims: Vec::new(),
-            };
-        }
-
-        let mut body: Value = (*current.data).clone();
-        if let Some(spec) = body.get_mut("spec").and_then(|v| v.as_object_mut()) {
-            match decision.node_name.as_deref() {
-                Some(node_name) => {
-                    spec.insert("nodeName".to_string(), json!(node_name));
-                }
-                None => {
-                    spec.remove("nodeName");
-                }
-            }
-        }
-        if let Some(status) = body.get_mut("status").and_then(|v| v.as_object_mut()) {
-            let conditions = status
-                .entry("conditions".to_string())
-                .or_insert_with(|| json!([]));
-            if let Some(conditions) = conditions.as_array_mut() {
-                conditions.retain(|condition| {
-                    condition.get("type").and_then(|v| v.as_str()) != Some("PodScheduled")
-                });
-                conditions.push(
-                    if let Some(message) = decision.unschedulable_message.as_deref() {
-                        json!({
-                            "type": "PodScheduled",
-                            "status": "False",
-                            "lastTransitionTime": transition_time.clone(),
-                            "reason": "Unschedulable",
-                            "message": message,
-                        })
-                    } else {
-                        json!({
-                            "type": "PodScheduled",
-                            "status": "True",
-                            "lastTransitionTime": transition_time.clone(),
-                        })
-                    },
-                );
-            }
-        }
-        let desired_status = body.get("status").cloned();
-        let spec_changed = body.get("spec") != current.data.get("spec");
-        let status_changed = desired_status
-            .as_ref()
-            .is_some_and(|status| pod_scheduled_condition_changed(&current.data, status));
-
-        let mut final_resource = if spec_changed && status_changed {
-            self.persistence
-                .replace_pod_including_status(PodPersistenceReplaceRequest {
-                    namespace: namespace.to_string(),
-                    name: name.to_string(),
-                    body,
-                    expected_resource_version: current.resource_version,
-                })
-                .await?
-        } else if spec_changed {
-            self.persistence
-                .replace_pod(PodPersistenceReplaceRequest {
-                    namespace: namespace.to_string(),
-                    name: name.to_string(),
-                    body,
-                    expected_resource_version: current.resource_version,
-                })
-                .await?
-        } else {
-            current
-        };
-        if status_changed && !spec_changed {
-            let status = desired_status.expect("status_changed requires desired status");
-            final_resource = self
-                .status_persistence
-                .write_pod_status(PodStatusWriteRequest {
-                    namespace: namespace.to_string(),
-                    name: name.to_string(),
-                    status,
-                    expected_resource_version: Some(final_resource.resource_version),
-                })
-                .await?;
-        }
-        self.wait_scheduler_bind_gate_for_test().await;
-        apply_pod_preemption(
-            PodPreemptionContext {
-                query: self.pod_query.as_ref(),
-                persistence: self.persistence.as_ref(),
-                deletion: self.deletion.as_ref(),
-                mutation_effects: self.mutation_effects.as_ref(),
-                preemptor_namespace: namespace,
-                preemptor_name: name,
-            },
-            &decision.preemption_victims,
-            &transition_time,
-        )
-        .await?;
-        if status_changed
-            && let Some(message) = decision.unschedulable_message.as_deref()
-            && let Err(e) = self
-                .event_sink
-                .emit_pod_event(PodControlPlaneEventRequest {
-                    pod: final_resource.data.clone(),
-                    reason: "FailedScheduling".to_string(),
-                    message: message.to_string(),
-                    event_type: "Warning".to_string(),
-                    reporting_component: "default-scheduler".to_string(),
-                    reporting_instance: decision.node_name.clone().unwrap_or_default(),
-                })
-                .await
-        {
-            tracing::warn!(
-                namespace = %namespace,
-                name = %name,
-                error = %e,
-                "failed to emit FailedScheduling event during scheduler retry"
-            );
-        }
-        Ok(Some(final_resource))
-    }
-
-    async fn planned_node_still_fits(
-        &self,
-        namespace: &str,
-        name: &str,
-        pod: &Value,
-        planned_node: &str,
-    ) -> Result<bool, AppError> {
-        let live_decision = schedule_pod_on_available_nodes(
-            self.pod_query.as_ref(),
-            self.resource_query.as_ref(),
-            self.placement.as_ref(),
-            pod,
-            namespace,
-            name,
-        )
-        .await?;
-        Ok(live_decision.node_name.as_deref() == Some(planned_node))
     }
 
     pub async fn bind_pod_from_api(
@@ -1430,530 +1012,22 @@ impl PodNativeOrchestration {
     }
 }
 
-fn pod_scheduled_condition_changed(current_pod: &Value, desired_status: &Value) -> bool {
-    pod_scheduled_condition_signature(current_pod.get("status"))
-        != pod_scheduled_condition_signature(Some(desired_status))
-}
-
-fn pod_scheduled_condition_signature(
-    status: Option<&Value>,
-) -> Option<(String, Option<String>, Option<String>)> {
-    let condition = status
-        .and_then(|status| status.get("conditions"))
-        .and_then(|conditions| conditions.as_array())
-        .and_then(|conditions| {
-            conditions.iter().find(|condition| {
-                condition.get("type").and_then(|v| v.as_str()) == Some("PodScheduled")
-            })
-        })?;
-
-    Some((
-        condition_string_field(condition, "status")?,
-        condition_string_field(condition, "reason"),
-        condition_string_field(condition, "message"),
-    ))
-}
-
-fn condition_string_field(condition: &Value, field: &str) -> Option<String> {
-    condition
-        .get(field)
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-}
-
-fn initial_create_scheduling_decision(pod: &Value) -> PodSchedulingDecision {
+fn initial_create_scheduling_state(pod: &Value) -> InitialPodSchedulingState {
     let explicit_node_name = pod
         .pointer("/spec/nodeName")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
     if let Some(explicit_node_name) = explicit_node_name {
-        PodSchedulingDecision {
+        InitialPodSchedulingState {
             node_name: Some(explicit_node_name.to_string()),
             pending: false,
-            unschedulable_message: None,
-            preemption_victims: Vec::new(),
         }
     } else {
-        PodSchedulingDecision {
+        InitialPodSchedulingState {
             node_name: None,
             pending: true,
-            unschedulable_message: None,
-            preemption_victims: Vec::new(),
         }
     }
-}
-
-fn sorted_unbound_pods(pods: Vec<Resource>) -> Vec<Resource> {
-    let mut pods: Vec<Resource> = pods
-        .into_iter()
-        .filter(|pod| {
-            pod.data
-                .pointer("/spec/nodeName")
-                .and_then(|v| v.as_str())
-                .is_none_or(|s| s.is_empty())
-        })
-        .collect();
-    pods.sort_by(compare_pod_scheduling_order);
-    pods
-}
-
-fn compare_pod_scheduling_order(a: &Resource, b: &Resource) -> Ordering {
-    pod_priority(&b.data)
-        .cmp(&pod_priority(&a.data))
-        .then_with(|| pod_creation_timestamp(&a.data).cmp(pod_creation_timestamp(&b.data)))
-        .then_with(|| pod_namespace(a).cmp(&pod_namespace(b)))
-        .then_with(|| a.name.cmp(&b.name))
-}
-
-fn pod_creation_timestamp(pod: &Value) -> &str {
-    pod.pointer("/metadata/creationTimestamp")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-}
-
-fn pod_namespace(pod: &Resource) -> String {
-    pod.namespace
-        .clone()
-        .or_else(|| {
-            pod.data
-                .pointer("/metadata/namespace")
-                .and_then(|v| v.as_str())
-                .map(ToString::to_string)
-        })
-        .unwrap_or_else(|| "default".to_string())
-}
-
-fn reserved_pod_body(pod: &Resource, node_name: &str) -> Value {
-    let mut body = std::sync::Arc::unwrap_or_clone(pod.data.clone());
-    if let Some(obj) = body.as_object_mut() {
-        let spec = obj.entry("spec".to_string()).or_insert_with(|| json!({}));
-        if let Some(spec) = spec.as_object_mut() {
-            spec.insert("nodeName".to_string(), json!(node_name));
-        }
-    }
-    body
-}
-
-struct PodSchedulingView {
-    nodes: Vec<Resource>,
-    pods: Vec<Resource>,
-    namespaces: Vec<Resource>,
-    pdbs: Vec<Resource>,
-}
-
-async fn schedule_pod_from_snapshot(
-    query: &dyn PodQuery,
-    placement: &dyn klights_pod_api::PodPlacement,
-    snapshot: &PodSchedulingView,
-    pod: &Value,
-    namespace: &str,
-    pod_name: &str,
-    reservations: &[Value],
-) -> Result<PodSchedulingDecision, AppError> {
-    let explicit_node_name = pod
-        .pointer("/spec/nodeName")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
-    if let Some(explicit_node_name) = explicit_node_name {
-        return Ok(PodSchedulingDecision {
-            node_name: Some(explicit_node_name.to_string()),
-            pending: false,
-            unschedulable_message: None,
-            preemption_victims: Vec::new(),
-        });
-    }
-
-    let mut node_names: Vec<String> = snapshot.nodes.iter().map(|n| n.name.clone()).collect();
-    node_names.sort();
-
-    let node_values: Vec<Arc<Value>> = snapshot.nodes.iter().map(|n| n.data.clone()).collect();
-    let namespace_values: Vec<Arc<Value>> = snapshot
-        .namespaces
-        .iter()
-        .map(|namespace| namespace.data.clone())
-        .collect();
-    let pdb_values: Vec<Arc<Value>> = snapshot.pdbs.iter().map(|pdb| pdb.data.clone()).collect();
-    let existing_per_node: Vec<(String, Vec<Arc<Value>>)> = node_names
-        .iter()
-        .map(|name| {
-            let mut pods_on_node: Vec<Arc<Value>> = snapshot
-                .pods
-                .iter()
-                .filter(|p| pod_counts_toward_node_allocated(&p.data, name, namespace, pod_name))
-                .map(|p| p.data.clone())
-                .collect();
-            pods_on_node.extend(
-                reservations
-                    .iter()
-                    .filter(|p| pod_counts_toward_node_allocated(p, name, namespace, pod_name))
-                    .cloned()
-                    .map(Arc::new),
-            );
-            (name.clone(), pods_on_node)
-        })
-        .collect();
-
-    let decision = placement
-        .place_pod(klights_pod_api::PodPlacementRequest {
-            nodes: node_values,
-            incoming_pod: Arc::new(pod.clone()),
-            existing_pods_by_node: existing_per_node,
-            namespaces: namespace_values,
-            disruption_budgets: pdb_values,
-        })
-        .map_err(|error| AppError::ServiceUnavailable(error.to_string()))?;
-
-    let mut api_decision = scheduling_decision_to_api(decision);
-    if !api_decision.preemption_victims.is_empty() {
-        let victim_keys: Vec<String> = api_decision
-            .preemption_victims
-            .iter()
-            .map(|v| format!("{}/{}", v.namespace, v.name))
-            .collect();
-        if let Some(node_name) = api_decision.node_name.as_deref() {
-            api_decision.preemption_victims =
-                collect_preemption_victims_with_data(query, node_name, pod, &victim_keys).await?;
-        }
-    }
-
-    Ok(api_decision)
-}
-
-async fn schedule_pod_on_available_nodes(
-    query: &dyn PodQuery,
-    resources: &dyn klights_leader_api::LeaderResourceQuery,
-    placement: &dyn klights_pod_api::PodPlacement,
-    pod: &Value,
-    namespace: &str,
-    pod_name: &str,
-) -> Result<PodSchedulingDecision, AppError> {
-    let explicit_node_name = pod
-        .pointer("/spec/nodeName")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
-    if let Some(explicit_node_name) = explicit_node_name {
-        return Ok(PodSchedulingDecision {
-            node_name: Some(explicit_node_name.to_string()),
-            pending: false,
-            unschedulable_message: None,
-            preemption_victims: Vec::new(),
-        });
-    }
-
-    let nodes = list_controller_resources(resources, "v1", "Node").await?;
-    let namespaces = list_controller_resources(resources, "v1", "Namespace").await?;
-    let pdbs = list_controller_resources(resources, "policy/v1", "PodDisruptionBudget").await?;
-
-    // Collect existing pods on each node
-    let all_pods = query.list_pods(pod_list_request(None, None, None)?).await?;
-
-    let mut node_names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
-    node_names.sort();
-
-    let node_values: Vec<Arc<Value>> = nodes.iter().map(|n| n.data.clone()).collect();
-    let namespace_values: Vec<Arc<Value>> = namespaces
-        .iter()
-        .map(|namespace| namespace.data.clone())
-        .collect();
-    let pdb_values: Vec<Arc<Value>> = pdbs.iter().map(|pdb| pdb.data.clone()).collect();
-    let existing_per_node: Vec<(String, Vec<Arc<Value>>)> = node_names
-        .iter()
-        .map(|name| {
-            let pods_on_node: Vec<Arc<Value>> = all_pods
-                .items()
-                .iter()
-                .filter(|p| pod_counts_toward_node_allocated(&p.data, name, namespace, pod_name))
-                .map(|p| p.data.clone())
-                .collect();
-            (name.clone(), pods_on_node)
-        })
-        .collect();
-
-    let decision = placement
-        .place_pod(klights_pod_api::PodPlacementRequest {
-            nodes: node_values,
-            incoming_pod: Arc::new(pod.clone()),
-            existing_pods_by_node: existing_per_node,
-            namespaces: namespace_values,
-            disruption_budgets: pdb_values,
-        })
-        .map_err(|error| AppError::ServiceUnavailable(error.to_string()))?;
-
-    let mut api_decision = scheduling_decision_to_api(decision);
-    if !api_decision.preemption_victims.is_empty() {
-        let victim_keys: Vec<String> = api_decision
-            .preemption_victims
-            .iter()
-            .map(|v| format!("{}/{}", v.namespace, v.name))
-            .collect();
-        if let Some(node_name) = api_decision.node_name.as_deref() {
-            api_decision.preemption_victims =
-                collect_preemption_victims_with_data(query, node_name, pod, &victim_keys).await?;
-        }
-    }
-
-    Ok(api_decision)
-}
-
-fn scheduling_decision_to_api(
-    decision: klights_pod_api::PodPlacementDecision,
-) -> PodSchedulingDecision {
-    PodSchedulingDecision {
-        node_name: decision.selected_node,
-        pending: false,
-        unschedulable_message: decision.unschedulable_message,
-        preemption_victims: decision
-            .preemption_victims
-            .iter()
-            .map(|v| {
-                let parts: Vec<&str> = v.splitn(2, '/').collect();
-                PodPreemptionCandidate {
-                    namespace: parts.first().unwrap_or(&"").to_string(),
-                    name: parts.get(1).unwrap_or(&"").to_string(),
-                    resource_version: 0,
-                    data: Value::Null,
-                }
-            })
-            .collect(),
-    }
-}
-
-async fn collect_preemption_victims_with_data(
-    query: &dyn PodQuery,
-    node_name: &str,
-    incoming: &Value,
-    victim_names: &[String],
-) -> Result<Vec<PodPreemptionCandidate>, AppError> {
-    let incoming_priority = pod_priority(incoming);
-    let pods = query.list_pods(pod_list_request(None, None, None)?).await?;
-    let mut victims = Vec::new();
-    for resource in pods.into_parts().0 {
-        if !pod_counts_toward_node_allocated(&resource.data, node_name, "", "") {
-            continue;
-        }
-        if pod_priority(&resource.data) >= incoming_priority {
-            continue;
-        }
-        let ns = resource
-            .namespace
-            .clone()
-            .or_else(|| {
-                resource
-                    .data
-                    .pointer("/metadata/namespace")
-                    .and_then(|v| v.as_str())
-                    .map(ToString::to_string)
-            })
-            .unwrap_or_else(|| "default".to_string());
-        let key = format!("{}/{}", ns, resource.name);
-        if victim_names.contains(&key) {
-            victims.push(PodPreemptionCandidate {
-                namespace: ns,
-                name: resource.name,
-                resource_version: resource.resource_version,
-                data: std::sync::Arc::unwrap_or_clone(resource.data),
-            });
-        }
-    }
-    Ok(victims)
-}
-
-fn pod_counts_toward_node_allocated(
-    pod: &Value,
-    node_name: &str,
-    pending_namespace: &str,
-    pending_name: &str,
-) -> bool {
-    if pod
-        .pointer("/metadata/deletionTimestamp")
-        .and_then(|v| v.as_str())
-        .is_some()
-    {
-        return false;
-    }
-    if pod.pointer("/spec/nodeName").and_then(|v| v.as_str()) != Some(node_name) {
-        return false;
-    }
-    let namespace = pod
-        .pointer("/metadata/namespace")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default");
-    let name = pod.pointer("/metadata/name").and_then(|v| v.as_str());
-    if namespace == pending_namespace && name == Some(pending_name) {
-        return false;
-    }
-    !matches!(
-        pod.pointer("/status/phase").and_then(|v| v.as_str()),
-        Some("Succeeded" | "Failed")
-    )
-}
-
-async fn apply_pod_preemption(
-    ctx: PodPreemptionContext<'_>,
-    victims: &[PodPreemptionCandidate],
-    transition_time: &str,
-) -> Result<(), AppError> {
-    for victim in victims {
-        let updated = mark_preemption_candidate(
-            ctx.query,
-            ctx.persistence,
-            victim,
-            ctx.preemptor_namespace,
-            ctx.preemptor_name,
-            transition_time,
-        )
-        .await?;
-        let uid = updated.uid.clone();
-        let hook_resource = std::sync::Arc::unwrap_or_clone(updated.data);
-        ctx.deletion
-            .enqueue_marked_retry(klights_pod_api::PodMarkedRetryRequest {
-                namespace: victim.namespace.clone(),
-                name: victim.name.clone(),
-                uid,
-                run_after: Duration::ZERO,
-                pod_data: hook_resource.clone(),
-            })
-            .await?;
-        ctx.mutation_effects
-            .dispatch_resource_mutation_effects(
-                klights_reconcile_api::ResourceMutationEffectsRequest::new(
-                    klights_reconcile_api::ResourceChange::Updated,
-                    &hook_resource,
-                    Some(&victim.data),
-                    "pod_preemption_victim",
-                ),
-            )
-            .await;
-    }
-    Ok(())
-}
-
-async fn mark_preemption_candidate(
-    query: &dyn PodQuery,
-    persistence: &dyn PodPersistence,
-    victim: &PodPreemptionCandidate,
-    preemptor_namespace: &str,
-    preemptor_name: &str,
-    transition_time: &str,
-) -> Result<Resource, AppError> {
-    const MAX_RETRIES: u32 = 5;
-    let mut resource_version = victim.resource_version;
-    let mut data = victim.data.clone();
-
-    for attempt in 0..MAX_RETRIES {
-        mark_pod_preempted_metadata(&mut data, transition_time);
-        let mut status =
-            preempted_status(&data, preemptor_namespace, preemptor_name, transition_time);
-        // This is a scheduler-originated write (preemption sets the
-        // scheduler-owned `DisruptionTarget` condition). Route it through the
-        // central Pod status merge policy as the Scheduler owner so it is
-        // authoritative for scheduler conditions while kubelet-owned lifecycle
-        // conditions present in the live status are preserved, and no terminal
-        // container-state rewrite is applied (that is a kubelet-only guarantee).
-        klights_types::merge_pod_status_for_update(
-            "v1",
-            "Pod",
-            &data,
-            &mut status,
-            klights_types::PodStatusOwner::Scheduler,
-        );
-        if let Some(object) = data.as_object_mut() {
-            object.insert("status".to_string(), status);
-        }
-        match persistence
-            .replace_pod_including_status(PodPersistenceReplaceRequest {
-                namespace: victim.namespace.clone(),
-                name: victim.name.clone(),
-                body: data,
-                expected_resource_version: resource_version,
-            })
-            .await
-        {
-            Ok(updated) => return Ok(updated),
-            Err(e)
-                if attempt + 1 < MAX_RETRIES
-                    && matches!(e, PodRepositoryError::Conflict { .. }) =>
-            {
-                let current = query
-                    .get_pod(pod_get_request(&victim.namespace, &victim.name)?)
-                    .await?
-                    .ok_or_else(|| AppError::NotFound("Pod not found".to_string()))?;
-                resource_version = current.resource_version;
-                data = std::sync::Arc::unwrap_or_clone(current.data);
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-
-    unreachable!("preemption termination retry loop exhausted without returning")
-}
-
-fn mark_pod_preempted_metadata(data: &mut Value, transition_time: &str) {
-    if let Some(meta) = data.get_mut("metadata").and_then(|v| v.as_object_mut()) {
-        meta.entry("deletionTimestamp".to_string())
-            .or_insert_with(|| json!(transition_time));
-        meta.entry("deletionGracePeriodSeconds".to_string())
-            .or_insert_with(|| json!(0));
-    }
-}
-
-fn preempted_status(
-    data: &Value,
-    preemptor_namespace: &str,
-    preemptor_name: &str,
-    transition_time: &str,
-) -> Value {
-    let mut status = data.get("status").cloned().unwrap_or_else(|| json!({}));
-    if !status.is_object() {
-        status = json!({});
-    }
-    let has_bound_node = data
-        .pointer("/spec/nodeName")
-        .and_then(|v| v.as_str())
-        .is_some_and(|node_name| !node_name.is_empty());
-    let condition = json!({
-        "type": "DisruptionTarget",
-        "status": "True",
-        "lastTransitionTime": transition_time,
-        "reason": "PreemptionByScheduler",
-        "message": format!("Preempted by pod {preemptor_namespace}/{preemptor_name} on node")
-    });
-    if let Some(status) = status.as_object_mut() {
-        let conditions = status
-            .entry("conditions".to_string())
-            .or_insert_with(|| json!([]));
-        if let Some(conditions) = conditions.as_array_mut() {
-            let pod_scheduled_true = if has_bound_node {
-                conditions
-                    .iter()
-                    .find(|existing| {
-                        existing.get("type").and_then(|v| v.as_str()) == Some("PodScheduled")
-                            && existing.get("status").and_then(|v| v.as_str()) == Some("True")
-                    })
-                    .cloned()
-                    .or_else(|| {
-                        Some(json!({
-                            "type": "PodScheduled",
-                            "status": "True",
-                            "lastTransitionTime": transition_time,
-                        }))
-                    })
-            } else {
-                None
-            };
-            conditions.retain(|existing| {
-                let condition_type = existing.get("type").and_then(|v| v.as_str());
-                condition_type != Some("DisruptionTarget")
-                    && (!has_bound_node || condition_type != Some("PodScheduled"))
-            });
-            if let Some(pod_scheduled_true) = pod_scheduled_true {
-                conditions.push(pod_scheduled_true);
-            }
-            conditions.push(condition);
-        }
-    }
-    status
 }
 
 fn validate_pod_binding_object(
@@ -2187,12 +1261,6 @@ fn priority_class_value_and_policy(pc: Option<&Value>) -> (Option<i64>, Option<S
         .and_then(|v| v.as_str())
         .map(ToString::to_string);
     (priority, policy)
-}
-
-fn pod_priority(pod: &Value) -> i64 {
-    pod.pointer("/spec/priority")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
 }
 
 fn patch_type_to_content_type(p: PodStatusPatchType) -> &'static str {
