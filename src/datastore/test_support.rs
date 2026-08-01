@@ -10,7 +10,8 @@
 
 #![cfg(test)]
 
-use super::{Datastore, DatastoreBackend, DatastoreHandle};
+use super::sqlite::Datastore;
+use super::{DatastoreBackend, DatastoreHandle};
 use klights_cluster_core::{LogApplyCommit, LogApplyMutation};
 use std::sync::Arc;
 

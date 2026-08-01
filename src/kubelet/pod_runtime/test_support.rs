@@ -2363,11 +2363,7 @@ impl PodRuntimeHarness {
         // The API create path enforces the upstream NamespaceLifecycle rule
         // (target namespace must exist). Ensure the pod's namespace is present,
         // mirroring a live cluster where the namespace always pre-exists.
-        crate::datastore::sqlite::test_support::ensure_namespace(
-            self.db_handle.as_ref(),
-            &namespace,
-        )
-        .await;
+        crate::datastore::test_support::ensure_namespace(self.db_handle.as_ref(), &namespace).await;
 
         self.repo
             .create_controller_pod(&namespace, &name, &node_name, pod)

@@ -9279,7 +9279,7 @@ async fn test_crd_live_replay_failure_emits_terminal_error() {
     use std::time::Duration;
     use tower::ServiceExt;
 
-    let concrete_db = crate::datastore::sqlite::test_support::in_memory().await;
+    let concrete_db = crate::datastore::test_support::in_memory().await;
     let focused_reads = concrete_db.focused_read_store();
     let failing_history =
         std::sync::Arc::new(ToggleFailingWatchHistory::new(focused_reads.clone()));

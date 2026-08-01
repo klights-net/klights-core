@@ -45,7 +45,7 @@ pub use types::{
 };
 
 #[cfg(test)]
-pub use sqlite::test_support;
+pub mod test_support;
 
 #[cfg(test)]
 pub use sqlite::{create_staged_post_commit, staged_post_commit_from_event, staged_test_event};

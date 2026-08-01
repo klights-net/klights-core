@@ -14,8 +14,6 @@ mod merge_patch;
 mod outbox_codec;
 mod rv_helpers;
 #[cfg(test)]
-pub mod test_support;
-#[cfg(test)]
 mod tests;
 mod watch;
 // DSB-04: broadcast mode probe. Dead code until DSB-HA-02 consumes it.

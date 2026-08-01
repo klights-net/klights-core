@@ -2140,7 +2140,7 @@ mod tests {
     /// scope, ignoring both the cursor high-water and a fresh collection read.
     #[tokio::test]
     async fn resolve_periodic_bookmark_rv_scoped_anchors_to_delivered_frontier() {
-        let (ds, handle) = crate::datastore::sqlite::test_support::in_memory_with_handle().await;
+        let (ds, handle) = crate::datastore::test_support::in_memory_with_handle().await;
         // Seed unrelated objects so a naive "collection RV" read would return a
         // large global value; the scoped resolver must NOT touch it.
         for i in 0..10 {
@@ -2188,7 +2188,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_periodic_bookmark_rv_keeps_absent_exact_name_scope_open() {
-        let (ds, handle) = crate::datastore::sqlite::test_support::in_memory_with_handle().await;
+        let (ds, handle) = crate::datastore::test_support::in_memory_with_handle().await;
         ds.create_resource(
             "v1",
             "ConfigMap",
@@ -2229,7 +2229,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_periodic_bookmark_rv_selector_free_uses_cursor_high_water() {
-        let (ds, handle) = crate::datastore::sqlite::test_support::in_memory_with_handle().await;
+        let (ds, handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let watch_source = datastore_watch_source(&ds, &handle);
         let rv = resolve_periodic_bookmark_rv(PeriodicBookmarkContext {
             db: &watch_source,
@@ -2253,7 +2253,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_periodic_bookmark_rv_selector_free_falls_back_to_collection_when_zero() {
-        let (ds, handle) = crate::datastore::sqlite::test_support::in_memory_with_handle().await;
+        let (ds, handle) = crate::datastore::test_support::in_memory_with_handle().await;
         ds.create_resource(
             "v1",
             "ConfigMap",
@@ -2293,7 +2293,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_freshness_wait_is_noop_when_zero_or_already_fresh() {
-        let (ds, handle) = crate::datastore::sqlite::test_support::in_memory_with_handle().await;
+        let (ds, handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let watch_source = datastore_watch_source(&ds, &handle);
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
 
@@ -2318,7 +2318,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_freshness_wait_wakes_on_applied_write() {
-        let (ds, handle) = crate::datastore::sqlite::test_support::in_memory_with_handle().await;
+        let (ds, handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let watch_source = datastore_watch_source(&ds, &handle);
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let base = handle.get_current_resource_version().await.unwrap();
