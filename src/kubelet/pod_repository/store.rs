@@ -23,24 +23,8 @@ use crate::datastore::DatastoreHandle;
 #[cfg(test)]
 use crate::watch::WatchEvent;
 use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
+use klights_kubelet::unscheduled_deletion::EligibleUnscheduledPodDeletion;
 use klights_pod_api::PodRepositoryError;
-
-/// Result of [`PodStore::delete_unscheduled_with_uid`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum UnscheduledPodDeleteOutcome {
-    /// The Pod row was removed (or was already gone / superseded by a
-    /// same-name replacement UID).
-    Removed,
-    /// The Pod has already been picked up by a kubelet (`spec.nodeName` set).
-    /// Row removal must go through actor-owned finalization.
-    DeferToActor,
-    /// The Pod still carries finalizers; removal must wait until they clear.
-    FinalizersPending,
-    /// The row changed after the leader worker's observation. The worker must
-    /// retry from a fresh read rather than route a possibly-unbound Pod to an
-    /// actor.
-    Retry,
-}
 
 /// Result of the root-private, actor-owned bound-Pod finalization primitive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,13 +44,6 @@ pub(crate) enum ActorPodDeleteObservation {
     IdentityChanged,
     FinalizersPending,
     Retry,
-}
-
-/// True once a Pod has been bound to a node (a kubelet owns its lifecycle).
-fn pod_has_node_assignment(pod: &Value) -> bool {
-    pod.pointer("/spec/nodeName")
-        .and_then(|node| node.as_str())
-        .is_some_and(|node| !node.trim().is_empty())
 }
 
 fn pod_is_terminating_or_node_lost(pod: &Value) -> bool {
@@ -461,92 +438,33 @@ impl PodStore {
         }
     }
 
-    /// HR#11 exception: remove an *unscheduled* Pod row from the leader /
-    /// API-server side.
+    /// Execute the HR#11 exact UID/resourceVersion CAS authorized by the
+    /// kubelet-owned unscheduled-deletion policy.
     ///
-    /// A Pod that was never bound to a node (`spec.nodeName` empty) has no
-    /// kubelet lifecycle actor that will ever finalize it. Once such a Pod is
-    /// marked for deletion, its datastore row — and therefore its namespace —
-    /// would otherwise linger forever. This is the only non-actor path
-    /// permitted to remove a Pod row, and it stays safe by atomically
-    /// confirming no kubelet has picked the Pod up: the hard delete is gated on
-    /// the exact `resourceVersion` observed while `spec.nodeName` was still
-    /// empty. If a scheduler bind lands first, the `resourceVersion` changes,
-    /// the compare-and-swap delete no-ops, and the caller retries from a fresh
-    /// observation. A newly bound observation then defers to actor-owned
-    /// finalization (which the bind's watch event already wakes).
-    ///
-    /// Once a kubelet has picked up a Pod (`spec.nodeName` set), only the Pod
-    /// lifecycle actor may remove the row — this method refuses
-    /// (`DeferToActor`).
+    /// The opaque token can be constructed only after a fresh observation
+    /// proves the same UID/RV is terminating, finalizer-free, and unbound.
+    /// Persistence still performs the exact CAS, so an intervening bind,
+    /// resourceVersion change, or same-name replacement cannot be deleted.
     pub(super) async fn delete_unscheduled_with_uid(
         &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-        observed_resource_version: i64,
-    ) -> Result<UnscheduledPodDeleteOutcome> {
-        let Some(current) = self.get(ns, name).await? else {
-            // Already gone (actor or a prior sweep finalized it) — idempotent.
-            return Ok(UnscheduledPodDeleteOutcome::Removed);
-        };
-        if current.uid != uid {
-            // A same-name replacement Pod owns the slot now; our UID is gone.
-            return Ok(UnscheduledPodDeleteOutcome::Removed);
-        }
-        if current.resource_version != observed_resource_version {
-            // The row changed after the deferred worker observed it as
-            // unbound. Never acquire a newer RV implicitly: the exact
-            // observation supplied by the worker is the delete CAS token.
-            return Ok(UnscheduledPodDeleteOutcome::Retry);
-        }
-        // A kubelet has picked the Pod up — only the actor may remove the row.
-        if pod_has_node_assignment(&current.data) {
-            return Ok(UnscheduledPodDeleteOutcome::DeferToActor);
-        }
-        // Never hard-delete a live (non-terminating) Pod.
-        if current
-            .data
-            .pointer("/metadata/deletionTimestamp")
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.is_empty())
-            .is_none()
-        {
-            return Ok(UnscheduledPodDeleteOutcome::Retry);
-        }
-        // Respect finalizers exactly like the actor finalizer does.
-        if current
-            .data
-            .pointer("/metadata/finalizers")
-            .and_then(|value| value.as_array())
-            .is_some_and(|finalizers| !finalizers.is_empty())
-        {
-            return Ok(UnscheduledPodDeleteOutcome::FinalizersPending);
-        }
-
-        self.mark_sandbox_dirty();
-        match self
+        eligible: EligibleUnscheduledPodDeletion,
+    ) -> Result<PodDeleteCasOutcome> {
+        let identity = eligible.identity();
+        let outcome = self
             .persistence
             .delete(
-                ns,
-                name,
+                &identity.namespace,
+                &identity.name,
                 ResourcePreconditions {
-                    uid: Some(uid.to_string()),
-                    // Compare-and-swap on the observed RV: confirms no bind /
-                    // kubelet pickup raced between the read above and here.
-                    resource_version: Some(observed_resource_version),
+                    uid: Some(identity.uid.clone()),
+                    resource_version: Some(eligible.observed_resource_version()),
                 },
             )
-            .await?
-        {
-            PodDeleteCasOutcome::Removed => Ok(UnscheduledPodDeleteOutcome::Removed),
-            // CAS lost: the row changed (almost always a scheduler bind setting
-            // spec.nodeName). Retry from a fresh observation so an RV-only
-            // race is not mistaken for an already-bound Pod.
-            PodDeleteCasOutcome::Conflict => Ok(UnscheduledPodDeleteOutcome::Retry),
-            // Row vanished concurrently — treat as removed (idempotent).
-            PodDeleteCasOutcome::Gone => Ok(UnscheduledPodDeleteOutcome::Removed),
+            .await?;
+        if outcome == PodDeleteCasOutcome::Removed {
+            self.mark_sandbox_dirty();
         }
+        Ok(outcome)
     }
 
     #[cfg(test)]

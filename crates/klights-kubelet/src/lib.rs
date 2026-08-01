@@ -13,6 +13,7 @@ pub mod runtime;
 pub mod runtime_observations;
 pub mod runtime_reconcile_hint;
 pub mod runtime_types;
+pub mod unscheduled_deletion;
 
 #[cfg(test)]
 mod phase15b2_red_tests;

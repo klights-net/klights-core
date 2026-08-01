@@ -22,8 +22,9 @@ use klights_leader_api::{
 };
 
 use super::state_only_writer::StateOnlyWriter;
-use super::store::{BoundPodDeleteOutcome, PodStore, UnscheduledPodDeleteOutcome};
+use super::store::{BoundPodDeleteOutcome, PodStore};
 use super::{PodReader, PodRepository, PodRepositoryBuildConfig};
+use klights_pod_api::{UnscheduledPodDeletionOutcome, UnscheduledPodDeletionRequest};
 use klights_types::PodIdentity;
 
 fn fixture_supervisor() -> Arc<klights_supervisor::TaskSupervisor> {
@@ -2360,10 +2361,30 @@ fn delete_mark_body() -> serde_json::Value {
     json!({"metadata": {"deletionTimestamp": DELETE_TS, "deletionGracePeriodSeconds": 0}})
 }
 
+async fn delete_unscheduled_through_leader(
+    store: Arc<PodStore>,
+    namespace: &str,
+    name: &str,
+    uid: &str,
+    observed_resource_version: i64,
+) -> UnscheduledPodDeletionOutcome {
+    let deletion = super::workqueue::test_leader_unscheduled_deletion(store);
+    deletion
+        .delete_unscheduled_pod(
+            UnscheduledPodDeletionRequest::try_new(
+                PodIdentity::new(namespace, name, uid),
+                observed_resource_version,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn delete_unscheduled_removes_terminating_unscheduled_pod() {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-    let store = PodStore::new(db);
+    let store = Arc::new(PodStore::new(db));
     let created = store
         .create("default", "u1", make_pod("u1", None, None))
         .await
@@ -2373,12 +2394,16 @@ async fn delete_unscheduled_removes_terminating_unscheduled_pod() {
         .await
         .unwrap();
 
-    let outcome = store
-        .delete_unscheduled_with_uid("default", "u1", &created.uid, marked.resource_version)
-        .await
-        .unwrap();
+    let outcome = delete_unscheduled_through_leader(
+        store.clone(),
+        "default",
+        "u1",
+        &created.uid,
+        marked.resource_version,
+    )
+    .await;
 
-    assert_eq!(outcome, UnscheduledPodDeleteOutcome::Removed);
+    assert_eq!(outcome, UnscheduledPodDeletionOutcome::Removed);
     assert!(
         store.get("default", "u1").await.unwrap().is_none(),
         "unscheduled terminating Pod row must be removed"
@@ -2388,7 +2413,7 @@ async fn delete_unscheduled_removes_terminating_unscheduled_pod() {
 #[tokio::test]
 async fn delete_unscheduled_defers_when_kubelet_picked_pod_up() {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-    let store = PodStore::new(db);
+    let store = Arc::new(PodStore::new(db));
     let mut pod = make_pod("s1", None, None);
     pod["spec"]["nodeName"] = json!("node-a");
     let created = store.create("default", "s1", pod).await.unwrap();
@@ -2397,12 +2422,16 @@ async fn delete_unscheduled_defers_when_kubelet_picked_pod_up() {
         .await
         .unwrap();
 
-    let outcome = store
-        .delete_unscheduled_with_uid("default", "s1", &created.uid, marked.resource_version)
-        .await
-        .unwrap();
+    let outcome = delete_unscheduled_through_leader(
+        store.clone(),
+        "default",
+        "s1",
+        &created.uid,
+        marked.resource_version,
+    )
+    .await;
 
-    assert_eq!(outcome, UnscheduledPodDeleteOutcome::DeferToActor);
+    assert_eq!(outcome, UnscheduledPodDeletionOutcome::DeferToActor);
     assert!(
         store.get("default", "s1").await.unwrap().is_some(),
         "a Pod bound to a node must only be removed by the actor"
@@ -2412,7 +2441,7 @@ async fn delete_unscheduled_defers_when_kubelet_picked_pod_up() {
 #[tokio::test]
 async fn delete_unscheduled_waits_for_finalizers() {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-    let store = PodStore::new(db);
+    let store = Arc::new(PodStore::new(db));
     let mut pod = make_pod("f1", None, None);
     pod["metadata"]["finalizers"] = json!(["example.com/hold"]);
     let created = store.create("default", "f1", pod).await.unwrap();
@@ -2421,30 +2450,38 @@ async fn delete_unscheduled_waits_for_finalizers() {
         .await
         .unwrap();
 
-    let outcome = store
-        .delete_unscheduled_with_uid("default", "f1", &created.uid, marked.resource_version)
-        .await
-        .unwrap();
+    let outcome = delete_unscheduled_through_leader(
+        store.clone(),
+        "default",
+        "f1",
+        &created.uid,
+        marked.resource_version,
+    )
+    .await;
 
-    assert_eq!(outcome, UnscheduledPodDeleteOutcome::FinalizersPending);
+    assert_eq!(outcome, UnscheduledPodDeletionOutcome::FinalizersPending);
     assert!(store.get("default", "f1").await.unwrap().is_some());
 }
 
 #[tokio::test]
 async fn delete_unscheduled_refuses_non_terminating_pod() {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-    let store = PodStore::new(db);
+    let store = Arc::new(PodStore::new(db));
     let created = store
         .create("default", "live1", make_pod("live1", None, None))
         .await
         .unwrap();
 
-    let outcome = store
-        .delete_unscheduled_with_uid("default", "live1", &created.uid, created.resource_version)
-        .await
-        .unwrap();
+    let outcome = delete_unscheduled_through_leader(
+        store.clone(),
+        "default",
+        "live1",
+        &created.uid,
+        created.resource_version,
+    )
+    .await;
 
-    assert_eq!(outcome, UnscheduledPodDeleteOutcome::Retry);
+    assert_eq!(outcome, UnscheduledPodDeletionOutcome::Retry);
     assert!(
         store.get("default", "live1").await.unwrap().is_some(),
         "a non-terminating Pod must never be hard-deleted"
@@ -2454,14 +2491,12 @@ async fn delete_unscheduled_refuses_non_terminating_pod() {
 #[tokio::test]
 async fn delete_unscheduled_is_idempotent_for_missing_or_replaced_uid() {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-    let store = PodStore::new(db);
+    let store = Arc::new(PodStore::new(db));
 
     // Missing Pod — nothing to remove.
-    let outcome = store
-        .delete_unscheduled_with_uid("default", "ghost", "uid-x", 1)
-        .await
-        .unwrap();
-    assert_eq!(outcome, UnscheduledPodDeleteOutcome::Removed);
+    let outcome =
+        delete_unscheduled_through_leader(store.clone(), "default", "ghost", "uid-x", 1).await;
+    assert_eq!(outcome, UnscheduledPodDeletionOutcome::Removed);
 
     // A same-name replacement Pod owns the slot: our (old) UID is already gone.
     let created = store
@@ -2472,11 +2507,15 @@ async fn delete_unscheduled_is_idempotent_for_missing_or_replaced_uid() {
         .mark_deleting_latest("default", "r1", &created.uid, &delete_mark_body())
         .await
         .unwrap();
-    let outcome = store
-        .delete_unscheduled_with_uid("default", "r1", "stale-uid", marked.resource_version)
-        .await
-        .unwrap();
-    assert_eq!(outcome, UnscheduledPodDeleteOutcome::Removed);
+    let outcome = delete_unscheduled_through_leader(
+        store.clone(),
+        "default",
+        "r1",
+        "stale-uid",
+        marked.resource_version,
+    )
+    .await;
+    assert_eq!(outcome, UnscheduledPodDeletionOutcome::Removed);
     assert!(
         store.get("default", "r1").await.unwrap().is_some(),
         "the live replacement Pod must be preserved"
@@ -12958,7 +12997,7 @@ async fn old_uid_operations_do_not_mutate_replacement() {
 #[tokio::test]
 async fn deferred_delete_preserves_same_name_replacement() {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-    let store = PodStore::new(db);
+    let store = Arc::new(PodStore::new(db));
 
     // (1) Picked-up terminating Pod: nodeName is set → DeferToActor.
     {
@@ -12966,18 +13005,17 @@ async fn deferred_delete_preserves_same_name_replacement() {
         pod["spec"]["nodeName"] = json!("node-a");
         let created = store.create("default", "picked-up", pod).await.unwrap();
 
-        let outcome = store
-            .delete_unscheduled_with_uid(
-                "default",
-                "picked-up",
-                "uid-picked",
-                created.resource_version,
-            )
-            .await
-            .unwrap();
+        let outcome = delete_unscheduled_through_leader(
+            store.clone(),
+            "default",
+            "picked-up",
+            "uid-picked",
+            created.resource_version,
+        )
+        .await;
         assert_eq!(
             outcome,
-            UnscheduledPodDeleteOutcome::DeferToActor,
+            UnscheduledPodDeletionOutcome::DeferToActor,
             "a Pod bound to a kubelet must only be removed by its lifecycle actor"
         );
         let live = store
@@ -12998,13 +13036,17 @@ async fn deferred_delete_preserves_same_name_replacement() {
             .await
             .unwrap();
 
-        let outcome = store
-            .delete_unscheduled_with_uid("default", "replaced", "uid-old", created.resource_version)
-            .await
-            .unwrap();
+        let outcome = delete_unscheduled_through_leader(
+            store.clone(),
+            "default",
+            "replaced",
+            "uid-old",
+            created.resource_version,
+        )
+        .await;
         assert_eq!(
             outcome,
-            UnscheduledPodDeleteOutcome::Removed,
+            UnscheduledPodDeletionOutcome::Removed,
             "stale-UID deferred delete must report Removed without touching the replacement"
         );
         let live = store
@@ -13179,7 +13221,7 @@ async fn build_store_with_delete_cas_race(
     pod_name: &str,
     set_node_name: bool,
 ) -> (
-    PodStore,
+    Arc<PodStore>,
     crate::datastore::DatastoreHandle,
     Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -13196,7 +13238,7 @@ async fn build_store_with_delete_cas_race(
     let sequenced =
         Arc::new(crate::bootstrap::sequenced_datastore::SequencedDatastore::new(inner, proposal));
     let db: crate::datastore::DatastoreHandle = sequenced;
-    (PodStore::new(db.clone()), db, raced)
+    (Arc::new(PodStore::new(db.clone())), db, raced)
 }
 
 /// CAS race: a scheduler bind lands between the `spec.nodeName` observation
@@ -13213,14 +13255,18 @@ async fn unscheduled_delete_compare_and_swap_rejects_node_bind_race() {
     let created = store.create("default", "bind-race", pod).await.unwrap();
     assert_eq!(created.uid, "uid-bind");
 
-    let outcome = store
-        .delete_unscheduled_with_uid("default", "bind-race", "uid-bind", created.resource_version)
-        .await
-        .expect("CAS race must not propagate a hard error");
+    let outcome = delete_unscheduled_through_leader(
+        store,
+        "default",
+        "bind-race",
+        "uid-bind",
+        created.resource_version,
+    )
+    .await;
 
     assert_eq!(
         outcome,
-        UnscheduledPodDeleteOutcome::Retry,
+        UnscheduledPodDeletionOutcome::Retry,
         "node-bind race must lose the CAS and retry from the newly bound observation"
     );
     assert!(
@@ -13254,14 +13300,18 @@ async fn unscheduled_delete_compare_and_swap_rejects_resource_version_race() {
     let created = store.create("default", "rv-race", pod).await.unwrap();
     assert_eq!(created.uid, "uid-rv");
 
-    let outcome = store
-        .delete_unscheduled_with_uid("default", "rv-race", "uid-rv", created.resource_version)
-        .await
-        .expect("CAS race must not propagate a hard error");
+    let outcome = delete_unscheduled_through_leader(
+        store,
+        "default",
+        "rv-race",
+        "uid-rv",
+        created.resource_version,
+    )
+    .await;
 
     assert_eq!(
         outcome,
-        UnscheduledPodDeleteOutcome::Retry,
+        UnscheduledPodDeletionOutcome::Retry,
         "resourceVersion race must lose the CAS and retry from a fresh observation"
     );
     assert!(
