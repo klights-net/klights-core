@@ -1,6 +1,6 @@
 //! `Controller` impl for `Job`. Registered in `ControllerDispatcher`.
 
-use crate::controllers::job as job_core;
+use klights_controllers::job as job_core;
 
 pub struct JobController {
     identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
@@ -44,6 +44,12 @@ impl crate::controllers::Controller for JobController {
         .map(|_| ())
     }
 }
+
+#[cfg(test)]
+use klights_controllers::job::*;
+#[cfg(test)]
+#[path = "job/tests/mod.rs"]
+mod policy_tests;
 
 #[cfg(test)]
 mod tests {

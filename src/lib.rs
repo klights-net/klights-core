@@ -51,7 +51,6 @@ mod namespace_termination_adapter;
 pub mod networking;
 mod networking_state_adapter;
 pub mod node_admin;
-pub mod node_lease_tracker;
 mod node_lifecycle_controller_adapter;
 mod node_metrics_adapter;
 pub(crate) mod node_routing_metadata;
@@ -66,7 +65,6 @@ pub(crate) mod pod_api_service;
 mod pod_event_adapter;
 mod pod_native_adapter;
 mod pod_native_orchestration;
-pub(crate) mod pod_readiness;
 pub(crate) mod pod_reconcile_adapter;
 pub(crate) mod pod_repository_composition;
 pub(crate) mod pod_subresource_service;
@@ -113,10 +111,10 @@ mod cronjob_event_driven_scheduler_tests;
 
 mod bootstrap;
 mod bound_pod_finalization_adapter;
+mod deployment_store_adapter;
 
 #[cfg(test)]
 mod deployment_replicaset_error_test;
-mod deployment_store_adapter;
 #[cfg(test)]
 mod grpc_test_proto_channel_sink;
 #[cfg(test)]

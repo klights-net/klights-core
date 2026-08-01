@@ -1,40 +1,17 @@
-pub mod annotations;
-pub mod apiservice;
 pub mod apiservice_controller;
-pub mod common;
-pub mod coredns;
-pub mod crd;
-pub mod cronjob;
-pub mod cronjob_scheduler;
 pub mod csr_signer;
-pub mod daemonset;
 pub mod daemonset_controller;
-pub mod default_rbac_policy;
-pub mod deployment;
 pub mod deployment_controller;
 mod dispatcher;
 pub mod endpoints_controller;
-pub mod hpa;
-pub mod job;
 pub mod job_controller;
-pub mod kube_service;
-pub mod namespace;
-pub mod node_lifecycle;
-pub mod node_subnet;
-pub mod pdb;
 pub mod pdb_controller;
 mod ports;
-pub mod pvc;
 pub mod pvc_controller;
-pub mod rbac_reconcile;
-pub mod replicaset;
 pub mod replicaset_controller;
 pub mod replication_controller_runner;
-pub mod replicationcontroller;
-pub mod resource_quota;
 mod runtime;
 pub mod service_controller;
-pub mod statefulset;
 pub mod statefulset_controller;
 #[cfg(test)]
 pub mod test_utils;
@@ -44,6 +21,12 @@ pub(crate) use ports::{
     ControllerRuntimeDependencies, DeploymentControllerPodMutation, DeploymentControllerPodReader,
 };
 pub(crate) use runtime::{Context, Controller, controller_wrapper};
+
+#[cfg(test)]
+use klights_controllers::common::*;
+#[cfg(test)]
+#[path = "common/tests.rs"]
+mod common_policy_tests;
 
 #[cfg(test)]
 pub(crate) fn test_reconcile_context<'a>(

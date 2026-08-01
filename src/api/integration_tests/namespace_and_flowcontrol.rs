@@ -6335,9 +6335,17 @@ async fn namespace_delete_returns_while_picked_up_pods_wait_for_actor_finalizati
 
     // Namespace finalization must be re-drivable event-style from the
     // actor-owned Pod row removal — no production polling.
-    crate::controllers::namespace::reconcile_namespace_for_test(db.as_ref(), "gc-cleanup")
-        .await
-        .unwrap();
+    let namespace_store =
+        crate::api_state_adapter_test_owner::RootNamespaceTerminationStore::new(db.clone());
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
+    crate::api::reconcile_namespace_termination_at(
+        namespace_store.as_ref(),
+        "gc-cleanup",
+        metrics.as_ref(),
+        chrono::DateTime::UNIX_EPOCH,
+    )
+    .await
+    .unwrap();
     assert!(
         db.get_namespace("gc-cleanup").await.unwrap().is_none(),
         "namespace must finalize once actor-owned Pod rows are removed"

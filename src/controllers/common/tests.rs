@@ -5,6 +5,8 @@ mod cases {
     use crate::datastore::DatastoreBackend;
     use crate::datastore::sqlite::Datastore;
 
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference as K8sOwnerReference;
+    use serde_json::Value;
     use serde_json::json;
 
     fn is_controller_conflict(error: &anyhow::Error) -> bool {
@@ -641,82 +643,6 @@ mod cases {
     }
 
     #[tokio::test]
-    async fn test_write_status_preserves_spec_and_emits_status_only_update() {
-        let db = Datastore::new_in_memory().await.unwrap();
-        let created = db
-            .create_resource(
-                "apps/v1",
-                "ReplicaSet",
-                Some("default"),
-                "rs-x",
-                json!({
-                    "metadata": {"name": "rs-x", "namespace": "default"},
-                    "spec": {"replicas": 5},
-                    "status": {"replicas": 0}
-                }),
-            )
-            .await
-            .unwrap();
-
-        // Hand the controller the resource it just read (with apiVersion/kind/RV stamped).
-        let mut resource: Value = (*created.data).clone();
-        resource["apiVersion"] = json!("apps/v1");
-        resource["kind"] = json!("ReplicaSet");
-        resource["metadata"]["resourceVersion"] = json!(created.resource_version.to_string());
-
-        let result = write_status(
-            &db as &dyn DatastoreBackend,
-            &resource,
-            &json!({"replicas": 5, "readyReplicas": 5}),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.data["spec"]["replicas"], 5);
-        assert_eq!(result.data["status"]["replicas"], 5);
-        assert_eq!(result.data["status"]["readyReplicas"], 5);
-    }
-
-    #[tokio::test]
-    async fn test_write_status_skips_unchanged_status() {
-        let db = Datastore::new_in_memory().await.unwrap();
-        let created = db
-            .create_resource(
-                "apps/v1",
-                "DaemonSet",
-                Some("default"),
-                "ds-noop",
-                json!({
-                    "apiVersion": "apps/v1",
-                    "kind": "DaemonSet",
-                    "metadata": {"name": "ds-noop", "namespace": "default"},
-                    "spec": {},
-                    "status": {"desiredNumberScheduled": 1, "numberReady": 1}
-                }),
-            )
-            .await
-            .unwrap();
-
-        let mut snapshot: Value = (*created.data).clone();
-        snapshot["apiVersion"] = json!("apps/v1");
-        snapshot["kind"] = json!("DaemonSet");
-        snapshot["metadata"]["resourceVersion"] = json!(created.resource_version.to_string());
-
-        let result = write_status(
-            &db as &dyn DatastoreBackend,
-            &snapshot,
-            &json!({"desiredNumberScheduled": 1, "numberReady": 1}),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            result.resource_version, created.resource_version,
-            "unchanged controller status must not churn resourceVersion"
-        );
-    }
-
-    #[tokio::test]
     async fn test_write_status_for_resource_skips_unchanged_status() {
         let db = Datastore::new_in_memory().await.unwrap();
         let created = db
@@ -747,103 +673,6 @@ mod cases {
             "unchanged controller status must not churn resourceVersion or race e2e status writers"
         );
         assert_eq!(result.data["status"]["readyReplicas"], json!(1));
-    }
-
-    #[tokio::test]
-    async fn test_write_status_skips_cas_when_resource_version_missing() {
-        let db = Datastore::new_in_memory().await.unwrap();
-        db.create_resource(
-            "apps/v1",
-            "Deployment",
-            Some("default"),
-            "dep-y",
-            json!({
-                "metadata": {"name": "dep-y", "namespace": "default"},
-                "spec": {"replicas": 2},
-                "status": {}
-            }),
-        )
-        .await
-        .unwrap();
-
-        // Resource without metadata.resourceVersion — write_status must skip CAS,
-        // not parse "" or default to 0 (which would mismatch).
-        let resource = json!({
-            "apiVersion": "apps/v1",
-            "kind": "Deployment",
-            "metadata": {"name": "dep-y", "namespace": "default"},
-        });
-        write_status(
-            &db as &dyn DatastoreBackend,
-            &resource,
-            &json!({"replicas": 2, "updatedReplicas": 2}),
-        )
-        .await
-        .unwrap();
-
-        let after = db
-            .get_resource("apps/v1", "Deployment", Some("default"), "dep-y")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(after.data["status"]["updatedReplicas"], 2);
-        assert_eq!(after.data["spec"]["replicas"], 2);
-    }
-
-    #[tokio::test]
-    async fn test_write_status_rejects_stale_snapshot_after_status_only_overlap() {
-        let db = Datastore::new_in_memory().await.unwrap();
-        let created = db
-            .create_resource(
-                "apps/v1",
-                "Deployment",
-                Some("default"),
-                "dep-stale",
-                json!({
-                    "metadata": {"name": "dep-stale", "namespace": "default"},
-                    "spec": {"replicas": 1},
-                    "status": {"availableReplicas": 0}
-                }),
-            )
-            .await
-            .unwrap();
-
-        let mut stale_snapshot: Value = (*created.data).clone();
-        stale_snapshot["apiVersion"] = json!("apps/v1");
-        stale_snapshot["kind"] = json!("Deployment");
-        stale_snapshot["metadata"]["resourceVersion"] = json!(created.resource_version.to_string());
-
-        db.update_status_only(
-            "apps/v1",
-            "Deployment",
-            Some("default"),
-            "dep-stale",
-            json!({"availableReplicas": 1}),
-            Some(created.resource_version),
-        )
-        .await
-        .expect("fresh writer must win first");
-
-        let stale_write = write_status(
-            &db as &dyn DatastoreBackend,
-            &stale_snapshot,
-            &json!({"availableReplicas": 0, "observedGeneration": 2}),
-        )
-        .await;
-        let err =
-            stale_write.expect_err("stale status-only overlap must not overwrite live status");
-        assert!(
-            is_controller_conflict(&err),
-            "expected status conflict, got {err:#}"
-        );
-
-        let live = db
-            .get_resource("apps/v1", "Deployment", Some("default"), "dep-stale")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(live.data["status"]["availableReplicas"], 1);
-        assert!(live.data["status"].get("observedGeneration").is_none());
     }
 
     #[tokio::test]
@@ -964,66 +793,6 @@ mod cases {
     }
 
     #[tokio::test]
-    async fn test_write_status_rejects_when_desired_matches_stale_snapshot_after_status_overlap() {
-        let db = Datastore::new_in_memory().await.unwrap();
-        let created = db
-            .create_resource(
-                "apps/v1",
-                "Deployment",
-                Some("default"),
-                "dep-stale-unchanged",
-                json!({
-                    "metadata": {"name": "dep-stale-unchanged", "namespace": "default"},
-                    "spec": {"replicas": 1},
-                    "status": {"availableReplicas": 0}
-                }),
-            )
-            .await
-            .unwrap();
-
-        let mut stale_snapshot: Value = (*created.data).clone();
-        stale_snapshot["apiVersion"] = json!("apps/v1");
-        stale_snapshot["kind"] = json!("Deployment");
-        stale_snapshot["metadata"]["resourceVersion"] = json!(created.resource_version.to_string());
-
-        db.update_status_only(
-            "apps/v1",
-            "Deployment",
-            Some("default"),
-            "dep-stale-unchanged",
-            json!({"availableReplicas": 1}),
-            Some(created.resource_version),
-        )
-        .await
-        .expect("concurrent status writer must advance live status");
-
-        let stale_write = write_status(
-            &db as &dyn DatastoreBackend,
-            &stale_snapshot,
-            &json!({"availableReplicas": 0}),
-        )
-        .await;
-        let err = stale_write
-            .expect_err("stale unchanged snapshot status must not overwrite live status");
-        assert!(
-            is_controller_conflict(&err),
-            "expected status conflict, got {err:#}"
-        );
-
-        let live = db
-            .get_resource(
-                "apps/v1",
-                "Deployment",
-                Some("default"),
-                "dep-stale-unchanged",
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(live.data["status"]["availableReplicas"], 1);
-    }
-
-    #[tokio::test]
     async fn test_write_status_for_resource_rejects_when_desired_matches_stale_snapshot_after_status_overlap()
      {
         let db = Datastore::new_in_memory().await.unwrap();
@@ -1077,58 +846,6 @@ mod cases {
             .unwrap()
             .unwrap();
         assert_eq!(live.data["status"]["readyReplicas"], 1);
-    }
-
-    #[tokio::test]
-    async fn test_write_status_stale_snapshot_does_not_retry_after_spec_change() {
-        let db = Datastore::new_in_memory().await.unwrap();
-        let created = db
-            .create_resource(
-                "apps/v1",
-                "Deployment",
-                Some("default"),
-                "dep-spec-changed",
-                json!({
-                    "metadata": {"name": "dep-spec-changed", "namespace": "default", "generation": 1},
-                    "spec": {"replicas": 1},
-                    "status": {"availableReplicas": 0}
-                }),
-            )
-            .await
-            .unwrap();
-
-        let mut stale_snapshot: Value = (*created.data).clone();
-        stale_snapshot["apiVersion"] = json!("apps/v1");
-        stale_snapshot["kind"] = json!("Deployment");
-        stale_snapshot["metadata"]["resourceVersion"] = json!(created.resource_version.to_string());
-
-        db.update_resource(
-            "apps/v1",
-            "Deployment",
-            Some("default"),
-            "dep-spec-changed",
-            json!({
-                "metadata": {
-                    "name": "dep-spec-changed",
-                    "namespace": "default",
-                    "generation": 2
-                },
-                "spec": {"replicas": 2},
-                "status": {"availableReplicas": 0}
-            }),
-            created.resource_version,
-        )
-        .await
-        .expect("spec writer must advance resourceVersion");
-
-        let stale_write = write_status(
-            &db as &dyn DatastoreBackend,
-            &stale_snapshot,
-            &json!({"availableReplicas": 1, "observedGeneration": 1}),
-        )
-        .await;
-        let err = stale_write.expect_err("stale spec snapshot must not retry");
-        assert!(is_controller_conflict(&err), "expected 409, got {err:#}");
     }
 
     // --- append_owner_reference / remove_owner_reference_by_uid tests ---

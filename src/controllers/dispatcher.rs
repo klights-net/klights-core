@@ -149,7 +149,7 @@ impl ControllerDispatcher {
         service_ipam: Arc<ServiceIpam>,
         nodeport_alloc: Arc<NodePortAllocator>,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-        csr_issuer: Option<Arc<dyn crate::controllers::csr_signer::CsrIssuer>>,
+        csr_issuer: Option<Arc<dyn klights_controllers::csr_signer::CsrIssuer>>,
         identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Self {
         let mut controllers: HashMap<(&'static str, &'static str), Arc<dyn Controller>> =
@@ -237,7 +237,7 @@ impl ControllerDispatcher {
     fn controller_registry(
         service_ipam: Arc<ServiceIpam>,
         nodeport_alloc: Arc<NodePortAllocator>,
-        csr_issuer: Option<Arc<dyn crate::controllers::csr_signer::CsrIssuer>>,
+        csr_issuer: Option<Arc<dyn klights_controllers::csr_signer::CsrIssuer>>,
         hpa_controller: Arc<dyn Controller>,
         identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> HashMap<(&'static str, &'static str), Arc<dyn Controller>> {
@@ -308,7 +308,7 @@ impl ControllerDispatcher {
         service_ipam: Arc<ServiceIpam>,
         nodeport_alloc: Arc<NodePortAllocator>,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-        csr_issuer: Option<Arc<dyn crate::controllers::csr_signer::CsrIssuer>>,
+        csr_issuer: Option<Arc<dyn klights_controllers::csr_signer::CsrIssuer>>,
         hpa_controller: Arc<dyn Controller>,
         dependencies: ControllerRuntimeDependencies,
         identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
@@ -335,7 +335,7 @@ impl ControllerDispatcher {
         service_ipam: Arc<ServiceIpam>,
         nodeport_alloc: Arc<NodePortAllocator>,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-        csr_issuer: Option<Arc<dyn crate::controllers::csr_signer::CsrIssuer>>,
+        csr_issuer: Option<Arc<dyn klights_controllers::csr_signer::CsrIssuer>>,
         hpa_controller: Arc<dyn Controller>,
         dependencies: ControllerRuntimeDependencies,
         identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
@@ -666,7 +666,7 @@ impl ControllerDispatcher {
         }
 
         let Some(delay) =
-            crate::controllers::job::job_ttl_cleanup_delay_at(&resource.data, chrono::Utc::now())?
+            klights_controllers::job::job_ttl_cleanup_delay_at(&resource.data, chrono::Utc::now())?
         else {
             return Ok(());
         };
@@ -695,7 +695,7 @@ impl ControllerDispatcher {
         {
             return Ok(());
         }
-        let Some(delay) = crate::controllers::job::job_ttl_cleanup_delay_at(
+        let Some(delay) = klights_controllers::job::job_ttl_cleanup_delay_at(
             &resource.data,
             (self.dependencies.wall_time)(),
         )?

@@ -34,7 +34,7 @@ impl ResourceQuotaAdmissionRuntime for ResourceQuotaAdmissionAdapter {
     }
 
     fn pod_has_deletion_timestamp(&self, pod: &serde_json::Value) -> bool {
-        crate::controllers::resource_quota::pod_has_deletion_timestamp(pod)
+        klights_controllers::resource_quota::pod_has_deletion_timestamp(pod)
     }
 
     fn pod_matches_resource_quota_scopes(
@@ -42,19 +42,19 @@ impl ResourceQuotaAdmissionRuntime for ResourceQuotaAdmissionAdapter {
         pod: &serde_json::Value,
         quota: &serde_json::Value,
     ) -> bool {
-        crate::controllers::resource_quota::pod_matches_resource_quota_scopes(pod, quota)
+        klights_controllers::resource_quota::pod_matches_resource_quota_scopes(pod, quota)
     }
 
     fn resource_quota_has_pod_scope_constraints(&self, quota: &serde_json::Value) -> bool {
-        crate::controllers::resource_quota::resource_quota_has_pod_scope_constraints(quota)
+        klights_controllers::resource_quota::resource_quota_has_pod_scope_constraints(quota)
     }
 
     fn parse_resource_quantity(&self, resource_key: &str, quantity: &str) -> Option<i64> {
-        crate::controllers::resource_quota::parse_resource_quantity(resource_key, quantity)
+        klights_controllers::resource_quota::parse_resource_quantity(resource_key, quantity)
     }
 
     fn format_resource_quantity(&self, resource_key: &str, value: i64) -> String {
-        crate::controllers::resource_quota::format_resource_quantity(resource_key, value)
+        klights_controllers::resource_quota::format_resource_quantity(resource_key, value)
     }
 
     fn calculate_pod_effective_resource_for_key(
@@ -63,7 +63,7 @@ impl ResourceQuotaAdmissionRuntime for ResourceQuotaAdmissionAdapter {
         bucket: &str,
         resource_key: &str,
     ) -> i64 {
-        crate::controllers::resource_quota::calculate_pod_effective_resource_for_key(
+        klights_controllers::resource_quota::calculate_pod_effective_resource_for_key(
             pod,
             bucket,
             resource_key,

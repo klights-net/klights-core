@@ -1279,7 +1279,7 @@ impl PodRepository {
     /// reaches a terminal phase or is marked failed.
     ///
     /// This replaces the old synchronous `reconcile_job_for_pod_owner` path
-    /// that called `controllers::job::reconcile_job()` inline, blocking the
+    /// that called `klights_controllers::job::reconcile_job()` inline, blocking the
     /// pod watcher. The async enqueue gives the Job controller exponential
     /// backoff retry and keeps the watcher responsive.
     ///

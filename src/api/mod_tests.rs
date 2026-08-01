@@ -3600,7 +3600,7 @@ async fn test_create_resource_with_generate_name() {
     // This test verifies that generateName logic in the API create handlers
     // (namespaced_resource_handlers! and cluster_resource_handlers!) works correctly.
     //
-    // The implementation (around lines 2829 and 3502) calls crate::resource_name::generate(prefix)
+    // Generated-name policy is owned by klights-controllers.
     // when metadata.name is missing but metadata.generateName is present.
     //
     // We test the database layer with a pre-generated name to verify storage works.

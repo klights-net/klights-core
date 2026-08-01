@@ -1,7 +1,7 @@
 //! `Controller` impl for `PersistentVolumeClaim`. Registered in `ControllerDispatcher`.
 
 use crate::controllers::controller_wrapper;
-use crate::controllers::pvc as pvc_core;
+use klights_controllers::pvc as pvc_core;
 
 controller_wrapper!(
     PVCController,
@@ -12,6 +12,12 @@ controller_wrapper!(
     with_file_process,
     store = pvc_store
 );
+
+#[cfg(test)]
+use klights_controllers::pvc::*;
+#[cfg(test)]
+#[path = "pvc/tests.rs"]
+mod policy_tests;
 
 #[cfg(test)]
 mod tests {

@@ -7,7 +7,7 @@ async fn test_replicaset_scale_subresource() {
     use tower::ServiceExt;
 
     let db = crate::datastore::test_support::in_memory().await;
-    let registry = crate::controllers::crd::CrdRegistry::new();
+    let registry = klights_controllers::crd::CrdRegistry::new();
     let _config = std::sync::Arc::new({
         let ns = "klights-test";
         crate::KlightsConfig {
@@ -638,16 +638,9 @@ async fn test_replicaset_status_write_never_clobbers_user_scale_under_race() {
         });
 
         // Create the RS and capture the controller's snapshot at this RV.
-        let created = db
-            .create_resource("apps/v1", "ReplicaSet", Some("default"), &name, initial)
+        db.create_resource("apps/v1", "ReplicaSet", Some("default"), &name, initial)
             .await
             .unwrap();
-        let mut controller_snapshot: serde_json::Value = (*created.data).clone();
-        controller_snapshot["apiVersion"] = json!("apps/v1");
-        controller_snapshot["kind"] = json!("ReplicaSet");
-        // Note: deliberately omit metadata.resourceVersion so the controller's
-        // status write skips CAS — modeling a controller that has no RV (or
-        // a stale one) at the moment of write.
 
         let user_db = Arc::clone(&db);
         let user_name = name.clone();
@@ -669,7 +662,7 @@ async fn test_replicaset_status_write_never_clobbers_user_scale_under_race() {
         });
 
         let ctl_db = Arc::clone(&db);
-        let ctl_snapshot = controller_snapshot.clone();
+        let ctl_name = name.clone();
         let ctl_handle = tokio::spawn(async move {
             // Controller writes its computed status through the safe path.
             let new_status = json!({
@@ -679,10 +672,14 @@ async fn test_replicaset_status_write_never_clobbers_user_scale_under_race() {
                 "fullyLabeledReplicas": 3,
                 "observedGeneration": 1
             });
-            crate::controllers::common::write_status(
-                ctl_db.as_ref() as &dyn crate::datastore::DatastoreBackend,
-                &ctl_snapshot,
-                &new_status,
+            klights_controllers::common::ControllerStatusStore::update_status(
+                ctl_db.as_ref(),
+                "apps/v1",
+                "ReplicaSet",
+                Some("default"),
+                &ctl_name,
+                new_status,
+                klights_cluster_core::ResourcePreconditions::default(),
             )
             .await
             .unwrap();

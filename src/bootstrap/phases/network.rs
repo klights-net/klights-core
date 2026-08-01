@@ -123,7 +123,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     let boot_peering = network_boot.peer_router();
     {
         let mut applied = std::collections::HashMap::new();
-        if let Err(e) = crate::controllers::node_subnet::sync_peer_routes_with_ports(
+        if let Err(e) = klights_controllers::node_subnet::sync_peer_routes_with_ports(
             network_topology.as_ref(),
             resource_query.as_ref(),
             &config.node_name,

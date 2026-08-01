@@ -82,7 +82,7 @@ pub struct BootstrapRunArgs<'a> {
     pub assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
     pub replication_service_for_router: Option<Arc<klights_replication::ReplicationService>>,
     pub outbox_runtime: Arc<klights_kubelet::node_outbox::Outbox>,
-    pub node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+    pub node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
     pub node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
     pub network: Arc<crate::networking::Network>,
     pub services: Arc<dyn klights_network_api::ServiceRouter>,
@@ -355,7 +355,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         is_leader_tx,
         is_leader_rx,
     } = args;
-    use crate::{api, controllers, kubelet};
+    use crate::{api, kubelet};
     #[cfg(not(test))]
     let service_account_signing_key_path = runtime_paths.service_account_signing_key();
     let api_runtime_paths = crate::api::ApiRuntimePaths::from_data_root(config.data_root.clone())
@@ -395,7 +395,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
 
     // Initialize default namespaces (only on the seed leader).
     if leader_lease.is_some() {
-        controllers::namespace::init_default_namespaces_with_ca_path(
+        klights_controllers::namespace::init_default_namespaces_with_ca_path(
             &klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
             db,
             &api_runtime_paths.ca_cert,
@@ -408,12 +408,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
 
     // Seed and reconcile default RBAC objects (only on leader).
     if leader_lease.is_some() {
-        controllers::rbac_reconcile::reconcile_default_rbac_objects(db_handle.as_ref())
+        klights_controllers::rbac_reconcile::reconcile_default_rbac_objects(db_handle.as_ref())
             .await
             .context("Failed to seed default RBAC objects")?;
     }
 
-    let crd_registry = controllers::crd::CrdRegistry::new();
+    let crd_registry = klights_controllers::crd::CrdRegistry::new();
     let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
         &config.service_cidr,
     ));
@@ -427,7 +427,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .context("Failed to rebuild NodePort allocator")?;
 
     // Load CA cert/key for CSR signing (supervised file I/O)
-    let csr_issuer: Option<std::sync::Arc<dyn crate::controllers::csr_signer::CsrIssuer>> = {
+    let csr_issuer: Option<std::sync::Arc<dyn klights_controllers::csr_signer::CsrIssuer>> = {
         let ca_cert_path = crate::paths::ca_cert_path(&config.containerd_namespace);
         let ca_key_path = crate::paths::ca_key_path(&config.containerd_namespace);
         let cert_result = supervisor
@@ -464,7 +464,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                         std::sync::Arc::new(klights_auth::clock::SystemClock),
                         supervisor.clone(),
                     ))
-                        as std::sync::Arc<dyn crate::controllers::csr_signer::CsrIssuer>,
+                        as std::sync::Arc<dyn klights_controllers::csr_signer::CsrIssuer>,
                 )
             }
             _ => {
@@ -1394,10 +1394,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     // ServiceCIDR + kubernetes Service (skip on joining controlplanes —
     // raft AppendEntries delivers these from the seed).
     if leader_lease.is_some() {
-        controllers::kube_service::bootstrap_default_service_cidr(db, &config.service_cidr)
+        klights_controllers::kube_service::bootstrap_default_service_cidr(db, &config.service_cidr)
             .await
             .context("Failed to bootstrap default ServiceCIDR")?;
-        controllers::kube_service::bootstrap_kubernetes_service(
+        klights_controllers::kube_service::bootstrap_kubernetes_service(
             db,
             &config.service_cidr,
             config.tls_port,
@@ -1434,7 +1434,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .await
         .context("Failed to rebuild NodePort allocator after bootstrap services")?;
 
-    controllers::crd::load_existing_crds(db, &crd_registry)
+    klights_controllers::crd::load_existing_crds(db, &crd_registry)
         .await
         .context("Failed to load existing CRDs")?;
 
@@ -1448,7 +1448,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 klights_supervisor::TaskCategory::Background,
                 "runtime_crd_registry_watch",
                 async move {
-                    controllers::crd::run_crd_registry_watch_with_components(
+                    klights_controllers::crd::run_crd_registry_watch_with_components(
                         crd_runtime,
                         registry,
                         cancel,
@@ -1580,7 +1580,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 klights_supervisor::TaskCategory::Background,
                 "runtime_node_subnet_peer_watch",
                 async move {
-                    controllers::node_subnet::run_focused_peer_watch(
+                    klights_controllers::node_subnet::run_focused_peer_watch(
                         topology,
                         query,
                         watch,
@@ -1588,7 +1588,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                         node_name,
                         peering,
                         peer_supervisor,
-                        Some(Arc::new(health)),
+                        Some(
+                            crate::node_subnet_controller_adapter::DataplaneHealthAdapter::new(
+                                health,
+                            ),
+                        ),
                         readiness_publisher,
                         cancel,
                     )

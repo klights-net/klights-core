@@ -5,10 +5,14 @@ use async_trait::async_trait;
 use klights_pod_api::{PodListRequest, PodQuery};
 use serde_json::Value;
 
-use crate::controllers::pdb;
 use crate::datastore::{DatastoreBackend, DatastoreHandle};
 use crate::side_effects::pdb::{PdbSideEffectPort, apply_pdb_event, pdb_event_namespace};
+use klights_controllers::pdb;
 use klights_controllers::side_effects::{PodSideEffectPortsSlot, SideEffect};
+
+#[cfg(test)]
+#[path = "controller_policy_tests/pdb.rs"]
+mod policy_tests;
 
 /// Updates PodDisruptionBudget status after Pod create/update/delete.
 ///
@@ -26,7 +30,7 @@ struct BoundPdbPort<'a> {
 }
 
 #[async_trait]
-impl crate::controllers::pdb::PdbPodReader for BoundPdbPort<'_> {
+impl klights_controllers::pdb::PdbPodReader for BoundPdbPort<'_> {
     async fn list_namespace_pods(
         &self,
         namespace: &str,

@@ -1,11 +1,15 @@
 use std::sync::Arc;
 
 use crate::controller_store_error_adapter::map_controller_store_error;
-use crate::controllers::node_subnet::{
+use crate::datastore::DatastoreHandle;
+use klights_controllers::node_subnet::{
     NodeReadinessPublishFuture, NodeReadinessPublishResult, NodeReadinessPublisher,
     PeerDataplaneHealth, PeerSyncOutcome, PeerTopologyProjection, PeerTopologyProjectionFuture,
 };
-use crate::datastore::DatastoreHandle;
+
+#[cfg(test)]
+#[path = "controller_policy_tests/node_subnet.rs"]
+mod policy_tests;
 
 pub struct DatastorePeerTopologyProjection {
     db: DatastoreHandle,
@@ -70,14 +74,14 @@ impl PeerTopologyProjection for DatastorePeerTopologyProjection {
                             .map_err(map_controller_store_error)?;
                         return Ok(());
                     }
-                    if let Some(node_ip) = crate::controllers::node_subnet::node_dataplane_ip(node)
+                    if let Some(node_ip) = klights_controllers::node_subnet::node_dataplane_ip(node)
                     {
                         self.db
                             .allocate_node_subnet(peer_name, &self.cluster_cidr, &node_ip)
                             .await
                             .map_err(map_controller_store_error)?;
                         let (mode, hostport_range) =
-                            crate::controllers::node_subnet::project_node_peer_attributes(node);
+                            klights_controllers::node_subnet::project_node_peer_attributes(node);
                         self.db
                             .update_node_peer_attributes(peer_name, mode, hostport_range)
                             .await
@@ -92,20 +96,30 @@ impl PeerTopologyProjection for DatastorePeerTopologyProjection {
     }
 }
 
-impl PeerDataplaneHealth for klights_networking::dataplane_health::DataplaneHealth {
+pub struct DataplaneHealthAdapter {
+    inner: klights_networking::dataplane_health::DataplaneHealth,
+}
+
+impl DataplaneHealthAdapter {
+    pub fn new(inner: klights_networking::dataplane_health::DataplaneHealth) -> Arc<Self> {
+        Arc::new(Self { inner })
+    }
+}
+
+impl PeerDataplaneHealth for DataplaneHealthAdapter {
     fn apply_peer_sync_outcome(
         &self,
         outcome: &PeerSyncOutcome,
     ) -> klights_network_api::DataplaneHealthSnapshot {
         if outcome.unreachable_ready_peers == 0 {
-            self.set_peers_connected();
+            self.inner.set_peers_connected();
         } else {
-            self.set_peers_disconnected(format!(
+            self.inner.set_peers_disconnected(format!(
                 "Waiting for WireGuard dataplane connectivity to {} of {} ready peer(s)",
                 outcome.unreachable_ready_peers, outcome.ready_peers
             ));
         }
-        self.snapshot()
+        self.inner.snapshot()
     }
 }
 

@@ -1,5 +1,5 @@
-use crate::controllers::deployment::reconcile_deployment as reconcile_deployment_core;
-use crate::controllers::replicaset::reconcile_replicaset as reconcile_replicaset_core;
+use klights_controllers::deployment::reconcile_deployment as reconcile_deployment_core;
+use klights_controllers::replicaset::reconcile_replicaset as reconcile_replicaset_core;
 use klights_controllers::service::ServiceIpam;
 use serde_json::json;
 

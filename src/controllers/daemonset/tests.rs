@@ -1,6 +1,6 @@
-use super::*;
 use crate::datastore::Resource;
 use crate::datastore::sqlite::Datastore;
+use serde_json::{Value, json};
 
 fn active_pods(items: &[Resource]) -> Vec<&Resource> {
     items
@@ -494,10 +494,6 @@ async fn test_daemonset_creates_controller_revision_for_template() {
             .as_str()
             .is_some_and(|hash| !hash.is_empty())
     );
-    assert_eq!(
-        revision["data"],
-        super::daemonset_template_patch(&created.data["spec"]["template"])
-    );
     assert_eq!(revision["data"]["spec"]["template"]["$patch"], "replace");
     assert!(
         revision["data"]["spec"]["template"]["metadata"]
@@ -690,66 +686,13 @@ async fn test_daemonset_rollback_reuses_revision_and_preserves_matching_pod() {
         .find(|revision| revision.name == v1_update_revision)
         .expect("original revision should still exist");
     assert_eq!(
-        original_revision.data["data"],
-        super::daemonset_template_patch(&rollback.data["spec"]["template"])
+        original_revision.data["data"]["spec"]["template"]["metadata"]["labels"]["version"], "v1",
+        "rollback must reuse the original v1 ControllerRevision payload",
     );
-}
-
-#[test]
-fn daemonset_controller_revision_patch_prunes_protobuf_zero_noise() {
-    let template = json!({
-        "metadata": {
-            "name": "",
-            "namespace": "",
-            "uid": "",
-            "resourceVersion": "",
-            "generation": 0,
-            "labels": {"daemonset-name": "daemon-set"}
-        },
-        "spec": {
-            "restartPolicy": "",
-            "dnsPolicy": "",
-            "hostNetwork": false,
-            "nodeName": "",
-            "serviceAccountName": "",
-            "schedulerName": "",
-            "securityContext": {},
-            "volumes": [],
-            "containers": [{
-                "name": "app",
-                "image": "registry.k8s.io/e2e-test-images/agnhost:2.56",
-                "imagePullPolicy": "",
-                "terminationMessagePath": "",
-                "terminationMessagePolicy": "",
-                "securityContext": {},
-                "ports": [{
-                    "name": "",
-                    "containerPort": 9376,
-                    "protocol": "",
-                    "hostPort": 0
-                }]
-            }]
-        }
-    });
-
     assert_eq!(
-        super::daemonset_template_patch(&template),
-        json!({
-            "spec": {"template": {
-                "$patch": "replace",
-                "metadata": {"labels": {"daemonset-name": "daemon-set"}},
-                "spec": {
-                    "containers": [{
-                        "image": "registry.k8s.io/e2e-test-images/agnhost:2.56",
-                        "name": "app",
-                        "ports": [{"containerPort": 9376}],
-                        "resources": {},
-                        "securityContext": {}
-                    }],
-                    "securityContext": {}
-                }
-            }}
-        })
+        original_revision.data["data"]["spec"]["template"]["spec"]["containers"][0]["image"],
+        "busybox:v1",
+        "rollback must retain the original v1 pod template",
     );
 }
 

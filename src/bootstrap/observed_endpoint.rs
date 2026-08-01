@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::bootstrap::NodeMode;
-use crate::controllers::annotations::GRPC_PORT_ANNOTATION;
 use crate::datastore::{DatastoreHandle, ResourceListQuery};
+use klights_controllers::annotations::GRPC_PORT_ANNOTATION;
 use klights_leader_api::JoinRole;
 use klights_leader_rpc::client::{GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient};
 use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};

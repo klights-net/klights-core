@@ -155,7 +155,7 @@ pub(crate) trait GrpcReplicationServerTestExt: Sized {
     fn new_with_node_lease_tracker(
         service: Arc<ReplicationService>,
         db: DatastoreHandle,
-        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+        node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
     ) -> Self;
 
     fn with_namespace(self, data_root: &str) -> Self;
@@ -199,7 +199,7 @@ impl GrpcReplicationServerTestExt for GrpcReplicationServer {
     fn new_with_node_lease_tracker(
         service: Arc<ReplicationService>,
         db: DatastoreHandle,
-        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+        node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
     ) -> Self {
         build_test_server(
             service,
@@ -231,10 +231,13 @@ fn build_test_server(
     db: DatastoreHandle,
     passive_reads: crate::datastore::selector::PassiveReadPorts,
     controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
-    node_lease_tracker: Option<Arc<crate::node_lease_tracker::NodeLeaseTracker>>,
+    node_lease_tracker: Option<Arc<klights_controllers::node_lease::NodeLeaseTracker>>,
 ) -> GrpcReplicationServer {
-    let node_lease_tracker = node_lease_tracker
-        .unwrap_or_else(|| Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()));
+    let node_lease_tracker = node_lease_tracker.unwrap_or_else(|| {
+        Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
+            chrono::Utc::now(),
+        ))
+    });
     let local = Arc::new(
         crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_and_passive_reads(
             db.clone(),
@@ -282,7 +285,7 @@ pub(crate) fn mount_service_full(
     service: Arc<ReplicationService>,
     db: DatastoreHandle,
     controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
-    node_lease_tracker: Option<Arc<crate::node_lease_tracker::NodeLeaseTracker>>,
+    node_lease_tracker: Option<Arc<klights_controllers::node_lease::NodeLeaseTracker>>,
     raft_rpc_router: Option<Arc<dyn klights_leader_rpc::raft_rpc::RaftRpcRouter>>,
     controlplane_join_handler: Option<Arc<dyn klights_leader_api::ControlplaneJoinHandler>>,
     data_root: &str,
@@ -395,7 +398,7 @@ pub(crate) fn mount_service_with_controller_dispatcher(
     service: Arc<ReplicationService>,
     db: DatastoreHandle,
     controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
-    node_lease_tracker: Option<Arc<crate::node_lease_tracker::NodeLeaseTracker>>,
+    node_lease_tracker: Option<Arc<klights_controllers::node_lease::NodeLeaseTracker>>,
     transport_policy: Arc<klights_leader_rpc::transport_policy::GrpcTransportPolicy>,
 ) -> axum::Router {
     mount_service_full(
@@ -423,7 +426,7 @@ fn mount_service_full_with_passive_reads(
     db: DatastoreHandle,
     passive_reads: crate::datastore::selector::PassiveReadPorts,
     controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
-    node_lease_tracker: Option<Arc<crate::node_lease_tracker::NodeLeaseTracker>>,
+    node_lease_tracker: Option<Arc<klights_controllers::node_lease::NodeLeaseTracker>>,
     raft_rpc_router: Option<Arc<dyn klights_leader_rpc::raft_rpc::RaftRpcRouter>>,
     controlplane_join_handler: Option<Arc<dyn klights_leader_api::ControlplaneJoinHandler>>,
     data_root: &str,
@@ -434,8 +437,11 @@ fn mount_service_full_with_passive_reads(
     node_lifecycle_status: Option<Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>>,
     transport_policy: Arc<klights_leader_rpc::transport_policy::GrpcTransportPolicy>,
 ) -> axum::Router {
-    let node_lease_tracker = node_lease_tracker
-        .unwrap_or_else(|| Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()));
+    let node_lease_tracker = node_lease_tracker.unwrap_or_else(|| {
+        Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
+            chrono::Utc::now(),
+        ))
+    });
     let local = Arc::new(
         crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_and_passive_reads(
             db.clone(),

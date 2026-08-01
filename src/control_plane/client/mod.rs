@@ -29,8 +29,8 @@ pub(crate) fn focused_node_subnet(
     subnet: klights_cluster_store::StoredNodeSubnet,
 ) -> std::result::Result<klights_leader_api::NodeSubnet, NetworkTopologyError> {
     let mode = match subnet.mode {
-        crate::controllers::annotations::NodePeerMode::Root => NetworkNodeMode::Root,
-        crate::controllers::annotations::NodePeerMode::Rootless => NetworkNodeMode::Rootless,
+        klights_controllers::annotations::NodePeerMode::Root => NetworkNodeMode::Root,
+        klights_controllers::annotations::NodePeerMode::Rootless => NetworkNodeMode::Rootless,
     };
     let hostport_range = subnet
         .hostport_range
@@ -55,8 +55,8 @@ pub(crate) fn legacy_node_subnet(
     let pod_subnet = klights_types::PodSubnet::parse(subnet.subnet())
         .map_err(NetworkTopologyError::corrupt_response)?;
     let mode = match subnet.mode() {
-        NetworkNodeMode::Root => crate::controllers::annotations::NodePeerMode::Root,
-        NetworkNodeMode::Rootless => crate::controllers::annotations::NodePeerMode::Rootless,
+        NetworkNodeMode::Root => klights_controllers::annotations::NodePeerMode::Root,
+        NetworkNodeMode::Rootless => klights_controllers::annotations::NodePeerMode::Rootless,
     };
     let hostport_range = subnet
         .hostport_range()
@@ -114,13 +114,6 @@ pub(crate) fn legacy_dataplane(
         metadata.port(),
     )
     .map_err(|error| NetworkTopologyError::corrupt_response(error.to_string()))
-}
-
-#[cfg(test)]
-pub(crate) fn runtime_dataplane(
-    metadata: klights_cluster_store::DataplanePeerMetadata,
-) -> std::result::Result<NetworkDataplane, NetworkTopologyError> {
-    focused_dataplane(metadata)
 }
 
 pub(crate) fn node_subnet_allocation_is_exhausted(message: &str) -> bool {
@@ -421,7 +414,9 @@ mod tests {
     async fn node_effect_ports_gate_follower_lease_before_tracker_mutation() {
         let db: crate::datastore::DatastoreHandle =
             Arc::new(crate::datastore::test_support::in_memory().await);
-        let tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new());
+        let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
+            chrono::Utc::now(),
+        ));
         let (_leader_tx, follower_rx) = tokio::sync::watch::channel(false);
         let local =
             crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker(
@@ -466,7 +461,9 @@ mod tests {
     #[tokio::test]
     async fn node_effect_lease_renewal_has_no_cluster_rv_watch_or_lease_row() {
         let db = crate::datastore::test_support::in_memory().await;
-        let tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new());
+        let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
+            chrono::Utc::now(),
+        ));
         let client =
             crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker(
                 Arc::new(db.clone()),

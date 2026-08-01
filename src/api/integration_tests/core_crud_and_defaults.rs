@@ -293,9 +293,14 @@ async fn test_create_namespace_auto_creates_default_service_account() {
         .unwrap();
 
     // Call the function that should auto-create the default SA
-    crate::controllers::namespace::create_default_service_account(&db, namespace_name)
-        .await
-        .unwrap();
+    klights_controllers::namespace::create_default_service_account_at(
+        &db,
+        namespace_name,
+        chrono::DateTime::UNIX_EPOCH,
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+    )
+    .await
+    .unwrap();
 
     // Verify the default ServiceAccount was created
     let sa = db
@@ -319,9 +324,15 @@ async fn test_create_kube_root_ca_configmap_contains_ca_cert() {
     let ca_cert_pem = "-----BEGIN CERTIFICATE-----\ntest-ca-cert\n-----END CERTIFICATE-----";
 
     // Call the function to create kube-root-ca.crt ConfigMap
-    crate::controllers::namespace::create_kube_root_ca_configmap(&db, namespace_name, ca_cert_pem)
-        .await
-        .unwrap();
+    klights_controllers::namespace::create_kube_root_ca_configmap_at(
+        &db,
+        namespace_name,
+        ca_cert_pem,
+        chrono::DateTime::UNIX_EPOCH,
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+    )
+    .await
+    .unwrap();
 
     // Verify the ConfigMap was created
     let cm = db
@@ -402,12 +413,23 @@ async fn test_dynamic_namespace_creates_kube_root_ca_configmap() {
 
     // Simulate what the API handler does after namespace creation:
     // auto-create default SA and kube-root-ca.crt ConfigMap
-    crate::controllers::namespace::create_default_service_account(&db, namespace_name)
-        .await
-        .unwrap();
-    crate::controllers::namespace::create_kube_root_ca_configmap(&db, namespace_name, ca_cert_pem)
-        .await
-        .unwrap();
+    klights_controllers::namespace::create_default_service_account_at(
+        &db,
+        namespace_name,
+        chrono::DateTime::UNIX_EPOCH,
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+    )
+    .await
+    .unwrap();
+    klights_controllers::namespace::create_kube_root_ca_configmap_at(
+        &db,
+        namespace_name,
+        ca_cert_pem,
+        chrono::DateTime::UNIX_EPOCH,
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+    )
+    .await
+    .unwrap();
 
     // Verify kube-root-ca.crt ConfigMap exists in the dynamic namespace
     let cm = db
@@ -442,13 +464,25 @@ async fn test_kube_root_ca_configmap_idempotent() {
     let ca_pem = "-----BEGIN CERTIFICATE-----\nca-data\n-----END CERTIFICATE-----";
 
     // Create configmap first time — should succeed
-    crate::controllers::namespace::create_kube_root_ca_configmap(&db, "default", ca_pem)
-        .await
-        .unwrap();
+    klights_controllers::namespace::create_kube_root_ca_configmap_at(
+        &db,
+        "default",
+        ca_pem,
+        chrono::DateTime::UNIX_EPOCH,
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+    )
+    .await
+    .unwrap();
 
     // Create again — should fail (duplicate) but not panic
-    let result =
-        crate::controllers::namespace::create_kube_root_ca_configmap(&db, "default", ca_pem).await;
+    let result = klights_controllers::namespace::create_kube_root_ca_configmap_at(
+        &db,
+        "default",
+        ca_pem,
+        chrono::DateTime::UNIX_EPOCH,
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+    )
+    .await;
     assert!(
         result.is_err(),
         "Duplicate kube-root-ca.crt creation should return error, not panic"
@@ -752,7 +786,7 @@ async fn test_patch_custom_resource_apply_strict_missing_resource_returns_schema
     )
     .await
     .unwrap();
-    crate::controllers::crd::register_crd_from_value(&crd_registry, &crd)
+    klights_controllers::crd::register_crd_from_value(&crd_registry, &crd)
         .await
         .unwrap();
 
@@ -861,7 +895,7 @@ async fn test_patch_custom_resource_apply_yaml_duplicate_fields_reports_duplicat
     )
     .await
     .unwrap();
-    crate::controllers::crd::register_crd_from_value(&crd_registry, &crd)
+    klights_controllers::crd::register_crd_from_value(&crd_registry, &crd)
         .await
         .unwrap();
 

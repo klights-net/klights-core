@@ -3,15 +3,12 @@ use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
 use klights_reconcile_api::ControllerStoreResult as Result;
 
 use crate::controller_store_error_adapter::map_controller_store_error;
-use crate::controllers::deployment::{DeploymentPodMutation, DeploymentStore};
 use crate::datastore::{DatastoreBackend, ResourceListQuery, ResourcePatchRequest};
 use crate::kubelet::pod_repository::PodObjectWriter;
+use klights_controllers::deployment::{DeploymentPodMutation, DeploymentStore};
 
 #[async_trait]
-impl<T> DeploymentPodMutation for T
-where
-    T: PodObjectWriter + Send + Sync + ?Sized,
-{
+impl DeploymentPodMutation for crate::controller_runtime_adapter::RootControllerPodPort {
     async fn merge_deployment_pod_labels(
         &self,
         namespace: &str,
@@ -25,10 +22,35 @@ where
 }
 
 #[async_trait]
-impl<T> DeploymentStore for T
-where
-    T: DatastoreBackend + klights_controllers::gc::GcResourceStore + Send + Sync + ?Sized,
-{
+impl DeploymentPodMutation for dyn PodObjectWriter + '_ {
+    async fn merge_deployment_pod_labels(
+        &self,
+        namespace: &str,
+        name: &str,
+        labels: Vec<(String, String)>,
+    ) -> Result<Resource> {
+        PodObjectWriter::merge_pod_labels(self, namespace, name, labels)
+            .await
+            .map_err(map_controller_store_error)
+    }
+}
+
+#[async_trait]
+impl DeploymentPodMutation for crate::kubelet::pod_repository::PodRepository {
+    async fn merge_deployment_pod_labels(
+        &self,
+        namespace: &str,
+        name: &str,
+        labels: Vec<(String, String)>,
+    ) -> Result<Resource> {
+        PodObjectWriter::merge_pod_labels(self, namespace, name, labels)
+            .await
+            .map_err(map_controller_store_error)
+    }
+}
+
+#[async_trait]
+impl DeploymentStore for dyn DatastoreBackend + '_ {
     async fn list_replicasets(&self, namespace: &str) -> Result<Vec<Resource>> {
         Ok(self
             .list_resources(
@@ -80,7 +102,7 @@ where
         resource: &Resource,
         status: serde_json::Value,
     ) -> Result<()> {
-        crate::controllers::common::write_status_for_resource(self, resource, &status)
+        klights_controllers::common::write_status_for_resource(self, resource, &status)
             .await
             .map(|_| ())
             .map_err(map_controller_store_error)

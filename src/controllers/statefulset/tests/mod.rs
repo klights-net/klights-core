@@ -1,4 +1,17 @@
 use super::*;
+use klights_reconcile_api::compute_statefulset_update_revision;
+use serde_json::json;
+
+async fn is_pod_ready(
+    pod_query: &(impl klights_pod_api::PodQuery + ?Sized),
+    namespace: &str,
+    pod_name: &str,
+) -> anyhow::Result<bool> {
+    let request = klights_pod_api::PodGetRequest::try_by_name(namespace, pod_name)?;
+    Ok(pod_query.get_pod(request).await?.is_some_and(|pod| {
+        klights_controllers::common::controller_common().is_pod_ready(&pod.data)
+    }))
+}
 
 /// Test-only shim that mirrors the public `reconcile_statefulset` signature
 /// before the Task 18 migration. Builds a `PodRepository` over the supplied

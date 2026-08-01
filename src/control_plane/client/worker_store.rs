@@ -1430,7 +1430,7 @@ impl crate::datastore::NetworkMetadataStore for WorkerStoreAdapter {
     async fn update_node_peer_attributes(
         &self,
         _node_name: &str,
-        _mode: crate::controllers::annotations::NodePeerMode,
+        _mode: klights_controllers::annotations::NodePeerMode,
         _hostport_range: Option<klights_types::HostPortRange>,
     ) -> Result<()> {
         Ok(())

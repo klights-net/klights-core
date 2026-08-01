@@ -15,7 +15,7 @@ use anyhow::Context;
 
 use crate::bootstrap::phases;
 use crate::bootstrap::{CliFlags, NodeRole};
-use crate::{controllers, kubelet, pidfile};
+use crate::{kubelet, pidfile};
 
 use super::init::dataplane::*;
 use super::init::host::print_ready_message;
@@ -410,7 +410,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                 klights_supervisor::TaskCategory::Background,
                 "worker_node_subnet_peer_watch",
                 async move {
-                    controllers::node_subnet::run_focused_peer_watch(
+                    klights_controllers::node_subnet::run_focused_peer_watch(
                         topology_for_peer_watch,
                         query_for_peer_watch,
                         watch_for_peer_watch,
@@ -418,7 +418,11 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                         node_name,
                         peering,
                         supervisor_for_task,
-                        Some(std::sync::Arc::new(health_for_peer_watch)),
+                        Some(
+                            crate::node_subnet_controller_adapter::DataplaneHealthAdapter::new(
+                                health_for_peer_watch,
+                            ),
+                        ),
                         readiness_publisher,
                         cancel,
                     )

@@ -6522,7 +6522,7 @@ async fn test_crd_get_non_storage_version_uses_conversion_webhook() {
     )
     .await
     .unwrap();
-    crate::controllers::crd::register_crd_from_value(&registry, &crd)
+    klights_controllers::crd::register_crd_from_value(&registry, &crd)
         .await
         .unwrap();
 
@@ -6656,7 +6656,7 @@ async fn test_crd_list_non_storage_version_converts_heterogeneous_storage() {
     )
     .await
     .unwrap();
-    crate::controllers::crd::register_crd_from_value(&registry, &crd)
+    klights_controllers::crd::register_crd_from_value(&registry, &crd)
         .await
         .unwrap();
 
@@ -10180,7 +10180,7 @@ async fn custom_resource_operations_denied_with_deny_authorizer() {
     state
         .discovery()
         .crd_registry
-        .register(crate::controllers::crd::CrdResourceInfo {
+        .register(klights_controllers::crd::CrdResourceInfo {
             group: "example-auth.com".to_string(),
             version: "v1".to_string(),
             kind: "AuthWidget".to_string(),
@@ -10304,7 +10304,7 @@ async fn custom_resource_allowed_identity_gets_normal_response() {
     state
         .discovery()
         .crd_registry
-        .register(crate::controllers::crd::CrdResourceInfo {
+        .register(klights_controllers::crd::CrdResourceInfo {
             group: "example-allow.com".to_string(),
             version: "v1".to_string(),
             kind: "AllowWidget".to_string(),

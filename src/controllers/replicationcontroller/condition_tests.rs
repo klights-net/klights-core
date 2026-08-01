@@ -1,6 +1,5 @@
-use super::*;
 use crate::datastore::sqlite::Datastore;
-use serde_json::json;
+use serde_json::{Value, json};
 
 /// Test-only shim wrapping `reconcile_replicationcontroller` with the
 /// repository-backed argument list, mirroring the pre-Task-18 signature.
@@ -47,16 +46,30 @@ async fn setup_db_with_rc(db: &Datastore, rc_name: &str) {
 async fn test_rc_publishes_replica_failure_condition_on_create_failure() {
     let db = crate::datastore::test_support::in_memory().await;
     setup_db_with_rc(&db, "test-rc").await;
-    update_replicationcontroller_status(
-        &crate::controllers::test_utils::controller_store_for_test(&db),
-        "test-rc",
-        "default",
-        &[],
-        Some("exceeded quota: pods count limit"),
-        chrono::DateTime::UNIX_EPOCH,
+    db.create_resource(
+        "v1",
+        "ResourceQuota",
+        Some("default"),
+        "deny-pods",
+        json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": {"name": "deny-pods", "namespace": "default"},
+            "spec": {"hard": {"pods": "0"}}
+        }),
     )
     .await
     .unwrap();
+    let rc = db
+        .get_resource("v1", "ReplicationController", Some("default"), "test-rc")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        reconcile_rc_test(&db, rc.data.as_ref(), "node1")
+            .await
+            .is_err()
+    );
     let updated = db
         .get_resource("v1", "ReplicationController", Some("default"), "test-rc")
         .await
@@ -79,16 +92,14 @@ async fn test_rc_publishes_replica_failure_condition_on_create_failure() {
 async fn test_rc_clears_replica_failure_condition_when_healthy() {
     let db = crate::datastore::test_support::in_memory().await;
     setup_db_with_rc(&db, "test-rc-ok").await;
-    update_replicationcontroller_status(
-        &crate::controllers::test_utils::controller_store_for_test(&db),
-        "test-rc-ok",
-        "default",
-        &[],
-        None,
-        chrono::DateTime::UNIX_EPOCH,
-    )
-    .await
-    .unwrap();
+    let rc = db
+        .get_resource("v1", "ReplicationController", Some("default"), "test-rc-ok")
+        .await
+        .unwrap()
+        .unwrap();
+    reconcile_rc_test(&db, rc.data.as_ref(), "node1")
+        .await
+        .unwrap();
     let updated = db
         .get_resource("v1", "ReplicationController", Some("default"), "test-rc-ok")
         .await
@@ -274,7 +285,7 @@ async fn test_replicationcontroller_scale_subresource() {
         crate::controllers::ControllerDispatcher::new(service_ipam.clone()),
     );
     let state =
-        crate::crd_tests::build_test_app_state(db, crate::controllers::crd::CrdRegistry::new())
+        crate::crd_tests::build_test_app_state(db, klights_controllers::crd::CrdRegistry::new())
             .await;
     let app = crate::api::build_router(state);
 

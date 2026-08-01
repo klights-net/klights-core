@@ -794,7 +794,7 @@ async fn test_aggregated_discovery_includes_crd_resources() {
     state
         .discovery()
         .crd_registry
-        .register(crate::controllers::crd::CrdResourceInfo {
+        .register(klights_controllers::crd::CrdResourceInfo {
             group: "stable.example.com".to_string(),
             version: "v1".to_string(),
             kind: "CronTab".to_string(),
@@ -906,7 +906,7 @@ async fn test_aggregated_discovery_includes_crd_synced_from_datastore() {
     )
     .await
     .unwrap();
-    crate::controllers::crd::sync_registry_from_datastore(db.as_ref(), &crd_registry)
+    klights_controllers::crd::sync_registry_from_datastore(db.as_ref(), &crd_registry)
         .await
         .unwrap();
 

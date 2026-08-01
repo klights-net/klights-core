@@ -2090,7 +2090,7 @@ async fn test_job_stale_controller_status_write_preserves_patched_condition() {
         "startTime": "2026-06-25T00:00:00Z",
         "terminating": 0
     });
-    let stale_write = crate::controllers::common::write_status_for_resource(
+    let stale_write = klights_controllers::common::write_status_for_resource(
         &db,
         &stale_job_resource,
         &stale_controller_status,

@@ -493,7 +493,7 @@ mod tests {
                 "metadata": {
                     "name": name,
                     "annotations": {
-                        crate::controllers::annotations::GIT_COMMIT_ANNOTATION: "test-commit"
+                        klights_controllers::annotations::GIT_COMMIT_ANNOTATION: "test-commit"
                     }
                 },
                 "status": {
@@ -573,7 +573,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_network_conditions_stamps_current_git_commit() {
-        use crate::controllers::annotations::GIT_COMMIT_ANNOTATION;
+        use klights_controllers::annotations::GIT_COMMIT_ANNOTATION;
 
         let db = crate::datastore::test_support::in_memory().await;
         db.create_resource(
@@ -623,7 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_effect_git_commit_refresh_uses_uid_rv_resource_command() {
-        use crate::controllers::annotations::GIT_COMMIT_ANNOTATION;
+        use klights_controllers::annotations::GIT_COMMIT_ANNOTATION;
 
         let db = crate::datastore::test_support::in_memory().await;
         db.create_resource(
@@ -873,7 +873,7 @@ mod tests {
         assert_eq!(
             NODE_HEARTBEAT_INTERVAL,
             Duration::from_secs(
-                crate::node_lease_tracker::DEFAULT_NODE_HEARTBEAT_INTERVAL_SECONDS as u64
+                klights_controllers::node_lease::DEFAULT_NODE_HEARTBEAT_INTERVAL_SECONDS as u64
             ),
         );
     }
@@ -946,7 +946,7 @@ mod tests {
         let db = crate::datastore::test_support::in_memory().await;
         let snapshot = NodeRegistrationSnapshot {
             node_name: "remote-cp".to_string(),
-            node_mode: crate::controllers::annotations::NodePeerMode::Root,
+            node_mode: klights_controllers::annotations::NodePeerMode::Root,
             node_role: klights_kubelet::node_config::KubeletNodeRole::Controlplane {
                 as_learner: false,
             },
@@ -1877,7 +1877,7 @@ mod tests {
     /// annotations so peers can project this node as `NodePeerMode::Rootless`.
     #[tokio::test]
     async fn node_status_publishes_mode_annotation() {
-        use crate::controllers::annotations::{
+        use klights_controllers::annotations::{
             DEFAULT_HOSTPORT_RANGE, HOSTPORT_RANGE_ANNOTATION, NODE_MODE_ANNOTATION,
         };
         let db = crate::datastore::test_support::in_memory().await;
@@ -1926,7 +1926,7 @@ mod tests {
     /// without implying root mode has a rootless host-port graft range.
     #[tokio::test]
     async fn node_status_root_publishes_empty_hostport_annotation() {
-        use crate::controllers::annotations::{HOSTPORT_RANGE_ANNOTATION, NODE_MODE_ANNOTATION};
+        use klights_controllers::annotations::{HOSTPORT_RANGE_ANNOTATION, NODE_MODE_ANNOTATION};
         let db = crate::datastore::test_support::in_memory().await;
         register_node(
             &db,
@@ -1970,7 +1970,7 @@ mod tests {
     /// string, this test fails the symbol equality.
     #[test]
     fn annotation_key_constants_are_shared() {
-        use crate::controllers::annotations::{HOSTPORT_RANGE_ANNOTATION, NODE_MODE_ANNOTATION};
+        use klights_controllers::annotations::{HOSTPORT_RANGE_ANNOTATION, NODE_MODE_ANNOTATION};
         assert_eq!(NODE_MODE_ANNOTATION, "klights.io/mode");
         assert_eq!(HOSTPORT_RANGE_ANNOTATION, "klights.io/hostport-range");
     }
@@ -1980,7 +1980,7 @@ mod tests {
     /// across nodes in a multinode cluster.
     #[tokio::test]
     async fn node_status_publishes_git_commit_annotation() {
-        use crate::controllers::annotations::GIT_COMMIT_ANNOTATION;
+        use klights_controllers::annotations::GIT_COMMIT_ANNOTATION;
         let db = crate::datastore::test_support::in_memory().await;
         register_node(
             &db,

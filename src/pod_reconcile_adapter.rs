@@ -288,7 +288,7 @@ impl NamespaceTerminationSink for PodReconcileAdapter {
 impl NamespaceBootstrapSink for PodReconcileAdapter {
     fn create_default_service_account(&self, namespace: String) -> ReconcileSinkFuture<'_> {
         Box::pin(async move {
-            crate::controllers::namespace::create_default_service_account_at(
+            klights_controllers::namespace::create_default_service_account_at(
                 self.db.as_ref(),
                 &namespace,
                 chrono::Utc::now(),
@@ -305,7 +305,7 @@ impl NamespaceBootstrapSink for PodReconcileAdapter {
         ca_certificate: String,
     ) -> ReconcileSinkFuture<'_> {
         Box::pin(async move {
-            crate::controllers::namespace::create_kube_root_ca_configmap_at(
+            klights_controllers::namespace::create_kube_root_ca_configmap_at(
                 self.db.as_ref(),
                 &namespace,
                 &ca_certificate,
@@ -383,7 +383,7 @@ impl PodPdbReconcileSink for PodReconcileAdapter {
     fn reconcile_namespace_pdbs(&self, namespace: String) -> ReconcileSinkFuture<'_> {
         Box::pin(async move {
             let now = chrono::Utc::now();
-            crate::controllers::pdb::reconcile_pdbs_for_namespace(
+            klights_controllers::pdb::reconcile_pdbs_for_namespace(
                 self.db.as_ref(),
                 self.pod_reader.as_ref(),
                 &namespace,
@@ -405,7 +405,7 @@ impl PodEvictionAdmissionSink for PodReconcileAdapter {
             let namespace = request.pod.namespace.as_deref().ok_or_else(|| {
                 ReconcileSinkError::unavailable("stored Pod is missing metadata.namespace")
             })?;
-            crate::controllers::pdb::reconcile_pdbs_for_namespace_checked(
+            klights_controllers::pdb::reconcile_pdbs_for_namespace_checked(
                 self.db.as_ref(),
                 self.pod_reader.as_ref(),
                 namespace,
@@ -413,7 +413,7 @@ impl PodEvictionAdmissionSink for PodReconcileAdapter {
             )
             .await
             .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))?;
-            crate::controllers::pdb::admit_pod_eviction_at(
+            klights_controllers::pdb::admit_pod_eviction_at(
                 self.db.as_ref(),
                 &request.pod,
                 request.dry_run,
@@ -448,7 +448,7 @@ impl<'a> PersistentVolumeReconcileAdapter<'a> {
 impl PvcReconcileSink for PersistentVolumeReconcileAdapter<'_> {
     fn reconcile_pvc(&self, pvc: Resource) -> PvcReconcileFuture<'_> {
         Box::pin(async move {
-            let updated = crate::controllers::pvc::reconcile_pvc(
+            let updated = klights_controllers::pvc::reconcile_pvc(
                 self.file_process,
                 self.local_path_provisioner_root,
                 self.db,

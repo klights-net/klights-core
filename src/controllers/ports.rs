@@ -5,7 +5,8 @@ use klights_cluster_core::Resource;
 #[cfg(not(test))]
 use serde_json::Value;
 
-use super::{
+use klights_controllers::service::ServiceControllerStore;
+use klights_controllers::{
     apiservice::ApiServiceStore,
     csr_signer::CsrStatusStore,
     daemonset::{DaemonSetPodMutation, DaemonSetStore},
@@ -17,7 +18,6 @@ use super::{
     replicationcontroller::{ReplicationControllerPodMutation, ReplicationControllerStore},
     statefulset::{StatefulSetPodMutation, StatefulSetStore},
 };
-use klights_controllers::service::ServiceControllerStore;
 
 #[async_trait]
 #[cfg_attr(test, allow(dead_code))]
@@ -86,7 +86,7 @@ pub(crate) struct ControllerRuntimeDependencies {
     pub(crate) apiservice_store: Arc<dyn ApiServiceStore>,
     pub(crate) csr_status_store: Arc<dyn CsrStatusStore>,
     pub(crate) pod_query: Arc<dyn klights_pod_api::PodQuery>,
-    pub(crate) pdb_pod_reader: Arc<dyn super::pdb::PdbPodReader>,
+    pub(crate) pdb_pod_reader: Arc<dyn klights_controllers::pdb::PdbPodReader>,
     pub(crate) deployment_pod_reader: Arc<dyn DeploymentControllerPodReader>,
     pub(crate) deployment_pod_mutation: Arc<dyn DeploymentControllerPodMutation>,
     pub(crate) replicaset_pod_mutation: Arc<dyn ReplicaSetPodMutation>,

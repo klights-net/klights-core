@@ -10,22 +10,22 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::controller_store_error_adapter::map_controller_store_error;
-use crate::controllers::node_lifecycle::{
-    NodeLifecyclePodStore, NodeLifecycleStore, NodeLostPodLifecycleSink,
-};
 use crate::datastore::{DatastoreBackend, DatastoreHandle, ResourceListQuery};
 use crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey;
 use crate::kubelet::pod_lifecycle_router::{
     OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
 };
-use crate::kubelet::pod_repository::{PodReader, PodSubresourceWriter};
 use klights_cluster_core::Resource;
+use klights_controllers::node_lifecycle::{
+    NodeLifecyclePodStore, NodeLifecycleStore, NodeLostPodLifecycleSink,
+};
+
+#[cfg(test)]
+#[path = "controller_policy_tests/node_lifecycle.rs"]
+mod policy_tests;
 
 #[async_trait]
-impl<T> NodeLifecycleStore for T
-where
-    T: DatastoreBackend + Send + Sync + ?Sized,
-{
+impl NodeLifecycleStore for dyn DatastoreBackend + '_ {
     async fn list_nodes(&self) -> klights_reconcile_api::ControllerStoreResult<Vec<Resource>> {
         Ok(self
             .list_resources("v1", "Node", None, ResourceListQuery::all())
@@ -50,51 +50,19 @@ where
     }
 }
 
-#[async_trait]
-impl<T> NodeLifecyclePodStore for T
-where
-    T: PodReader + PodSubresourceWriter + Send + Sync + ?Sized,
-{
-    async fn list_pods_bound_to_node(
-        &self,
-        node_name: &str,
-    ) -> klights_reconcile_api::ControllerStoreResult<Vec<Resource>> {
-        let field_selector = format!("spec.nodeName={node_name}");
-        Ok(
-            PodReader::list_pods(self, None, None, Some(&field_selector), None, None)
-                .await
-                .map_err(map_controller_store_error)?
-                .items,
-        )
-    }
-
-    async fn replace_pod_status_for_uid(
-        &self,
-        pod: &Resource,
-        status: serde_json::Value,
-    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
-        PodSubresourceWriter::replace_status_from_api_for_uid(
-            self,
-            pod.namespace.as_deref().unwrap_or("default"),
-            &pod.name,
-            &pod.uid,
-            status,
-            pod.resource_version,
-        )
-        .await
-        .map_err(map_controller_store_error)
-    }
+struct NodeLostPodLifecycleAdapter {
+    inner: Arc<PodLifecycleRouter>,
 }
 
 #[async_trait]
-impl NodeLostPodLifecycleSink for PodLifecycleRouter {
+impl NodeLostPodLifecycleSink for NodeLostPodLifecycleAdapter {
     async fn enqueue_node_lost_cleanup(
         &self,
         pod: Resource,
     ) -> klights_reconcile_api::ControllerStoreResult<()> {
         let namespace = pod.namespace.as_deref().unwrap_or("default");
         enqueue_orphan_finalize(
-            self,
+            self.inner.as_ref(),
             PodLifecycleKey::new(namespace, &pod.name, &pod.uid),
             OrphanReason::NodeLost,
         )
@@ -110,7 +78,7 @@ pub(crate) struct NodeLifecycleControllerDependencies {
     pub(crate) pods: Arc<dyn NodeLifecyclePodStore>,
     pub(crate) pod_mutations: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     pub(crate) pod_lifecycle: Arc<PodLifecycleRouter>,
-    pub(crate) lease_observations: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+    pub(crate) lease_observations: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
     pub(crate) supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub(crate) node_status: Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>,
     pub(crate) watch: Arc<dyn LeaderWatch>,
@@ -133,6 +101,9 @@ pub(crate) async fn run_node_lifecycle_controller(
         watch,
         pod_eviction_grace,
     } = dependencies;
+    let pod_lifecycle_sink = NodeLostPodLifecycleAdapter {
+        inner: pod_lifecycle_router.clone(),
+    };
     let mut events = match open_node_lifecycle_watches(watch.as_ref()).await {
         Ok(events) => events,
         Err(error) => {
@@ -141,7 +112,7 @@ pub(crate) async fn run_node_lifecycle_controller(
         }
     };
     if let Err(err) =
-        crate::controllers::node_lifecycle::refresh_node_lease_tracker_from_cluster_leases(
+        klights_controllers::node_lifecycle::refresh_node_lease_tracker_from_cluster_leases(
             db.as_ref(),
             node_lease_tracker.as_ref(),
         )
@@ -169,15 +140,15 @@ pub(crate) async fn run_node_lifecycle_controller(
         }
 
         let next_deadline =
-            match crate::controllers::node_lifecycle::reconcile_node_lifecycle_once_with_tracker(
+            match klights_controllers::node_lifecycle::reconcile_node_lifecycle_once_with_tracker(
                 db.as_ref(),
                 node_status.as_ref(),
                 pod_repository.as_ref(),
                 node_lease_tracker.as_ref(),
                 Utc::now(),
-                crate::controllers::node_lifecycle::NodeLifecyclePodActions {
+                klights_controllers::node_lifecycle::NodeLifecyclePodActions {
                     mutation_reconcile: Some(pod_mutations.as_ref()),
-                    lifecycle: Some(pod_lifecycle_router.as_ref() as &dyn NodeLostPodLifecycleSink),
+                    lifecycle: Some(&pod_lifecycle_sink),
                     eviction_grace: pod_eviction_grace,
                 },
             )
@@ -250,7 +221,7 @@ pub(crate) async fn run_node_lifecycle_controller(
 
         match watch_result {
             Ok(event) => {
-                if let Err(err) = crate::controllers::node_lifecycle::track_lease_from_event(
+                if let Err(err) = klights_controllers::node_lifecycle::track_lease_from_event(
                     &event,
                     node_lease_tracker.as_ref(),
                 )
@@ -263,14 +234,11 @@ pub(crate) async fn run_node_lifecycle_controller(
                 if event.event_type() == WatchEventType::Deleted && event.resource().kind == "Node"
                 {
                     loop {
-                        match crate::controllers::node_lifecycle::cleanup_pods_bound_to_deleted_node_event(
+                        match klights_controllers::node_lifecycle::cleanup_pods_bound_to_deleted_node_event(
                             db.as_ref(),
                             pod_repository.as_ref(),
                             Some(pod_mutations.as_ref()),
-                            Some(
-                                pod_lifecycle_router.as_ref()
-                                    as &dyn NodeLostPodLifecycleSink,
-                            ),
+                            Some(&pod_lifecycle_sink),
                             &event,
                             chrono::Utc::now(),
                         )
@@ -300,7 +268,7 @@ pub(crate) async fn run_node_lifecycle_controller(
                         }
                     }
                 }
-                if crate::controllers::node_lifecycle::node_lifecycle_event(&event) {
+                if klights_controllers::node_lifecycle::node_lifecycle_event(&event) {
                     continue;
                 }
             }
@@ -309,7 +277,7 @@ pub(crate) async fn run_node_lifecycle_controller(
                     "node_lifecycle watch replay expired; refreshing lease state and reopening"
                 );
                 if let Err(error) =
-                    crate::controllers::node_lifecycle::refresh_node_lease_tracker_from_cluster_leases(
+                    klights_controllers::node_lifecycle::refresh_node_lease_tracker_from_cluster_leases(
                         db.as_ref(),
                         node_lease_tracker.as_ref(),
                     )
@@ -358,7 +326,7 @@ async fn open_node_lifecycle_watches(
 }
 
 async fn wait_for_leadership(
-    node_lease_tracker: &crate::node_lease_tracker::NodeLeaseTracker,
+    node_lease_tracker: &klights_controllers::node_lease::NodeLeaseTracker,
     cancel: &CancellationToken,
     is_leader_rx: &mut watch::Receiver<bool>,
 ) -> bool {
@@ -383,7 +351,7 @@ async fn wait_for_retry(
     cancel: &CancellationToken,
     attempt: u32,
 ) -> bool {
-    let delay = crate::controllers::node_lifecycle::node_lifecycle_retry_delay(attempt);
+    let delay = klights_controllers::node_lifecycle::node_lifecycle_retry_delay(attempt);
     tokio::select! {
         _ = cancel.cancelled() => false,
         _ = task_supervisor.sleep("node_lifecycle_retry", delay) => true,

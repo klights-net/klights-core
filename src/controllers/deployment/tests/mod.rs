@@ -1,6 +1,17 @@
-use super::*;
 use serde_json::Value;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+
+fn compute_pod_template_hash(template: &Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(template).unwrap_or_default());
+    let digest = hasher.finalize();
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()[..10]
+        .to_string()
+}
 
 fn coordination() -> &'static klights_controllers::ControllerCoordination {
     static COORDINATION: std::sync::LazyLock<klights_controllers::ControllerCoordination> =

@@ -150,9 +150,12 @@ mod tests {
     #[tokio::test]
     async fn leader_kubernetes_service_reconcile_moves_endpoint_to_current_gateway() {
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(
+        klights_controllers::namespace::init_default_namespaces_with_ca_path(
             &crate::kubelet::file_blocking::test_file_process_executor(),
             &db,
+            &crate::paths::ca_cert_path(&crate::paths::runtime_namespace()),
+            chrono::DateTime::UNIX_EPOCH,
+            crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
         )
         .await
         .expect("default namespaces");
@@ -359,7 +362,7 @@ async fn reconcile_kubernetes_service_for_leader(
     klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
         anyhow::anyhow!("controller authority rejected Service bootstrap: {error}")
     })?;
-    crate::controllers::kube_service::bootstrap_default_service_cidr(
+    klights_controllers::kube_service::bootstrap_default_service_cidr(
         db_handle.as_ref(),
         &config.service_cidr,
     )
@@ -367,7 +370,7 @@ async fn reconcile_kubernetes_service_for_leader(
     klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
         anyhow::anyhow!("controller authority rejected Service bootstrap: {error}")
     })?;
-    crate::controllers::kube_service::bootstrap_kubernetes_service(
+    klights_controllers::kube_service::bootstrap_kubernetes_service(
         db_handle.as_ref(),
         &config.service_cidr,
         config.tls_port,

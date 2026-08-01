@@ -1794,7 +1794,7 @@ async fn raft_install_snapshot_rejects_admin_certificate() {
 async fn renew_node_lease_rejects_mismatched_node() {
     let db = crate::datastore::test_support::in_memory().await;
     let db: DatastoreHandle = Arc::new(db);
-    let tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new_for_test(
+    let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         chrono::DateTime::parse_from_rfc3339("2026-05-25T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc),
@@ -1830,7 +1830,9 @@ async fn renew_node_lease_rejects_mismatched_node() {
 #[tokio::test]
 async fn node_effect_rpc_rejects_nonpositive_lease_duration_before_tracker_mutation() {
     let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
-    let tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new());
+    let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
+        chrono::Utc::now(),
+    ));
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(crate::grpc_test_support::replication_service(
         db.clone(),
@@ -2413,7 +2415,7 @@ async fn renew_node_lease_rejects_renew_time_skew_over_100_seconds() {
         .with_timezone(&chrono::Utc);
     let db = crate::datastore::test_support::in_memory().await;
     let db: DatastoreHandle = Arc::new(db);
-    let tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new_for_test(
+    let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         wall_time,
     ));
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -2849,7 +2851,7 @@ async fn renew_node_lease_rpc_rejects_bootstrap_token_on_leader() {
     let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
         .await
         .unwrap();
-    let tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new_for_test(
+    let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         chrono::DateTime::parse_from_rfc3339("2026-05-25T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc),
@@ -2887,7 +2889,7 @@ async fn renew_node_lease_rpc_updates_memory_without_cluster_db_write() {
         .await
         .unwrap();
     let before_rv = db.get_current_resource_version().await.unwrap();
-    let tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new_for_test(
+    let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         wall_time,
     ));
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -2942,7 +2944,7 @@ async fn renew_node_lease_rpc_rejects_follower_local_heartbeat_write() {
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
-    let tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new_for_test(
+    let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         chrono::DateTime::parse_from_rfc3339("2026-05-25T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc),
@@ -3873,9 +3875,12 @@ async fn channel_snapshot_sink_forwards_typed_restore_operations() {
     // Build a fixture cluster with a couple of resources so the snapshot
     // emitter has real commits to stream.
     let db = crate::datastore::test_support::in_memory().await;
-    crate::controllers::namespace::init_default_namespaces(
+    klights_controllers::namespace::init_default_namespaces_with_ca_path(
         &crate::kubelet::file_blocking::test_file_process_executor(),
         &db,
+        &crate::paths::ca_cert_path(&crate::paths::runtime_namespace()),
+        chrono::DateTime::UNIX_EPOCH,
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
     )
     .await
     .unwrap();

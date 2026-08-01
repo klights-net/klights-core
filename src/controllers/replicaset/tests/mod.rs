@@ -1,4 +1,4 @@
-use super::*;
+use serde_json::json;
 
 fn coordination() -> &'static klights_controllers::ControllerCoordination {
     static COORDINATION: std::sync::LazyLock<klights_controllers::ControllerCoordination> =
@@ -36,5 +36,4 @@ where
 }
 
 mod adoption_and_ownerref_tests;
-mod generated_name_collision_tests;
 mod reconcile_scale_tests;

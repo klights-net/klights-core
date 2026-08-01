@@ -435,7 +435,7 @@ pub struct LocalApiClient {
     service_account_signing_key_path: std::path::PathBuf,
     file_process: klights_supervisor::FileProcessExecutor,
     crypto: klights_supervisor::CryptoExecutor,
-    node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+    node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
     /// Set once the leader's `ControllerDispatcher` is constructed (later in
     /// bootstrap than `LocalApiClient`). When present, every successful
     /// outbox apply on a Pod status fires the same Service / workload
@@ -575,7 +575,9 @@ impl LocalApiClient {
             passive_reads,
             authoring_node,
             std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string()),
-            Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
+            Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
+                chrono::Utc::now(),
+            )),
             is_leader_rx,
             crate::kubelet::file_blocking::test_file_process_executor(),
         )
@@ -592,7 +594,9 @@ impl LocalApiClient {
             db,
             authoring_node,
             std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string()),
-            Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
+            Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
+                chrono::Utc::now(),
+            )),
             is_leader_rx,
             file_process,
         )
@@ -602,7 +606,7 @@ impl LocalApiClient {
     pub(crate) fn new_with_node_lease_tracker(
         db: DatastoreHandle,
         authoring_node: String,
-        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+        node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
         is_leader_rx: watch::Receiver<bool>,
     ) -> Self {
         Self::new_with_node_lease_tracker_and_file_process(
@@ -619,7 +623,7 @@ impl LocalApiClient {
         db: DatastoreHandle,
         passive_reads: crate::datastore::selector::PassiveReadPorts,
         authoring_node: String,
-        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+        node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
         is_leader_rx: watch::Receiver<bool>,
     ) -> Self {
         Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process_with_reads(
@@ -637,7 +641,7 @@ impl LocalApiClient {
     pub(crate) fn new_with_node_lease_tracker_and_file_process(
         db: DatastoreHandle,
         authoring_node: String,
-        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+        node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
         is_leader_rx: watch::Receiver<bool>,
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
@@ -656,7 +660,7 @@ impl LocalApiClient {
         db: DatastoreHandle,
         authoring_node: String,
         containerd_namespace: String,
-        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+        node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
         is_leader_rx: watch::Receiver<bool>,
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
@@ -677,7 +681,7 @@ impl LocalApiClient {
         passive_reads: crate::datastore::selector::PassiveReadPorts,
         authoring_node: String,
         containerd_namespace: String,
-        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+        node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
         is_leader_rx: watch::Receiver<bool>,
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
@@ -699,7 +703,7 @@ impl LocalApiClient {
         authoring_node: String,
         containerd_namespace: String,
         service_account_signing_key_path: std::path::PathBuf,
-        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+        node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
         is_leader_rx: watch::Receiver<bool>,
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
@@ -2400,7 +2404,7 @@ mod inner_gate_tests {
         let _check_with_tracker: fn(
             DatastoreHandle,
             String,
-            Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+            Arc<klights_controllers::node_lease::NodeLeaseTracker>,
             watch::Receiver<bool>,
         ) -> LocalApiClient = LocalApiClient::new_with_node_lease_tracker;
     }
@@ -2556,7 +2560,9 @@ mod inner_gate_tests {
                     "node-a".to_string(),
                     namespace,
                     signing_key_path,
-                    Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
+                    Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
+                        chrono::Utc::now(),
+                    )),
                     leadership_rx,
                     crate::kubelet::file_blocking::test_file_process_executor(),
                 ),
@@ -2675,7 +2681,9 @@ mod inner_gate_tests {
                 "leader-cp1".to_string(),
                 namespace,
                 signing_key_path,
-                Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
+                Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
+                    chrono::Utc::now(),
+                )),
                 always_leader_watch(),
                 crate::kubelet::file_blocking::test_file_process_executor(),
             ),

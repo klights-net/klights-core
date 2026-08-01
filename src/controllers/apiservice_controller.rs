@@ -1,6 +1,10 @@
 //! `Controller` impl for `APIService`. Registered in `ControllerDispatcher`.
 
-use crate::controllers::apiservice as apiservice_core;
+use klights_controllers::apiservice as apiservice_core;
+
+#[cfg(test)]
+#[path = "../controller_policy_tests/apiservice.rs"]
+mod policy_tests;
 pub struct APIServiceController;
 
 #[async_trait::async_trait]

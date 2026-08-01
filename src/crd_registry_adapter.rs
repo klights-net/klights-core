@@ -3,8 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::controller_store_error_adapter::map_controller_store_error;
-use crate::controllers::crd::{CrdRegistryReader, CrdRegistryRuntime, CrdRegistryWatchSession};
 use crate::datastore::{DatastoreBackend, DatastoreHandle};
+use klights_controllers::crd::{CrdRegistryReader, CrdRegistryRuntime, CrdRegistryWatchSession};
 use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest};
 
 struct LeaderCrdRegistryRuntime {
@@ -13,10 +13,7 @@ struct LeaderCrdRegistryRuntime {
 }
 
 #[async_trait]
-impl<T> CrdRegistryReader for T
-where
-    T: DatastoreBackend + ?Sized,
-{
+impl CrdRegistryReader for dyn DatastoreBackend + '_ {
     async fn list_crd_values(
         &self,
     ) -> klights_reconcile_api::ControllerStoreResult<Vec<serde_json::Value>> {
@@ -91,4 +88,118 @@ pub(crate) fn new_runtime(
         db,
         positioned_watch,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use klights_controllers::crd::{
+        CrdRegistry, run_crd_registry_watch_with_components, sync_registry_from_datastore,
+    };
+    use serde_json::{Value, json};
+    use tokio_util::sync::CancellationToken;
+
+    fn crd(group: &str, kind: &str, plural: &str) -> Value {
+        json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": format!("{plural}.{group}")},
+            "spec": {
+                "group": group,
+                "scope": "Namespaced",
+                "names": {"kind": kind, "plural": plural, "singular": plural.trim_end_matches('s')},
+                "versions": [{"name": "v1", "served": true, "storage": true, "schema": {"openAPIV3Schema": {"type": "object"}}}]
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn datastore_reader_is_registry_source_of_truth() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let registry = CrdRegistry::new();
+        db.create_resource(
+            "apiextensions.k8s.io/v1",
+            "CustomResourceDefinition",
+            None,
+            "syncwidgets.sync.example.com",
+            crd("sync.example.com", "SyncWidget", "syncwidgets"),
+        )
+        .await
+        .unwrap();
+
+        sync_registry_from_datastore(&db as &dyn DatastoreBackend, &registry)
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .get("sync.example.com", "v1", "syncwidgets")
+                .await
+                .is_some()
+        );
+
+        db.delete_resource(
+            "apiextensions.k8s.io/v1",
+            "CustomResourceDefinition",
+            None,
+            "syncwidgets.sync.example.com",
+        )
+        .await
+        .unwrap();
+        sync_registry_from_datastore(&db as &dyn DatastoreBackend, &registry)
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .get("sync.example.com", "v1", "syncwidgets")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn positioned_watch_runtime_syncs_datastore_applied_crds() {
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let handle: DatastoreHandle = Arc::new(db.clone());
+        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
+        let registry = CrdRegistry::new();
+        let cancel = CancellationToken::new();
+        let watcher = tokio::spawn(run_crd_registry_watch_with_components(
+            new_runtime(
+                handle.clone(),
+                crate::positioned_watch_adapter::for_test(&passive_reads, handle),
+            ),
+            registry.clone(),
+            cancel.clone(),
+        ));
+
+        db.create_resource(
+            "apiextensions.k8s.io/v1",
+            "CustomResourceDefinition",
+            None,
+            "watchwidgets.watch.example.com",
+            crd("watch.example.com", "WatchWidget", "watchwidgets"),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if registry
+                    .get("watch.example.com", "v1", "watchwidgets")
+                    .await
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("positioned watch must observe datastore-applied CRD");
+
+        cancel.cancel();
+        watcher.await.unwrap();
+    }
 }

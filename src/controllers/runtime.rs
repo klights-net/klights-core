@@ -251,23 +251,25 @@ impl Context {
         self.node_metrics.as_ref()
     }
 
-    pub(crate) fn deployment_store(&self) -> &dyn super::deployment::DeploymentStore {
+    pub(crate) fn deployment_store(&self) -> &dyn klights_controllers::deployment::DeploymentStore {
         self.dependencies.deployment_store.as_ref()
     }
 
-    pub(crate) fn replicaset_store(&self) -> &dyn super::replicaset::ReplicaSetStore {
+    pub(crate) fn replicaset_store(&self) -> &dyn klights_controllers::replicaset::ReplicaSetStore {
         self.dependencies.replicaset_store.as_ref()
     }
 
-    pub(crate) fn statefulset_store(&self) -> &dyn super::statefulset::StatefulSetStore {
+    pub(crate) fn statefulset_store(
+        &self,
+    ) -> &dyn klights_controllers::statefulset::StatefulSetStore {
         self.dependencies.statefulset_store.as_ref()
     }
 
-    pub(crate) fn daemonset_store(&self) -> &dyn super::daemonset::DaemonSetStore {
+    pub(crate) fn daemonset_store(&self) -> &dyn klights_controllers::daemonset::DaemonSetStore {
         self.dependencies.daemonset_store.as_ref()
     }
 
-    pub(crate) fn job_store(&self) -> &dyn super::job::JobStore {
+    pub(crate) fn job_store(&self) -> &dyn klights_controllers::job::JobStore {
         self.dependencies.job_store.as_ref()
     }
 
@@ -277,25 +279,25 @@ impl Context {
         self.dependencies.service_store.as_ref()
     }
 
-    pub(crate) fn pvc_store(&self) -> &dyn super::pvc::PvcStore {
+    pub(crate) fn pvc_store(&self) -> &dyn klights_controllers::pvc::PvcStore {
         self.dependencies.pvc_store.as_ref()
     }
 
-    pub(crate) fn pdb_store(&self) -> &dyn super::pdb::PdbStore {
+    pub(crate) fn pdb_store(&self) -> &dyn klights_controllers::pdb::PdbStore {
         self.dependencies.pdb_store.as_ref()
     }
 
     pub(crate) fn replicationcontroller_store(
         &self,
-    ) -> &dyn super::replicationcontroller::ReplicationControllerStore {
+    ) -> &dyn klights_controllers::replicationcontroller::ReplicationControllerStore {
         self.dependencies.replicationcontroller_store.as_ref()
     }
 
-    pub(crate) fn apiservice_store(&self) -> &dyn super::apiservice::ApiServiceStore {
+    pub(crate) fn apiservice_store(&self) -> &dyn klights_controllers::apiservice::ApiServiceStore {
         self.dependencies.apiservice_store.as_ref()
     }
 
-    pub(crate) fn csr_status_store(&self) -> &dyn super::csr_signer::CsrStatusStore {
+    pub(crate) fn csr_status_store(&self) -> &dyn klights_controllers::csr_signer::CsrStatusStore {
         self.dependencies.csr_status_store.as_ref()
     }
 
@@ -303,7 +305,7 @@ impl Context {
         self.dependencies.pod_query.as_ref()
     }
 
-    pub(crate) fn pdb_reader(&self) -> &dyn super::pdb::PdbPodReader {
+    pub(crate) fn pdb_reader(&self) -> &dyn klights_controllers::pdb::PdbPodReader {
         self.dependencies.pdb_pod_reader.as_ref()
     }
 
@@ -315,25 +317,31 @@ impl Context {
         self.dependencies.deployment_pod_mutation.as_ref()
     }
 
-    pub(crate) fn replicaset_mutation(&self) -> &dyn super::replicaset::ReplicaSetPodMutation {
+    pub(crate) fn replicaset_mutation(
+        &self,
+    ) -> &dyn klights_controllers::replicaset::ReplicaSetPodMutation {
         self.dependencies.replicaset_pod_mutation.as_ref()
     }
 
-    pub(crate) fn statefulset_mutation(&self) -> &dyn super::statefulset::StatefulSetPodMutation {
+    pub(crate) fn statefulset_mutation(
+        &self,
+    ) -> &dyn klights_controllers::statefulset::StatefulSetPodMutation {
         self.dependencies.statefulset_pod_mutation.as_ref()
     }
 
-    pub(crate) fn daemonset_mutation(&self) -> &dyn super::daemonset::DaemonSetPodMutation {
+    pub(crate) fn daemonset_mutation(
+        &self,
+    ) -> &dyn klights_controllers::daemonset::DaemonSetPodMutation {
         self.dependencies.daemonset_pod_mutation.as_ref()
     }
 
-    pub(crate) fn job_mutation(&self) -> &dyn super::job::JobPodMutation {
+    pub(crate) fn job_mutation(&self) -> &dyn klights_controllers::job::JobPodMutation {
         self.dependencies.job_pod_mutation.as_ref()
     }
 
     pub(crate) fn replicationcontroller_mutation(
         &self,
-    ) -> &dyn super::replicationcontroller::ReplicationControllerPodMutation {
+    ) -> &dyn klights_controllers::replicationcontroller::ReplicationControllerPodMutation {
         self.dependencies
             .replicationcontroller_pod_mutation
             .as_ref()

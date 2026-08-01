@@ -528,12 +528,12 @@ impl ApiFailureMetrics for RootApiFailureMetrics {
 }
 
 pub(crate) struct RootApiNodeLeaseObservations {
-    inner: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+    inner: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
 }
 
 impl RootApiNodeLeaseObservations {
     #[cfg(not(test))]
-    pub(crate) fn new(inner: Arc<crate::node_lease_tracker::NodeLeaseTracker>) -> Arc<Self> {
+    pub(crate) fn new(inner: Arc<klights_controllers::node_lease::NodeLeaseTracker>) -> Arc<Self> {
         Arc::new(Self { inner })
     }
 }

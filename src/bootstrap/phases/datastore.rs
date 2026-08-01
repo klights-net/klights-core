@@ -108,7 +108,7 @@ pub struct DatastorePhase {
     pub replication_service: Option<Arc<klights_replication::ReplicationService>>,
     pub node_local: crate::datastore::node_local::NodeLocalStores,
     pub outbox: Arc<klights_kubelet::node_outbox::Outbox>,
-    pub node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+    pub node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
     pub node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
     /// P3-11c: when this node is a leader-class boot under raft mode,
     /// `raft_node` holds the live `RaftNode` so later phases (kubelet
@@ -203,7 +203,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     // through authoritative snapshot installation plus AppendEntries.
     let is_joining_controlplane = role.is_controlplane_join();
 
-    let node_lease_tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new_at(
+    let node_lease_tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         klights_supervisor::SystemWallClock::now_utc(),
     ));
     // T6 step 4b: prepare the remote arm independently of local persistence.
@@ -667,10 +667,10 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                         },
                         snapshot: klights_leader_api::RemoteNodeRegistrationSnapshot {
                             node_mode: match join_node_registration.node_mode {
-                                crate::controllers::annotations::NodePeerMode::Root => {
+                                klights_controllers::annotations::NodePeerMode::Root => {
                                     klights_leader_api::RemoteNodeMode::Root
                                 }
-                                crate::controllers::annotations::NodePeerMode::Rootless => {
+                                klights_controllers::annotations::NodePeerMode::Rootless => {
                                     klights_leader_api::RemoteNodeMode::Rootless
                                 }
                             },

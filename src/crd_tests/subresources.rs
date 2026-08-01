@@ -127,7 +127,7 @@ async fn crd_operations_denied_with_deny_authorizer() {
 
     // Now register the CRD in the registry (normally done by the controller, but for
     // tests we do it manually)
-    let crd_info = crate::controllers::crd::CrdResourceInfo {
+    let crd_info = klights_controllers::crd::CrdResourceInfo {
         group: "example-deny.com".to_string(),
         version: "v1".to_string(),
         kind: "DenyWidget".to_string(),
@@ -247,7 +247,7 @@ async fn crd_allowed_identity_gets_normal_response() {
         .await
         .unwrap();
 
-    let crd_info = crate::controllers::crd::CrdResourceInfo {
+    let crd_info = klights_controllers::crd::CrdResourceInfo {
         group: "example-allow2.com".to_string(),
         version: "v1".to_string(),
         kind: "AllowWidget2".to_string(),
@@ -355,7 +355,7 @@ async fn crd_list_authorization_preserves_field_and_label_selectors() {
         .await
         .unwrap();
 
-    let crd_info = crate::controllers::crd::CrdResourceInfo {
+    let crd_info = klights_controllers::crd::CrdResourceInfo {
         group: "example-sel.com".to_string(),
         version: "v1".to_string(),
         kind: "SelectorWidget".to_string(),
@@ -499,7 +499,7 @@ async fn crd_rbac_resource_names_uses_field_selector() {
         .await
         .unwrap();
 
-    let crd_info = crate::controllers::crd::CrdResourceInfo {
+    let crd_info = klights_controllers::crd::CrdResourceInfo {
         group: "example-rns.com".to_string(),
         version: "v1".to_string(),
         kind: "RnsWidget".to_string(),
@@ -635,7 +635,7 @@ async fn crd_rbac_resource_names_requires_matching_metadata_name_selector() {
         .await
         .unwrap();
 
-    let crd_info = crate::controllers::crd::CrdResourceInfo {
+    let crd_info = klights_controllers::crd::CrdResourceInfo {
         group: "example-rbac.com".to_string(),
         version: "v1".to_string(),
         kind: "RbacWidget".to_string(),
@@ -679,7 +679,7 @@ async fn crd_rbac_resource_names_requires_matching_metadata_name_selector() {
         )
         .await
         .unwrap();
-    let crd_info_cluster = crate::controllers::crd::CrdResourceInfo {
+    let crd_info_cluster = klights_controllers::crd::CrdResourceInfo {
         group: "example-rbac.com".to_string(),
         version: "v1".to_string(),
         kind: "ClusterRbac".to_string(),

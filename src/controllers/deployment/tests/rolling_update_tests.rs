@@ -70,10 +70,9 @@ impl PodReader for ReplicaSetStatusRacingPodReader {
                 .get_resource("apps/v1", "ReplicaSet", Some(ns), &self.replica_set_name)
                 .await?
                 .expect("racing ReplicaSet should exist");
-            let rs_with_rv = crate::api::inject_resource_version(rs.data, rs.resource_version);
-            crate::controllers::common::write_status(
+            klights_controllers::common::write_status_for_resource(
                 &self.db,
-                &rs_with_rv,
+                &rs,
                 &json!({
                     "replicas": 1,
                     "readyReplicas": 1,
@@ -1679,7 +1678,7 @@ async fn test_proportional_scaling_keeps_unavailable_new_rs_within_surge_budget(
         .unwrap();
     for rs in rs_after_ready.items {
         let rs_with_rv = crate::api::inject_resource_version(rs.data, rs.resource_version);
-        crate::controllers::replicaset::reconcile_replicaset(
+        klights_controllers::replicaset::reconcile_replicaset(
             &crate::controllers::test_utils::controller_store_for_test(&db),
             __pod_repo.as_ref(),
             __pod_repo.as_ref(),
@@ -3471,7 +3470,7 @@ async fn test_reconcile_deployment_rolling_update_completes() {
         .unwrap();
     for rs in rs_after_ready.items {
         let rs_with_rv = crate::api::inject_resource_version(rs.data, rs.resource_version);
-        crate::controllers::replicaset::reconcile_replicaset(
+        klights_controllers::replicaset::reconcile_replicaset(
             &crate::controllers::test_utils::controller_store_for_test(&db),
             __pod_repo.as_ref(),
             __pod_repo.as_ref(),

@@ -3,12 +3,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::controllers::ControllerDispatcher;
-use crate::controllers::cronjob_scheduler::{
+use crate::datastore::DatastoreHandle;
+use klights_controllers::cronjob_scheduler::{
     CronJobScheduler, CronJobSchedulerRuntime, CronJobSchedulerRuntimeError, CronJobWatchSession,
 };
-use crate::datastore::DatastoreHandle;
 use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest};
 use klights_supervisor::TaskSupervisor;
+
+#[cfg(test)]
+#[path = "controller_policy_tests/cronjob.rs"]
+mod cronjob_policy_tests;
 
 struct LeaderCronJobSchedulerRuntime {
     db: DatastoreHandle,
@@ -44,7 +48,7 @@ impl CronJobSchedulerRuntime for LeaderCronJobSchedulerRuntime {
     ) -> std::result::Result<(), CronJobSchedulerRuntimeError> {
         klights_leader_api::validate_controller_lease_if_scoped()
             .map_err(|error| CronJobSchedulerRuntimeError::reconcile_failed(error.to_string()))?;
-        crate::controllers::cronjob::reconcile_cronjob_one_at(
+        klights_controllers::cronjob::reconcile_cronjob_one_at(
             self.db.as_ref(),
             Some(self.dispatcher.as_ref()),
             &resource.data,

@@ -104,6 +104,21 @@ impl PodObjectWriter for ScaleDownDuringStatefulSetCreateWriter {
     }
 }
 
+#[async_trait::async_trait]
+impl StatefulSetPodMutation for ScaleDownDuringStatefulSetCreateWriter {
+    async fn create_statefulset_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        node_name: &str,
+        pod: serde_json::Value,
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
+        PodObjectWriter::create_controller_pod(self, namespace, name, node_name, pod)
+            .await
+            .map_err(crate::controller_store_error_adapter::map_controller_store_error)
+    }
+}
+
 #[tokio::test]
 async fn test_statefulset_stale_snapshot_after_delete_does_not_recreate_pods() {
     let db = crate::datastore::test_support::in_memory().await;
@@ -222,7 +237,7 @@ async fn test_statefulset_create_loop_observes_live_scale_down() {
         .unwrap();
     let sts_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
 
-    crate::controllers::statefulset::reconcile_statefulset(
+    klights_controllers::statefulset::reconcile_statefulset(
         &crate::controllers::test_utils::controller_store_for_test(&db),
         pod_reader.as_ref(),
         pod_writer.as_ref(),

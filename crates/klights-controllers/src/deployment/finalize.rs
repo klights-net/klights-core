@@ -1,0 +1,205 @@
+use crate::common::{condition_from_status, preserve_condition_timestamps};
+use anyhow::Result;
+use async_trait::async_trait;
+use klights_cluster_core::Resource;
+use klights_reconcile_api::ControllerStoreResult;
+use serde_json::{Value, json};
+
+use super::helpers::templates_match;
+
+#[async_trait]
+pub trait DeploymentFinalizeStore: Send + Sync {
+    async fn get_deployment(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>>;
+
+    async fn patch_deployment_revision(
+        &self,
+        namespace: &str,
+        name: &str,
+        revision: String,
+        expected_uid: String,
+    ) -> ControllerStoreResult<()>;
+
+    async fn delete_replicaset(
+        &self,
+        namespace: &str,
+        name: &str,
+        expected_uid: String,
+    ) -> ControllerStoreResult<()>;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_conditions_and_revision(
+    available_pods: i64,
+    updated_pods: i64,
+    desired_replicas: i64,
+    created_rs_name: &Option<String>,
+    matching_rs: &Option<&Resource>,
+    next_revision: i64,
+    existing_status: Option<&Value>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Vec<Value>, Option<String>) {
+    let now = klights_cluster_core::k8s_time::format_legacy_timestamp(now);
+    let mut conditions = Vec::new();
+
+    let (available_status, available_reason, available_message) = if available_pods > 0 {
+        (
+            "True",
+            "MinimumReplicasAvailable",
+            "Deployment has minimum availability.",
+        )
+    } else {
+        (
+            "False",
+            "MinimumReplicasUnavailable",
+            "Deployment does not have minimum availability.",
+        )
+    };
+
+    let mut available_condition = json!({
+        "type": "Available",
+        "status": available_status,
+        "reason": available_reason,
+        "message": available_message
+    });
+    preserve_condition_timestamps(
+        &mut available_condition,
+        condition_from_status(existing_status, "Available"),
+        &now,
+    );
+    conditions.push(available_condition);
+
+    let (current_revision, rs_was_existing, rs_name_for_msg_owned) = if created_rs_name.is_some() {
+        let name = created_rs_name.as_deref().unwrap_or("unknown").to_string();
+        (Some(next_revision.to_string()), false, name)
+    } else if let Some(rs) = matching_rs {
+        let rev = rs
+            .data
+            .pointer("/metadata/annotations/deployment.kubernetes.io~1revision")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let name = rs
+            .data
+            .pointer("/metadata/name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        (rev, true, name)
+    } else {
+        (None, false, "unknown".to_string())
+    };
+
+    let progressing_reason = if rs_was_existing && updated_pods == desired_replicas {
+        "NewReplicaSetAvailable"
+    } else {
+        "NewReplicaSetCreated"
+    };
+
+    let progressing_message = if progressing_reason == "NewReplicaSetAvailable" {
+        format!(
+            "ReplicaSet \"{}\" has successfully progressed.",
+            rs_name_for_msg_owned
+        )
+    } else {
+        format!("Created new replica set \"{}\".", rs_name_for_msg_owned)
+    };
+
+    let mut progressing_condition = json!({
+        "type": "Progressing",
+        "status": "True",
+        "reason": progressing_reason,
+        "message": progressing_message
+    });
+    preserve_condition_timestamps(
+        &mut progressing_condition,
+        condition_from_status(existing_status, "Progressing"),
+        &now,
+    );
+    conditions.push(progressing_condition);
+
+    (conditions, current_revision)
+}
+
+pub(super) async fn apply_revision_and_gc<S: DeploymentFinalizeStore + ?Sized>(
+    store: &S,
+    namespace: &str,
+    deployment_name: &str,
+    spec: &Value,
+    owned_rs_list: &[Resource],
+    template: &Value,
+    current_revision: Option<String>,
+) -> Result<()> {
+    if let Some(rev) = current_revision {
+        let Some(deployment) = store.get_deployment(namespace, deployment_name).await? else {
+            return Ok(());
+        };
+        store
+            .patch_deployment_revision(namespace, deployment_name, rev, deployment.uid)
+            .await?;
+    }
+
+    let revision_history_limit = spec
+        .get("revisionHistoryLimit")
+        .and_then(|r| r.as_i64())
+        .unwrap_or(10);
+
+    let mut old_zero_replicas_rs: Vec<_> = owned_rs_list
+        .iter()
+        .filter(|rs| {
+            let rs_replicas = rs
+                .data
+                .get("spec")
+                .and_then(|s| s.get("replicas"))
+                .and_then(|r| r.as_i64())
+                .unwrap_or(0);
+
+            let rs_template = rs.data.get("spec").and_then(|s| s.get("template"));
+            let is_current = rs_template
+                .map(|t| templates_match(t, template))
+                .unwrap_or(false);
+            rs_replicas == 0 && !is_current
+        })
+        .collect();
+
+    old_zero_replicas_rs.sort_by(|a, b| {
+        let a_time = a
+            .data
+            .get("metadata")
+            .and_then(|m| m.get("creationTimestamp"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        let b_time = b
+            .data
+            .get("metadata")
+            .and_then(|m| m.get("creationTimestamp"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        a_time.cmp(b_time)
+    });
+
+    if old_zero_replicas_rs.len() as i64 > revision_history_limit {
+        let to_delete_count = old_zero_replicas_rs.len() as i64 - revision_history_limit;
+        for rs in old_zero_replicas_rs.iter().take(to_delete_count as usize) {
+            let rs_name = rs
+                .data
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            tracing::debug!(
+                "Garbage collecting old ReplicaSet {}/{} (exceeds revisionHistoryLimit={})",
+                namespace,
+                rs_name,
+                revision_history_limit
+            );
+            store
+                .delete_replicaset(namespace, rs_name, rs.uid.clone())
+                .await?;
+        }
+    }
+
+    Ok(())
+}

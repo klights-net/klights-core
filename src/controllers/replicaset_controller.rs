@@ -1,7 +1,7 @@
 //! `Controller` impl for `ReplicaSet`. Registered in `ControllerDispatcher`.
 
 use crate::controllers::controller_wrapper;
-use crate::controllers::replicaset as replicaset_core;
+use klights_controllers::replicaset as replicaset_core;
 
 controller_wrapper!(
     ReplicaSetController,
@@ -13,6 +13,12 @@ controller_wrapper!(
     reader = pod_query,
     mutation = replicaset_mutation
 );
+
+#[cfg(test)]
+use klights_controllers::replicaset::*;
+#[cfg(test)]
+#[path = "replicaset/tests/mod.rs"]
+mod policy_tests;
 
 #[cfg(test)]
 mod tests {

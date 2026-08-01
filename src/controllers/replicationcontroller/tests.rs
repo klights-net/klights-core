@@ -3,7 +3,7 @@ use super::*;
 use crate::datastore::Resource;
 use crate::kubelet::pod_repository::PodObjectWriter;
 use anyhow::Result;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Barrier, Notify};
@@ -391,6 +391,46 @@ impl PodObjectWriter for BlockingFirstCreateWriter {
 
 /// Test-only shim wrapping `reconcile_replicationcontroller` with the
 /// repository-backed argument list, mirroring the pre-Task-18 signature.
+macro_rules! impl_replication_controller_mutation {
+    ($writer:ty) => {
+        #[async_trait::async_trait]
+        impl ReplicationControllerPodMutation for $writer {
+            async fn create_replication_controller_pod(
+                &self,
+                namespace: &str,
+                name: &str,
+                node_name: &str,
+                pod: serde_json::Value,
+            ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
+                PodObjectWriter::create_controller_pod(self, namespace, name, node_name, pod)
+                    .await
+                    .map_err(crate::controller_store_error_adapter::map_controller_store_error)
+            }
+
+            async fn replace_replication_controller_pod_owner_references(
+                &self,
+                namespace: &str,
+                name: &str,
+                owner_references: Vec<serde_json::Value>,
+            ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
+                PodObjectWriter::update_pod_owner_references(
+                    self,
+                    namespace,
+                    name,
+                    owner_references,
+                )
+                .await
+                .map_err(crate::controller_store_error_adapter::map_controller_store_error)
+            }
+        }
+    };
+}
+
+impl_replication_controller_mutation!(SlowFirstCreateWriter);
+impl_replication_controller_mutation!(ScaleDownDuringRcCreateWriter);
+impl_replication_controller_mutation!(BlockingSecondCreateWriter);
+impl_replication_controller_mutation!(BlockingFirstCreateWriter);
+
 async fn reconcile_rc_test(
     db: &crate::datastore::sqlite::Datastore,
     rc: &Value,
@@ -1711,25 +1751,6 @@ fn rc_flat_selector_matches_only_labeled_pods() {
     assert!(
         !parsed.matches_resource(&no_labels_pod),
         "pod with no labels must not match"
-    );
-}
-
-#[test]
-fn rc_empty_selector_matches_no_pods() {
-    let selector = json!({});
-    let parsed = klights_types::LabelSelector::from_flat_match_labels(&selector)
-        .expect("empty selector should parse");
-    assert!(
-        parsed.requirements().is_empty(),
-        "empty flat selector should have zero requirements"
-    );
-
-    // RC adoption: empty selector matches nothing for safety.
-    // pod_matches_selector returns false when requirements are empty.
-    let pod_with_labels = json!({"metadata": {"labels": {"app": "x"}}});
-    assert!(
-        !pod_matches_selector(&pod_with_labels, &parsed),
-        "empty RC selector must not match any pod"
     );
 }
 

@@ -1898,10 +1898,11 @@ async fn test_apply_pod_phase_update_reconciles_pdb_on_ready_transition() {
         .unwrap()
         .unwrap();
 
-    crate::controllers::pdb::reconcile_pdb(
+    klights_controllers::pdb::reconcile_pdb_at(
         &db,
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         &pdb,
+        chrono::Utc::now(),
     )
     .await
     .unwrap();

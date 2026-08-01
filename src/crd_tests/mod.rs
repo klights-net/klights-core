@@ -1,6 +1,6 @@
-use crate::controllers::crd::{CrdRegistry, register_crd_from_value};
 use crate::datastore::sqlite::Datastore;
 use crate::watch::{EventType, WatchEvent};
+use klights_controllers::crd::{CrdRegistry, register_crd_from_value};
 use serde_json::json;
 
 mod delete_cascade;
@@ -195,7 +195,9 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
             nodeport_alloc,
             controller_dispatcher,
             metrics,
-            std::sync::Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
+            std::sync::Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
+                chrono::Utc::now(),
+            )),
         ),
         crate::api::ApiPodNodeSubresourceServices::new(
             std::sync::Arc::new(

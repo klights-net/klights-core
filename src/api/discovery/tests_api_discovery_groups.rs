@@ -137,9 +137,9 @@ async fn crd_group_discovery_lists_all_served_versions_in_one_group() {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let registry = crate::controllers::crd::CrdRegistry::new();
+    let registry = klights_controllers::crd::CrdRegistry::new();
     registry
-        .register(crate::controllers::crd::CrdResourceInfo {
+        .register(klights_controllers::crd::CrdResourceInfo {
             group: "multi.example.com".to_string(),
             version: "v1".to_string(),
             kind: "Widget".to_string(),
@@ -150,7 +150,7 @@ async fn crd_group_discovery_lists_all_served_versions_in_one_group() {
         })
         .await;
     registry
-        .register(crate::controllers::crd::CrdResourceInfo {
+        .register(klights_controllers::crd::CrdResourceInfo {
             group: "multi.example.com".to_string(),
             version: "v2".to_string(),
             kind: "Widget".to_string(),
@@ -209,10 +209,10 @@ async fn crd_group_by_name_lists_all_served_versions() {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let registry = crate::controllers::crd::CrdRegistry::new();
+    let registry = klights_controllers::crd::CrdRegistry::new();
     for version in ["v1", "v2", "v3alpha1"] {
         registry
-            .register(crate::controllers::crd::CrdResourceInfo {
+            .register(klights_controllers::crd::CrdResourceInfo {
                 group: "groupby.example.com".to_string(),
                 version: version.to_string(),
                 kind: "Thing".to_string(),

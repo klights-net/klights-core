@@ -6,10 +6,14 @@ use klights_cluster_core::Resource;
 use serde_json::Value;
 
 use crate::controller_store_error_adapter::map_controller_store_error;
-use crate::controllers::coredns::{
+use crate::datastore::DatastoreBackend;
+use klights_controllers::coredns::{
     CoreDnsBootstrapStore, CoreDnsResourceKind, bootstrap_coredns_with_store,
 };
-use crate::datastore::DatastoreBackend;
+
+#[cfg(test)]
+#[path = "controller_policy_tests/coredns.rs"]
+mod policy_tests;
 
 struct CoreDnsBootstrapAdapter<'a> {
     db: &'a dyn DatastoreBackend,
@@ -110,7 +114,7 @@ impl CoreDnsBootstrapStore for CoreDnsBootstrapAdapter<'_> {
             now,
             self.identity,
         );
-        crate::controllers::deployment::reconcile_deployment(
+        klights_controllers::deployment::reconcile_deployment(
             self.db,
             self.pod_reader.as_ref(),
             self.pod_mutation.as_ref(),

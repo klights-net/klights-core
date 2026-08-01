@@ -5,10 +5,10 @@ use klights_pod_api::{PodListRequest, PodQuery};
 use serde_json::Value;
 
 use crate::controller_store_error_adapter::map_controller_store_error;
-use crate::controllers::resource_quota::{
+use crate::datastore::{DatastoreBackend, ResourceListQuery};
+use klights_controllers::resource_quota::{
     ResourceQuotaRuntime, reconcile_resource_quotas_with_runtime,
 };
-use crate::datastore::{DatastoreBackend, ResourceListQuery};
 
 struct ResourceQuotaControllerAdapter<'a> {
     db: &'a dyn DatastoreBackend,
@@ -56,7 +56,7 @@ impl ResourceQuotaRuntime for ResourceQuotaControllerAdapter<'_> {
         resource: &Resource,
         status: &Value,
     ) -> klights_reconcile_api::ControllerStoreResult<()> {
-        crate::controllers::common::write_status_for_resource(self.db, resource, status)
+        klights_controllers::common::write_status_for_resource(self.db, resource, status)
             .await
             .map(|_| ())
             .map_err(map_controller_store_error)
@@ -74,3 +74,9 @@ pub async fn reconcile_resource_quotas_for_namespace(
     )
     .await
 }
+
+#[cfg(test)]
+use klights_controllers::resource_quota::*;
+#[cfg(test)]
+#[path = "controllers/resource_quota/tests.rs"]
+mod policy_tests;

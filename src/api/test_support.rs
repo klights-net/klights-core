@@ -155,7 +155,7 @@ pub(crate) async fn build_test_app_state_with_db(
 ) -> crate::api::ApiState {
     use std::sync::Arc;
 
-    let crd_registry = crate::controllers::crd::CrdRegistry::new();
+    let crd_registry = klights_controllers::crd::CrdRegistry::new();
     let config = Arc::new(crate::KlightsConfig::test_default());
     let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
         &config.service_cidr,
@@ -321,7 +321,9 @@ pub(crate) async fn build_test_app_state_with_db(
             nodeport_alloc,
             controller_dispatcher,
             metrics,
-            Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
+            Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
+                chrono::Utc::now(),
+            )),
         ),
         crate::api::ApiPodNodeSubresourceServices::new(
             Arc::new(

@@ -1,6 +1,6 @@
 //! `Controller` impl for `PodDisruptionBudget`. Registered in `ControllerDispatcher`.
 
-use crate::controllers::pdb as pdb_core;
+use klights_controllers::pdb as pdb_core;
 
 pub struct PDBController;
 

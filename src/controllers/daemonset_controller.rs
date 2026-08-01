@@ -1,7 +1,7 @@
 //! `Controller` impl for `DaemonSet`. Registered in `ControllerDispatcher`.
 
 use crate::controllers::controller_wrapper;
-use crate::controllers::daemonset as daemonset_core;
+use klights_controllers::daemonset as daemonset_core;
 
 controller_wrapper!(
     DaemonSetController,
@@ -12,6 +12,12 @@ controller_wrapper!(
     store = daemonset_store,
     mutation = daemonset_mutation
 );
+
+#[cfg(test)]
+use klights_controllers::daemonset::*;
+#[cfg(test)]
+#[path = "daemonset/tests.rs"]
+mod policy_tests;
 
 #[cfg(test)]
 mod tests {

@@ -170,9 +170,9 @@ impl klights_controllers::gc::GcResourceStore for RootControllerLeaderPort {
 }
 
 #[async_trait]
-impl crate::controllers::replicaset::ReplicaSetStore for RootControllerLeaderPort {
+impl klights_controllers::replicaset::ReplicaSetStore for RootControllerLeaderPort {
     async fn get_replicaset(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        crate::controllers::replicaset::ReplicaSetStore::get_replicaset(
+        klights_controllers::replicaset::ReplicaSetStore::get_replicaset(
             self.store.as_ref(),
             namespace,
             name,
@@ -186,7 +186,7 @@ impl crate::controllers::replicaset::ReplicaSetStore for RootControllerLeaderPor
         status: serde_json::Value,
     ) -> Result<()> {
         validate_controller_effect()?;
-        crate::controllers::replicaset::ReplicaSetStore::update_replicaset_status(
+        klights_controllers::replicaset::ReplicaSetStore::update_replicaset_status(
             self.store.as_ref(),
             resource,
             status,
@@ -196,9 +196,9 @@ impl crate::controllers::replicaset::ReplicaSetStore for RootControllerLeaderPor
 }
 
 #[async_trait]
-impl crate::controllers::deployment::DeploymentFinalizeStore for RootControllerLeaderPort {
+impl klights_controllers::deployment::DeploymentFinalizeStore for RootControllerLeaderPort {
     async fn get_deployment(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        crate::controllers::deployment::DeploymentFinalizeStore::get_deployment(
+        klights_controllers::deployment::DeploymentFinalizeStore::get_deployment(
             self.store.as_ref(),
             namespace,
             name,
@@ -214,7 +214,7 @@ impl crate::controllers::deployment::DeploymentFinalizeStore for RootControllerL
         expected_uid: String,
     ) -> Result<()> {
         validate_controller_effect()?;
-        crate::controllers::deployment::DeploymentFinalizeStore::patch_deployment_revision(
+        klights_controllers::deployment::DeploymentFinalizeStore::patch_deployment_revision(
             self.store.as_ref(),
             namespace,
             name,
@@ -231,7 +231,7 @@ impl crate::controllers::deployment::DeploymentFinalizeStore for RootControllerL
         expected_uid: String,
     ) -> Result<()> {
         validate_controller_effect()?;
-        crate::controllers::deployment::DeploymentFinalizeStore::delete_replicaset(
+        klights_controllers::deployment::DeploymentFinalizeStore::delete_replicaset(
             self.store.as_ref(),
             namespace,
             name,
@@ -242,9 +242,9 @@ impl crate::controllers::deployment::DeploymentFinalizeStore for RootControllerL
 }
 
 #[async_trait]
-impl crate::controllers::deployment::DeploymentStore for RootControllerLeaderPort {
+impl klights_controllers::deployment::DeploymentStore for RootControllerLeaderPort {
     async fn list_replicasets(&self, namespace: &str) -> Result<Vec<Resource>> {
-        crate::controllers::deployment::DeploymentStore::list_replicasets(
+        klights_controllers::deployment::DeploymentStore::list_replicasets(
             self.store.as_ref(),
             namespace,
         )
@@ -258,7 +258,7 @@ impl crate::controllers::deployment::DeploymentStore for RootControllerLeaderPor
         replicaset: serde_json::Value,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        crate::controllers::deployment::DeploymentStore::create_replicaset(
+        klights_controllers::deployment::DeploymentStore::create_replicaset(
             self.store.as_ref(),
             namespace,
             name,
@@ -275,7 +275,7 @@ impl crate::controllers::deployment::DeploymentStore for RootControllerLeaderPor
         expected_uid: String,
     ) -> Result<Option<Resource>> {
         validate_controller_effect()?;
-        crate::controllers::deployment::DeploymentStore::patch_replicaset_scale(
+        klights_controllers::deployment::DeploymentStore::patch_replicaset_scale(
             self.store.as_ref(),
             namespace,
             name,
@@ -291,7 +291,7 @@ impl crate::controllers::deployment::DeploymentStore for RootControllerLeaderPor
         status: serde_json::Value,
     ) -> Result<()> {
         validate_controller_effect()?;
-        crate::controllers::deployment::DeploymentStore::update_deployment_status(
+        klights_controllers::deployment::DeploymentStore::update_deployment_status(
             self.store.as_ref(),
             resource,
             status,
@@ -301,9 +301,9 @@ impl crate::controllers::deployment::DeploymentStore for RootControllerLeaderPor
 }
 
 #[async_trait]
-impl crate::controllers::statefulset::StatefulSetStore for RootControllerLeaderPort {
+impl klights_controllers::statefulset::StatefulSetStore for RootControllerLeaderPort {
     async fn get_statefulset(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        crate::controllers::statefulset::StatefulSetStore::get_statefulset(
+        klights_controllers::statefulset::StatefulSetStore::get_statefulset(
             self.store.as_ref(),
             namespace,
             name,
@@ -317,7 +317,7 @@ impl crate::controllers::statefulset::StatefulSetStore for RootControllerLeaderP
         status: serde_json::Value,
     ) -> Result<()> {
         validate_controller_effect()?;
-        crate::controllers::statefulset::StatefulSetStore::update_statefulset_status(
+        klights_controllers::statefulset::StatefulSetStore::update_statefulset_status(
             self.store.as_ref(),
             resource,
             status,
@@ -327,9 +327,9 @@ impl crate::controllers::statefulset::StatefulSetStore for RootControllerLeaderP
 }
 
 #[async_trait]
-impl crate::controllers::daemonset::DaemonSetStore for RootControllerLeaderPort {
+impl klights_controllers::daemonset::DaemonSetStore for RootControllerLeaderPort {
     async fn list_controller_revisions(&self, namespace: &str) -> Result<Vec<Resource>> {
-        crate::controllers::daemonset::DaemonSetStore::list_controller_revisions(
+        klights_controllers::daemonset::DaemonSetStore::list_controller_revisions(
             self.store.as_ref(),
             namespace,
         )
@@ -343,7 +343,7 @@ impl crate::controllers::daemonset::DaemonSetStore for RootControllerLeaderPort 
         revision: serde_json::Value,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        crate::controllers::daemonset::DaemonSetStore::create_controller_revision(
+        klights_controllers::daemonset::DaemonSetStore::create_controller_revision(
             self.store.as_ref(),
             namespace,
             name,
@@ -353,7 +353,7 @@ impl crate::controllers::daemonset::DaemonSetStore for RootControllerLeaderPort 
     }
 
     async fn list_nodes(&self) -> Result<Vec<Resource>> {
-        crate::controllers::daemonset::DaemonSetStore::list_nodes(self.store.as_ref()).await
+        klights_controllers::daemonset::DaemonSetStore::list_nodes(self.store.as_ref()).await
     }
 
     async fn update_daemonset_status(
@@ -362,7 +362,7 @@ impl crate::controllers::daemonset::DaemonSetStore for RootControllerLeaderPort 
         status: serde_json::Value,
     ) -> Result<()> {
         validate_controller_effect()?;
-        crate::controllers::daemonset::DaemonSetStore::update_daemonset_status(
+        klights_controllers::daemonset::DaemonSetStore::update_daemonset_status(
             self.store.as_ref(),
             resource,
             status,
@@ -372,9 +372,9 @@ impl crate::controllers::daemonset::DaemonSetStore for RootControllerLeaderPort 
 }
 
 #[async_trait]
-impl crate::controllers::job::JobStore for RootControllerLeaderPort {
+impl klights_controllers::job::JobStore for RootControllerLeaderPort {
     async fn get_job(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        crate::controllers::job::JobStore::get_job(self.store.as_ref(), namespace, name).await
+        klights_controllers::job::JobStore::get_job(self.store.as_ref(), namespace, name).await
     }
 
     async fn update_job_status(
@@ -383,7 +383,7 @@ impl crate::controllers::job::JobStore for RootControllerLeaderPort {
         status: serde_json::Value,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        crate::controllers::job::JobStore::update_job_status(self.store.as_ref(), resource, status)
+        klights_controllers::job::JobStore::update_job_status(self.store.as_ref(), resource, status)
             .await
     }
 }
@@ -536,7 +536,7 @@ impl klights_controllers::endpoints::EndpointReconcileStore for RootControllerLe
 }
 
 #[async_trait]
-impl crate::controllers::common::ControllerStatusStore for RootControllerLeaderPort {
+impl klights_controllers::common::ControllerStatusStore for RootControllerLeaderPort {
     async fn get_status_resource(
         &self,
         api_version: &str,
@@ -544,7 +544,7 @@ impl crate::controllers::common::ControllerStatusStore for RootControllerLeaderP
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>> {
-        crate::controllers::common::ControllerStatusStore::get_status_resource(
+        klights_controllers::common::ControllerStatusStore::get_status_resource(
             self.store.as_ref(),
             api_version,
             kind,
@@ -564,7 +564,7 @@ impl crate::controllers::common::ControllerStatusStore for RootControllerLeaderP
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        crate::controllers::common::ControllerStatusStore::update_status(
+        klights_controllers::common::ControllerStatusStore::update_status(
             self.store.as_ref(),
             api_version,
             kind,
@@ -582,7 +582,7 @@ impl crate::controllers::common::ControllerStatusStore for RootControllerLeaderP
         resource: &Resource,
         reason: &'static str,
     ) {
-        crate::controllers::common::ControllerStatusStore::log_noop_status_write(
+        klights_controllers::common::ControllerStatusStore::log_noop_status_write(
             self.store.as_ref(),
             operation,
             resource,
@@ -592,17 +592,17 @@ impl crate::controllers::common::ControllerStatusStore for RootControllerLeaderP
 }
 
 #[async_trait]
-impl crate::controllers::pvc::PvcStore for RootControllerLeaderPort {
+impl klights_controllers::pvc::PvcStore for RootControllerLeaderPort {
     async fn get_pvc(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        crate::controllers::pvc::PvcStore::get_pvc(self.store.as_ref(), namespace, name).await
+        klights_controllers::pvc::PvcStore::get_pvc(self.store.as_ref(), namespace, name).await
     }
 
     async fn list_persistent_volumes(&self) -> Result<Vec<Resource>> {
-        crate::controllers::pvc::PvcStore::list_persistent_volumes(self.store.as_ref()).await
+        klights_controllers::pvc::PvcStore::list_persistent_volumes(self.store.as_ref()).await
     }
 
     async fn get_persistent_volume(&self, name: &str) -> Result<Option<Resource>> {
-        crate::controllers::pvc::PvcStore::get_persistent_volume(self.store.as_ref(), name).await
+        klights_controllers::pvc::PvcStore::get_persistent_volume(self.store.as_ref(), name).await
     }
 
     async fn create_persistent_volume(
@@ -611,7 +611,7 @@ impl crate::controllers::pvc::PvcStore for RootControllerLeaderPort {
         value: serde_json::Value,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        crate::controllers::pvc::PvcStore::create_persistent_volume(
+        klights_controllers::pvc::PvcStore::create_persistent_volume(
             self.store.as_ref(),
             name,
             value,
@@ -626,7 +626,7 @@ impl crate::controllers::pvc::PvcStore for RootControllerLeaderPort {
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        crate::controllers::pvc::PvcStore::update_persistent_volume(
+        klights_controllers::pvc::PvcStore::update_persistent_volume(
             self.store.as_ref(),
             name,
             value,
@@ -637,14 +637,14 @@ impl crate::controllers::pvc::PvcStore for RootControllerLeaderPort {
 }
 
 #[async_trait]
-impl crate::controllers::pdb::PdbStore for RootControllerLeaderPort {
+impl klights_controllers::pdb::PdbStore for RootControllerLeaderPort {
     async fn list_pdbs(&self, namespace: &str) -> Result<Vec<Resource>> {
-        crate::controllers::pdb::PdbStore::list_pdbs(self.store.as_ref(), namespace).await
+        klights_controllers::pdb::PdbStore::list_pdbs(self.store.as_ref(), namespace).await
     }
 }
 
 #[async_trait]
-impl crate::controllers::replicationcontroller::ReplicationControllerStore
+impl klights_controllers::replicationcontroller::ReplicationControllerStore
     for RootControllerLeaderPort
 {
     async fn get_replication_controller(
@@ -652,7 +652,7 @@ impl crate::controllers::replicationcontroller::ReplicationControllerStore
         namespace: &str,
         name: &str,
     ) -> Result<Option<Resource>> {
-        crate::controllers::replicationcontroller::ReplicationControllerStore::get_replication_controller(
+        klights_controllers::replicationcontroller::ReplicationControllerStore::get_replication_controller(
             self.store.as_ref(),
             namespace,
             name,
@@ -661,7 +661,7 @@ impl crate::controllers::replicationcontroller::ReplicationControllerStore
     }
 
     async fn list_resource_quotas(&self, namespace: &str) -> Result<Vec<Resource>> {
-        crate::controllers::replicationcontroller::ReplicationControllerStore::list_resource_quotas(
+        klights_controllers::replicationcontroller::ReplicationControllerStore::list_resource_quotas(
             self.store.as_ref(),
             namespace,
         )
@@ -674,7 +674,7 @@ impl crate::controllers::replicationcontroller::ReplicationControllerStore
         status: serde_json::Value,
     ) -> Result<()> {
         validate_controller_effect()?;
-        crate::controllers::replicationcontroller::ReplicationControllerStore::update_replication_controller_status(
+        klights_controllers::replicationcontroller::ReplicationControllerStore::update_replication_controller_status(
             self.store.as_ref(),
             resource,
             status,
@@ -684,14 +684,14 @@ impl crate::controllers::replicationcontroller::ReplicationControllerStore
 }
 
 #[async_trait]
-impl crate::controllers::apiservice::ApiServiceStore for RootControllerLeaderPort {
+impl klights_controllers::apiservice::ApiServiceStore for RootControllerLeaderPort {
     async fn get_apiservice(&self, name: &str) -> Result<Option<Resource>> {
-        crate::controllers::apiservice::ApiServiceStore::get_apiservice(self.store.as_ref(), name)
+        klights_controllers::apiservice::ApiServiceStore::get_apiservice(self.store.as_ref(), name)
             .await
     }
 
     async fn service_exists(&self, namespace: &str, name: &str) -> Result<bool> {
-        crate::controllers::apiservice::ApiServiceStore::service_exists(
+        klights_controllers::apiservice::ApiServiceStore::service_exists(
             self.store.as_ref(),
             namespace,
             name,
@@ -704,7 +704,7 @@ impl crate::controllers::apiservice::ApiServiceStore for RootControllerLeaderPor
         namespace: &str,
         service_name: &str,
     ) -> Result<Vec<Resource>> {
-        crate::controllers::apiservice::ApiServiceStore::list_endpoint_slices(
+        klights_controllers::apiservice::ApiServiceStore::list_endpoint_slices(
             self.store.as_ref(),
             namespace,
             service_name,
@@ -713,7 +713,7 @@ impl crate::controllers::apiservice::ApiServiceStore for RootControllerLeaderPor
     }
 
     async fn get_endpoints(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        crate::controllers::apiservice::ApiServiceStore::get_endpoints(
+        klights_controllers::apiservice::ApiServiceStore::get_endpoints(
             self.store.as_ref(),
             namespace,
             name,
@@ -727,7 +727,7 @@ impl crate::controllers::apiservice::ApiServiceStore for RootControllerLeaderPor
         status: serde_json::Value,
     ) -> Result<()> {
         validate_controller_effect()?;
-        crate::controllers::apiservice::ApiServiceStore::update_apiservice_status(
+        klights_controllers::apiservice::ApiServiceStore::update_apiservice_status(
             self.store.as_ref(),
             current,
             status,
@@ -737,9 +737,9 @@ impl crate::controllers::apiservice::ApiServiceStore for RootControllerLeaderPor
 }
 
 #[async_trait]
-impl crate::controllers::csr_signer::CsrStatusStore for RootControllerLeaderPort {
+impl klights_controllers::csr_signer::CsrStatusStore for RootControllerLeaderPort {
     async fn get_csr(&self, name: &str) -> Result<Option<Resource>> {
-        crate::controllers::csr_signer::CsrStatusStore::get_csr(self.store.as_ref(), name).await
+        klights_controllers::csr_signer::CsrStatusStore::get_csr(self.store.as_ref(), name).await
     }
 
     async fn update_csr_status(
@@ -750,7 +750,7 @@ impl crate::controllers::csr_signer::CsrStatusStore for RootControllerLeaderPort
         status: serde_json::Value,
     ) -> Result<()> {
         validate_controller_effect()?;
-        crate::controllers::csr_signer::CsrStatusStore::update_csr_status(
+        klights_controllers::csr_signer::CsrStatusStore::update_csr_status(
             self.store.as_ref(),
             name,
             uid,
@@ -990,7 +990,7 @@ impl crate::kubelet::pod_repository::PodSubresourceWriter for RootControllerPodP
 }
 
 #[async_trait]
-impl crate::controllers::node_lifecycle::NodeLifecyclePodStore for RootControllerPodPort {
+impl klights_controllers::node_lifecycle::NodeLifecyclePodStore for RootControllerPodPort {
     async fn list_pods_bound_to_node(&self, node_name: &str) -> Result<Vec<Resource>> {
         let field_selector = format!("spec.nodeName={node_name}");
         Ok(crate::kubelet::pod_repository::PodReader::list_pods(

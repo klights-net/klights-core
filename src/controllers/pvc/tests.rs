@@ -1,7 +1,6 @@
-use super::*;
-
 use crate::datastore::DatastoreBackend;
-use serde_json::json;
+use anyhow::Result;
+use serde_json::{Value, json};
 
 async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Value> {
     let file_process = crate::kubelet::file_blocking::test_file_process_executor();
@@ -18,8 +17,7 @@ async fn get_pvc(db: &dyn DatastoreBackend, namespace: &str, name: &str) -> Valu
         .unwrap()
         .unwrap();
 
-    let mut pvc: Value = std::sync::Arc::unwrap_or_clone(resource.data);
-    inject_resource_version(&mut pvc, resource.resource_version);
+    let pvc: Value = crate::api::inject_resource_version(resource.data, resource.resource_version);
     pvc
 }
 
@@ -31,8 +29,7 @@ async fn get_pv(db: &dyn DatastoreBackend, name: &str) -> Value {
         .unwrap()
         .unwrap();
 
-    let mut pv: Value = std::sync::Arc::unwrap_or_clone(resource.data);
-    inject_resource_version(&mut pv, resource.resource_version);
+    let pv: Value = crate::api::inject_resource_version(resource.data, resource.resource_version);
     pv
 }
 
@@ -369,10 +366,10 @@ async fn test_pvc_status_writer_rejects_stale_snapshot_after_status_patch() {
     .await
     .expect("user status patch should win the race first");
 
-    let stale_write = write_pvc_status(
+    let stale_write = klights_controllers::common::write_status_for_resource(
         &db,
         &created,
-        json!({
+        &json!({
             "phase": "Bound",
             "accessModes": ["ReadWriteOnce"],
             "capacity": {"storage": "1Gi"},

@@ -136,15 +136,17 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
 
     fn reconcile_cluster_role_aggregation(&self) -> GeneratedHandlerFuture<'_, ()> {
         Box::pin(async move {
-            crate::controllers::rbac_reconcile::reconcile_cluster_role_aggregation(self.db.as_ref())
-                .await
-                .map_err(|error| AppError::Internal(error.to_string()))
+            klights_controllers::rbac_reconcile::reconcile_cluster_role_aggregation(
+                self.db.as_ref(),
+            )
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))
         })
     }
 
     fn create_default_service_account(&self, namespace: String) -> GeneratedHandlerFuture<'_, ()> {
         Box::pin(async move {
-            crate::controllers::namespace::create_default_service_account_at(
+            klights_controllers::namespace::create_default_service_account_at(
                 self.db.as_ref(),
                 &namespace,
                 chrono::Utc::now(),
@@ -163,7 +165,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
             )
             .await
             .map_err(|error| AppError::Internal(error.to_string()))?;
-            crate::controllers::namespace::create_kube_root_ca_configmap_at(
+            klights_controllers::namespace::create_kube_root_ca_configmap_at(
                 self.db.as_ref(),
                 &namespace,
                 &ca_cert_pem,
@@ -177,7 +179,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
 
     fn reconcile_root_ca_data(&self, namespace: String) -> GeneratedHandlerFuture<'_, ()> {
         Box::pin(async move {
-            crate::controllers::namespace::reconcile_kube_root_ca_data_with_path(
+            klights_controllers::namespace::reconcile_kube_root_ca_data_with_path(
                 &self.file_process,
                 self.db.as_ref(),
                 &namespace,
@@ -192,7 +194,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
 
     fn reconcile_root_ca(&self, namespace: String) -> GeneratedHandlerFuture<'_, ()> {
         Box::pin(async move {
-            crate::controllers::namespace::reconcile_kube_root_ca_with_path(
+            klights_controllers::namespace::reconcile_kube_root_ca_with_path(
                 &self.file_process,
                 self.db.as_ref(),
                 &namespace,

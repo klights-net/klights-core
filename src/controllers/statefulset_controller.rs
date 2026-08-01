@@ -1,7 +1,7 @@
 //! `Controller` impl for `StatefulSet`. Registered in `ControllerDispatcher`.
 
 use crate::controllers::controller_wrapper;
-use crate::controllers::statefulset as statefulset_core;
+use klights_controllers::statefulset as statefulset_core;
 
 controller_wrapper!(
     StatefulSetController,
@@ -13,6 +13,12 @@ controller_wrapper!(
     reader = pod_query,
     mutation = statefulset_mutation
 );
+
+#[cfg(test)]
+use klights_controllers::statefulset::*;
+#[cfg(test)]
+#[path = "statefulset/tests/mod.rs"]
+mod policy_tests;
 
 #[cfg(test)]
 mod tests {

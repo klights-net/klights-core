@@ -75,31 +75,6 @@ async fn test_reconcile_deployment_creates_replicaset() {
     assert_eq!(pods.items.len(), 3, "Should create 3 pods");
 }
 
-#[test]
-fn test_templates_match_ignores_pod_template_hash() {
-    let t1 = json!({
-        "metadata": {"labels": {"app": "nginx"}},
-        "spec": {"containers": [{"name": "nginx", "image": "nginx:1.0"}]}
-    });
-    let t2 = json!({
-        "metadata": {"labels": {"app": "nginx", "pod-template-hash": "abc123"}},
-        "spec": {"containers": [{"name": "nginx", "image": "nginx:1.0"}]}
-    });
-    assert!(
-        templates_match(&t1, &t2),
-        "Should match when only difference is pod-template-hash"
-    );
-
-    let t3 = json!({
-        "metadata": {"labels": {"app": "nginx", "pod-template-hash": "xyz"}},
-        "spec": {"containers": [{"name": "nginx", "image": "nginx:2.0"}]}
-    });
-    assert!(
-        !templates_match(&t1, &t3),
-        "Should not match when spec differs"
-    );
-}
-
 #[tokio::test]
 async fn test_reconcile_deployment_rs_has_pod_template_hash() {
     let db = crate::datastore::test_support::in_memory().await;

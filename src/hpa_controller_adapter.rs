@@ -4,14 +4,18 @@ use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
 use serde_json::{Value, json};
 
 use crate::controller_store_error_adapter::map_controller_store_error;
-use crate::controllers::hpa::{
-    HpaMetricUsage, HpaMetrics, HpaMetricsSnapshot, HpaRuntime, ScaleTarget, ScaleTargetKind,
-    reconcile_hpa_with_runtime,
-};
 use crate::controllers::{Context, Controller};
 use crate::datastore::{DatastoreBackend, ResourcePatchRequest};
 use crate::kubelet::pod_repository::{PodReader, PodRepository};
+use klights_controllers::hpa::{
+    HpaMetricUsage, HpaMetrics, HpaMetricsSnapshot, HpaRuntime, ScaleTarget, ScaleTargetKind,
+    reconcile_hpa_with_runtime,
+};
 use klights_node_api::NodeMetrics;
+
+#[cfg(test)]
+#[path = "controller_policy_tests/hpa.rs"]
+mod policy_tests;
 
 struct NodeApiHpaMetrics<'a> {
     node_metrics: &'a dyn NodeMetrics,
@@ -299,7 +303,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
         let pods = self.pod_repository;
         let now = chrono::Utc::now();
         match target.kind_tag {
-            ScaleTargetKind::Deployment => crate::controllers::deployment::reconcile_deployment(
+            ScaleTargetKind::Deployment => klights_controllers::deployment::reconcile_deployment(
                 self.db,
                 pods,
                 pods,
@@ -315,7 +319,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
             )
             .await
             .map_err(map_controller_store_error),
-            ScaleTargetKind::ReplicaSet => crate::controllers::replicaset::reconcile_replicaset(
+            ScaleTargetKind::ReplicaSet => klights_controllers::replicaset::reconcile_replicaset(
                 self.db,
                 pods,
                 pods,
@@ -331,24 +335,26 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
             )
             .await
             .map_err(map_controller_store_error),
-            ScaleTargetKind::StatefulSet => crate::controllers::statefulset::reconcile_statefulset(
-                self.db,
-                pods,
-                pods,
-                self.identity,
-                pods,
-                self.non_pod_finalization,
-                resource,
-                klights_controllers::ControllerReconcileContext::at(
-                    self.coordination,
-                    node_name,
-                    now,
-                ),
-            )
-            .await
-            .map_err(map_controller_store_error),
+            ScaleTargetKind::StatefulSet => {
+                klights_controllers::statefulset::reconcile_statefulset(
+                    self.db,
+                    pods,
+                    pods,
+                    self.identity,
+                    pods,
+                    self.non_pod_finalization,
+                    resource,
+                    klights_controllers::ControllerReconcileContext::at(
+                        self.coordination,
+                        node_name,
+                        now,
+                    ),
+                )
+                .await
+                .map_err(map_controller_store_error)
+            }
             ScaleTargetKind::ReplicationController => {
-                crate::controllers::replicationcontroller::reconcile_replicationcontroller(
+                klights_controllers::replicationcontroller::reconcile_replicationcontroller(
                     self.db,
                     pods,
                     pods,
@@ -386,28 +392,6 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
             .map(|_| ())
             .map_err(map_controller_store_error)
     }
-}
-
-#[cfg(test)]
-pub async fn reconcile_hpa(
-    db: &dyn DatastoreBackend,
-    pod_repository: &PodRepository,
-    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
-    hpa: &Value,
-    node_name: &str,
-) -> Result<()> {
-    reconcile_hpa_with_metrics(
-        db,
-        pod_repository,
-        non_pod_finalization,
-        &klights_controllers::ControllerCoordination::new(),
-        hpa,
-        node_name,
-        &crate::node_metrics_adapter::UnavailableNodeMetrics,
-        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
-        chrono::Utc::now(),
-    )
-    .await
 }
 
 #[allow(clippy::too_many_arguments)]

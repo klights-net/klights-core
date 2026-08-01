@@ -1,7 +1,7 @@
 //! `Controller` impl for `ReplicationController`. Registered in `ControllerDispatcher`.
 
 use crate::controllers::controller_wrapper;
-use crate::controllers::replicationcontroller as rc_core;
+use klights_controllers::replicationcontroller as rc_core;
 
 controller_wrapper!(
     ReplicationControllerController,
@@ -13,6 +13,15 @@ controller_wrapper!(
     reader = pod_query,
     mutation = replicationcontroller_mutation
 );
+
+#[cfg(test)]
+use klights_controllers::replicationcontroller::*;
+#[cfg(test)]
+#[path = "replicationcontroller/condition_tests.rs"]
+mod condition_policy_tests;
+#[cfg(test)]
+#[path = "replicationcontroller/tests.rs"]
+mod policy_tests;
 
 #[cfg(test)]
 mod tests {

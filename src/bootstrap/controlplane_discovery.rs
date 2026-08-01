@@ -6,8 +6,8 @@
 //! `set_all_leader_endpoints` so the reconnect loop can reach any
 //! controlplane when the initially specified leader is down.
 
-use crate::controllers::annotations::GRPC_PORT_ANNOTATION;
 use crate::watch::events::{EventType, WatchEvent};
+use klights_controllers::annotations::GRPC_PORT_ANNOTATION;
 
 /// Result of inspecting a single watch event for controlplane discovery.
 #[derive(Clone, Debug, PartialEq, Eq)]

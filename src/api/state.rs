@@ -132,7 +132,7 @@ pub(crate) struct ApiControllerReconcileServices {
     #[cfg(not(test))]
     pub(crate) node_lease_tracker: Arc<dyn crate::api::state_ports::ApiNodeLeaseObservations>,
     #[cfg(test)]
-    pub(crate) node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+    pub(crate) node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
 }
 
 impl ApiControllerReconcileServices {
@@ -150,7 +150,7 @@ impl ApiControllerReconcileServices {
         #[cfg(not(test))] node_lease_tracker: Arc<
             dyn crate::api::state_ports::ApiNodeLeaseObservations,
         >,
-        #[cfg(test)] node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+        #[cfg(test)] node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
     ) -> Self {
         Self {
             service_allocations,

@@ -1,7 +1,7 @@
 //! `Controller` impl for `Deployment`. Registered in `ControllerDispatcher`.
 
 use crate::controllers::controller_wrapper;
-use crate::controllers::deployment as deployment_core;
+use klights_controllers::deployment as deployment_core;
 
 controller_wrapper!(
     DeploymentController,
@@ -13,6 +13,12 @@ controller_wrapper!(
     reader = deployment_reader,
     mutation = deployment_mutation
 );
+
+#[cfg(test)]
+use klights_controllers::deployment::*;
+#[cfg(test)]
+#[path = "deployment/tests/mod.rs"]
+mod policy_tests;
 
 #[cfg(test)]
 mod tests {

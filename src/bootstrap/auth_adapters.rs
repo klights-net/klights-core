@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::controllers::csr_signer::{
-    CsrIssuanceError, CsrIssuanceOutcome, CsrIssuanceRequest, CsrIssuer, IssuedCsr,
-};
 use crate::datastore::backend::DatastoreHandle;
 use crate::datastore::types::ListPageRequest;
 use crate::kubelet::pod_repository::PodReader;
 use klights_auth::node_policy_store::NodePolicyStore;
 use klights_auth::rbac_policy_store::RbacResourceReader;
+use klights_controllers::csr_signer::{
+    CsrIssuanceError, CsrIssuanceOutcome, CsrIssuanceRequest, CsrIssuer, IssuedCsr,
+};
 use klights_leader_rpc::server::{
     ControlplaneCredentialError, ControlplaneCredentialIssuer, ReplicationPeerAuthenticationError,
     ReplicationPeerAuthenticator, ReplicationPeerIdentity,

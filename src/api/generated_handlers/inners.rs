@@ -2252,7 +2252,7 @@ mod tests {
 
     async fn seeded_rbac_state() -> Arc<ApiState> {
         let state = Arc::new(crate::api::test_support::build_test_app_state().await);
-        crate::controllers::rbac_reconcile::reconcile_default_rbac_objects(
+        klights_controllers::rbac_reconcile::reconcile_default_rbac_objects(
             state.resource_mutation().db.as_ref(),
         )
         .await
@@ -2281,7 +2281,7 @@ mod tests {
             )
             .await
             .expect("create aggregate source");
-        crate::controllers::rbac_reconcile::reconcile_cluster_role_aggregation(
+        klights_controllers::rbac_reconcile::reconcile_cluster_role_aggregation(
             state.resource_mutation().db.as_ref(),
         )
         .await

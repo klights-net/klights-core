@@ -3,7 +3,8 @@ use crate::datastore::DatastoreBackend;
 
 use crate::datastore::Resource;
 use crate::kubelet::pod_repository::PodObjectWriter;
-use serde_json::json;
+use anyhow::Result;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -11,6 +12,10 @@ fn coordination() -> &'static klights_controllers::ControllerCoordination {
     static COORDINATION: std::sync::LazyLock<klights_controllers::ControllerCoordination> =
         std::sync::LazyLock::new(klights_controllers::ControllerCoordination::new);
     &COORDINATION
+}
+
+fn derive_job_status_from_owned_pods(job: &Value, owned_pods: &[Resource]) -> Value {
+    derive_job_status_from_owned_pods_at(job, owned_pods, chrono::Utc::now())
 }
 
 /// Test-only shim wrapping `reconcile_job` with the repository-backed
@@ -199,6 +204,32 @@ impl PodObjectWriter for ScaleDownDuringJobCreateWriter {
         self.db
             .update_resource("v1", "Pod", Some(ns), name, pod, current.resource_version)
             .await
+    }
+}
+
+#[async_trait::async_trait]
+impl JobPodMutation for ScaleDownDuringJobCreateWriter {
+    async fn create_job_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        node_name: &str,
+        pod: serde_json::Value,
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
+        PodObjectWriter::create_controller_pod(self, namespace, name, node_name, pod)
+            .await
+            .map_err(crate::controller_store_error_adapter::map_controller_store_error)
+    }
+
+    async fn replace_job_pod_owner_references(
+        &self,
+        namespace: &str,
+        name: &str,
+        owner_references: Vec<serde_json::Value>,
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
+        PodObjectWriter::update_pod_owner_references(self, namespace, name, owner_references)
+            .await
+            .map_err(crate::controller_store_error_adapter::map_controller_store_error)
     }
 }
 

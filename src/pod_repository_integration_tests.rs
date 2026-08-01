@@ -3413,7 +3413,7 @@ async fn set_pod_status_reconciles_matching_pdb_after_readiness_transition() {
         .await
         .unwrap();
 
-    crate::controllers::pdb::reconcile_pdb(&*db, repo.as_ref(), &pdb)
+    klights_controllers::pdb::reconcile_pdb_at(&*db, repo.as_ref(), &pdb, chrono::Utc::now())
         .await
         .unwrap();
     let before = db
@@ -3520,7 +3520,7 @@ async fn record_sandbox_id_does_not_reconcile_pdb_without_endpoint_change() {
         .await
         .unwrap();
 
-    crate::controllers::pdb::reconcile_pdb(&*db, &repo, &pdb)
+    klights_controllers::pdb::reconcile_pdb_at(&*db, &repo, &pdb, chrono::Utc::now())
         .await
         .unwrap();
     let before = db

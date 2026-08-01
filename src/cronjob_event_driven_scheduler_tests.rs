@@ -1,6 +1,6 @@
 //! Event-driven CronJob scheduler tests (T13).
 //!
-//! Asserts that `controllers::cronjob_scheduler::CronJobScheduler` arms
+//! Asserts that `klights_controllers::cronjob_scheduler::CronJobScheduler` arms
 //! per-UID `spawn_delay` timers, fires CronJobs at their scheduled time,
 //! handles concurrency policy, suspend/delete edge cases, and that no
 //! `spawn_interval` task with `cronjob` in its name remains in `src/`.
@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use crate::controllers::cronjob_scheduler::{CronJobScheduler, compute_next_fire};
+use klights_controllers::cronjob_scheduler::{CronJobScheduler, compute_next_fire};
 
 async fn make_scheduler() -> (
     crate::datastore::sqlite::Datastore,
@@ -261,11 +261,12 @@ async fn forbid_concurrent_blocks_second_job_when_active_present() {
         .await
         .unwrap()
         .unwrap();
-    crate::controllers::cronjob::reconcile_cronjob_one(
+    klights_controllers::cronjob::reconcile_cronjob_one_at(
         &db,
         Some(dispatcher.as_ref()),
         &cj_now,
         resource.resource_version,
+        chrono::Utc::now(),
     )
     .await
     .unwrap();
