@@ -9,15 +9,15 @@ use super::RedbDatastore;
 #[async_trait]
 impl DatastoreSnapshotter for RedbDatastore {
     fn backend_kind(&self) -> &'static str {
-        self.recovery.backend_kind()
+        self.recovery_store().backend_kind()
     }
 
     fn schema_fingerprint(&self) -> String {
-        self.recovery.schema_fingerprint()
+        self.recovery_store().schema_fingerprint()
     }
 
     async fn snapshot(&self, fence: SnapshotExclusiveFence) -> Result<SnapshotEnvelope> {
-        self.recovery.snapshot(fence).await
+        self.recovery_store().snapshot(fence).await
     }
 
     async fn restore(
@@ -25,6 +25,6 @@ impl DatastoreSnapshotter for RedbDatastore {
         envelope: &SnapshotEnvelope,
         fence: SnapshotExclusiveFence,
     ) -> Result<()> {
-        self.recovery.restore(envelope, fence).await
+        self.recovery_store().restore(envelope, fence).await
     }
 }

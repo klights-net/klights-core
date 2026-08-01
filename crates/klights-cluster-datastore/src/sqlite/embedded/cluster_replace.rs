@@ -140,7 +140,7 @@ impl Datastore {
 
         #[cfg(not(test))]
         let _ = pending;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.publish_watch_events(pending);
         Ok(())
     }
@@ -162,17 +162,17 @@ impl Datastore {
             .live_committed_apply
             .apply_committed_with_pending(commit)
             .await?;
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let _ = pending;
         #[cfg(test)]
-        {
-            let published = pause_after_commit_before_publish(post_commit_publish_pause.as_ref());
-            if let Some(commit_sink) = self.commit_sink.as_deref() {
-                super::watch::publish_pending_batch(pending, commit_sink);
-            }
-            if let Some(published) = published {
-                published.notify_one();
-            }
+        let published = pause_after_commit_before_publish(post_commit_publish_pause.as_ref());
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(commit_sink) = self.commit_sink.as_deref() {
+            super::watch::publish_pending_batch(pending, commit_sink);
+        }
+        #[cfg(test)]
+        if let Some(published) = published {
+            published.notify_one();
         }
         Ok(receipt)
     }

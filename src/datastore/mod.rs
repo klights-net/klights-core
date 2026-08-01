@@ -32,11 +32,11 @@ pub use klights_cluster_core::{
     PatchKind, PositionedWatchEvent, Resource, ResourceBatchOperation, ResourceBatchPutMode,
     ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
 };
+#[cfg(test)]
+pub use klights_cluster_datastore::sqlite::embedded::ReplicatedCreateOptions;
 pub use klights_cluster_store::StagedPostCommit;
 #[cfg(test)]
 pub(crate) use klights_watch::WatchTopic;
-#[cfg(test)]
-pub use types::ReplicatedCreateOptions;
 pub use types::{
     CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation, ListPageRequest,
     POD_CLEANUP_REASON_NODE_LOST, PositionedWatchReplay, PositionedWatchReplayRead,

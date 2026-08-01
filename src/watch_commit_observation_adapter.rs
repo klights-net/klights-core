@@ -65,18 +65,6 @@ pub(crate) fn subscribe(
 }
 
 #[cfg(test)]
-pub(crate) fn subscribe_from_sink(
-    sink: &dyn CommitObservationSink,
-    topic: klights_watch::WatchTopic,
-) -> klights_watch::WatchSignalReceiver {
-    sink.as_any()
-        .downcast_ref::<WatchCommitObservationSink>()
-        .expect("cluster datastore was not composed with the root watch observation sink")
-        .signals
-        .subscribe(topic)
-}
-
-#[cfg(test)]
 pub(crate) struct WatchCommitObservationSink {
     wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>,
     #[cfg(test)]
@@ -123,6 +111,13 @@ impl CommitObservationSink for WatchCommitObservationSink {
             })
             .collect::<Vec<_>>();
         self.wakeups.wake(&advances);
+        #[cfg(test)]
+        for event in observations
+            .iter()
+            .filter_map(crate::datastore::staged_test_event)
+        {
+            self.bus.publish(event);
+        }
     }
 
     #[cfg(test)]

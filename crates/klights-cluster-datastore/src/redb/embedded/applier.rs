@@ -1,4 +1,4 @@
-#![cfg(test)]
+#![cfg(any(test, feature = "test-support"))]
 //! TO-BE-CLEANUP: legacy replicated StorageCommand test support only.
 //!
 //! `DatastoreApplier` implementation for `RedbDatastore`.
@@ -6,8 +6,10 @@
 //! Delegates each `StorageCommand` variant to the appropriate domain store.
 
 use anyhow::Result;
+#[cfg(test)]
 use async_trait::async_trait;
 
+#[cfg(test)]
 use crate::test_fixtures::live_apply::DatastoreApplier;
 use klights_cluster_core::command::{CommandMeta, StorageCommand};
 use klights_types::HostPortRange;
@@ -15,9 +17,14 @@ use klights_types::NodePeerMode;
 
 use super::RedbDatastore;
 
-#[async_trait]
-impl DatastoreApplier for RedbDatastore {
-    async fn apply_command(&self, cmd: StorageCommand, _meta: CommandMeta) -> Result<()> {
+impl RedbDatastore {
+    /// Preserve the historical root test-command behavior while keeping its
+    /// concrete persistence execution in the destination crate.
+    pub async fn apply_legacy_test_command(
+        &self,
+        cmd: StorageCommand,
+        _meta: CommandMeta,
+    ) -> Result<()> {
         match cmd {
             StorageCommand::CreateResource {
                 api_version,
@@ -267,5 +274,13 @@ impl DatastoreApplier for RedbDatastore {
             _ => unreachable!("unsupported StorageCommand variant in Redb test adapter"),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl DatastoreApplier for RedbDatastore {
+    async fn apply_command(&self, cmd: StorageCommand, meta: CommandMeta) -> Result<()> {
+        self.apply_legacy_test_command(cmd, meta).await
     }
 }

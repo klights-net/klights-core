@@ -3585,14 +3585,18 @@ async fn destination_noop_patch_built_before_spec_update_preserves_live_spec() {
     .await
     .expect("client scale update applies before stale patch commit");
 
-    // The focused persistence owner has already materialized this annotation,
-    // so its commit carries only the outbox ledger and must not roll back the
-    // newer client-owned state.
+    // Committed apply keeps strict captured-RV validation even when the patch
+    // was already materialized at proposal time. The stale command must be
+    // rejected without rolling back the newer client-owned state.
     let apply_result = db
         .apply_raft_log_apply_commit(commit)
         .await
         .expect("stale committed apply returns a deterministic outcome");
-    assert_eq!(apply_result.error_message, None);
+    assert!(
+        apply_result.error_message.is_some(),
+        "stale committed apply must fail strict RV validation: {apply_result:?}"
+    );
+    assert_eq!(apply_result.applied_rv, None);
     assert!(!apply_result.public_resource_changed);
 
     let live = db

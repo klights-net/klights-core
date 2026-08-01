@@ -1,8 +1,6 @@
 //! Root composition adapters from the concrete datastore to focused
 //! cluster-store and replication ports.
 
-use klights_cluster_core::LogApplyCommit;
-
 use crate::datastore::DatastoreHandle;
 
 pub(crate) struct DatastoreRaftCommitMaterializer {
@@ -56,6 +54,12 @@ pub(crate) fn map_storage_mutation_error_for_test(
     error: anyhow::Error,
 ) -> klights_cluster_core::StorageMutationError {
     map_storage_mutation_error(error)
+}
+
+pub(crate) fn storage_command_result_from_receipt(
+    receipt: &klights_cluster_store::CommittedRaftApplyReceipt,
+) -> klights_cluster_store::StorageCommandResult {
+    klights_replication::committed_apply::storage_command_result_from_committed_outcome(receipt)
 }
 
 #[async_trait::async_trait]
@@ -158,18 +162,4 @@ pub(crate) fn raft_store_ports_for_test(
         allocator,
         lifecycle,
     )
-}
-
-impl crate::datastore::sqlite::Datastore {
-    pub async fn apply_raft_log_apply_commit(
-        &self,
-        commit: LogApplyCommit,
-    ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
-        let receipt = self.apply_raft_log_apply_commit_receipt(commit).await?;
-        Ok(
-            klights_replication::committed_apply::storage_command_result_from_committed_outcome(
-                &receipt,
-            ),
-        )
-    }
 }

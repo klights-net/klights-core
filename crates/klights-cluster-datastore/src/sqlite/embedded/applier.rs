@@ -1,4 +1,4 @@
-#![cfg(test)]
+#![cfg(any(test, feature = "test-support"))]
 //! TO-BE-CLEANUP: legacy replicated StorageCommand test support only.
 //!
 //! `DatastoreApplier` implementation for the SQLite backend.
@@ -10,16 +10,23 @@
 //! backend calls.
 
 use anyhow::{Result, anyhow};
+#[cfg(test)]
 use async_trait::async_trait;
 
+#[cfg(test)]
 use crate::test_fixtures::live_apply::DatastoreApplier;
 use klights_cluster_core::command::{CommandMeta, StorageCommand};
 
 use super::Datastore;
 
-#[async_trait]
-impl DatastoreApplier for Datastore {
-    async fn apply_command(&self, cmd: StorageCommand, _meta: CommandMeta) -> Result<()> {
+impl Datastore {
+    /// Preserve the historical root test-command behavior while keeping its
+    /// concrete persistence execution in the destination crate.
+    pub async fn apply_legacy_test_command(
+        &self,
+        cmd: StorageCommand,
+        _meta: CommandMeta,
+    ) -> Result<()> {
         match cmd {
             // -- Resource CRUD --
             StorageCommand::CreateResource {
@@ -320,6 +327,14 @@ impl DatastoreApplier for Datastore {
             _ => unreachable!("unsupported StorageCommand variant in SQLite test adapter"),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl DatastoreApplier for Datastore {
+    async fn apply_command(&self, cmd: StorageCommand, meta: CommandMeta) -> Result<()> {
+        self.apply_legacy_test_command(cmd, meta).await
     }
 }
 

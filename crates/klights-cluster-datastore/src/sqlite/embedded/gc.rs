@@ -56,7 +56,7 @@ impl Datastore {
 
     /// Total `watch_events` rows currently held. Used by GC tests and could
     /// be surfaced as an ops metric in the future.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn count_watch_events(&self) -> Result<i64> {
         let count = self
             .db_call("count_watch_events", |conn| {

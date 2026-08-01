@@ -55,13 +55,13 @@ pub fn create_staged_post_commit(
     event_type: &str,
     data: impl Into<std::sync::Arc<Value>>,
 ) -> StagedPostCommit {
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         let _ = (name, event_type, data);
         StagedPostCommit::new(api_version, kind, namespace, resource_version)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         let mut value = data.into().as_ref().clone();
         let object = value
@@ -158,7 +158,7 @@ impl Datastore {
     /// Delegates to the free function `publish_pending` so the broadcast
     /// path is identical whether called from CRUD methods or a future
     /// Raft FSM apply hook.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn publish_watch_event(&self, pending: StagedPostCommit) {
         if let Some(commit_sink) = self.commit_sink.as_deref() {
             publish_pending(pending, commit_sink);
@@ -169,7 +169,7 @@ impl Datastore {
     /// committed. Multi-event apply paths (raft/cluster replace) use this so
     /// the post-commit signals are grouped per `(topic, namespace)` through
     /// `publish_pending_batch` instead of emitting one signal per event.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn publish_watch_events(&self, pending: impl IntoIterator<Item = StagedPostCommit>) {
         if let Some(commit_sink) = self.commit_sink.as_deref() {
             publish_pending_batch(pending, commit_sink);

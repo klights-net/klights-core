@@ -1,4 +1,4 @@
-#![cfg(test)]
+#![cfg(any(test, feature = "test-support"))]
 //! TO-BE-CLEANUP: legacy replicated StorageCommand test support only.
 //!
 //! Replicated create resource — converges a follower cache to the
@@ -16,7 +16,7 @@ use crate::sqlite::selector_index;
 use crate::sqlite::embedded::create_staged_post_commit;
 
 impl Datastore {
-    pub(crate) async fn apply_replicated_create_resource(
+    pub async fn apply_replicated_create_resource(
         &self,
         api_version: &str,
         kind: &str,
@@ -396,7 +396,7 @@ impl Datastore {
                     "ADDED",
                     data.clone(),
                 );
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 self.publish_watch_event(pending);
                 id
             }
@@ -410,7 +410,7 @@ impl Datastore {
                     "MODIFIED",
                     data.clone(),
                 );
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 self.publish_watch_event(pending);
                 id
             }
@@ -441,7 +441,7 @@ impl Datastore {
                         "DELETED",
                         old_data,
                     );
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     self.publish_watch_event(pending_delete);
                 }
                 let pending_add = create_staged_post_commit(
@@ -453,7 +453,7 @@ impl Datastore {
                     "ADDED",
                     data.clone(),
                 );
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 self.publish_watch_event(pending_add);
                 id
             }

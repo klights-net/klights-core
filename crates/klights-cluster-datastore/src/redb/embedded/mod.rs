@@ -14,7 +14,7 @@ use klights_cluster_store::CommitObservationSink;
 use klights_supervisor::TaskSupervisor;
 
 pub mod advance;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod applier;
 pub mod network;
 pub mod snapshot;
@@ -217,7 +217,7 @@ impl RedbDatastore {
         ))
     }
 
-    fn finish_post_commit<T>(
+    pub fn finish_post_commit<T>(
         &self,
         (result, pending): (T, Option<klights_cluster_store::StagedPostCommit>),
     ) -> T {
@@ -244,5 +244,38 @@ impl RedbDatastore {
 
     pub fn focused_recovery_store(&self) -> Arc<RedbRecoveryStore> {
         Arc::new(self.recovery.clone())
+    }
+
+    pub fn resources(&self) -> &RedbResourceStore {
+        &self.resources
+    }
+
+    pub fn namespaces(&self) -> &RedbNamespaceStore {
+        &self.namespaces
+    }
+
+    pub fn watch_store(&self) -> &RedbWatchStore {
+        &self.watch_store
+    }
+
+    pub fn network_store(&self) -> &RedbNetworkStore {
+        &self.network
+    }
+
+    pub fn live_committed_apply_store(&self) -> &RedbLiveCommittedApplyStore {
+        &self.live_committed_apply
+    }
+
+    pub fn recovery_store(&self) -> &RedbRecoveryStore {
+        &self.recovery
+    }
+
+    pub fn rv_store(&self) -> &RedbRvStore {
+        &self.rv_store
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn commit_observation_sink(&self) -> Option<Arc<dyn CommitObservationSink>> {
+        self.commit_sink.clone()
     }
 }

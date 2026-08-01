@@ -1,11 +1,11 @@
 use super::*;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::sqlite::ListResourcesSnapshotPause;
 use crate::sqlite::read_store::SqliteResourceListQuery;
 
 impl Datastore {
-    #[cfg(test)]
-    pub(crate) fn install_list_resources_snapshot_pause_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_list_resources_snapshot_pause_for_test(
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
@@ -25,8 +25,8 @@ impl Datastore {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_list_resources_snapshot_after_rows_pause_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_list_resources_snapshot_after_rows_pause_for_test(
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,

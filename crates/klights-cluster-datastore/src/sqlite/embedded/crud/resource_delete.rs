@@ -109,7 +109,7 @@ impl Datastore {
                         "DELETED",
                         data,
                     );
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     self.publish_watch_event(_pending);
                 }
                 Ok(rv)

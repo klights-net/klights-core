@@ -26,7 +26,7 @@ impl Datastore {
                     "ADDED",
                     data.clone(),
                 );
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 self.publish_watch_event(_pending);
 
                 Ok(Resource {
@@ -53,7 +53,7 @@ impl Datastore {
     /// cluster resourceVersion counter and without emitting a watch event, so
     /// RV-asserting and watch-replay tests remain deterministic. Used to make
     /// the standard cluster namespaces present in in-memory test datastores.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn seed_namespace_no_rv(&self, name: &str) -> Result<()> {
         let data = serde_json::json!({
             "apiVersion": "v1", "kind": "Namespace", "metadata": {"name": name}
@@ -109,7 +109,7 @@ impl Datastore {
                     "MODIFIED",
                     data.clone(),
                 );
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 self.publish_watch_event(_pending);
 
                 Ok(Resource {
@@ -151,7 +151,7 @@ impl Datastore {
                 let data: Value = serde_json::from_slice(&namespace_data)?;
                 let _pending =
                     create_staged_post_commit("v1", "Namespace", None, name, rv, "DELETED", data);
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 self.publish_watch_event(_pending);
                 Ok(rv)
             }

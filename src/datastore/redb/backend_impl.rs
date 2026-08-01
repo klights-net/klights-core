@@ -92,7 +92,8 @@ impl DatastoreBackend for RedbDatastore {
     fn commit_observation_sink(
         &self,
     ) -> std::sync::Arc<dyn crate::datastore::CommitObservationSink> {
-        self.commit_sink.clone()
+        klights_cluster_datastore::redb::embedded::RedbDatastore::commit_observation_sink(self)
+            .expect("test datastore must install a commit observation sink")
     }
 
     async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {
@@ -108,7 +109,7 @@ impl DatastoreBackend for RedbDatastore {
     }
 
     async fn read_cluster_metadata_observation(&self) -> Result<ClusterMetadataObservation> {
-        let observed = self.recovery.read_cluster_metadata().await?;
+        let observed = self.recovery_store().read_cluster_metadata().await?;
         let membership = match observed.membership {
             klights_cluster_store::SnapshotMembership::LegacyOmitted => {
                 ReplicatedMembershipState::LegacyOmitted
@@ -147,7 +148,7 @@ impl DatastoreBackend for RedbDatastore {
         request: klights_cluster_store::SnapshotCaptureRequest,
         fence: klights_cluster_store::SnapshotExclusiveFence,
     ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
-        self.recovery.begin_snapshot(request, fence).await
+        self.recovery_store().begin_snapshot(request, fence).await
     }
 
     fn close(&self) {
@@ -157,7 +158,9 @@ impl DatastoreBackend for RedbDatastore {
     #[cfg(test)]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<crate::watch::WatchEvent> {
         crate::watch_commit_observation_adapter::subscribe_test_events(
-            self.commit_sink.as_ref(),
+            klights_cluster_datastore::redb::embedded::RedbDatastore::commit_observation_sink(self)
+                .expect("test datastore must install a commit observation sink")
+                .as_ref(),
             topic,
         )
     }
@@ -165,7 +168,9 @@ impl DatastoreBackend for RedbDatastore {
     #[cfg(test)]
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> crate::watch::WatchReceiver {
         crate::watch_commit_observation_adapter::subscribe_test_events_many(
-            self.commit_sink.as_ref(),
+            klights_cluster_datastore::redb::embedded::RedbDatastore::commit_observation_sink(self)
+                .expect("test datastore must install a commit observation sink")
+                .as_ref(),
             topics,
         )
     }
@@ -175,7 +180,9 @@ impl DatastoreBackend for RedbDatastore {
         let event = crate::datastore::staged_test_event(&pending).expect("staged test watch event");
         let _ = WatchSignal::from_event(&event);
         crate::watch_commit_observation_adapter::publish_test_events(
-            self.commit_sink.as_ref(),
+            klights_cluster_datastore::redb::embedded::RedbDatastore::commit_observation_sink(self)
+                .expect("test datastore must install a commit observation sink")
+                .as_ref(),
             vec![event],
         );
     }
@@ -184,21 +191,22 @@ impl DatastoreBackend for RedbDatastore {
         &self,
         _commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<()> {
-        self.live_committed_apply.apply_log_apply_commit()
+        self.live_committed_apply_store().apply_log_apply_commit()
     }
 
     async fn apply_raft_log_apply_commit(
         &self,
         _commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<klights_cluster_store::StorageCommandResult> {
-        self.live_committed_apply.apply_raft_log_apply_commit()
+        self.live_committed_apply_store()
+            .apply_raft_log_apply_commit()
     }
 
     async fn apply_raft_log_apply_commit_receipt(
         &self,
         _commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<klights_cluster_store::CommittedRaftApplyReceipt> {
-        self.live_committed_apply
+        self.live_committed_apply_store()
             .apply_raft_log_apply_commit_receipt()
     }
 
@@ -210,7 +218,7 @@ impl DatastoreBackend for RedbDatastore {
         m: &str,
         d: Value,
     ) -> Result<Resource> {
-        let committed = self.resources.create_res(a, k, n, m, d).await?;
+        let committed = self.resources().create_res(a, k, n, m, d).await?;
         Ok(self.finish_post_commit(committed))
     }
     async fn get_resource(
@@ -220,7 +228,10 @@ impl DatastoreBackend for RedbDatastore {
         n: Option<&str>,
         m: &str,
     ) -> Result<Option<Resource>> {
-        self.read_store.core().get_resource(a, k, n, m).await
+        self.focused_read_store()
+            .core()
+            .get_resource(a, k, n, m)
+            .await
     }
     async fn update_resource(
         &self,
@@ -231,7 +242,7 @@ impl DatastoreBackend for RedbDatastore {
         d: Value,
         e: i64,
     ) -> Result<Resource> {
-        let committed = self.resources.update_res(a, k, n, m, d, e).await?;
+        let committed = self.resources().update_res(a, k, n, m, d, e).await?;
         Ok(self.finish_post_commit(committed))
     }
     async fn update_resource_with_preconditions(
@@ -244,13 +255,13 @@ impl DatastoreBackend for RedbDatastore {
         p: ResourcePreconditions,
     ) -> Result<Resource> {
         let committed = self
-            .resources
+            .resources()
             .update_res_with_preconditions(a, k, n, m, d, p)
             .await?;
         Ok(self.finish_post_commit(committed))
     }
     async fn delete_resource(&self, a: &str, k: &str, n: Option<&str>, m: &str) -> Result<()> {
-        let committed = self.resources.delete_res(a, k, n, m).await?;
+        let committed = self.resources().delete_res(a, k, n, m).await?;
         self.finish_post_commit(committed);
         Ok(())
     }
@@ -263,7 +274,7 @@ impl DatastoreBackend for RedbDatastore {
         p: ResourcePreconditions,
     ) -> Result<()> {
         let committed = self
-            .resources
+            .resources()
             .delete_res_with_preconditions(a, k, n, m, p)
             .await?;
         self.finish_post_commit(committed);
@@ -280,7 +291,7 @@ impl DatastoreBackend for RedbDatastore {
         grace_seconds: i64,
     ) -> Result<Resource> {
         let committed = self
-            .resources
+            .resources()
             .delete_res_with_tombstone(a, k, n, m, p, grace_seconds)
             .await?;
         Ok(self.finish_post_commit(committed))
@@ -300,7 +311,7 @@ impl DatastoreBackend for RedbDatastore {
             )
         });
         let page = self
-            .read_store
+            .focused_read_store()
             .core()
             .list_resources(
                 a,
@@ -335,14 +346,14 @@ impl DatastoreBackend for RedbDatastore {
         fs: Option<&str>,
         page: ListPageRequest,
     ) -> Result<ResourceList> {
-        self.resources.list_res_page(a, k, n, ls, fs, page).await
+        self.resources().list_res_page(a, k, n, ls, fs, page).await
     }
     async fn list_resources_for_watch_targets(
         &self,
         targets: &[WatchTarget],
         label_selector: Option<&str>,
     ) -> Result<ResourceList> {
-        self.resources
+        self.resources()
             .list_resources_for_watch_targets(targets, label_selector)
             .await
     }
@@ -352,7 +363,7 @@ impl DatastoreBackend for RedbDatastore {
         k: String,
         namespaced: bool,
     ) -> Result<Vec<(Option<String>, String)>> {
-        self.namespaces
+        self.namespaces()
             .list_resource_keys_for_scope_impl(&a, &k, namespaced)
             .await
     }
@@ -366,7 +377,7 @@ impl DatastoreBackend for RedbDatastore {
         e: Option<i64>,
     ) -> Result<Resource> {
         let committed = self
-            .resources
+            .resources()
             .update_status_only_impl(a, k, n, m, s, e)
             .await?;
         Ok(self.finish_post_commit(committed))
@@ -381,7 +392,7 @@ impl DatastoreBackend for RedbDatastore {
         p: ResourcePreconditions,
     ) -> Result<Resource> {
         let committed = self
-            .resources
+            .resources()
             .update_status_only_with_preconditions_impl(a, k, n, m, s, p)
             .await?;
         Ok(self.finish_post_commit(committed))
@@ -395,18 +406,18 @@ impl DatastoreBackend for RedbDatastore {
             .map_err(anyhow::Error::from)
     }
     async fn create_namespace(&self, n: &str, d: Value) -> Result<Resource> {
-        let committed = self.namespaces.create_ns(n, d).await?;
+        let committed = self.namespaces().create_ns(n, d).await?;
         Ok(self.finish_post_commit(committed))
     }
     async fn get_namespace(&self, n: &str) -> Result<Option<Resource>> {
-        self.read_store
+        self.focused_read_store()
             .core()
             .get_resource("v1", "Namespace", None, n)
             .await
     }
     async fn list_namespaces(&self, ls: Option<&str>, fs: Option<&str>) -> Result<ResourceList> {
         let page = self
-            .read_store
+            .focused_read_store()
             .core()
             .list_resources(
                 "v1",
@@ -438,16 +449,16 @@ impl DatastoreBackend for RedbDatastore {
         Ok(page.apply_to_sorted_resource_list(list))
     }
     async fn update_namespace(&self, n: &str, d: Value, e: i64) -> Result<Resource> {
-        self.namespaces.update_ns_impl(n, d, e).await
+        self.namespaces().update_ns_impl(n, d, e).await
     }
     async fn delete_namespace_contents(&self, n: &str) -> Result<()> {
-        self.namespaces.delete_namespace_contents_impl(n).await
+        self.namespaces().delete_namespace_contents_impl(n).await
     }
     async fn delete_namespace(&self, n: &str) -> Result<()> {
-        self.namespaces.delete_ns_impl(n).await
+        self.namespaces().delete_ns_impl(n).await
     }
     async fn find_owned_resources(&self, o: &str, ns: Option<&str>) -> Result<Vec<Resource>> {
-        self.read_store.core().find_owned(o, ns).await
+        self.focused_read_store().core().find_owned(o, ns).await
     }
     async fn list_resources_by_owner_uid(
         &self,
@@ -456,7 +467,7 @@ impl DatastoreBackend for RedbDatastore {
         ns: Option<&str>,
         o: &str,
     ) -> Result<Vec<Resource>> {
-        let mut resources = self.read_store.core().find_owned(o, ns).await?;
+        let mut resources = self.focused_read_store().core().find_owned(o, ns).await?;
         resources.retain(|r| r.api_version == a && r.kind == k);
         Ok(resources)
     }
@@ -467,7 +478,7 @@ impl DatastoreBackend for RedbDatastore {
         owner_kind: &str,
         ns: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        let candidates = self.read_store.core().find_owned("", ns).await?;
+        let candidates = self.focused_read_store().core().find_owned("", ns).await?;
         let filtered: Vec<Resource> = candidates
             .into_iter()
             .filter(|r| {
@@ -499,7 +510,7 @@ impl DatastoreBackend for RedbDatastore {
         k: &str,
         s: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        self.read_store
+        self.focused_read_store()
             .core()
             .watch_events_since(
                 &[klights_cluster_store::DurableWatchTarget::cluster(a, k)],
@@ -509,7 +520,10 @@ impl DatastoreBackend for RedbDatastore {
             .map(|events| events.into_iter().map(durable_to_catchup).collect())
     }
     async fn list_cluster_resources(&self) -> Result<Vec<Resource>> {
-        self.read_store.core().list_cluster_resources().await
+        self.focused_read_store()
+            .core()
+            .list_cluster_resources()
+            .await
     }
     async fn list_resources_modified_since(
         &self,
@@ -524,23 +538,23 @@ impl DatastoreBackend for RedbDatastore {
                 klights_cluster_store::DurableWatchTarget::namespaced_in_namespace(a, k, namespace)
             },
         );
-        self.read_store
+        self.focused_read_store()
             .core()
             .watch_events_since(&[target], s)
             .await
             .map(|events| events.into_iter().map(durable_to_catchup).collect())
     }
     async fn advance_resource_version_after(&self, min_rv: i64) -> Result<i64> {
-        self.rv_store.advance_rv(min_rv).await
+        self.rv_store().advance_rv(min_rv).await
     }
     async fn list_namespace_resources(&self, ns: &str) -> Result<Vec<Resource>> {
-        self.read_store
+        self.focused_read_store()
             .core()
             .list_namespace_resources(ns, None, false)
             .await
     }
     async fn list_namespace_resources_of_kind(&self, ns: &str, k: &str) -> Result<Vec<Resource>> {
-        self.read_store
+        self.focused_read_store()
             .core()
             .list_namespace_resources(ns, Some(k), false)
             .await
@@ -550,13 +564,16 @@ impl DatastoreBackend for RedbDatastore {
         ns: &str,
         k: &str,
     ) -> Result<Vec<Resource>> {
-        self.read_store
+        self.focused_read_store()
             .core()
             .list_namespace_resources(ns, Some(k), true)
             .await
     }
     async fn count_namespace_resources(&self, ns: &str) -> Result<i64> {
-        self.read_store.core().count_namespace_resources(ns).await
+        self.focused_read_store()
+            .core()
+            .count_namespace_resources(ns)
+            .await
     }
     async fn list_watch_events_since(
         &self,
@@ -564,7 +581,7 @@ impl DatastoreBackend for RedbDatastore {
         s: i64,
     ) -> Result<Vec<CatchUpResource>> {
         let targets: Vec<_> = t.iter().map(legacy_target_to_durable).collect();
-        self.read_store
+        self.focused_read_store()
             .core()
             .watch_events_since(&targets, s)
             .await
@@ -577,7 +594,7 @@ impl DatastoreBackend for RedbDatastore {
     ) -> Result<WatchReplayRead> {
         let targets: Vec<_> = t.iter().map(legacy_target_to_durable).collect();
         match self
-            .read_store
+            .focused_read_store()
             .core()
             .watch_events_since_checked(&targets, s, None)
             .await?
@@ -596,7 +613,7 @@ impl DatastoreBackend for RedbDatastore {
     ) -> Result<WatchReplayRead> {
         let targets: Vec<_> = t.iter().map(legacy_target_to_durable).collect();
         match self
-            .read_store
+            .focused_read_store()
             .core()
             .watch_events_since_checked(&targets, s, Some(limit))
             .await?
@@ -615,7 +632,7 @@ impl DatastoreBackend for RedbDatastore {
     ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
         let targets: Vec<_> = targets.iter().map(legacy_target_to_durable).collect();
         match self
-            .read_store
+            .focused_read_store()
             .core()
             .positioned_watch_events(&targets, position, limit)
             .await?
@@ -637,7 +654,7 @@ impl DatastoreBackend for RedbDatastore {
         }
     }
     async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition> {
-        self.read_store.core().allocator_position().await
+        self.focused_read_store().core().allocator_position().await
     }
     async fn snapshot_resources_at_position(
         &self,
@@ -648,7 +665,7 @@ impl DatastoreBackend for RedbDatastore {
     ) -> Result<SnapshotAtRv> {
         let targets: Vec<_> = targets.iter().map(legacy_target_to_durable).collect();
         match self
-            .read_store
+            .focused_read_store()
             .core()
             .snapshot_at_position(&targets, label_selector, field_selector, position)
             .await?
@@ -673,7 +690,7 @@ impl DatastoreBackend for RedbDatastore {
     ) -> Result<WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
         let targets: Vec<_> = t.iter().map(legacy_target_to_durable).collect();
         match self
-            .read_store
+            .focused_read_store()
             .core()
             .raw_watch_events_since_checked(&targets, s, limit)
             .await?
@@ -690,7 +707,7 @@ impl DatastoreBackend for RedbDatastore {
     ) -> Result<PositionedWatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
         let targets: Vec<_> = targets.iter().map(legacy_target_to_durable).collect();
         match self
-            .read_store
+            .focused_read_store()
             .core()
             .positioned_raw_watch_events(&targets, position, limit)
             .await?
@@ -705,7 +722,7 @@ impl DatastoreBackend for RedbDatastore {
         }
     }
     async fn list_all_watch_events_since(&self, s: i64) -> Result<Vec<CatchUpResource>> {
-        self.read_store
+        self.focused_read_store()
             .core()
             .all_watch_events_since(s, false)
             .await
@@ -719,7 +736,7 @@ impl DatastoreBackend for RedbDatastore {
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<(i64, CatchUpResource)>> {
         let _ = after_resource_version;
-        self.read_store
+        self.focused_read_store()
             .core()
             .all_watch_events_since_paged(s, after_id, None, limit)
             .await
@@ -736,7 +753,7 @@ impl DatastoreBackend for RedbDatastore {
         through_id: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<(i64, CatchUpResource)>> {
-        self.read_store
+        self.focused_read_store()
             .core()
             .all_watch_events_since_paged(0, after_id, Some(through_id), limit)
             .await
@@ -748,7 +765,7 @@ impl DatastoreBackend for RedbDatastore {
             })
     }
     async fn list_watch_replay_floors(&self) -> Result<Vec<WatchReplayFloor>> {
-        self.read_store
+        self.focused_read_store()
             .core()
             .replay_floors()
             .await
@@ -760,14 +777,14 @@ impl DatastoreBackend for RedbDatastore {
         after: Option<&klights_cluster_store::SnapshotReplayFloorCursor>,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<WatchReplayFloor>> {
-        self.read_store
+        self.focused_read_store()
             .core()
             .replay_floors_paged(after, limit)
             .await
             .map(|floors| floors.into_iter().map(durable_floor_to_legacy).collect())
     }
     async fn list_deleted_watch_events_since(&self, s: i64) -> Result<Vec<CatchUpResource>> {
-        self.read_store
+        self.focused_read_store()
             .core()
             .all_watch_events_since(s, true)
             .await
@@ -779,7 +796,7 @@ impl DatastoreBackend for RedbDatastore {
         c: &str,
         i: &str,
     ) -> Result<klights_cluster_store::StoredNodeSubnet> {
-        self.network.allocate_node_subnet(n, c, i).await
+        self.network_store().allocate_node_subnet(n, c, i).await
     }
     async fn update_node_peer_attributes(
         &self,
@@ -787,34 +804,40 @@ impl DatastoreBackend for RedbDatastore {
         mode: NodePeerMode,
         hpr: Option<HostPortRange>,
     ) -> Result<()> {
-        self.network.update_peer_attrs(n, mode, hpr).await
+        self.network_store().update_peer_attrs(n, mode, hpr).await
     }
     async fn update_node_dataplane(
         &self,
         metadata: klights_cluster_store::DataplanePeerMetadata,
     ) -> Result<()> {
-        self.network.update_node_dataplane(metadata).await
+        self.network_store().update_node_dataplane(metadata).await
     }
     async fn get_node_dataplane(
         &self,
         node_name: &str,
     ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>> {
-        self.read_store.core().get_node_dataplane(node_name).await
+        self.focused_read_store()
+            .core()
+            .get_node_dataplane(node_name)
+            .await
     }
     async fn get_node_subnet(
         &self,
         n: &str,
     ) -> Result<Option<klights_cluster_store::StoredNodeSubnet>> {
-        self.read_store.core().get_node_subnet(n).await
+        self.focused_read_store().core().get_node_subnet(n).await
     }
     async fn list_peer_subnets(
         &self,
         request: klights_cluster_store::PeerTopologyRequest,
     ) -> Result<Vec<klights_cluster_store::StoredNodeSubnet>> {
-        self.read_store.core().list_peer_subnets(request).await
+        self.focused_read_store()
+            .core()
+            .list_peer_subnets(request)
+            .await
     }
     async fn delete_node_subnet(&self, n: &str) -> Result<()> {
-        self.network.delete_node_subnet(n).await
+        self.network_store().delete_node_subnet(n).await
     }
     async fn patch_resource_latest(
         &self,
@@ -825,7 +848,7 @@ impl DatastoreBackend for RedbDatastore {
         _pk: PatchKind,
         p: Value,
     ) -> Result<Option<Resource>> {
-        let committed = self.resources.patch(a, k, ns, n, p).await?;
+        let committed = self.resources().patch(a, k, ns, n, p).await?;
         Ok(self.finish_post_commit(committed))
     }
     async fn patch_resource_latest_with_preconditions(
@@ -837,19 +860,19 @@ impl DatastoreBackend for RedbDatastore {
         request: ResourcePatchRequest,
     ) -> Result<Option<Resource>> {
         let committed = self
-            .resources
+            .resources()
             .patch_with_preconditions(a, k, ns, n, request)
             .await?;
         Ok(self.finish_post_commit(committed))
     }
     async fn watch_events_gc_prunable_count(&self, m: i64, b: i64) -> Result<usize> {
-        self.watch_store.gc_watch_prunable_count(m, b).await
+        self.watch_store().gc_watch_prunable_count(m, b).await
     }
     async fn gc_watch_events(&self, m: i64, b: i64) -> Result<usize> {
-        self.watch_store.gc_watch(m, b).await
+        self.watch_store().gc_watch(m, b).await
     }
     async fn applied_outbox_gc_prunable_count(&self, cutoff_ms: i64) -> Result<usize> {
-        self.live_committed_apply
+        self.live_committed_apply_store()
             .applied_outbox_prunable_count(cutoff_ms)
             .await
     }
@@ -857,7 +880,9 @@ impl DatastoreBackend for RedbDatastore {
     async fn list_outbox_stream_watermarks(
         &self,
     ) -> Result<Vec<klights_cluster_core::OutboxStreamWatermark>> {
-        self.live_committed_apply.list_outbox_watermarks().await
+        self.live_committed_apply_store()
+            .list_outbox_watermarks()
+            .await
     }
 
     async fn list_outbox_stream_watermarks_paged(
@@ -865,24 +890,26 @@ impl DatastoreBackend for RedbDatastore {
         after: Option<&klights_cluster_store::SnapshotOutboxWatermarkCursor>,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<klights_cluster_core::OutboxStreamWatermark>> {
-        self.live_committed_apply
+        self.live_committed_apply_store()
             .list_outbox_watermarks_paged(after, limit)
             .await
     }
 
     async fn get_klights_meta(&self, key: &str) -> anyhow::Result<Option<String>> {
-        self.recovery.get_klights_meta(key).await
+        self.recovery_store().get_klights_meta(key).await
     }
 
     async fn set_klights_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        self.live_committed_apply.set_klights_meta(key, value).await
+        self.live_committed_apply_store()
+            .set_klights_meta(key, value)
+            .await
     }
 
     async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
     ) -> anyhow::Result<Option<LogApplyAppliedOutboxRow>> {
-        self.live_committed_apply
+        self.live_committed_apply_store()
             .get_applied_outbox_bytes(idempotency_key)
             .await?
             .map(|bytes| serde_json::from_slice(&bytes).map_err(anyhow::Error::from))
@@ -892,13 +919,13 @@ impl DatastoreBackend for RedbDatastore {
     async fn insert_applied_outbox(&self, record: LogApplyAppliedOutboxRow) -> Result<bool> {
         let idempotency_key = record.idempotency_key.clone();
         let bytes = serde_json::to_vec(&record)?;
-        self.live_committed_apply
+        self.live_committed_apply_store()
             .insert_applied_outbox_bytes(idempotency_key, bytes)
             .await
     }
 
     async fn list_applied_outbox(&self) -> Result<Vec<LogApplyAppliedOutboxRow>> {
-        self.live_committed_apply
+        self.live_committed_apply_store()
             .list_applied_outbox_bytes()
             .await?
             .into_iter()
@@ -911,7 +938,7 @@ impl DatastoreBackend for RedbDatastore {
         after_key: Option<&str>,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<LogApplyAppliedOutboxRow>> {
-        self.live_committed_apply
+        self.live_committed_apply_store()
             .list_applied_outbox_bytes_paged(after_key, limit)
             .await?
             .into_iter()
@@ -929,7 +956,8 @@ impl DatastoreBackend for RedbDatastore {
         klights_cluster_core::OutboxApplyOutcome,
         klights_cluster_core::OutboxApplyError,
     > {
-        self.live_committed_apply.apply_outbox_transactionally()
+        self.live_committed_apply_store()
+            .apply_outbox_transactionally()
     }
 
     async fn apply_outbox_transactionally_with_watermark(
@@ -943,7 +971,7 @@ impl DatastoreBackend for RedbDatastore {
         klights_cluster_core::OutboxApplyOutcome,
         klights_cluster_core::OutboxApplyError,
     > {
-        self.live_committed_apply
+        self.live_committed_apply_store()
             .apply_outbox_transactionally_with_watermark()
     }
 
@@ -958,7 +986,7 @@ impl DatastoreBackend for RedbDatastore {
         crate::datastore::CommittedOutboxApply,
         klights_cluster_core::OutboxApplyError,
     > {
-        self.live_committed_apply
+        self.live_committed_apply_store()
             .apply_outbox_transactionally_with_watermark_effect()
     }
 
@@ -968,7 +996,7 @@ impl DatastoreBackend for RedbDatastore {
         _operation: &str,
         _authoring_node: &str,
     ) -> Result<klights_cluster_core::LogApplyCommit> {
-        self.live_committed_apply
+        self.live_committed_apply_store()
             .build_log_apply_commit_for_command()
     }
 
@@ -982,7 +1010,7 @@ impl DatastoreBackend for RedbDatastore {
         klights_cluster_core::BuildOutboxOutcome,
         klights_cluster_core::OutboxApplyError,
     > {
-        self.live_committed_apply
+        self.live_committed_apply_store()
             .build_log_apply_commit_for_outbox()
     }
 
@@ -997,12 +1025,12 @@ impl DatastoreBackend for RedbDatastore {
         klights_cluster_core::BuildOutboxOutcome,
         klights_cluster_core::OutboxApplyError,
     > {
-        self.live_committed_apply
+        self.live_committed_apply_store()
             .build_log_apply_commit_for_outbox_with_watermark()
     }
 
     async fn gc_applied_outbox(&self, now_ms: i64, ttl_ms: i64) -> Result<usize> {
-        self.live_committed_apply
+        self.live_committed_apply_store()
             .gc_applied_outbox(now_ms, ttl_ms)
             .await
     }
@@ -1518,7 +1546,7 @@ impl crate::datastore::ReplicationStore for RedbDatastore {
         command: klights_cluster_core::command::StorageCommand,
         meta: klights_cluster_core::command::CommandMeta,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::apply_replicated_command(self, command, meta).await
+        self.0.apply_legacy_test_command(command, meta).await
     }
 
     async fn replace_replicated_resource_state(

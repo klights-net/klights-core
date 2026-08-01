@@ -6,7 +6,7 @@ mod namespace_read;
 mod node_subnet;
 mod ownership;
 // TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(in crate::sqlite::embedded) mod replicated_create;
 pub(in crate::sqlite::embedded) mod resource_create;
 pub(in crate::sqlite::embedded) mod resource_delete;

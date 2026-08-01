@@ -7,7 +7,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 #[cfg(test)]
-use std::any::Any;
 #[cfg(test)]
 use std::sync::Arc;
 
@@ -30,55 +29,7 @@ fn snapshot_replay_floor_cursor_key(
 }
 
 use klights_cluster_core::{PodEndpointEffect, ResourceMutationEffect};
-
-/// Transaction-derived metadata for an outbox apply. Its fields remain
-/// private so transport and API layers cannot synthesize apply effects.
-#[doc(hidden)]
-pub struct CommittedOutboxApply {
-    result: klights_cluster_core::OutboxApplyOutcome,
-    resource_effect: ResourceMutationEffect,
-    pod_endpoint_effect: PodEndpointEffect,
-    committed_resource: Option<crate::datastore::Resource>,
-}
-
-impl CommittedOutboxApply {
-    pub(crate) const fn new(
-        result: klights_cluster_core::OutboxApplyOutcome,
-        resource_effect: ResourceMutationEffect,
-        pod_endpoint_effect: PodEndpointEffect,
-    ) -> Self {
-        Self {
-            result,
-            resource_effect,
-            pod_endpoint_effect,
-            committed_resource: None,
-        }
-    }
-
-    pub(crate) fn with_committed_resource(
-        mut self,
-        resource: Option<crate::datastore::Resource>,
-    ) -> Self {
-        self.committed_resource = resource;
-        self
-    }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        klights_cluster_core::OutboxApplyOutcome,
-        ResourceMutationEffect,
-        PodEndpointEffect,
-        Option<crate::datastore::Resource>,
-    ) {
-        (
-            self.result,
-            self.resource_effect,
-            self.pod_endpoint_effect,
-            self.committed_resource,
-        )
-    }
-}
+pub use klights_cluster_store::CommittedOutboxApply;
 
 async fn apply_with_default_endpoint_effect<F, Fut>(
     is_pod_status: bool,
@@ -142,14 +93,8 @@ use klights_cluster_store::StagedPostCommit;
 
 pub use klights_cluster_store::{SnapshotExclusiveFence, SnapshotMutationFence};
 
-/// Synchronous, nonblocking post-commit observation port. Implementations are
-/// injected by root composition and must not perform datastore work.
 #[cfg(test)]
-pub trait CommitObservationSink: Send + Sync {
-    fn observe(&self, observations: &[StagedPostCommit]);
-    #[cfg(test)]
-    fn as_any(&self) -> &dyn Any;
-}
+pub use klights_cluster_store::CommitObservationSink;
 
 /// `DatastoreBackend` is the runtime contract. Every state operation goes
 /// through this trait.

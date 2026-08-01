@@ -4,7 +4,7 @@
 //! types via `use super::*;` — the re-exports below make the `types::`
 //! and `backend::` symbols visible to them.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod applier;
 mod cluster_replace;
 mod crud;
@@ -17,8 +17,6 @@ mod rv_helpers;
 mod tests;
 mod watch;
 
-#[cfg(test)]
-use crate::test_fixtures::replicated_create::ReplicatedCreateOptions;
 use anyhow::{Result, anyhow};
 use klights_supervisor::TaskSupervisor;
 use klights_types::{NodeName, PodSubnet};
@@ -64,7 +62,7 @@ use crate::sqlite::live_apply;
 use crate::sqlite::mutation_diagnostics;
 use crate::sqlite::mutation_queries;
 use crate::sqlite::ordinary;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::sqlite::owner_ref_index;
 use crate::sqlite::resource_shape;
 use crate::sqlite::transaction_primitives;
@@ -269,6 +267,24 @@ pub struct Datastore {
     #[cfg(any(test, feature = "test-support"))]
     resource_mutation_pause:
         std::sync::Arc<std::sync::Mutex<Option<ResourceMutationPauseRegistration>>>,
+}
+
+/// Legacy replicated-create fixture carried across the root composition seam.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicatedCreateOptions {
+    pub resource_version: i64,
+    pub meta_uid: Option<String>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ReplicatedCreateOptions {
+    pub fn new(resource_version: i64, meta_uid: Option<String>) -> Self {
+        Self {
+            resource_version,
+            meta_uid,
+        }
+    }
 }
 
 struct AtomicOutboxMutation {
@@ -1598,9 +1614,6 @@ impl Datastore {
                     &mut live,
                 );
                 preserve_server_metadata_fields_from_existing(&mut live, &live_before_patch);
-                if live == live_before_patch {
-                    return Ok((Self::author_live_commit(rv, Vec::new())?, rv));
-                }
                 let uid = ensure_metadata_uid(&mut live);
                 Self::author_live_commit_from_cluster_mutations(
                     rv,
@@ -2131,7 +2144,7 @@ impl Datastore {
             })
             .await
             .map_err(|e| anyhow!("apply resource batch failed: {e}"))?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.publish_watch_events(_pending);
         Ok(())
     }
@@ -2172,7 +2185,7 @@ impl Datastore {
             })
             .await
             .map_err(|e| anyhow!("move pod to cleanup intent failed: {e}"))?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.publish_watch_events(_pending);
         Ok(())
     }
@@ -2266,7 +2279,7 @@ impl Datastore {
             })
             .await
             .map_err(|e| anyhow!("apply cluster maintenance command failed: {e}"))?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.publish_watch_events(_pending);
         Ok(())
     }
@@ -2869,7 +2882,7 @@ impl Datastore {
                 committed_resource,
             } => {
                 if let Some(_pending) = pending {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     self.publish_watch_event(_pending);
                 }
                 Ok(klights_cluster_store::CommittedOutboxApply::new(
@@ -3794,6 +3807,27 @@ impl Datastore {
         &self,
     ) -> std::sync::Arc<crate::sqlite::recovery::SqliteRecoveryStore> {
         self.focused_recovery.clone()
+    }
+
+    pub async fn acquire_snapshot_exclusive_fence(
+        &self,
+    ) -> klights_cluster_store::SnapshotExclusiveFence {
+        klights_cluster_store::SnapshotExclusiveFence::new(
+            self.snapshot_fence.clone().write_owned().await,
+        )
+    }
+
+    pub async fn acquire_snapshot_mutation_fence(
+        &self,
+    ) -> klights_cluster_store::SnapshotMutationFence {
+        klights_cluster_store::SnapshotMutationFence::new(
+            self.snapshot_fence.clone().read_owned().await,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn commit_observation_sink(&self) -> Option<std::sync::Arc<dyn CommitObservationSink>> {
+        self.commit_sink.clone()
     }
 
     async fn from_executor(

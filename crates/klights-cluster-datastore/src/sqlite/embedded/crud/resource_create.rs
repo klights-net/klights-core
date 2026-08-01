@@ -116,7 +116,7 @@ impl Datastore {
                     "ADDED",
                     data.clone(),
                 );
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 self.publish_watch_event(_pending);
 
                 Ok(Resource {
