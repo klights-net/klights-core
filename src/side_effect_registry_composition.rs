@@ -380,7 +380,7 @@ mod tests {
         let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let service_ipam = Arc::new(crate::controllers::service::ServiceIpam::new(
+        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
         let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
@@ -519,7 +519,7 @@ mod tests {
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let metrics = SideEffectMetrics::new();
         let registry = default_registry(metrics.clone(), None, None, Some(db_handle.clone()));
-        let service_ipam = Arc::new(crate::controllers::service::ServiceIpam::new(
+        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
         let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
@@ -630,7 +630,7 @@ mod tests {
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let metrics = SideEffectMetrics::new();
         let registry = default_registry(metrics.clone(), None, None, Some(db_handle.clone()));
-        let service_ipam = Arc::new(crate::controllers::service::ServiceIpam::new(
+        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
         let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
@@ -710,7 +710,7 @@ mod tests {
         let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let metrics = SideEffectMetrics::new();
         let registry = default_registry(metrics.clone(), None, None, Some(db_handle.clone()));
-        let service_ipam = Arc::new(crate::controllers::service::ServiceIpam::new(
+        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
         let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
@@ -747,7 +747,7 @@ mod tests {
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let metrics = SideEffectMetrics::new();
         let registry = default_registry(metrics.clone(), None, None, Some(db_handle.clone()));
-        let service_ipam = Arc::new(crate::controllers::service::ServiceIpam::new(
+        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
         let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
@@ -861,7 +861,7 @@ mod tests {
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let metrics = SideEffectMetrics::new();
         let registry = default_registry(metrics.clone(), None, None, Some(db_handle.clone()));
-        let service_ipam = Arc::new(crate::controllers::service::ServiceIpam::new(
+        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
         let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
@@ -944,7 +944,7 @@ mod tests {
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let metrics = SideEffectMetrics::new();
         let registry = default_registry(metrics.clone(), None, None, Some(db_handle.clone()));
-        let service_ipam = Arc::new(crate::controllers::service::ServiceIpam::new(
+        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
         let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
@@ -1057,7 +1057,7 @@ mod tests {
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let metrics = SideEffectMetrics::new();
         let registry = default_registry(metrics.clone(), None, None, Some(db_handle.clone()));
-        let service_ipam = Arc::new(crate::controllers::service::ServiceIpam::new(
+        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
         let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));

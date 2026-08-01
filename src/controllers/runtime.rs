@@ -271,7 +271,9 @@ impl Context {
         self.dependencies.job_store.as_ref()
     }
 
-    pub(crate) fn service_store(&self) -> &dyn super::service::ServiceControllerStore {
+    pub(crate) fn service_store(
+        &self,
+    ) -> &dyn klights_controllers::service::ServiceControllerStore {
         self.dependencies.service_store.as_ref()
     }
 

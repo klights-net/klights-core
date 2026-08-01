@@ -15,17 +15,12 @@
 
 use crate::controllers::{Context, Controller, ControllerRuntimeDependencies};
 use crate::controllers::{
-    apiservice_controller::APIServiceController,
-    daemonset_controller::DaemonSetController,
-    deployment_controller::DeploymentController,
-    job_controller::JobController,
-    pdb_controller::PDBController,
-    pvc_controller::PVCController,
+    apiservice_controller::APIServiceController, daemonset_controller::DaemonSetController,
+    deployment_controller::DeploymentController, job_controller::JobController,
+    pdb_controller::PDBController, pvc_controller::PVCController,
     replicaset_controller::ReplicaSetController,
     replication_controller_runner::ReplicationControllerController,
-    service::{NodePortAllocator, ServiceIpam},
-    service_controller::ServiceController,
-    statefulset_controller::StatefulSetController,
+    service_controller::ServiceController, statefulset_controller::StatefulSetController,
 };
 #[cfg(test)]
 use crate::datastore::DatastoreHandle;
@@ -33,6 +28,7 @@ use crate::datastore::DatastoreHandle;
 use crate::hpa_controller_adapter::HpaController;
 use anyhow::{Context as _, Result};
 use klights_controllers::DispatcherRuntime;
+use klights_controllers::service::{NodePortAllocator, ServiceIpam};
 use klights_controllers::workqueue::{Key, controller_kind_static};
 use klights_reconcile_api::{
     ControllerReconcileSink, ReconcileKey, ReconcileSinkFuture, ServiceReconcileKey,

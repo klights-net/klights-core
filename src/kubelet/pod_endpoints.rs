@@ -106,7 +106,7 @@ pub async fn reconcile_endpoints_for_pod(
                         .map(|v| v == "true")
                         .unwrap_or(false);
 
-                crate::controllers::endpoints::reconcile_endpoints(
+                klights_controllers::endpoints::reconcile_endpoints(
                     db,
                     pod_reader,
                     service_name,
@@ -118,7 +118,7 @@ pub async fn reconcile_endpoints_for_pod(
                 .await?;
 
                 // Also update EndpointSlice
-                crate::controllers::endpoints::reconcile_endpointslice(
+                klights_controllers::endpoints::reconcile_endpointslice(
                     db,
                     pod_reader,
                     service_name,

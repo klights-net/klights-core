@@ -143,7 +143,7 @@ pub(crate) async fn reconcile_replicationcontroller(
         _ => live_resource,
     };
 
-    let rc = crate::controllers::resource_projection::with_resource_version(
+    let rc = klights_controllers::resource_projection::with_resource_version(
         live_resource.data,
         live_resource.resource_version,
         reconcile_context.wall_time,

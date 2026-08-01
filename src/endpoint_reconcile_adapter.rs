@@ -4,14 +4,11 @@ use klights_reconcile_api::ControllerStoreResult as Result;
 use serde_json::Value;
 
 use crate::controller_store_error_adapter::map_controller_store_error;
-use crate::controllers::endpoints::EndpointReconcileStore;
 use crate::datastore::{DatastoreBackend, ResourceListQuery};
+use klights_controllers::endpoints::EndpointReconcileStore;
 
 #[async_trait]
-impl<T> EndpointReconcileStore for T
-where
-    T: DatastoreBackend + Send + Sync + ?Sized,
-{
+impl EndpointReconcileStore for dyn DatastoreBackend + '_ {
     async fn endpoint_namespace_is_terminating(&self, namespace: &str) -> Result<bool> {
         let Some(resource) = self
             .get_namespace(namespace)

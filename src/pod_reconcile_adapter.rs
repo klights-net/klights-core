@@ -109,7 +109,7 @@ impl PodMutationReconcileSink for PodReconcileAdapter {
                     }
                 }
                 PodMutationReconcileRequest::ServicesAfterUpdate { previous, updated } => {
-                    crate::side_effects::service_pod::enqueue_services_after_pod_update(
+                    klights_controllers::side_effects::service_pod::enqueue_services_after_pod_update(
                         &previous.data,
                         &updated.data,
                         self.db.as_ref(),
@@ -119,7 +119,7 @@ impl PodMutationReconcileSink for PodReconcileAdapter {
                     .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))?;
                 }
                 PodMutationReconcileRequest::ServicesAfterDelete { deleted } => {
-                    crate::side_effects::service_pod::enqueue_services_after_pod_delete(
+                    klights_controllers::side_effects::service_pod::enqueue_services_after_pod_delete(
                         &deleted.data,
                         self.db.as_ref(),
                         &self.dispatcher,
@@ -128,7 +128,7 @@ impl PodMutationReconcileSink for PodReconcileAdapter {
                     .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))?;
                 }
                 PodMutationReconcileRequest::StatusChanged { previous, updated } => {
-                    crate::side_effects::service_pod::enqueue_services_after_pod_update(
+                    klights_controllers::side_effects::service_pod::enqueue_services_after_pod_update(
                         &previous.data,
                         &updated.data,
                         self.db.as_ref(),
@@ -466,7 +466,7 @@ impl PvcReconcileSink for PersistentVolumeReconcileAdapter<'_> {
 impl PodServiceReconcileSink for PodReconcileAdapter {
     fn enqueue_after_pod_create(&self, pod: Resource) -> ReconcileSinkFuture<'_> {
         Box::pin(async move {
-            crate::side_effects::service_pod::enqueue_services_after_pod_create(
+            klights_controllers::side_effects::service_pod::enqueue_services_after_pod_create(
                 &pod.data,
                 self.db.as_ref(),
                 &self.dispatcher,
@@ -482,7 +482,7 @@ impl PodServiceReconcileSink for PodReconcileAdapter {
         updated: Resource,
     ) -> ReconcileSinkFuture<'_> {
         Box::pin(async move {
-            crate::side_effects::service_pod::enqueue_services_after_pod_update(
+            klights_controllers::side_effects::service_pod::enqueue_services_after_pod_update(
                 &previous.data,
                 &updated.data,
                 self.db.as_ref(),

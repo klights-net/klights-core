@@ -1,9 +1,9 @@
 //! `Controller` impl for `Service`.
 
-use crate::controllers::service as service_core;
 use crate::controllers::{Context, Controller};
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_controllers::service as service_core;
 use serde_json::Value;
 use std::sync::Arc;
 

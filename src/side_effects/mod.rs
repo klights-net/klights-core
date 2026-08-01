@@ -11,5 +11,4 @@ pub mod node_taint_manager;
 pub mod pdb;
 pub mod resource_quota;
 pub mod service_account_defaults;
-pub mod service_pod;
 pub mod workload_pod;

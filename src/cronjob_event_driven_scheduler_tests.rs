@@ -23,7 +23,7 @@ async fn make_scheduler() -> (
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let service_ipam = Arc::new(crate::controllers::service::ServiceIpam::new(
+    let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
         "10.43.128.0/17",
     ));
     let dispatcher = Arc::new(

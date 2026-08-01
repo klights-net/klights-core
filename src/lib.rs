@@ -29,6 +29,8 @@ mod daemonset_store_adapter;
 pub mod datastore;
 mod endpoint_mirror_side_effect_adapter;
 mod endpoint_reconcile_adapter;
+#[cfg(test)]
+mod endpoint_reconcile_integration_tests;
 mod endpoint_slice_sync_side_effect_adapter;
 pub mod gc;
 mod gc_delete_adapter;
@@ -79,8 +81,12 @@ mod resource_quota_controller_adapter;
 mod resource_quota_side_effect_adapter;
 mod resource_write_diagnostics;
 mod service_account_defaults_side_effect_adapter;
+#[cfg(test)]
+mod service_pod_integration_tests;
 mod service_pod_side_effect_adapter;
 mod service_reconcile_adapter;
+#[cfg(test)]
+mod service_reconcile_integration_tests;
 pub mod shutdown;
 mod side_effect_registry_composition;
 pub mod side_effects;

@@ -1411,10 +1411,10 @@ mod inner_gate_tests {
             1
         );
         let pod_store = crate::kubelet::pod_repository::store::PodStore::new(db.clone());
-        crate::controllers::endpoints::reconcile_service_endpoints_batch(
+        klights_controllers::endpoints::reconcile_service_endpoints_batch(
             db.as_ref(),
             &pod_store,
-            crate::controllers::endpoints::ServiceEndpointBatchReconcileRequest {
+            klights_controllers::endpoints::ServiceEndpointBatchReconcileRequest {
                 service_name: "web",
                 service_uid: &service.uid,
                 namespace: "default",

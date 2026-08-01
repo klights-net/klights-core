@@ -157,11 +157,11 @@ pub(crate) async fn build_test_app_state_with_db(
 
     let crd_registry = crate::controllers::crd::CrdRegistry::new();
     let config = Arc::new(crate::KlightsConfig::test_default());
-    let service_ipam = Arc::new(crate::controllers::service::ServiceIpam::new(
+    let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
         &config.service_cidr,
     ));
     // F6-02: Create NodePortAllocator and mark as ready for tests
-    let nodeport_alloc = Arc::new(crate::controllers::service::NodePortAllocator::new());
+    let nodeport_alloc = Arc::new(klights_controllers::service::NodePortAllocator::new());
     nodeport_alloc.set_ready();
     let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),

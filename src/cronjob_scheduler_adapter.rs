@@ -128,7 +128,7 @@ mod tests {
         ));
         let dispatcher = Arc::new(
             crate::controllers::ControllerDispatcher::with_task_supervisor(
-                Arc::new(crate::controllers::service::ServiceIpam::new(
+                Arc::new(klights_controllers::service::ServiceIpam::new(
                     "10.43.128.0/17",
                 )),
                 supervisor,

@@ -442,7 +442,14 @@ async fn service_create_releases_cluster_ip_when_nodeport_allocation_fails() {
 
     let state = crate::api::test_support::build_test_app_state().await;
     for port in 30000..=32767 {
-        state.controller_reconcile().nodeport_alloc.mark_used(port);
+        assert_eq!(
+            state
+                .controller_reconcile()
+                .nodeport_alloc
+                .allocate()
+                .unwrap(),
+            port
+        );
     }
     let app = crate::api::build_router(state);
 
@@ -498,7 +505,14 @@ async fn create_service_does_not_enqueue_reconcile_after_allocation_failure() {
     // Exhaust the NodePort range so NodePort allocation inside
     // `prepare_service_for_create` fails for a NodePort Service.
     for port in 30000..=32767 {
-        state.controller_reconcile().nodeport_alloc.mark_used(port);
+        assert_eq!(
+            state
+                .controller_reconcile()
+                .nodeport_alloc
+                .allocate()
+                .unwrap(),
+            port
+        );
     }
     let services: Arc<MockServiceRouter> = Arc::new(MockServiceRouter::new());
     state

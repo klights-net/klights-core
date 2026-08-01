@@ -43,10 +43,11 @@ fn make_crd_value(group: &str, kind: &str, plural: &str, scope: &str) -> serde_j
 
 /// Helper: build a minimal ApiState for HTTP-level tests.
 pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate::api::ApiState {
-    let service_ipam = std::sync::Arc::new(crate::controllers::service::ServiceIpam::new(
+    let service_ipam = std::sync::Arc::new(klights_controllers::service::ServiceIpam::new(
         "10.43.128.0/17",
     ));
-    let nodeport_alloc = std::sync::Arc::new(crate::controllers::service::NodePortAllocator::new());
+    let nodeport_alloc =
+        std::sync::Arc::new(klights_controllers::service::NodePortAllocator::new());
     let controller_dispatcher = std::sync::Arc::new(crate::controllers::ControllerDispatcher::new(
         service_ipam.clone(),
     ));

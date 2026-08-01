@@ -103,7 +103,7 @@ impl CoreDnsBootstrapStore for CoreDnsBootstrapAdapter<'_> {
         node_name: &str,
     ) -> klights_reconcile_api::ControllerStoreResult<()> {
         let now = chrono::Utc::now();
-        let deployment = crate::controllers::resource_projection::with_resource_version(
+        let deployment = klights_controllers::resource_projection::with_resource_version(
             deployment.data,
             deployment.resource_version,
             now,

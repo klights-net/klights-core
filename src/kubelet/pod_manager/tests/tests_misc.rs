@@ -2143,7 +2143,7 @@ async fn test_enqueue_job_reconcile_non_job_owner_is_noop() {
 #[tokio::test]
 async fn test_enqueue_job_reconcile_enqueues_job_key_via_dispatcher() {
     let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    let service_ipam = std::sync::Arc::new(crate::controllers::service::ServiceIpam::new(
+    let service_ipam = std::sync::Arc::new(klights_controllers::service::ServiceIpam::new(
         "10.43.128.0/17",
     ));
     let dispatcher =
@@ -2236,7 +2236,7 @@ async fn test_enqueue_job_reconcile_enqueues_job_key_via_dispatcher() {
 #[tokio::test]
 async fn test_terminal_watch_modified_pod_enqueues_job_reconcile() {
     let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    let service_ipam = std::sync::Arc::new(crate::controllers::service::ServiceIpam::new(
+    let service_ipam = std::sync::Arc::new(klights_controllers::service::ServiceIpam::new(
         "10.43.128.0/17",
     ));
     let dispatcher =

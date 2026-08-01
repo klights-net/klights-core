@@ -4,9 +4,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::controllers::endpoints;
 use crate::datastore::{DatastoreBackend, DatastoreHandle};
 use crate::side_effects::endpoint_mirror::EndpointMirrorStore;
+use klights_controllers::endpoints;
 use klights_controllers::side_effects::SideEffect;
 
 /// Mirrors manually-created/updated Endpoints to EndpointSlices.

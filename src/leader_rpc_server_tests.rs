@@ -3747,7 +3747,7 @@ async fn apply_outbox_pod_status_enqueues_matching_service() {
     .await
     .unwrap();
     let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(Arc::new(
-        crate::controllers::service::ServiceIpam::new("10.43.128.0/17"),
+        klights_controllers::service::ServiceIpam::new("10.43.128.0/17"),
     )));
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(crate::grpc_test_support::replication_service(
@@ -3822,10 +3822,10 @@ async fn apply_outbox_pod_status_enqueues_matching_service() {
         .unwrap()
         .expect("Service row");
     let pod_store = crate::kubelet::pod_repository::store::PodStore::new(db.clone());
-    crate::controllers::endpoints::reconcile_service_endpoints_batch(
+    klights_controllers::endpoints::reconcile_service_endpoints_batch(
         db.as_ref(),
         &pod_store,
-        crate::controllers::endpoints::ServiceEndpointBatchReconcileRequest {
+        klights_controllers::endpoints::ServiceEndpointBatchReconcileRequest {
             service_name: "web",
             service_uid: &service.uid,
             namespace: "default",

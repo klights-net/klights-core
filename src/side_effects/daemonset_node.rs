@@ -103,7 +103,7 @@ mod tests {
     async fn node_label_change_enqueues_daemonsets_without_reconciling_inline() {
         let db = crate::datastore::test_support::in_memory().await;
         let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
-        let service_ipam = Arc::new(crate::controllers::service::ServiceIpam::new(
+        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
         let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));

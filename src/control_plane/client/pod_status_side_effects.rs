@@ -157,7 +157,7 @@ async fn enqueue_pod_status_side_effects_with_endpoint_change(
                 command,
                 StorageCommand::DeleteResource { .. } | StorageCommand::FinalizeBoundPod { .. }
             )) {
-        match crate::side_effects::service_pod::service_reconcile_keys_for_pod(
+        match klights_controllers::side_effects::service_pod::service_reconcile_keys_for_pod(
             &resource.data,
             db,
             namespace,

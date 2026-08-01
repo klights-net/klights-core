@@ -1,69 +1,4 @@
 use super::*;
-#[test]
-fn test_resolve_target_port_zero_falls_back_to_service_port() {
-    let service_port = json!({"port": 100, "targetPort": 0, "protocol": "TCP"});
-    let result = resolve_target_port(&service_port, &[]);
-    assert_eq!(
-        result,
-        Some(100),
-        "targetPort=0 must fall back to service port=100"
-    );
-}
-
-#[test]
-fn test_resolve_target_port_absent_uses_service_port() {
-    let service_port = json!({"port": 200, "protocol": "TCP"});
-    let result = resolve_target_port(&service_port, &[]);
-    assert_eq!(
-        result,
-        Some(200),
-        "absent targetPort must use service port=200"
-    );
-}
-
-#[test]
-fn test_resolve_target_port_nonzero_integer_used_directly() {
-    let service_port = json!({"port": 80, "targetPort": 8080, "protocol": "TCP"});
-    let result = resolve_target_port(&service_port, &[]);
-    assert_eq!(result, Some(8080), "non-zero targetPort must be used as-is");
-}
-
-#[test]
-fn test_resolve_target_port_intorstring_object_string_type_uses_str_val() {
-    let service_port = json!({
-        "port": 80,
-        "targetPort": {
-            "type": 1,
-            "intVal": 0,
-            "strVal": "100"
-        },
-        "protocol": "TCP"
-    });
-    let result = resolve_target_port(&service_port, &[]);
-    assert_eq!(result, Some(100));
-}
-
-#[test]
-fn test_resolve_target_port_intorstring_object_named_port_resolves_container_port() {
-    let pod = json!({
-        "spec": {
-            "containers": [{
-                "ports": [{"name": "portname1", "containerPort": 100, "protocol": "TCP"}]
-            }]
-        }
-    });
-    let service_port = json!({
-        "port": 80,
-        "targetPort": {
-            "type": 1,
-            "intVal": 0,
-            "strVal": "portname1"
-        },
-        "protocol": "TCP"
-    });
-    let result = resolve_target_port(&service_port, &[&pod]);
-    assert_eq!(result, Some(100));
-}
 
 #[tokio::test]
 async fn test_reconcile_endpointslice_sets_empty_name_for_unnamed_service_port() {
@@ -89,7 +24,7 @@ async fn test_reconcile_endpointslice_sets_empty_name_for_unnamed_service_port()
     let selector = json!({"app": "agnhost", "role": "primary"});
     let ports = json!([{"port": 6379, "targetPort": 6379, "protocol": "TCP"}]);
     reconcile_endpointslice(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "agnhost-primary",
         "svc-uid",
@@ -143,7 +78,7 @@ async fn test_mirror_endpoints_to_endpointslice_sets_empty_name_for_unnamed_port
         .unwrap();
     let endpoints = crate::api::inject_resource_version(created.data, created.resource_version);
 
-    mirror_endpoints_to_endpointslice(&db, &endpoints)
+    mirror_endpoints_to_endpointslice(&controller_store(&db), &endpoints)
         .await
         .unwrap();
 
@@ -211,7 +146,7 @@ async fn test_reconcile_endpoints_creates_endpoints_for_matching_pods() {
 
     // Reconcile endpoints
     reconcile_endpoints(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "nginx-service",
         "test",
@@ -299,7 +234,7 @@ async fn test_reconcile_endpoints_empty_when_no_matching_pods() {
 
     // Reconcile endpoints
     reconcile_endpoints(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "nginx-service",
         "test",
@@ -356,7 +291,7 @@ async fn test_reconcile_endpoints_updates_existing_endpoints() {
 
     // First reconcile creates endpoints
     reconcile_endpoints(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "nginx-service",
         "test",
@@ -393,7 +328,7 @@ async fn test_reconcile_endpoints_updates_existing_endpoints() {
 
     // Second reconcile updates endpoints
     reconcile_endpoints(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "nginx-service",
         "test",
@@ -462,7 +397,7 @@ async fn test_reconcile_endpoints_uses_target_port() {
     }]);
 
     reconcile_endpoints(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "nginx-service",
         "test",
@@ -510,7 +445,7 @@ async fn test_reconcile_endpoints_excludes_pods_with_zero_ip() {
     let ports = json!([{"port": 80}]);
 
     reconcile_endpoints(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "nginx-svc",
         "test",
@@ -557,7 +492,7 @@ async fn test_reconcile_endpoints_excludes_pods_with_empty_ip() {
     let ports = json!([{"port": 80}]);
 
     reconcile_endpoints(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "nginx-svc",
         "test",
@@ -606,7 +541,7 @@ async fn test_reconcile_endpoints_no_selector_creates_empty_subsets() {
     // No selector — headless-style service, no automatic endpoint population
     // K8s behavior: controller does NOT create Endpoints when service has no selector
     reconcile_endpoints(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "headless-svc",
         "test",
@@ -636,7 +571,7 @@ async fn test_reconcile_endpoints_empty_selector_does_not_create_endpoints() {
     let ports = json!([{"port": 80}]);
 
     reconcile_endpoints(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "selectorless-svc",
         "test",
@@ -681,7 +616,7 @@ async fn test_reconcile_endpoints_falls_back_to_port_when_no_target_port() {
     let ports = json!([{"port": 80, "protocol": "TCP"}]);
 
     reconcile_endpoints(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "nginx-svc",
         "test",
@@ -739,7 +674,7 @@ async fn test_reconcile_endpointslice_creates_slice_for_matching_pods() {
     let ports = json!([{"port": 80, "targetPort": 8080, "name": "http"}]);
 
     reconcile_endpointslice(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "nginx-service",
         "test-service-uid",
@@ -808,7 +743,7 @@ async fn test_reconcile_endpointslice_empty_matchlabels_does_not_create_slice() 
     let selector = json!({"matchLabels": {}});
     let ports = json!([{"port": 80, "name": "http"}]);
     reconcile_endpointslice(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "selectorless-service",
         "selectorless-service-uid",
@@ -868,7 +803,7 @@ async fn test_reconcile_endpointslice_marks_not_ready_pods() {
     let ports = json!([{"port": 80}]);
 
     reconcile_endpointslice(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "nginx-service",
         "test-service-uid",

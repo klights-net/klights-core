@@ -411,13 +411,15 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     }
 
     let crd_registry = controllers::crd::CrdRegistry::new();
-    let service_ipam = Arc::new(controllers::service::ServiceIpam::new(&config.service_cidr));
-    controllers::service::rebuild_service_ipam_from_services(db, &service_ipam)
+    let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
+        &config.service_cidr,
+    ));
+    klights_controllers::service::rebuild_service_ipam_from_services(db, &service_ipam)
         .await
         .context("Failed to rebuild Service ClusterIP allocator")?;
-    let nodeport_alloc: Arc<controllers::service::NodePortAllocator> =
-        Arc::new(controllers::service::NodePortAllocator::new());
-    controllers::service::rebuild_nodeport_allocator_from_services(db, &nodeport_alloc)
+    let nodeport_alloc: Arc<klights_controllers::service::NodePortAllocator> =
+        Arc::new(klights_controllers::service::NodePortAllocator::new());
+    klights_controllers::service::rebuild_nodeport_allocator_from_services(db, &nodeport_alloc)
         .await
         .context("Failed to rebuild NodePort allocator")?;
 
@@ -1414,10 +1416,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .await
         .context("Failed to bootstrap CoreDNS")?;
     }
-    controllers::service::rebuild_service_ipam_from_services(db, service_ipam.as_ref())
+    klights_controllers::service::rebuild_service_ipam_from_services(db, service_ipam.as_ref())
         .await
         .context("Failed to rebuild Service ClusterIP allocator after bootstrap services")?;
-    controllers::service::rebuild_nodeport_allocator_from_services(db, &nodeport_alloc)
+    klights_controllers::service::rebuild_nodeport_allocator_from_services(db, &nodeport_alloc)
         .await
         .context("Failed to rebuild NodePort allocator after bootstrap services")?;
 

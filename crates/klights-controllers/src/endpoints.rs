@@ -1096,7 +1096,7 @@ pub async fn mirror_endpoints_to_endpointslice_at(
     else {
         return Ok(());
     };
-    let endpoints = crate::controllers::resource_projection::with_resource_version(
+    let endpoints = crate::resource_projection::with_resource_version(
         live_endpoints.data,
         live_endpoints.resource_version,
         now,
@@ -1414,4 +1414,4 @@ pub async fn delete_mirrored_endpointslice_for_endpoints(
 }
 
 #[cfg(test)]
-mod tests;
+mod endpoints_unit_tests;

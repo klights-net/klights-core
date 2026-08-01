@@ -118,9 +118,9 @@ impl ApiDiscoveryAggregationServices {
 pub(crate) struct ApiControllerReconcileServices {
     pub(crate) service_allocations: Arc<dyn klights_reconcile_api::ServiceWriteAllocator>,
     #[cfg(test)]
-    pub(crate) service_ipam: Arc<crate::controllers::service::ServiceIpam>,
+    pub(crate) service_ipam: Arc<klights_controllers::service::ServiceIpam>,
     #[cfg(test)]
-    pub(crate) nodeport_alloc: Arc<crate::controllers::service::NodePortAllocator>,
+    pub(crate) nodeport_alloc: Arc<klights_controllers::service::NodePortAllocator>,
     #[cfg(not(test))]
     pub(crate) controller_dispatcher: Arc<dyn klights_reconcile_api::ControllerDispatcherPort>,
     #[cfg(test)]
@@ -139,8 +139,8 @@ impl ApiControllerReconcileServices {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         service_allocations: Arc<dyn klights_reconcile_api::ServiceWriteAllocator>,
-        #[cfg(test)] service_ipam: Arc<crate::controllers::service::ServiceIpam>,
-        #[cfg(test)] nodeport_alloc: Arc<crate::controllers::service::NodePortAllocator>,
+        #[cfg(test)] service_ipam: Arc<klights_controllers::service::ServiceIpam>,
+        #[cfg(test)] nodeport_alloc: Arc<klights_controllers::service::NodePortAllocator>,
         #[cfg(not(test))] controller_dispatcher: Arc<
             dyn klights_reconcile_api::ControllerDispatcherPort,
         >,

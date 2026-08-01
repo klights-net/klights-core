@@ -389,13 +389,14 @@ impl crate::controllers::job::JobStore for RootControllerLeaderPort {
 }
 
 #[async_trait]
-impl crate::controllers::service::ServiceReconcileStore for RootControllerLeaderPort {
+impl klights_controllers::service::ServiceReconcileStore for RootControllerLeaderPort {
     async fn list_services(&self) -> Result<Vec<Resource>> {
-        crate::controllers::service::ServiceReconcileStore::list_services(self.store.as_ref()).await
+        klights_controllers::service::ServiceReconcileStore::list_services(self.store.as_ref())
+            .await
     }
 
     async fn get_service(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        crate::controllers::service::ServiceReconcileStore::get_service(
+        klights_controllers::service::ServiceReconcileStore::get_service(
             self.store.as_ref(),
             namespace,
             name,
@@ -411,7 +412,7 @@ impl crate::controllers::service::ServiceReconcileStore for RootControllerLeader
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        crate::controllers::service::ServiceReconcileStore::update_service(
+        klights_controllers::service::ServiceReconcileStore::update_service(
             self.store.as_ref(),
             namespace,
             name,
@@ -423,9 +424,9 @@ impl crate::controllers::service::ServiceReconcileStore for RootControllerLeader
 }
 
 #[async_trait]
-impl crate::controllers::endpoints::EndpointReconcileStore for RootControllerLeaderPort {
+impl klights_controllers::endpoints::EndpointReconcileStore for RootControllerLeaderPort {
     async fn endpoint_namespace_is_terminating(&self, namespace: &str) -> Result<bool> {
-        crate::controllers::endpoints::EndpointReconcileStore::endpoint_namespace_is_terminating(
+        klights_controllers::endpoints::EndpointReconcileStore::endpoint_namespace_is_terminating(
             self.store.as_ref(),
             namespace,
         )
@@ -439,7 +440,7 @@ impl crate::controllers::endpoints::EndpointReconcileStore for RootControllerLea
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>> {
-        crate::controllers::endpoints::EndpointReconcileStore::get_resource(
+        klights_controllers::endpoints::EndpointReconcileStore::get_resource(
             self.store.as_ref(),
             api_version,
             kind,
@@ -454,7 +455,7 @@ impl crate::controllers::endpoints::EndpointReconcileStore for RootControllerLea
         namespace: &str,
         service_name: &str,
     ) -> Result<Vec<Resource>> {
-        crate::controllers::endpoints::EndpointReconcileStore::list_service_endpoint_slices(
+        klights_controllers::endpoints::EndpointReconcileStore::list_service_endpoint_slices(
             self.store.as_ref(),
             namespace,
             service_name,
@@ -471,7 +472,7 @@ impl crate::controllers::endpoints::EndpointReconcileStore for RootControllerLea
         data: serde_json::Value,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        crate::controllers::endpoints::EndpointReconcileStore::create_resource(
+        klights_controllers::endpoints::EndpointReconcileStore::create_resource(
             self.store.as_ref(),
             api_version,
             kind,
@@ -492,7 +493,7 @@ impl crate::controllers::endpoints::EndpointReconcileStore for RootControllerLea
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        crate::controllers::endpoints::EndpointReconcileStore::update_resource_with_preconditions(
+        klights_controllers::endpoints::EndpointReconcileStore::update_resource_with_preconditions(
             self.store.as_ref(),
             api_version,
             kind,
@@ -513,7 +514,7 @@ impl crate::controllers::endpoints::EndpointReconcileStore for RootControllerLea
         preconditions: ResourcePreconditions,
     ) -> Result<()> {
         validate_controller_effect()?;
-        crate::controllers::endpoints::EndpointReconcileStore::delete_resource_with_preconditions(
+        klights_controllers::endpoints::EndpointReconcileStore::delete_resource_with_preconditions(
             self.store.as_ref(),
             api_version,
             kind,
@@ -526,7 +527,7 @@ impl crate::controllers::endpoints::EndpointReconcileStore for RootControllerLea
 
     async fn apply_resource_batch(&self, operations: Vec<ResourceBatchOperation>) -> Result<()> {
         validate_controller_effect()?;
-        crate::controllers::endpoints::EndpointReconcileStore::apply_resource_batch(
+        klights_controllers::endpoints::EndpointReconcileStore::apply_resource_batch(
             self.store.as_ref(),
             operations,
         )

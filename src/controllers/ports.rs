@@ -15,9 +15,9 @@ use super::{
     pvc::PvcStore,
     replicaset::{ReplicaSetPodMutation, ReplicaSetStore},
     replicationcontroller::{ReplicationControllerPodMutation, ReplicationControllerStore},
-    service::ServiceControllerStore,
     statefulset::{StatefulSetPodMutation, StatefulSetStore},
 };
+use klights_controllers::service::ServiceControllerStore;
 
 #[async_trait]
 #[cfg_attr(test, allow(dead_code))]

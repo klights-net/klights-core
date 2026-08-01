@@ -2,8 +2,11 @@
 
 mod coordination;
 mod dispatcher;
+pub mod endpoints;
 mod lease_loop;
+pub mod resource_projection;
 pub mod scheduler;
+pub mod service;
 pub mod side_effects;
 pub mod workqueue;
 

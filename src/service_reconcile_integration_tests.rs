@@ -1,4 +1,30 @@
-use super::*;
+use klights_controllers::service::*;
+use serde_json::json;
+
+fn controller_store(
+    db: &crate::datastore::sqlite::Datastore,
+) -> crate::controller_runtime_adapter::RootControllerLeaderPort {
+    crate::controller_runtime_adapter::RootControllerLeaderPort::new(std::sync::Arc::new(
+        db.clone(),
+    ))
+}
+
+async fn reconcile_service(
+    db: &(impl ServiceControllerStore + ?Sized),
+    pod_reader: &(impl klights_pod_api::PodQuery + ?Sized),
+    service: &serde_json::Value,
+    service_ipam: &ServiceIpam,
+) -> anyhow::Result<serde_json::Value> {
+    reconcile_service_with_nodeport_at(
+        db,
+        pod_reader,
+        service,
+        service_ipam,
+        &NodePortAllocator::new(),
+        chrono::Utc::now(),
+    )
+    .await
+}
 
 #[tokio::test]
 async fn test_service_stale_snapshot_after_delete_does_not_recreate_endpoints() {
@@ -63,7 +89,7 @@ async fn test_service_stale_snapshot_after_delete_does_not_recreate_endpoints() 
         .unwrap();
 
     reconcile_service(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         &stale_snapshot,
         &service_ipam,
@@ -145,7 +171,7 @@ async fn service_reconcile_commits_endpointslice_and_legacy_endpoints_in_one_bat
         crate::api::inject_resource_version(created.data, created.resource_version);
 
     reconcile_service(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         &service_snapshot,
         &service_ipam,
@@ -292,21 +318,6 @@ fn test_ipam_release_nonexistent_is_noop() {
 }
 
 #[test]
-fn test_parse_ip_to_u32_valid() {
-    assert_eq!(parse_ip_to_u32("10.43.128.2"), Some(0x0A2B8002));
-    assert_eq!(parse_ip_to_u32("0.0.0.0"), Some(0));
-    assert_eq!(parse_ip_to_u32("255.255.255.255"), Some(0xFFFFFFFF));
-}
-
-#[test]
-fn test_parse_ip_to_u32_invalid() {
-    assert_eq!(parse_ip_to_u32(""), None);
-    assert_eq!(parse_ip_to_u32("not.an.ip"), None);
-    assert_eq!(parse_ip_to_u32("10.43.128"), None);
-    assert_eq!(parse_ip_to_u32("10.43.128.2.5"), None);
-}
-
-#[test]
 fn test_ipam_release_invalid_ip_is_noop() {
     let ipam = ServiceIpam::new("10.43.128.0/17");
     // Releasing invalid IP strings should not panic
@@ -422,7 +433,7 @@ async fn test_reconcile_service_preserves_headless_cluster_ip_none() {
     }
 
     let result = reconcile_service(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         &service,
         &service_ipam,
@@ -497,7 +508,7 @@ async fn test_reconcile_service_allocates_cluster_ip_when_not_set() {
     }
 
     let result = reconcile_service(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         &service,
         &service_ipam,
@@ -568,7 +579,7 @@ async fn test_service_external_name_no_cluster_ip() {
     }
 
     let result = reconcile_service(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         &service,
         &service_ipam,
@@ -634,7 +645,7 @@ async fn test_service_external_name_no_endpoints() {
     }
 
     let _result = reconcile_service(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         &service,
         &service_ipam,
@@ -651,106 +662,6 @@ async fn test_service_external_name_no_endpoints() {
         matches!(endpoints, Ok(None)),
         "ExternalName service must not create Endpoints"
     );
-}
-
-#[test]
-fn test_externalname_service_clears_clusterip_on_type_change() {
-    // When a service has type=ExternalName, normalize_externalname_spec must
-    // clear clusterIP and clusterIPs regardless of what values they have.
-    // This mirrors what reconcile_service does before persisting.
-    let mut spec = serde_json::Map::new();
-    spec.insert("type".to_string(), json!("ExternalName"));
-    spec.insert("externalName".to_string(), json!("database.example.com"));
-    spec.insert("clusterIP".to_string(), json!("10.43.128.2"));
-    spec.insert("clusterIPs".to_string(), json!(["10.43.128.2"]));
-
-    clear_externalname_invalid_fields(&mut spec);
-
-    assert_eq!(
-        spec.get("clusterIP").and_then(|v| v.as_str()),
-        Some(""),
-        "ExternalName service must have empty string clusterIP"
-    );
-    assert_eq!(
-        spec.get("clusterIPs")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len()),
-        Some(0),
-        "ExternalName service must have empty clusterIPs array"
-    );
-}
-
-#[test]
-fn test_externalname_clear_noop_for_clusterip_type() {
-    // ClusterIP services must NOT be modified by the ExternalName clearing logic.
-    let mut spec = serde_json::Map::new();
-    spec.insert("type".to_string(), json!("ClusterIP"));
-    spec.insert("clusterIP".to_string(), json!("10.43.128.2"));
-    spec.insert("clusterIPs".to_string(), json!(["10.43.128.2"]));
-
-    clear_externalname_invalid_fields(&mut spec);
-
-    assert_eq!(
-        spec.get("clusterIP").and_then(|v| v.as_str()),
-        Some("10.43.128.2"),
-        "ClusterIP service must keep its clusterIP"
-    );
-}
-
-#[test]
-fn test_externalname_clears_per_port_node_port_on_type_change() {
-    // P0-E2E-20260423-07 regression: a NodePort service transitioning to
-    // ExternalName must drop every per-port `nodePort` allocation as
-    // well as `clusterIP`/`clusterIPs`. Conformance asserts
-    // Spec.Ports[0].NodePort is unset on the persisted ExternalName form.
-    let mut spec = serde_json::Map::new();
-    spec.insert("type".to_string(), json!("ExternalName"));
-    spec.insert("externalName".to_string(), json!("backend.example.com"));
-    spec.insert("clusterIP".to_string(), json!("10.43.128.5"));
-    spec.insert("clusterIPs".to_string(), json!(["10.43.128.5"]));
-    spec.insert(
-        "ports".to_string(),
-        json!([
-            {"port": 80,  "targetPort": 8080, "protocol": "TCP", "nodePort": 30080},
-            {"port": 443, "targetPort": 8443, "protocol": "TCP", "nodePort": 30443},
-        ]),
-    );
-
-    clear_externalname_invalid_fields(&mut spec);
-
-    let ports = spec
-        .get("ports")
-        .and_then(|p| p.as_array())
-        .expect("ports preserved");
-    for port in ports {
-        assert!(
-            port.get("nodePort").is_none(),
-            "ExternalName port must not retain nodePort, got: {port}"
-        );
-    }
-}
-
-#[test]
-fn test_externalname_clear_preserves_node_port_for_non_externalname_types() {
-    // NodePort services must keep their nodePort allocations when the
-    // helper is invoked (it's a no-op outside the ExternalName branch).
-    let mut spec = serde_json::Map::new();
-    spec.insert("type".to_string(), json!("NodePort"));
-    spec.insert("clusterIP".to_string(), json!("10.43.128.6"));
-    spec.insert(
-        "ports".to_string(),
-        json!([{"port": 80, "nodePort": 30080}]),
-    );
-
-    clear_externalname_invalid_fields(&mut spec);
-
-    let np = spec
-        .get("ports")
-        .and_then(|p| p.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|p| p.get("nodePort"))
-        .and_then(|v| v.as_u64());
-    assert_eq!(np, Some(30080), "NodePort service must keep its nodePort");
 }
 
 #[tokio::test]
@@ -790,7 +701,7 @@ async fn test_service_external_name_no_endpoint_slice() {
     }
 
     let _result = reconcile_service(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         &service,
         &service_ipam,
@@ -856,39 +767,6 @@ fn test_reconcile_service_defaults_type_to_clusterip_when_empty() {
     );
 }
 
-#[test]
-fn test_normalize_service_ports_defaults_protocol_and_target_port() {
-    let mut spec = serde_json::Map::new();
-    spec.insert("ports".to_string(), json!([{"port": 6379}]));
-
-    normalize_service_ports(&mut spec);
-
-    let ports = spec
-        .get("ports")
-        .and_then(|p| p.as_array())
-        .expect("ports must exist");
-    assert_eq!(ports[0]["protocol"], "TCP");
-    assert_eq!(ports[0]["targetPort"], 6379);
-}
-
-#[test]
-fn test_normalize_service_ports_keeps_explicit_values() {
-    let mut spec = serde_json::Map::new();
-    spec.insert(
-        "ports".to_string(),
-        json!([{"port": 80, "targetPort": "http", "protocol": "UDP"}]),
-    );
-
-    normalize_service_ports(&mut spec);
-
-    let ports = spec
-        .get("ports")
-        .and_then(|p| p.as_array())
-        .expect("ports must exist");
-    assert_eq!(ports[0]["protocol"], "UDP");
-    assert_eq!(ports[0]["targetPort"], "http");
-}
-
 #[tokio::test]
 async fn test_reconcile_service_defaults_single_stack_ip_family_fields() {
     let db = crate::datastore::test_support::in_memory().await;
@@ -912,7 +790,7 @@ async fn test_reconcile_service_defaults_single_stack_ip_family_fields() {
     let service = crate::api::inject_resource_version(created.data, created.resource_version);
 
     let result = reconcile_service(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         &service,
         &service_ipam,
@@ -933,7 +811,7 @@ fn test_nodeport_allocator_skips_already_used_ports() {
     // Set allocator to ready state
     alloc.set_ready();
     // Pre-allocate 30000
-    alloc.mark_used(30000);
+    assert_eq!(alloc.allocate().unwrap(), 30000);
     // First free allocation must skip 30000 and return 30001
     let port = alloc.allocate().unwrap();
     assert_ne!(port, 30000, "Must not allocate already-used port 30000");
@@ -957,9 +835,9 @@ fn test_nodeport_allocator_mark_used_then_allocate_skips() {
     let alloc = NodePortAllocator::new();
     alloc.set_ready();
     // Mark a range as used
-    alloc.mark_used(30000);
-    alloc.mark_used(30001);
-    alloc.mark_used(30002);
+    assert_eq!(alloc.allocate().unwrap(), 30000);
+    assert_eq!(alloc.allocate().unwrap(), 30001);
+    assert_eq!(alloc.allocate().unwrap(), 30002);
     // First allocation should skip to 30003
     assert_eq!(alloc.allocate().unwrap(), 30003);
 }
@@ -973,7 +851,7 @@ fn test_nodeport_allocator_collision_avoidance_matches_real_allocation_flow() {
     alloc.set_ready();
 
     // Bootstrap: existing service occupies 30000
-    alloc.mark_used(30000);
+    assert_eq!(alloc.allocate().unwrap(), 30000);
 
     // New service request: must get a different port
     let new_port = alloc.allocate().unwrap();
@@ -1062,7 +940,7 @@ async fn test_nodeport_allocator_rebuild_scans_existing_services() {
 
     // Create a fresh allocator and rebuild from DB
     let alloc = Arc::new(NodePortAllocator::new());
-    rebuild_nodeport_allocator_from_services(&db, &alloc)
+    rebuild_nodeport_allocator_from_services(&controller_store(&db), &alloc)
         .await
         .unwrap();
 
@@ -1082,7 +960,7 @@ fn nodeport_allocator_exhaustion_returns_error() {
     alloc.set_ready();
     // Exhaust the entire range
     for port in 30000..=32767 {
-        alloc.mark_used(port);
+        assert_eq!(alloc.allocate().unwrap(), port);
     }
     let result = alloc.allocate();
     assert!(
@@ -1144,10 +1022,16 @@ async fn service_reconcile_recovers_cluster_ip_after_generic_service_delete() {
         serde_json::json!(created_first.resource_version.to_string());
     first["metadata"]["uid"] = serde_json::json!(created_first.uid);
 
-    let first_result =
-        reconcile_service_with_nodeport(&db, pod_reader.as_ref(), &first, &ipam, &alloc)
-            .await
-            .unwrap();
+    let first_result = reconcile_service_with_nodeport_at(
+        &controller_store(&db),
+        pod_reader.as_ref(),
+        &first,
+        &ipam,
+        &alloc,
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
     assert_eq!(first_result["spec"]["clusterIP"], "10.0.0.2");
 
     // Namespace termination, delete-collection, and GC delete Service rows
@@ -1174,10 +1058,16 @@ async fn service_reconcile_recovers_cluster_ip_after_generic_service_delete() {
         serde_json::json!(created_second.resource_version.to_string());
     second["metadata"]["uid"] = serde_json::json!(created_second.uid);
 
-    let second_result =
-        reconcile_service_with_nodeport(&db, pod_reader.as_ref(), &second, &ipam, &alloc)
-            .await
-            .unwrap();
+    let second_result = reconcile_service_with_nodeport_at(
+        &controller_store(&db),
+        pod_reader.as_ref(),
+        &second,
+        &ipam,
+        &alloc,
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(second_result["spec"]["clusterIP"], "10.0.0.2");
 }
@@ -1215,12 +1105,13 @@ async fn reconcile_idempotent_does_not_churn_resource_version() {
         meta_obj.insert("uid".to_string(), serde_json::json!(created.uid));
     }
 
-    let result = reconcile_service_with_nodeport(
-        &db,
+    let result = reconcile_service_with_nodeport_at(
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         &svc,
         &ipam,
         &alloc,
+        chrono::Utc::now(),
     )
     .await
     .unwrap();
@@ -1232,12 +1123,13 @@ async fn reconcile_idempotent_does_not_churn_resource_version() {
     assert!(rv1 > created.resource_version);
 
     // Second reconcile — no changes, must not bump resourceVersion.
-    let result2 = reconcile_service_with_nodeport(
-        &db,
+    let result2 = reconcile_service_with_nodeport_at(
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         &result,
         &ipam,
         &alloc,
+        chrono::Utc::now(),
     )
     .await
     .unwrap();
@@ -1289,8 +1181,13 @@ async fn create_service_returns_error_when_allocation_fails() {
         "metadata": {"name": "new-svc", "namespace": "default"},
         "spec": {"type": "ClusterIP", "ports": [{"port": 80, "protocol": "TCP"}]}
     });
-    let result =
-        prepare_service_for_create(&db, &mut new_svc, &service_ipam, &nodeport_alloc).await;
+    let result = prepare_service_for_create(
+        &controller_store(&db),
+        &mut new_svc,
+        &service_ipam,
+        &nodeport_alloc,
+    )
+    .await;
     assert!(
         result.is_err(),
         "prepare_service_for_create must return Err when ClusterIP pool is exhausted"
@@ -1327,9 +1224,14 @@ async fn prepare_service_for_create_populates_allocated_fields() {
         "metadata": {"name": "my-svc", "namespace": "default"},
         "spec": {"type": "ClusterIP", "ports": [{"port": 80, "protocol": "TCP"}]}
     });
-    let pending = prepare_service_for_create(&db, &mut svc, &service_ipam, &nodeport_alloc)
-        .await
-        .expect("prepare_service_for_create must succeed when IPs are available");
+    let pending = prepare_service_for_create(
+        &controller_store(&db),
+        &mut svc,
+        &service_ipam,
+        &nodeport_alloc,
+    )
+    .await
+    .expect("prepare_service_for_create must succeed when IPs are available");
 
     let cluster_ip = svc
         .pointer("/spec/clusterIP")
@@ -1345,10 +1247,12 @@ async fn prepare_service_for_create_populates_allocated_fields() {
             .is_some_and(|arr| !arr.is_empty()),
         "response must carry non-empty clusterIPs"
     );
-    // pending tracks the allocation for rollback if the datastore create fails
-    assert!(
-        pending.cluster_ip.is_some(),
-        "PendingServiceAllocations must track allocated ClusterIP for rollback"
+    // Pending allocations must release the exact ClusterIP on create rollback.
+    pending.release(&service_ipam, &nodeport_alloc);
+    assert_eq!(
+        service_ipam.allocate().unwrap(),
+        cluster_ip,
+        "PendingServiceAllocations must track the allocated ClusterIP for rollback"
     );
 }
 

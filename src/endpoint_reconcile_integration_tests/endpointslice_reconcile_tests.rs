@@ -26,7 +26,7 @@ async fn test_mirror_endpoints_sets_owner_reference() {
         .unwrap();
     let endpoints = crate::api::inject_resource_version(created.data, created.resource_version);
 
-    mirror_endpoints_to_endpointslice(&db, &endpoints)
+    mirror_endpoints_to_endpointslice(&controller_store(&db), &endpoints)
         .await
         .unwrap();
 
@@ -82,7 +82,7 @@ async fn test_mirror_endpoints_stale_snapshot_after_delete_does_not_recreate_sli
         .await
         .unwrap();
 
-    mirror_endpoints_to_endpointslice(&db, &stale_snapshot)
+    mirror_endpoints_to_endpointslice(&controller_store(&db), &stale_snapshot)
         .await
         .unwrap();
 
@@ -139,7 +139,7 @@ async fn test_reconcile_endpointslice_named_target_port_resolves_to_container_po
     let ports = json!([{"port": 80, "targetPort": "http", "protocol": "TCP", "name": "http"}]);
 
     reconcile_endpointslice(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "nginx-service",
         "test-service-uid",
@@ -213,7 +213,7 @@ async fn test_reconcile_endpointslice_splits_named_target_ports_per_resolved_por
     }]);
 
     reconcile_endpointslice(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "example-named-port",
         "svc-uid",
@@ -302,7 +302,7 @@ async fn test_reconcile_endpointslice_create_conflict_recovers_to_desired_state(
     let desired_slice_name = format!("{service_name}-klights-1");
 
     reconcile_endpointslice(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         service_name,
         "svc-uid",
@@ -353,7 +353,7 @@ async fn test_reconcile_endpointslice_create_conflict_recovers_to_desired_state(
     .unwrap();
 
     reconcile_endpointslice(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         service_name,
         "svc-uid",
@@ -428,7 +428,7 @@ async fn test_reconcile_endpointslice_numeric_string_target_port_and_skip_unreso
     ]);
 
     reconcile_endpointslice(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "multi-endpoint-test",
         "svc-uid-3",
@@ -501,7 +501,7 @@ async fn test_reconcile_endpoints_named_target_port_resolves_to_container_port()
     let ports = json!([{"port": 80, "targetPort": "http", "protocol": "TCP"}]);
 
     reconcile_endpoints(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "nginx-service",
         "test",
@@ -565,7 +565,7 @@ async fn test_reconcile_endpoints_numeric_string_target_port_and_skip_unresolved
     ]);
 
     reconcile_endpoints(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "multi-endpoint-test",
         "test",
@@ -635,7 +635,7 @@ async fn test_reconcile_endpoints_preserves_service_port_name() {
     }]);
 
     reconcile_endpoints(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "svc",
         "test",
@@ -711,7 +711,7 @@ async fn test_endpointslice_deleted_when_service_deleted_via_cascade() {
     let selector = json!({"app": "nginx"});
     let ports = json!([{"port": 80, "targetPort": 8080}]);
     reconcile_endpointslice(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "test-service",
         "test-service-uid-123",
@@ -740,7 +740,7 @@ async fn test_endpointslice_deleted_when_service_deleted_via_cascade() {
     // Now simulate cascade delete (what happens when Service is deleted)
     let coordination = klights_controllers::ControllerCoordination::new();
     crate::controllers::gc::cascade_delete_with_uid(
-        &db,
+        &controller_store(&db),
         "test-service-uid-123",
         "v1",
         "test-service",
@@ -796,7 +796,7 @@ async fn test_endpointslice_ports_match_service_targetport() {
     let ports = json!([{"port": 80, "targetPort": 8080, "protocol": "TCP"}]);
 
     reconcile_endpointslice(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "web-svc",
         "svc-uid-1",
@@ -850,7 +850,7 @@ async fn test_endpointslice_ports_use_service_port_when_no_targetport() {
     let ports = json!([{"port": 9000, "protocol": "TCP"}]);
 
     reconcile_endpointslice(
-        &db,
+        &controller_store(&db),
         crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
         "web-svc",
         "svc-uid-2",
@@ -916,7 +916,7 @@ async fn test_endpointslice_ports_not_zero() {
         let svc_name = format!("web-svc-{}", test_case.replace(' ', "-"));
         let slice_name = format!("{}-klights", svc_name);
         reconcile_endpointslice(
-            &db,
+            &controller_store(&db),
             crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
             &svc_name,
             &format!("uid-{}", test_case),

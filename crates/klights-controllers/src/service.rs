@@ -27,12 +27,12 @@ pub trait ServiceReconcileStore: Send + Sync {
 }
 
 pub trait ServiceControllerStore:
-    ServiceReconcileStore + crate::controllers::endpoints::EndpointReconcileStore
+    ServiceReconcileStore + crate::endpoints::EndpointReconcileStore
 {
 }
 
 impl<T> ServiceControllerStore for T where
-    T: ServiceReconcileStore + crate::controllers::endpoints::EndpointReconcileStore + ?Sized
+    T: ServiceReconcileStore + crate::endpoints::EndpointReconcileStore + ?Sized
 {
 }
 
@@ -692,10 +692,10 @@ pub async fn reconcile_service_with_nodeport_at(
             .get("uid")
             .and_then(|u| u.as_str())
             .unwrap_or("");
-        crate::controllers::endpoints::reconcile_service_endpoints_batch(
+        crate::endpoints::reconcile_service_endpoints_batch(
             db,
             pod_reader,
-            crate::controllers::endpoints::ServiceEndpointBatchReconcileRequest {
+            crate::endpoints::ServiceEndpointBatchReconcileRequest {
                 service_name: updated_metadata
                     .get("name")
                     .and_then(|n| n.as_str())
@@ -778,7 +778,7 @@ pub async fn allocate_service_fields_for_api_write(
     let Some(live_service) = db.get_service(namespace, name).await? else {
         return Ok(None);
     };
-    let service = crate::controllers::resource_projection::with_resource_version(
+    let service = crate::resource_projection::with_resource_version(
         live_service.data,
         live_service.resource_version,
         now,
@@ -820,13 +820,10 @@ pub async fn allocate_service_fields_for_api_write(
         (std::sync::Arc::new(service.clone()), current_rv)
     };
 
-    let service_with_rv = crate::controllers::resource_projection::with_resource_version(
-        updated_data.clone(),
-        updated_rv,
-        now,
-    );
+    let service_with_rv =
+        crate::resource_projection::with_resource_version(updated_data.clone(), updated_rv, now);
     Ok(Some(service_with_rv))
 }
 
 #[cfg(test)]
-mod tests;
+mod service_unit_tests;

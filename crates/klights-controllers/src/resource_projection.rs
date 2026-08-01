@@ -6,7 +6,7 @@ use serde_json::Value;
 ///
 /// This mirrors the API response identity projection without making
 /// controllers depend on API-server ownership.
-pub(crate) fn with_resource_version(
+pub fn with_resource_version(
     data: impl Into<Arc<Value>>,
     resource_version: i64,
     now: chrono::DateTime<chrono::Utc>,

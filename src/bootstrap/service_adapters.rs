@@ -2,15 +2,15 @@ use std::sync::Arc;
 
 pub(crate) struct ApiServiceWriteAllocator {
     db: crate::datastore::DatastoreHandle,
-    service_ipam: Arc<crate::controllers::service::ServiceIpam>,
-    nodeport_alloc: Arc<crate::controllers::service::NodePortAllocator>,
+    service_ipam: Arc<klights_controllers::service::ServiceIpam>,
+    nodeport_alloc: Arc<klights_controllers::service::NodePortAllocator>,
 }
 
 impl ApiServiceWriteAllocator {
     pub(crate) fn new(
         db: crate::datastore::DatastoreHandle,
-        service_ipam: Arc<crate::controllers::service::ServiceIpam>,
-        nodeport_alloc: Arc<crate::controllers::service::NodePortAllocator>,
+        service_ipam: Arc<klights_controllers::service::ServiceIpam>,
+        nodeport_alloc: Arc<klights_controllers::service::NodePortAllocator>,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,
@@ -21,9 +21,9 @@ impl ApiServiceWriteAllocator {
 }
 
 struct ApiServiceAllocationReservation {
-    pending: crate::controllers::service::PendingServiceAllocations,
-    service_ipam: Arc<crate::controllers::service::ServiceIpam>,
-    nodeport_alloc: Arc<crate::controllers::service::NodePortAllocator>,
+    pending: klights_controllers::service::PendingServiceAllocations,
+    service_ipam: Arc<klights_controllers::service::ServiceIpam>,
+    nodeport_alloc: Arc<klights_controllers::service::NodePortAllocator>,
 }
 
 impl klights_reconcile_api::ServiceAllocationReservation for ApiServiceAllocationReservation {
@@ -46,7 +46,7 @@ impl klights_reconcile_api::ServiceWriteAllocator for ApiServiceWriteAllocator {
         Box<dyn klights_reconcile_api::ServiceAllocationReservation>,
     > {
         Box::pin(async move {
-            let pending = crate::controllers::service::prepare_service_for_create(
+            let pending = klights_controllers::service::prepare_service_for_create(
                 self.db.as_ref(),
                 service,
                 &self.service_ipam,
@@ -72,7 +72,7 @@ impl klights_reconcile_api::ServiceWriteAllocator for ApiServiceWriteAllocator {
         service: &'a serde_json::Value,
     ) -> klights_reconcile_api::ServiceAllocationFuture<'a, Option<serde_json::Value>> {
         Box::pin(async move {
-            crate::controllers::service::allocate_service_fields_for_api_write(
+            klights_controllers::service::allocate_service_fields_for_api_write(
                 self.db.as_ref(),
                 service,
                 &self.service_ipam,
@@ -87,7 +87,7 @@ impl klights_reconcile_api::ServiceWriteAllocator for ApiServiceWriteAllocator {
     }
 
     fn release_resource(&self, service: &serde_json::Value) {
-        crate::controllers::service::release_service_allocations_from_resource(
+        klights_controllers::service::release_service_allocations_from_resource(
             &self.service_ipam,
             &self.nodeport_alloc,
             service,

@@ -551,7 +551,7 @@ async fn test_delete_controller_managed_endpointslice_queues_service_reconcile()
         .await
         .unwrap();
 
-    crate::controllers::endpoints::reconcile_endpointslice(
+    klights_controllers::endpoints::reconcile_endpointslice(
         db.as_ref(),
         pod_repository.as_ref(),
         "example",

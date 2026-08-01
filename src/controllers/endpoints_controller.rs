@@ -3,10 +3,10 @@
 //! This module provides a trait-based implementation of the Endpoints controller,
 //! wrapping the existing free-function reconcile logic.
 
-use crate::controllers::endpoints as endpoints_core;
 use crate::controllers::{Context, Controller};
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_controllers::endpoints as endpoints_core;
 use serde_json::Value;
 
 /// Legacy `Controller` wrapper for the Endpoints reconciler.

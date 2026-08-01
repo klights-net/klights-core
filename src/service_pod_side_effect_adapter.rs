@@ -2,13 +2,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::datastore::{DatastoreBackend, ResourceListQuery};
-use crate::side_effects::service_pod::{ServiceEndpointState, ServicePodStore};
+use klights_controllers::side_effects::service_pod::{ServiceEndpointState, ServicePodStore};
 
 #[async_trait]
-impl<T> ServicePodStore for T
-where
-    T: DatastoreBackend + ?Sized,
-{
+impl ServicePodStore for dyn DatastoreBackend + '_ {
     async fn load_service_endpoint_state(&self, namespace: &str) -> Result<ServiceEndpointState> {
         let services = self
             .list_resources("v1", "Service", Some(namespace), ResourceListQuery::all())

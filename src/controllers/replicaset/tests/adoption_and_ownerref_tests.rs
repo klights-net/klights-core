@@ -69,7 +69,7 @@ async fn test_replicaset_scale_subresource() {
             webhook_auth_ca_bundle: None,
         }
     });
-    let service_ipam = std::sync::Arc::new(crate::controllers::service::ServiceIpam::new(
+    let service_ipam = std::sync::Arc::new(klights_controllers::service::ServiceIpam::new(
         "10.43.128.0/17",
     ));
     let _controller_dispatcher = std::sync::Arc::new(

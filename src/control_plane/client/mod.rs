@@ -1044,7 +1044,7 @@ mod tests {
             crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(Arc::new(db.clone())),
         ));
         let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(Arc::new(
-            crate::controllers::service::ServiceIpam::new("10.43.128.0/17"),
+            klights_controllers::service::ServiceIpam::new("10.43.128.0/17"),
         )));
         dispatcher
             .set_pod_repository(crate::controllers::test_utils::pod_repository_for_test(&db))
@@ -1147,7 +1147,7 @@ mod tests {
             crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(Arc::new(db.clone())),
         ));
         let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(Arc::new(
-            crate::controllers::service::ServiceIpam::new("10.43.128.0/17"),
+            klights_controllers::service::ServiceIpam::new("10.43.128.0/17"),
         )));
         dispatcher
             .set_pod_repository(crate::controllers::test_utils::pod_repository_for_test(&db))

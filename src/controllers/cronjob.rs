@@ -1039,7 +1039,7 @@ mod tests {
         .unwrap();
 
         let dispatcher = std::sync::Arc::new(crate::controllers::ControllerDispatcher::new(
-            std::sync::Arc::new(crate::controllers::service::ServiceIpam::new(
+            std::sync::Arc::new(klights_controllers::service::ServiceIpam::new(
                 "10.43.128.0/17",
             )),
         ));

@@ -302,7 +302,7 @@ async fn redrive_zero_replica_old_replicasets_with_live_pods(
             continue;
         }
 
-        let rs_with_metadata = crate::controllers::resource_projection::with_resource_version(
+        let rs_with_metadata = klights_controllers::resource_projection::with_resource_version(
             rs.data.clone(),
             rs.resource_version,
             ctx.wall_time,
@@ -597,7 +597,7 @@ pub(crate) async fn reconcile_deployment(
         Some(resource) => resource,
         None => return Ok(()),
     };
-    let live_deployment = crate::controllers::resource_projection::with_resource_version(
+    let live_deployment = klights_controllers::resource_projection::with_resource_version(
         live_deployment_resource.data.clone(),
         live_deployment_resource.resource_version,
         reconcile_context.wall_time,
@@ -969,7 +969,7 @@ pub(crate) async fn reconcile_deployment(
                     )
                     .await?;
                     let rs_with_metadata =
-                        crate::controllers::resource_projection::with_resource_version(
+                        klights_controllers::resource_projection::with_resource_version(
                             updated.data,
                             updated.resource_version,
                             reconcile_context.wall_time,
@@ -1022,7 +1022,7 @@ pub(crate) async fn reconcile_deployment(
                 )
                 .await?;
                 let rs_with_metadata =
-                    crate::controllers::resource_projection::with_resource_version(
+                    klights_controllers::resource_projection::with_resource_version(
                         updated.data,
                         updated.resource_version,
                         reconcile_context.wall_time,
@@ -1164,7 +1164,7 @@ pub(crate) async fn reconcile_deployment(
                 .await?;
                 reconciled_rs_names.insert(target.name.clone());
                 let rs_with_metadata =
-                    crate::controllers::resource_projection::with_resource_version(
+                    klights_controllers::resource_projection::with_resource_version(
                         updated.data,
                         updated.resource_version,
                         reconcile_context.wall_time,
@@ -1203,7 +1203,7 @@ pub(crate) async fn reconcile_deployment(
                 }
 
                 let rs_with_metadata =
-                    crate::controllers::resource_projection::with_resource_version(
+                    klights_controllers::resource_projection::with_resource_version(
                         old_rs.data.clone(),
                         old_rs.resource_version,
                         reconcile_context.wall_time,
@@ -1237,7 +1237,7 @@ pub(crate) async fn reconcile_deployment(
                 )
                 .await?;
                 let rs_with_metadata =
-                    crate::controllers::resource_projection::with_resource_version(
+                    klights_controllers::resource_projection::with_resource_version(
                         updated.data,
                         updated.resource_version,
                         reconcile_context.wall_time,
@@ -1288,7 +1288,7 @@ pub(crate) async fn reconcile_deployment(
                     )
                     .await?;
                     let rs_with_metadata =
-                        crate::controllers::resource_projection::with_resource_version(
+                        klights_controllers::resource_projection::with_resource_version(
                             updated.data,
                             updated.resource_version,
                             reconcile_context.wall_time,
@@ -1398,7 +1398,7 @@ pub(crate) async fn reconcile_deployment(
                 .await?;
                 old_replicas_after_plan.insert(target.name, target.replicas);
                 let rs_with_metadata =
-                    crate::controllers::resource_projection::with_resource_version(
+                    klights_controllers::resource_projection::with_resource_version(
                         updated.data,
                         updated.resource_version,
                         reconcile_context.wall_time,
@@ -1563,7 +1563,7 @@ pub(crate) async fn reconcile_deployment(
         }
 
         // Reconcile the ReplicaSet to create pods
-        let rs_with_metadata = crate::controllers::resource_projection::with_resource_version(
+        let rs_with_metadata = klights_controllers::resource_projection::with_resource_version(
             created_rs.data,
             created_rs.resource_version,
             reconcile_context.wall_time,

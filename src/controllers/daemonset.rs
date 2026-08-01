@@ -631,7 +631,7 @@ pub(crate) async fn reconcile_daemonset(
         }
         _ => live_resource,
     };
-    let daemonset = crate::controllers::resource_projection::with_resource_version(
+    let daemonset = klights_controllers::resource_projection::with_resource_version(
         live_resource.data,
         live_resource.resource_version,
         now,
