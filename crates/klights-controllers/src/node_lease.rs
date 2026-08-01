@@ -74,8 +74,8 @@ impl NodeLeaseTracker {
 
     /// Reset the startup grace window to begin at `now`.
     ///
-    /// Called when this node (re)acquires raft leadership. A new leader's
-    /// in-memory liveness is empty, so never-yet-observed nodes must fall back
+    /// Called when this graph (re)acquires its controller coordination lease.
+    /// A new graph's in-memory liveness is empty, so never-yet-observed nodes must fall back
     /// to `now + startup_grace` (not an ancient process-start time), giving
     /// them a fresh window to renew before they can be declared stale. Observed
     /// leases are untouched — they keep their real renew-based deadlines.

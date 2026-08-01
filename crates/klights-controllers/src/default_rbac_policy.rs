@@ -879,58 +879,23 @@ mod default_roles_tests {
     }
 
     #[test]
-    fn cluster_admin_grants_both_resource_and_non_resource_access() {
-        use klights_auth::rbac_rule_evaluator::{PolicyRule, RuleMatchRequest, rule_matches};
-
+    fn cluster_admin_keeps_resource_and_non_resource_grants_separate() {
         let objs = default_rbac_fixtures();
         let role = find(&objs, "ClusterRole", "cluster-admin");
-        let rules: Vec<PolicyRule> = role
-            .rules
-            .as_ref()
-            .unwrap()
-            .iter()
-            .map(|r| PolicyRule {
-                verbs: r.verbs.iter().map(|s| s.to_string()).collect(),
-                api_groups: r.api_groups.iter().map(|s| s.to_string()).collect(),
-                resources: r.resources.iter().map(|s| s.to_string()).collect(),
-                resource_names: r.resource_names.iter().map(|s| s.to_string()).collect(),
-                non_resource_urls: r.non_resource_urls.iter().map(|s| s.to_string()).collect(),
-            })
-            .collect();
+        let rules = role.rules.as_ref().unwrap();
 
-        // cluster-admin must authorize an ordinary resource request. With the
-        // resource grant and the non-resource grant fused into a SINGLE rule,
-        // `rule_matches` rejects it as malformed (a rule may target resources
-        // XOR nonResourceURLs, never both), so cluster-admin grants nothing —
-        // exactly the 403 a ServiceAccount bound to cluster-admin hit.
-        let resource_req = RuleMatchRequest {
-            verb: "list",
-            api_group: Some(""),
-            resource: Some("limitranges"),
-            subresource: None,
-            resource_name: None,
-            non_resource_url: None,
-            field_selector: None,
-        };
-        assert!(
-            rules.iter().any(|r| rule_matches(r, resource_req)),
-            "cluster-admin must grant resource access (list limitranges)"
-        );
-
-        // cluster-admin must also authorize a non-resource URL request.
-        let non_resource_req = RuleMatchRequest {
-            verb: "get",
-            api_group: None,
-            resource: None,
-            subresource: None,
-            resource_name: None,
-            non_resource_url: Some("/healthz"),
-            field_selector: None,
-        };
-        assert!(
-            rules.iter().any(|r| rule_matches(r, non_resource_req)),
-            "cluster-admin must grant non-resource URL access (/healthz)"
-        );
+        assert!(rules.iter().any(|rule| {
+            rule.verbs == vec!["*"]
+                && rule.api_groups == vec!["*"]
+                && rule.resources == vec!["*"]
+                && rule.non_resource_urls.is_empty()
+        }));
+        assert!(rules.iter().any(|rule| {
+            rule.verbs == vec!["*"]
+                && rule.api_groups.is_empty()
+                && rule.resources.is_empty()
+                && rule.non_resource_urls == vec!["*"]
+        }));
     }
 
     #[test]

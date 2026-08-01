@@ -6,8 +6,8 @@
 //! actually due to fire.
 //!
 //! Lifecycle:
-//! 1. `start` is called once at bootstrap. It subscribes to the datastore
-//!    watch *before* the startup walk so no event is missed.
+//! 1. `start` is called once when controller coordination is acquired. It
+//!    opens a positioned watch *before* the startup walk so no event is missed.
 //! 2. The startup walk lists every CronJob and arms a per-UID timer.
 //! 3. The watch loop arms / re-arms / cancels timers in response to
 //!    create / update / delete events on `batch/v1` `CronJob`.
@@ -15,14 +15,10 @@
 //!    reconcile path (which applies the concurrency policy and creates
 //!    the Job), then re-arms its own timer for the next fire time.
 //!
-//! HA forward-compat: this scheduler holds a `DatastoreHandle` and never
-//! depends on consensus mode. Under future Raft mode the scheduler is
-//! started fresh by the elected leader (every leadership acquisition
-//! re-runs `start`); the per-UID timer map is process-local and is
-//! rebuilt from `cluster.db` state — there is no shared state between
-//! leaders. The fire closure re-reads the CronJob through
-//! `DatastoreBackend` so a stale follower-turned-leader sees the latest
-//! spec.
+//! Coordination is supplied through focused runtime capabilities. Every
+//! acquisition starts a fresh scheduler and rebuilds the process-local UID
+//! timer map from the positioned initial resource set. A fire re-reads the
+//! CronJob through that same capability so it never reconciles stale input.
 
 use std::collections::HashMap;
 use std::sync::Arc;

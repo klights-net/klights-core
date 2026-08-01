@@ -1,5 +1,6 @@
 use crate::datastore::backend::DatastoreHandle;
 use crate::datastore::sqlite::Datastore;
+use klights_auth::rbac_rule_evaluator::{PolicyRule, RuleMatchRequest, rule_matches};
 use klights_controllers::default_rbac_policy::{
     AUTOUPDATE_ANNOTATION, RBAC_API_VERSION, default_cluster_role_rules, default_rbac_fixtures,
 };
@@ -47,6 +48,56 @@ fn has_rule(rules: &[Value], expected: &Value) -> bool {
     rules
         .iter()
         .any(|rule| RuleShape::from_rule(rule) == expected_shape)
+}
+
+#[test]
+fn cluster_admin_fixture_authorizes_resource_and_non_resource_requests() {
+    let fixture = default_rbac_fixtures()
+        .into_iter()
+        .find(|object| object.kind == "ClusterRole" && object.name == "cluster-admin")
+        .expect("cluster-admin fixture exists");
+    let rules: Vec<PolicyRule> = fixture
+        .rules
+        .expect("cluster-admin rules")
+        .into_iter()
+        .map(|rule| PolicyRule {
+            verbs: rule.verbs.into_iter().map(str::to_string).collect(),
+            api_groups: rule.api_groups.into_iter().map(str::to_string).collect(),
+            resources: rule.resources.into_iter().map(str::to_string).collect(),
+            resource_names: rule
+                .resource_names
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            non_resource_urls: rule
+                .non_resource_urls
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        })
+        .collect();
+
+    let resource = RuleMatchRequest {
+        verb: "list",
+        api_group: Some(""),
+        resource: Some("limitranges"),
+        subresource: None,
+        resource_name: None,
+        non_resource_url: None,
+        field_selector: None,
+    };
+    assert!(rules.iter().any(|rule| rule_matches(rule, resource)));
+
+    let non_resource = RuleMatchRequest {
+        verb: "get",
+        api_group: None,
+        resource: None,
+        subresource: None,
+        resource_name: None,
+        non_resource_url: Some("/healthz"),
+        field_selector: None,
+    };
+    assert!(rules.iter().any(|rule| rule_matches(rule, non_resource)));
 }
 
 #[tokio::test]

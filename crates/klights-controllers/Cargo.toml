@@ -37,4 +37,3 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true, features = ["clock"] }
-klights-auth = { workspace = true }

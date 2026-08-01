@@ -535,21 +535,6 @@ fn pod_has_controller_owner(pod: &Value) -> bool {
         })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_selector_matches_no_pods_for_adoption() {
-        let selector = json!({});
-        let parsed =
-            LabelSelector::from_flat_match_labels(&selector).expect("empty selector should parse");
-        assert!(parsed.requirements().is_empty());
-        let pod = json!({"metadata": {"labels": {"app": "x"}}});
-        assert!(!pod_matches_selector(&pod, &parsed));
-    }
-}
-
 fn active_replicationcontroller_pods(
     pods: &[klights_cluster_core::Resource],
 ) -> Vec<&klights_cluster_core::Resource> {
@@ -727,4 +712,19 @@ async fn update_replicationcontroller_status(
     db.update_replication_controller_status(&rc, status).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_selector_matches_no_pods_for_adoption() {
+        let selector = json!({});
+        let parsed =
+            LabelSelector::from_flat_match_labels(&selector).expect("empty selector should parse");
+        assert!(parsed.requirements().is_empty());
+        let pod = json!({"metadata": {"labels": {"app": "x"}}});
+        assert!(!pod_matches_selector(&pod, &parsed));
+    }
 }
