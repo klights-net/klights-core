@@ -4,9 +4,6 @@ use klights_cluster_core::{
     LogApplyNodeSubnetRow, LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow,
     LogApplyWatchEventRow, OutboxStreamWatermark, SnapshotRestoreOperation,
 };
-use klights_cluster_datastore::sqlite::live_apply::{
-    ApplyConflictCode, apply_conflict_error, is_terminal_apply_conflict, other_error,
-};
 use std::net::Ipv4Addr;
 
 fn committed_apply_v1(commit: LogApplyCommit) -> LogApplyCommit {
@@ -1256,28 +1253,6 @@ fn subnet_commit(
             hostport_range: None,
         })],
     )
-}
-
-#[test]
-fn terminal_apply_conflict_classification_uses_typed_codes_not_message_text() {
-    for code in [
-        ApplyConflictCode::NotFound,
-        ApplyConflictCode::AlreadyExists,
-        ApplyConflictCode::UidPrecondition,
-        ApplyConflictCode::ResourceVersionPrecondition,
-    ] {
-        let err = apply_conflict_error(code, "typed conflict without status text");
-        assert!(
-            is_terminal_apply_conflict(&err),
-            "typed conflict {code:?} must classify as terminal"
-        );
-    }
-
-    let transient = other_error("transient text mentioning 409 Conflict and 404 Not Found");
-    assert!(
-        !is_terminal_apply_conflict(&transient),
-        "untyped internal errors must not classify as terminal by message text"
-    );
 }
 
 fn dataplane_commit(

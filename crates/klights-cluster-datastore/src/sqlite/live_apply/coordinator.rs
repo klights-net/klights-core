@@ -1127,3 +1127,30 @@ pub fn other_error(message: impl Into<String>) -> tokio_rusqlite::Error {
         message.into(),
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ApplyConflictCode, apply_conflict_error, is_terminal_apply_conflict, other_error};
+
+    #[test]
+    fn terminal_apply_conflict_classification_uses_typed_codes_not_message_text() {
+        for code in [
+            ApplyConflictCode::NotFound,
+            ApplyConflictCode::AlreadyExists,
+            ApplyConflictCode::UidPrecondition,
+            ApplyConflictCode::ResourceVersionPrecondition,
+        ] {
+            let err = apply_conflict_error(code, "typed conflict without status text");
+            assert!(
+                is_terminal_apply_conflict(&err),
+                "typed conflict {code:?} must classify as terminal"
+            );
+        }
+
+        let transient = other_error("transient text mentioning 409 Conflict and 404 Not Found");
+        assert!(
+            !is_terminal_apply_conflict(&transient),
+            "untyped internal errors must not classify as terminal by message text"
+        );
+    }
+}
