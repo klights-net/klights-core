@@ -300,6 +300,7 @@ debug = 1
 klights-auth = { workspace = true, features = ["test-support"] }
 klights-cluster-datastore = { workspace = true, features = ["test-support"] }
 klights-cluster-store = { workspace = true, features = ["test-support"] }
+klights-kubelet = { workspace = true, features = ["test-support"] }
 klights-networking = { workspace = true, features = ["test-support"] }
 openraft = { workspace = true }
 rtnetlink = { workspace = true }

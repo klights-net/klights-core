@@ -36,7 +36,7 @@ impl From<k8s_cri::v1::ContainerState> for ContainerRuntimeState {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl From<&str> for ContainerRuntimeState {
     fn from(state: &str) -> Self {
         match state {
@@ -52,7 +52,7 @@ impl From<&str> for ContainerRuntimeState {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl From<String> for ContainerRuntimeState {
     fn from(state: String) -> Self {
         Self::from(state.as_str())
@@ -195,15 +195,15 @@ pub trait ContainerRuntimeControl: Send + Sync {
 
 // --- Production adapter: SharedCriRuntime ---
 
-use crate::kubelet::cri::SharedCriClient;
-use crate::kubelet::cri_events::{KubeletEvent, KubeletEventKind};
+use crate::cri::SharedCriClient;
+use crate::cri_events::{KubeletEvent, KubeletEventKind};
 
 /// Production CRI adapter implementing `CriRuntime`.
 /// Each method clones `SharedCriClient::client()` and calls the
 /// existing concrete CRI method. No Mutex.
 pub struct SharedCriRuntime {
     shared: SharedCriClient,
-    registry_proxy: Option<crate::kubelet::registry_proxy::ContainerdRegistryProxyConfigurator>,
+    registry_proxy: Option<crate::registry_proxy::ContainerdRegistryProxyConfigurator>,
 }
 
 impl SharedCriRuntime {
@@ -216,7 +216,7 @@ impl SharedCriRuntime {
 
     pub fn new_with_registry_proxy(
         shared: SharedCriClient,
-        registry_proxy: Option<crate::kubelet::registry_proxy::ContainerdRegistryProxyConfigurator>,
+        registry_proxy: Option<crate::registry_proxy::ContainerdRegistryProxyConfigurator>,
     ) -> Self {
         Self {
             shared,
@@ -226,7 +226,7 @@ impl SharedCriRuntime {
 }
 
 struct SharedCriRuntimeEventStream {
-    inner: tonic::codec::Streaming<crate::kubelet::cri_events::CriContainerEventResponse>,
+    inner: tonic::codec::Streaming<crate::cri_events::CriContainerEventResponse>,
 }
 
 #[async_trait::async_trait]
@@ -286,8 +286,7 @@ impl CriRuntime for SharedCriRuntime {
         pod_uid_filter: Option<&str>,
     ) -> anyhow::Result<Vec<(String, String)>> {
         let mut client = self.shared.client();
-        let mut items =
-            crate::kubelet::cri::CriClient::list_pod_sandboxes(&mut client, None).await?;
+        let mut items = crate::cri::CriClient::list_pod_sandboxes(&mut client, None).await?;
         if let Some(pod_uid) = pod_uid_filter.filter(|uid| !uid.trim().is_empty()) {
             items.retain(|sb| {
                 sb.metadata
@@ -304,7 +303,7 @@ impl CriRuntime for SharedCriRuntime {
 
     async fn list_pod_sandbox_summaries(&self) -> anyhow::Result<Vec<CriPodSandboxSummary>> {
         let mut client = self.shared.client();
-        let items = crate::kubelet::cri::CriClient::list_pod_sandboxes(&mut client, None).await?;
+        let items = crate::cri::CriClient::list_pod_sandboxes(&mut client, None).await?;
         Ok(items
             .into_iter()
             .map(cri_pod_sandbox_summary_from)
@@ -318,7 +317,7 @@ impl CriRuntime for SharedCriRuntime {
         sandbox_config: PodSandboxConfig,
     ) -> anyhow::Result<String> {
         let mut client = self.shared.client();
-        crate::kubelet::cri::CriClient::create_container(
+        crate::cri::CriClient::create_container(
             &mut client,
             sandbox_id,
             container_config,
@@ -408,7 +407,7 @@ impl ContainerRuntimeControl for SharedCriRuntime {
             label_selector: std::collections::HashMap::new(),
         };
         let mut client = self.shared.client();
-        let containers = crate::kubelet::cri::CriClient::list_containers(&mut client, Some(filter))
+        let containers = crate::cri::CriClient::list_containers(&mut client, Some(filter))
             .await?
             .containers;
         let Some(container) = containers.into_iter().next() else {
@@ -421,8 +420,7 @@ impl ContainerRuntimeControl for SharedCriRuntime {
         };
         let mut client = self.shared.client();
         let sandboxes =
-            crate::kubelet::cri::CriClient::list_pod_sandboxes(&mut client, Some(sandbox_filter))
-                .await?;
+            crate::cri::CriClient::list_pod_sandboxes(&mut client, Some(sandbox_filter)).await?;
         let Some(sandbox) = sandboxes.into_iter().next() else {
             return Ok(None);
         };
@@ -436,9 +434,9 @@ impl ContainerRuntimeControl for SharedCriRuntime {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait::async_trait]
-impl CriRuntime for crate::kubelet::cri::CriClient {
+impl CriRuntime for crate::cri::CriClient {
     async fn image_status(&self, image: &str) -> anyhow::Result<bool> {
         self.clone().image_status(image).await
     }
@@ -464,8 +462,7 @@ impl CriRuntime for crate::kubelet::cri::CriClient {
         pod_uid_filter: Option<&str>,
     ) -> anyhow::Result<Vec<(String, String)>> {
         let mut client = self.clone();
-        let mut items =
-            crate::kubelet::cri::CriClient::list_pod_sandboxes(&mut client, None).await?;
+        let mut items = crate::cri::CriClient::list_pod_sandboxes(&mut client, None).await?;
         if let Some(pod_uid) = pod_uid_filter.filter(|uid| !uid.trim().is_empty()) {
             items.retain(|sb| {
                 sb.metadata
@@ -482,7 +479,7 @@ impl CriRuntime for crate::kubelet::cri::CriClient {
 
     async fn list_pod_sandbox_summaries(&self) -> anyhow::Result<Vec<CriPodSandboxSummary>> {
         let mut client = self.clone();
-        let items = crate::kubelet::cri::CriClient::list_pod_sandboxes(&mut client, None).await?;
+        let items = crate::cri::CriClient::list_pod_sandboxes(&mut client, None).await?;
         Ok(items
             .into_iter()
             .map(cri_pod_sandbox_summary_from)
@@ -496,7 +493,7 @@ impl CriRuntime for crate::kubelet::cri::CriClient {
         sandbox_config: PodSandboxConfig,
     ) -> anyhow::Result<String> {
         let mut client = self.clone();
-        crate::kubelet::cri::CriClient::create_container(
+        crate::cri::CriClient::create_container(
             &mut client,
             sandbox_id,
             container_config,

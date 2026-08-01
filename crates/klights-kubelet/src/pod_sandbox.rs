@@ -1,7 +1,7 @@
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn extract_netns_path_from_sandbox_status_info(
     info: &HashMap<String, String>,
 ) -> Option<String> {
@@ -44,7 +44,7 @@ pub fn extract_netns_path_from_sandbox_status_info(
 /// Pure matching logic for the Tier-3 CRI fallback. UID-bearing delete work
 /// must match by UID only; namespace/name fallback is safe only when the
 /// deleted snapshot has no UID.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn match_sandbox_by_uid_then_name(
     sandboxes: &[k8s_cri::v1::PodSandbox],
     namespace: &str,
@@ -101,7 +101,7 @@ pub fn match_sandbox_by_uid_then_name(
     None
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn container_id_sets_for_delete(
     containers: &[k8s_cri::v1::Container],
 ) -> (Vec<String>, Vec<String>) {

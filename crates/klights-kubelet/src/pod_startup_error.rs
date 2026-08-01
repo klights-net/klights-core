@@ -1,4 +1,4 @@
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PodStartupRetryPolicy {
     Retry,
@@ -8,21 +8,21 @@ pub enum PodStartupRetryPolicy {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PodStartupErrorKind {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     ImagePull,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     InitContainerFailed {
         exit_code: i32,
     },
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     MissingProjectedSource,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     CniUnavailable,
     NetworkAssignmentTimedOut,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     CriUnavailable,
     PodDisappeared,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     InvalidPodSpec,
     /// Per-container configuration error (invalid subPath, runAsNonRoot
     /// mismatch, etc.) that create_run has already surfaced into the pod's
@@ -32,30 +32,30 @@ pub enum PodStartupErrorKind {
     /// or flip the pod phase to Failed — upstream K8s leaves such pods
     /// in Pending so clients (and conformance `WaitForPodContainerToFail`)
     /// can observe the CreateContainerConfigError reason.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     ContainerConfigError,
 }
 
 impl std::fmt::Display for PodStartupErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Self::ImagePull => write!(f, "image pull failed"),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Self::InitContainerFailed { exit_code } => {
                 write!(f, "init container failed with exit code {exit_code}")
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Self::MissingProjectedSource => write!(f, "projected volume source is missing"),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Self::CniUnavailable => write!(f, "cni plugin is unavailable"),
             Self::NetworkAssignmentTimedOut => write!(f, "pod network assignment timed out"),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Self::CriUnavailable => write!(f, "cri runtime is unavailable"),
             Self::PodDisappeared => write!(f, "pod disappeared during startup"),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Self::InvalidPodSpec => write!(f, "invalid pod spec"),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Self::ContainerConfigError => {
                 write!(f, "container configuration error (pod stays Pending)")
             }
@@ -65,7 +65,7 @@ impl std::fmt::Display for PodStartupErrorKind {
 
 impl std::error::Error for PodStartupErrorKind {}
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl PodStartupErrorKind {
     pub fn retry_policy(&self, restart_policy: &str) -> PodStartupRetryPolicy {
         match self {

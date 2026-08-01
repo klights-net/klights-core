@@ -760,7 +760,7 @@ mod tests {
         assert_eq!(request.bound_node_name(), "node-a");
 
         let _ = std::fs::remove_dir_all(
-            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+            crate::kubelet::runtime_paths::for_test(&runtime_ns)
                 .data_root()
                 .to_path_buf(),
         );
@@ -866,7 +866,7 @@ mod tests {
         assert_eq!(sources.token_requests().len(), 1);
 
         let _ = std::fs::remove_dir_all(
-            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+            crate::kubelet::runtime_paths::for_test(&runtime_ns)
                 .data_root()
                 .to_path_buf(),
         );
@@ -951,7 +951,7 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(
-            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+            crate::kubelet::runtime_paths::for_test(&runtime_ns)
                 .data_root()
                 .to_path_buf(),
         );
@@ -1016,7 +1016,7 @@ mod tests {
         assert!(std::path::Path::new(&expected_path).exists());
 
         let _ = std::fs::remove_dir_all(
-            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+            crate::kubelet::runtime_paths::for_test(&runtime_ns)
                 .data_root()
                 .to_path_buf(),
         );
@@ -1165,7 +1165,7 @@ mod tests {
         assert_eq!(requests[0].bound_node_uid(), None);
 
         let _ = std::fs::remove_dir_all(
-            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+            crate::kubelet::runtime_paths::for_test(&runtime_ns)
                 .data_root()
                 .to_path_buf(),
         );
@@ -1244,7 +1244,7 @@ mod tests {
         assert_eq!(requests[0].bound_pod_uid(), "pod-uid-a");
 
         let _ = std::fs::remove_dir_all(
-            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+            crate::kubelet::runtime_paths::for_test(&runtime_ns)
                 .data_root()
                 .to_path_buf(),
         );
@@ -1325,7 +1325,7 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(
-            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+            crate::kubelet::runtime_paths::for_test(&runtime_ns)
                 .data_root()
                 .to_path_buf(),
         );
@@ -1339,7 +1339,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let runtime_ns = format!("volreg-test-sa-signer-{}", suffix);
-        let etc_dir = crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+        let etc_dir = crate::kubelet::runtime_paths::for_test(&runtime_ns)
             .etc_dir()
             .to_string_lossy()
             .into_owned();
@@ -1395,7 +1395,7 @@ mod tests {
         assert_eq!(sources.token_requests().len(), 1);
 
         let _ = std::fs::remove_dir_all(
-            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+            crate::kubelet::runtime_paths::for_test(&runtime_ns)
                 .data_root()
                 .to_path_buf(),
         );

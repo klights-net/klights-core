@@ -92,7 +92,7 @@ fn test_build_mounts_sa_volume_via_volume_mount() {
         }]
     });
     let mut volume_paths = HashMap::new();
-    let projected_path = crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("klights")
+    let projected_path = crate::kubelet::runtime_paths::for_test("klights")
         .volumes_root()
         .join("test-pod")
         .join("volumes")

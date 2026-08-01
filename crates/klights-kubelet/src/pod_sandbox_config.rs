@@ -1,5 +1,5 @@
-use crate::kubelet::pod_dns::HostDnsConfig;
-use crate::kubelet::pod_hosts::{parse_boolish, resolve_hostname};
+use crate::pod_dns::HostDnsConfig;
+use crate::pod_hosts::{parse_boolish, resolve_hostname};
 use k8s_cri::v1::{
     DnsConfig, Int64Value, LinuxPodSandboxConfig, LinuxSandboxSecurityContext, NamespaceOption,
     PodSandboxConfig, PodSandboxMetadata,
@@ -30,7 +30,7 @@ pub fn build_sandbox_config_with_runtime_inputs(
     dns_ip: &str,
     pod_spec: &Value,
     runtime_inputs: &SandboxRuntimeInputs,
-    paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    paths: &crate::runtime_paths::KubeletRuntimePaths,
 ) -> PodSandboxConfig {
     let SandboxIdentity {
         pod_name,
@@ -270,7 +270,7 @@ pub fn build_sandbox_config_with_runtime_inputs(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn build_sandbox_config_with_dns_policy(
     pod_name: &str,
     namespace: &str,
@@ -291,7 +291,7 @@ pub fn build_sandbox_config_with_dns_policy(
         dns_ip,
         pod_spec,
         &SandboxRuntimeInputs::default(),
-        &crate::kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
+        &crate::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
             "/tmp/klights-sandbox-test",
         ))
         .expect("absolute test path"),
@@ -381,7 +381,7 @@ mod tests {
         );
         assert_eq!(
             config.log_directory,
-            crate::kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
+            crate::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
                 "/tmp/klights-sandbox-test"
             ),)
             .unwrap()
@@ -487,7 +487,7 @@ mod tests {
         assert!(
             dns.servers
                 .iter()
-                .all(|server| !crate::kubelet::pod_dns::is_loopback_nameserver(server)),
+                .all(|server| !crate::pod_dns::is_loopback_nameserver(server)),
             "dnsPolicy=Default must not put loopback nameservers in pod resolv.conf"
         );
     }

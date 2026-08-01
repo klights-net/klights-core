@@ -1,7 +1,7 @@
-#[cfg(test)]
-use crate::kubelet::pod_startup_error::{PodStartupErrorKind, PodStartupRetryPolicy};
-#[cfg(test)]
-use crate::kubelet::pod_status_logic::is_image_pull_error_msg;
+#[cfg(any(test, feature = "test-support"))]
+use crate::pod_startup_error::{PodStartupErrorKind, PodStartupRetryPolicy};
+#[cfg(any(test, feature = "test-support"))]
+use crate::pod_status_logic::is_image_pull_error_msg;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 pub type PodCreationTracker = Arc<Mutex<HashSet<String>>>;
 pub type PodStartRetryTracker = Arc<Mutex<PodStartRetryState>>;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PodStartSource {
     WatchAdded,
@@ -22,7 +22,7 @@ pub fn pod_creation_key(namespace: &str, pod_name: &str) -> String {
     format!("{}/{}", namespace, pod_name)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn parse_pod_creation_key(key: &str) -> Option<(&str, &str)> {
     let (namespace, pod_name) = key.split_once('/')?;
     if namespace.is_empty() || pod_name.is_empty() {
@@ -138,7 +138,7 @@ pub fn should_clear_pod_creation_inflight(pod: &Value) -> bool {
     false
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn classify_legacy_startup_error(err: &anyhow::Error) -> PodStartupErrorKind {
     if let Some(kind) = err.downcast_ref::<PodStartupErrorKind>() {
         return kind.clone();
@@ -193,14 +193,14 @@ pub fn classify_legacy_startup_error(err: &anyhow::Error) -> PodStartupErrorKind
     PodStartupErrorKind::InvalidPodSpec
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn parse_init_exit_code(lower_error: &str) -> Option<i32> {
     let marker = " failed with exit code ";
     let (_, tail) = lower_error.split_once(marker)?;
     tail.split_whitespace().next()?.parse::<i32>().ok()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn pod_startup_retry_policy_for_error(
     pod: &Value,
     err: &anyhow::Error,
@@ -212,17 +212,17 @@ pub fn pod_startup_retry_policy_for_error(
     classify_legacy_startup_error(err).retry_policy(restart_policy)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn is_transient_pod_start_error(err: &anyhow::Error) -> bool {
     classify_legacy_startup_error(err).retry_policy("Always") == PodStartupRetryPolicy::Retry
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn should_fail_pod_for_start_error(pod: &Value, err: &anyhow::Error) -> bool {
     pod_startup_retry_policy_for_error(pod, err) == PodStartupRetryPolicy::FailPod
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn is_pod_disappeared_during_start_error(err: &anyhow::Error) -> bool {
     classify_legacy_startup_error(err) == PodStartupErrorKind::PodDisappeared
 }
@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn typed_startup_errors_define_retry_policy_without_string_matching() {
-        use crate::kubelet::pod_startup_error::{PodStartupErrorKind, PodStartupRetryPolicy};
+        use crate::pod_startup_error::{PodStartupErrorKind, PodStartupRetryPolicy};
 
         assert_eq!(
             PodStartupErrorKind::NetworkAssignmentTimedOut.retry_policy("Always"),

@@ -613,8 +613,7 @@ async fn mock_filesystem_records_hosts_logs_cgroups_and_fsgroup() {
 #[tokio::test]
 async fn real_filesystem_handles_termination_log_with_parity() {
     let runtime_namespace = "klights-term-real-fs-test";
-    let runtime_paths =
-        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace);
+    let runtime_paths = crate::kubelet::runtime_paths::for_test(runtime_namespace);
     let _ = std::fs::remove_dir_all(runtime_paths.data_root());
     let fs = crate::kubelet::pod_runtime::filesystem::RealPodFilesystem::new(
         std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
@@ -642,8 +641,7 @@ async fn real_filesystem_handles_termination_log_with_parity() {
 #[tokio::test]
 async fn real_filesystem_cleanup_removes_entire_pod_root() {
     let runtime_namespace = "klights-pod-root-cleanup-test";
-    let runtime_paths =
-        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace);
+    let runtime_paths = crate::kubelet::runtime_paths::for_test(runtime_namespace);
     let data_root = runtime_paths.data_root().to_path_buf();
     let _ = std::fs::remove_dir_all(&data_root);
     let fs = crate::kubelet::pod_runtime::filesystem::RealPodFilesystem::new(
@@ -724,8 +722,7 @@ async fn fs_group_volume_ownership_with_parity() {
         .unwrap()
         .as_nanos();
     let containerd_ns = format!("podfs-fsgroup-test-{suffix}");
-    let runtime_paths =
-        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&containerd_ns);
+    let runtime_paths = crate::kubelet::runtime_paths::for_test(&containerd_ns);
     let data_root = runtime_paths.data_root().to_path_buf();
     let _ = std::fs::remove_dir_all(&data_root);
 
@@ -9125,7 +9122,7 @@ async fn real_runtime_reconcile_preserves_terminal_container_state_after_stale_r
 async fn mocked_runtime_does_not_create_termination_log_file_directly() {
     let runtime_namespace = "klights-term-mock-create-test";
     let _ = std::fs::remove_dir_all(
-        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
+        crate::kubelet::runtime_paths::for_test(runtime_namespace)
             .data_root()
             .to_path_buf(),
     );
@@ -9168,13 +9165,12 @@ async fn mocked_runtime_does_not_create_termination_log_file_directly() {
         "termination-message-pod",
         "uid-termination-mock-create",
     );
-    let direct_host_path =
-        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
-            .containerd_termination_log(
-                "container-runtime",
-                "termination-message-pod",
-                "termination-message-container",
-            );
+    let direct_host_path = crate::kubelet::runtime_paths::for_test(runtime_namespace)
+        .containerd_termination_log(
+            "container-runtime",
+            "termination-message-pod",
+            "termination-message-container",
+        );
 
     harness.create_runtime_pod(pod.clone()).await;
     let start = harness.start_pod_through_runtime(key, pod).await;
@@ -9185,7 +9181,7 @@ async fn mocked_runtime_does_not_create_termination_log_file_directly() {
     );
 
     let _ = std::fs::remove_dir_all(
-        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
+        crate::kubelet::runtime_paths::for_test(runtime_namespace)
             .data_root()
             .to_path_buf(),
     );
@@ -9199,7 +9195,7 @@ async fn mocked_runtime_does_not_read_termination_message_file_directly() {
 
     let runtime_namespace = "klights-term-mock-read-test";
     let _ = std::fs::remove_dir_all(
-        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
+        crate::kubelet::runtime_paths::for_test(runtime_namespace)
             .data_root()
             .to_path_buf(),
     );
@@ -9289,13 +9285,12 @@ async fn mocked_runtime_does_not_read_termination_message_file_directly() {
         .cri
         .set_container_status_state(k8s_cri::v1::ContainerState::ContainerExited as i32);
     harness.cri.set_container_exit_code(0);
-    let direct_host_path =
-        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
-            .containerd_termination_log(
-                "container-runtime",
-                "termination-message-pod",
-                "termination-message-container",
-            );
+    let direct_host_path = crate::kubelet::runtime_paths::for_test(runtime_namespace)
+        .containerd_termination_log(
+            "container-runtime",
+            "termination-message-pod",
+            "termination-message-container",
+        );
     std::fs::create_dir_all(direct_host_path.parent().unwrap()).unwrap();
     std::fs::write(&direct_host_path, "direct-fs-message").unwrap();
 
@@ -9309,7 +9304,7 @@ async fn mocked_runtime_does_not_read_termination_message_file_directly() {
     );
 
     let _ = std::fs::remove_dir_all(
-        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
+        crate::kubelet::runtime_paths::for_test(runtime_namespace)
             .data_root()
             .to_path_buf(),
     );
@@ -9385,7 +9380,7 @@ async fn termination_message_mount_path_with_parity() {
     }));
 
     let _ = std::fs::remove_dir_all(
-        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
+        crate::kubelet::runtime_paths::for_test(runtime_namespace)
             .data_root()
             .to_path_buf(),
     );
@@ -9461,7 +9456,7 @@ async fn hosts_file_mount_path_with_parity() {
     );
 
     let _ = std::fs::remove_dir_all(
-        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
+        crate::kubelet::runtime_paths::for_test(runtime_namespace)
             .data_root()
             .to_path_buf(),
     );
@@ -9578,7 +9573,7 @@ async fn termination_message_file_handling_with_parity() {
     }));
 
     let _ = std::fs::remove_dir_all(
-        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
+        crate::kubelet::runtime_paths::for_test(runtime_namespace)
             .data_root()
             .to_path_buf(),
     );

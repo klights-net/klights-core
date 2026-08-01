@@ -1,4 +1,4 @@
-use crate::kubelet::cri_events::{CriContainerEventCodec, CriContainerEventResponse};
+use crate::cri_events::{CriContainerEventCodec, CriContainerEventResponse};
 use anyhow::{Context, Result};
 use k8s_cri::v1::{
     AttachRequest, AttachResponse, ContainerConfig, ContainerFilter, ContainerStatusRequest,
@@ -61,7 +61,7 @@ impl SharedCriClient {
 
 impl CriClient {
     /// Test helper that connects using the default transport policy.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn connect(socket_path: &str, namespace: &str) -> Result<Self> {
         Self::connect_with_policy(
             socket_path,
@@ -404,7 +404,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // Only run with: cargo test -- --ignored
     async fn test_cri_connect() {
-        let sock = crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("klights")
+        let sock = crate::runtime_paths::KubeletRuntimePaths::for_test("klights")
             .data_root()
             .to_path_buf()
             .join("containerd.sock")
@@ -429,7 +429,7 @@ mod tests {
         // Verify that subscribe_container_events returns a valid stream.
         // The stream blocks until a container event occurs, so we just verify
         // the subscription succeeds (stream is established).
-        let sock = crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("klights")
+        let sock = crate::runtime_paths::KubeletRuntimePaths::for_test("klights")
             .data_root()
             .to_path_buf()
             .join("containerd.sock")
@@ -455,7 +455,7 @@ mod tests {
             return;
         }
 
-        let sock = crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("klights")
+        let sock = crate::runtime_paths::KubeletRuntimePaths::for_test("klights")
             .data_root()
             .to_path_buf()
             .join("containerd.sock")
@@ -488,7 +488,7 @@ mod tests {
         // This test verifies that CRI Exec() returns an ExecResponse with a streaming URL
         // The URL format should be: http://localhost:PORT/exec/TOKEN
 
-        let sock = crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("klights")
+        let sock = crate::runtime_paths::KubeletRuntimePaths::for_test("klights")
             .data_root()
             .to_path_buf()
             .join("containerd.sock")

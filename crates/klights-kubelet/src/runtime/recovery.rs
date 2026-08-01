@@ -1,6 +1,6 @@
-use crate::kubelet::pod_runtime::cri::{ContainerRuntimeControl, ContainerRuntimeState};
-use crate::kubelet::pod_runtime::service::PodRuntimeKey;
-use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+use crate::runtime::cri::{ContainerRuntimeControl, ContainerRuntimeState};
+use crate::runtime::store::PodRuntimeStore;
+use crate::runtime_types::PodRuntimeKey;
 
 pub async fn already_realized_running_sandbox(
     store: &dyn PodRuntimeStore,

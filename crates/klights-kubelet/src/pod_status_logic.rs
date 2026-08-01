@@ -9,7 +9,7 @@ pub const REASON_POD_INITIALIZING: &str = "PodInitializing";
 
 /// Information about a container's CRI state
 #[derive(Default)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct ContainerInfo {
     pub state: i32, // CRI ContainerState enum value (0=Created, 1=Running, 2=Exited, 3=Unknown)
     pub exit_code: i32,
@@ -23,7 +23,7 @@ pub struct ContainerInfo {
 
 /// Tracks restart backoff state for a container
 #[derive(Debug, Clone)]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct ContainerBackoffState {
     pub next_restart_time: i64, // Unix timestamp (seconds)
 }
@@ -148,7 +148,7 @@ pub fn get_condition_last_transition_time(
 /// Any container exited with non-zero code -> Failed
 /// Any container still running -> Running
 /// All containers created but not started -> Pending
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn compute_pod_phase(
     container_states: &[(String, ContainerInfo)],
     restart_policy: &str,
@@ -214,7 +214,7 @@ pub fn compute_pod_phase(
 }
 
 /// Decide whether to restart a container based on restart policy and exit code
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn should_restart(restart_policy: &str, exit_code: i32) -> bool {
     match effective_restart_policy(restart_policy) {
         "Always" => true,
@@ -224,7 +224,7 @@ pub fn should_restart(restart_policy: &str, exit_code: i32) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn effective_restart_policy(restart_policy: &str) -> &str {
     if restart_policy.is_empty() {
         "Always"
@@ -235,7 +235,7 @@ pub fn effective_restart_policy(restart_policy: &str) -> &str {
 
 /// Calculate exponential backoff delay in seconds for container restarts.
 /// Spec: 10s, 20s, 40s, 80s, 160s, capped at 300s (5 min)
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn calculate_backoff_delay(restart_count: i32) -> u64 {
     if restart_count == 0 {
         return 0; // First restart is immediate
@@ -251,7 +251,7 @@ pub fn calculate_backoff_delay(restart_count: i32) -> u64 {
 /// 1. It has no readiness probe (ready as soon as running), OR
 /// 2. It has a readiness probe AND the existing containerStatuses show it as ready
 ///    (set by the probe manager after the probe succeeds)
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn extract_ready_containers_from_pod_condition(
     pod: &Value,
 ) -> std::collections::HashSet<String> {

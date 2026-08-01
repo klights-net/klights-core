@@ -14,7 +14,7 @@ impl NetworkRuntimeInputs {
     fn from_image_pull_timeout_env(raw: Option<&str>) -> Self {
         let seconds = raw
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(crate::kubelet::cri::DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT_SECS);
+            .unwrap_or(crate::kubelet::cri::DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT.as_secs());
         Self {
             image_pull_response_timeout: std::time::Duration::from_secs(seconds),
         }

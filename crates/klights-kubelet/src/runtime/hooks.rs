@@ -4,7 +4,7 @@
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::kubelet::pod_runtime::cri::CriRuntime;
+use crate::runtime::cri::CriRuntime;
 
 /// Outcome of a lifecycle hook execution.
 #[derive(Clone, Debug, Eq, PartialEq)]

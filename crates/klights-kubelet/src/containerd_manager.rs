@@ -177,10 +177,10 @@ pub struct ContainerdStartConfig<'a> {
     pub rootless: bool,
     pub executable_path: &'a Path,
     pub image_pull_response_timeout: Duration,
-    pub paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    pub paths: &'a crate::runtime_paths::KubeletRuntimePaths,
     pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub cri_transport_policy: klights_node_api::CriTransportPolicy,
-    pub registry_proxy: &'a crate::kubelet::registry_proxy::RegistryProxyConfig,
+    pub registry_proxy: &'a crate::registry_proxy::RegistryProxyConfig,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -220,7 +220,7 @@ impl ContainerdManager {
         format!(
             "#!/bin/sh\nexec {} {} \"$@\"\n",
             Self::shell_quote(klights_binary),
-            crate::kubelet::rootless_runc_wrapper::WRAPPER_MODE_ARG
+            crate::rootless_runc_wrapper::WRAPPER_MODE_ARG
         )
     }
 
@@ -533,7 +533,7 @@ state = "{state_dir}"
             pod_link_mtu,
         )
         .await?;
-        crate::kubelet::registry_proxy::ContainerdRegistryProxyConfigurator::new(
+        crate::registry_proxy::ContainerdRegistryProxyConfigurator::new(
             registry_proxy.clone(),
             registry_hosts_path.clone(),
             file_process.clone(),
@@ -720,7 +720,7 @@ state = "{state_dir}"
         rootless: bool,
         cri_transport_policy: &klights_node_api::CriTransportPolicy,
         image_pull_response_timeout: Duration,
-        paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
+        paths: &crate::runtime_paths::KubeletRuntimePaths,
     ) -> Result<bool> {
         if !klights_supervisor::runtime_fs::exists_async(file_process, socket_path).await? {
             return Ok(false);
@@ -770,7 +770,7 @@ state = "{state_dir}"
         rootless: bool,
         cri_transport_policy: &klights_node_api::CriTransportPolicy,
         image_pull_response_timeout: Duration,
-        paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
+        paths: &crate::runtime_paths::KubeletRuntimePaths,
     ) -> Result<bool> {
         let socket_path = paths.containerd_socket().to_string_lossy().into_owned();
         if !klights_supervisor::runtime_fs::exists_async(file_process, &socket_path).await? {
@@ -795,7 +795,7 @@ state = "{state_dir}"
         rootless: bool,
         cri_transport_policy: &klights_node_api::CriTransportPolicy,
         image_pull_response_timeout: Duration,
-        paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
+        paths: &crate::runtime_paths::KubeletRuntimePaths,
     ) -> Result<bool> {
         match super::cri::CriClient::connect_with_policy(
             socket_path,
@@ -898,7 +898,7 @@ state = "{state_dir}"
         namespace: &str,
         task_supervisor: &klights_supervisor::TaskSupervisor,
         file_process: &klights_supervisor::FileProcessExecutor,
-        paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
+        paths: &crate::runtime_paths::KubeletRuntimePaths,
     ) -> Result<usize> {
         let config_path = paths.containerd_data_dir().join("config.toml");
         let socket_path = paths.containerd_socket();
@@ -1012,7 +1012,7 @@ pub fn process_exists(pid: libc::pid_t) -> bool {
 
 async fn rootless_namespace_containerd_is_current(
     file_process: &klights_supervisor::FileProcessExecutor,
-    paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    paths: &crate::runtime_paths::KubeletRuntimePaths,
 ) -> Result<bool> {
     let config_path = paths.containerd_data_dir().join("config.toml");
     let pids = find_containerd_pids_for_config(file_process, &config_path).await?;
@@ -1220,10 +1220,18 @@ fn normalize_path_for_match(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn test_file_process_executor() -> klights_supervisor::FileProcessExecutor {
+        klights_supervisor::FileProcessExecutor::new(std::sync::Arc::new(
+            klights_supervisor::TaskSupervisor::new(
+                klights_supervisor::TaskCategoryConfig::default(),
+            ),
+        ))
+    }
+
     /// Per-process unique test root under /tmp, shared by all tests in
     /// this module.
     fn test_root(ns: &str) -> String {
-        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(ns)
+        crate::runtime_paths::KubeletRuntimePaths::for_test(ns)
             .data_root()
             .to_path_buf()
             .to_string_lossy()
@@ -1231,7 +1239,7 @@ mod tests {
     }
 
     fn test_cni_conf_dir(ns: &str) -> String {
-        let root = crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(ns)
+        let root = crate::runtime_paths::KubeletRuntimePaths::for_test(ns)
             .data_root()
             .to_path_buf();
         root.join("cni")
@@ -1964,16 +1972,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cni_dir = dir.path().to_string_lossy().into_owned();
         let rpc_socket =
-            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("klights-test")
-                .cni_rpc_socket();
+            crate::runtime_paths::KubeletRuntimePaths::for_test("klights-test").cni_rpc_socket();
 
         ContainerdManager::write_cni_config(
-            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &test_file_process_executor(),
             &cni_dir,
             &rpc_socket,
             "klights-test",
             "10.43.0.0/24",
-            klights_networking::wireguard::WIREGUARD_MTU,
+            1280,
         )
         .await
         .unwrap();
@@ -1985,7 +1992,7 @@ mod tests {
         assert_eq!(parsed["type"], "klights-cni");
         assert_eq!(parsed["bridge"], "klights-test");
         assert_eq!(parsed["subnet"], "10.43.0.0/24");
-        assert_eq!(parsed["mtu"], klights_networking::wireguard::WIREGUARD_MTU);
+        assert_eq!(parsed["mtu"], 1280);
         assert_eq!(
             parsed["rpcSocket"],
             rpc_socket.to_string_lossy().into_owned()

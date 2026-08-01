@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::kubelet::pod_runtime::service::PodRuntimeKey;
+use crate::runtime_types::PodRuntimeKey;
 
 pub trait RuntimeClock: Send + Sync {
     fn now_ms(&self) -> i64;

@@ -5,6 +5,15 @@ use tokio_util::sync::CancellationToken;
 use crate::lifecycle::LifecycleCommand;
 use crate::pod_lifecycle_router::LifecycleReplyHandle;
 
+pub mod cri;
+pub mod hooks;
+pub mod images;
+pub mod recovery;
+pub mod store;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 pub use crate::runtime_reconcile_hint::RuntimeReconcileHint;
 pub use crate::runtime_types::{
     PodDeletionFinalizeResult, PodFinalizeStartupResult, PodOwnershipError, PodRuntimeKey,

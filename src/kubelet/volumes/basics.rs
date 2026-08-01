@@ -11,7 +11,7 @@ pub fn volumes_root() -> String {
 
 #[cfg(test)]
 pub fn volumes_root_for_namespace(runtime_ns: &str) -> String {
-    crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_ns)
+    crate::kubelet::runtime_paths::for_test(runtime_ns)
         .volumes_root()
         .to_string_lossy()
         .into_owned()
@@ -755,7 +755,7 @@ mod tests {
     fn test_collect_mount_targets_under_sorts_deepest_first_and_dedupes() {
         let root = format!(
             "{}/pods/default_pod/volumes",
-            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("klights")
+            crate::kubelet::runtime_paths::for_test("klights")
                 .data_root()
                 .to_path_buf()
                 .display()
@@ -779,7 +779,7 @@ mod tests {
     fn test_collect_mount_targets_under_excludes_similar_prefixes() {
         let root = format!(
             "{}/pods/default_pod/volumes",
-            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("klights")
+            crate::kubelet::runtime_paths::for_test("klights")
                 .data_root()
                 .to_path_buf()
                 .display()

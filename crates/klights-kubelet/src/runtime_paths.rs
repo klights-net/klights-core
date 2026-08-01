@@ -28,7 +28,7 @@ impl KubeletRuntimePaths {
         self.data_root.join("etc")
     }
 
-    pub(crate) fn service_account_signing_key(&self) -> PathBuf {
+    pub fn service_account_signing_key(&self) -> PathBuf {
         self.etc_dir().join("service-account-signing.key")
     }
 
