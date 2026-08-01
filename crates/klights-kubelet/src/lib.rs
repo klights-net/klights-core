@@ -1,5 +1,6 @@
 //! Embedded kubelet implementation for klights.
 
+pub mod cgroup_cleanup;
 pub mod cni_readiness;
 pub mod containerd_manager;
 pub mod context;

@@ -178,16 +178,18 @@ pub fn main_entry() {
 
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new(
-            kubelet::rootless_runc_wrapper::WRAPPER_MODE_ARG,
+            klights_kubelet::rootless_runc_wrapper::WRAPPER_MODE_ARG,
         ))
     {
         let args = std::env::args_os().skip(2).collect();
-        let config = kubelet::rootless_runc_wrapper::RootlessRuncWrapperConfig {
+        let config = klights_kubelet::rootless_runc_wrapper::RootlessRuncWrapperConfig {
             runc_binary: std::env::var_os("KLIGHTS_RUNC_BINARY")
                 .unwrap_or_else(|| std::ffi::OsString::from("runc")),
             current_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")),
         };
-        std::process::exit(kubelet::rootless_runc_wrapper::run_from_args(args, config));
+        std::process::exit(klights_kubelet::rootless_runc_wrapper::run_from_args(
+            args, config,
+        ));
     }
 
     let cli = cli::Cli::from_args();

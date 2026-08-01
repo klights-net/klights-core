@@ -4,7 +4,7 @@ use crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey;
 use crate::kubelet::pod_lifecycle_router::{
     OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
 };
-use crate::kubelet::pod_runtime::cri::{ContainerRuntimeState, CriPodSandboxSummary, CriRuntime};
+use klights_kubelet::runtime::cri::{ContainerRuntimeState, CriPodSandboxSummary, CriRuntime};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CriContainerInventory {

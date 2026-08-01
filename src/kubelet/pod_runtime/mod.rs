@@ -1,9 +1,6 @@
 // Pod runtime service module.
 
 pub mod active_deadline;
-pub mod cri {
-    pub use klights_kubelet::runtime::cri::*;
-}
 pub mod deletion_finalizer;
 pub mod events;
 pub mod filesystem;

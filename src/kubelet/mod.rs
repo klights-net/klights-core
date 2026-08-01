@@ -1,18 +1,5 @@
-pub mod cgroup_cleanup;
-pub mod containerd_manager {
-    pub use klights_kubelet::containerd_manager::*;
-}
 pub mod context;
-pub mod cri {
-    pub use klights_kubelet::cri::*;
-}
-pub mod cri_events {
-    pub use klights_kubelet::cri_events::*;
-}
 pub mod file_blocking;
-pub mod log_rotation {
-    pub use klights_kubelet::log_rotation::*;
-}
 pub mod pod_cluster_runtime;
 pub mod pod_container_config;
 pub mod pod_creation_state {
@@ -59,16 +46,10 @@ pub mod pod_watch_source;
 #[cfg(test)]
 mod probe_manager_integration;
 pub mod reconciler;
-pub mod registry_proxy {
-    pub use klights_kubelet::registry_proxy::*;
-}
-pub mod rootless_runc_wrapper {
-    pub use klights_kubelet::rootless_runc_wrapper::*;
-}
+#[cfg(test)]
 pub mod runtime_paths {
-    pub use klights_kubelet::runtime_paths::{KubeletRuntimePathError, KubeletRuntimePaths};
+    use klights_kubelet::runtime_paths::KubeletRuntimePaths;
 
-    #[cfg(test)]
     pub(crate) fn for_test(namespace: &str) -> KubeletRuntimePaths {
         use std::hash::{Hash, Hasher};
 
@@ -92,10 +73,6 @@ pub mod runtime_paths {
 }
 #[cfg(test)]
 mod volume_integration_tests;
-
-pub use containerd_manager::ContainerdManager;
-pub use cri::CriClient;
-pub use klights_kubelet::probe_manager::ProbeManager;
 
 pub mod pod_lifecycle_actor;
 pub mod pod_lifecycle_core;

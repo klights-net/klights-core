@@ -7,10 +7,10 @@ use crate::kubelet::pod_lifecycle_core::message::LifecycleMessage;
 use crate::kubelet::pod_lifecycle_router::{
     OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
 };
-use crate::kubelet::pod_runtime::cri::{ContainerRuntimeControl, CriRuntime};
 use crate::kubelet::reconciler::cri_inventory::{
     CriContainerInventory, CriInventoryAction, cleanup_cold_sandbox, diff_cri_inventory,
 };
+use klights_kubelet::runtime::cri::{ContainerRuntimeControl, CriRuntime};
 use klights_leader_api::{CacheReadinessRequest, LeaderCacheReadiness, LeaderResourceQuery};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -165,7 +165,7 @@ impl CriReconnectReconciler {
                         .route(LifecycleMessage::CriEvent {
                             key: key.clone(),
                             container_id: String::new(),
-                            kind: crate::kubelet::cri_events::KubeletEventKind::Stopped,
+                            kind: klights_kubelet::cri_events::KubeletEventKind::Stopped,
                         })
                         .await?;
                 }

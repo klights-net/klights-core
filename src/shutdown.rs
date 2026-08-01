@@ -41,7 +41,7 @@ fn require_success<'a>(
 /// Stop and remove all pod sandboxes on shutdown.
 pub async fn cleanup_pod_sandboxes(
     file_process: &klights_supervisor::FileProcessExecutor,
-    cri: &mut crate::kubelet::CriClient,
+    cri: &mut klights_kubelet::cri::CriClient,
     runtime_store: &dyn klights_node_store::PodRuntimeStore,
     network: &dyn klights_network_api::Datapath,
     containerd_ns: &str,
@@ -98,7 +98,7 @@ pub async fn cleanup_pod_sandboxes(
 
 async fn cleanup_one_pod_sandbox(
     file_process: &klights_supervisor::FileProcessExecutor,
-    cri: &mut crate::kubelet::CriClient,
+    cri: &mut klights_kubelet::cri::CriClient,
     runtime_store: &dyn klights_node_store::PodRuntimeStore,
     network: &dyn klights_network_api::Datapath,
     containerd_ns: &str,
@@ -128,7 +128,7 @@ async fn cleanup_one_pod_sandbox(
         Ok(_) => {
             if let Some((_, _, pod_uid)) = owner
                 && !pod_uid.trim().is_empty()
-                && let Err(e) = crate::kubelet::cgroup_cleanup::cleanup_pod_cgroup(
+                && let Err(e) = klights_kubelet::cgroup_cleanup::cleanup_pod_cgroup(
                     file_process,
                     containerd_ns,
                     pod_uid,

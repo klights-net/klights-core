@@ -19,7 +19,7 @@ pub struct KlightsConfig {
     pub containerd_namespace: String,
     pub containerd_socket: Option<String>,
     /// Immutable registry-proxy settings captured once at bootstrap.
-    pub registry_proxy: crate::kubelet::registry_proxy::RegistryProxyConfig,
+    pub registry_proxy: klights_kubelet::registry_proxy::RegistryProxyConfig,
     pub node_name: String,
     /// Node-local IP override for the Kubernetes Node InternalIP and local
     /// endpoint fallback. When unset, startup discovers the host IP.
@@ -215,7 +215,7 @@ impl KlightsConfig {
             .map(std::path::PathBuf::from);
         let containerd_socket = std::env::var("KLIGHTS_CONTAINERD_SOCKET").ok();
         let registry_proxy_endpoint = std::env::var("KLIGHTS_REGISTRY_PROXY_ENDPOINT").ok();
-        let registry_proxy = crate::kubelet::registry_proxy::RegistryProxyConfig::from_inputs(
+        let registry_proxy = klights_kubelet::registry_proxy::RegistryProxyConfig::from_inputs(
             parse_bool_env("KLIGHTS_REGISTRY_PROXY_ENABLED", false)?,
             registry_proxy_endpoint.as_deref(),
             containerd_socket.is_some(),
@@ -348,7 +348,7 @@ impl KlightsConfig {
             log_file: None,
             containerd_namespace: ns.into(),
             containerd_socket: None,
-            registry_proxy: crate::kubelet::registry_proxy::RegistryProxyConfig::from_inputs(
+            registry_proxy: klights_kubelet::registry_proxy::RegistryProxyConfig::from_inputs(
                 false, None, false,
             )
             .expect("default registry proxy configuration must be valid"),

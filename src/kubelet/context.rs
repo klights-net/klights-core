@@ -34,9 +34,9 @@ impl HostIpState {
 }
 
 pub(crate) type KubeletConfig = klights_kubelet::context::KubeletConfig<
-    crate::kubelet::log_rotation::LogRotationPolicy,
+    klights_kubelet::log_rotation::LogRotationPolicy,
     klights_kubelet::node_capacity::NodeCapacity,
-    crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    klights_kubelet::runtime_paths::KubeletRuntimePaths,
 >;
 
 pub(crate) type KubeletLifecycleServices = klights_kubelet::context::LifecycleServices<

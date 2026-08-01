@@ -3,7 +3,7 @@
 use anyhow::Context;
 
 use crate::bootstrap::{CliFlags, NodeMode};
-use crate::{KlightsConfig, kubelet, networking, paths, pidfile, shutdown};
+use crate::{KlightsConfig, networking, paths, pidfile, shutdown};
 use klights_networking::cni_plugin;
 
 /// Full teardown with the same immutable mode detection used by startup. This
@@ -55,7 +55,7 @@ pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
         .to_string_lossy()
         .into_owned();
     let runtime_paths =
-        kubelet::runtime_paths::KubeletRuntimePaths::new(paths::data_root_path(namespace))
+        klights_kubelet::runtime_paths::KubeletRuntimePaths::new(paths::data_root_path(namespace))
             .context("invalid cleanup runtime path layout")?;
     let mut cleanup_cni_rpc = match start_cleanup_cni_rpc_server(
         namespace,
@@ -80,11 +80,11 @@ pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
         grpc_transport_policy.connect_timeout,
         grpc_transport_policy.max_message_bytes,
     );
-    let mut cri = match kubelet::CriClient::connect_with_policy(
+    let mut cri = match klights_kubelet::cri::CriClient::connect_with_policy(
         containerd_socket.to_string_lossy().as_ref(),
         namespace,
         &cri_transport_policy,
-        kubelet::cri::DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT,
+        klights_kubelet::cri::DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT,
     )
     .await
     {
@@ -139,7 +139,7 @@ pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
                             .as_ref()
                             .map(|meta| meta.uid.as_str())
                             .filter(|uid| !uid.trim().is_empty())
-                            && let Err(e) = kubelet::cgroup_cleanup::cleanup_pod_cgroup(
+                            && let Err(e) = klights_kubelet::cgroup_cleanup::cleanup_pod_cgroup(
                                 &file_process,
                                 namespace,
                                 uid,
@@ -191,7 +191,9 @@ pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
     .await
 }
 
-async fn cleanup_all_runtime_containers(cri: &mut kubelet::CriClient) -> anyhow::Result<()> {
+async fn cleanup_all_runtime_containers(
+    cri: &mut klights_kubelet::cri::CriClient,
+) -> anyhow::Result<()> {
     let mut response = cri.list_containers(None).await?;
     if response.containers.is_empty() {
         return Ok(());
@@ -305,9 +307,9 @@ pub async fn stop_namespace_containerd_after_cleanup(
     namespace: &str,
     task_supervisor: &klights_supervisor::TaskSupervisor,
     file_process: &klights_supervisor::FileProcessExecutor,
-    paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    paths: &klights_kubelet::runtime_paths::KubeletRuntimePaths,
 ) {
-    match kubelet::ContainerdManager::stop_namespace_containerd(
+    match klights_kubelet::containerd_manager::ContainerdManager::stop_namespace_containerd(
         namespace,
         task_supervisor,
         file_process,
@@ -423,7 +425,7 @@ async fn cleanup_directories_and_network(
 
     // Remove leftover cgroupfs directories for this klights containerd namespace.
     tracing::info!("Removing pod cgroup directories");
-    match kubelet::cgroup_cleanup::kill_namespace_cgroup_processes(
+    match klights_kubelet::cgroup_cleanup::kill_namespace_cgroup_processes(
         namespace,
         task_supervisor,
         file_process,
@@ -436,7 +438,9 @@ async fn cleanup_directories_and_network(
         Ok(_) => {}
         Err(e) => tracing::warn!("Failed to stop leftover cgroup processes: {}", e),
     }
-    match kubelet::cgroup_cleanup::cleanup_namespace_cgroup_tree(file_process, namespace).await {
+    match klights_kubelet::cgroup_cleanup::cleanup_namespace_cgroup_tree(file_process, namespace)
+        .await
+    {
         Ok(removed) if removed > 0 => {
             tracing::info!(removed, "Removed cgroup directories");
         }

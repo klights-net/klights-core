@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use crate::kubelet::pod_cluster_runtime::{ClusterRuntimeView, NodeRuntimeView};
 use crate::kubelet::pod_env::EnvSourceReader;
-use crate::kubelet::pod_runtime::cri::{ContainerRuntimeControl, CriRuntime};
 use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
 use crate::kubelet::pod_runtime::events::PodEventSink;
 use crate::kubelet::pod_runtime::filesystem::PodFilesystem;
@@ -14,6 +13,7 @@ use crate::kubelet::pod_runtime::repository::PodRuntimeRepository;
 use crate::kubelet::pod_runtime::service::RuntimeConfig;
 use crate::kubelet::pod_runtime::store::{PodRuntimeStore, PodSlotAdmission};
 use crate::kubelet::pod_runtime::volumes::PodVolumeRuntime;
+use klights_kubelet::runtime::cri::{ContainerRuntimeControl, CriRuntime};
 use klights_kubelet::runtime_clock::RuntimeClock;
 use klights_supervisor::TaskSupervisor;
 

@@ -288,8 +288,8 @@ fn cri_runtime_trait_exposes_only_runtime_arguments() {
     // (image names, sandbox IDs, container configs) — never PodRepository,
     // Old watcher context bundles, DatastoreHandle, or any lifecycle key.
     fn assert_object_safe<T: ?Sized + Send + Sync>() {}
-    assert_object_safe::<dyn crate::kubelet::pod_runtime::cri::CriRuntime>();
-    assert_object_safe::<dyn crate::kubelet::pod_runtime::cri::ContainerRuntimeControl>();
+    assert_object_safe::<dyn klights_kubelet::runtime::cri::CriRuntime>();
+    assert_object_safe::<dyn klights_kubelet::runtime::cri::ContainerRuntimeControl>();
 }
 
 // --- Task 2.2: SharedCriRuntime production adapter ---
@@ -301,19 +301,19 @@ fn cri_runtime_trait_exposes_only_runtime_arguments() {
 fn shared_cri_runtime_clones_client_per_call_without_mutex() {
     // SharedCriRuntime is Send + Sync (no Mutex).
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<crate::kubelet::pod_runtime::cri::SharedCriRuntime>();
+    assert_send_sync::<klights_kubelet::runtime::cri::SharedCriRuntime>();
     // The adapter implements CriRuntime.
-    fn _takes_cri_runtime(_: &dyn crate::kubelet::pod_runtime::cri::CriRuntime) {}
+    fn _takes_cri_runtime(_: &dyn klights_kubelet::runtime::cri::CriRuntime) {}
 }
 
 // --- Task 2.3: MockCriRuntime ---
 
-use crate::kubelet::pod_runtime::cri::{ContainerRuntimeState, CriRuntime};
 use crate::kubelet::pod_runtime::test_support::{
     MockContainerControlOp, MockCriOperation, MockCriRuntime, MockHostPortOp, MockHostPortRuntime,
     MockNetworkOp, MockPodEventSink, MockPodFilesystem, MockPodNetworkRuntime,
     MockPodVolumeRuntime, MockProbeCall, MockProbeRuntime,
 };
+use klights_kubelet::runtime::cri::{ContainerRuntimeState, CriRuntime};
 
 #[tokio::test]
 async fn mock_cri_records_call_arguments_exactly() {
@@ -1174,17 +1174,14 @@ async fn real_pod_runtime_service_constructor_requires_all_object_ports() {
         containerd_namespace: "klights-test".into(),
         sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
         node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
-        paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
+        paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
             "/tmp/klights-runtime-test",
         ))
         .unwrap(),
     };
-    let node_view = std::sync::Arc::new(FakeNode::new("node-1", RuntimeNodeRole::Worker));
+    let node_view = std::sync::Arc::new(FakeNode::new("node-1"));
     let cluster_view = std::sync::Arc::new(
-        crate::kubelet::pod_cluster_runtime::WorkerClusterRuntimeView::new(
-            repo.clone(),
-            "node-1".into(),
-        ),
+        crate::kubelet::pod_cluster_runtime::RepositoryClusterRuntimeView::new(repo.clone()),
     );
 
     let _runtime = crate::kubelet::pod_runtime::service::RealPodRuntimeService::new(
@@ -1527,16 +1524,15 @@ async fn real_runtime_start_pod_uses_provided_snapshot_without_fresh_liveness_re
                 containerd_namespace: "klights-test".to_string(),
                 sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
                 node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
-                paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+                paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                     std::path::PathBuf::from("/tmp/klights-runtime-test"),
                 )
                 .unwrap(),
             },
             node_view: harness.node_view.clone(),
             cluster_view: Arc::new(
-                crate::kubelet::pod_cluster_runtime::WorkerClusterRuntimeView::new(
+                crate::kubelet::pod_cluster_runtime::RepositoryClusterRuntimeView::new(
                     harness.repo.clone(),
-                    "test-node".to_string(),
                 ),
             ),
         },
@@ -2797,7 +2793,7 @@ async fn mid_lifecycle_status_writes_preserve_host_ip_with_parity() {
 
     let conflict_cluster = std::sync::Arc::new(FakeCluster::new());
     let (_cri, conflict_runtime, conflict_repo, conflict_cluster, conflict_hostports) =
-        fixture_runtime_with_cluster("test-node", RuntimeNodeRole::Worker, conflict_cluster).await;
+        fixture_runtime_with_cluster("test-node", conflict_cluster).await;
     let holder = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -2895,7 +2891,7 @@ async fn mid_lifecycle_status_writes_preserve_host_ip_with_parity() {
 
     let init_cluster = std::sync::Arc::new(FakeCluster::new());
     let (init_cri, init_runtime, init_repo, init_cluster, _init_hostports) =
-        fixture_runtime_with_cluster("test-node", RuntimeNodeRole::Worker, init_cluster).await;
+        fixture_runtime_with_cluster("test-node", init_cluster).await;
     init_cri.set_container_exit_code(1);
     let init_pod = serde_json::json!({
         "apiVersion": "v1",
@@ -3787,61 +3783,42 @@ async fn mock_deletion_finalizer_returns_configured_outcome() {
 
 #[test]
 fn multi_node_runtime_traits_are_object_safe_send_sync() {
-    use crate::kubelet::pod_cluster_runtime::{
-        ClusterRuntimeView, NodeRuntimeView, ReplicationRuntime,
-    };
+    use crate::kubelet::pod_cluster_runtime::{ClusterRuntimeView, NodeRuntimeView};
 
     fn assert_send_sync<T: ?Sized + Send + Sync>() {}
     assert_send_sync::<dyn NodeRuntimeView>();
     assert_send_sync::<dyn ClusterRuntimeView>();
-    assert_send_sync::<dyn ReplicationRuntime>();
 }
 
 #[test]
 fn multi_node_traits_mutating_methods_require_uid() {
-    use crate::kubelet::pod_cluster_runtime::{
-        ClusterRuntimeView, NodeRuntimeView, ReplicationRuntime, RuntimeNodeRole,
-    };
+    use crate::kubelet::pod_cluster_runtime::{ClusterRuntimeView, NodeRuntimeView};
     use crate::kubelet::pod_runtime::service::PodRuntimeKey;
 
     // Compile-time verification: every mutating method on ClusterRuntimeView
-    // and ReplicationRuntime takes PodRuntimeKey (UID-qualified).
+    // takes PodRuntimeKey (UID-qualified).
     // NodeRuntimeView is read-only (no UID needed).
-
-    // RuntimeNodeRole is Send + Sync + Clone.
-    fn assert_send_sync_clone<T: Send + Sync + Clone>() {}
-    assert_send_sync_clone::<RuntimeNodeRole>();
-
-    // Verify enum variants exist.
-    let _ = RuntimeNodeRole::Leader;
-    let _ = RuntimeNodeRole::Worker;
-    let _ = RuntimeNodeRole::Replica;
 
     // Verify key is usable with the traits (compile-time).
     let _key = PodRuntimeKey::new("ns", "name", "uid");
 
     // Verify the traits accept PodRuntimeKey.
     fn _takes_cluster_view(_v: &dyn ClusterRuntimeView) {}
-    fn _takes_replication(_r: &dyn ReplicationRuntime) {}
     fn _takes_node_view(_n: &dyn NodeRuntimeView) {}
 }
 
 // --- Task 11.2: FakeNode and FakeCluster test doubles ---
 
-use crate::kubelet::pod_cluster_runtime::{
-    ClusterRuntimeView, NodeRuntimeView, ReplicationRuntime, RuntimeNodeRole,
-};
+use crate::kubelet::pod_cluster_runtime::{ClusterRuntimeView, NodeRuntimeView};
 use crate::kubelet::pod_runtime::test_support::{FakeCluster, FakeNode};
 
 #[test]
 fn fake_cluster_nodes_keep_runtime_arguments_isolated() {
-    let leader = FakeNode::new("node-leader", RuntimeNodeRole::Leader);
-    let worker = FakeNode::new("node-worker", RuntimeNodeRole::Worker);
+    let leader = FakeNode::new("node-leader");
+    let worker = FakeNode::new("node-worker");
 
     assert_eq!(leader.node_name(), "node-leader");
-    assert_eq!(leader.role(), RuntimeNodeRole::Leader);
     assert_eq!(worker.node_name(), "node-worker");
-    assert_eq!(worker.role(), RuntimeNodeRole::Worker);
 
     // Each node has independent state — no shared mutable state.
     let leader_pod = serde_json::json!({
@@ -3859,7 +3836,7 @@ fn fake_cluster_nodes_keep_runtime_arguments_isolated() {
 
 #[test]
 fn fake_worker_owns_only_pods_scheduled_to_its_node() {
-    let worker = FakeNode::new("worker-1", RuntimeNodeRole::Worker);
+    let worker = FakeNode::new("worker-1");
 
     // Pod scheduled to this node.
     let owned = serde_json::json!({"spec": {"nodeName": "worker-1"}});
@@ -3877,7 +3854,6 @@ fn fake_worker_owns_only_pods_scheduled_to_its_node() {
 #[tokio::test]
 async fn fake_cluster_records_worker_status_forward_to_leader() {
     use crate::kubelet::pod_runtime::service::PodRuntimeKey;
-    use klights_cluster_core::command::StorageCommand;
 
     let cluster = FakeCluster::new();
 
@@ -3899,28 +3875,6 @@ async fn fake_cluster_records_worker_status_forward_to_leader() {
     assert_eq!(forwards[0].0.name, "test-pod");
     assert_eq!(forwards[0].0.uid, "uid-1");
     assert_eq!(forwards[0].1, status);
-
-    // enqueue_storage_command records the command.
-    let key2 = PodRuntimeKey::new("default", "test-pod", "uid-1");
-    let cmd = StorageCommand::DeleteResource {
-        api_version: "v1".to_string(),
-        kind: "Pod".to_string(),
-        namespace: Some("default".to_string()),
-        name: "test-pod".to_string(),
-        preconditions: crate::datastore::ResourcePreconditions {
-            uid: Some("uid-1".to_string()),
-            resource_version: None,
-        },
-    };
-    cluster
-        .enqueue_storage_command(&key2, cmd.clone())
-        .await
-        .unwrap();
-
-    let commands = cluster.recorded_storage_commands();
-    assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].0.namespace, "default");
-    assert_eq!(commands[0].0.uid, "uid-1");
 }
 
 // --- Task 12.1: Multi-node runtime start respects node ownership ---
@@ -3928,7 +3882,6 @@ async fn fake_cluster_records_worker_status_forward_to_leader() {
 /// Build a RealPodRuntimeService with a custom FakeNode for node-ownership tests.
 async fn fixture_runtime_with_node(
     node_name: &str,
-    role: RuntimeNodeRole,
 ) -> (
     std::sync::Arc<MockCriRuntime>,
     std::sync::Arc<crate::kubelet::pod_runtime::service::RealPodRuntimeService>,
@@ -3963,20 +3916,17 @@ async fn fixture_runtime_with_node(
         containerd_namespace: "klights-test".into(),
         sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
         node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
-        paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
+        paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
             "/tmp/klights-runtime-test",
         ))
         .unwrap(),
     };
-    // Every role routes through the same worker cluster-view path.
+    // Every node routes through the same repository-backed cluster-view path.
     let cluster_view: std::sync::Arc<dyn crate::kubelet::pod_cluster_runtime::ClusterRuntimeView> =
         std::sync::Arc::new(
-            crate::kubelet::pod_cluster_runtime::WorkerClusterRuntimeView::new(
-                repo.clone(),
-                node_name.to_string(),
-            ),
+            crate::kubelet::pod_cluster_runtime::RepositoryClusterRuntimeView::new(repo.clone()),
         );
-    let node_view = std::sync::Arc::new(FakeNode::new(node_name, role));
+    let node_view = std::sync::Arc::new(FakeNode::new(node_name));
 
     let runtime = std::sync::Arc::new(
         crate::kubelet::pod_runtime::service::RealPodRuntimeService::new(
@@ -4010,7 +3960,7 @@ use crate::kubelet::pod_runtime::test_support::scheduled_pod_json;
 
 #[tokio::test]
 async fn worker_runtime_starts_local_pod_and_does_not_touch_leader_cri() {
-    let (cri, runtime, repo) = fixture_runtime_with_node("worker-1", RuntimeNodeRole::Worker).await;
+    let (cri, runtime, repo) = fixture_runtime_with_node("worker-1").await;
 
     // Pod scheduled to a different node (leader) — must be rejected.
     let leader_pod = scheduled_pod_json("ns", "leader-pod", "uid-leader", "leader-node");
@@ -4055,7 +4005,7 @@ async fn worker_runtime_starts_local_pod_and_does_not_touch_leader_cri() {
 
 #[tokio::test]
 async fn worker_runtime_does_not_start_same_name_replacement_for_stale_uid() {
-    let (cri, runtime, repo) = fixture_runtime_with_node("worker-1", RuntimeNodeRole::Worker).await;
+    let (cri, runtime, repo) = fixture_runtime_with_node("worker-1").await;
 
     // Create a pod with new-uid (simulating same-name replacement).
     let new_pod = scheduled_pod_json("ns", "test-pod", "new-uid", "worker-1");
@@ -4094,7 +4044,7 @@ async fn worker_runtime_does_not_start_same_name_replacement_for_stale_uid() {
 /// CRI. Locks in that the guard does not depend on a snapshot being supplied.
 #[tokio::test]
 async fn worker_runtime_rejects_same_name_replacement_without_snapshot() {
-    let (cri, runtime, repo) = fixture_runtime_with_node("worker-1", RuntimeNodeRole::Worker).await;
+    let (cri, runtime, repo) = fixture_runtime_with_node("worker-1").await;
 
     // Live pod has the NEW uid (the replacement); the start request carries the
     // OLD uid via the key and no snapshot.
@@ -4126,7 +4076,6 @@ async fn worker_runtime_rejects_same_name_replacement_without_snapshot() {
 /// Build a RealPodRuntimeService with a FakeCluster for status-forwarding tests.
 async fn fixture_runtime_with_cluster(
     node_name: &str,
-    role: RuntimeNodeRole,
     cluster: std::sync::Arc<FakeCluster>,
 ) -> (
     std::sync::Arc<MockCriRuntime>,
@@ -4164,12 +4113,12 @@ async fn fixture_runtime_with_cluster(
         containerd_namespace: "klights-test".into(),
         sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
         node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
-        paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
+        paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
             "/tmp/klights-runtime-test",
         ))
         .unwrap(),
     };
-    let node_view = std::sync::Arc::new(FakeNode::new(node_name, role));
+    let node_view = std::sync::Arc::new(FakeNode::new(node_name));
 
     let runtime = std::sync::Arc::new(
         crate::kubelet::pod_runtime::service::RealPodRuntimeService::new(
@@ -4203,7 +4152,7 @@ async fn fixture_runtime_with_cluster(
 async fn worker_runtime_forwards_status_to_leader() {
     let cluster = std::sync::Arc::new(FakeCluster::new());
     let (_cri, runtime, repo, cluster, _hostports) =
-        fixture_runtime_with_cluster("worker-1", RuntimeNodeRole::Worker, cluster).await;
+        fixture_runtime_with_cluster("worker-1", cluster).await;
 
     let pod = scheduled_pod_json("ns", "fwd-pod", "uid-fwd", "worker-1");
     repo.create_controller_pod("ns", "fwd-pod", "worker-1", pod.clone())
@@ -4266,7 +4215,7 @@ async fn leader_runtime_writes_status_locally() {
 async fn worker_runtime_forwarded_status_is_uid_preconditioned() {
     let cluster = std::sync::Arc::new(FakeCluster::new());
     let (_cri, runtime, repo, cluster, _hostports) =
-        fixture_runtime_with_cluster("worker-1", RuntimeNodeRole::Worker, cluster).await;
+        fixture_runtime_with_cluster("worker-1", cluster).await;
 
     let pod = scheduled_pod_json("ns", "uid-pod", "uid-chk", "worker-1");
     repo.create_controller_pod("ns", "uid-pod", "worker-1", pod.clone())
@@ -4294,7 +4243,7 @@ async fn worker_runtime_forwarded_status_is_uid_preconditioned() {
 
 #[tokio::test]
 async fn cross_node_delete_is_rejected_on_non_owner_node() {
-    let (cri, runtime, repo) = fixture_runtime_with_node("worker-1", RuntimeNodeRole::Worker).await;
+    let (cri, runtime, repo) = fixture_runtime_with_node("worker-1").await;
 
     // Pod scheduled to a different node: this node must not perform any local
     // cleanup and must not report success, because success lets the lifecycle
@@ -4350,7 +4299,7 @@ async fn cross_node_delete_is_rejected_on_non_owner_node() {
 #[tokio::test]
 async fn cri_leftover_cleanup_is_node_local() {
     // Build a runtime on worker-1 and test reconcile_cri_leftovers node-local gate.
-    let (cri, runtime, repo) = fixture_runtime_with_node("worker-1", RuntimeNodeRole::Worker).await;
+    let (cri, runtime, repo) = fixture_runtime_with_node("worker-1").await;
 
     // Pod scheduled to a different node — reconcile must return Ok without CRI work.
     let cross_pod = scheduled_pod_json("ns", "cross-pod", "uid-cross", "worker-2");
@@ -4580,39 +4529,6 @@ async fn mock_dependency_matrix_cluster_view() {
     assert_eq!(calls[0].0, "ns");
     assert_eq!(calls[0].1, "cv-pod");
     assert_eq!(calls[0].2, "uid-cv");
-}
-
-/// Replication: minimal fake verifying UID-preconditioned StorageCommand enqueued.
-#[tokio::test]
-async fn mock_dependency_matrix_replication() {
-    struct FakeReplication {
-        commands: std::sync::Mutex<Vec<(String, String, String, String)>>,
-    }
-    impl FakeReplication {
-        fn new() -> Self {
-            Self {
-                commands: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-        fn enqueue_command(&self, ns: &str, name: &str, uid: &str, action: &str) {
-            self.commands.lock().unwrap().push((
-                ns.to_string(),
-                name.to_string(),
-                uid.to_string(),
-                action.to_string(),
-            ));
-        }
-    }
-
-    let rep = FakeReplication::new();
-    rep.enqueue_command("ns", "rep-pod", "uid-rep", "update_status");
-
-    let cmds = rep.commands.lock().unwrap();
-    assert_eq!(cmds.len(), 1);
-    assert_eq!(cmds[0].0, "ns");
-    assert_eq!(cmds[0].1, "rep-pod");
-    assert_eq!(cmds[0].2, "uid-rep");
-    assert_eq!(cmds[0].3, "update_status");
 }
 
 /// Timer: TaskSupervisor spawn_delay fires once per scheduled deadline.
@@ -4934,7 +4850,7 @@ async fn mock_dependency_matrix_fake_cluster() {
 #[tokio::test]
 async fn shared_cri_runtime_implements_container_runtime_control_with_parity() {
     // Verify the trait is implemented on the production adapter type.
-    use crate::kubelet::pod_runtime::cri::ContainerRuntimeControl;
+    use klights_kubelet::runtime::cri::ContainerRuntimeControl;
     // Trait object conversion compiles only if SharedCriRuntime: ContainerRuntimeControl.
     fn _assert_impl(_: &dyn ContainerRuntimeControl) {}
     // Verify mock also implements the trait (Task 20.1 coverage gate).
@@ -5115,18 +5031,17 @@ use crate::kubelet::pod_cluster_runtime::LocalNodeRuntimeView;
 
 #[test]
 fn local_node_runtime_view_owns_pod_with_matching_node_name() {
-    let view = LocalNodeRuntimeView::new("node-1".into(), RuntimeNodeRole::Leader);
+    let view = LocalNodeRuntimeView::new("node-1".into());
     let pod = serde_json::json!({
         "spec": {"nodeName": "node-1"}
     });
     assert!(view.owns_pod_runtime(&pod));
     assert_eq!(view.node_name(), "node-1");
-    assert!(matches!(view.role(), RuntimeNodeRole::Leader));
 }
 
 #[test]
 fn local_node_runtime_view_rejects_pod_with_different_node_name() {
-    let view = LocalNodeRuntimeView::new("node-1".into(), RuntimeNodeRole::Worker);
+    let view = LocalNodeRuntimeView::new("node-1".into());
     let pod = serde_json::json!({
         "spec": {"nodeName": "node-2"}
     });
@@ -5135,39 +5050,19 @@ fn local_node_runtime_view_rejects_pod_with_different_node_name() {
 
 #[test]
 fn local_node_runtime_view_rejects_pod_without_node_name() {
-    let view = LocalNodeRuntimeView::new("node-1".into(), RuntimeNodeRole::Worker);
+    let view = LocalNodeRuntimeView::new("node-1".into());
     let pod = serde_json::json!({
         "spec": {}
     });
     assert!(!view.owns_pod_runtime(&pod));
 }
 
-// ── Task 20.11-20.12: ClusterRuntimeView & ReplicationRuntime ──
+// ── Task 20.11: ClusterRuntimeView ──
 
 #[tokio::test]
-async fn worker_cluster_runtime_view_constructs_with_repository() {
+async fn repository_cluster_runtime_view_constructs_with_repository() {
     let repo = fixture_pod_repository().await;
-    let _view =
-        crate::kubelet::pod_cluster_runtime::WorkerClusterRuntimeView::new(repo, "node-1".into());
-}
-
-#[tokio::test]
-async fn real_replication_runtime_enqueue_is_noop_in_single_node() {
-    let repo = fixture_pod_repository().await;
-    let replication = crate::kubelet::pod_cluster_runtime::RealReplicationRuntime::new(repo);
-    let key = PodRuntimeKey::new("ns", "pod", "uid");
-    let cmd = klights_cluster_core::command::StorageCommand::create_resource(
-        "v1",
-        "Pod",
-        Some("ns"),
-        "pod",
-        serde_json::json!({}),
-    );
-    // Should succeed (no-op in single-node mode).
-    replication
-        .enqueue_storage_command(&key, cmd)
-        .await
-        .unwrap();
+    let _view = crate::kubelet::pod_cluster_runtime::RepositoryClusterRuntimeView::new(repo);
 }
 
 // ── Task 21.1: finalize_deletion routes through PodDeletionFinalizer ──
@@ -5329,8 +5224,8 @@ async fn real_runtime_handle_lifecycle_command_startup_passed() {
 #[tokio::test]
 async fn liveness_restart_uses_runtime_container_id_with_parity() {
     use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
-    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
     use klights_kubelet::lifecycle::{LifecycleCommand, RestartReason};
+    use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
     let pod = serde_json::json!({
@@ -5476,8 +5371,8 @@ async fn liveness_restart_uses_runtime_container_id_with_parity() {
 #[tokio::test]
 async fn liveness_restart_publishes_replacement_container_status_immediately() {
     use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
-    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
     use klights_kubelet::lifecycle::{LifecycleCommand, RestartReason};
+    use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
     let pod = serde_json::json!({
@@ -5630,7 +5525,7 @@ async fn reconcile_ephemeral_full_sequence_with_parity() {
         containerd_namespace: "klights-test".into(),
         sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
         node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
-        paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
+        paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
             "/tmp/klights-runtime-test",
         ))
         .unwrap(),
@@ -5829,7 +5724,7 @@ async fn real_runtime_reconcile_runtime_noop_when_no_sandbox() {
 #[tokio::test]
 async fn real_runtime_reconcile_runtime_restarts_exited_restart_policy_always_container() {
     use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
-    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
+    use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
     let pod = serde_json::json!({
@@ -5975,7 +5870,7 @@ async fn real_runtime_reconcile_runtime_restarts_exited_restart_policy_always_co
 #[tokio::test]
 async fn real_runtime_reconcile_restart_policy_always_publishes_replacement_running_status() {
     use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
-    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
+    use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
     let key = PodRuntimeKey::new(
@@ -6113,8 +6008,8 @@ async fn real_runtime_reconcile_restart_policy_always_publishes_replacement_runn
 #[tokio::test]
 async fn reconcile_runtime_writes_pod_and_host_ips_with_parity() {
     use crate::kubelet::pod_repository::PodStatusWriter;
-    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+    use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
     let key = PodRuntimeKey::new("pods", "ip-pod", "uid-ip-pod");
@@ -6293,8 +6188,8 @@ async fn reconcile_runtime_writes_pod_and_host_ips_with_parity() {
 #[tokio::test]
 async fn reconcile_runtime_duplicate_status_does_not_emit_second_watch_event() {
     use crate::kubelet::pod_repository::PodReader;
-    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+    use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
     let key = PodRuntimeKey::new("pods", "dedup-pod", "uid-dedup-pod");
@@ -6407,7 +6302,7 @@ async fn reconcile_runtime_duplicate_status_does_not_emit_second_watch_event() {
 
 #[tokio::test]
 async fn active_deadline_enforcement_marks_failed_with_parity() {
-    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
+    use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
     let key = PodRuntimeKey::new("pods", "deadline-pod", "uid-deadline-pod");
@@ -7464,7 +7359,7 @@ async fn real_runtime_start_pod_retrying_init_failure_publishes_pod_initializing
 async fn worker_init_retry_never_forwards_phase_only_pending_status() {
     let cluster = std::sync::Arc::new(FakeCluster::new());
     let (cri, runtime, repo, cluster, _hostports) =
-        fixture_runtime_with_cluster("worker-1", RuntimeNodeRole::Worker, cluster).await;
+        fixture_runtime_with_cluster("worker-1", cluster).await;
     cri.set_container_exit_code(1);
     let pod = serde_json::json!({
         "apiVersion": "v1",
@@ -8890,8 +8785,8 @@ async fn real_runtime_reconcile_does_not_preserve_ready_started_for_missing_cont
 #[tokio::test]
 async fn real_runtime_reconcile_reports_exited_restart_never_container_as_succeeded() {
     use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
-    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+    use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
     let pod = serde_json::json!({
@@ -8996,8 +8891,8 @@ async fn real_runtime_reconcile_reports_exited_restart_never_container_as_succee
 #[tokio::test]
 async fn real_runtime_reconcile_preserves_terminal_container_state_after_stale_running_snapshot() {
     use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
-    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+    use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
     let key = PodRuntimeKey::new(
@@ -9133,7 +9028,7 @@ async fn mocked_runtime_does_not_create_termination_log_file_directly() {
             containerd_namespace: runtime_namespace.into(),
             sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
-            paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+            paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
             )
             .unwrap(),
@@ -9190,8 +9085,8 @@ async fn mocked_runtime_does_not_create_termination_log_file_directly() {
 #[tokio::test]
 async fn mocked_runtime_does_not_read_termination_message_file_directly() {
     use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
-    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+    use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let runtime_namespace = "klights-term-mock-read-test";
     let _ = std::fs::remove_dir_all(
@@ -9206,7 +9101,7 @@ async fn mocked_runtime_does_not_read_termination_message_file_directly() {
             containerd_namespace: runtime_namespace.into(),
             sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
-            paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+            paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
             )
             .unwrap(),
@@ -9320,7 +9215,7 @@ async fn termination_message_mount_path_with_parity() {
             containerd_namespace: runtime_namespace.into(),
             sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
-            paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+            paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
             )
             .unwrap(),
@@ -9396,7 +9291,7 @@ async fn hosts_file_mount_path_with_parity() {
             containerd_namespace: runtime_namespace.into(),
             sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
-            paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+            paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
             )
             .unwrap(),
@@ -9438,7 +9333,7 @@ async fn hosts_file_mount_path_with_parity() {
     let config = create_configs
         .first()
         .expect("container config must be created");
-    let expected_host_path = crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+    let expected_host_path = klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
         std::path::PathBuf::from("/tmp/klights-runtime-test"),
     )
     .unwrap()
@@ -9465,8 +9360,8 @@ async fn hosts_file_mount_path_with_parity() {
 #[tokio::test]
 async fn termination_message_file_handling_with_parity() {
     use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
-    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+    use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let runtime_namespace = "klights-term-read-test";
     let harness = PodRuntimeHarness::new_with_runtime_config(
@@ -9476,7 +9371,7 @@ async fn termination_message_file_handling_with_parity() {
             containerd_namespace: runtime_namespace.into(),
             sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
-            paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+            paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
             )
             .unwrap(),
@@ -9879,7 +9774,7 @@ async fn kubernetes_service_envs_with_parity() {
             containerd_namespace: "klights-test".into(),
             sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
-            paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+            paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
             )
             .unwrap(),
@@ -10214,7 +10109,7 @@ async fn real_runtime_reconcile_treats_cri_numeric_running_state_as_running() {
 
     harness.container_control.set_container_states(vec![(
         "container-coredns".into(),
-        crate::kubelet::pod_runtime::cri::ContainerRuntimeState::from_cri_state_i32(
+        klights_kubelet::runtime::cri::ContainerRuntimeState::from_cri_state_i32(
             k8s_cri::v1::ContainerState::ContainerRunning as i32,
         ),
     )]);
@@ -10346,7 +10241,7 @@ async fn real_runtime_actor_cycle_starts_reconciles_running_and_deletes_pod() {
         .route(LifecycleMessage::CriEvent {
             key: lifecycle_key.clone(),
             container_id: "container-sandbox-0001".into(),
-            kind: crate::kubelet::cri_events::KubeletEventKind::Started,
+            kind: klights_kubelet::cri_events::KubeletEventKind::Started,
         })
         .await
         .expect("route cri start event");
@@ -10606,16 +10501,15 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
                 containerd_namespace: "klights-test".into(),
                 sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
                 node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
-                paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+                paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                     std::path::PathBuf::from("/tmp/klights-runtime-test"),
                 )
                 .unwrap(),
             },
-            node_view: std::sync::Arc::new(FakeNode::new("test-node", RuntimeNodeRole::Leader)),
+            node_view: std::sync::Arc::new(FakeNode::new("test-node")),
             cluster_view: std::sync::Arc::new(
-                crate::kubelet::pod_cluster_runtime::WorkerClusterRuntimeView::new(
+                crate::kubelet::pod_cluster_runtime::RepositoryClusterRuntimeView::new(
                     repo.clone(),
-                    "test-node".into(),
                 ),
             ),
         },
@@ -10650,9 +10544,9 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
 #[tokio::test]
 async fn real_runtime_reconcile_uses_cri_event_container_id_when_list_is_empty() {
     use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
-    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
     use crate::kubelet::pod_runtime::service::RuntimeReconcileHint;
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+    use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
     let key = PodRuntimeKey::new("container-runtime", "fast-exit", "uid-fast-exit");
@@ -10710,11 +10604,11 @@ async fn real_runtime_reconcile_uses_cri_event_container_id_when_list_is_empty()
             key.clone(),
             RuntimeReconcileHint::from_container_event(
                 "ctr-fast-exit",
-                crate::kubelet::cri_events::KubeletEventKind::Started,
+                klights_kubelet::cri_events::KubeletEventKind::Started,
             )
             .with_container_event(
                 "ctr-fast-exit",
-                crate::kubelet::cri_events::KubeletEventKind::Stopped,
+                klights_kubelet::cri_events::KubeletEventKind::Stopped,
             ),
         )
         .await
@@ -10751,11 +10645,11 @@ async fn real_runtime_reconcile_uses_cri_event_container_id_when_list_is_empty()
 
 #[tokio::test]
 async fn started_cri_event_overrides_lagging_created_status_snapshot() {
-    use crate::kubelet::cri_events::KubeletEventKind;
     use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
-    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
     use crate::kubelet::pod_runtime::service::RuntimeReconcileHint;
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+    use klights_kubelet::cri_events::KubeletEventKind;
+    use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
     let key = PodRuntimeKey::new("kube-system", "coredns", "uid-coredns");
@@ -10877,10 +10771,10 @@ async fn started_cri_event_overrides_lagging_created_status_snapshot() {
 mod task4_runtime_observations {
     use super::*;
     use crate::kubelet::pod_lifecycle_core::state::PodLifecycleState;
-    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
     use crate::kubelet::pod_runtime::service::PodRuntimeKey;
     use crate::kubelet::pod_runtime::service::RuntimeReconcileHint;
     use crate::kubelet::pod_runtime::test_support::PodRuntimeHarness;
+    use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     #[test]
     fn deferred_runtime_reconcile_preserves_multiple_container_ids() {
@@ -10898,7 +10792,7 @@ mod task4_runtime_observations {
 
     #[test]
     fn deferred_runtime_reconcile_preserves_latest_kind_per_container() {
-        use crate::kubelet::cri_events::KubeletEventKind;
+        use klights_kubelet::cri_events::KubeletEventKind;
 
         let mut state = PodLifecycleState::new();
         state.defer_runtime_reconcile_event("ctr-a", KubeletEventKind::Created);

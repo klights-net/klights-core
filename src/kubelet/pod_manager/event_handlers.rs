@@ -31,7 +31,7 @@ pub(super) struct WatchEventHandlerContext<'a> {
     pub deadline_timers: super::deadline_timers::DeadlineTimerRegistry,
     pub now_unix_seconds: i64,
     pub node_capacity: klights_kubelet::node_capacity::NodeCapacity,
-    pub paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    pub paths: klights_kubelet::runtime_paths::KubeletRuntimePaths,
 }
 
 pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, event: WatchEvent) {
@@ -911,7 +911,7 @@ mod tests {
         let pod_dir_id =
             klights_kubelet::volumes::pod_volume_dir_id("default", "cm-pod", "uid-cm-pod");
         let paths =
-            crate::kubelet::runtime_paths::KubeletRuntimePaths::new(temp.path().to_path_buf())
+            klights_kubelet::runtime_paths::KubeletRuntimePaths::new(temp.path().to_path_buf())
                 .unwrap();
         let volume_path = paths
             .volumes_root()

@@ -23,10 +23,6 @@ use super::init::leader_control_stream::start_worker_leader_control_stream;
 use super::runtime::resolve_token_file_if_present;
 use super::worker_store_adapter::start_worker_store_adapter;
 
-fn worker_pod_runtime_node_role() -> crate::kubelet::pod_cluster_runtime::RuntimeNodeRole {
-    crate::kubelet::pod_cluster_runtime::RuntimeNodeRole::Worker
-}
-
 // ── Worker boot ──────────────────────────────────────────────────────────
 
 pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
@@ -438,8 +434,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         tokio::sync::mpsc::channel::<klights_kubelet::lifecycle::LifecycleCommand>(128);
     let pod_lifecycle_rx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(pod_lifecycle_rx)));
     let pod_watcher_runtime_ports = cri_for_pod_watcher.clone().map(|cri| {
-        let runtime = std::sync::Arc::new(crate::kubelet::pod_runtime::cri::SharedCriRuntime::new(
-            crate::kubelet::cri::SharedCriClient::new(cri),
+        let runtime = std::sync::Arc::new(klights_kubelet::runtime::cri::SharedCriRuntime::new(
+            klights_kubelet::cri::SharedCriClient::new(cri),
         ));
         crate::kubelet::pod_manager::PodWatcherRuntimePorts::new(
             runtime.clone(),
@@ -497,9 +493,9 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             node_capacity: kubelet_capacity,
             paths: runtime_paths.clone(),
             lifecycle_route_mode: crate::kubelet::pod_lifecycle_router::PodLifecycleRouteMode::Actor,
-            cri: cri_for_pod_watcher.clone().map(crate::kubelet::cri::SharedCriClient::new),
+            cri: cri_for_pod_watcher.clone().map(klights_kubelet::cri::SharedCriClient::new),
             registry_proxy: config.registry_proxy.enabled().then(|| {
-                crate::kubelet::registry_proxy::ContainerdRegistryProxyConfigurator::new(
+                klights_kubelet::registry_proxy::ContainerdRegistryProxyConfigurator::new(
                     config.registry_proxy.clone(),
                     runtime_paths.containerd_data_dir().join("certs.d"),
                     klights_supervisor::FileProcessExecutor::new(task_supervisor.clone()),
@@ -510,7 +506,6 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             probe_manager: None,
             datapath: Some(kubelet_runtime_network.datapath.clone()),
             service_router: Some(services.clone()),
-            runtime_node_role: worker_pod_runtime_node_role(),
             runtime_service: None,
             runtime_store: std::sync::Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(
@@ -561,7 +556,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         config.service_cidr.clone(),
         config.node_name.clone(),
         config.containerd_namespace.clone(),
-        crate::kubelet::log_rotation::LogRotationPolicy::default(),
+        klights_kubelet::log_rotation::LogRotationPolicy::default(),
         kubelet_capacity,
         runtime_paths,
     )
@@ -941,14 +936,5 @@ mod tests {
         config.heartbeat = false;
         let err = validate_worker_config(&config).unwrap_err();
         assert!(err.contains("heartbeat"));
-    }
-
-    #[test]
-    fn worker_pod_runtime_role_is_worker() {
-        assert_eq!(
-            super::worker_pod_runtime_node_role(),
-            crate::kubelet::pod_cluster_runtime::RuntimeNodeRole::Worker,
-            "worker kubelet runtime must forward cluster writes through the worker cluster view"
-        );
     }
 }

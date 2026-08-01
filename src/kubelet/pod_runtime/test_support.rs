@@ -1624,7 +1624,7 @@ impl PodRuntimeHarness {
             containerd_namespace: "klights-test".into(),
             sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
-            paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+            paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
             )
             .unwrap(),
@@ -1683,15 +1683,9 @@ impl PodRuntimeHarness {
         let env_source = std::sync::Arc::new(MockEnvSourceReader::new());
         let finalizer = std::sync::Arc::new(MockPodDeletionFinalizer::new());
 
-        let node_view = std::sync::Arc::new(FakeNode::new(
-            &config.node_name,
-            super::super::pod_cluster_runtime::RuntimeNodeRole::Worker,
-        ));
+        let node_view = std::sync::Arc::new(FakeNode::new(&config.node_name));
         let cluster_view = std::sync::Arc::new(
-            super::super::pod_cluster_runtime::WorkerClusterRuntimeView::new(
-                repo.clone(),
-                config.node_name.clone(),
-            ),
+            super::super::pod_cluster_runtime::RepositoryClusterRuntimeView::new(repo.clone()),
         );
 
         let runtime = std::sync::Arc::new(
@@ -1806,7 +1800,7 @@ impl PodRuntimeHarness {
                 .map(|container_id| {
                     (
                         container_id,
-                        crate::kubelet::pod_runtime::cri::ContainerRuntimeState::Running,
+                        klights_kubelet::runtime::cri::ContainerRuntimeState::Running,
                     )
                 })
                 .collect(),
@@ -1832,14 +1826,12 @@ impl PodRuntimeHarness {
 /// Fake node implementing `NodeRuntimeView` for multi-node tests.
 pub struct FakeNode {
     node_name: String,
-    role: super::super::pod_cluster_runtime::RuntimeNodeRole,
 }
 
 impl FakeNode {
-    pub fn new(node_name: &str, role: super::super::pod_cluster_runtime::RuntimeNodeRole) -> Self {
+    pub fn new(node_name: &str) -> Self {
         Self {
             node_name: node_name.to_string(),
-            role,
         }
     }
 }
@@ -1847,10 +1839,6 @@ impl FakeNode {
 impl super::super::pod_cluster_runtime::NodeRuntimeView for FakeNode {
     fn node_name(&self) -> &str {
         &self.node_name
-    }
-
-    fn role(&self) -> super::super::pod_cluster_runtime::RuntimeNodeRole {
-        self.role.clone()
     }
 
     fn owns_pod_runtime(&self, pod: &serde_json::Value) -> bool {
@@ -1864,15 +1852,10 @@ impl super::super::pod_cluster_runtime::NodeRuntimeView for FakeNode {
 
 /// Records forwarded status updates for multi-node tests.
 type StatusForward = (PodRuntimeKey, serde_json::Value);
-/// Records enqueued storage commands for multi-node tests.
-type StorageCommandRecord = (PodRuntimeKey, klights_cluster_core::command::StorageCommand);
-
-/// Fake cluster implementing `ClusterRuntimeView` and `ReplicationRuntime`
-/// for multi-node tests.
+/// Fake cluster implementing `ClusterRuntimeView` for multi-node tests.
 pub struct FakeCluster {
     fresh_pods: Mutex<std::collections::HashMap<(String, String), crate::datastore::Resource>>,
     status_forwards: Mutex<Vec<StatusForward>>,
-    storage_commands: Mutex<Vec<StorageCommandRecord>>,
 }
 
 impl Default for FakeCluster {
@@ -1886,7 +1869,6 @@ impl FakeCluster {
         Self {
             fresh_pods: Mutex::new(std::collections::HashMap::new()),
             status_forwards: Mutex::new(Vec::new()),
-            storage_commands: Mutex::new(Vec::new()),
         }
     }
 
@@ -1899,10 +1881,6 @@ impl FakeCluster {
 
     pub fn recorded_status_forwards(&self) -> Vec<StatusForward> {
         self.status_forwards.lock().unwrap().clone()
-    }
-
-    pub fn recorded_storage_commands(&self) -> Vec<StorageCommandRecord> {
-        self.storage_commands.lock().unwrap().clone()
     }
 }
 
@@ -1946,21 +1924,6 @@ impl super::super::pod_cluster_runtime::ClusterRuntimeView for FakeCluster {
             })),
             resource_version: 1,
         })
-    }
-}
-
-#[async_trait::async_trait]
-impl super::super::pod_cluster_runtime::ReplicationRuntime for FakeCluster {
-    async fn enqueue_storage_command(
-        &self,
-        key: &PodRuntimeKey,
-        command: klights_cluster_core::command::StorageCommand,
-    ) -> anyhow::Result<()> {
-        self.storage_commands
-            .lock()
-            .unwrap()
-            .push((key.clone(), command));
-        Ok(())
     }
 }
 

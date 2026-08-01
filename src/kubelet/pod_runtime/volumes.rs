@@ -33,7 +33,7 @@ pub struct RealPodVolumeRuntime {
     supervisor: Arc<TaskSupervisor>,
     file_process: klights_supervisor::FileProcessExecutor,
     node_capacity: klights_kubelet::node_capacity::NodeCapacity,
-    paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    paths: klights_kubelet::runtime_paths::KubeletRuntimePaths,
     projected_sa_refresh_cancellations: Arc<Mutex<HashMap<PodRuntimeKey, CancellationToken>>>,
 }
 
@@ -43,7 +43,7 @@ impl RealPodVolumeRuntime {
         containerd_namespace: String,
         supervisor: Arc<TaskSupervisor>,
         node_capacity: klights_kubelet::node_capacity::NodeCapacity,
-        paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
+        paths: klights_kubelet::runtime_paths::KubeletRuntimePaths,
     ) -> Self {
         Self {
             sources,
@@ -159,7 +159,7 @@ mod tests {
         let containerd_ns = "rt-volumes-test";
         let temp = tempfile::tempdir().expect("create kubelet test fixture");
         let runtime_paths =
-            crate::kubelet::runtime_paths::KubeletRuntimePaths::new(temp.path().to_path_buf())
+            klights_kubelet::runtime_paths::KubeletRuntimePaths::new(temp.path().to_path_buf())
                 .unwrap();
 
         let runtime = RealPodVolumeRuntime::new(
@@ -206,7 +206,7 @@ mod tests {
                 klights_supervisor::TaskCategoryConfig::default(),
             )),
             klights_kubelet::node_capacity::NodeCapacity::default(),
-            crate::kubelet::runtime_paths::KubeletRuntimePaths::new(temp.path().to_path_buf())
+            klights_kubelet::runtime_paths::KubeletRuntimePaths::new(temp.path().to_path_buf())
                 .unwrap(),
         );
         let pod = serde_json::json!({

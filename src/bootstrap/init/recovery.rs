@@ -3,7 +3,7 @@
 use anyhow::Context;
 
 use crate::bootstrap::NodeMode;
-use crate::{KlightsConfig, kubelet, networking, paths, shutdown};
+use crate::{KlightsConfig, networking, paths, shutdown};
 
 use super::cleanup::stop_namespace_containerd_after_cleanup;
 
@@ -12,7 +12,7 @@ pub struct StartupRecoveryContext<'a> {
     pub node_mode: &'a NodeMode,
     pub network_cleanup: &'a networking::NetworkCleanup,
     pub containerd_state_dir: &'a str,
-    pub runtime_paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    pub runtime_paths: &'a klights_kubelet::runtime_paths::KubeletRuntimePaths,
     pub task_supervisor: &'a klights_supervisor::TaskSupervisor,
     pub file_process: &'a klights_supervisor::FileProcessExecutor,
     pub grpc_transport_policy: &'a klights_leader_rpc::transport_policy::GrpcTransportPolicy,
@@ -44,12 +44,12 @@ pub async fn run_startup_resource_recovery(
         grpc_transport_policy.connect_timeout,
         grpc_transport_policy.max_message_bytes,
     );
-    match kubelet::ContainerdManager::namespace_containerd_is_reusable(
+    match klights_kubelet::containerd_manager::ContainerdManager::namespace_containerd_is_reusable(
         file_process,
         namespace,
         rootless,
         &cri_transport_policy,
-        crate::kubelet::cri::DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT,
+        klights_kubelet::cri::DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT,
         runtime_paths,
     )
     .await
@@ -106,7 +106,7 @@ pub async fn run_startup_resource_recovery(
         tracing::warn!("Failed to cleanup stale startup sandbox mounts: {}", e);
     }
 
-    match kubelet::cgroup_cleanup::kill_namespace_cgroup_processes(
+    match klights_kubelet::cgroup_cleanup::kill_namespace_cgroup_processes(
         namespace,
         task_supervisor,
         file_process,
@@ -119,7 +119,9 @@ pub async fn run_startup_resource_recovery(
         Ok(_) => {}
         Err(e) => tracing::warn!("Failed to stop stale startup cgroup processes: {}", e),
     }
-    match kubelet::cgroup_cleanup::cleanup_namespace_cgroup_tree(file_process, namespace).await {
+    match klights_kubelet::cgroup_cleanup::cleanup_namespace_cgroup_tree(file_process, namespace)
+        .await
+    {
         Ok(removed) if removed > 0 => {
             tracing::info!(namespace = %namespace, removed, "Removed stale startup cgroups");
         }

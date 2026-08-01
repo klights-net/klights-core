@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::kubelet::pod_runtime::cri::{ContainerRuntimeControl, CriRuntime};
 use crate::kubelet::pod_runtime::repository::PodRuntimeRepository;
 use crate::kubelet::pod_runtime::types::PodRuntimeKey;
+use klights_kubelet::runtime::cri::{ContainerRuntimeControl, CriRuntime};
 
 /// Owns the activeDeadlineSeconds exceeded transition for a Pod.
 pub(super) struct ActiveDeadlineEnforcer {

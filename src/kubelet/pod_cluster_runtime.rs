@@ -2,7 +2,7 @@
 //!
 //! These traits are separated from `PodRuntimeService` because they represent
 //! cluster-level concerns (node ownership, cross-node status forwarding,
-//! replication) that are orthogonal to the single-node CRI/CNI/volume
+//! delivery) that are orthogonal to the single-node CRI/CNI/volume
 //! operations in the core runtime service.
 
 use std::sync::Arc;
@@ -11,18 +11,9 @@ use crate::kubelet::pod_repository::{
     PodReader, PodRepository, PodStatusUpdate, PodStatusWriter, RuntimeReconcileStatus,
 };
 
-/// Role of a node in the cluster for Pod runtime purposes.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RuntimeNodeRole {
-    Leader,
-    Worker,
-    Replica,
-}
-
 /// View of the local node's identity and Pod ownership.
 pub trait NodeRuntimeView: Send + Sync {
     fn node_name(&self) -> &str;
-    fn role(&self) -> RuntimeNodeRole;
     fn owns_pod_runtime(&self, pod: &serde_json::Value) -> bool;
 }
 
@@ -44,17 +35,6 @@ pub trait ClusterRuntimeView: Send + Sync {
         key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
         status: serde_json::Value,
     ) -> anyhow::Result<klights_cluster_core::Resource>;
-}
-
-/// Replication-level operations for multi-node Pod runtime.
-#[async_trait::async_trait]
-pub trait ReplicationRuntime: Send + Sync {
-    /// Enqueue a storage command for replication to other nodes.
-    async fn enqueue_storage_command(
-        &self,
-        key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
-        command: klights_cluster_core::StorageCommand,
-    ) -> anyhow::Result<()>;
 }
 
 // --- Production adapters ---
@@ -147,25 +127,20 @@ async fn apply_forwarded_status(
         .map_err(|e| anyhow::anyhow!("{:#}", e))
 }
 
-/// Local node view for single-node or worker/leader identity.
+/// Local node identity and Pod-ownership view.
 pub struct LocalNodeRuntimeView {
     node_name: String,
-    role: RuntimeNodeRole,
 }
 
 impl LocalNodeRuntimeView {
-    pub fn new(node_name: String, role: RuntimeNodeRole) -> Self {
-        Self { node_name, role }
+    pub fn new(node_name: String) -> Self {
+        Self { node_name }
     }
 }
 
 impl NodeRuntimeView for LocalNodeRuntimeView {
     fn node_name(&self) -> &str {
         &self.node_name
-    }
-
-    fn role(&self) -> RuntimeNodeRole {
-        self.role.clone()
     }
 
     fn owns_pod_runtime(&self, pod: &serde_json::Value) -> bool {
@@ -183,22 +158,18 @@ impl NodeRuntimeView for LocalNodeRuntimeView {
 /// repository that forwards to the leader. Because the role difference lives in
 /// the repository, the leader's kubelet uses this exact same path as a normal
 /// worker — there is no leader-specific runtime view or status bypass.
-pub struct WorkerClusterRuntimeView {
+pub struct RepositoryClusterRuntimeView {
     repository: Arc<PodRepository>,
-    _node_name: String,
 }
 
-impl WorkerClusterRuntimeView {
-    pub fn new(repository: Arc<PodRepository>, node_name: String) -> Self {
-        Self {
-            repository,
-            _node_name: node_name,
-        }
+impl RepositoryClusterRuntimeView {
+    pub fn new(repository: Arc<PodRepository>) -> Self {
+        Self { repository }
     }
 }
 
 #[async_trait::async_trait]
-impl ClusterRuntimeView for WorkerClusterRuntimeView {
+impl ClusterRuntimeView for RepositoryClusterRuntimeView {
     async fn get_fresh_pod(
         &self,
         namespace: &str,
@@ -216,32 +187,6 @@ impl ClusterRuntimeView for WorkerClusterRuntimeView {
         status: serde_json::Value,
     ) -> anyhow::Result<klights_cluster_core::Resource> {
         apply_forwarded_status(self.repository.as_ref(), key, status).await
-    }
-}
-
-/// Production replication runtime adapter.
-pub struct RealReplicationRuntime {
-    _repository: Arc<PodRepository>,
-}
-
-impl RealReplicationRuntime {
-    pub fn new(repository: Arc<PodRepository>) -> Self {
-        Self {
-            _repository: repository,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl ReplicationRuntime for RealReplicationRuntime {
-    async fn enqueue_storage_command(
-        &self,
-        _key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
-        _command: klights_cluster_core::StorageCommand,
-    ) -> anyhow::Result<()> {
-        // Single-node: no replication needed. In multi-node mode this
-        // enqueues the command for the replication stream.
-        Ok(())
     }
 }
 

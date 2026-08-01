@@ -32,7 +32,7 @@ pub struct RuntimeConfig {
     pub containerd_namespace: String,
     pub sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs,
     pub node_capacity: klights_kubelet::node_capacity::NodeCapacity,
-    pub paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    pub paths: klights_kubelet::runtime_paths::KubeletRuntimePaths,
 }
 
 // --- RealPodRuntimeService ---
@@ -41,10 +41,6 @@ use std::sync::Arc;
 
 use crate::kubelet::pod_cluster_runtime::{ClusterRuntimeView, NodeRuntimeView};
 use crate::kubelet::pod_runtime::active_deadline::ActiveDeadlineEnforcer;
-use crate::kubelet::pod_runtime::cri::{
-    ContainerRuntimeControl, CriRuntime, CriRuntimeContainerEventKind,
-    CriRuntimeContainerEventStream,
-};
 use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
 use crate::kubelet::pod_runtime::events::PodEventSink;
 use crate::kubelet::pod_runtime::filesystem::PodFilesystem;
@@ -75,6 +71,10 @@ use crate::kubelet::pod_status_builders::{
     build_initial_pending_status, build_pod_initializing_app_statuses,
 };
 use crate::kubelet::pod_termination::{find_pod_container_spec, get_termination_message_path};
+use klights_kubelet::runtime::cri::{
+    ContainerRuntimeControl, CriRuntime, CriRuntimeContainerEventKind,
+    CriRuntimeContainerEventStream,
+};
 use klights_supervisor::TaskSupervisor;
 
 const INIT_CONTAINER_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -93,16 +93,16 @@ const POST_SANDBOX_VOLUME_SETUP_TIMEOUT: std::time::Duration = std::time::Durati
 fn apply_runtime_event_hint(
     hint: &RuntimeReconcileHint,
     container_id: &str,
-    state: crate::kubelet::pod_runtime::cri::ContainerRuntimeState,
-) -> crate::kubelet::pod_runtime::cri::ContainerRuntimeState {
-    if hint.event_kind(container_id) == Some(crate::kubelet::cri_events::KubeletEventKind::Started)
+    state: klights_kubelet::runtime::cri::ContainerRuntimeState,
+) -> klights_kubelet::runtime::cri::ContainerRuntimeState {
+    if hint.event_kind(container_id) == Some(klights_kubelet::cri_events::KubeletEventKind::Started)
         && matches!(
             state,
-            crate::kubelet::pod_runtime::cri::ContainerRuntimeState::Created
-                | crate::kubelet::pod_runtime::cri::ContainerRuntimeState::Unknown
+            klights_kubelet::runtime::cri::ContainerRuntimeState::Created
+                | klights_kubelet::runtime::cri::ContainerRuntimeState::Unknown
         )
     {
-        crate::kubelet::pod_runtime::cri::ContainerRuntimeState::Running
+        klights_kubelet::runtime::cri::ContainerRuntimeState::Running
     } else {
         state
     }
@@ -119,7 +119,7 @@ pub(super) struct ContainerConfigBuildRequest<'a> {
 }
 
 fn managed_hosts_file_path(
-    paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    paths: &klights_kubelet::runtime_paths::KubeletRuntimePaths,
     key: &PodRuntimeKey,
     pod: &serde_json::Value,
 ) -> Option<String> {

@@ -86,7 +86,7 @@ pub(crate) async fn resolve_token_file_if_present(
 async fn start_controlplane_leader_control_stream_if_needed(
     role: &NodeRole,
     client: Option<std::sync::Arc<klights_leader_rpc::client::ReplicationGrpcClient>>,
-    cri_for_api: Option<&std::sync::Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
+    cri_for_api: Option<&std::sync::Arc<tokio::sync::Mutex<klights_kubelet::cri::CriClient>>>,
     config: &std::sync::Arc<crate::KlightsConfig>,
     pod_watch: std::sync::Arc<dyn klights_kubelet::node_api::logs::PodLogFollowWatchPort>,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,

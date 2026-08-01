@@ -79,7 +79,7 @@ async fn open_leader_node_local(
 
 pub struct OpenLeaderArgs<'a> {
     pub config: &'a Arc<KlightsConfig>,
-    pub runtime_paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    pub runtime_paths: &'a klights_kubelet::runtime_paths::KubeletRuntimePaths,
     pub role: &'a NodeRole,
     pub node_mode: &'a crate::bootstrap::NodeMode,
     pub supervisor: Arc<TaskSupervisor>,

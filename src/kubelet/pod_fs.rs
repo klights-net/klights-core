@@ -254,7 +254,7 @@ fn apply_fs_group_sync(path: &Path, gid: u32) -> anyhow::Result<()> {
 }
 
 fn rotate_logs_sync(root: &Path, max_size: u64, max_files: usize) {
-    use crate::kubelet::log_rotation::{RotationPlan, build_rotation_plan};
+    use klights_kubelet::log_rotation::{RotationPlan, build_rotation_plan};
 
     if !root.exists() {
         return;

@@ -10,9 +10,8 @@ use tokio_util::sync::CancellationToken;
 use crate::KlightsConfig;
 use crate::bootstrap::{CliFlags, NodeMode};
 use crate::datastore::DatastoreHandle;
-use crate::kubelet::CriClient;
-use crate::kubelet::cri::SharedCriClient;
-use crate::kubelet::pod_cluster_runtime::RuntimeNodeRole;
+use klights_kubelet::cri::CriClient;
+use klights_kubelet::cri::SharedCriClient;
 use klights_supervisor::{SupervisedJoinHandle, TaskSupervisor};
 
 fn publish_leadership_if_changed(
@@ -95,7 +94,7 @@ pub struct BootstrapRunArgs<'a> {
     pub cri_for_pod_watcher: Option<CriClient>,
     pub cri_for_api: Option<Arc<tokio::sync::Mutex<CriClient>>>,
     pub cni_readiness: klights_kubelet::cni_readiness::CniReadiness,
-    pub runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    pub runtime_paths: klights_kubelet::runtime_paths::KubeletRuntimePaths,
     pub supervisor: Arc<TaskSupervisor>,
     pub grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
     pub shutdown_token: CancellationToken,
@@ -519,16 +518,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     } else {
         crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode
     };
-    let runtime_node_role = if kubelet_uses_worker_store_adapter || !has_leader_coordination {
-        RuntimeNodeRole::Worker
-    } else {
-        RuntimeNodeRole::Leader
-    };
     let (pod_lifecycle_tx, pod_lifecycle_rx) =
         tokio::sync::mpsc::channel::<klights_kubelet::lifecycle::LifecycleCommand>(128);
     let pod_lifecycle_rx = Arc::new(tokio::sync::Mutex::new(Some(pod_lifecycle_rx)));
     let pod_watcher_runtime_ports = cri_for_pod_watcher.clone().map(|cri| {
-        let runtime = Arc::new(crate::kubelet::pod_runtime::cri::SharedCriRuntime::new(
+        let runtime = Arc::new(klights_kubelet::runtime::cri::SharedCriRuntime::new(
             SharedCriClient::new(cri),
         ));
         crate::kubelet::pod_manager::PodWatcherRuntimePorts::new(
@@ -624,7 +618,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             lifecycle_route_mode: crate::kubelet::pod_lifecycle_router::PodLifecycleRouteMode::Actor,
             cri: cri_for_pod_watcher.clone().map(SharedCriClient::new),
             registry_proxy: config.registry_proxy.enabled().then(|| {
-                crate::kubelet::registry_proxy::ContainerdRegistryProxyConfigurator::new(
+                klights_kubelet::registry_proxy::ContainerdRegistryProxyConfigurator::new(
                     config.registry_proxy.clone(),
                     runtime_paths.containerd_data_dir().join("certs.d"),
                     klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
@@ -635,7 +629,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             probe_manager: None,
             datapath: Some(kubelet_runtime_network.datapath.clone()),
             service_router: Some(services.clone()),
-            runtime_node_role,
             runtime_service: None,
             runtime_store: Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(
@@ -1097,7 +1090,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         config.service_cidr.clone(),
         config.node_name.clone(),
         config.containerd_namespace.clone(),
-        crate::kubelet::log_rotation::LogRotationPolicy::default(),
+        klights_kubelet::log_rotation::LogRotationPolicy::default(),
         kubelet_capacity,
         runtime_paths,
     )

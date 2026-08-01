@@ -23,7 +23,7 @@ pub struct ConfigPhase {
     pub shutdown_token: CancellationToken,
     pub etc_dir: String,
     pub containerd_state_dir: String,
-    pub runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    pub runtime_paths: klights_kubelet::runtime_paths::KubeletRuntimePaths,
 }
 
 pub async fn load(cli: &CliFlags) -> Result<ConfigPhase> {
@@ -74,7 +74,7 @@ pub async fn load(cli: &CliFlags) -> Result<ConfigPhase> {
         .to_string_lossy()
         .into_owned();
     let runtime_paths =
-        crate::kubelet::runtime_paths::KubeletRuntimePaths::new(config.data_root.clone())
+        klights_kubelet::runtime_paths::KubeletRuntimePaths::new(config.data_root.clone())
             .context("invalid kubelet runtime path layout")?;
 
     Ok(ConfigPhase {

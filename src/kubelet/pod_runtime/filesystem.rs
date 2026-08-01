@@ -54,7 +54,7 @@ pub struct RealPodFilesystem {
     file_process: klights_supervisor::FileProcessExecutor,
     containerd_ns: String,
     _node_name: String,
-    paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    paths: klights_kubelet::runtime_paths::KubeletRuntimePaths,
 }
 
 impl RealPodFilesystem {
@@ -62,7 +62,7 @@ impl RealPodFilesystem {
         supervisor: Arc<TaskSupervisor>,
         containerd_ns: String,
         node_name: String,
-        paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
+        paths: klights_kubelet::runtime_paths::KubeletRuntimePaths,
     ) -> Self {
         Self {
             file_process: klights_supervisor::FileProcessExecutor::new(supervisor),
@@ -168,7 +168,7 @@ impl PodFilesystem for RealPodFilesystem {
     }
 
     async fn cleanup_cgroup(&self, key: &PodRuntimeKey) -> anyhow::Result<()> {
-        crate::kubelet::cgroup_cleanup::cleanup_pod_cgroup(
+        klights_kubelet::cgroup_cleanup::cleanup_pod_cgroup(
             &self.file_process,
             &self.containerd_ns,
             &key.uid,

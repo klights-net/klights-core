@@ -512,7 +512,7 @@ mod tests {
                 .join("containerd/state")
                 .to_string_lossy()
                 .into_owned(),
-            runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+            runtime_paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                 data_root.to_path_buf(),
             )
             .unwrap(),

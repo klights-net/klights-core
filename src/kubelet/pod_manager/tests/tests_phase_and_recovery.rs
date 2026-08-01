@@ -9,7 +9,7 @@ async fn process_volumes(
     pod: &serde_json::Value,
 ) -> anyhow::Result<std::collections::HashMap<String, String>> {
     let file_process = crate::kubelet::file_blocking::test_file_process_executor();
-    let paths = crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+    let paths = klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
         crate::kubelet::runtime_paths::for_test(containerd_namespace)
             .data_root()
             .to_path_buf(),

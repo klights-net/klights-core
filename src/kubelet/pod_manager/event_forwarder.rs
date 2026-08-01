@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) async fn spawn_cri_event_forwarder(
-    cri: std::sync::Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>,
+    cri: std::sync::Arc<dyn klights_kubelet::runtime::cri::CriRuntime>,
     cancel_token: tokio_util::sync::CancellationToken,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     lifecycle_tx: Option<
@@ -9,8 +9,8 @@ pub(super) async fn spawn_cri_event_forwarder(
     >,
     wall_clock: std::sync::Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 ) -> CriEventReceiver {
-    use crate::kubelet::cri_events::{KubeletEvent, KubeletEventKind};
-    use crate::kubelet::pod_runtime::cri::CriRuntimeContainerEventKind;
+    use klights_kubelet::cri_events::{KubeletEvent, KubeletEventKind};
+    use klights_kubelet::runtime::cri::CriRuntimeContainerEventKind;
 
     let (tx, rx) = mpsc::channel(1024);
     let task_supervisor_for_worker = task_supervisor.clone();
@@ -140,7 +140,7 @@ mod tests {
     use anyhow::Result;
     use tokio_util::sync::CancellationToken;
 
-    use crate::kubelet::pod_runtime::cri::{
+    use klights_kubelet::runtime::cri::{
         CriRuntime, CriRuntimeContainerEvent, CriRuntimeContainerEventStream,
     };
 
@@ -210,7 +210,7 @@ mod tests {
         }
         async fn list_pod_sandbox_summaries(
             &self,
-        ) -> Result<Vec<crate::kubelet::pod_runtime::cri::CriPodSandboxSummary>> {
+        ) -> Result<Vec<klights_kubelet::runtime::cri::CriPodSandboxSummary>> {
             Ok(Vec::new())
         }
         async fn create_container(

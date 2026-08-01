@@ -6,8 +6,8 @@ use crate::kubelet::pod_lifecycle_core::message::{
 use crate::kubelet::pod_lifecycle_router::{
     OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
 };
-use crate::kubelet::pod_runtime::cri::CriRuntime;
 use anyhow::{Context, Result};
+use klights_kubelet::runtime::cri::CriRuntime;
 use klights_leader_api::{
     CacheReadinessRequest, LeaderCacheReadiness, LeaderPodCleanupIntents, LeaderResourceQuery,
     PodCleanupIntent, PodCleanupIntentListRequest,
@@ -19,7 +19,7 @@ pub use crate::kubelet::reconciler::cri_inventory::{
 
 pub struct StartupReconciler {
     node_name: String,
-    paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    paths: klights_kubelet::runtime_paths::KubeletRuntimePaths,
     resource_query: Arc<dyn LeaderResourceQuery>,
     cache_readiness: Arc<dyn LeaderCacheReadiness>,
     pod_cleanup_intents: Arc<dyn LeaderPodCleanupIntents>,
@@ -44,7 +44,7 @@ pub struct StartupDependencies {
 impl StartupReconciler {
     pub fn new(
         node_name: String,
-        paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
+        paths: klights_kubelet::runtime_paths::KubeletRuntimePaths,
         dependencies: StartupDependencies,
     ) -> Self {
         let StartupDependencies {
@@ -230,7 +230,7 @@ impl StartupReconciler {
                         .route(LifecycleMessage::CriEvent {
                             key: key.clone(),
                             container_id: String::new(),
-                            kind: crate::kubelet::cri_events::KubeletEventKind::Stopped,
+                            kind: klights_kubelet::cri_events::KubeletEventKind::Stopped,
                         })
                         .await?;
                 }

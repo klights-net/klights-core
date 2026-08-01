@@ -19,7 +19,7 @@ mod tests {
             log_file: None,
             containerd_namespace: ns.to_string(),
             containerd_socket: None,
-            registry_proxy: crate::kubelet::registry_proxy::RegistryProxyConfig::from_inputs(
+            registry_proxy: klights_kubelet::registry_proxy::RegistryProxyConfig::from_inputs(
                 false, None, false,
             )
             .unwrap(),

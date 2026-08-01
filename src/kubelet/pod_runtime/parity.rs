@@ -9,13 +9,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::kubelet::pod_cluster_runtime::{
-    ClusterRuntimeView, ReplicationRuntime, RuntimeNodeRole,
-};
+use crate::kubelet::pod_cluster_runtime::ClusterRuntimeView;
 use crate::kubelet::pod_repository::{PodReader, PodRepository, PodRepositoryBuildConfig};
 use crate::kubelet::pod_runtime::service::PodRuntimeKey;
 
-use super::cri::{ContainerRuntimeControl, CriRuntime};
 use super::events::PodEventSink;
 use super::filesystem::PodFilesystem;
 use super::hostports::HostPortRuntime;
@@ -23,6 +20,7 @@ use super::network::PodNetworkRuntime;
 use super::probes::ProbeRuntime;
 use super::store::{PodRuntimeStore, PodSlotAdmission};
 use super::volumes::PodVolumeRuntime;
+use klights_kubelet::runtime::cri::{ContainerRuntimeControl, CriRuntime};
 
 // Re-export mock types from test_support for convenience.
 use super::test_support::{
@@ -94,17 +92,6 @@ pub enum RecordingClusterCall {
     },
 }
 
-/// Recording of replication operations.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RecordingReplicationCall {
-    EnqueueStorageCommand {
-        namespace: String,
-        name: String,
-        uid: String,
-        command_debug: String,
-    },
-}
-
 /// Full behaviour recording from a single parity run.
 ///
 /// # Invariant
@@ -124,7 +111,6 @@ pub struct Recording {
     pub hostports: Vec<MockHostPortOp>,
     pub events: Vec<MockPodEvent>,
     pub cluster_view: Vec<RecordingClusterCall>,
-    pub replication: Vec<RecordingReplicationCall>,
     pub repository_writes: Vec<RepositoryWrite>,
     pub outbox: Vec<OutboxEvent>,
     pub finalizer_calls: Vec<PodRuntimeKey>,
@@ -144,7 +130,6 @@ impl Recording {
             hostports: Vec::new(),
             events: Vec::new(),
             cluster_view: Vec::new(),
-            replication: Vec::new(),
             repository_writes: Vec::new(),
             outbox: Vec::new(),
             finalizer_calls: Vec::new(),
@@ -227,53 +212,6 @@ impl ClusterRuntimeView for RecordingClusterRuntimeView {
     }
 }
 
-/// Recording wrapper around `ReplicationRuntime` for parity tests.
-pub struct RecordingReplicationRuntime {
-    calls: Mutex<Vec<RecordingReplicationCall>>,
-}
-
-impl Default for RecordingReplicationRuntime {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RecordingReplicationRuntime {
-    pub fn new() -> Self {
-        Self {
-            calls: Mutex::new(Vec::new()),
-        }
-    }
-
-    pub fn recorded_calls(&self) -> Vec<RecordingReplicationCall> {
-        self.calls.lock().unwrap().clone()
-    }
-
-    pub fn clear(&self) {
-        self.calls.lock().unwrap().clear();
-    }
-}
-
-#[async_trait::async_trait]
-impl ReplicationRuntime for RecordingReplicationRuntime {
-    async fn enqueue_storage_command(
-        &self,
-        key: &PodRuntimeKey,
-        command: klights_cluster_core::StorageCommand,
-    ) -> anyhow::Result<()> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push(RecordingReplicationCall::EnqueueStorageCommand {
-                namespace: key.namespace.clone(),
-                name: key.name.clone(),
-                uid: key.uid.clone(),
-                command_debug: format!("{:?}", command),
-            });
-        Ok(())
-    }
-}
-
 // ── ParityFixture ──
 
 /// Harness that wires every mockable port for parity comparison between
@@ -290,7 +228,6 @@ pub struct ParityFixture {
     pub hostports: Arc<MockHostPortRuntime>,
     pub events: Arc<MockPodEventSink>,
     pub cluster_view: Arc<RecordingClusterRuntimeView>,
-    pub replication: Arc<RecordingReplicationRuntime>,
     pub repository: Arc<PodRepository>,
     pub node_view: Arc<FakeNode>,
     pub outbox_log: Arc<Mutex<Vec<OutboxEvent>>>,
@@ -336,9 +273,8 @@ impl ParityFixture {
             hostports: Arc::new(MockHostPortRuntime::new()),
             events: Arc::new(MockPodEventSink::new()),
             cluster_view: Arc::new(RecordingClusterRuntimeView::new()),
-            replication: Arc::new(RecordingReplicationRuntime::new()),
             repository,
-            node_view: Arc::new(FakeNode::new("test-node", RuntimeNodeRole::Worker)),
+            node_view: Arc::new(FakeNode::new("test-node")),
             outbox_log: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -358,7 +294,6 @@ impl ParityFixture {
         self.hostports.clear_calls();
         self.events.clear_events();
         self.cluster_view.clear();
-        self.replication.clear();
         self.outbox_log.lock().unwrap().clear();
     }
 
@@ -376,7 +311,6 @@ impl ParityFixture {
             hostports: self.hostports.recorded_calls(),
             events: self.events.recorded_events(),
             cluster_view: self.cluster_view.recorded_calls(),
-            replication: self.replication.recorded_calls(),
             repository_writes: Vec::new(),
             outbox: self.outbox_log.lock().unwrap().clone(),
             finalizer_calls: Vec::new(),
@@ -505,23 +439,6 @@ mod tests {
             .cluster_view
             .get_fresh_pod("default", "test-pod")
             .await;
-        let _ = fixture
-            .replication
-            .enqueue_storage_command(
-                &key,
-                klights_cluster_core::StorageCommand::DeleteResource {
-                    api_version: "v1".to_string(),
-                    kind: "Pod".to_string(),
-                    namespace: Some("default".to_string()),
-                    name: "test-pod".to_string(),
-                    preconditions: klights_cluster_core::ResourcePreconditions {
-                        uid: Some("uid-1".to_string()),
-                        resource_version: None,
-                    },
-                },
-            )
-            .await;
-
         let snap1 = fixture.snapshot();
 
         // All 14 channels recorded at least one call.
@@ -542,11 +459,6 @@ mod tests {
             !snap1.cluster_view.is_empty(),
             "cluster_view channel recorded"
         );
-        assert!(
-            !snap1.replication.is_empty(),
-            "replication channel recorded"
-        );
-
         // Reset then re-snapshot — all channels empty.
         fixture.reset();
         let snap2 = fixture.snapshot();
@@ -578,10 +490,6 @@ mod tests {
         assert!(
             snap2.cluster_view.is_empty(),
             "cluster_view channel cleared after reset"
-        );
-        assert!(
-            snap2.replication.is_empty(),
-            "replication channel cleared after reset"
         );
     }
 

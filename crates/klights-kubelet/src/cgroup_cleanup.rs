@@ -86,9 +86,9 @@ pub async fn kill_namespace_cgroup_processes(
     }
 
     for pid in &pids {
-        crate::kubelet::containerd_manager::send_signal(*pid, libc::SIGTERM);
+        crate::containerd_manager::send_signal(*pid, libc::SIGTERM);
     }
-    crate::kubelet::containerd_manager::wait_for_pids_to_exit(
+    crate::containerd_manager::wait_for_pids_to_exit(
         &pids,
         std::time::Duration::from_secs(5),
         task_supervisor,
@@ -98,13 +98,13 @@ pub async fn kill_namespace_cgroup_processes(
     let remaining: Vec<libc::pid_t> = pids
         .iter()
         .copied()
-        .filter(|pid| crate::kubelet::containerd_manager::process_exists(*pid))
+        .filter(|pid| crate::containerd_manager::process_exists(*pid))
         .collect();
     for pid in &remaining {
-        crate::kubelet::containerd_manager::send_signal(*pid, libc::SIGKILL);
+        crate::containerd_manager::send_signal(*pid, libc::SIGKILL);
     }
     if !remaining.is_empty() {
-        crate::kubelet::containerd_manager::wait_for_pids_to_exit(
+        crate::containerd_manager::wait_for_pids_to_exit(
             &remaining,
             std::time::Duration::from_secs(2),
             task_supervisor,

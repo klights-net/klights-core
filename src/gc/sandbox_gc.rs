@@ -16,11 +16,11 @@
 //!   * Second pass: `pod_sandboxes` rows whose sandbox_id is not in the CRI
 //!     list get dropped, along with their matching `pod_networks` rows.
 
-use crate::kubelet::cgroup_cleanup::cleanup_pod_cgroup;
-use crate::kubelet::cri::CriClient;
 use crate::kubelet::pod_repository::PodReader;
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_kubelet::cgroup_cleanup::cleanup_pod_cgroup;
+use klights_kubelet::cri::CriClient;
 use klights_node_store::{CacheNetworkError, PodNetworkCache, SandboxKey};
 use std::collections::HashSet;
 use std::sync::Arc;

@@ -1,8 +1,8 @@
-use crate::kubelet::pod_runtime::cri::{ContainerRuntimeState, CriRuntime};
 use crate::kubelet::pod_runtime::filesystem::PodFilesystem;
 use crate::kubelet::pod_runtime::service::PodRuntimeKey;
 use crate::kubelet::pod_runtime::status_helpers::cri_timestamp_from_ns;
 use crate::kubelet::pod_termination::{find_pod_container_spec, termination_message_policy};
+use klights_kubelet::runtime::cri::{ContainerRuntimeState, CriRuntime};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReconcileContainerInfo {

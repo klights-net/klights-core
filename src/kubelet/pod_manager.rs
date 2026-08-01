@@ -37,7 +37,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
-type CriEventReceiver = mpsc::Receiver<crate::kubelet::cri_events::KubeletEvent>;
+type CriEventReceiver = mpsc::Receiver<klights_kubelet::cri_events::KubeletEvent>;
 type PodWatchReconnectFuture = std::pin::Pin<
     Box<
         dyn std::future::Future<Output = Result<PodWatchSession, LeaderWatchError>>
@@ -54,15 +54,15 @@ mod event_forwarder;
 
 #[derive(Clone)]
 pub struct PodWatcherRuntimePorts {
-    cri_runtime: Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>,
-    container_control: Arc<dyn crate::kubelet::pod_runtime::cri::ContainerRuntimeControl>,
+    cri_runtime: Arc<dyn klights_kubelet::runtime::cri::CriRuntime>,
+    container_control: Arc<dyn klights_kubelet::runtime::cri::ContainerRuntimeControl>,
     cni_readiness: klights_kubelet::cni_readiness::CniReadiness,
 }
 
 impl PodWatcherRuntimePorts {
     pub fn new(
-        cri_runtime: Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>,
-        container_control: Arc<dyn crate::kubelet::pod_runtime::cri::ContainerRuntimeControl>,
+        cri_runtime: Arc<dyn klights_kubelet::runtime::cri::CriRuntime>,
+        container_control: Arc<dyn klights_kubelet::runtime::cri::ContainerRuntimeControl>,
         cni_readiness: klights_kubelet::cni_readiness::CniReadiness,
     ) -> Self {
         Self {
@@ -128,7 +128,7 @@ struct PodRecovery<'a> {
     pod_lifecycle_router: std::sync::Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
 }
 async fn spawn_cri_event_forwarder(
-    cri: Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>,
+    cri: Arc<dyn klights_kubelet::runtime::cri::CriRuntime>,
     cancel_token: tokio_util::sync::CancellationToken,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     lifecycle_tx: Option<
@@ -202,7 +202,7 @@ pub struct PodWatcherConfig {
 async fn rotate_all_pod_logs(
     file_process: &klights_supervisor::FileProcessExecutor,
     log_root: std::path::PathBuf,
-    policy: crate::kubelet::log_rotation::LogRotationPolicy,
+    policy: klights_kubelet::log_rotation::LogRotationPolicy,
 ) {
     crate::kubelet::pod_fs::PodFs::rotate_logs(
         file_process,
@@ -649,9 +649,9 @@ async fn pod_lifecycle_key_for_pod_name(
 }
 
 async fn pod_lifecycle_key_for_cri_event(
-    container_control: &dyn crate::kubelet::pod_runtime::cri::ContainerRuntimeControl,
+    container_control: &dyn klights_kubelet::runtime::cri::ContainerRuntimeControl,
     pod_repo: &Arc<crate::kubelet::pod_repository::PodRepository>,
-    event: &crate::kubelet::cri_events::KubeletEvent,
+    event: &klights_kubelet::cri_events::KubeletEvent,
 ) -> Option<PodLifecycleKey> {
     let resolved = match (event.pod_namespace.as_deref(), event.pod_name.as_deref()) {
         (Some(namespace), Some(name)) => Some((namespace.to_string(), name.to_string())),

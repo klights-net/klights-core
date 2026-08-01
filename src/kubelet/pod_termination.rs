@@ -39,7 +39,7 @@ pub fn termination_message_policy(container_spec: Option<&Value>) -> &str {
 /// Returns the host-side file path for a container's termination message log.
 /// Pattern mirrors the /etc/hosts host path under KLIGHTS_DATA_ROOT.
 pub fn termination_log_host_path(
-    paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    paths: &klights_kubelet::runtime_paths::KubeletRuntimePaths,
     namespace: &str,
     pod_name: &str,
     container_name: &str,
@@ -51,7 +51,7 @@ pub fn termination_log_host_path(
 }
 
 pub fn container_log_host_path(
-    paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    paths: &klights_kubelet::runtime_paths::KubeletRuntimePaths,
     namespace: &str,
     pod_name: &str,
     pod_uid: &str,
@@ -210,7 +210,7 @@ pub fn read_termination_message_with_fallback(
 
 pub async fn ensure_termination_log_host_file(
     file_process: &klights_supervisor::FileProcessExecutor,
-    paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    paths: &klights_kubelet::runtime_paths::KubeletRuntimePaths,
     namespace: &str,
     pod_name: &str,
     container_name: &str,

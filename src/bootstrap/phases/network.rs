@@ -17,9 +17,9 @@ pub struct NetworkPhase {
     pub _local_pod_subnet: String,
     pub cni_rpc_token: CancellationToken,
     pub cni_rpc_handle: SupervisedJoinHandle<()>,
-    pub _containerd_manager: Option<crate::kubelet::ContainerdManager>,
-    pub cri_for_pod_watcher: Option<crate::kubelet::CriClient>,
-    pub cri_for_api: Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
+    pub _containerd_manager: Option<klights_kubelet::containerd_manager::ContainerdManager>,
+    pub cri_for_pod_watcher: Option<klights_kubelet::cri::CriClient>,
+    pub cri_for_api: Option<Arc<tokio::sync::Mutex<klights_kubelet::cri::CriClient>>>,
     pub cni_readiness: klights_kubelet::cni_readiness::CniReadiness,
     pub dataplane_health: klights_networking::dataplane_health::DataplaneHealth,
     pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
@@ -42,7 +42,7 @@ pub struct NetworkBootArgs<'a> {
     pub pod_endpoints: Arc<dyn klights_node_store::PodEndpointStore>,
     pub pod_endpoint_events: Arc<dyn klights_node_store::PodEndpointStoreEventSource>,
     pub network_cleanup: &'a NetworkCleanup,
-    pub runtime_paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    pub runtime_paths: &'a klights_kubelet::runtime_paths::KubeletRuntimePaths,
     pub runtime_inputs: crate::bootstrap::runtime_inputs::NetworkRuntimeInputs,
     pub supervisor: Arc<TaskSupervisor>,
     pub grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
@@ -254,8 +254,8 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         None
     } else {
         let is_rootless = matches!(node_mode, NodeMode::Rootless { .. });
-        let mgr = crate::kubelet::ContainerdManager::start(
-            crate::kubelet::containerd_manager::ContainerdStartConfig {
+        let mgr = klights_kubelet::containerd_manager::ContainerdManager::start(
+            klights_kubelet::containerd_manager::ContainerdStartConfig {
                 namespace: &config.containerd_namespace,
                 bridge_name: &config.bridge_name,
                 pod_subnet: &local_pod_subnet,
@@ -283,7 +283,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         unreachable!("containerd socket required")
     };
 
-    let cri_for_pod_watcher = match crate::kubelet::CriClient::connect_with_policy(
+    let cri_for_pod_watcher = match klights_kubelet::cri::CriClient::connect_with_policy(
         socket,
         &config.containerd_namespace,
         &cri_transport_policy,
@@ -297,7 +297,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
             return Err(err).context("CRI connection unavailable after network boot");
         }
     };
-    let cri_for_api = match crate::kubelet::CriClient::connect_with_policy(
+    let cri_for_api = match klights_kubelet::cri::CriClient::connect_with_policy(
         socket,
         &config.containerd_namespace,
         &cri_transport_policy,

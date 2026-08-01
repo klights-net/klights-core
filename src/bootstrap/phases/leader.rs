@@ -33,7 +33,7 @@ pub struct LeaderStart<'a> {
     pub dispatcher_for_cronjobs: &'a Arc<crate::controllers::ControllerDispatcher>,
     pub pod_repository: &'a Arc<crate::kubelet::pod_repository::PodRepository>,
     pub pod_scheduling: &'a Arc<dyn klights_pod_api::PodScheduling>,
-    pub cri_for_shutdown: &'a Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
+    pub cri_for_shutdown: &'a Option<Arc<tokio::sync::Mutex<klights_kubelet::cri::CriClient>>>,
     pub datapath: &'a Arc<dyn klights_network_api::Datapath>,
     pub shutdown_token: CancellationToken,
 }
@@ -50,7 +50,7 @@ struct LeaderScopedTaskContext {
     dispatcher_for_cronjobs: Arc<crate::controllers::ControllerDispatcher>,
     pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
     pod_scheduling: Arc<dyn klights_pod_api::PodScheduling>,
-    cri_for_shutdown: Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
+    cri_for_shutdown: Option<Arc<tokio::sync::Mutex<klights_kubelet::cri::CriClient>>>,
     datapath: Arc<dyn klights_network_api::Datapath>,
 }
 

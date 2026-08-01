@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::kubelet::pod_cluster_runtime::RuntimeNodeRole;
 use crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
 use crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry;
 use crate::kubelet::pod_lifecycle_router::executor::{PodLifecycleExecutor, PodWorkExecutor};
@@ -47,17 +46,17 @@ pub struct PodSubsystemConfig {
     pub pod_actor_idle_grace: std::time::Duration,
     pub sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs,
     pub node_capacity: klights_kubelet::node_capacity::NodeCapacity,
-    pub paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    pub paths: klights_kubelet::runtime_paths::KubeletRuntimePaths,
     pub lifecycle_route_mode: PodLifecycleRouteMode,
     // Task 19: runtime dependencies for RealPodRuntimeService construction (Task 24).
-    pub cri: Option<crate::kubelet::cri::SharedCriClient>,
-    pub registry_proxy: Option<crate::kubelet::registry_proxy::ContainerdRegistryProxyConfigurator>,
+    pub cri: Option<klights_kubelet::cri::SharedCriClient>,
+    pub registry_proxy:
+        Option<klights_kubelet::registry_proxy::ContainerdRegistryProxyConfigurator>,
     pub containerd_ns: String,
     pub lifecycle_tx: tokio::sync::mpsc::Sender<klights_kubelet::lifecycle::LifecycleCommand>,
     pub probe_manager: Option<Arc<ProbeManager>>,
     pub datapath: Option<Arc<dyn klights_network_api::Datapath>>,
     pub service_router: Option<Arc<dyn klights_network_api::ServiceRouter>>,
-    pub runtime_node_role: RuntimeNodeRole,
     pub runtime_service: Option<Arc<dyn PodRuntimeService>>,
     pub runtime_store: Arc<dyn PodRuntimeStore>,
     pub wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
@@ -76,12 +75,11 @@ pub struct PodSubsystem {
     pub lifecycle_service: PodLifecycleService,
     pub runtime: Arc<dyn PodRuntimeService>,
     // Task 19: runtime adapter dependencies stored for Task 24 construction.
-    pub cri: Option<crate::kubelet::cri::SharedCriClient>,
+    pub cri: Option<klights_kubelet::cri::SharedCriClient>,
     pub containerd_ns: String,
     pub probe_manager: Option<Arc<ProbeManager>>,
     pub datapath: Option<Arc<dyn klights_network_api::Datapath>>,
     pub service_router: Option<Arc<dyn klights_network_api::ServiceRouter>>,
-    pub runtime_node_role: RuntimeNodeRole,
     pub node_name: String,
     pub service_cidr: String,
 }
@@ -89,8 +87,8 @@ pub struct PodSubsystem {
 struct RuntimeServiceBuildRequest {
     supervisor: Arc<TaskSupervisor>,
     repository: Arc<PodRepository>,
-    cri: Option<crate::kubelet::cri::SharedCriClient>,
-    registry_proxy: Option<crate::kubelet::registry_proxy::ContainerdRegistryProxyConfigurator>,
+    cri: Option<klights_kubelet::cri::SharedCriClient>,
+    registry_proxy: Option<klights_kubelet::registry_proxy::ContainerdRegistryProxyConfigurator>,
     containerd_ns: String,
     probe_manager: Arc<ProbeManager>,
     datapath: Option<Arc<dyn klights_network_api::Datapath>>,
@@ -99,8 +97,7 @@ struct RuntimeServiceBuildRequest {
     service_cidr: String,
     sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs,
     node_capacity: klights_kubelet::node_capacity::NodeCapacity,
-    paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
-    runtime_node_role: RuntimeNodeRole,
+    paths: klights_kubelet::runtime_paths::KubeletRuntimePaths,
     resource_query: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     projected_tokens: Option<Arc<dyn klights_leader_api::LeaderProjectedServiceAccountToken>>,
     runtime_store: Arc<dyn PodRuntimeStore>,
@@ -126,7 +123,6 @@ impl PodSubsystem {
         let service_router = config.service_router.clone();
         let resource_query = config.resource_query.clone();
         let projected_tokens = config.projected_tokens.clone();
-        let runtime_node_role = config.runtime_node_role.clone();
         let outbox = config.outbox.clone();
         let lifecycle_concurrency = config.lifecycle_concurrency.clone();
         let sandbox_inputs = config.sandbox_inputs.clone();
@@ -166,11 +162,11 @@ impl PodSubsystem {
         let repository = Arc::new(repository);
         let probe_cri_runtime = config.cri.clone().map(|cri| {
             Arc::new(
-                crate::kubelet::pod_runtime::cri::SharedCriRuntime::new_with_registry_proxy(
+                klights_kubelet::runtime::cri::SharedCriRuntime::new_with_registry_proxy(
                     cri,
                     registry_proxy.clone(),
                 ),
-            ) as Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>
+            ) as Arc<dyn klights_kubelet::runtime::cri::CriRuntime>
         });
         let probe_manager = config.probe_manager.unwrap_or_else(|| {
             Arc::new(ProbeManager::new_with_lifecycle(
@@ -197,7 +193,6 @@ impl PodSubsystem {
                 sandbox_inputs,
                 node_capacity,
                 paths,
-                runtime_node_role: runtime_node_role.clone(),
                 resource_query,
                 projected_tokens,
                 runtime_store: config.runtime_store.clone(),
@@ -220,7 +215,6 @@ impl PodSubsystem {
             probe_manager: Some(probe_manager),
             datapath,
             service_router,
-            runtime_node_role,
             node_name,
             service_cidr,
         })
@@ -243,7 +237,6 @@ impl PodSubsystem {
             sandbox_inputs,
             node_capacity,
             paths,
-            runtime_node_role,
             resource_query,
             projected_tokens,
             runtime_store,
@@ -266,7 +259,7 @@ impl PodSubsystem {
             anyhow::anyhow!("missing PodRuntimeService dependencies: projected_tokens")
         })?;
         let cri_runtime = Arc::new(
-            crate::kubelet::pod_runtime::cri::SharedCriRuntime::new_with_registry_proxy(
+            klights_kubelet::runtime::cri::SharedCriRuntime::new_with_registry_proxy(
                 cri.clone(),
                 registry_proxy,
             ),
@@ -280,19 +273,15 @@ impl PodSubsystem {
             ),
         );
         let node_view = Arc::new(
-            crate::kubelet::pod_cluster_runtime::LocalNodeRuntimeView::new(
-                node_name.clone(),
-                runtime_node_role.clone(),
-            ),
+            crate::kubelet::pod_cluster_runtime::LocalNodeRuntimeView::new(node_name.clone()),
         );
-        // Every role — leader included — routes Pod status through the same
-        // worker cluster-view path. The role difference lives in the injected
-        // repository, not the view, so there is no leader-specific bypass.
+        // Every node routes Pod status through the same repository-backed
+        // cluster view. Local versus remote delivery is selected by the
+        // injected repository, so kubelet policy has no node-role branch.
         let cluster_view: Arc<dyn crate::kubelet::pod_cluster_runtime::ClusterRuntimeView> =
             Arc::new(
-                crate::kubelet::pod_cluster_runtime::WorkerClusterRuntimeView::new(
+                crate::kubelet::pod_cluster_runtime::RepositoryClusterRuntimeView::new(
                     repository.clone(),
-                    node_name.clone(),
                 ),
             );
         Ok(Arc::new(RealPodRuntimeService::new(
@@ -444,7 +433,7 @@ mod tests {
                 crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
             sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
-            paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+            paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-pod-subsystem-test"),
             )
             .unwrap(),
@@ -455,7 +444,6 @@ mod tests {
             probe_manager: None,
             datapath: None,
             service_router: None,
-            runtime_node_role: RuntimeNodeRole::Worker,
             runtime_service: Some(runtime_service),
             runtime_store: Arc::new(
                 crate::kubelet::pod_runtime::test_support::MockPodRuntimeStore::new(),
@@ -598,11 +586,6 @@ mod tests {
             config.service_router.is_none(),
             "service_router is None by default"
         );
-        assert_eq!(
-            config.runtime_node_role,
-            RuntimeNodeRole::Worker,
-            "default to Worker for single-node"
-        );
         // Storage ports on PodSubsystem config work after construction.
         let config2 = fixture_config(db);
         let subsystem = PodSubsystem::new(config2).expect("construction must succeed");
@@ -613,7 +596,6 @@ mod tests {
             subsystem.probe_manager.is_some(),
             "PodSubsystem hoists ProbeManager construction"
         );
-        assert_eq!(subsystem.runtime_node_role, RuntimeNodeRole::Worker);
     }
 
     /// Task 24: PodSubsystem owns the runtime service and builds the
@@ -626,11 +608,11 @@ mod tests {
         let sock_path = temp_dir.path().join("cri.sock");
         let _listener =
             std::os::unix::net::UnixListener::bind(&sock_path).expect("bind temp unix socket");
-        let cri = crate::kubelet::CriClient::connect(&sock_path.to_string_lossy(), "klights")
+        let cri = klights_kubelet::cri::CriClient::connect(&sock_path.to_string_lossy(), "klights")
             .await
             .expect("connect temp cri socket");
         let mut config = fixture_config(db);
-        config.cri = Some(crate::kubelet::cri::SharedCriClient::new(cri));
+        config.cri = Some(klights_kubelet::cri::SharedCriClient::new(cri));
         config.datapath = Some(Arc::new(
             crate::networking::test_support::MockNetworkProvider::new(),
         ));
