@@ -424,7 +424,8 @@ mod tests {
         let backend: Arc<crate::datastore::sqlite::Datastore> = Arc::new(backend);
         let mut state_machine = build_sm_with_backend(backend).await;
         let mut builder = state_machine.get_snapshot_builder().await;
-        let pause = crate::datastore::sqlite::install_snapshot_capture_page_pause();
+        let pause =
+            klights_cluster_datastore::sqlite::recovery::install_snapshot_capture_page_pause();
         let snapshot_task = tokio::spawn(async move { builder.build_snapshot().await });
         tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
             .await
@@ -672,7 +673,8 @@ mod tests {
         let destination: Arc<crate::datastore::sqlite::Datastore> = Arc::new(destination);
         let mut destination_sm = build_sm_with_backend(destination).await;
         let mut builder = destination_sm.get_snapshot_builder().await;
-        let pause = crate::datastore::sqlite::install_snapshot_capture_page_pause();
+        let pause =
+            klights_cluster_datastore::sqlite::recovery::install_snapshot_capture_page_pause();
         let snapshot_task = tokio::spawn(async move { builder.build_snapshot().await });
         tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
             .await

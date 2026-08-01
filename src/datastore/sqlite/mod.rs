@@ -13,9 +13,6 @@ mod gc;
 mod merge_patch;
 mod outbox_codec;
 mod rv_helpers;
-mod snapshot_capture;
-#[cfg(test)]
-pub(crate) use snapshot_capture::install_snapshot_capture_page_pause;
 #[cfg(test)]
 pub mod test_support;
 #[cfg(test)]
