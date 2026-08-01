@@ -343,4 +343,224 @@ mod field_filter_tests {
         let filtered = filter_by_field_selector(items, "");
         assert_eq!(filtered.len(), 1);
     }
+
+    #[test]
+    fn test_filter_by_field_selector_boolean_spec_unschedulable() {
+        let schedulable = Resource {
+            id: 0,
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: "node-a".to_string(),
+            uid: "uid-node-a".to_string(),
+            resource_version: 1,
+            data: std::sync::Arc::new(json!({"spec": {"unschedulable": false}})),
+        };
+        let cordoned = Resource {
+            id: 1,
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: "node-b".to_string(),
+            uid: "uid-node-b".to_string(),
+            resource_version: 2,
+            data: std::sync::Arc::new(json!({"spec": {"unschedulable": true}})),
+        };
+        // Node with omitted unschedulable field (omitempty behavior — default is false)
+        let omitted = Resource {
+            id: 2,
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: "node-c".to_string(),
+            uid: "uid-node-c".to_string(),
+            resource_version: 3,
+            data: std::sync::Arc::new(json!({"spec": {}})),
+        };
+        let items = vec![schedulable, cordoned, omitted];
+
+        // Both explicit false and omitted (default false) should match
+        let filtered = filter_by_field_selector(items.clone(), "spec.unschedulable=false");
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().any(|r| r.name == "node-a"));
+        assert!(filtered.iter().any(|r| r.name == "node-c"));
+
+        let filtered = filter_by_field_selector(items, "spec.unschedulable=true");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "node-b");
+    }
+
+    #[test]
+    fn test_filter_by_field_selector_event_source_alias() {
+        let items = vec![
+            Resource {
+                id: 0,
+                api_version: "v1".to_string(),
+                kind: "Event".to_string(),
+                namespace: Some("default".to_string()),
+                name: "event-a".to_string(),
+                uid: "uid-event-a".to_string(),
+                resource_version: 1,
+                data: std::sync::Arc::new(json!({
+                    "metadata": {"name": "event-a", "namespace": "default"},
+                    "source": {"component": "event-test"},
+                    "reason": "Test"
+                })),
+            },
+            Resource {
+                id: 1,
+                api_version: "v1".to_string(),
+                kind: "Event".to_string(),
+                namespace: Some("default".to_string()),
+                name: "event-b".to_string(),
+                uid: "uid-event-b".to_string(),
+                resource_version: 2,
+                data: std::sync::Arc::new(json!({
+                    "metadata": {"name": "event-b", "namespace": "default"},
+                    "source": {"component": "other"},
+                    "reason": "Test"
+                })),
+            },
+        ];
+
+        let filtered = filter_by_field_selector(items, "source=event-test");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "event-a");
+    }
+
+    #[test]
+    fn test_filter_by_field_selector_event_source_alias_events_v1_shape() {
+        let items = vec![
+            Resource {
+                id: 0,
+                api_version: "events.k8s.io/v1".to_string(),
+                kind: "Event".to_string(),
+                namespace: Some("default".to_string()),
+                name: "event-a".to_string(),
+                uid: "uid-event-a".to_string(),
+                resource_version: 1,
+                data: std::sync::Arc::new(json!({
+                    "metadata": {"name": "event-a", "namespace": "default"},
+                    "reportingController": "event-test",
+                    "reason": "Test"
+                })),
+            },
+            Resource {
+                id: 1,
+                api_version: "events.k8s.io/v1".to_string(),
+                kind: "Event".to_string(),
+                namespace: Some("default".to_string()),
+                name: "event-b".to_string(),
+                uid: "uid-event-b".to_string(),
+                resource_version: 2,
+                data: std::sync::Arc::new(json!({
+                    "metadata": {"name": "event-b", "namespace": "default"},
+                    "reportingController": "other",
+                    "reason": "Test"
+                })),
+            },
+        ];
+
+        let filtered = filter_by_field_selector(items, "source=event-test");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "event-a");
+    }
+
+    #[test]
+    fn test_filter_by_field_selector_event_source_alias_ignores_empty_deprecated_source() {
+        let items = vec![Resource {
+            id: 0,
+            api_version: "events.k8s.io/v1".to_string(),
+            kind: "Event".to_string(),
+            namespace: Some("default".to_string()),
+            name: "event-a".to_string(),
+            uid: "uid-event-a".to_string(),
+            resource_version: 1,
+            data: std::sync::Arc::new(json!({
+                "metadata": {"name": "event-a", "namespace": "default"},
+                "deprecatedSource": {"component": ""},
+                "reportingController": "event-test",
+                "reason": "Test"
+            })),
+        }];
+
+        let filtered = filter_by_field_selector(items, "source=event-test");
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "event-a");
+    }
+
+    #[test]
+    fn test_filter_by_field_selector_event_source_alias_reporting_component() {
+        let items = vec![
+            Resource {
+                id: 0,
+                api_version: "events.k8s.io/v1".to_string(),
+                kind: "Event".to_string(),
+                namespace: Some("default".to_string()),
+                name: "event-a".to_string(),
+                uid: "uid-event-a".to_string(),
+                resource_version: 1,
+                data: std::sync::Arc::new(json!({
+                    "metadata": {"name": "event-a", "namespace": "default"},
+                    "reportingComponent": "event-test",
+                    "reason": "Test"
+                })),
+            },
+            Resource {
+                id: 1,
+                api_version: "events.k8s.io/v1".to_string(),
+                kind: "Event".to_string(),
+                namespace: Some("default".to_string()),
+                name: "event-b".to_string(),
+                uid: "uid-event-b".to_string(),
+                resource_version: 2,
+                data: std::sync::Arc::new(json!({
+                    "metadata": {"name": "event-b", "namespace": "default"},
+                    "reportingComponent": "other",
+                    "reason": "Test"
+                })),
+            },
+        ];
+
+        let filtered = filter_by_field_selector(items, "source=event-test");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "event-a");
+    }
+
+    #[test]
+    fn test_filter_by_field_selector_event_involved_object_alias_events_v1_shape() {
+        let items = vec![
+            Resource {
+                id: 0,
+                api_version: "events.k8s.io/v1".to_string(),
+                kind: "Event".to_string(),
+                namespace: Some("default".to_string()),
+                name: "event-a".to_string(),
+                uid: "uid-event-a".to_string(),
+                resource_version: 1,
+                data: std::sync::Arc::new(json!({
+                    "metadata": {"name": "event-a", "namespace": "default"},
+                    "regarding": {"kind": "Pod", "name": "pod-a", "namespace": "default"}
+                })),
+            },
+            Resource {
+                id: 1,
+                api_version: "events.k8s.io/v1".to_string(),
+                kind: "Event".to_string(),
+                namespace: Some("default".to_string()),
+                name: "event-b".to_string(),
+                uid: "uid-event-b".to_string(),
+                resource_version: 2,
+                data: std::sync::Arc::new(json!({
+                    "metadata": {"name": "event-b", "namespace": "default"},
+                    "regarding": {"kind": "Pod", "name": "pod-b", "namespace": "default"}
+                })),
+            },
+        ];
+
+        let filtered = filter_by_field_selector(items, "involvedObject.name=pod-a");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "event-a");
+    }
 }

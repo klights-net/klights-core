@@ -233,8 +233,6 @@ use crate::datastore::pod_serviceaccount::{
     inject_serviceaccount_volume, should_inject_serviceaccount_volume,
 };
 #[cfg(test)]
-use klights_cluster_datastore::sqlite::filters::filter_by_field_selector;
-#[cfg(test)]
 use klights_cluster_datastore::sqlite::filters::parse_label_selector;
 #[cfg(test)]
 use klights_cluster_datastore::sqlite::filters::split_selector;
