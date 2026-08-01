@@ -8,13 +8,13 @@ use ::redb::ReadableTable;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
-use klights_cluster_datastore::redb::RedbAccessor;
-use klights_cluster_datastore::redb::tables;
+use crate::redb::RedbAccessor;
+use crate::redb::tables;
 use klights_types::HostPortRange;
 use klights_types::NodePeerMode;
 use klights_types::{ClusterCidr, NodeName, PodSubnet};
 
-use klights_cluster_datastore::redb::read_core::RedbReadCore;
+use crate::redb::read_core::RedbReadCore;
 
 #[derive(Clone)]
 pub struct RedbNetworkStore {
@@ -392,8 +392,8 @@ fn parse_peer_mode(s: &str) -> Result<NodePeerMode> {
 mod tests {
     use std::sync::Arc;
 
-    use klights_cluster_datastore::redb as open_boundary;
-    use klights_cluster_datastore::redb::RedbAccessor;
+    use crate::redb as open_boundary;
+    use crate::redb::RedbAccessor;
     use klights_supervisor::TaskSupervisor;
 
     use super::*;

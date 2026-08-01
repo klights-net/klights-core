@@ -14,7 +14,6 @@ use klights_supervisor::TaskSupervisor;
 #[cfg(test)]
 mod applier;
 mod backend_impl;
-pub mod network;
 pub mod snapshot;
 mod snapshot_capture;
 pub mod watch;
@@ -34,9 +33,9 @@ use klights_cluster_datastore::redb::RedbAccessor;
 use klights_cluster_datastore::redb::RedbOpenOpts;
 use klights_cluster_datastore::redb::RedbReadStore;
 use klights_cluster_datastore::redb::embedded::advance::RedbRvStore;
+use klights_cluster_datastore::redb::embedded::network::RedbNetworkStore;
 use klights_cluster_datastore::redb::live_committed_apply::RedbLiveCommittedApplyStore;
 use klights_cluster_datastore::redb::recovery::RedbRecoveryStore;
-use network::RedbNetworkStore;
 use watch::RedbWatchStore;
 
 /// Redb-backed datastore composed from focused domain stores.
