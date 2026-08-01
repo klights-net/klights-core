@@ -1,4 +1,4 @@
-use super::*;
+use crate::api::discovery::*;
 use serde_json::json;
 
 #[test]

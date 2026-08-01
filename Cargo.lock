@@ -1979,13 +1979,26 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
+ "bytes",
+ "futures",
+ "k8s-openapi",
  "klights-auth",
+ "klights-cluster-core",
  "klights-leader-api",
  "klights-pod-api",
  "klights-reconcile-api",
+ "klights-supervisor",
+ "klights-types",
+ "rcgen",
+ "reqwest",
+ "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
  "tokio",
  "tower",
+ "tracing",
 ]
 
 [[package]]

@@ -1,15 +1,11 @@
 use super::*;
-pub(in crate::api) async fn custom_resource_discovery(
-    State(state): State<Arc<ApiState>>,
+pub async fn custom_resource_discovery<S: DiscoveryState + 'static>(
+    State(state): State<Arc<S>>,
     headers: HeaderMap,
     Path((group, version)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, AppError> {
-    let resources = state
-        .discovery()
-        .crd_registry
-        .list_resources(&group, &version)
-        .await;
+    let resources = state.crd_registry().list_resources(&group, &version).await;
 
     if resources.is_empty() {
         let path_and_query = uri
@@ -23,7 +19,7 @@ pub(in crate::api) async fn custom_resource_discovery(
             "system:apiserver".to_string(),
             vec!["system:authenticated".to_string()],
         );
-        if let Some(resp) = crate::api::proxy_apiservice_request(
+        if let Some(resp) = super::apiservice_proxy::proxy_apiservice_request(
             &state,
             &group,
             &version,

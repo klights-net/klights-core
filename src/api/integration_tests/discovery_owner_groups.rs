@@ -1,4 +1,4 @@
-use super::*;
+use crate::api::discovery::*;
 use serde_json::json;
 
 /// Helper: check if the openapi/v2 handler would return 406 for a given Accept header.

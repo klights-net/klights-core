@@ -4,10 +4,15 @@
 //! Kubernetes error/status adaptation. Route families and handlers migrate in
 //! their later packets.
 
+pub mod discovery;
 mod error;
 mod router;
 mod state;
 
+pub use discovery::{
+    api_group_by_name, api_groups, custom_resource_discovery, get_openapi_v2,
+    get_openapi_v3_api_v1, get_openapi_v3_discovery, get_openapi_v3_group_version,
+};
 pub use error::{
     AppError, StatusCause, map_mutating_admission_error, map_validating_admission_error,
 };

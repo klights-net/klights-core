@@ -26,7 +26,7 @@ pub async fn openapi_v3_discovery_with_crds(
     let mut paths = static_openapi_v3_paths().clone();
 
     // Collect CRD group/version pairs
-    let crds = crate::api::resource_query_ports::list_all_resources(
+    let crds = list_all_resources(
         query,
         "apiextensions.k8s.io/v1",
         "CustomResourceDefinition",
@@ -590,7 +590,7 @@ fn openapi_v3_schemas_from_definitions(
 /// OpenAPI v2 endpoint - returns Swagger 2.0 spec with CRD schemas
 pub async fn openapi_v2(query: &dyn klights_leader_api::LeaderResourceQuery) -> Value {
     // Fetch all CRDs from the database
-    let crds = crate::api::resource_query_ports::list_all_resources(
+    let crds = list_all_resources(
         query,
         "apiextensions.k8s.io/v1",
         "CustomResourceDefinition",
@@ -698,10 +698,10 @@ pub async fn openapi_v2(query: &dyn klights_leader_api::LeaderResourceQuery) -> 
 }
 
 /// Handler for GET /openapi/v3
-pub(in crate::api) async fn get_openapi_v3_discovery(
-    State(state): State<Arc<ApiState>>,
+pub async fn get_openapi_v3_discovery<S: DiscoveryState + 'static>(
+    State(state): State<Arc<S>>,
 ) -> Json<Value> {
-    Json(openapi_v3_discovery_with_crds(state.resource_mutation().resource_query.as_ref()).await)
+    Json(openapi_v3_discovery_with_crds(state.resource_query()).await)
 }
 
 /// Build OpenAPI v3 path operations for a resource.
@@ -925,18 +925,11 @@ pub async fn build_openapi_v3_group_version(
 }
 
 /// Handler for GET /openapi/v3/apis/:group/:version
-pub(in crate::api) async fn get_openapi_v3_group_version(
-    State(state): State<Arc<ApiState>>,
+pub async fn get_openapi_v3_group_version<S: DiscoveryState + 'static>(
+    State(state): State<Arc<S>>,
     Path((group, version)): Path<(String, String)>,
 ) -> Json<Value> {
-    Json(
-        build_openapi_v3_group_version(
-            state.resource_mutation().resource_query.as_ref(),
-            &group,
-            &version,
-        )
-        .await,
-    )
+    Json(build_openapi_v3_group_version(state.resource_query(), &group, &version).await)
 }
 
 /// Build OpenAPI v3 spec for core v1 resources (testable).
@@ -1021,10 +1014,10 @@ pub async fn build_openapi_v3_api_v1(query: &dyn klights_leader_api::LeaderResou
 }
 
 /// Handler for GET /openapi/v3/api/v1
-pub(in crate::api) async fn get_openapi_v3_api_v1(
-    State(state): State<Arc<ApiState>>,
+pub async fn get_openapi_v3_api_v1<S: DiscoveryState + 'static>(
+    State(state): State<Arc<S>>,
 ) -> Json<Value> {
-    Json(build_openapi_v3_api_v1(state.resource_mutation().resource_query.as_ref()).await)
+    Json(build_openapi_v3_api_v1(state.resource_query()).await)
 }
 
 /// Handler for GET /openapi/v3/apis
@@ -1064,11 +1057,11 @@ pub async fn get_openapi_v3_apis() -> Json<Value> {
 /// kubectl may send protobuf-oriented Accept headers while still being able
 /// to consume JSON OpenAPI from the apiserver for schema validation flows.
 /// Always return JSON Swagger 2.0 here.
-pub(in crate::api) async fn get_openapi_v2(
-    State(state): State<Arc<ApiState>>,
+pub async fn get_openapi_v2<S: DiscoveryState + 'static>(
+    State(state): State<Arc<S>>,
     _headers: HeaderMap,
 ) -> Response {
-    let mut spec = openapi_v2(state.resource_mutation().resource_query.as_ref()).await;
+    let mut spec = openapi_v2(state.resource_query()).await;
     // Strip x-kubernetes-preserve-unknown-fields from definitions: Swagger 2.0 clients
     // do not support this extension. The openapi_v2() function keeps it for v3 callers
     // (build_openapi_v3_group_version delegates to openapi_v2); strip it here for the
@@ -1081,11 +1074,11 @@ pub(in crate::api) async fn get_openapi_v2(
     Json(spec).into_response()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 /// Test helper: apply the same v2-specific strip that get_openapi_v2 does in production.
 /// Tests that directly call openapi_v2() see the v3-compatible version (field preserved).
 /// Tests that want v2 HTTP behavior should call this instead.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn get_openapi_v2_stripped(query: &dyn klights_leader_api::LeaderResourceQuery) -> Value {
     let mut spec = openapi_v2(query).await;
     if let Some(defs) = spec.get_mut("definitions").and_then(|d| d.as_object_mut()) {

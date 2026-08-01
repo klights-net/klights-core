@@ -1822,6 +1822,10 @@ mod core_crud_and_defaults;
 
 mod discovery_and_schema;
 
+mod discovery_owner_core;
+
+mod discovery_owner_groups;
+
 mod quota_and_storage;
 
 mod namespace_and_flowcontrol;

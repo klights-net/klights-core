@@ -1,4 +1,6 @@
+mod access;
 mod apiextensions_v1;
+mod apiservice_proxy;
 mod apps_v1;
 mod authorization_v1;
 mod batch_v1;
@@ -26,19 +28,27 @@ pub use self::batch_v1::*;
 pub use self::certificates_v1::*;
 pub use self::coordination_v1::*;
 pub use self::core_v1::*;
-pub(in crate::api) use self::custom_resource::*;
+pub use self::custom_resource::*;
 pub use self::discovery_v1::*;
 pub use self::events_k8s_io_v1::*;
-pub(in crate::api) use self::groups::*;
+pub use self::groups::*;
 pub use self::metrics_v1beta1::*;
 pub use self::networking_v1::*;
 pub use self::node_k8s_io_v1::*;
-pub(in crate::api) use self::openapi::*;
+pub use self::openapi::*;
 pub use self::policy_v1::*;
 pub use self::rbac_v1::*;
 pub use self::scheduling_v1::*;
 pub use self::shared::*;
 pub use self::storage_v1::*;
+pub use access::{
+    DiscoveryAggregation, DiscoveryOperationalInputs, DiscoveryResourceQuery, DiscoveryState,
+};
+pub use apiservice_proxy::{
+    ApiServiceProxyCache, invalidate_apiservice_proxy_cache_for_resource,
+    load_apiservice_proxy_identity, proxy_apiservice_request, resolve_service_endpoint,
+    resolve_service_proxy_target,
+};
 
 pub async fn register_crd_from_value(
     registry: &klights_leader_api::CrdRegistry,

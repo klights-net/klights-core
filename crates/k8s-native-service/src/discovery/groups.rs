@@ -42,8 +42,8 @@ pub fn wants_aggregated_discovery(headers: &HeaderMap) -> Option<&'static str> {
     }
 }
 
-pub(in crate::api) async fn api_groups(
-    State(state): State<Arc<ApiState>>,
+pub async fn api_groups<S: DiscoveryState + 'static>(
+    State(state): State<Arc<S>>,
     headers: HeaderMap,
 ) -> Response {
     let mut groups = vec![
@@ -276,11 +276,7 @@ pub(in crate::api) async fn api_groups(
     ];
 
     // Dynamically add CRD API groups from the registry
-    let crd_versions_by_group = state
-        .discovery()
-        .crd_registry
-        .list_versions_by_group()
-        .await;
+    let crd_versions_by_group = state.crd_registry().list_versions_by_group().await;
     for (group, versions) in crd_versions_by_group {
         // Skip if already in static list
         if groups.iter().any(|g| g.name == group) {
@@ -308,7 +304,7 @@ pub(in crate::api) async fn api_groups(
         });
     }
 
-    if let Ok(api_service_groups) = apiservice_group_versions(&state).await {
+    if let Ok(api_service_groups) = apiservice_group_versions(state.as_ref()).await {
         for (group, versions_set) in api_service_groups {
             if groups.iter().any(|g| g.name == group) {
                 continue;
@@ -363,8 +359,7 @@ pub(in crate::api) async fn api_groups(
                 // For CRD groups (empty static resources), populate from CRD registry
                 if resources.is_empty() {
                     let crd_resources = state
-                        .discovery()
-                        .crd_registry
+                        .crd_registry()
                         .list_resources(&g.name, &v.version)
                         .await;
                     for crd in crd_resources {
@@ -432,10 +427,10 @@ pub(in crate::api) async fn api_groups(
 
 /// Handler for GET /apis/{group} — returns APIGroup for a specific API group.
 /// K8s clients call this to discover available versions for a group.
-pub(in crate::api) async fn api_group_by_name(
-    State(state): State<Arc<ApiState>>,
+pub async fn api_group_by_name<S: DiscoveryState + 'static>(
+    State(state): State<Arc<S>>,
     Path(group): Path<String>,
-) -> Result<Json<Value>, crate::api::AppError> {
+) -> Result<Json<Value>, AppError> {
     // Static groups
     let static_groups: &[(&str, &str)] = &[
         ("apps", "v1"),
@@ -486,11 +481,7 @@ pub(in crate::api) async fn api_group_by_name(
     }
 
     // Check CRD registry for dynamic groups
-    let crd_versions_by_group = state
-        .discovery()
-        .crd_registry
-        .list_versions_by_group()
-        .await;
+    let crd_versions_by_group = state.crd_registry().list_versions_by_group().await;
     if let Some(versions) = crd_versions_by_group.get(&group)
         && !versions.is_empty()
     {
@@ -519,7 +510,7 @@ pub(in crate::api) async fn api_group_by_name(
     }
 
     // Check APIService registrations for dynamic aggregated groups
-    if let Ok(api_service_groups) = apiservice_group_versions(&state).await
+    if let Ok(api_service_groups) = apiservice_group_versions(state.as_ref()).await
         && let Some(versions_set) = api_service_groups.get(&group)
     {
         let versions: Vec<String> = versions_set.iter().cloned().collect();
@@ -546,7 +537,7 @@ pub(in crate::api) async fn api_group_by_name(
         }
     }
 
-    Err(crate::api::AppError::NotFound(
+    Err(AppError::NotFound(
         "the server could not find the requested resource".to_string(),
     ))
 }

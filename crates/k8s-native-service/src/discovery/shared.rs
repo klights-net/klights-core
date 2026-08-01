@@ -3,9 +3,9 @@ use super::*;
 
 pub use axum::{
     Json,
-    body::Body,
+    body::{Body, Bytes},
     extract::{OriginalUri, Path, State},
-    http::{HeaderMap, Method},
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
 pub use serde::ser::{SerializeSeq, SerializeStruct};
@@ -13,8 +13,51 @@ pub use serde::{Serialize, Serializer};
 pub use serde_json::Value;
 pub use std::sync::Arc;
 
-pub(in crate::api) use crate::api::ApiState;
-pub use crate::api::AppError;
+pub use super::DiscoveryState;
+pub use crate::AppError;
+use klights_leader_api::{
+    LeaderResourceQuery, ResourceGetRequest, ResourceListRequest, ResourceListResult,
+    ResourceQueryConsistency,
+};
+use klights_types::ResourceKey;
+
+pub(super) async fn list_all_resources(
+    query: &dyn LeaderResourceQuery,
+    api_version: &str,
+    kind: &str,
+    namespace: Option<&str>,
+) -> Result<ResourceListResult, AppError> {
+    let request = ResourceListRequest::try_new(
+        api_version,
+        kind,
+        namespace.map(str::to_string),
+        None,
+        None,
+        None,
+        None,
+        ResourceQueryConsistency::LeaderFresh,
+    )?;
+    query.list_resources(request).await.map_err(AppError::from)
+}
+
+pub(super) async fn get_resource(
+    query: &dyn LeaderResourceQuery,
+    api_version: &str,
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+) -> Result<Option<klights_cluster_core::Resource>, AppError> {
+    let request = ResourceGetRequest::try_new(
+        ResourceKey {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            namespace: namespace.map(str::to_string),
+            name: name.to_string(),
+        },
+        ResourceQueryConsistency::LeaderFresh,
+    )?;
+    query.get_resource(request).await.map_err(AppError::from)
+}
 
 /// Compute the `storageVersionHash` advertised in discovery for a built-in
 /// kind. Upstream emits a base64-encoded hash that clients use only to detect
@@ -29,13 +72,13 @@ pub fn storage_version_hash_for(kind: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(&digest[..8])
 }
 
-pub(in crate::api) async fn apiservice_group_versions(
-    state: &ApiState,
+pub(super) async fn apiservice_group_versions<S: DiscoveryState + ?Sized>(
+    state: &S,
 ) -> Result<std::collections::HashMap<String, std::collections::BTreeSet<String>>, AppError> {
     let mut groups: std::collections::HashMap<String, std::collections::BTreeSet<String>> =
         std::collections::HashMap::new();
-    let list = crate::api::resource_query_ports::list_all_resources(
-        state.resource_mutation().resource_query.as_ref(),
+    let list = list_all_resources(
+        state.resource_query(),
         "apiregistration.k8s.io/v1",
         "APIService",
         None,
@@ -62,8 +105,8 @@ pub(in crate::api) async fn apiservice_group_versions(
     Ok(groups)
 }
 
-pub(in crate::api) async fn apiservice_discovery_resources(
-    state: &Arc<ApiState>,
+pub(super) async fn apiservice_discovery_resources<S: DiscoveryState + ?Sized>(
+    state: &Arc<S>,
     group: &str,
     version: &str,
 ) -> Vec<APIResourceDiscovery> {
@@ -82,7 +125,7 @@ pub(in crate::api) async fn apiservice_discovery_resources(
         "system:apiserver".to_string(),
         vec!["system:authenticated".to_string()],
     );
-    let response = match crate::api::proxy_apiservice_request(
+    let response = match super::apiservice_proxy::proxy_apiservice_request(
         state,
         group,
         version,
@@ -121,7 +164,7 @@ pub(in crate::api) async fn apiservice_discovery_resources(
 
     let payload = match axum::body::to_bytes(
         response.into_body(),
-        crate::api::pod_subresources::MAX_PROXY_RESPONSE_BODY_BYTES,
+        super::apiservice_proxy::MAX_PROXY_RESPONSE_BODY_BYTES,
     )
     .await
     {

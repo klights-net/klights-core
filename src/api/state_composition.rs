@@ -31,6 +31,12 @@ pub(crate) struct ApiResourceMutationServices {
     pub(crate) pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
 }
 
+impl k8s_native_service::discovery::DiscoveryResourceQuery for ApiResourceMutationServices {
+    fn resource_query(&self) -> &dyn klights_leader_api::LeaderResourceQuery {
+        self.resource_query.as_ref()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ApiAuthenticators {
     pub(crate) bootstrap_token: Arc<dyn klights_leader_api::LeaderBootstrapTokenAuthentication>,
@@ -111,6 +117,20 @@ impl ApiDiscoveryAggregationServices {
             apiservice_proxy_identity_cache,
             apiservice_proxy_cache,
         }
+    }
+}
+
+impl k8s_native_service::discovery::DiscoveryAggregation for ApiDiscoveryAggregationServices {
+    fn crd_registry(&self) -> &CrdRegistry {
+        &self.crd_registry
+    }
+
+    fn apiservice_proxy_identity_cache(&self) -> &tokio::sync::OnceCell<reqwest::Identity> {
+        self.apiservice_proxy_identity_cache.as_ref()
+    }
+
+    fn apiservice_proxy_cache(&self) -> &k8s_native_service::discovery::ApiServiceProxyCache {
+        self.apiservice_proxy_cache.as_ref()
     }
 }
 
@@ -394,6 +414,20 @@ impl ApiOperationalServices {
             signing_keys,
             authority,
         }
+    }
+}
+
+impl k8s_native_service::discovery::DiscoveryOperationalInputs for ApiOperationalServices {
+    fn apiservice_proxy_cert(&self) -> &std::path::Path {
+        &self.config.runtime.paths.apiservice_proxy_cert
+    }
+
+    fn apiservice_proxy_key(&self) -> &std::path::Path {
+        &self.config.runtime.paths.apiservice_proxy_key
+    }
+
+    fn task_supervisor(&self) -> &klights_supervisor::TaskSupervisor {
+        self.task_supervisor.as_ref()
     }
 }
 
