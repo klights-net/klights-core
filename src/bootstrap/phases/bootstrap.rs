@@ -1793,9 +1793,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         api_authority,
     );
     #[cfg(test)]
-    let state_with_cri = (*watcher_state)
-        .clone()
-        .with_local_node_exec(local_node_exec);
+    let state_with_cri = {
+        let mut state = (*watcher_state).clone();
+        state.pod_node_subresources_mut().local_node_exec = local_node_exec;
+        state
+    };
     #[cfg(test)]
     let (api_router, api_outer_layers) = api::build_router_parts(state_with_cri);
     let api_router = api_outer_layers.finish(klights_apiserver::wrap_authority_router(

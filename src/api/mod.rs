@@ -25,7 +25,6 @@ mod custom_resources;
 mod debug;
 mod defaulting;
 pub mod discovery;
-mod errors;
 mod extractors;
 pub mod finalizer_delete;
 mod gc_ports;
@@ -59,7 +58,7 @@ mod response;
 mod response_tests;
 mod routes;
 pub mod server_side_apply;
-mod state;
+mod state_composition;
 pub(crate) mod state_ports;
 pub mod status;
 mod task_supervisor;
@@ -100,8 +99,6 @@ pub use defaulting::{
     apply_workload_replicas_default, increment_generation_for_spec_change,
     increment_generation_if_spec_changed, inject_create_metadata_at, set_deletion_timestamp_at,
 };
-pub use errors::AppError;
-pub(crate) use errors::{map_mutating_admission_error, map_validating_admission_error};
 pub use extractors::LenientJson;
 use extractors::{decode_json_or_proto, parse_lenient_value_from_bytes};
 pub use generated_handlers::*;
@@ -137,6 +134,8 @@ pub use helpers::{
     reconcile_namespace_termination, reconcile_namespace_termination_for_uid_with_outcome,
     set_namespace_terminating_status,
 };
+pub use k8s_native_service::AppError;
+pub(crate) use k8s_native_service::{map_mutating_admission_error, map_validating_admission_error};
 pub(in crate::api) use namespace::{
     create_namespace, delete_namespace, finalize_namespace, get_namespace, list_namespaces,
     patch_namespace, update_namespace,
@@ -178,20 +177,20 @@ pub(crate) use routes::build_router;
 pub(crate) fn build_router_parts(state: ApiState) -> (axum::Router, routes::NativeApiOuterLayers) {
     routes::build_router_parts(state)
 }
-pub(crate) use state::ApiNodeRole;
+pub(crate) use state_composition::ApiNodeRole;
 #[cfg(not(test))]
-use state::ApiState;
+use state_composition::ApiState;
 #[cfg(test)]
-pub(crate) use state::ApiState;
+pub(crate) use state_composition::ApiState;
 #[cfg(test)]
-pub(crate) use state::{
+pub(crate) use state_composition::{
     ApiAuthPolicy, ApiAuthenticators, ApiControllerReconcileServices,
     ApiDiscoveryAggregationServices, ApiOperationalConfig, ApiOperationalServices,
     ApiPodNodeSubresourceServices, ApiRemoteNodeServices, ApiResourceMutationServices,
 };
-pub(crate) use state::{ApiRuntimeInputs, ApiRuntimePaths};
+pub(crate) use state_composition::{ApiRuntimeInputs, ApiRuntimePaths};
 #[cfg(not(test))]
-pub(crate) use state::{RootApiRole, build_router_from_root};
+pub(crate) use state_composition::{RootApiRole, build_router_from_root};
 pub(crate) use validation::run_admission_for_request;
 pub use validation::{
     AdmissionContextRequest, DeleteOptions, apply_crd_defaults, apply_crd_pruning,

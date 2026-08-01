@@ -1,6 +1,6 @@
 //! Transport-neutral resource precondition comparison.
 //!
-//! HTTP error adaptation stays in `api::errors`; persistence and feature
+//! HTTP error adaptation stays in `k8s-native-service`; persistence and feature
 //! owners can share the Kubernetes UID/resourceVersion comparison without
 //! importing API mutation internals.
 

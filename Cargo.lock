@@ -1976,6 +1976,17 @@ dependencies = [
 [[package]]
 name = "k8s-native-service"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "klights-auth",
+ "klights-leader-api",
+ "klights-pod-api",
+ "klights-reconcile-api",
+ "serde_json",
+ "tokio",
+ "tower",
+]
 
 [[package]]
 name = "k8s-openapi"
@@ -2025,6 +2036,7 @@ dependencies = [
  "json-patch",
  "jsonwebtoken",
  "k8s-cri",
+ "k8s-native-service",
  "k8s-openapi",
  "klights-apiserver",
  "klights-auth",

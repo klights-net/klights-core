@@ -6,8 +6,6 @@ use axum::{
 use klights_auth::{AuthenticationError, ImpersonationError};
 use klights_pod_api::PodRepositoryError;
 
-use crate::resource_preconditions::ResourcePreconditionError;
-
 #[derive(Debug)]
 pub enum AppError {
     Unauthorized(String),
@@ -166,12 +164,6 @@ impl From<klights_reconcile_api::NamespaceLifecycleError> for AppError {
                 Self::Internal(message)
             }
         }
-    }
-}
-
-impl From<ResourcePreconditionError> for AppError {
-    fn from(error: ResourcePreconditionError) -> Self {
-        Self::Conflict(error.to_string())
     }
 }
 
@@ -389,6 +381,23 @@ impl IntoResponse for AppError {
     }
 }
 
+pub fn map_mutating_admission_error(err: anyhow::Error) -> AppError {
+    AppError::InternalError(format!("Mutating webhook failed: {}", err))
+}
+
+pub fn map_validating_admission_error(err: anyhow::Error) -> AppError {
+    let msg = err.to_string();
+    if msg.contains("Admission denied by webhook:") {
+        AppError::Forbidden(format!("Validating webhook denied: {}", msg))
+    } else if msg.contains("Admission denied by policy:") {
+        AppError::UnprocessableEntity(msg)
+    } else if msg.contains("sideEffects does not allow dryRun") {
+        AppError::BadRequest(msg)
+    } else {
+        AppError::InternalError(format!("Validating webhook failed: {}", msg))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,22 +531,5 @@ mod tests {
         assert_eq!(causes[0]["reason"], "FieldValueRequired");
         assert_eq!(causes[0]["field"], "spec.containers");
         assert_eq!(causes[0]["message"], "Required value");
-    }
-}
-
-pub fn map_mutating_admission_error(err: anyhow::Error) -> AppError {
-    AppError::InternalError(format!("Mutating webhook failed: {}", err))
-}
-
-pub fn map_validating_admission_error(err: anyhow::Error) -> AppError {
-    let msg = err.to_string();
-    if msg.contains("Admission denied by webhook:") {
-        AppError::Forbidden(format!("Validating webhook denied: {}", msg))
-    } else if msg.contains("Admission denied by policy:") {
-        AppError::UnprocessableEntity(msg)
-    } else if msg.contains("sideEffects does not allow dryRun") {
-        AppError::BadRequest(msg)
-    } else {
-        AppError::InternalError(format!("Validating webhook failed: {}", msg))
     }
 }

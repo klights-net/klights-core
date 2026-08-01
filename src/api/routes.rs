@@ -464,8 +464,9 @@ pub(in crate::api) fn build_router_parts(state: ApiState) -> (Router, NativeApiO
                     crate::api::priority_fairness::admit_request(apf_state, request, next).await
                 }
             })
-        })
-        .with_state(state.clone());
+        });
+    let router = k8s_native_service::CurrentRouter::from_transitional_routes(router)
+        .bind_state(state.clone());
     (
         router,
         NativeApiOuterLayers {

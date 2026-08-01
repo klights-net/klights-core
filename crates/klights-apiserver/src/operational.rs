@@ -77,7 +77,7 @@ mod tests {
         for path in ["/healthz", "/livez", "/readyz", "/metrics", "/version"] {
             let response = app
                 .clone()
-                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{path}");

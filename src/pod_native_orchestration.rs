@@ -69,7 +69,7 @@ fn ensure_resource_preconditions_match(
     preconditions: &ResourcePreconditions,
 ) -> Result<(), AppError> {
     crate::resource_preconditions::ensure_delete_preconditions_match(resource, preconditions)
-        .map_err(AppError::from)
+        .map_err(|error| AppError::Conflict(error.to_string()))
 }
 
 fn pod_get_request(namespace: &str, name: &str) -> Result<PodGetRequest, AppError> {

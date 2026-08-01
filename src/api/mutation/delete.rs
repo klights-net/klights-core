@@ -9,7 +9,7 @@ pub fn ensure_delete_preconditions_match(
     preconditions: &ResourcePreconditions,
 ) -> Result<(), AppError> {
     resource_preconditions::ensure_delete_preconditions_match(resource, preconditions)
-        .map_err(AppError::from)
+        .map_err(|error| AppError::Conflict(error.to_string()))
 }
 
 #[derive(Debug)]

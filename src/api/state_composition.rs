@@ -553,122 +553,25 @@ pub(crate) fn build_router_from_root(
     crate::api::routes::build_router_parts(state)
 }
 
-#[derive(Clone)]
 #[cfg(not(test))]
-pub(super) struct ApiState {
-    auth_policy: ApiAuthPolicy,
-    resource_mutation: ApiResourceMutationServices,
-    discovery: ApiDiscoveryAggregationServices,
-    controller_reconcile: ApiControllerReconcileServices,
-    pod_node_subresources: ApiPodNodeSubresourceServices,
-    operational: ApiOperationalServices,
-}
-
-#[derive(Clone)]
-#[cfg(test)]
-pub(crate) struct ApiState {
-    auth_policy: ApiAuthPolicy,
-    resource_mutation: ApiResourceMutationServices,
-    discovery: ApiDiscoveryAggregationServices,
-    controller_reconcile: ApiControllerReconcileServices,
-    pod_node_subresources: ApiPodNodeSubresourceServices,
-    operational: ApiOperationalServices,
-}
-
-impl ApiState {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        auth_policy: ApiAuthPolicy,
-        resource_mutation: ApiResourceMutationServices,
-        discovery: ApiDiscoveryAggregationServices,
-        controller_reconcile: ApiControllerReconcileServices,
-        pod_node_subresources: ApiPodNodeSubresourceServices,
-        operational: ApiOperationalServices,
-    ) -> Self {
-        Self {
-            auth_policy,
-            resource_mutation,
-            discovery,
-            controller_reconcile,
-            pod_node_subresources,
-            operational,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_local_node_exec(
-        mut self,
-        local_node_exec: Option<Arc<dyn klights_node_api::NodeExec>>,
-    ) -> Self {
-        self.pod_node_subresources.local_node_exec = local_node_exec;
-        self
-    }
-
-    pub(crate) fn resource_mutation(&self) -> &ApiResourceMutationServices {
-        &self.resource_mutation
-    }
-
-    pub(crate) fn auth_policy(&self) -> &ApiAuthPolicy {
-        &self.auth_policy
-    }
-
-    pub(crate) fn discovery(&self) -> &ApiDiscoveryAggregationServices {
-        &self.discovery
-    }
-
-    pub(crate) fn controller_reconcile(&self) -> &ApiControllerReconcileServices {
-        &self.controller_reconcile
-    }
-
-    pub(crate) fn pod_node_subresources(&self) -> &ApiPodNodeSubresourceServices {
-        &self.pod_node_subresources
-    }
-
-    pub(crate) fn operational(&self) -> &ApiOperationalServices {
-        &self.operational
-    }
-
-    #[cfg(test)]
-    pub(crate) fn resource_mutation_mut(&mut self) -> &mut ApiResourceMutationServices {
-        &mut self.resource_mutation
-    }
-
-    #[cfg(test)]
-    pub(crate) fn discovery_mut(&mut self) -> &mut ApiDiscoveryAggregationServices {
-        &mut self.discovery
-    }
-
-    #[cfg(test)]
-    pub(crate) fn controller_reconcile_mut(&mut self) -> &mut ApiControllerReconcileServices {
-        &mut self.controller_reconcile
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pod_node_subresources_mut(&mut self) -> &mut ApiPodNodeSubresourceServices {
-        &mut self.pod_node_subresources
-    }
-
-    #[cfg(test)]
-    pub(crate) fn operational_mut(&mut self) -> &mut ApiOperationalServices {
-        &mut self.operational
-    }
-}
+pub(super) type ApiState = k8s_native_service::ApiState<
+    ApiAuthPolicy,
+    ApiResourceMutationServices,
+    ApiDiscoveryAggregationServices,
+    ApiControllerReconcileServices,
+    ApiPodNodeSubresourceServices,
+    ApiOperationalServices,
+>;
 
 #[cfg(test)]
-impl std::ops::Deref for ApiState {
-    type Target = ApiAuthPolicy;
-
-    fn deref(&self) -> &Self::Target {
-        &self.auth_policy
-    }
-}
-
-#[cfg(test)]
-impl std::ops::DerefMut for ApiState {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.auth_policy
-    }
-}
+pub(crate) type ApiState = k8s_native_service::ApiState<
+    ApiAuthPolicy,
+    ApiResourceMutationServices,
+    ApiDiscoveryAggregationServices,
+    ApiControllerReconcileServices,
+    ApiPodNodeSubresourceServices,
+    ApiOperationalServices,
+>;
 
 #[cfg(test)]
 mod runtime_input_tests {
