@@ -1,5 +1,4 @@
 use super::*;
-use klights_types::LabelRequirement;
 use serde_json::json;
 
 async fn create_and_fetch_via_backend(db: &dyn DatastoreBackend) -> Result<Option<Resource>> {
