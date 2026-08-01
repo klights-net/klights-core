@@ -1,6 +1,6 @@
 //! Root composition for post-mutation side effects.
 
-use crate::side_effects::{ErrorPolicy, SideEffectMetrics, SideEffectRegistry};
+use klights_controllers::side_effects::{ErrorPolicy, SideEffectMetrics, SideEffectRegistry};
 
 /// Run all registered hooks for `resource`, logging and counting any failure.
 ///
@@ -36,7 +36,7 @@ pub async fn run_hooks_logged(
     let (failures, failed) = registry.run_hooks_collect_failures(resource).await;
 
     for failure in &failures {
-        metrics.record_recent_failure(crate::side_effects::metrics::SideEffectFailureEntry {
+        metrics.record_recent_failure(klights_controllers::side_effects::SideEffectFailureEntry {
             api_version: api_version.clone(),
             kind: kind.clone(),
             namespace: namespace.clone(),
@@ -104,7 +104,7 @@ pub async fn run_delete_hooks_logged(
     let (failures, failed) = registry.run_delete_hooks_collect_failures(resource).await;
 
     for failure in &failures {
-        metrics.record_recent_failure(crate::side_effects::metrics::SideEffectFailureEntry {
+        metrics.record_recent_failure(klights_controllers::side_effects::SideEffectFailureEntry {
             api_version: api_version.clone(),
             kind: kind.clone(),
             namespace: namespace.clone(),
@@ -175,7 +175,7 @@ pub async fn run_named_hook_logged(
         .await;
 
     for failure in &failures {
-        metrics.record_recent_failure(crate::side_effects::metrics::SideEffectFailureEntry {
+        metrics.record_recent_failure(klights_controllers::side_effects::SideEffectFailureEntry {
             api_version: api_version.clone(),
             kind: kind.clone(),
             namespace: namespace.clone(),
@@ -355,8 +355,8 @@ pub fn default_registry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::side_effects::SideEffect;
     use async_trait::async_trait;
+    use klights_controllers::side_effects::SideEffect;
     use serde_json::json;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -372,6 +372,92 @@ mod tests {
         async fn apply(&self, _resource: &serde_json::Value) -> anyhow::Result<()> {
             anyhow::bail!("intentional failure")
         }
+    }
+
+    #[tokio::test]
+    async fn node_side_effect_enqueues_daemonset_key_without_inline_reconcile() {
+        let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let service_ipam = Arc::new(crate::controllers::service::ServiceIpam::new(
+            "10.43.128.0/17",
+        ));
+        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
+        let registry = default_registry(
+            SideEffectMetrics::new(),
+            None,
+            Some(task_supervisor),
+            Some(db_handle),
+        );
+        registry.set_controller_dispatcher(dispatcher.clone());
+
+        let node = db
+            .create_resource(
+                "v1",
+                "Node",
+                None,
+                "node-a",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Node",
+                    "metadata": {
+                        "name": "node-a",
+                        "labels": {"daemonset-color": "blue"}
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        db.create_resource(
+            "apps/v1",
+            "DaemonSet",
+            Some("default"),
+            "daemon-set",
+            json!({
+                "apiVersion": "apps/v1",
+                "kind": "DaemonSet",
+                "metadata": {"name": "daemon-set", "namespace": "default", "uid": "ds-uid"},
+                "spec": {
+                    "selector": {"matchLabels": {"name": "daemon"}},
+                    "template": {
+                        "metadata": {"labels": {"name": "daemon"}},
+                        "spec": {
+                            "nodeSelector": {"daemonset-color": "blue"},
+                            "containers": [{"name": "app", "image": "pause"}]
+                        }
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        registry.run_hooks(&node.data).await.unwrap();
+
+        assert_eq!(
+            dispatcher.queued_reconcile_keys_for_test().await,
+            vec![klights_reconcile_api::ReconcileKey::namespaced(
+                "apps/v1",
+                "DaemonSet",
+                "default",
+                "daemon-set"
+            )],
+            "node side effect should enqueue the affected daemonset"
+        );
+        assert!(
+            db.list_resources(
+                "v1",
+                "Pod",
+                Some("default"),
+                crate::datastore::ResourceListQuery::all(),
+            )
+            .await
+            .unwrap()
+            .items
+            .is_empty(),
+            "node side effect must not run DaemonSet reconciliation inline"
+        );
     }
 
     #[tokio::test]

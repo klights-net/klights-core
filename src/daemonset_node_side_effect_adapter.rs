@@ -10,7 +10,7 @@ use crate::datastore::{DatastoreBackend, DatastoreHandle, ResourceListQuery};
 use crate::side_effects::daemonset_node::{
     DaemonSetNodeSideEffectStore, NodeSchedulingFingerprint, reconcile_keys_for_node,
 };
-use crate::side_effects::{ControllerDispatcherSlot, SideEffect};
+use klights_controllers::side_effects::{ControllerDispatcherSlot, SideEffect};
 
 struct DaemonSetNodeReconcile {
     db: DatastoreHandle,

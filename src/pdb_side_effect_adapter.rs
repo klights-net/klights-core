@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::controllers::pdb;
 use crate::datastore::{DatastoreBackend, DatastoreHandle};
 use crate::side_effects::pdb::{PdbSideEffectPort, apply_pdb_event, pdb_event_namespace};
-use crate::side_effects::{PodSideEffectPortsSlot, SideEffect};
+use klights_controllers::side_effects::{PodSideEffectPortsSlot, SideEffect};
 
 /// Updates PodDisruptionBudget status after Pod create/update/delete.
 ///

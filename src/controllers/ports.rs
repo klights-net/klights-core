@@ -98,7 +98,7 @@ pub(crate) struct ControllerRuntimeDependencies {
     pub(crate) reconcile: Arc<dyn ControllerReconcilePort>,
     pub(crate) network: Arc<dyn ControllerNetworkPort>,
     pub(crate) effects: Arc<dyn ControllerEffectPort>,
-    pub(crate) coordination: Arc<super::ControllerCoordination>,
+    pub(crate) coordination: Arc<klights_controllers::ControllerCoordination>,
     pub(crate) node_name: Arc<str>,
 }
 
@@ -126,7 +126,7 @@ mod tests {
         reconcile: Arc<dyn ControllerReconcilePort>,
         network: Arc<dyn ControllerNetworkPort>,
         effects: Arc<dyn ControllerEffectPort>,
-        coordination: Arc<crate::controllers::ControllerCoordination>,
+        coordination: Arc<klights_controllers::ControllerCoordination>,
     ) -> ControllerRuntimeDependencies {
         ControllerRuntimeDependencies {
             wall_time: chrono::Utc::now,

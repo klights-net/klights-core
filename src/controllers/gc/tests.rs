@@ -7,9 +7,9 @@ use std::sync::{
 };
 use tokio::sync::Notify;
 
-fn test_gc_coordination() -> &'static crate::controllers::ControllerCoordination {
-    static COORDINATION: std::sync::LazyLock<crate::controllers::ControllerCoordination> =
-        std::sync::LazyLock::new(crate::controllers::ControllerCoordination::new);
+fn test_gc_coordination() -> &'static klights_controllers::ControllerCoordination {
+    static COORDINATION: std::sync::LazyLock<klights_controllers::ControllerCoordination> =
+        std::sync::LazyLock::new(klights_controllers::ControllerCoordination::new);
     &COORDINATION
 }
 
@@ -2595,7 +2595,7 @@ async fn assert_foreground_delete_reservation_released_after(
     .await
     .unwrap();
 
-    let coordination = crate::controllers::ControllerCoordination::new();
+    let coordination = klights_controllers::ControllerCoordination::new();
     let sink = FailOrLoseFirstGcPodDeleteSink::new(first_result);
     for _ in 0..2 {
         let ready = super::check_foreground_deletion_ready(

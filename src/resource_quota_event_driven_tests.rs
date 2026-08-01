@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::side_effect_registry_composition::default_registry;
-use crate::side_effects::SideEffectMetrics;
-use crate::side_effects::SideEffectRegistry;
+use klights_controllers::side_effects::SideEffectMetrics;
+use klights_controllers::side_effects::SideEffectRegistry;
 
 const CONVERGENCE_BUDGET: Duration = Duration::from_secs(1);
 

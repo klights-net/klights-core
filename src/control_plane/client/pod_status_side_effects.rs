@@ -430,9 +430,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    fn gc_coordination() -> &'static crate::controllers::ControllerCoordination {
-        static COORDINATION: std::sync::LazyLock<crate::controllers::ControllerCoordination> =
-            std::sync::LazyLock::new(crate::controllers::ControllerCoordination::new);
+    fn gc_coordination() -> &'static klights_controllers::ControllerCoordination {
+        static COORDINATION: std::sync::LazyLock<klights_controllers::ControllerCoordination> =
+            std::sync::LazyLock::new(klights_controllers::ControllerCoordination::new);
         &COORDINATION
     }
 

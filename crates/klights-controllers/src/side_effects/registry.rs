@@ -71,10 +71,8 @@ impl ControllerDispatcherSlot {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_service_reconcile_sink_for_test(
-        sink: Arc<dyn ServiceReconcileSink>,
-    ) -> Self {
+    /// Construct a slot with only the focused Service sink populated.
+    pub fn with_service_reconcile_sink(sink: Arc<dyn ServiceReconcileSink>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(ReconcileSinks {
                 controller: None,
@@ -457,94 +455,5 @@ mod tests {
         let result = registry.run_hooks(&resource).await;
         // Warn policy continues despite failure
         assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn node_side_effect_enqueues_daemonset_key_without_inline_reconcile() {
-        let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-        let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
-            klights_supervisor::TaskCategoryConfig::default(),
-        ));
-        let service_ipam = Arc::new(crate::controllers::service::ServiceIpam::new(
-            "10.43.128.0/17",
-        ));
-        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
-        let metrics = crate::side_effects::SideEffectMetrics::new();
-        let registry = crate::side_effect_registry_composition::default_registry(
-            metrics,
-            None,
-            Some(task_supervisor.clone()),
-            Some(db_handle.clone()),
-        );
-        registry.set_controller_dispatcher(dispatcher.clone());
-
-        let node = db
-            .create_resource(
-                "v1",
-                "Node",
-                None,
-                "node-a",
-                json!({
-                    "apiVersion": "v1",
-                    "kind": "Node",
-                    "metadata": {
-                        "name": "node-a",
-                        "labels": {"daemonset-color": "blue"}
-                    }
-                }),
-            )
-            .await
-            .unwrap();
-        db.create_resource(
-            "apps/v1",
-            "DaemonSet",
-            Some("default"),
-            "daemon-set",
-            json!({
-                "apiVersion": "apps/v1",
-                "kind": "DaemonSet",
-                "metadata": {"name": "daemon-set", "namespace": "default", "uid": "ds-uid"},
-                "spec": {
-                    "selector": {"matchLabels": {"name": "daemon"}},
-                    "template": {
-                        "metadata": {"labels": {"name": "daemon"}},
-                        "spec": {
-                            "nodeSelector": {"daemonset-color": "blue"},
-                            "containers": [{"name": "app", "image": "pause"}]
-                        }
-                    }
-                }
-            }),
-        )
-        .await
-        .unwrap();
-
-        registry.run_hooks(&node.data).await.unwrap();
-
-        let keys = dispatcher.queued_reconcile_keys_for_test().await;
-        assert_eq!(
-            keys,
-            vec![klights_reconcile_api::ReconcileKey::namespaced(
-                "apps/v1",
-                "DaemonSet",
-                "default",
-                "daemon-set"
-            )],
-            "node side effect should enqueue the affected daemonset"
-        );
-
-        let pods = db
-            .list_resources(
-                "v1",
-                "Pod",
-                Some("default"),
-                crate::datastore::ResourceListQuery::all(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            pods.items.is_empty(),
-            "node side effect must not run DaemonSet reconciliation inline"
-        );
     }
 }

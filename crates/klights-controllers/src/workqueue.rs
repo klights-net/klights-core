@@ -25,10 +25,10 @@ use std::time::Duration;
 use klights_reconcile_api::ReconcileKey;
 use tokio::sync::{Mutex, Notify};
 
-pub(crate) type Key = ReconcileKey;
+pub type Key = ReconcileKey;
 
 #[cfg(test)]
-pub(crate) fn key_for_test(api_version: &str, kind: &str, namespace: &str, name: &str) -> Key {
+pub fn key_for_test(api_version: &str, kind: &str, namespace: &str, name: &str) -> Key {
     let (api_version, kind) = controller_kind_static(api_version, kind)
         .unwrap_or_else(|| panic!("unsupported controller key {api_version}/{kind}"));
     if namespace.is_empty() {

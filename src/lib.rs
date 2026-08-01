@@ -41,7 +41,6 @@ mod hpa_side_effect_adapter;
 mod job_side_effect_adapter;
 mod job_store_adapter;
 pub mod kubelet;
-pub mod leader_election;
 mod list_query_adapter;
 mod namespace_admission;
 mod namespace_termination_adapter;

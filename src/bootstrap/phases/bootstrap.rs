@@ -490,7 +490,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             supervisor.clone(),
         ));
 
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     #[cfg(not(test))]
     let namespace_lifecycle_store =
         crate::api_state_adapter::RootNamespaceTerminationStore::new(db_handle.clone());
@@ -510,7 +510,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let non_pod_finalization: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort> = Arc::new(
         crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db_handle.clone()),
     );
-    let controller_coordination = Arc::new(crate::controllers::ControllerCoordination::new());
+    let controller_coordination = Arc::new(klights_controllers::ControllerCoordination::new());
     local_api_client.set_non_pod_finalization(non_pod_finalization.clone());
 
     let scheduling_mode = if has_leader_coordination {

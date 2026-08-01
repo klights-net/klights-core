@@ -13,8 +13,8 @@ use klights_cluster_datastore::errors::DatastoreError;
 pub(crate) struct DatastoreFinalizerLifecycleAdapter {
     db: DatastoreHandle,
     pod_delete_sink: Arc<dyn GcPodDeleteSink>,
-    side_effects: Arc<crate::side_effects::SideEffectRegistry>,
-    metrics: Arc<crate::side_effects::SideEffectMetrics>,
+    side_effects: Arc<klights_controllers::side_effects::SideEffectRegistry>,
+    metrics: Arc<klights_controllers::side_effects::SideEffectMetrics>,
     non_pod_finalization: crate::gc_delete_adapter::GcNonPodFinalizationAdapter,
     coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
 }
@@ -24,23 +24,23 @@ impl DatastoreFinalizerLifecycleAdapter {
     pub(crate) fn new(
         db: DatastoreHandle,
         pod_delete_sink: Arc<dyn GcPodDeleteSink>,
-        side_effects: Arc<crate::side_effects::SideEffectRegistry>,
-        metrics: Arc<crate::side_effects::SideEffectMetrics>,
+        side_effects: Arc<klights_controllers::side_effects::SideEffectRegistry>,
+        metrics: Arc<klights_controllers::side_effects::SideEffectMetrics>,
     ) -> Arc<Self> {
         Self::new_with_coordination(
             db,
             pod_delete_sink,
             side_effects,
             metrics,
-            Arc::new(crate::controllers::ControllerCoordination::new()),
+            Arc::new(klights_controllers::ControllerCoordination::new()),
         )
     }
 
     pub(crate) fn new_with_coordination(
         db: DatastoreHandle,
         pod_delete_sink: Arc<dyn GcPodDeleteSink>,
-        side_effects: Arc<crate::side_effects::SideEffectRegistry>,
-        metrics: Arc<crate::side_effects::SideEffectMetrics>,
+        side_effects: Arc<klights_controllers::side_effects::SideEffectRegistry>,
+        metrics: Arc<klights_controllers::side_effects::SideEffectMetrics>,
         coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -337,8 +337,8 @@ mod tests {
         let adapter = DatastoreFinalizerLifecycleAdapter::new(
             db_handle,
             sink.clone(),
-            Arc::new(crate::side_effects::SideEffectRegistry::new()),
-            crate::side_effects::SideEffectMetrics::new(),
+            Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
+            klights_controllers::side_effects::SideEffectMetrics::new(),
         );
         let owner = klights_cluster_core::Resource {
             id: 1,

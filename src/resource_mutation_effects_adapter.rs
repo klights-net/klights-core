@@ -6,14 +6,14 @@ use klights_reconcile_api::{
 };
 
 pub(crate) struct ResourceMutationEffectsAdapter {
-    registry: Arc<crate::side_effects::SideEffectRegistry>,
-    metrics: Arc<crate::side_effects::SideEffectMetrics>,
+    registry: Arc<klights_controllers::side_effects::SideEffectRegistry>,
+    metrics: Arc<klights_controllers::side_effects::SideEffectMetrics>,
 }
 
 impl ResourceMutationEffectsAdapter {
     pub(crate) fn new(
-        registry: Arc<crate::side_effects::SideEffectRegistry>,
-        metrics: Arc<crate::side_effects::SideEffectMetrics>,
+        registry: Arc<klights_controllers::side_effects::SideEffectRegistry>,
+        metrics: Arc<klights_controllers::side_effects::SideEffectMetrics>,
     ) -> Arc<Self> {
         Arc::new(Self { registry, metrics })
     }

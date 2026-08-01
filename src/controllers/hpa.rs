@@ -859,7 +859,7 @@ mod tests {
             db,
             pod_repository,
             crate::controllers::test_utils::non_pod_finalization_port_for_test(),
-            &crate::controllers::ControllerCoordination::new(),
+            &klights_controllers::ControllerCoordination::new(),
             hpa,
             node_name,
             node_metrics,

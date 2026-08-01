@@ -25,12 +25,12 @@ use crate::datastore::DatastoreHandle;
 use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
 use crate::kubelet::pod_runtime::service::PodDeletionFinalizeResult;
 #[cfg(test)]
-use crate::side_effects::SideEffectMetrics;
-#[cfg(test)]
-use crate::side_effects::SideEffectRegistry;
-#[cfg(test)]
 use crate::watch::WatchEvent;
 use klights_cluster_core::Resource;
+#[cfg(test)]
+use klights_controllers::side_effects::SideEffectMetrics;
+#[cfg(test)]
+use klights_controllers::side_effects::SideEffectRegistry;
 use klights_leader_api::LeaderResourceQuery;
 use klights_leader_api::{ResourceGetRequest, ResourceListRequest, ResourceQueryConsistency};
 use klights_pod_api::{PodDeleteOptions, PodRepositoryError};

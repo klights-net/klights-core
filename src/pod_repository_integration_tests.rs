@@ -33,18 +33,18 @@ fn fixture_supervisor() -> Arc<klights_supervisor::TaskSupervisor> {
     ))
 }
 
-fn fixture_side_effects() -> Arc<crate::side_effects::SideEffectRegistry> {
-    Arc::new(crate::side_effects::SideEffectRegistry::new())
+fn fixture_side_effects() -> Arc<klights_controllers::side_effects::SideEffectRegistry> {
+    Arc::new(klights_controllers::side_effects::SideEffectRegistry::new())
 }
 
 fn fixture_mutation_reconcile(
     store: Arc<PodStore>,
-    side_effects: Arc<crate::side_effects::SideEffectRegistry>,
+    side_effects: Arc<klights_controllers::side_effects::SideEffectRegistry>,
 ) -> Arc<dyn klights_reconcile_api::PodMutationReconcileSink> {
     Arc::new(crate::pod_reconcile_adapter::PodReconcileAdapter::new(
         store.db().clone(),
         side_effects.controller_dispatcher_slot(),
-        crate::side_effects::SideEffectMetrics::new(),
+        klights_controllers::side_effects::SideEffectMetrics::new(),
         side_effects,
         store,
     ))
@@ -74,7 +74,7 @@ fn build_worker_repository_for_test(
             resource_query: cluster_api,
             pod_workqueue_store: node_local,
             supervisor: fixture_supervisor(),
-            metrics: crate::side_effects::SideEffectMetrics::new(),
+            metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
             pod_network_cache: super::empty_test_pod_network_cache(),
             assignment_waiter: super::test_assignment_bus(),
             outbox,
@@ -96,7 +96,7 @@ async fn fixture_repository_with_node_local(
         pod_workqueue_store: Some(node_local.clone()),
         supervisor,
         side_effects: fixture_side_effects(),
-        metrics: crate::side_effects::SideEffectMetrics::new(),
+        metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
         pod_network_cache: super::test_pod_network_cache(node_local.clone()),
         assignment_waiter: super::test_assignment_bus(),
         scheduling_mode: super::PodSchedulingMode::InlineSingleNode,
@@ -228,7 +228,7 @@ crate::control_plane::client::impl_unavailable_leader_pod_effects!(FakeLeaderApi
 
 #[async_trait::async_trait]
 #[async_trait::async_trait]
-impl crate::side_effects::SideEffect for RecordingPodDeleteHook {
+impl klights_controllers::side_effects::SideEffect for RecordingPodDeleteHook {
     fn name(&self) -> &'static str {
         "recording_pod_delete_hook"
     }
@@ -343,7 +343,7 @@ async fn build_repo_with_scheduling_mode_for_outbox(
         node_db.clone(),
     ));
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let repo = super::PodRepository::new_with_scheduling_mode_and_outbox(
         db.clone(),
@@ -378,7 +378,7 @@ async fn drain_repo_outbox(
 async fn pod_repository_constructs_with_db_and_supervisor() {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let _repo = PodRepository::new(db, supervisor, side_effects, metrics);
 }
@@ -389,7 +389,7 @@ async fn pod_repository_constructs_with_db_and_supervisor() {
 async fn pod_repository_build_parts_exposes_repository_and_background_without_starting() {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let node_local = fixture_node_local().await;
     let pod_network_cache = super::test_pod_network_cache(node_local.clone());
@@ -420,7 +420,7 @@ async fn pod_repository_build_parts_exposes_repository_and_background_without_st
 async fn pod_repository_build_parts_does_not_start_workqueue_until_background_start() {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let node_local = fixture_node_local().await;
     let pod_network_cache = super::test_pod_network_cache(node_local.clone());
@@ -461,7 +461,7 @@ async fn pod_repository_build_parts_does_not_start_workqueue_until_background_st
 async fn pod_workqueue_runner_start_calls_workqueue_start_once() {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let node_local = fixture_node_local().await;
     let pod_network_cache = super::test_pod_network_cache(node_local.clone());
@@ -501,7 +501,7 @@ async fn pod_object_service_requires_uid_for_mutating_paths() {
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let repo = PodRepository::new(db.clone(), supervisor, side_effects, metrics);
 
@@ -596,7 +596,7 @@ async fn pod_status_service_writes_are_uid_preconditioned() {
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let repo = PodRepository::new(db.clone(), supervisor, side_effects, metrics);
 
@@ -647,7 +647,7 @@ async fn mark_start_pending_for_retry_writes_err_image_pull_then_image_pull_back
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let repo = PodRepository::new(db.clone(), supervisor, side_effects, metrics);
 
@@ -730,7 +730,7 @@ async fn mark_start_pending_for_retry_rejects_stale_uid() {
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let repo = PodRepository::new(db.clone(), supervisor, side_effects, metrics);
 
@@ -772,7 +772,7 @@ async fn pod_subresource_service_status_and_ephemeral_updates_require_uid() {
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let repo = PodRepository::new(db.clone(), supervisor, side_effects, metrics);
 
@@ -839,7 +839,7 @@ async fn pod_network_service_pod_network_rows_are_uid_keyed() {
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let repo = PodRepository::new(db, supervisor, side_effects, metrics);
 
@@ -859,7 +859,7 @@ async fn pod_watch_service_preserves_resource_version_and_uid() {
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let repo = PodRepository::new(db.clone(), supervisor, side_effects, metrics);
 
@@ -1025,7 +1025,7 @@ async fn worker_status_enqueue_does_not_bypass_leader_side_effects() {
         node_db.clone(),
     ));
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let repo = PodRepository::new_with_scheduling_mode_and_outbox(
         db.clone(),
@@ -1130,7 +1130,7 @@ async fn kubelet_pod_reader_uses_leader_api_when_configured() {
         db,
         fixture_supervisor(),
         fixture_side_effects(),
-        crate::side_effects::SideEffectMetrics::new(),
+        klights_controllers::side_effects::SideEffectMetrics::new(),
         crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         None,
         Arc::new(FakeLeaderApiClient::new(pod.clone())),
@@ -1203,7 +1203,7 @@ async fn kubelet_pod_reader_uses_fresh_leader_api_for_single_pod_reads() {
         db,
         fixture_supervisor(),
         fixture_side_effects(),
-        crate::side_effects::SideEffectMetrics::new(),
+        klights_controllers::side_effects::SideEffectMetrics::new(),
         crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         None,
         Arc::new(FakeLeaderApiClient::new(stale_pod).with_fresh_pod(fresh_pod)),
@@ -1274,7 +1274,7 @@ async fn runtime_reconcile_reads_pending_status_checkpoint_from_node_db() {
         db,
         fixture_supervisor(),
         fixture_side_effects(),
-        crate::side_effects::SideEffectMetrics::new(),
+        klights_controllers::side_effects::SideEffectMetrics::new(),
         crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         Some(outbox),
         Arc::new(FakeLeaderApiClient::new(stale_pod)),
@@ -1377,7 +1377,7 @@ async fn get_pod_for_uid_overlays_local_status_checkpoint_for_read_your_own_writ
         db,
         fixture_supervisor(),
         fixture_side_effects(),
-        crate::side_effects::SideEffectMetrics::new(),
+        klights_controllers::side_effects::SideEffectMetrics::new(),
         crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         Some(outbox),
         Arc::new(FakeLeaderApiClient::new(stale_pod)),
@@ -1473,7 +1473,7 @@ async fn outbox_status_reads_current_pod_through_leader_api() {
         db.clone(),
         fixture_supervisor(),
         fixture_side_effects(),
-        crate::side_effects::SideEffectMetrics::new(),
+        klights_controllers::side_effects::SideEffectMetrics::new(),
         crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         Some(outbox),
         Arc::new(FakeLeaderApiClient::new(pod)),
@@ -1553,7 +1553,7 @@ async fn outbox_sandbox_annotation_uses_leader_api_and_outbox() {
         db.clone(),
         fixture_supervisor(),
         fixture_side_effects(),
-        crate::side_effects::SideEffectMetrics::new(),
+        klights_controllers::side_effects::SideEffectMetrics::new(),
         crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         Some(outbox),
         Arc::new(FakeLeaderApiClient::new(pod)),
@@ -1652,7 +1652,7 @@ async fn controller_owner_reference_update_commits_to_leader_store_not_node_outb
         db.clone(),
         fixture_supervisor(),
         fixture_side_effects(),
-        crate::side_effects::SideEffectMetrics::new(),
+        klights_controllers::side_effects::SideEffectMetrics::new(),
         crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
         Some(outbox),
         Arc::new(FakeLeaderApiClient::new(created)),
@@ -1731,7 +1731,7 @@ async fn non_leader_pod_object_writer_without_outbox_retries_later() {
         db,
         fixture_supervisor(),
         fixture_side_effects(),
-        crate::side_effects::SideEffectMetrics::new(),
+        klights_controllers::side_effects::SideEffectMetrics::new(),
         crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         None,
         Arc::new(FakeLeaderApiClient::new(pod)),
@@ -1856,7 +1856,7 @@ async fn non_leader_pod_status_writer_without_outbox_retries_later() {
         db,
         fixture_supervisor(),
         fixture_side_effects(),
-        crate::side_effects::SideEffectMetrics::new(),
+        klights_controllers::side_effects::SideEffectMetrics::new(),
         crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         None,
         Arc::new(FakeLeaderApiClient::new(pod)),
@@ -2550,7 +2550,7 @@ async fn delete_unscheduled_is_idempotent_for_missing_or_replaced_uid() {
 async fn build_repo() -> super::PodRepository {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     super::PodRepository::new(db, supervisor, side_effects, metrics)
 }
@@ -2558,7 +2558,7 @@ async fn build_repo() -> super::PodRepository {
 async fn build_repo_with_bound_side_effects() -> Arc<super::PodRepository> {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = Arc::new(crate::side_effect_registry_composition::default_registry(
         metrics.clone(),
         None,
@@ -2747,7 +2747,7 @@ async fn build_raft_repo_with_status_race_on_delete(
         Arc::new(crate::bootstrap::sequenced_datastore::SequencedDatastore::new(inner, proposal));
     let db: crate::datastore::DatastoreHandle = sequenced;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     (
         super::PodRepository::new(db, supervisor, side_effects, metrics),
@@ -2760,7 +2760,7 @@ async fn build_repo_with_scheduling_mode(
 ) -> super::PodRepository {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     super::PodRepository::new_with_scheduling_mode(
         db,
@@ -2777,7 +2777,7 @@ async fn build_repo_with_scheduling_mode_and_gate(
 ) -> super::PodRepository {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     super::PodRepository::build_parts(PodRepositoryBuildConfig {
         db,
@@ -2802,7 +2802,7 @@ async fn build_repo_with_dispatcher() -> (
 ) {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = Arc::new(crate::side_effect_registry_composition::default_registry(
         metrics.clone(),
         None,
@@ -2900,7 +2900,7 @@ async fn cluster_backed_pod_reader_list_pods_uses_fresh_leader_list() {
         db,
         fixture_supervisor(),
         fixture_side_effects(),
-        crate::side_effects::SideEffectMetrics::new(),
+        klights_controllers::side_effects::SideEffectMetrics::new(),
         crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         None,
         Arc::new(
@@ -2961,7 +2961,7 @@ async fn pod_watch_source_receives_added_on_create() {
         .expect("watch-enabled in-memory datastore");
     let db: crate::datastore::DatastoreHandle = std::sync::Arc::new(ds.clone());
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let repo = super::PodRepository::new(db, supervisor, side_effects, metrics);
 
@@ -3364,7 +3364,7 @@ async fn set_pod_status_reconciles_namespace_termination_for_late_pod() {
             .unwrap(),
         "actor finalization should remove the terminating late Pod"
     );
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     crate::api::reconcile_namespace_termination(db.as_ref(), "term-status", metrics.as_ref())
         .await
         .unwrap();
@@ -6804,7 +6804,7 @@ async fn read_pod_network_assignment_returns_assigned_ip() {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let node_local = super::test_node_local_store(supervisor.clone()).await;
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let repo = super::PodRepository::new_with_network_events(
         db,
@@ -7016,7 +7016,7 @@ async fn read_pod_network_assignment_retries_then_succeeds() {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let node_local = super::test_node_local_store(supervisor.clone()).await;
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let (events, mut registered) = RegistrationSignalingAssignmentBus::new();
     let repo = std::sync::Arc::new(super::PodRepository::new_with_network_events(
@@ -7200,7 +7200,7 @@ async fn read_pod_network_assignment_tolerates_cni_db_backlog() {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let node_local = super::test_node_local_store(supervisor.clone()).await;
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let (events, mut registered) = RegistrationSignalingAssignmentBus::new();
     let repo = std::sync::Arc::new(super::PodRepository::new_with_network_events(
@@ -11548,9 +11548,9 @@ async fn delete_pod_runs_side_effects_after_marking_terminating_with_original_po
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let observed = Arc::new(tokio::sync::Mutex::new(None));
-    let mut registry = crate::side_effects::SideEffectRegistry::new();
+    let mut registry = klights_controllers::side_effects::SideEffectRegistry::new();
     registry.register(
         "v1",
         "Pod",
@@ -11558,7 +11558,7 @@ async fn delete_pod_runs_side_effects_after_marking_terminating_with_original_po
             db: db.clone(),
             observed: observed.clone(),
         }),
-        crate::side_effects::ErrorPolicy::Fail,
+        klights_controllers::side_effects::ErrorPolicy::Fail,
     );
     let repo = super::PodRepository::new(db, supervisor, Arc::new(registry), metrics);
     repo.store
@@ -12173,7 +12173,7 @@ async fn build_finalizer() -> RealPodDeletionFinalizer {
         None,
         None,
         fixture_side_effects(),
-        crate::side_effects::SideEffectMetrics::new(),
+        klights_controllers::side_effects::SideEffectMetrics::new(),
         fixture_supervisor(),
     )
 }
@@ -12221,7 +12221,7 @@ async fn deletion_finalizer_without_outbox_retries_later() {
         Some(cluster_api),
         None,
         fixture_side_effects(),
-        crate::side_effects::SideEffectMetrics::new(),
+        klights_controllers::side_effects::SideEffectMetrics::new(),
         fixture_supervisor(),
     );
 
@@ -12296,7 +12296,7 @@ async fn deletion_finalizer_reissues_missing_delete_mark_through_outbox() {
         Some(cluster_api),
         Some(outbox),
         fixture_side_effects(),
-        crate::side_effects::SideEffectMetrics::new(),
+        klights_controllers::side_effects::SideEffectMetrics::new(),
         fixture_supervisor(),
     );
 
@@ -12621,7 +12621,7 @@ async fn emptydir_survivor_diagnosis_records_mark_workqueue_and_actor_state() {
 
     // Drive the real RC background-delete cascade (one-shot inline call, the
     // path inners.rs runs after hard-deleting the RC row).
-    let coordination = crate::controllers::ControllerCoordination::new();
+    let coordination = klights_controllers::ControllerCoordination::new();
     cascade_delete_with_uid(
         db.as_ref(),
         rc_uid,
@@ -12775,7 +12775,7 @@ async fn gc_conflicts_are_identity_changed_only_after_an_authoritative_reread() 
         db.clone(),
         fixture_supervisor(),
         fixture_side_effects(),
-        crate::side_effects::SideEffectMetrics::new(),
+        klights_controllers::side_effects::SideEffectMetrics::new(),
     );
     db.create_resource(
         "v1",

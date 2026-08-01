@@ -738,7 +738,7 @@ async fn test_endpointslice_deleted_when_service_deleted_via_cascade() {
     );
 
     // Now simulate cascade delete (what happens when Service is deleted)
-    let coordination = crate::controllers::ControllerCoordination::new();
+    let coordination = klights_controllers::ControllerCoordination::new();
     crate::controllers::gc::cascade_delete_with_uid(
         &db,
         "test-service-uid-123",

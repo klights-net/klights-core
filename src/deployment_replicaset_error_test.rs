@@ -44,7 +44,7 @@ mod tests {
             crate::api::inject_resource_version(created.data, created.resource_version);
 
         // Reconcile should succeed (not return error) and set failure condition
-        let coordination = crate::controllers::ControllerCoordination::new();
+        let coordination = klights_controllers::ControllerCoordination::new();
         let result = crate::controllers::deployment::reconcile_deployment(
             &db,
             __pod_repo.as_ref(),
@@ -54,7 +54,7 @@ mod tests {
                 db.clone(),
             )),
             &deployment_with_rv,
-            crate::controllers::ControllerReconcileContext::new(&coordination, "test-node"),
+            crate::controllers::test_reconcile_context(&coordination, "test-node"),
         )
         .await;
 

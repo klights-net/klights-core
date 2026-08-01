@@ -4,8 +4,8 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use crate::datastore::DatastoreHandle;
-use crate::side_effects::SideEffect;
-use crate::side_effects::SideEffectMetrics;
+use klights_controllers::side_effects::SideEffect;
+use klights_controllers::side_effects::SideEffectMetrics;
 
 struct NamespaceTerminationEffect {
     store: Arc<dyn klights_reconcile_api::NamespaceLifecycleStore>,

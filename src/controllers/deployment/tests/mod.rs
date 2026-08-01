@@ -2,9 +2,9 @@ use super::*;
 use serde_json::Value;
 use serde_json::json;
 
-fn coordination() -> &'static crate::controllers::ControllerCoordination {
-    static COORDINATION: std::sync::LazyLock<crate::controllers::ControllerCoordination> =
-        std::sync::LazyLock::new(crate::controllers::ControllerCoordination::new);
+fn coordination() -> &'static klights_controllers::ControllerCoordination {
+    static COORDINATION: std::sync::LazyLock<klights_controllers::ControllerCoordination> =
+        std::sync::LazyLock::new(klights_controllers::ControllerCoordination::new);
     &COORDINATION
 }
 
@@ -28,7 +28,7 @@ where
         pod_delete_sink,
         &non_pod_finalization,
         deployment,
-        crate::controllers::ControllerReconcileContext::new(coordination(), node_name),
+        crate::controllers::test_reconcile_context(coordination(), node_name),
     )
     .await
 }

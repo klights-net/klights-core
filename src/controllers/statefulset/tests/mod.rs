@@ -17,8 +17,8 @@ async fn reconcile_statefulset_test(
         repo.as_ref(),
         crate::controllers::test_utils::non_pod_finalization_port_for_test(),
         statefulset,
-        crate::controllers::ControllerReconcileContext::new(
-            &crate::controllers::ControllerCoordination::new(),
+        crate::controllers::test_reconcile_context(
+            &klights_controllers::ControllerCoordination::new(),
             node_name,
         ),
     )

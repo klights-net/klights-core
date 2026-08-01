@@ -501,7 +501,7 @@ mod tests {
             controller_pods,
             pod_repository,
             crate::controllers::test_utils::non_pod_finalization_port_for_test(),
-            &crate::controllers::ControllerCoordination::new(),
+            &klights_controllers::ControllerCoordination::new(),
             crate::coredns_bootstrap_adapter::CoreDnsBootstrapConfig {
                 tls_port,
                 service_cidr,

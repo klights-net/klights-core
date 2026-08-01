@@ -53,7 +53,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
     let task_supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     let local_api = std::sync::Arc::new(crate::control_plane::client::local::LocalApiClient::new(

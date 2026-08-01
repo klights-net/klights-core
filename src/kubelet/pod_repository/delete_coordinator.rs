@@ -508,7 +508,7 @@ pub(super) fn pod_target_node_from_pod_data(pod: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::side_effects::SideEffectMetrics;
+    use klights_controllers::side_effects::SideEffectMetrics;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 

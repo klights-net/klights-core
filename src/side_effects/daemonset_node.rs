@@ -95,7 +95,7 @@ pub(crate) async fn reconcile_keys_for_node<Store: DaemonSetNodeSideEffectStore 
 
 #[cfg(test)]
 mod tests {
-    use crate::side_effects::ControllerDispatcherSlot;
+    use klights_controllers::side_effects::ControllerDispatcherSlot;
     use serde_json::json;
     use std::sync::Arc;
 

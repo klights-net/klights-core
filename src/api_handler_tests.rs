@@ -3,9 +3,9 @@ use crate::controllers::replicaset::reconcile_replicaset as reconcile_replicaset
 use crate::controllers::service::ServiceIpam;
 use serde_json::json;
 
-fn controller_coordination() -> &'static crate::controllers::ControllerCoordination {
-    static COORDINATION: std::sync::LazyLock<crate::controllers::ControllerCoordination> =
-        std::sync::LazyLock::new(crate::controllers::ControllerCoordination::new);
+fn controller_coordination() -> &'static klights_controllers::ControllerCoordination {
+    static COORDINATION: std::sync::LazyLock<klights_controllers::ControllerCoordination> =
+        std::sync::LazyLock::new(klights_controllers::ControllerCoordination::new);
     &COORDINATION
 }
 
@@ -31,7 +31,7 @@ async fn reconcile_deployment(
         pod_delete_sink,
         non_pod_finalization,
         deployment,
-        crate::controllers::ControllerReconcileContext::new(controller_coordination(), node_name),
+        crate::controllers::test_reconcile_context(controller_coordination(), node_name),
     )
     .await
 }
@@ -52,7 +52,7 @@ async fn reconcile_replicaset(
         pod_delete_sink,
         non_pod_finalization,
         replicaset,
-        crate::controllers::ControllerReconcileContext::new(controller_coordination(), node_name),
+        crate::controllers::test_reconcile_context(controller_coordination(), node_name),
     )
     .await
 }

@@ -78,7 +78,7 @@ mod tests {
         let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let effect = crate::job_side_effect_adapter::effect(
             db_handle,
-            crate::side_effects::ControllerDispatcherSlot::new(),
+            klights_controllers::side_effects::ControllerDispatcherSlot::new(),
         );
         assert_eq!(effect.name(), "job_reconcile");
     }

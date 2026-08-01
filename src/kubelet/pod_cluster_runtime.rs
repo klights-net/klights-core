@@ -205,8 +205,8 @@ mod tests {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let metrics = crate::side_effects::SideEffectMetrics::new();
-        let side_effects = Arc::new(crate::side_effects::SideEffectRegistry::new());
+        let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
+        let side_effects = Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
         PodRepository::new(db, supervisor, side_effects, metrics)
     }
 

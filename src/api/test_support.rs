@@ -178,7 +178,7 @@ pub(crate) async fn build_test_app_state_with_db(
     controller_dispatcher
         .set_sync_context(db_handle.clone(), config.node_name.clone())
         .await;
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let local_api = Arc::new(crate::control_plane::client::local::LocalApiClient::new(
         db_handle.clone(),
         config.node_name.clone(),

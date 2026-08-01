@@ -951,7 +951,7 @@ struct RecordingWidgetSideEffect {
 }
 
 #[async_trait::async_trait]
-impl crate::side_effects::SideEffect for RecordingWidgetSideEffect {
+impl klights_controllers::side_effects::SideEffect for RecordingWidgetSideEffect {
     fn name(&self) -> &'static str {
         "recording-widget"
     }
@@ -1020,7 +1020,7 @@ async fn mutation_crd_events_fire_once_after_persisted_writes_and_never_on_dry_r
     let mut state = build_test_app_state().await;
     let hook_db = state.resource_mutation().db.clone();
     let records = Arc::new(Mutex::new(Vec::new()));
-    let mut registry = crate::side_effects::SideEffectRegistry::new();
+    let mut registry = klights_controllers::side_effects::SideEffectRegistry::new();
     registry.register(
         "example.com/v1",
         "Widget",
@@ -1028,7 +1028,7 @@ async fn mutation_crd_events_fire_once_after_persisted_writes_and_never_on_dry_r
             db: hook_db,
             records: records.clone(),
         }),
-        crate::side_effects::ErrorPolicy::Warn,
+        klights_controllers::side_effects::ErrorPolicy::Warn,
     );
     let registry = Arc::new(registry);
     let mutation_effects =

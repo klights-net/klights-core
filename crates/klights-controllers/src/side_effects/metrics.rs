@@ -1,3 +1,5 @@
+//! Controller side-effect failure metrics.
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, atomic::AtomicU64, atomic::Ordering};
 

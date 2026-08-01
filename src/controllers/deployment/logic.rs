@@ -253,7 +253,7 @@ struct ZeroReplicaOldReplicaSetRedrive<'a, S: ?Sized, R: ?Sized, W: ?Sized> {
     pod_writer: &'a W,
     pod_delete_sink: &'a dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &'a dyn klights_reconcile_api::GcNonPodFinalizationPort,
-    coordination: &'a crate::controllers::ControllerCoordination,
+    coordination: &'a klights_controllers::ControllerCoordination,
     namespace: &'a str,
     deployment_uid: &'a str,
     current_template: &'a Value,
@@ -314,7 +314,7 @@ async fn redrive_zero_replica_old_replicasets_with_live_pods(
             ctx.pod_delete_sink,
             ctx.non_pod_finalization,
             &rs_with_metadata,
-            crate::controllers::ControllerReconcileContext::at(
+            klights_controllers::ControllerReconcileContext::at(
                 ctx.coordination,
                 ctx.node_name,
                 ctx.wall_time,
@@ -560,7 +560,7 @@ pub(crate) async fn reconcile_deployment(
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     deployment: &Value,
-    reconcile_context: crate::controllers::ControllerReconcileContext<'_>,
+    reconcile_context: klights_controllers::ControllerReconcileContext<'_>,
 ) -> Result<()> {
     let coordination = reconcile_context.coordination;
     let node_name = reconcile_context.node_name;

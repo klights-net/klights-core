@@ -70,8 +70,8 @@ impl Context {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let side_effects = Arc::new(crate::side_effects::SideEffectRegistry::new());
-        let metrics = crate::side_effects::SideEffectMetrics::new();
+        let side_effects = Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
+        let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
         let repository = Arc::new(crate::kubelet::pod_repository::PodRepository::new(
             db_handle.clone(),
             supervisor.clone(),
@@ -134,7 +134,7 @@ impl Context {
                             .join("local-path-provisioner"),
                     ),
                 ),
-                coordination: Arc::new(super::ControllerCoordination::new()),
+                coordination: Arc::new(klights_controllers::ControllerCoordination::new()),
                 node_name: Arc::from(node_name),
             },
             reconcile_time: chrono::Utc::now(),
@@ -353,7 +353,7 @@ impl Context {
         self.dependencies.effects.as_ref()
     }
 
-    pub(crate) fn coordination(&self) -> &super::ControllerCoordination {
+    pub(crate) fn coordination(&self) -> &klights_controllers::ControllerCoordination {
         self.dependencies.coordination.as_ref()
     }
 
@@ -509,7 +509,7 @@ macro_rules! controller_wrapper {
                     ctx.pod_delete_sink(),
                     ctx.reconcile_port().non_pod_finalization(),
                     &resource,
-                    $crate::controllers::ControllerReconcileContext::at(
+                    klights_controllers::ControllerReconcileContext::at(
                         ctx.coordination(),
                         ctx.node_name(),
                         ctx.reconcile_time(),
@@ -638,7 +638,7 @@ macro_rules! controller_wrapper {
                     ctx.pod_delete_sink(),
                     ctx.reconcile_port().non_pod_finalization(),
                     &resource,
-                    $crate::controllers::ControllerReconcileContext::at(
+                    klights_controllers::ControllerReconcileContext::at(
                         ctx.coordination(),
                         ctx.node_name(),
                         ctx.reconcile_time(),

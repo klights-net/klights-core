@@ -22,7 +22,7 @@ impl crate::controllers::Controller for JobController {
             ctx.pod_delete_sink(),
             ctx.reconcile_port().non_pod_finalization(),
             &resource,
-            crate::controllers::ControllerReconcileContext::at(
+            klights_controllers::ControllerReconcileContext::at(
                 ctx.coordination(),
                 ctx.node_name(),
                 ctx.reconcile_time(),

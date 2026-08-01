@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Barrier, Notify};
 
-fn coordination() -> &'static crate::controllers::ControllerCoordination {
-    static COORDINATION: std::sync::LazyLock<crate::controllers::ControllerCoordination> =
-        std::sync::LazyLock::new(crate::controllers::ControllerCoordination::new);
+fn coordination() -> &'static klights_controllers::ControllerCoordination {
+    static COORDINATION: std::sync::LazyLock<klights_controllers::ControllerCoordination> =
+        std::sync::LazyLock::new(klights_controllers::ControllerCoordination::new);
     &COORDINATION
 }
 
@@ -30,7 +30,7 @@ async fn reconcile_replicationcontroller(
         pod_delete_sink,
         non_pod_finalization,
         rc,
-        crate::controllers::ControllerReconcileContext::new(coordination(), node_name),
+        crate::controllers::test_reconcile_context(coordination(), node_name),
     )
     .await
 }

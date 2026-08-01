@@ -1233,7 +1233,7 @@ mod tests {
     use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleWorkKind};
     use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
     use crate::kubelet::pod_lifecycle_router::executor::{ExecutorError, PodWorkExecutor};
-    use crate::side_effects::SideEffectMetrics;
+    use klights_controllers::side_effects::SideEffectMetrics;
 
     #[derive(Clone, Copy)]
     struct TestCoordinationState {
@@ -2592,9 +2592,9 @@ mod tests {
         workqueue.set_namespace_termination_sink(Arc::new(
             crate::pod_reconcile_adapter::PodReconcileAdapter::new(
                 db.clone(),
-                crate::side_effects::ControllerDispatcherSlot::new(),
+                klights_controllers::side_effects::ControllerDispatcherSlot::new(),
                 SideEffectMetrics::new(),
-                Arc::new(crate::side_effects::SideEffectRegistry::new()),
+                Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
                 workqueue.store.clone(),
             ),
         ));

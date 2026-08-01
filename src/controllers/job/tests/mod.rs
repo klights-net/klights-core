@@ -7,9 +7,9 @@ use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-fn coordination() -> &'static crate::controllers::ControllerCoordination {
-    static COORDINATION: std::sync::LazyLock<crate::controllers::ControllerCoordination> =
-        std::sync::LazyLock::new(crate::controllers::ControllerCoordination::new);
+fn coordination() -> &'static klights_controllers::ControllerCoordination {
+    static COORDINATION: std::sync::LazyLock<klights_controllers::ControllerCoordination> =
+        std::sync::LazyLock::new(klights_controllers::ControllerCoordination::new);
     &COORDINATION
 }
 
@@ -30,7 +30,7 @@ async fn reconcile_job_test(
         repo.as_ref(),
         &non_pod_finalization,
         job,
-        crate::controllers::ControllerReconcileContext::new(coordination(), node_name),
+        crate::controllers::test_reconcile_context(coordination(), node_name),
         chrono::Utc::now(),
     )
     .await
@@ -252,7 +252,7 @@ async fn test_job_create_loop_observes_live_parallelism_scale_down() {
         pod_reader.as_ref(),
         crate::controllers::test_utils::non_pod_finalization_port_for_test(),
         &job_with_rv,
-        crate::controllers::ControllerReconcileContext::new(coordination(), "test-node"),
+        crate::controllers::test_reconcile_context(coordination(), "test-node"),
         chrono::Utc::now(),
     )
     .await

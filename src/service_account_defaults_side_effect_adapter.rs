@@ -6,10 +6,10 @@ use serde_json::Value;
 
 use crate::controllers::namespace;
 use crate::datastore::{DatastoreBackend, DatastoreHandle};
-use crate::side_effects::SideEffect;
 use crate::side_effects::service_account_defaults::{
     DefaultServiceAccountPort, apply_default_service_account_delete,
 };
+use klights_controllers::side_effects::SideEffect;
 
 struct DefaultServiceAccountEffect {
     db: DatastoreHandle,

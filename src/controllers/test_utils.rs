@@ -55,8 +55,8 @@ pub fn pod_repository_for_test(
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let metrics = crate::side_effects::SideEffectMetrics::new();
-    let side_effects = Arc::new(crate::side_effects::SideEffectRegistry::new());
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
+    let side_effects = Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
     let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
     Arc::new(crate::kubelet::pod_repository::PodRepository::new(
         db_handle,
@@ -83,8 +83,8 @@ pub(crate) async fn pod_repository_with_node_local_for_test(
             db: db_handle,
             pod_workqueue_store: Some(node_local.clone()),
             supervisor,
-            side_effects: Arc::new(crate::side_effects::SideEffectRegistry::new()),
-            metrics: crate::side_effects::SideEffectMetrics::new(),
+            side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
+            metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
             pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(
                 node_local.clone(),
             ),
@@ -108,8 +108,8 @@ pub async fn deferred_outbox_pod_repository_for_test(
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let metrics = crate::side_effects::SideEffectMetrics::new();
-    let side_effects = Arc::new(crate::side_effects::SideEffectRegistry::new());
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
+    let side_effects = Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
     let outbox = Arc::new(crate::outbox_test_support::test_outbox().await);
     let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
     Arc::new(

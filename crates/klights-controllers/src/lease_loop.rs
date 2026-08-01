@@ -1,4 +1,4 @@
-//! Event-driven controller lease orchestration.
+//! Event-driven controller lease orchestration owned by `klights-controllers`.
 //!
 //! The loop depends only on the neutral coordination capability. The embedded
 //! adapter waits for authority changes and validates an opaque generation
@@ -131,9 +131,9 @@ mod tests {
             let state = *self.receiver.borrow();
             if !state.local {
                 Err(ControllerCoordinationError::Unavailable)
-            } else if !lease
+            } else if lease
                 .adapter_fence::<FakeCoordinationFence>()
-                .is_some_and(|fence| fence.0 == state.generation)
+                .is_none_or(|fence| fence.0 != state.generation)
             {
                 Err(ControllerCoordinationError::StalePermit)
             } else {

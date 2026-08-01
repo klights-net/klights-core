@@ -1037,7 +1037,7 @@ mod tests {
                 crate::api_state_adapter_test_owner::RootNamespaceTerminationStore::new(Arc::new(
                     db.clone(),
                 )),
-                crate::side_effects::SideEffectMetrics::new(),
+                klights_controllers::side_effects::SideEffectMetrics::new(),
             ),
         );
         client.set_non_pod_finalization(Arc::new(

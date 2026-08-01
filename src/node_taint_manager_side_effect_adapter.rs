@@ -12,7 +12,7 @@ use crate::datastore::DatastoreHandle;
 use crate::side_effects::node_taint_manager::{
     EvictionAction, eviction_action_for_pod, noexecute_taints,
 };
-use crate::side_effects::{PodSideEffectPortsSlot, SideEffect};
+use klights_controllers::side_effects::{PodSideEffectPortsSlot, SideEffect};
 
 pub fn node_taint_manager(
     pod_repository: PodSideEffectPortsSlot,

@@ -123,7 +123,7 @@ pub(crate) async fn reconcile_statefulset(
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     statefulset: &Value,
-    reconcile_context: crate::controllers::ControllerReconcileContext<'_>,
+    reconcile_context: klights_controllers::ControllerReconcileContext<'_>,
 ) -> Result<()> {
     let coordination = reconcile_context.coordination;
     let node_name = reconcile_context.node_name;

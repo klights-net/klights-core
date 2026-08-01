@@ -1,9 +1,9 @@
 //! Side effect to reconcile workload controllers after Pod metadata mutations.
 
-use crate::controllers::workqueue::controller_kind_static;
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
+use klights_controllers::workqueue::controller_kind_static;
 use klights_reconcile_api::ReconcileKey;
 use serde_json::Value;
 use std::collections::HashSet;

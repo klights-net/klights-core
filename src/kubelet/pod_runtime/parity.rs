@@ -241,9 +241,9 @@ impl ParityFixture {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let side_effects = Arc::new(crate::side_effects::SideEffectRegistry::new());
-        let metrics: Arc<crate::side_effects::SideEffectMetrics> =
-            crate::side_effects::SideEffectMetrics::new();
+        let side_effects = Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
+        let metrics: Arc<klights_controllers::side_effects::SideEffectMetrics> =
+            klights_controllers::side_effects::SideEffectMetrics::new();
         let node_local =
             crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
         let parts = PodRepository::build_parts(PodRepositoryBuildConfig {

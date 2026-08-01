@@ -17,7 +17,7 @@ struct CoreDnsBootstrapAdapter<'a> {
     pod_mutation: Arc<dyn crate::controllers::DeploymentControllerPodMutation>,
     pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
     non_pod_finalization: &'a dyn klights_reconcile_api::GcNonPodFinalizationPort,
-    coordination: &'a crate::controllers::ControllerCoordination,
+    coordination: &'a klights_controllers::ControllerCoordination,
 }
 
 fn coordinates(
@@ -115,7 +115,7 @@ impl CoreDnsBootstrapStore for CoreDnsBootstrapAdapter<'_> {
             self.pod_delete_sink.as_ref(),
             self.non_pod_finalization,
             &deployment,
-            crate::controllers::ControllerReconcileContext::at(self.coordination, node_name, now),
+            klights_controllers::ControllerReconcileContext::at(self.coordination, node_name, now),
         )
         .await
         .map_err(map_controller_store_error)
@@ -135,7 +135,7 @@ pub(crate) async fn bootstrap_coredns(
     pod_mutation: Arc<dyn crate::controllers::DeploymentControllerPodMutation>,
     pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
-    coordination: &crate::controllers::ControllerCoordination,
+    coordination: &klights_controllers::ControllerCoordination,
     config: CoreDnsBootstrapConfig<'_>,
 ) -> Result<()> {
     bootstrap_coredns_with_store(

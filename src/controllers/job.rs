@@ -856,7 +856,7 @@ pub(crate) async fn reconcile_job(
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     job: &Value,
-    reconcile_context: crate::controllers::ControllerReconcileContext<'_>,
+    reconcile_context: klights_controllers::ControllerReconcileContext<'_>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Value> {
     let coordination = reconcile_context.coordination;
@@ -874,7 +874,7 @@ pub(crate) async fn reconcile_job(
         .ok_or_else(|| anyhow::anyhow!("Missing namespace"))?;
 
     let reconcile_lock = coordination.reconcile_lock(
-        crate::controllers::CoordinatedControllerKind::Job,
+        klights_controllers::CoordinatedControllerKind::Job,
         initial_namespace,
         initial_name,
     );

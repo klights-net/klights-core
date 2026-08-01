@@ -51,8 +51,8 @@ impl klights_cluster_store::PodUidPreconditionRead for dyn crate::datastore::Dat
 }
 use crate::pod_api_service::{PodApiService, PodApiServiceDependencies};
 use crate::pod_native_orchestration::{PodNativeOrchestration, PodNativeOrchestrationDependencies};
-use crate::side_effects::SideEffectMetrics;
-use crate::side_effects::SideEffectRegistry;
+use klights_controllers::side_effects::SideEffectMetrics;
+use klights_controllers::side_effects::SideEffectRegistry;
 use klights_leader_api::LeaderResourceQuery;
 use klights_supervisor::TaskSupervisor;
 use klights_types::PodIdentity;
@@ -1036,7 +1036,7 @@ pub(crate) fn build_pod_repository_parts(
     } = config;
     #[cfg(test)]
     let gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination> =
-        Arc::new(crate::controllers::ControllerCoordination::new());
+        Arc::new(klights_controllers::ControllerCoordination::new());
     let _ = scheduling_mode;
     #[cfg(not(test))]
     let resource_query = cluster_api

@@ -2,7 +2,6 @@ pub mod annotations;
 pub mod apiservice;
 pub mod apiservice_controller;
 pub mod common;
-mod coordination;
 pub mod coredns;
 pub mod crd;
 pub mod cronjob;
@@ -44,17 +43,20 @@ pub mod statefulset;
 pub mod statefulset_controller;
 #[cfg(test)]
 pub mod test_utils;
-pub mod workqueue;
-
-pub(crate) use coordination::{
-    ControllerCoordination, ControllerReconcileContext, CoordinatedControllerKind,
-};
 pub(crate) use dispatcher::ControllerDispatcher;
 pub(crate) use ports::{
     ControllerEffectPort, ControllerNetworkPort, ControllerReconcilePort, ControllerResourceQuery,
     ControllerRuntimeDependencies, DeploymentControllerPodMutation, DeploymentControllerPodReader,
 };
 pub(crate) use runtime::{Context, Controller, controller_wrapper};
+
+#[cfg(test)]
+pub(crate) fn test_reconcile_context<'a>(
+    coordination: &'a klights_controllers::ControllerCoordination,
+    node_name: &'a str,
+) -> klights_controllers::ControllerReconcileContext<'a> {
+    klights_controllers::ControllerReconcileContext::at(coordination, node_name, chrono::Utc::now())
+}
 
 #[cfg(test)]
 use crate::datastore::DatastoreBackend;

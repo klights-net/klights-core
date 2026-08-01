@@ -20,7 +20,7 @@ impl GcOwnerLifecycleAdapter {
         Self::new_with_coordination(
             db,
             pod_delete_sink,
-            std::sync::Arc::new(crate::controllers::ControllerCoordination::new()),
+            std::sync::Arc::new(klights_controllers::ControllerCoordination::new()),
         )
     }
 

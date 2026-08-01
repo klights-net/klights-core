@@ -2151,8 +2151,9 @@ async fn test_enqueue_job_reconcile_enqueues_job_key_via_dispatcher() {
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let metrics = crate::side_effects::SideEffectMetrics::new();
-    let side_effects = std::sync::Arc::new(crate::side_effects::SideEffectRegistry::new());
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
+    let side_effects =
+        std::sync::Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
     side_effects.set_controller_dispatcher(dispatcher.clone());
     let pod_repo = std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(
         db_handle,
@@ -2243,8 +2244,9 @@ async fn test_terminal_watch_modified_pod_enqueues_job_reconcile() {
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let metrics = crate::side_effects::SideEffectMetrics::new();
-    let side_effects = std::sync::Arc::new(crate::side_effects::SideEffectRegistry::new());
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
+    let side_effects =
+        std::sync::Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
     side_effects.set_controller_dispatcher(dispatcher.clone());
     let pod_repo = std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(
         db_handle,

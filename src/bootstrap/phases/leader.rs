@@ -98,7 +98,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
             "runtime_leader_controller_lease_loop",
             async move {
                 let scoped_coordination = coordination.clone();
-                crate::leader_election::run_under_lease(
+                klights_controllers::run_under_lease(
                     coordination,
                     ControllerScope::Cluster,
                     shutdown_token,

@@ -526,8 +526,8 @@ async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_matc
             db: db.clone(),
             pod_workqueue_store: Some(node_local.clone()),
             supervisor,
-            side_effects: Arc::new(crate::side_effects::SideEffectRegistry::new()),
-            metrics: crate::side_effects::SideEffectMetrics::new(),
+            side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
+            metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
             pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(node_local),
             assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
             scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
@@ -1114,8 +1114,9 @@ async fn fixture_pod_repository() -> std::sync::Arc<crate::kubelet::pod_reposito
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let side_effects = std::sync::Arc::new(crate::side_effects::SideEffectRegistry::new());
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let side_effects =
+        std::sync::Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let node_local =
         crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
     let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
@@ -10436,8 +10437,10 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
             db: db.clone(),
             pod_workqueue_store: Some(node_local.clone()),
             supervisor: supervisor.clone(),
-            side_effects: std::sync::Arc::new(crate::side_effects::SideEffectRegistry::new()),
-            metrics: crate::side_effects::SideEffectMetrics::new(),
+            side_effects: std::sync::Arc::new(
+                klights_controllers::side_effects::SideEffectRegistry::new(),
+            ),
+            metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
             pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(node_local),
             assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
             scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,

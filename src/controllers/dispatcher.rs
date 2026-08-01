@@ -26,21 +26,23 @@ use crate::controllers::{
     service::{NodePortAllocator, ServiceIpam},
     service_controller::ServiceController,
     statefulset_controller::StatefulSetController,
-    workqueue::{Key, MAX_RETRY_ATTEMPTS, WorkQueue, backoff_for, controller_kind_static},
 };
 #[cfg(test)]
 use crate::datastore::DatastoreHandle;
 #[cfg(test)]
 use crate::hpa_controller_adapter::HpaController;
 use anyhow::{Context as _, Result};
+use klights_controllers::DispatcherRuntime;
+use klights_controllers::workqueue::{Key, controller_kind_static};
 use klights_reconcile_api::{
     ControllerReconcileSink, ReconcileKey, ReconcileSinkFuture, ServiceReconcileKey,
     ServiceReconcileSink,
 };
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify};
+#[cfg(test)]
+use tokio::sync::Mutex;
 
 /// Controller dispatcher that routes resources to the appropriate controller.
 ///
@@ -57,9 +59,7 @@ use tokio::sync::{Mutex, Notify};
 /// drive HTTP handlers without a running worker.
 pub struct ControllerDispatcher {
     controllers: HashMap<(&'static str, &'static str), Arc<dyn Controller>>,
-    queue: WorkQueue,
-    retry_count: Arc<Mutex<HashMap<Key, u32>>>,
-    worker_running: Arc<std::sync::atomic::AtomicBool>,
+    runtime: Arc<DispatcherRuntime>,
     /// Datastore handle + node_name captured by the running worker, used by
     /// [`enqueue`] when no worker is registered (test mode) so the call still
     /// has somewhere to dispatch synchronously.
@@ -83,15 +83,7 @@ pub struct ControllerDispatcher {
     dependencies: ControllerRuntimeDependencies,
     #[cfg(test)]
     file_process: klights_supervisor::FileProcessExecutor,
-    coordination: Arc<crate::controllers::ControllerCoordination>,
-    active_reconciles: Arc<Mutex<ActiveReconciles>>,
-    active_reconciles_changed: Arc<Notify>,
-}
-
-#[derive(Default)]
-struct ActiveReconciles {
-    in_flight: HashSet<Key>,
-    pending_followup: HashSet<Key>,
+    coordination: Arc<klights_controllers::ControllerCoordination>,
 }
 
 impl ControllerDispatcher {
@@ -206,17 +198,13 @@ impl ControllerDispatcher {
         let file_process = klights_supervisor::FileProcessExecutor::new(task_supervisor.clone());
         Self {
             controllers,
-            queue: WorkQueue::with_task_supervisor(task_supervisor),
-            retry_count: Arc::new(Mutex::new(HashMap::new())),
-            worker_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            runtime: Arc::new(DispatcherRuntime::new(task_supervisor)),
             sync_ctx: Arc::new(Mutex::new(None)),
             services: Arc::new(Mutex::new(None)),
             pod_repository: Arc::new(Mutex::new(None)),
             node_metrics: Arc::new(Mutex::new(None)),
             file_process,
-            coordination: Arc::new(crate::controllers::ControllerCoordination::new()),
-            active_reconciles: Arc::new(Mutex::new(ActiveReconciles::default())),
-            active_reconciles_changed: Arc::new(Notify::new()),
+            coordination: Arc::new(klights_controllers::ControllerCoordination::new()),
         }
     }
 
@@ -283,17 +271,13 @@ impl ControllerDispatcher {
     ) -> Self {
         let mut controllers =
             Self::controller_registry(service_ipam, nodeport_alloc, csr_issuer, hpa_controller);
-        let queue = WorkQueue::with_task_supervisor(task_supervisor);
+        let runtime = Arc::new(DispatcherRuntime::new(task_supervisor));
         let coordination = dependencies.coordination.clone();
         Self {
             controllers: std::mem::take(&mut controllers),
-            queue,
-            retry_count: Arc::new(Mutex::new(HashMap::new())),
-            worker_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            runtime,
             dependencies,
             coordination,
-            active_reconciles: Arc::new(Mutex::new(ActiveReconciles::default())),
-            active_reconciles_changed: Arc::new(Notify::new()),
         }
     }
 
@@ -313,17 +297,13 @@ impl ControllerDispatcher {
                 csr_issuer,
                 hpa_controller,
             ),
-            queue: WorkQueue::with_task_supervisor(task_supervisor.clone()),
-            retry_count: Arc::new(Mutex::new(HashMap::new())),
-            worker_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            runtime: Arc::new(DispatcherRuntime::new(task_supervisor.clone())),
             sync_ctx: Arc::new(Mutex::new(None)),
             services: Arc::new(Mutex::new(None)),
             pod_repository: Arc::new(Mutex::new(None)),
             node_metrics: Arc::new(Mutex::new(None)),
             file_process: klights_supervisor::FileProcessExecutor::new(task_supervisor),
             coordination: dependencies.coordination,
-            active_reconciles: Arc::new(Mutex::new(ActiveReconciles::default())),
-            active_reconciles_changed: Arc::new(Notify::new()),
         }
     }
 
@@ -380,10 +360,7 @@ impl ControllerDispatcher {
     /// worker still observe the post-mutation reconcile side effects.
     pub async fn enqueue(&self, resource: &Value) {
         #[cfg(test)]
-        if !self
-            .worker_running
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if !self.runtime.worker_running() {
             // No worker — dispatch synchronously so callers (tests that don't
             // start a worker) still see the reconcile happen.
             let ctx = self.sync_ctx.lock().await;
@@ -395,7 +372,7 @@ impl ControllerDispatcher {
             return;
         }
         if let Some(key) = key_for_value(resource) {
-            self.queue.add(key).await;
+            self.runtime.enqueue(key).await;
         }
     }
 
@@ -403,25 +380,25 @@ impl ControllerDispatcher {
     /// fallback used by HTTP handler tests. Side effects use this path so they
     /// never run controller reconciliation inline with the mutating request.
     pub async fn enqueue_reconcile_key(&self, key: ReconcileKey) {
-        self.queue.add(key).await;
+        self.runtime.enqueue(key).await;
     }
 
     pub async fn enqueue_reconcile_batch(&self, keys: Vec<ReconcileKey>) {
-        self.queue.add_batch(keys).await;
+        self.runtime.enqueue_batch(keys).await;
     }
 
     pub async fn pending_reconcile_keys(&self) -> Vec<ReconcileKey> {
-        self.queue.ready_keys_snapshot().await
+        self.runtime.pending_keys().await
     }
 
     #[cfg(test)]
     pub async fn queued_reconcile_keys_for_test(&self) -> Vec<ReconcileKey> {
-        self.queue.ready_keys().await
+        self.runtime.pending_keys().await
     }
 
     #[cfg(test)]
     pub async fn take_reconcile_key_for_test(&self) -> ReconcileKey {
-        self.queue.take().await
+        self.runtime.take_next().await
     }
 
     #[cfg(test)]
@@ -430,13 +407,13 @@ impl ControllerDispatcher {
         db_handle: &crate::datastore::DatastoreHandle,
         node_name: &str,
     ) -> ReconcileKey {
-        let key = self.queue.take().await;
+        let key = self.runtime.take_next().await;
         assert!(
-            self.begin_key_dispatch(&key).await,
+            self.runtime.begin_key_dispatch(&key).await,
             "test dispatcher cannot drain a key that is already in flight"
         );
         self.dispatch_key(&key, db_handle, node_name).await;
-        self.finish_key_dispatch(key.clone()).await;
+        self.runtime.finish_key_dispatch(key.clone()).await;
         key
     }
 
@@ -462,7 +439,7 @@ impl ControllerDispatcher {
     /// each key, fetches the latest resource from the datastore (the
     /// resource may have changed since the producer enqueued it) and
     /// dispatches to the matching controller. Reconcile failures are
-    /// re-enqueued with exponential backoff up to [`MAX_RETRY_ATTEMPTS`];
+    /// re-enqueued with capped exponential backoff;
     /// persistent failures surface via `tracing::error!` and the key is
     /// dropped (the next mutation/watch event will re-enqueue it).
     #[cfg(test)]
@@ -483,54 +460,17 @@ impl ControllerDispatcher {
         node_name: String,
         cancel: tokio_util::sync::CancellationToken,
     ) {
-        // Mark the worker as running so subsequent `enqueue` calls go through
-        // the queue instead of falling back to synchronous reconcile.
-        self.worker_running
-            .store(true, std::sync::atomic::Ordering::Release);
-        let worker_count = worker_count.max(1);
-        tracing::info!(
-            workers = worker_count,
-            "Controller workqueue worker pool started"
-        );
-        let workers = (0..worker_count).map(|worker_id| {
-            let dispatcher = self.clone();
-            let db_handle = db_handle.clone();
-            let node_name = node_name.clone();
-            let cancel = cancel.clone();
-            async move {
-                dispatcher
-                    .run_worker_loop(worker_id, db_handle, node_name, cancel)
-                    .await;
-            }
-        });
-        futures::future::join_all(workers).await;
-        self.worker_running
-            .store(false, std::sync::atomic::Ordering::Release);
-    }
-
-    #[cfg(test)]
-    async fn run_worker_loop(
-        self: Arc<Self>,
-        worker_id: usize,
-        db_handle: crate::datastore::DatastoreHandle,
-        node_name: String,
-        cancel: tokio_util::sync::CancellationToken,
-    ) {
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    tracing::info!(worker_id, "Controller workqueue worker shutting down");
-                    return;
+        let runtime = self.runtime.clone();
+        runtime
+            .run_worker_pool(worker_count, cancel, move |key| {
+                let dispatcher = self.clone();
+                let db_handle = db_handle.clone();
+                let node_name = node_name.clone();
+                async move {
+                    dispatcher.dispatch_key(&key, &db_handle, &node_name).await;
                 }
-                key = self.queue.take() => {
-                    if !self.begin_key_dispatch(&key).await {
-                        continue;
-                    }
-                    self.dispatch_key(&key, &db_handle, &node_name).await;
-                    self.finish_key_dispatch(key).await;
-                }
-            }
-        }
+            })
+            .await;
     }
 
     #[cfg(not(test))]
@@ -539,76 +479,15 @@ impl ControllerDispatcher {
         worker_count: usize,
         cancel: tokio_util::sync::CancellationToken,
     ) {
-        self.worker_running
-            .store(true, std::sync::atomic::Ordering::Release);
-        let workers = (0..worker_count.max(1)).map(|worker_id| {
-            let dispatcher = self.clone();
-            let cancel = cancel.clone();
-            async move { dispatcher.run_worker_loop(worker_id, cancel).await }
-        });
-        futures::future::join_all(workers).await;
-        self.worker_running
-            .store(false, std::sync::atomic::Ordering::Release);
-    }
-
-    #[cfg(not(test))]
-    async fn run_worker_loop(
-        self: Arc<Self>,
-        worker_id: usize,
-        cancel: tokio_util::sync::CancellationToken,
-    ) {
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    tracing::info!(worker_id, "Controller workqueue worker shutting down");
-                    return;
+        let runtime = self.runtime.clone();
+        runtime
+            .run_worker_pool(worker_count, cancel, move |key| {
+                let dispatcher = self.clone();
+                async move {
+                    dispatcher.dispatch_key(&key).await;
                 }
-                key = self.queue.take() => {
-                    if !self.begin_key_dispatch(&key).await {
-                        continue;
-                    }
-                    self.dispatch_key(&key).await;
-                    self.finish_key_dispatch(key).await;
-                }
-            }
-        }
-    }
-
-    async fn begin_key_dispatch(&self, key: &Key) -> bool {
-        let mut active = self.active_reconciles.lock().await;
-        if active.in_flight.contains(key) {
-            active.pending_followup.insert(key.clone());
-            return false;
-        }
-        active.in_flight.insert(key.clone());
-        true
-    }
-
-    #[cfg(test)]
-    async fn wait_for_key_dispatch_slot(&self, key: &Key) {
-        loop {
-            let notified = self.active_reconciles_changed.notified();
-            {
-                let mut active = self.active_reconciles.lock().await;
-                if !active.in_flight.contains(key) {
-                    active.in_flight.insert(key.clone());
-                    return;
-                }
-            }
-            notified.await;
-        }
-    }
-
-    async fn finish_key_dispatch(&self, key: Key) {
-        let should_requeue = {
-            let mut active = self.active_reconciles.lock().await;
-            active.in_flight.remove(&key);
-            active.pending_followup.remove(&key)
-        };
-        self.active_reconciles_changed.notify_waiters();
-        if should_requeue {
-            self.queue.add(key).await;
-        }
+            })
+            .await;
     }
 
     #[cfg(test)]
@@ -633,7 +512,7 @@ impl ControllerDispatcher {
         {
             Ok(Some(r)) => r,
             Ok(None) => {
-                self.retry_count.lock().await.remove(key);
+                self.runtime.record_success(key).await;
                 return;
             }
             Err(e) => {
@@ -642,7 +521,7 @@ impl ControllerDispatcher {
                     error = %e,
                     "workqueue: failed to fetch resource; will retry"
                 );
-                self.requeue_with_backoff(key.clone()).await;
+                self.runtime.requeue_with_backoff(key.clone()).await;
                 return;
             }
         };
@@ -650,7 +529,7 @@ impl ControllerDispatcher {
         let value = crate::api::inject_resource_version(resource.data, resource.resource_version);
         match self.reconcile_unlocked(&value, db_handle, node_name).await {
             Ok(()) => {
-                self.retry_count.lock().await.remove(key);
+                self.runtime.record_success(key).await;
                 if let Err(e) = self
                     .schedule_finished_job_ttl_requeue_if_needed(key, db_handle)
                     .await
@@ -668,7 +547,7 @@ impl ControllerDispatcher {
                     error = %e,
                     "workqueue: reconcile failed; will retry with backoff"
                 );
-                self.requeue_with_backoff(key.clone()).await;
+                self.runtime.requeue_with_backoff(key.clone()).await;
             }
         }
     }
@@ -683,12 +562,12 @@ impl ControllerDispatcher {
         {
             Ok(Some(resource)) => resource,
             Ok(None) => {
-                self.retry_count.lock().await.remove(key);
+                self.runtime.record_success(key).await;
                 return;
             }
             Err(error) => {
                 tracing::warn!(workqueue_key = %key, %error, "workqueue resource read failed");
-                self.requeue_with_backoff(key.clone()).await;
+                self.runtime.requeue_with_backoff(key.clone()).await;
                 return;
             }
         };
@@ -698,14 +577,14 @@ impl ControllerDispatcher {
         );
         match self.reconcile_unlocked(&value).await {
             Ok(()) => {
-                self.retry_count.lock().await.remove(key);
+                self.runtime.record_success(key).await;
                 if let Err(error) = self.schedule_finished_job_ttl_requeue_if_needed(key).await {
                     tracing::warn!(workqueue_key = %key, %error, "job TTL requeue failed");
                 }
             }
             Err(error) => {
                 tracing::warn!(workqueue_key = %key, %error, "controller reconcile failed");
-                self.requeue_with_backoff(key.clone()).await;
+                self.runtime.requeue_with_backoff(key.clone()).await;
             }
         }
     }
@@ -741,11 +620,7 @@ impl ControllerDispatcher {
             return Ok(());
         };
 
-        if delay.is_zero() {
-            self.queue.add(key.clone()).await;
-        } else {
-            self.queue.add_after(key.clone(), delay).await;
-        }
+        self.runtime.enqueue_after(key.clone(), delay).await;
         Ok(())
     }
 
@@ -776,31 +651,8 @@ impl ControllerDispatcher {
         else {
             return Ok(());
         };
-        if delay.is_zero() {
-            self.queue.add(key.clone()).await;
-        } else {
-            self.queue.add_after(key.clone(), delay).await;
-        }
+        self.runtime.enqueue_after(key.clone(), delay).await;
         Ok(())
-    }
-
-    async fn requeue_with_backoff(&self, key: Key) {
-        let mut counts = self.retry_count.lock().await;
-        let attempt = counts.entry(key.clone()).or_insert(0);
-        if *attempt >= MAX_RETRY_ATTEMPTS {
-            tracing::error!(
-                workqueue_key = %key,
-                attempts = *attempt,
-                "workqueue: dropping key after MAX_RETRY_ATTEMPTS — \
-                 will only retry on next mutation or watch event"
-            );
-            counts.remove(&key);
-            return;
-        }
-        let backoff = backoff_for(*attempt);
-        *attempt += 1;
-        drop(counts);
-        self.queue.add_after(key, backoff).await;
     }
 
     /// Reconcile a resource by dispatching to the appropriate controller.
@@ -827,11 +679,11 @@ impl ControllerDispatcher {
                 .reconcile_unlocked(resource, db_handle, node_name)
                 .await;
         };
-        self.wait_for_key_dispatch_slot(&key).await;
+        self.runtime.wait_for_key_dispatch_slot(&key).await;
         let result = self
             .reconcile_unlocked(resource, db_handle, node_name)
             .await;
-        self.finish_key_dispatch(key).await;
+        self.runtime.finish_key_dispatch(key).await;
         result
     }
 
@@ -1680,12 +1532,7 @@ mod tests {
         .await
         .unwrap();
 
-        let key = crate::controllers::workqueue::key_for_test(
-            "batch/v1",
-            "Job",
-            "default",
-            "ttl-delayed-job",
-        );
+        let key = ReconcileKey::namespaced("batch/v1", "Job", "default", "ttl-delayed-job");
         dispatcher.dispatch_key(&key, &db_handle, "test-node").await;
 
         assert!(
@@ -1772,12 +1619,7 @@ mod tests {
         .await
         .unwrap();
 
-        let key = crate::controllers::workqueue::key_for_test(
-            "batch/v1",
-            "Job",
-            "default",
-            "ttl-deleting-job",
-        );
+        let key = ReconcileKey::namespaced("batch/v1", "Job", "default", "ttl-deleting-job");
         dispatcher.dispatch_key(&key, &db_handle, "test-node").await;
 
         assert!(

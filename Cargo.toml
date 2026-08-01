@@ -70,6 +70,7 @@ klights-network-api = { path = "crates/klights-network-api" }
 klights-networking = { path = "crates/klights-networking" }
 klights-kubelet = { path = "crates/klights-kubelet" }
 klights-auth = { path = "crates/klights-auth" }
+klights-controllers = { path = "crates/klights-controllers" }
 klights-supervisor = { path = "crates/klights-supervisor" }
 klights-internal-protobuf = { path = "crates/klights-internal-protobuf" }
 klights-kube-protobuf = { path = "crates/klights-kube-protobuf" }
@@ -217,6 +218,7 @@ klights-network-api = { workspace = true }
 klights-networking = { workspace = true }
 klights-kubelet = { workspace = true }
 klights-auth = { workspace = true }
+klights-controllers = { workspace = true }
 klights-supervisor = { workspace = true }
 klights-internal-protobuf = { workspace = true }
 klights-kube-protobuf = { workspace = true }

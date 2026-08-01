@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, Weak};
 use klights_reconcile_api::GcForegroundDeleteCoordination;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum CoordinatedControllerKind {
+pub enum CoordinatedControllerKind {
     Job,
     ReplicaSet,
     ReplicationController,
@@ -17,19 +17,19 @@ pub(crate) enum CoordinatedControllerKind {
 /// Keeping these values together makes the execution identity explicit without
 /// teaching controller logic about the composition root that owns them.
 #[derive(Clone, Copy)]
-pub(crate) struct ControllerReconcileContext<'a> {
-    pub(crate) coordination: &'a ControllerCoordination,
-    pub(crate) node_name: &'a str,
-    pub(crate) wall_time: chrono::DateTime<chrono::Utc>,
+pub struct ControllerReconcileContext<'a> {
+    pub coordination: &'a ControllerCoordination,
+    pub node_name: &'a str,
+    pub wall_time: chrono::DateTime<chrono::Utc>,
 }
 
 impl<'a> ControllerReconcileContext<'a> {
     #[cfg(test)]
-    pub(crate) fn new(coordination: &'a ControllerCoordination, node_name: &'a str) -> Self {
+    pub fn new(coordination: &'a ControllerCoordination, node_name: &'a str) -> Self {
         Self::at(coordination, node_name, chrono::Utc::now())
     }
 
-    pub(crate) fn at(
+    pub fn at(
         coordination: &'a ControllerCoordination,
         node_name: &'a str,
         wall_time: chrono::DateTime<chrono::Utc>,
@@ -79,17 +79,17 @@ impl ForegroundPodDeleteKey {
 /// Reconcile locks are held weakly so observing new Kubernetes names does not
 /// retain one lock allocation per name for the life of the process.
 #[derive(Default)]
-pub(crate) struct ControllerCoordination {
+pub struct ControllerCoordination {
     reconcile_locks: Mutex<HashMap<ControllerReconcileKey, Weak<tokio::sync::Mutex<()>>>>,
     foreground_pod_deletes: Mutex<HashSet<ForegroundPodDeleteKey>>,
 }
 
 impl ControllerCoordination {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn reconcile_lock(
+    pub fn reconcile_lock(
         &self,
         kind: CoordinatedControllerKind,
         namespace: &str,

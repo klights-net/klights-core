@@ -429,7 +429,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             .context("worker node subnet peer watch")?
     };
 
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let (pod_lifecycle_tx, pod_lifecycle_rx) =
         tokio::sync::mpsc::channel::<klights_kubelet::lifecycle::LifecycleCommand>(128);
     let pod_lifecycle_rx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(pod_lifecycle_rx)));
@@ -843,7 +843,7 @@ mod tests {
                 resource_query: std::sync::Arc::new(UnavailableWorkerQuery),
                 pod_workqueue_store: node_local.pod_workqueue(),
                 supervisor,
-                metrics: crate::side_effects::SideEffectMetrics::new(),
+                metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
                 pod_network_cache: crate::kubelet::pod_repository::empty_test_pod_network_cache(),
                 assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
                 outbox,

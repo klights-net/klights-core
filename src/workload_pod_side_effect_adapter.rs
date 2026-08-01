@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::datastore::{DatastoreBackend, DatastoreHandle, ResourceListQuery};
 use crate::side_effects::workload_pod::{WorkloadPodStore, workload_reconcile_keys_for_pod};
-use crate::side_effects::{ControllerDispatcherSlot, SideEffect};
+use klights_controllers::side_effects::{ControllerDispatcherSlot, SideEffect};
 
 /// Enqueues the explicit controller owner of a mutated Pod.
 ///

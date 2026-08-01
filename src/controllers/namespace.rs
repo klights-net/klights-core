@@ -490,7 +490,7 @@ pub async fn reconcile_namespace_for_test(
     db: &dyn DatastoreBackend,
     namespace: &str,
 ) -> Result<(), crate::api::AppError> {
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     crate::api::reconcile_namespace_termination(db, namespace, metrics.as_ref()).await
 }
 

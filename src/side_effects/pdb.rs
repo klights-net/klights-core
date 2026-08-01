@@ -48,7 +48,7 @@ mod tests {
         let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let effect = crate::pdb_side_effect_adapter::effect(
             db_handle,
-            crate::side_effects::PodSideEffectPortsSlot::new(),
+            klights_controllers::side_effects::PodSideEffectPortsSlot::new(),
         );
         assert_eq!(effect.name(), "pdb_reconcile");
     }

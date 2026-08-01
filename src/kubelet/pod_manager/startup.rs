@@ -89,8 +89,8 @@ mod tests {
                 db: db_handle.clone(),
                 pod_workqueue_store: None,
                 supervisor: supervisor.clone(),
-                side_effects: Arc::new(crate::side_effects::SideEffectRegistry::new()),
-                metrics: crate::side_effects::SideEffectMetrics::new(),
+                side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
+                metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
                 pod_network_cache: crate::kubelet::pod_repository::empty_test_pod_network_cache(),
                 assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
                 scheduling_mode:

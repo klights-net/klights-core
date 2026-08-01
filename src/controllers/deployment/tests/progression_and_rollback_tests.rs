@@ -153,7 +153,7 @@ async fn test_reconcile_deployment_rolling_update_completes_after_pods_become_re
             __pod_repo.as_ref(),
             crate::controllers::test_utils::non_pod_finalization_port_for_test(),
             &rs_with_rv,
-            crate::controllers::ControllerReconcileContext::new(coordination(), "test-node"),
+            crate::controllers::test_reconcile_context(coordination(), "test-node"),
         )
         .await
         .unwrap();
@@ -223,7 +223,7 @@ async fn test_reconcile_deployment_rolling_update_completes_after_pods_become_re
             __pod_repo.as_ref(),
             crate::controllers::test_utils::non_pod_finalization_port_for_test(),
             &rs_with_rv,
-            crate::controllers::ControllerReconcileContext::new(coordination(), "test-node"),
+            crate::controllers::test_reconcile_context(coordination(), "test-node"),
         )
         .await
         .unwrap();

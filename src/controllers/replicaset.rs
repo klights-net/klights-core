@@ -43,7 +43,7 @@ pub(crate) async fn reconcile_replicaset(
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     replicaset: &Value,
-    reconcile_context: crate::controllers::ControllerReconcileContext<'_>,
+    reconcile_context: klights_controllers::ControllerReconcileContext<'_>,
 ) -> Result<()> {
     let coordination = reconcile_context.coordination;
     let node_name = reconcile_context.node_name;
@@ -60,7 +60,7 @@ pub(crate) async fn reconcile_replicaset(
         .and_then(|n| n.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing namespace"))?;
     let reconcile_lock = coordination.reconcile_lock(
-        crate::controllers::CoordinatedControllerKind::ReplicaSet,
+        klights_controllers::CoordinatedControllerKind::ReplicaSet,
         namespace,
         name,
     );

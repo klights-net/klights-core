@@ -1645,9 +1645,10 @@ impl PodRuntimeHarness {
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let side_effects = std::sync::Arc::new(crate::side_effects::SideEffectRegistry::new());
-        let metrics: std::sync::Arc<crate::side_effects::SideEffectMetrics> =
-            crate::side_effects::SideEffectMetrics::new();
+        let side_effects =
+            std::sync::Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
+        let metrics: std::sync::Arc<klights_controllers::side_effects::SideEffectMetrics> =
+            klights_controllers::side_effects::SideEffectMetrics::new();
         let node_local =
             crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
         let parts = crate::kubelet::pod_repository::PodRepository::build_parts(

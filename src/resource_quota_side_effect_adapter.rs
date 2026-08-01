@@ -8,7 +8,7 @@ use crate::datastore::{DatastoreBackend, DatastoreHandle};
 use crate::side_effects::resource_quota::{
     ResourceQuotaSideEffectPort, apply_resource_quota_event,
 };
-use crate::side_effects::{PodSideEffectPortsSlot, SideEffect};
+use klights_controllers::side_effects::{PodSideEffectPortsSlot, SideEffect};
 use klights_pod_api::PodQuery;
 
 /// Recounts ResourceQuota status.used after any namespaced resource mutation.

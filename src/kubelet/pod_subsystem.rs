@@ -376,8 +376,8 @@ mod tests {
     use crate::datastore::DatastoreHandle;
     use crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
     use crate::pod_repository_composition::PodSchedulingMode;
-    use crate::side_effects::SideEffectMetrics;
-    use crate::side_effects::SideEffectRegistry;
+    use klights_controllers::side_effects::SideEffectMetrics;
+    use klights_controllers::side_effects::SideEffectRegistry;
 
     fn fixture_supervisor() -> Arc<TaskSupervisor> {
         Arc::new(TaskSupervisor::new(

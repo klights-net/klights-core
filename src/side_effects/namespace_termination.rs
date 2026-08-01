@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::side_effects::SideEffectMetrics;
+    use klights_controllers::side_effects::SideEffectMetrics;
     use std::sync::atomic::Ordering;
 
     #[tokio::test]

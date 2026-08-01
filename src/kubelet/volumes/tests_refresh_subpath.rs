@@ -3,8 +3,8 @@ use super::*;
 fn make_pod_reader(
     db: &crate::datastore::sqlite::Datastore,
 ) -> std::sync::Arc<dyn klights_pod_api::PodQuery> {
-    use crate::side_effects::SideEffectMetrics;
-    use crate::side_effects::SideEffectRegistry;
+    use klights_controllers::side_effects::SideEffectMetrics;
+    use klights_controllers::side_effects::SideEffectRegistry;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     let supervisor = std::sync::Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let metrics = SideEffectMetrics::new();

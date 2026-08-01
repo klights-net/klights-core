@@ -144,7 +144,7 @@ impl_namespace_lifecycle_store!(dyn DatastoreBackend + '_);
 #[cfg(test)]
 impl_namespace_lifecycle_store!(crate::datastore::sqlite::Datastore);
 
-impl NamespaceTerminationMetrics for crate::side_effects::SideEffectMetrics {
+impl NamespaceTerminationMetrics for klights_controllers::side_effects::SideEffectMetrics {
     fn record_namespace_delete_failure(&self) {
         self.namespace_delete_failures_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

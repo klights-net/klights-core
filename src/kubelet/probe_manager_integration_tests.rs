@@ -11,8 +11,9 @@ fn fixture_pod_repository(
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let side_effects = std::sync::Arc::new(crate::side_effects::SideEffectRegistry::new());
-    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let side_effects =
+        std::sync::Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(
         db_handle.clone(),
         supervisor,

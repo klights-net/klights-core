@@ -2030,6 +2030,7 @@ dependencies = [
  "klights-cluster-core",
  "klights-cluster-datastore",
  "klights-cluster-store",
+ "klights-controllers",
  "klights-internal-protobuf",
  "klights-kube-protobuf",
  "klights-kubelet",
@@ -2193,6 +2194,20 @@ dependencies = [
 [[package]]
 name = "klights-controllers"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "klights-leader-api",
+ "klights-pod-api",
+ "klights-reconcile-api",
+ "klights-supervisor",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
 
 [[package]]
 name = "klights-internal-protobuf"

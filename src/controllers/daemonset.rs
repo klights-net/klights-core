@@ -586,7 +586,7 @@ pub(crate) async fn reconcile_daemonset(
     pod_writer: &(impl DaemonSetPodMutation + ?Sized),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
-    coordination: &crate::controllers::ControllerCoordination,
+    coordination: &klights_controllers::ControllerCoordination,
     daemonset: &Value,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {

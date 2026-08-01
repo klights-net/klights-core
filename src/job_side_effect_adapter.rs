@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::datastore::{DatastoreBackend, DatastoreHandle, ResourceListQuery};
 use crate::side_effects::job::{JobSideEffectStore, job_reconcile_keys_for_pod};
-use crate::side_effects::{ControllerDispatcherSlot, SideEffect};
+use klights_controllers::side_effects::{ControllerDispatcherSlot, SideEffect};
 
 /// Reconciles namespace Jobs after Pod create/update/delete events.
 ///

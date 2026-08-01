@@ -1,10 +1,10 @@
 //! Service-namespace helpers for reconciling Services after endpoint-affecting
 //! Pod mutations.
 
-use super::ControllerDispatcherSlot;
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
+use klights_controllers::side_effects::ControllerDispatcherSlot;
 use klights_reconcile_api::ServiceReconcileKey;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -527,7 +527,7 @@ mod tests {
     async fn service_sink_gates_irrelevant_updates_and_stale_targetref_self_extinguishes() {
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let sink = Arc::new(RecordingServiceSink::default());
-        let slot = ControllerDispatcherSlot::with_service_reconcile_sink_for_test(sink.clone());
+        let slot = ControllerDispatcherSlot::with_service_reconcile_sink(sink.clone());
 
         let service = db
             .create_resource(

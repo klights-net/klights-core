@@ -6,8 +6,8 @@ use serde_json::Value;
 
 use crate::controllers::endpoints;
 use crate::datastore::{DatastoreBackend, DatastoreHandle};
-use crate::side_effects::SideEffect;
 use crate::side_effects::endpoint_mirror::EndpointMirrorStore;
+use klights_controllers::side_effects::SideEffect;
 
 /// Mirrors manually-created/updated Endpoints to EndpointSlices.
 struct EndpointMirrorEffect {

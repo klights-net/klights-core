@@ -190,13 +190,13 @@ impl klights_reconcile_api::NamespaceLifecycleStore for RootNamespaceTermination
 
 pub(crate) struct RootNamespaceTerminationReconciler {
     store: Arc<dyn klights_reconcile_api::NamespaceLifecycleStore>,
-    metrics: Arc<crate::side_effects::SideEffectMetrics>,
+    metrics: Arc<klights_controllers::side_effects::SideEffectMetrics>,
 }
 
 impl RootNamespaceTerminationReconciler {
     pub(crate) fn new(
         store: Arc<dyn klights_reconcile_api::NamespaceLifecycleStore>,
-        metrics: Arc<crate::side_effects::SideEffectMetrics>,
+        metrics: Arc<klights_controllers::side_effects::SideEffectMetrics>,
     ) -> Arc<Self> {
         Arc::new(Self { store, metrics })
     }
@@ -471,12 +471,14 @@ impl ApiPodRepository for RootApiPodRepository {
 }
 
 pub(crate) struct RootApiFailureMetrics {
-    inner: Arc<crate::side_effects::SideEffectMetrics>,
+    inner: Arc<klights_controllers::side_effects::SideEffectMetrics>,
 }
 
 impl RootApiFailureMetrics {
     #[cfg(not(test))]
-    pub(crate) fn new(inner: Arc<crate::side_effects::SideEffectMetrics>) -> Arc<Self> {
+    pub(crate) fn new(
+        inner: Arc<klights_controllers::side_effects::SideEffectMetrics>,
+    ) -> Arc<Self> {
         Arc::new(Self { inner })
     }
 }

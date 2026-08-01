@@ -1,4 +1,4 @@
-//! Error policy for side-effect hooks.
+//! Error policy for controller side-effect hooks.
 
 /// Error policy determining how side-effect failures are handled.
 ///

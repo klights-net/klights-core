@@ -121,7 +121,7 @@ fn toleration_matches_taint(toleration: &Value, taint: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::side_effects::PodSideEffectPortsSlot;
+    use klights_controllers::side_effects::PodSideEffectPortsSlot;
     use klights_supervisor::TaskSupervisor;
     use serde_json::json;
     use std::sync::Arc;
@@ -349,8 +349,8 @@ mod tests {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let metrics = crate::side_effects::SideEffectMetrics::new();
-        let side_effects = Arc::new(crate::side_effects::SideEffectRegistry::new());
+        let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
+        let side_effects = Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
         let repository = Arc::new(crate::kubelet::pod_repository::PodRepository::new(
             db_handle.clone(),
             supervisor.clone(),

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use klights_network_api::ServiceRouter;
 use serde_json::Value;
 
-use crate::side_effects::SideEffect;
+use klights_controllers::side_effects::SideEffect;
 
 /// Syncs nft service rules after EndpointSlice create/update.
 ///

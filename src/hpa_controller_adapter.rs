@@ -95,7 +95,7 @@ impl HpaController {
         _db: crate::datastore::DatastoreHandle,
         _pod_repository: std::sync::Arc<PodRepository>,
         _non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
-        _coordination: std::sync::Arc<crate::controllers::ControllerCoordination>,
+        _coordination: std::sync::Arc<klights_controllers::ControllerCoordination>,
         _node_name: std::sync::Arc<str>,
         _node_metrics: std::sync::Arc<dyn NodeMetrics>,
     ) -> Self {
@@ -108,7 +108,7 @@ pub struct HpaController {
     db: crate::datastore::DatastoreHandle,
     pod_repository: std::sync::Arc<PodRepository>,
     non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
-    coordination: std::sync::Arc<crate::controllers::ControllerCoordination>,
+    coordination: std::sync::Arc<klights_controllers::ControllerCoordination>,
     node_name: std::sync::Arc<str>,
     node_metrics: std::sync::Arc<dyn NodeMetrics>,
 }
@@ -119,7 +119,7 @@ impl HpaController {
         db: crate::datastore::DatastoreHandle,
         pod_repository: std::sync::Arc<PodRepository>,
         non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
-        coordination: std::sync::Arc<crate::controllers::ControllerCoordination>,
+        coordination: std::sync::Arc<klights_controllers::ControllerCoordination>,
         node_name: std::sync::Arc<str>,
         node_metrics: std::sync::Arc<dyn NodeMetrics>,
     ) -> Self {
@@ -205,7 +205,7 @@ struct HpaControllerAdapter<'a> {
     db: &'a dyn DatastoreBackend,
     pod_repository: &'a PodRepository,
     non_pod_finalization: &'a dyn klights_reconcile_api::GcNonPodFinalizationPort,
-    coordination: &'a crate::controllers::ControllerCoordination,
+    coordination: &'a klights_controllers::ControllerCoordination,
 }
 
 #[async_trait]
@@ -294,7 +294,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                 pods,
                 self.non_pod_finalization,
                 resource,
-                crate::controllers::ControllerReconcileContext::at(
+                klights_controllers::ControllerReconcileContext::at(
                     self.coordination,
                     node_name,
                     now,
@@ -309,7 +309,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                 pods,
                 self.non_pod_finalization,
                 resource,
-                crate::controllers::ControllerReconcileContext::at(
+                klights_controllers::ControllerReconcileContext::at(
                     self.coordination,
                     node_name,
                     now,
@@ -324,7 +324,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                 pods,
                 self.non_pod_finalization,
                 resource,
-                crate::controllers::ControllerReconcileContext::at(
+                klights_controllers::ControllerReconcileContext::at(
                     self.coordination,
                     node_name,
                     now,
@@ -340,7 +340,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                     pods,
                     self.non_pod_finalization,
                     resource,
-                    crate::controllers::ControllerReconcileContext::at(
+                    klights_controllers::ControllerReconcileContext::at(
                         self.coordination,
                         node_name,
                         now,
@@ -384,7 +384,7 @@ pub async fn reconcile_hpa(
         db,
         pod_repository,
         non_pod_finalization,
-        &crate::controllers::ControllerCoordination::new(),
+        &klights_controllers::ControllerCoordination::new(),
         hpa,
         node_name,
         &crate::node_metrics_adapter::UnavailableNodeMetrics,
@@ -398,7 +398,7 @@ pub async fn reconcile_hpa_with_metrics(
     db: &dyn DatastoreBackend,
     pod_repository: &PodRepository,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
-    coordination: &crate::controllers::ControllerCoordination,
+    coordination: &klights_controllers::ControllerCoordination,
     hpa: &Value,
     node_name: &str,
     node_metrics: &dyn NodeMetrics,
