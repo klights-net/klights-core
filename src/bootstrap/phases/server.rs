@@ -8,7 +8,6 @@ use tokio_util::sync::CancellationToken;
 use crate::KlightsConfig;
 use crate::bootstrap::init::host::print_ready_message;
 use crate::bootstrap::init::predicates::runs_api_server;
-use crate::bootstrap::init::tls::serve_https;
 use klights_supervisor::{SupervisedJoinHandle, TaskSupervisor};
 
 pub struct ServeArgs<'a> {
@@ -79,12 +78,12 @@ pub async fn serve(args: ServeArgs<'_>) -> Result<()> {
     } else {
         let addr = api_bind_addr(config, cli);
         print_ready_message(config);
-        serve_https(
+        klights_apiserver::serve_https(
             app,
             &addr,
             &config.data_root,
             supervisor.clone(),
-            grpc_transport_policy,
+            grpc_transport_policy.tls_handshake_timeout,
             shutdown_signal,
         )
         .await

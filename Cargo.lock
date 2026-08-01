@@ -2026,6 +2026,7 @@ dependencies = [
  "jsonwebtoken",
  "k8s-cri",
  "k8s-openapi",
+ "klights-apiserver",
  "klights-auth",
  "klights-cluster-core",
  "klights-cluster-datastore",
@@ -2107,6 +2108,30 @@ dependencies = [
 [[package]]
 name = "klights-apiserver"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "futures",
+ "hyper 1.9.0",
+ "hyper-util",
+ "klights-auth",
+ "klights-leader-api",
+ "klights-supervisor",
+ "klights-types",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "rustls-pemfile 2.2.0",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tonic",
+ "tower",
+ "tracing",
+]
 
 [[package]]
 name = "klights-auth"

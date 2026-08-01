@@ -107,12 +107,14 @@ impl NativeApiOuterLayers {
 pub(in crate::api) fn build_router_parts(state: ApiState) -> (Router, NativeApiOuterLayers) {
     let state = Arc::new(state);
     let slow_log_threshold = state.operational().config.runtime.slow_log_threshold;
+    let operational_endpoints = klights_apiserver::OperationalEndpointHandlers::new(
+        get(health_check),
+        get(metrics_handler),
+        get(version),
+        get(klights_status_handler),
+        crate::api::task_supervisor::routes(),
+    );
     let router = Router::new()
-        .route("/healthz", get(health_check))
-        .route("/livez", get(health_check))
-        .route("/readyz", get(health_check))
-        .route("/metrics", get(metrics_handler))
-        .route("/version", get(version))
         .route(
             "/.well-known/openid-configuration",
             get(openid_configuration),
@@ -431,12 +433,8 @@ pub(in crate::api) fn build_router_parts(state: ApiState) -> (Router, NativeApiO
         .route(
             "/debug/klights/pod-lifecycle",
             get(pod_lifecycle_debug_dump),
-        )
-        .nest(
-            "/klights/v1/task-supervisor",
-            crate::api::task_supervisor::routes(),
-        )
-        .route("/klights/v1/status", get(klights_status_handler))
+        );
+    let router = klights_apiserver::mount_operational_endpoints(router, operational_endpoints)
         // Unmatched paths and unsupported methods must return a metav1.Status
         // body (not axum's empty-body default). Set BEFORE the auth/authz
         // layers so the fallbacks are still covered by authentication and

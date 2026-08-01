@@ -65,7 +65,7 @@ async fn load_client_cert_verifier(
 ///
 /// Extracted from `serve_https` to allow focused unit testing of the
 /// connection worker lifecycle (timeouts, category limits, shutdown).
-pub(crate) async fn serve_https_connection(
+async fn serve_https_connection(
     acceptor: tokio_rustls::TlsAcceptor,
     app: axum::Router,
     supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
@@ -115,11 +115,7 @@ pub(crate) async fn serve_https_connection(
             req.extensions_mut()
                 .insert(klights_types::TlsClientCertificate(cert));
         }
-        klights_leader_rpc::server::insert_tonic_tcp_connect_info(
-            &mut req,
-            local_addr,
-            Some(remote_addr),
-        );
+        insert_tonic_tcp_connect_info(&mut req, local_addr, Some(remote_addr));
         app.clone().oneshot(req)
     });
 
@@ -136,7 +132,7 @@ pub async fn serve_https<F>(
     addr: &str,
     data_root: &std::path::Path,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
-    transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
+    handshake_timeout: std::time::Duration,
     shutdown_signal: F,
 ) -> anyhow::Result<()>
 where
@@ -205,7 +201,7 @@ where
                         "https_connection_worker",
                         serve_https_connection(
                             acceptor, app, sup, remote_addr, stream,
-                            transport_policy.tls_handshake_timeout,
+                            handshake_timeout,
                         ),
                     )
                     .await
@@ -221,6 +217,21 @@ where
     }
 
     Ok(())
+}
+
+/// Add the standard tonic TCP connection metadata to a request accepted by
+/// the shared HTTPS listener.
+pub fn insert_tonic_tcp_connect_info<B>(
+    request: &mut hyper::http::Request<B>,
+    local_addr: Option<std::net::SocketAddr>,
+    remote_addr: Option<std::net::SocketAddr>,
+) {
+    request
+        .extensions_mut()
+        .insert(tonic::transport::server::TcpConnectInfo {
+            local_addr,
+            remote_addr,
+        });
 }
 
 #[cfg(test)]

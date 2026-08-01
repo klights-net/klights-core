@@ -727,12 +727,13 @@ mod tests {
         let server_supervisor = leader_supervisor.clone();
         let server_data_root = leader_data_root.clone();
         let handle = tokio::spawn(async move {
-            crate::bootstrap::init::tls::serve_https(
+            klights_apiserver::serve_https(
                 app,
                 &addr.to_string(),
                 &server_data_root,
                 server_supervisor,
-                klights_leader_rpc::transport_policy::GrpcTransportPolicy::shared_default(),
+                klights_leader_rpc::transport_policy::GrpcTransportPolicy::default()
+                    .tls_handshake_timeout,
                 server_shutdown.cancelled_owned(),
             )
             .await

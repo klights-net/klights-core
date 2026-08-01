@@ -1524,11 +1524,8 @@ async fn follower_authority_router_does_not_fallback_local_for_pod_logs_without_
     let remote_node = format!("{}-worker", state.operational().config.node_name);
     let (_, is_leader_rx) = tokio::sync::watch::channel(false);
     let (_, leader_addr_rx) = tokio::sync::watch::channel(None::<String>);
-    let authority_router = std::sync::Arc::new(crate::api_server_shell::HttpAuthorityRouter::new(
-        is_leader_rx,
-        leader_addr_rx,
-        None,
-    ));
+    let authority_router =
+        crate::api::test_support::test_http_authority_router(is_leader_rx, leader_addr_rx, None);
     state
         .resource_mutation()
         .db
@@ -1554,7 +1551,7 @@ async fn follower_authority_router_does_not_fallback_local_for_pod_logs_without_
         )
         .await
         .unwrap();
-    let app = crate::api_server_shell::build_router_with_authority(state, authority_router);
+    let app = crate::api::test_support::build_router_with_authority(state, authority_router);
 
     let response = app
         .oneshot(

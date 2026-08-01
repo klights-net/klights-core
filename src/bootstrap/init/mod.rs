@@ -10,4 +10,3 @@ pub mod host;
 pub mod leader_control_stream;
 pub mod predicates;
 pub mod recovery;
-pub mod tls;

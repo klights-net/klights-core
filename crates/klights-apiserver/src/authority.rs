@@ -15,9 +15,11 @@ use axum::response::{IntoResponse, Response};
 use std::sync::Arc;
 use std::{fs as blocking_fs, path::Path};
 
+const FORWARDED_CLIENT_CERT_HEADER: &str = "x-remote-client-certificate";
+
 /// HTTP transport state paired with a backend-neutral authority capability.
 #[derive(Clone)]
-pub(crate) struct HttpAuthorityRouter {
+pub struct HttpAuthorityRouter {
     authority: Arc<dyn klights_leader_api::LeaderAuthority>,
     /// Cluster/front-proxy CA certificate PEM for verifying leader serving
     /// certificates. When set, the proxy verifies the leader's TLS certificate
@@ -30,7 +32,7 @@ pub(crate) struct HttpAuthorityRouter {
 }
 
 impl HttpAuthorityRouter {
-    pub(crate) fn from_authority(
+    pub fn from_authority(
         authority: Arc<dyn klights_leader_api::LeaderAuthority>,
         ca_cert_pem: Option<String>,
     ) -> Self {
@@ -95,11 +97,6 @@ impl HttpAuthorityRouter {
             return false;
         };
         self.authority.validate(&permit).is_ok()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn authority_capability(&self) -> Arc<dyn klights_leader_api::LeaderAuthority> {
-        self.authority.clone()
     }
 
     #[cfg(test)]
@@ -232,7 +229,7 @@ impl klights_leader_api::LeaderAuthority for TestWatchAuthority {
     }
 }
 
-pub(crate) async fn load_proxy_client_identity(
+pub async fn load_proxy_client_identity(
     cert_path: &Path,
     key_path: &Path,
     task_supervisor: &klights_supervisor::TaskSupervisor,
@@ -324,7 +321,7 @@ async fn leader_proxy_middleware(
 /// layers and its outer authentication/response layers. That preserves the
 /// existing authentication-before-forwarding behavior without making native
 /// state own an Axum/Reqwest authority adapter.
-pub(crate) fn wrap_authority_router(
+pub fn wrap_authority_router(
     router: axum::Router,
     authority_router: Option<Arc<HttpAuthorityRouter>>,
 ) -> axum::Router {
@@ -335,16 +332,6 @@ pub(crate) fn wrap_authority_router(
         )),
         None => router,
     }
-}
-
-#[cfg(test)]
-pub(crate) fn build_router_with_authority(
-    mut state: crate::api::ApiState,
-    authority_router: Arc<HttpAuthorityRouter>,
-) -> axum::Router {
-    state.operational_mut().authority = Some(authority_router.authority_capability());
-    let (router, outer_layers) = crate::api::build_router_parts(state);
-    outer_layers.finish(wrap_authority_router(router, Some(authority_router)))
 }
 
 /// Follower request handler: proxy to leader when available. If no current
@@ -419,7 +406,7 @@ async fn proxy_raw(
         let lname = name.as_str().to_ascii_lowercase();
         if lname == "x-remote-user"
             || lname == "x-remote-uid"
-            || lname == crate::api::auth_middleware::FORWARDED_CLIENT_CERT_HEADER
+            || lname == FORWARDED_CLIENT_CERT_HEADER
             || lname.starts_with("x-remote-group")
             || lname.starts_with("x-remote-extra-")
         {
@@ -512,14 +499,24 @@ fn stamp_forwarded_client_cert(
 ) -> reqwest::RequestBuilder {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&cert.0);
-    req_builder.header(
-        crate::api::auth_middleware::FORWARDED_CLIENT_CERT_HEADER,
-        encoded,
-    )
+    req_builder.header(FORWARDED_CLIENT_CERT_HEADER, encoded)
 }
 
 fn service_unavailable(msg: &str) -> Response {
-    let mut resp = crate::api::AppError::ServiceUnavailable(msg.to_string()).into_response();
+    let body = serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "metadata": {},
+        "status": "Failure",
+        "message": msg,
+        "reason": "ServiceUnavailable",
+        "code": 503u16,
+    });
+    let mut resp = (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(body),
+    )
+        .into_response();
     resp.headers_mut()
         .insert("connection", HeaderValue::from_static("close"));
     resp.headers_mut()
@@ -542,7 +539,7 @@ mod tests {
         let req = builder.build().expect("request builds");
         let header = req
             .headers()
-            .get(crate::api::auth_middleware::FORWARDED_CLIENT_CERT_HEADER)
+            .get(FORWARDED_CLIENT_CERT_HEADER)
             .expect("forwarded client cert header present")
             .to_str()
             .unwrap();
@@ -822,5 +819,111 @@ mod tests {
 
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         server.abort();
+    }
+
+    fn generate_ca_signed_cert(sans: Vec<String>) -> (String, String, String) {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(vec!["ca".to_string()]).unwrap();
+        ca_params.distinguished_name = rcgen::DistinguishedName::new();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "test-ca");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let mut server_params = rcgen::CertificateParams::new(sans).unwrap();
+        server_params.distinguished_name = rcgen::DistinguishedName::new();
+        server_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "test-server");
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        (ca_cert.pem(), server_cert.pem(), server_key.serialize_pem())
+    }
+
+    async fn start_tls_server(cert_pem: String, key_pem: String, response: String) -> u16 {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certs: Vec<rustls::pki_types::CertificateDer> =
+            rustls_pemfile::certs(&mut cert_pem.as_bytes())
+                .collect::<Result<_, _>>()
+                .unwrap();
+        let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+            .unwrap()
+            .unwrap();
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap(),
+        );
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await
+                && let Ok(mut tls) = acceptor.accept(stream).await
+            {
+                use tokio::io::AsyncWriteExt;
+                let _ = tls.write_all(response.as_bytes()).await;
+            }
+        });
+
+        port
+    }
+
+    #[tokio::test]
+    async fn proxy_http_client_rejects_untrusted_server_ca() {
+        let (trusted_ca_pem, _, _) = generate_ca_signed_cert(vec!["127.0.0.1".to_string()]);
+        let (_, server_pem, server_key) = generate_ca_signed_cert(vec!["127.0.0.1".to_string()]);
+        let port = start_tls_server(
+            server_pem,
+            server_key,
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_string(),
+        )
+        .await;
+        let (_, is_leader_rx) = tokio::sync::watch::channel(false);
+        let (_, leader_addr_rx) =
+            tokio::sync::watch::channel(Some(format!("https://127.0.0.1:{port}")));
+        let proxy = HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, Some(trusted_ca_pem));
+
+        let result = proxy
+            .http_client()
+            .get(format!("https://127.0.0.1:{port}/test"))
+            .send()
+            .await;
+
+        assert!(result.is_err(), "an untrusted server CA must be rejected");
+    }
+
+    #[tokio::test]
+    async fn proxy_http_client_rejects_server_san_mismatch() {
+        let (ca_pem, server_pem, server_key) =
+            generate_ca_signed_cert(vec!["127.0.0.2".to_string()]);
+        let port = start_tls_server(
+            server_pem,
+            server_key,
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
+        )
+        .await;
+        let (_, is_leader_rx) = tokio::sync::watch::channel(false);
+        let (_, leader_addr_rx) =
+            tokio::sync::watch::channel(Some(format!("https://127.0.0.1:{port}")));
+        let proxy = HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, Some(ca_pem));
+
+        let result = proxy
+            .http_client()
+            .get(format!("https://127.0.0.1:{port}/test"))
+            .send()
+            .await;
+
+        assert!(result.is_err(), "a mismatched server SAN must be rejected");
     }
 }

@@ -170,12 +170,12 @@ mod cases {
             let server_namespace = namespace.clone();
             let server_data_root = crate::paths::data_root_path(&server_namespace);
             let handle = tokio::spawn(async move {
-                crate::bootstrap::init::tls::serve_https(
+                klights_apiserver::serve_https(
                     app,
                     &addr.to_string(),
                     &server_data_root,
                     server_supervisor,
-                    default_transport_policy(),
+                    default_transport_policy().tls_handshake_timeout,
                     server_shutdown.cancelled_owned(),
                 )
                 .await

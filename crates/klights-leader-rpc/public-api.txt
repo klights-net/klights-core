@@ -1,4 +1,4 @@
 # Exact compiler-derived normal public API for klights-leader-rpc.
 # Update only after reviewing the complete rustdoc symbol delta.
-count=213
-sha256=7ab5849e9011ef5b328f7a9a59854754f81994ee914acc67321b98ef84b36beb
+count=212
+sha256=539ee76ea2673cc06a1a950c95e181ffbe60018e92548199b8e261abdc21d98a

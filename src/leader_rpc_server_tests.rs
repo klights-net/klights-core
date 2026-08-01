@@ -244,7 +244,7 @@ async fn grpc_test_server_full_with_node_cert_and_current_rv(
                                 &["system:nodes"],
                             )));
                     }
-                    klights_leader_rpc::server::insert_tonic_tcp_connect_info(
+                    klights_apiserver::insert_tonic_tcp_connect_info(
                         &mut req,
                         local_addr,
                         Some(remote_addr),
@@ -310,7 +310,7 @@ async fn grpc_test_server_with_policy(
                                 &["system:nodes"],
                             )));
                     }
-                    klights_leader_rpc::server::insert_tonic_tcp_connect_info(
+                    klights_apiserver::insert_tonic_tcp_connect_info(
                         &mut req,
                         local_addr,
                         Some(remote_addr),

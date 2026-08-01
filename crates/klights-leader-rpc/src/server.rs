@@ -7,7 +7,7 @@ use klights_node_api::{
     NodeLogTerminalError, NodeMetricsContainerSample, NodeMetricsError, NodeMetricsNodeSample,
     NodeMetricsPodSample, NodeMetricsResult,
 };
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::{Request, Response, Status, metadata::MetadataMap};
@@ -348,19 +348,6 @@ fn raft_addr_with_observed_host(addr: &str, endpoint_override: Option<IpAddr>) -
         path_and_query = "";
     }
     Ok(format!("{scheme}://{authority}{path_and_query}"))
-}
-
-pub fn insert_tonic_tcp_connect_info<B>(
-    request: &mut hyper::http::Request<B>,
-    local_addr: Option<SocketAddr>,
-    remote_addr: Option<SocketAddr>,
-) {
-    request
-        .extensions_mut()
-        .insert(tonic::transport::server::TcpConnectInfo {
-            local_addr,
-            remote_addr,
-        });
 }
 
 /// P0 (memory-improvement.md §10) made the snapshot serve path cache its

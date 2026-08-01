@@ -388,3 +388,91 @@ pub async fn build_test_router_with_authorizer(
 ) -> axum::Router {
     crate::api::build_router(build_test_app_state_with_authorizer(authorizer).await)
 }
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestHttpAuthorityRouter {
+    router: std::sync::Arc<klights_apiserver::HttpAuthorityRouter>,
+    authority: std::sync::Arc<TestRoutingAuthority>,
+}
+
+#[cfg(test)]
+struct TestRoutingAuthority {
+    is_leader: std::sync::Mutex<tokio::sync::watch::Receiver<bool>>,
+    leader_addr: std::sync::Mutex<tokio::sync::watch::Receiver<Option<String>>>,
+    issuer: klights_leader_api::AuthorityPermitIssuer,
+}
+
+#[cfg(test)]
+impl klights_leader_api::LeaderAuthority for TestRoutingAuthority {
+    fn route(&self) -> klights_leader_api::AuthorityRoute {
+        if *self.is_leader.lock().unwrap().borrow() {
+            klights_leader_api::AuthorityRoute::Local(self.issuer.issue(1))
+        } else if let Some(endpoint) = self.leader_addr.lock().unwrap().borrow().clone() {
+            klights_leader_api::AuthorityRoute::Forward { endpoint }
+        } else {
+            klights_leader_api::AuthorityRoute::Unavailable
+        }
+    }
+
+    fn validate(
+        &self,
+        permit: &klights_leader_api::AuthorityPermit,
+    ) -> Result<(), klights_leader_api::AuthorityError> {
+        if *self.is_leader.lock().unwrap().borrow() {
+            self.issuer.validate(permit, 1)
+        } else {
+            Err(klights_leader_api::AuthorityError::NotAuthoritative)
+        }
+    }
+
+    fn acquire(&self) -> klights_leader_api::AuthorityAcquireFuture<'_> {
+        Box::pin(async move {
+            match self.route() {
+                klights_leader_api::AuthorityRoute::Local(permit) => Ok(permit),
+                _ => Err(klights_leader_api::AuthorityError::NotAuthoritative),
+            }
+        })
+    }
+
+    fn wait_for_revocation<'a>(
+        &'a self,
+        permit: &'a klights_leader_api::AuthorityPermit,
+    ) -> klights_leader_api::AuthorityRevocationFuture<'a> {
+        Box::pin(async move {
+            let mut receiver = self.is_leader.lock().unwrap().clone();
+            while self.validate(permit).is_ok() && receiver.changed().await.is_ok() {}
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_http_authority_router(
+    is_leader: tokio::sync::watch::Receiver<bool>,
+    leader_addr: tokio::sync::watch::Receiver<Option<String>>,
+    ca_cert_pem: Option<String>,
+) -> TestHttpAuthorityRouter {
+    let authority = std::sync::Arc::new(TestRoutingAuthority {
+        is_leader: std::sync::Mutex::new(is_leader),
+        leader_addr: std::sync::Mutex::new(leader_addr),
+        issuer: klights_leader_api::AuthorityPermitIssuer::new(),
+    });
+    let router = std::sync::Arc::new(klights_apiserver::HttpAuthorityRouter::from_authority(
+        authority.clone(),
+        ca_cert_pem,
+    ));
+    TestHttpAuthorityRouter { router, authority }
+}
+
+#[cfg(test)]
+pub(crate) fn build_router_with_authority(
+    mut state: crate::api::ApiState,
+    authority_router: TestHttpAuthorityRouter,
+) -> axum::Router {
+    state.operational_mut().authority = Some(authority_router.authority);
+    let (router, outer_layers) = crate::api::build_router_parts(state);
+    outer_layers.finish(klights_apiserver::wrap_authority_router(
+        router,
+        Some(authority_router.router),
+    ))
+}

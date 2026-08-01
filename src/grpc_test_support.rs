@@ -121,7 +121,7 @@ pub(crate) async fn serve_tls_test_app(app: axum::Router) -> (String, tokio::tas
                 };
                 let io = TokioIo::new(stream);
                 let service = hyper::service::service_fn(move |mut request| {
-                    klights_leader_rpc::server::insert_tonic_tcp_connect_info(
+                    klights_apiserver::insert_tonic_tcp_connect_info(
                         &mut request,
                         local_addr,
                         Some(remote_addr),

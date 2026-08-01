@@ -458,10 +458,10 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::super::init::predicates::validate_rootless_multinode_support;
-    use super::super::init::tls::load_tls_pem_files;
     use super::should_use_worker_store_adapter_for_kubelet;
     use crate::bootstrap::{NodeMode, NodeRole};
     use crate::datastore::node_local::LegacyDeliveryTestStore as _;
+    use klights_apiserver::load_tls_pem_files;
     use std::sync::Arc;
 
     #[tokio::test]

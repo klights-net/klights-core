@@ -2,7 +2,6 @@ pub mod admission;
 mod allocator;
 pub mod api;
 mod api_helpers_adapter;
-mod api_server_shell;
 #[cfg(not(test))]
 mod api_state_adapter;
 #[cfg(test)]

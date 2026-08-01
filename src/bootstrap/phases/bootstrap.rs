@@ -860,14 +860,14 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .and_then(|r| r.ok());
     let authority_router = if raft_node.is_some() {
         let ca_cert_pem = cluster_ca_pem.clone();
-        let proxy_client_identity = crate::api_server_shell::load_proxy_client_identity(
+        let proxy_client_identity = klights_apiserver::load_proxy_client_identity(
             &api_runtime_paths.api_proxy_cert,
             &api_runtime_paths.api_proxy_key,
             supervisor.as_ref(),
         )
         .await;
         Some(std::sync::Arc::new(
-            crate::api_server_shell::HttpAuthorityRouter::from_authority(
+            klights_apiserver::HttpAuthorityRouter::from_authority(
                 leader_authority.clone(),
                 ca_cert_pem,
             )
@@ -1798,7 +1798,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .with_local_node_exec(local_node_exec);
     #[cfg(test)]
     let (api_router, api_outer_layers) = api::build_router_parts(state_with_cri);
-    let api_router = api_outer_layers.finish(crate::api_server_shell::wrap_authority_router(
+    let api_router = api_outer_layers.finish(klights_apiserver::wrap_authority_router(
         api_router,
         authority_router,
     ));

@@ -5622,12 +5622,9 @@ async fn test_raft_follower_proxy_forwards_authenticated_client_cert_identity_he
     let state = crate::api::test_support::build_test_app_state().await;
     let (_, is_leader_rx) = tokio::sync::watch::channel(false);
     let (_, leader_addr_rx) = tokio::sync::watch::channel(Some(format!("http://{addr}")));
-    let authority_router = std::sync::Arc::new(crate::api_server_shell::HttpAuthorityRouter::new(
-        is_leader_rx,
-        leader_addr_rx,
-        None,
-    ));
-    let app = crate::api_server_shell::build_router_with_authority(state, authority_router);
+    let authority_router =
+        crate::api::test_support::test_http_authority_router(is_leader_rx, leader_addr_rx, None);
+    let app = crate::api::test_support::build_router_with_authority(state, authority_router);
 
     let (ca_cert, ca_key, _, _) =
         klights_auth::test_support::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
@@ -5793,13 +5790,10 @@ async fn raft_follower_health_endpoints_bypass_leader_proxy() {
     let (_, leader_addr_rx) = tokio::sync::watch::channel(None::<String>);
 
     let follower_state = crate::api::test_support::build_test_app_state().await;
-    let authority_router = std::sync::Arc::new(crate::api_server_shell::HttpAuthorityRouter::new(
-        is_leader_rx,
-        leader_addr_rx,
-        None,
-    ));
+    let authority_router =
+        crate::api::test_support::test_http_authority_router(is_leader_rx, leader_addr_rx, None);
     let app =
-        crate::api_server_shell::build_router_with_authority(follower_state, authority_router);
+        crate::api::test_support::build_router_with_authority(follower_state, authority_router);
 
     for path in ["/healthz", "/livez", "/readyz"] {
         let response = app
@@ -5824,22 +5818,18 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    fn raft_proxy(is_leader: bool) -> std::sync::Arc<crate::api_server_shell::HttpAuthorityRouter> {
+    fn raft_proxy(is_leader: bool) -> crate::api::test_support::TestHttpAuthorityRouter {
         let (_, is_leader_rx) = tokio::sync::watch::channel(is_leader);
         let (_, leader_addr_rx) = tokio::sync::watch::channel(None::<String>);
-        std::sync::Arc::new(crate::api_server_shell::HttpAuthorityRouter::new(
-            is_leader_rx,
-            leader_addr_rx,
-            None,
-        ))
+        crate::api::test_support::test_http_authority_router(is_leader_rx, leader_addr_rx, None)
     }
 
     async fn get_response(
         state: crate::api::ApiState,
-        authority_router: std::sync::Arc<crate::api_server_shell::HttpAuthorityRouter>,
+        authority_router: crate::api::test_support::TestHttpAuthorityRouter,
         path: &str,
     ) -> axum::response::Response {
-        let app = crate::api_server_shell::build_router_with_authority(state, authority_router);
+        let app = crate::api::test_support::build_router_with_authority(state, authority_router);
         app.oneshot(
             Request::builder()
                 .method("GET")
@@ -5854,7 +5844,7 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
 
     async fn get_node_body(
         state: crate::api::ApiState,
-        authority_router: std::sync::Arc<crate::api_server_shell::HttpAuthorityRouter>,
+        authority_router: crate::api::test_support::TestHttpAuthorityRouter,
         path: &str,
     ) -> Value {
         let response = get_response(state, authority_router, path).await;
@@ -6000,24 +5990,20 @@ async fn raft_follower_without_leader_returns_503_for_get_list_watch_and_write()
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    fn raft_proxy_without_leader() -> std::sync::Arc<crate::api_server_shell::HttpAuthorityRouter> {
+    fn raft_proxy_without_leader() -> crate::api::test_support::TestHttpAuthorityRouter {
         let (_, is_leader_rx) = tokio::sync::watch::channel(false);
         let (_, leader_addr_rx) = tokio::sync::watch::channel(None::<String>);
-        std::sync::Arc::new(crate::api_server_shell::HttpAuthorityRouter::new(
-            is_leader_rx,
-            leader_addr_rx,
-            None,
-        ))
+        crate::api::test_support::test_http_authority_router(is_leader_rx, leader_addr_rx, None)
     }
 
     async fn follower_response(
         state: crate::api::ApiState,
-        authority_router: std::sync::Arc<crate::api_server_shell::HttpAuthorityRouter>,
+        authority_router: crate::api::test_support::TestHttpAuthorityRouter,
         method: &str,
         uri: &str,
         body: Option<serde_json::Value>,
     ) -> axum::response::Response {
-        let app = crate::api_server_shell::build_router_with_authority(state, authority_router);
+        let app = crate::api::test_support::build_router_with_authority(state, authority_router);
         let mut builder = Request::builder().method(method).uri(uri);
         let body = if let Some(value) = body {
             builder = builder.header("content-type", "application/json");
@@ -6100,11 +6086,8 @@ async fn raft_follower_with_unreachable_leader_returns_503_without_local_handler
     let follower_state = crate::api::test_support::build_test_app_state().await;
     let (_, is_leader_rx) = tokio::sync::watch::channel(false);
     let (_, leader_addr_rx) = tokio::sync::watch::channel(Some(format!("http://{addr}")));
-    let authority_router = std::sync::Arc::new(crate::api_server_shell::HttpAuthorityRouter::new(
-        is_leader_rx,
-        leader_addr_rx,
-        None,
-    ));
+    let authority_router =
+        crate::api::test_support::test_http_authority_router(is_leader_rx, leader_addr_rx, None);
     follower_state
         .resource_mutation()
         .db
@@ -6123,7 +6106,7 @@ async fn raft_follower_with_unreachable_leader_returns_503_without_local_handler
         .unwrap();
 
     let app =
-        crate::api_server_shell::build_router_with_authority(follower_state, authority_router);
+        crate::api::test_support::build_router_with_authority(follower_state, authority_router);
     let response = app
         .oneshot(
             Request::builder()
@@ -6961,235 +6944,4 @@ fn cluster_delete_collection_handler_macro_defined_only_in_macros_rs() {
 #[test]
 fn no_lenient_json_body_clone_in_production_handlers() {
     // R4: invariant now enforced by check_supervisor_spawn.sh
-}
-
-// ── T6: Raft leader proxy TLS verification tests ──
-
-/// Verify http_client builds without danger_accept_invalid_certs when CA is present.
-#[test]
-fn raft_leader_proxy_client_builder_no_invalid_certs() {
-    use crate::api_server_shell::HttpAuthorityRouter;
-    let (_tx, is_leader_rx) = tokio::sync::watch::channel(false);
-    let (_tx, leader_addr_rx) =
-        tokio::sync::watch::channel(Some("https://127.0.0.1:7679".to_string()));
-    // With a CA cert, the client should build without errors
-    let ca_cert = rcgen::generate_simple_self_signed(vec!["leader.test".to_string()])
-        .unwrap()
-        .cert
-        .pem();
-    let proxy = HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, Some(ca_cert));
-    let client = proxy.http_client();
-    // Client built successfully — won't reach this if it panics
-    let _ = client;
-}
-
-/// Verify http_client builds without CA (backwards compat for single-node).
-#[test]
-fn raft_leader_proxy_client_builder_no_ca() {
-    use crate::api_server_shell::HttpAuthorityRouter;
-    let (_tx, is_leader_rx) = tokio::sync::watch::channel(false);
-    let (_tx, leader_addr_rx) =
-        tokio::sync::watch::channel(Some("https://127.0.0.1:7679".to_string()));
-    let proxy = HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, None);
-    let client = proxy.http_client();
-    let _ = client;
-}
-
-/// Generate a CA cert, a server cert signed by that CA, and return
-/// (ca_pem, server_cert_pem, server_key_pem).
-fn generate_ca_signed_cert(sans: Vec<String>) -> (String, String, String) {
-    let ca_key = rcgen::KeyPair::generate().unwrap();
-    let mut ca_params = rcgen::CertificateParams::new(vec!["ca".to_string()]).unwrap();
-    ca_params.distinguished_name = rcgen::DistinguishedName::new();
-    ca_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "test-ca");
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params.key_usages = vec![
-        rcgen::KeyUsagePurpose::KeyCertSign,
-        rcgen::KeyUsagePurpose::CrlSign,
-    ];
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-    let server_key = rcgen::KeyPair::generate().unwrap();
-    let mut server_params = rcgen::CertificateParams::new(sans).unwrap();
-    server_params.distinguished_name = rcgen::DistinguishedName::new();
-    server_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "test-server");
-    let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
-        .unwrap();
-
-    (ca_cert.pem(), server_cert.pem(), server_key.serialize_pem())
-}
-
-/// Start a local TLS server that accepts one connection and responds with
-/// a fixed HTTP response. Returns the listening port.
-async fn start_tls_server_async(cert_pem: String, key_pem: String, response: String) -> u16 {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let certs: Vec<rustls::pki_types::CertificateDer> =
-        rustls_pemfile::certs(&mut cert_pem.as_bytes())
-            .collect::<Result<_, _>>()
-            .unwrap();
-    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-        .unwrap()
-        .unwrap();
-    let server_config = std::sync::Arc::new(
-        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .unwrap(),
-    );
-    let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    tokio::spawn(async move {
-        if let Ok((stream, _)) = listener.accept().await {
-            if let Ok(mut tls) = acceptor.accept(stream).await {
-                use tokio::io::AsyncWriteExt;
-                let _ = tls.write_all(response.as_bytes()).await;
-            }
-        }
-    });
-
-    port
-}
-
-/// Proxy must reject a leader certificate signed by an untrusted CA.
-#[tokio::test]
-async fn raft_proxy_rejects_leader_certificate_signed_by_untrusted_ca() {
-    use crate::api_server_shell::HttpAuthorityRouter;
-
-    // Generate CA A + server cert signed by CA A
-    let (ca_a_pem, _server_a_pem, _server_a_key) =
-        generate_ca_signed_cert(vec!["127.0.0.1".to_string()]);
-    // Generate CA B + server cert signed by CA B
-    let (_ca_b_pem, server_b_pem, server_b_key) =
-        generate_ca_signed_cert(vec!["127.0.0.1".to_string()]);
-
-    // Start server with CA B cert
-    let port = start_tls_server_async(
-        server_b_pem,
-        server_b_key,
-        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_string(),
-    )
-    .await;
-
-    // Build proxy configured with CA A — should reject server using CA B
-    let (_tx, is_leader_rx) = tokio::sync::watch::channel(false);
-    let (_tx, leader_addr_rx) =
-        tokio::sync::watch::channel(Some(format!("https://127.0.0.1:{}", port)));
-    let proxy = HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, Some(ca_a_pem));
-
-    let client = proxy.http_client();
-    let result = client
-        .get(format!("https://127.0.0.1:{}/test", port))
-        .send()
-        .await;
-
-    // Should fail because the server cert is signed by CA B, not CA A
-    assert!(
-        result.is_err(),
-        "proxy should reject server certificate signed by untrusted CA"
-    );
-}
-
-/// Proxy must forward requests to a leader with a trusted CA certificate
-/// and matching SAN.
-#[tokio::test]
-async fn raft_proxy_forwards_to_leader_with_trusted_ca_and_matching_san() {
-    use crate::api_server_shell::HttpAuthorityRouter;
-
-    let (ca_pem, server_pem, server_key) = generate_ca_signed_cert(vec!["127.0.0.1".to_string()]);
-
-    let body = "{\"result\":\"ok\"}";
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let port = start_tls_server_async(server_pem, server_key, response).await;
-
-    let (_tx, is_leader_rx) = tokio::sync::watch::channel(false);
-    let (_tx, leader_addr_rx) =
-        tokio::sync::watch::channel(Some(format!("https://127.0.0.1:{}", port)));
-    let proxy = HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, Some(ca_pem));
-
-    let client = proxy.http_client();
-    let result = client
-        .get(format!("https://127.0.0.1:{}/test", port))
-        .send()
-        .await;
-
-    let resp = result.expect("trusted CA and matching loopback IP SAN must connect");
-    assert_eq!(resp.status(), 200);
-}
-
-/// Proxy must reject a leader certificate whose SAN does not match
-/// the leader URL.
-#[tokio::test]
-async fn raft_proxy_rejects_leader_certificate_with_san_mismatch() {
-    use crate::api_server_shell::HttpAuthorityRouter;
-
-    // Server cert has SAN 127.0.0.2 but we'll connect to 127.0.0.1.
-    let (ca_pem, server_pem, server_key) = generate_ca_signed_cert(vec!["127.0.0.2".to_string()]);
-
-    let port = start_tls_server_async(
-        server_pem,
-        server_key,
-        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
-    )
-    .await;
-
-    let (_tx, is_leader_rx) = tokio::sync::watch::channel(false);
-    let (_tx, leader_addr_rx) =
-        tokio::sync::watch::channel(Some(format!("https://127.0.0.1:{}", port)));
-    let proxy = HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, Some(ca_pem));
-
-    let client = proxy.http_client();
-    let result = client
-        .get(format!("https://127.0.0.1:{}/test", port))
-        .send()
-        .await;
-
-    assert!(
-        result.is_err(),
-        "proxy should reject server with mismatched loopback IP SAN"
-    );
-}
-
-/// Proxy must preserve method, path, query, headers, and body when forwarding.
-#[tokio::test]
-async fn raft_proxy_preserves_forwarded_method_path_query_headers_and_body() {
-    use crate::api_server_shell::HttpAuthorityRouter;
-
-    let (ca_pem, server_pem, server_key) = generate_ca_signed_cert(vec!["127.0.0.1".to_string()]);
-
-    // Response echoes back a known body
-    let echo_body = "echo-me";
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-        echo_body.len(),
-        echo_body
-    );
-    let port = start_tls_server_async(server_pem, server_key, response).await;
-
-    let (_tx, is_leader_rx) = tokio::sync::watch::channel(false);
-    let (_tx, leader_addr_rx) =
-        tokio::sync::watch::channel(Some(format!("https://127.0.0.1:{}", port)));
-    let proxy = HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, Some(ca_pem));
-
-    let client = proxy.http_client();
-    let resp = client
-        .get(format!("https://127.0.0.1:{}/test?foo=bar", port))
-        .header("X-Custom", "test-value")
-        .send()
-        .await
-        .expect("trusted CA and matching loopback IP SAN must connect");
-    assert_eq!(resp.status(), 200);
-    let body = resp.text().await.unwrap();
-    assert_eq!(body, echo_body);
 }
