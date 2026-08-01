@@ -136,7 +136,10 @@ mod sql_pushdown_tests {
 
 #[cfg(test)]
 mod field_filter_tests {
-    use super::{filter_by_field_selector, resolve_field_path, split_selector};
+    use super::{
+        LabelRequirement, filter_by_field_selector, parse_label_selector, resolve_field_path,
+        split_selector,
+    };
     use klights_cluster_core::Resource;
     use serde_json::json;
 
@@ -598,5 +601,74 @@ mod field_filter_tests {
     fn test_split_selector_notin_with_multiple_values() {
         let parts = split_selector("env notin (dev,test,staging)");
         assert_eq!(parts, vec!["env notin (dev,test,staging)"]);
+    }
+
+    #[test]
+    fn test_parse_label_selector_equality() {
+        let reqs = parse_label_selector("app=nginx").unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            matches!(&reqs[0], LabelRequirement::Equality { key, value } if key == "app" && value == "nginx")
+        );
+    }
+
+    #[test]
+    fn test_parse_label_selector_inequality() {
+        let reqs = parse_label_selector("env!=prod").unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            matches!(&reqs[0], LabelRequirement::Inequality { key, value } if key == "env" && value == "prod")
+        );
+    }
+
+    #[test]
+    fn test_parse_label_selector_exists() {
+        let reqs = parse_label_selector("has-gpu").unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(matches!(&reqs[0], LabelRequirement::Exists { key } if key == "has-gpu"));
+    }
+
+    #[test]
+    fn test_parse_label_selector_not_exists() {
+        let reqs = parse_label_selector("!deprecated").unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(matches!(&reqs[0], LabelRequirement::NotExists { key } if key == "deprecated"));
+    }
+
+    #[test]
+    fn test_parse_label_selector_in_operator() {
+        let reqs = parse_label_selector("env in (prod,staging)").unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            matches!(&reqs[0], LabelRequirement::In { key, values } if key == "env" && values == &["prod", "staging"])
+        );
+    }
+
+    #[test]
+    fn test_parse_label_selector_notin_operator() {
+        let reqs = parse_label_selector("env notin (dev,test)").unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            matches!(&reqs[0], LabelRequirement::NotIn { key, values } if key == "env" && values == &["dev", "test"])
+        );
+    }
+
+    #[test]
+    fn test_parse_label_selector_combined() {
+        let reqs = parse_label_selector("app=nginx,env!=dev,!deprecated").unwrap();
+        assert_eq!(reqs.len(), 3);
+        assert!(
+            matches!(&reqs[0], LabelRequirement::Equality { key, value } if key == "app" && value == "nginx")
+        );
+        assert!(
+            matches!(&reqs[1], LabelRequirement::Inequality { key, value } if key == "env" && value == "dev")
+        );
+        assert!(matches!(&reqs[2], LabelRequirement::NotExists { key } if key == "deprecated"));
+    }
+
+    #[test]
+    fn test_parse_label_selector_empty_string() {
+        let reqs = parse_label_selector("").unwrap();
+        assert!(reqs.is_empty());
     }
 }

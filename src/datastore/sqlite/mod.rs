@@ -232,8 +232,6 @@ pub use watch::publish_pending_batch;
 use crate::datastore::pod_serviceaccount::{
     inject_serviceaccount_volume, should_inject_serviceaccount_volume,
 };
-#[cfg(test)]
-use klights_cluster_datastore::sqlite::filters::parse_label_selector;
 use klights_cluster_datastore::sqlite::scope::use_namespaced_table;
 use resource_shape::hydrate_watch_event_data;
 use resource_shape::{
