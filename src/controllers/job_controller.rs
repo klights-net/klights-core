@@ -2,7 +2,17 @@
 
 use crate::controllers::job as job_core;
 
-pub struct JobController;
+pub struct JobController {
+    identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
+}
+
+impl JobController {
+    pub(crate) fn new(
+        identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
+    ) -> Self {
+        Self { identity }
+    }
+}
 
 #[async_trait::async_trait]
 impl crate::controllers::Controller for JobController {
@@ -19,6 +29,7 @@ impl crate::controllers::Controller for JobController {
             ctx.job_store(),
             ctx.pod_query(),
             ctx.job_mutation(),
+            self.identity.as_ref(),
             ctx.pod_delete_sink(),
             ctx.reconcile_port().non_pod_finalization(),
             &resource,
@@ -43,13 +54,18 @@ mod tests {
 
     #[test]
     fn test_job_controller_name() {
-        assert_eq!(JobController.name(), "job");
+        assert_eq!(
+            JobController::new(crate::controllers::test_utils::deterministic_controller_identity())
+                .name(),
+            "job"
+        );
     }
 
     #[tokio::test]
     async fn test_job_controller_reconcile_creates_pod() {
         let db = crate::datastore::test_support::in_memory().await;
-        let controller = JobController;
+        let controller =
+            JobController::new(crate::controllers::test_utils::deterministic_controller_identity());
 
         let job = store_and_prepare(
             &db, "batch/v1", "Job", Some("default"), "pi",
@@ -96,7 +112,8 @@ mod tests {
         let db = crate::datastore::test_support::in_memory().await;
         let ctx = Context::new(std::sync::Arc::new(db.clone()), "test-node".to_string())
             .with_pod_repository(crate::controllers::test_utils::pod_repository_for_test(&db));
-        let controller = JobController;
+        let controller =
+            JobController::new(crate::controllers::test_utils::deterministic_controller_identity());
 
         let bad = store_and_prepare(
             &db,

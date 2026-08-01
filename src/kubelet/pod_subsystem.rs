@@ -417,6 +417,8 @@ mod tests {
                 scheduling_mode,
                 outbox: None,
                 cluster_api: Some(cluster_api.clone()),
+                controller_identity:
+                    crate::controllers::test_utils::deterministic_controller_identity(),
                 scheduler_bind_gate: None,
             });
         PodSubsystemConfig {

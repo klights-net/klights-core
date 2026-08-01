@@ -1069,6 +1069,7 @@ pub async fn mirror_endpoints_to_endpointslice_at(
     db: &(impl EndpointReconcileStore + ?Sized),
     endpoints: &Value,
     now: chrono::DateTime<chrono::Utc>,
+    identity: &dyn crate::ControllerIdentityGenerator,
 ) -> Result<()> {
     let input_metadata = endpoints
         .get("metadata")
@@ -1100,6 +1101,7 @@ pub async fn mirror_endpoints_to_endpointslice_at(
         live_endpoints.data,
         live_endpoints.resource_version,
         now,
+        identity,
     );
     let metadata = endpoints
         .get("metadata")
@@ -1369,7 +1371,8 @@ pub async fn mirror_endpoints_to_endpointslice(
     db: &(impl EndpointReconcileStore + ?Sized),
     endpoints: &Value,
 ) -> Result<()> {
-    mirror_endpoints_to_endpointslice_at(db, endpoints, chrono::Utc::now()).await
+    let identity = crate::identity::DeterministicControllerIdentityGenerator::default();
+    mirror_endpoints_to_endpointslice_at(db, endpoints, chrono::Utc::now(), &identity).await
 }
 
 pub async fn delete_mirrored_endpointslice_for_endpoints(

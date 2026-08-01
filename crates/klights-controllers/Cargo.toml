@@ -27,7 +27,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
-uuid = { workspace = true, features = ["std", "v4"] }
 
 [dev-dependencies]
 chrono = { workspace = true, features = ["clock"] }

@@ -116,10 +116,12 @@ async fn live_statefulset_replicas(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn reconcile_statefulset(
     db: &(impl StatefulSetStore + ?Sized),
     pod_reader: &(impl PodQuery + ?Sized),
     pod_writer: &(impl StatefulSetPodMutation + ?Sized),
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     statefulset: &Value,
@@ -166,6 +168,7 @@ pub(crate) async fn reconcile_statefulset(
         live_resource.data,
         live_resource.resource_version,
         reconcile_context.wall_time,
+        identity,
     );
 
     let metadata = statefulset

@@ -95,10 +95,12 @@ async fn list_replication_controller_pods(
 }
 
 /// Reconcile a ReplicationController to match desired state
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn reconcile_replicationcontroller(
     db: &(impl ReplicationControllerStore + ?Sized),
     pod_reader: &(impl PodQuery + ?Sized),
     pod_writer: &(impl ReplicationControllerPodMutation + ?Sized),
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     rc: &Value,
@@ -147,6 +149,7 @@ pub(crate) async fn reconcile_replicationcontroller(
         live_resource.data,
         live_resource.resource_version,
         reconcile_context.wall_time,
+        identity,
     );
 
     if rc.pointer("/metadata/deletionTimestamp").is_some() {
@@ -287,7 +290,7 @@ pub(crate) async fn reconcile_replicationcontroller(
                         break;
                     }
                     in_flight_creates.push(Box::pin(create_pod(
-                        pod_writer, rc_name, rc_uid, namespace, node_name, template,
+                        pod_writer, identity, rc_name, rc_uid, namespace, node_name, template,
                     )));
                 }
             }
@@ -549,6 +552,7 @@ fn active_replicationcontroller_pods(
 /// Create a pod from RC template
 async fn create_pod(
     pod_writer: &(impl ReplicationControllerPodMutation + ?Sized),
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
     rc_name: &str,
     rc_uid: &str,
     namespace: &str,
@@ -558,11 +562,7 @@ async fn create_pod(
     let pod_name = format!(
         "{}-{}",
         rc_name,
-        uuid::Uuid::new_v4()
-            .to_string()
-            .split('-')
-            .next()
-            .unwrap_or("xxxxx")
+        identity.new_uid().split('-').next().unwrap_or("xxxxx")
     );
     let pod = crate::controllers::common::build_child_pod(
         template,

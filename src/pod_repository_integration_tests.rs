@@ -47,6 +47,7 @@ fn fixture_mutation_reconcile(
         klights_controllers::side_effects::SideEffectMetrics::new(),
         side_effects,
         store,
+        crate::controllers::test_utils::deterministic_controller_identity(),
     ))
 }
 
@@ -102,6 +103,7 @@ async fn fixture_repository_with_node_local(
         scheduling_mode: super::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
+        controller_identity: crate::controllers::test_utils::deterministic_controller_identity(),
         scheduler_bind_gate: None,
     })
     .repository;
@@ -406,6 +408,7 @@ async fn pod_repository_build_parts_exposes_repository_and_background_without_st
         scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
+        controller_identity: crate::controllers::test_utils::deterministic_controller_identity(),
         scheduler_bind_gate: None,
     });
 
@@ -437,6 +440,7 @@ async fn pod_repository_build_parts_does_not_start_workqueue_until_background_st
         scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
+        controller_identity: crate::controllers::test_utils::deterministic_controller_identity(),
         scheduler_bind_gate: None,
     });
 
@@ -478,6 +482,7 @@ async fn pod_workqueue_runner_start_calls_workqueue_start_once() {
         scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
+        controller_identity: crate::controllers::test_utils::deterministic_controller_identity(),
         scheduler_bind_gate: None,
     });
 
@@ -2564,6 +2569,7 @@ async fn build_repo_with_bound_side_effects() -> Arc<super::PodRepository> {
         None,
         Some(supervisor.clone()),
         Some(db.clone()),
+        crate::controllers::test_utils::deterministic_controller_identity(),
     ));
     let repo = Arc::new(super::PodRepository::new(
         db,
@@ -2790,6 +2796,7 @@ async fn build_repo_with_scheduling_mode_and_gate(
         scheduling_mode,
         outbox: None,
         cluster_api: None,
+        controller_identity: crate::controllers::test_utils::deterministic_controller_identity(),
         scheduler_bind_gate: Some(gate),
     })
     .repository
@@ -2808,6 +2815,7 @@ async fn build_repo_with_dispatcher() -> (
         None,
         Some(supervisor.clone()),
         Some(db.clone()),
+        crate::controllers::test_utils::deterministic_controller_identity(),
     ));
     let dispatcher = Arc::new(
         crate::controllers::ControllerDispatcher::with_task_supervisor(

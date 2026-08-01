@@ -15,6 +15,7 @@ async fn reconcile_statefulset_test(
         &store,
         repo.as_ref(),
         repo.as_ref(),
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
         repo.as_ref(),
         crate::controllers::test_utils::non_pod_finalization_port_for_test(),
         statefulset,

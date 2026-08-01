@@ -211,6 +211,8 @@ async fn test_job_releases_owned_pod_that_no_longer_matches_selector() {
 async fn test_job_multiple_completions() {
     // Job with completions=3 should create 3 pods sequentially (parallelism=1)
     let db = crate::datastore::test_support::in_memory().await;
+    let identity_graph = crate::controllers::test_utils::ControllerIdentityTestGraph::default();
+    let identity = identity_graph.identity();
 
     let job = json!({
         "apiVersion": "batch/v1",
@@ -238,7 +240,9 @@ async fn test_job_multiple_completions() {
 
     // Reconcile 1 - create first pod
     let job = get_job(&db, "default", "multi-job").await;
-    let _job = reconcile_job_test(&db, &job, "test-node").await.unwrap();
+    let _job = reconcile_job_test_with_identity(&db, &job, "test-node", identity.as_ref())
+        .await
+        .unwrap();
     let mut pods = crate::controllers::find_owned_pods(&db, "default", "job-2")
         .await
         .unwrap();
@@ -260,7 +264,9 @@ async fn test_job_multiple_completions() {
     .unwrap();
 
     let job = get_job(&db, "default", "multi-job").await;
-    let _job = reconcile_job_test(&db, &job, "test-node").await.unwrap();
+    let _job = reconcile_job_test_with_identity(&db, &job, "test-node", identity.as_ref())
+        .await
+        .unwrap();
     pods = crate::controllers::find_owned_pods(&db, "default", "job-2")
         .await
         .unwrap();
@@ -286,7 +292,9 @@ async fn test_job_multiple_completions() {
     .unwrap();
 
     let job = get_job(&db, "default", "multi-job").await;
-    let _job = reconcile_job_test(&db, &job, "test-node").await.unwrap();
+    let _job = reconcile_job_test_with_identity(&db, &job, "test-node", identity.as_ref())
+        .await
+        .unwrap();
     pods = crate::controllers::find_owned_pods(&db, "default", "job-2")
         .await
         .unwrap();
@@ -312,7 +320,9 @@ async fn test_job_multiple_completions() {
     .unwrap();
 
     let job = get_job(&db, "default", "multi-job").await;
-    let job = reconcile_job_test(&db, &job, "test-node").await.unwrap();
+    let job = reconcile_job_test_with_identity(&db, &job, "test-node", identity.as_ref())
+        .await
+        .unwrap();
     let succeeded = job["status"]["succeeded"].as_i64().unwrap();
     assert_eq!(succeeded, 3, "Should have 3 succeeded pods");
 }
@@ -362,6 +372,8 @@ async fn test_job_parallelism() {
 async fn test_job_backoff_limit() {
     // Job with backoffLimit=1 should fail after 2 failures
     let db = crate::datastore::test_support::in_memory().await;
+    let identity_graph = crate::controllers::test_utils::ControllerIdentityTestGraph::default();
+    let identity = identity_graph.identity();
 
     let job = json!({
         "apiVersion": "batch/v1",
@@ -388,7 +400,9 @@ async fn test_job_backoff_limit() {
 
     // Reconcile - create first pod
     let job = get_job(&db, "default", "failing-job").await;
-    let _job = reconcile_job_test(&db, &job, "test-node").await.unwrap();
+    let _job = reconcile_job_test_with_identity(&db, &job, "test-node", identity.as_ref())
+        .await
+        .unwrap();
     let mut pods = crate::controllers::find_owned_pods(&db, "default", "job-4")
         .await
         .unwrap();
@@ -411,7 +425,9 @@ async fn test_job_backoff_limit() {
 
     // Reconcile - should create second pod (failed=1, limit=1, so can retry once)
     let job = get_job(&db, "default", "failing-job").await;
-    let _job = reconcile_job_test(&db, &job, "test-node").await.unwrap();
+    let _job = reconcile_job_test_with_identity(&db, &job, "test-node", identity.as_ref())
+        .await
+        .unwrap();
     pods = crate::controllers::find_owned_pods(&db, "default", "job-4")
         .await
         .unwrap();
@@ -438,7 +454,9 @@ async fn test_job_backoff_limit() {
 
     // Reconcile - should NOT create third pod (failed=2 > limit=1)
     let job = get_job(&db, "default", "failing-job").await;
-    let job = reconcile_job_test(&db, &job, "test-node").await.unwrap();
+    let job = reconcile_job_test_with_identity(&db, &job, "test-node", identity.as_ref())
+        .await
+        .unwrap();
     pods = crate::controllers::find_owned_pods(&db, "default", "job-4")
         .await
         .unwrap();

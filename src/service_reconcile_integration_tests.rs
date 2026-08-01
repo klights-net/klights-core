@@ -22,6 +22,7 @@ async fn reconcile_service(
         service_ipam,
         &NodePortAllocator::new(),
         chrono::Utc::now(),
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
     )
     .await
 }
@@ -1029,6 +1030,7 @@ async fn service_reconcile_recovers_cluster_ip_after_generic_service_delete() {
         &ipam,
         &alloc,
         chrono::Utc::now(),
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
     )
     .await
     .unwrap();
@@ -1065,6 +1067,7 @@ async fn service_reconcile_recovers_cluster_ip_after_generic_service_delete() {
         &ipam,
         &alloc,
         chrono::Utc::now(),
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
     )
     .await
     .unwrap();
@@ -1112,6 +1115,7 @@ async fn reconcile_idempotent_does_not_churn_resource_version() {
         &ipam,
         &alloc,
         chrono::Utc::now(),
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
     )
     .await
     .unwrap();
@@ -1130,6 +1134,7 @@ async fn reconcile_idempotent_does_not_churn_resource_version() {
         &ipam,
         &alloc,
         chrono::Utc::now(),
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
     )
     .await
     .unwrap();

@@ -863,6 +863,7 @@ mod tests {
             hpa,
             node_name,
             node_metrics,
+            crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
             chrono::Utc::now(),
         )
         .await

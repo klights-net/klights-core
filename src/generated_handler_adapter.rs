@@ -16,6 +16,7 @@ pub(crate) struct GeneratedHandlerAdapter {
     file_process: klights_supervisor::FileProcessExecutor,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ca_cert_path: std::path::PathBuf,
+    identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
 }
 
 impl GeneratedHandlerAdapter {
@@ -26,6 +27,7 @@ impl GeneratedHandlerAdapter {
         file_process: klights_supervisor::FileProcessExecutor,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
         ca_cert_path: std::path::PathBuf,
+        identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Arc<Self> {
         Arc::new(Self {
             watch_source: Arc::new(
@@ -39,6 +41,7 @@ impl GeneratedHandlerAdapter {
             file_process,
             task_supervisor,
             ca_cert_path,
+            identity,
         })
     }
 }
@@ -145,6 +148,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
                 self.db.as_ref(),
                 &namespace,
                 chrono::Utc::now(),
+                self.identity.as_ref(),
             )
             .await
             .map_err(|error| AppError::Internal(error.to_string()))
@@ -164,6 +168,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
                 &namespace,
                 &ca_cert_pem,
                 chrono::Utc::now(),
+                self.identity.as_ref(),
             )
             .await
             .map_err(|error| AppError::Internal(error.to_string()))
@@ -178,6 +183,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
                 &namespace,
                 &self.ca_cert_path,
                 chrono::Utc::now(),
+                self.identity.as_ref(),
             )
             .await
             .map_err(|error| AppError::Internal(error.to_string()))
@@ -192,6 +198,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
                 &namespace,
                 &self.ca_cert_path,
                 chrono::Utc::now(),
+                self.identity.as_ref(),
             )
             .await
             .map_err(|error| AppError::Internal(error.to_string()))

@@ -10,6 +10,7 @@ pub fn with_resource_version(
     data: impl Into<Arc<Value>>,
     resource_version: i64,
     now: chrono::DateTime<chrono::Utc>,
+    identity: &dyn crate::ControllerIdentityGenerator,
 ) -> Value {
     let mut data = Arc::unwrap_or_clone(data.into());
     if let Some(metadata) = data
@@ -24,10 +25,7 @@ pub fn with_resource_version(
         if metadata.get("uid").is_none_or(|value| {
             value.is_null() || value.as_str().is_some_and(|uid| uid.trim().is_empty())
         }) {
-            metadata.insert(
-                "uid".to_string(),
-                Value::String(uuid::Uuid::new_v4().to_string()),
-            );
+            metadata.insert("uid".to_string(), Value::String(identity.new_uid()));
         }
         if metadata.get("creationTimestamp").is_none_or(Value::is_null) {
             metadata.insert(
@@ -44,6 +42,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    struct FixedIdentity;
+
+    impl crate::ControllerIdentityGenerator for FixedIdentity {
+        fn generate_name(&self, prefix: &str) -> String {
+            format!("{prefix}abc12")
+        }
+
+        fn new_uid(&self) -> String {
+            "00000000-0000-4000-8000-000000000001".to_string()
+        }
+    }
+
     #[test]
     fn projects_resource_version_without_replacing_stable_identity() {
         let projected = with_resource_version(
@@ -56,6 +66,7 @@ mod tests {
             })),
             42,
             chrono::Utc::now(),
+            &FixedIdentity,
         );
 
         assert_eq!(
@@ -74,8 +85,12 @@ mod tests {
 
     #[test]
     fn fills_missing_identity_like_api_projection() {
-        let projected =
-            with_resource_version(json!({"metadata": {"uid": "  "}}), 7, chrono::Utc::now());
+        let projected = with_resource_version(
+            json!({"metadata": {"uid": "  "}}),
+            7,
+            chrono::Utc::now(),
+            &FixedIdentity,
+        );
 
         assert_eq!(
             projected.pointer("/metadata/resourceVersion"),
@@ -86,6 +101,10 @@ mod tests {
                 .pointer("/metadata/uid")
                 .and_then(Value::as_str)
                 .is_some_and(|uid| !uid.trim().is_empty())
+        );
+        assert_eq!(
+            projected.pointer("/metadata/uid"),
+            Some(&json!("00000000-0000-4000-8000-000000000001"))
         );
         assert!(
             projected

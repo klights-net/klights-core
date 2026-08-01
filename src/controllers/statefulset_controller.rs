@@ -23,13 +23,21 @@ mod tests {
 
     #[test]
     fn test_statefulset_controller_name() {
-        assert_eq!(StatefulSetController.name(), "statefulset");
+        assert_eq!(
+            StatefulSetController::new(
+                crate::controllers::test_utils::deterministic_controller_identity()
+            )
+            .name(),
+            "statefulset"
+        );
     }
 
     #[tokio::test]
     async fn test_statefulset_controller_reconcile_creates_ordinal_pod() {
         let db = crate::datastore::test_support::in_memory().await;
-        let controller = StatefulSetController;
+        let controller = StatefulSetController::new(
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        );
 
         let sts = store_and_prepare(
             &db,
@@ -79,7 +87,9 @@ mod tests {
     async fn test_statefulset_controller_reconcile_missing_metadata_returns_error() {
         let db = crate::datastore::test_support::in_memory().await;
         let ctx = Context::new(std::sync::Arc::new(db), "test-node".to_string());
-        let controller = StatefulSetController;
+        let controller = StatefulSetController::new(
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        );
 
         let bad = json!({"spec": {"replicas": 1}});
         assert!(controller.reconcile(bad, ctx).await.is_err());

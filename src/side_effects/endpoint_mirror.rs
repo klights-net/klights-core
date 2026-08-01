@@ -15,7 +15,10 @@ mod tests {
     #[tokio::test]
     async fn test_endpoint_mirror_name() {
         let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-        let effect = crate::endpoint_mirror_side_effect_adapter::effect(db_handle);
+        let effect = crate::endpoint_mirror_side_effect_adapter::effect(
+            db_handle,
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        );
         assert_eq!(effect.name(), "endpoint_mirror");
     }
 
@@ -54,10 +57,13 @@ mod tests {
             }
         });
 
-        crate::endpoint_mirror_side_effect_adapter::effect(db_handle)
-            .apply_delete(&endpoints)
-            .await
-            .expect("delete hook");
+        crate::endpoint_mirror_side_effect_adapter::effect(
+            db_handle,
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        )
+        .apply_delete(&endpoints)
+        .await
+        .expect("delete hook");
 
         assert!(
             db.get_resource(

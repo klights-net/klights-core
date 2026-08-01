@@ -22,13 +22,21 @@ mod tests {
 
     #[test]
     fn test_daemonset_controller_name() {
-        assert_eq!(DaemonSetController.name(), "daemonset");
+        assert_eq!(
+            DaemonSetController::new(
+                crate::controllers::test_utils::deterministic_controller_identity()
+            )
+            .name(),
+            "daemonset"
+        );
     }
 
     #[tokio::test]
     async fn test_daemonset_controller_reconcile_creates_pod_per_node() {
         let db = crate::datastore::test_support::in_memory().await;
-        let controller = DaemonSetController;
+        let controller = DaemonSetController::new(
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        );
 
         // DaemonSet reconcile lists nodes — create one
         let node = json!({
@@ -86,7 +94,9 @@ mod tests {
     #[tokio::test]
     async fn test_daemonset_controller_reconcile_no_nodes_creates_no_pods() {
         let db = crate::datastore::test_support::in_memory().await;
-        let controller = DaemonSetController;
+        let controller = DaemonSetController::new(
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        );
 
         let ds = store_and_prepare(
             &db,

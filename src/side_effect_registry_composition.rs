@@ -227,6 +227,7 @@ pub fn default_registry(
     services: Option<std::sync::Arc<dyn klights_network_api::ServiceRouter>>,
     task_supervisor: Option<std::sync::Arc<klights_supervisor::TaskSupervisor>>,
     db: Option<crate::datastore::DatastoreHandle>,
+    identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
 ) -> SideEffectRegistry {
     let db = db.expect("default side-effect registry requires a datastore handle");
     let mut registry = SideEffectRegistry::new();
@@ -235,7 +236,7 @@ pub fn default_registry(
     registry.register(
         "v1",
         "Endpoints",
-        crate::endpoint_mirror_side_effect_adapter::effect(db.clone()),
+        crate::endpoint_mirror_side_effect_adapter::effect(db.clone(), identity.clone()),
         ErrorPolicy::Warn,
     );
     registry.register(
@@ -268,7 +269,7 @@ pub fn default_registry(
     registry.register(
         "v1",
         "ServiceAccount",
-        crate::service_account_defaults_side_effect_adapter::effect(db.clone()),
+        crate::service_account_defaults_side_effect_adapter::effect(db.clone(), identity),
         ErrorPolicy::Warn,
     );
     registry.register(
@@ -389,6 +390,7 @@ mod tests {
             None,
             Some(task_supervisor),
             Some(db_handle),
+            crate::controllers::test_utils::deterministic_controller_identity(),
         );
         registry.set_controller_dispatcher(dispatcher.clone());
 
@@ -518,7 +520,13 @@ mod tests {
     async fn test_default_registry_enqueues_jobs_after_pod_mutation() {
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let metrics = SideEffectMetrics::new();
-        let registry = default_registry(metrics.clone(), None, None, Some(db_handle.clone()));
+        let registry = default_registry(
+            metrics.clone(),
+            None,
+            None,
+            Some(db_handle.clone()),
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        );
         let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
@@ -629,7 +637,13 @@ mod tests {
     async fn service_pod_side_effect_not_registered_for_generic_pod_hook() {
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let metrics = SideEffectMetrics::new();
-        let registry = default_registry(metrics.clone(), None, None, Some(db_handle.clone()));
+        let registry = default_registry(
+            metrics.clone(),
+            None,
+            None,
+            Some(db_handle.clone()),
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        );
         let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
@@ -709,7 +723,13 @@ mod tests {
     async fn test_endpoint_hooks_do_not_enqueue_service_reconcile() {
         let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let metrics = SideEffectMetrics::new();
-        let registry = default_registry(metrics.clone(), None, None, Some(db_handle.clone()));
+        let registry = default_registry(
+            metrics.clone(),
+            None,
+            None,
+            Some(db_handle.clone()),
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        );
         let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
@@ -746,7 +766,13 @@ mod tests {
     async fn test_default_registry_enqueues_replicationcontroller_owner_after_pod_mutation() {
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let metrics = SideEffectMetrics::new();
-        let registry = default_registry(metrics.clone(), None, None, Some(db_handle.clone()));
+        let registry = default_registry(
+            metrics.clone(),
+            None,
+            None,
+            Some(db_handle.clone()),
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        );
         let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
@@ -860,7 +886,13 @@ mod tests {
     async fn test_default_registry_enqueues_matching_replicaset_for_orphan_pod_mutation() {
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let metrics = SideEffectMetrics::new();
-        let registry = default_registry(metrics.clone(), None, None, Some(db_handle.clone()));
+        let registry = default_registry(
+            metrics.clone(),
+            None,
+            None,
+            Some(db_handle.clone()),
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        );
         let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
@@ -943,7 +975,13 @@ mod tests {
     async fn test_default_registry_enqueues_replicaset_parent_deployment_after_pod_mutation() {
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let metrics = SideEffectMetrics::new();
-        let registry = default_registry(metrics.clone(), None, None, Some(db_handle.clone()));
+        let registry = default_registry(
+            metrics.clone(),
+            None,
+            None,
+            Some(db_handle.clone()),
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        );
         let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
@@ -1056,7 +1094,13 @@ mod tests {
     async fn test_default_registry_enqueues_job_without_explicit_selector_after_pod_mutation() {
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let metrics = SideEffectMetrics::new();
-        let registry = default_registry(metrics.clone(), None, None, Some(db_handle.clone()));
+        let registry = default_registry(
+            metrics.clone(),
+            None,
+            None,
+            Some(db_handle.clone()),
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        );
         let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));

@@ -18,6 +18,7 @@ struct CoreDnsBootstrapAdapter<'a> {
     pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
     non_pod_finalization: &'a dyn klights_reconcile_api::GcNonPodFinalizationPort,
     coordination: &'a klights_controllers::ControllerCoordination,
+    identity: &'a dyn klights_controllers::ControllerIdentityGenerator,
 }
 
 fn coordinates(
@@ -107,11 +108,13 @@ impl CoreDnsBootstrapStore for CoreDnsBootstrapAdapter<'_> {
             deployment.data,
             deployment.resource_version,
             now,
+            self.identity,
         );
         crate::controllers::deployment::reconcile_deployment(
             self.db,
             self.pod_reader.as_ref(),
             self.pod_mutation.as_ref(),
+            self.identity,
             self.pod_delete_sink.as_ref(),
             self.non_pod_finalization,
             &deployment,
@@ -129,6 +132,7 @@ pub(crate) struct CoreDnsBootstrapConfig<'a> {
     pub(crate) node_name: &'a str,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn bootstrap_coredns(
     db: &dyn DatastoreBackend,
     pod_reader: Arc<dyn crate::controllers::DeploymentControllerPodReader>,
@@ -136,6 +140,7 @@ pub(crate) async fn bootstrap_coredns(
     pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     coordination: &klights_controllers::ControllerCoordination,
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
     config: CoreDnsBootstrapConfig<'_>,
 ) -> Result<()> {
     bootstrap_coredns_with_store(
@@ -146,6 +151,7 @@ pub(crate) async fn bootstrap_coredns(
             pod_delete_sink,
             non_pod_finalization,
             coordination,
+            identity,
         },
         config.tls_port,
         config.service_cidr,

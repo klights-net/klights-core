@@ -28,6 +28,7 @@ where
         &store,
         pod_reader,
         pod_writer,
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
         pod_delete_sink,
         &non_pod_finalization,
         deployment,

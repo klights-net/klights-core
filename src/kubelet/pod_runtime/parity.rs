@@ -22,6 +22,19 @@ use super::store::{PodRuntimeStore, PodSlotAdmission};
 use super::volumes::PodVolumeRuntime;
 use klights_kubelet::runtime::cri::{ContainerRuntimeControl, CriRuntime};
 
+#[derive(Debug)]
+struct ParityControllerIdentity;
+
+impl klights_controllers::ControllerIdentityGenerator for ParityControllerIdentity {
+    fn generate_name(&self, prefix: &str) -> String {
+        format!("{prefix}00000")
+    }
+
+    fn new_uid(&self) -> String {
+        "00000000-0000-4000-8000-000000000001".to_string()
+    }
+}
+
 // Re-export mock types from test_support for convenience.
 use super::test_support::{
     FakeNode, MockContainerControlOp, MockContainerRuntimeControl, MockCriCall, MockCriRuntime,
@@ -257,6 +270,7 @@ impl ParityFixture {
             scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
+            controller_identity: Arc::new(ParityControllerIdentity),
             scheduler_bind_gate: None,
         });
         let repository = Arc::new(parts.repository);

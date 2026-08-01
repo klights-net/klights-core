@@ -36,10 +36,12 @@ pub trait ReplicaSetPodMutation: Send + Sync {
     ) -> ControllerStoreResult<Resource>;
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn reconcile_replicaset(
     db: &(impl ReplicaSetStore + ?Sized),
     pod_reader: &(impl PodQuery + ?Sized),
     pod_writer: &(impl ReplicaSetPodMutation + ?Sized),
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     replicaset: &Value,
@@ -103,6 +105,7 @@ pub(crate) async fn reconcile_replicaset(
         live_resource.data,
         live_resource.resource_version,
         reconcile_context.wall_time,
+        identity,
     );
 
     let metadata = live_replicaset
@@ -228,7 +231,10 @@ pub(crate) async fn reconcile_replicaset(
             if created_or_existing >= live_replicas {
                 break;
             }
-            create_pod(pod_writer, name, uid, namespace, node_name, template).await?;
+            create_pod(
+                pod_writer, identity, name, uid, namespace, node_name, template,
+            )
+            .await?;
             created_or_existing += 1;
         }
     }
@@ -443,6 +449,7 @@ const GENERATED_POD_CREATE_MAX_ATTEMPTS: usize = 8;
 
 async fn create_pod(
     pod_writer: &(impl ReplicaSetPodMutation + ?Sized),
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
     rs_name: &str,
     rs_uid: &str,
     namespace: &str,
@@ -450,30 +457,9 @@ async fn create_pod(
     template: &Value,
 ) -> Result<()> {
     let prefix = format!("{rs_name}-");
-    create_pod_with_name_generator(
-        pod_writer,
-        rs_name,
-        rs_uid,
-        namespace,
-        node_name,
-        template,
-        || crate::resource_name::generate(&prefix),
-    )
-    .await
-}
-
-async fn create_pod_with_name_generator(
-    pod_writer: &(impl ReplicaSetPodMutation + ?Sized),
-    rs_name: &str,
-    rs_uid: &str,
-    namespace: &str,
-    node_name: &str,
-    template: &Value,
-    mut generate_name: impl FnMut() -> String,
-) -> Result<()> {
     let mut final_collision = None;
     for _ in 0..GENERATED_POD_CREATE_MAX_ATTEMPTS {
-        let pod_name = generate_name();
+        let pod_name = identity.generate_name(&prefix);
         let pod = crate::controllers::common::build_child_pod(
             template,
             &pod_name,

@@ -1666,6 +1666,8 @@ impl PodRuntimeHarness {
                     crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
                 outbox: None,
                 cluster_api: None,
+                controller_identity:
+                    crate::controllers::test_utils::deterministic_controller_identity(),
                 scheduler_bind_gate: None,
             },
         );

@@ -2339,6 +2339,7 @@ mod tests {
             state.controller_reconcile().nodeport_alloc.clone(),
             state.operational().task_supervisor.clone(),
             Some(issuer),
+            crate::controllers::test_utils::deterministic_controller_identity(),
         ));
         dispatcher
             .set_sync_context(

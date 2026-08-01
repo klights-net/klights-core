@@ -956,6 +956,8 @@ impl PodRepository {
             scheduling_mode,
             outbox,
             cluster_api: Some(cluster_api),
+            controller_identity: crate::controllers::test_utils::deterministic_controller_identity(
+            ),
             scheduler_bind_gate: None,
         })
     }
@@ -982,6 +984,8 @@ impl PodRepository {
             scheduling_mode,
             outbox,
             cluster_api: None,
+            controller_identity: crate::controllers::test_utils::deterministic_controller_identity(
+            ),
             scheduler_bind_gate: None,
         })
     }

@@ -20,6 +20,16 @@ async fn reconcile_job_test(
     job: &Value,
     node_name: &str,
 ) -> Result<Value> {
+    let identity = crate::controllers::test_utils::deterministic_controller_identity();
+    reconcile_job_test_with_identity(db, job, node_name, identity.as_ref()).await
+}
+
+async fn reconcile_job_test_with_identity(
+    db: &crate::datastore::sqlite::Datastore,
+    job: &Value,
+    node_name: &str,
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
+) -> Result<Value> {
     let repo = crate::controllers::test_utils::pod_repository_for_test(db);
     let non_pod_finalization =
         crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(db.clone()));
@@ -28,6 +38,7 @@ async fn reconcile_job_test(
         &store,
         repo.as_ref(),
         repo.as_ref(),
+        identity,
         repo.as_ref(),
         &non_pod_finalization,
         job,
@@ -35,6 +46,49 @@ async fn reconcile_job_test(
         chrono::Utc::now(),
     )
     .await
+}
+
+#[tokio::test]
+async fn job_consumes_one_uid_per_pod_and_preserves_five_hex_name_derivation() {
+    let db = crate::datastore::test_support::in_memory().await;
+    db.create_resource(
+        "batch/v1",
+        "Job",
+        Some("default"),
+        "spy-job",
+        json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {"name": "spy-job", "namespace": "default", "uid": "spy-job-uid"},
+            "spec": {
+                "completions": 2,
+                "parallelism": 2,
+                "template": {"spec": {"containers": [{"name": "worker", "image": "busybox"}]}}
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let job = get_job(&db, "default", "spy-job").await;
+    let identity =
+        crate::controllers::test_utils::ScriptedControllerIdentityGenerator::with_uids([
+            "abcde111-0000-4000-8000-000000000000",
+            "f0123222-0000-4000-8000-000000000000",
+        ]);
+
+    reconcile_job_test_with_identity(&db, &job, "test-node", &identity)
+        .await
+        .unwrap();
+
+    let mut names = crate::controllers::find_owned_pods(&db, "default", "spy-job-uid")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|pod| pod.name)
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, ["spy-job-abcde", "spy-job-f0123"]);
+    assert_eq!(identity.uid_calls(), 2);
 }
 
 /// Helper to fetch latest Job from DB with resourceVersion injected
@@ -250,6 +304,7 @@ async fn test_job_create_loop_observes_live_parallelism_scale_down() {
         &crate::controllers::test_utils::controller_store_for_test(&db),
         pod_reader.as_ref(),
         pod_writer.as_ref(),
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
         pod_reader.as_ref(),
         crate::controllers::test_utils::non_pod_finalization_port_for_test(),
         &job_with_rv,

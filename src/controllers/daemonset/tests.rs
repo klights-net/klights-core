@@ -13,12 +13,22 @@ fn active_pods(items: &[Resource]) -> Vec<&Resource> {
 /// before the Task 18 migration. Builds a `PodRepository` over the supplied
 /// in-memory `Datastore`.
 async fn reconcile_daemonset_test(db: &Datastore, daemonset: &Value) -> anyhow::Result<()> {
+    let identity = crate::controllers::test_utils::deterministic_controller_identity();
+    reconcile_daemonset_test_with_identity(db, daemonset, identity.as_ref()).await
+}
+
+async fn reconcile_daemonset_test_with_identity(
+    db: &Datastore,
+    daemonset: &Value,
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
+) -> anyhow::Result<()> {
     let repo = crate::controllers::test_utils::pod_repository_for_test(db);
     let store = crate::controllers::test_utils::controller_store_for_test(db);
     super::reconcile_daemonset(
         &store,
         repo.as_ref(),
         repo.as_ref(),
+        identity,
         repo.as_ref(),
         crate::controllers::test_utils::non_pod_finalization_port_for_test(),
         &klights_controllers::ControllerCoordination::new(),
@@ -26,6 +36,48 @@ async fn reconcile_daemonset_test(db: &Datastore, daemonset: &Value) -> anyhow::
         chrono::Utc::now(),
     )
     .await
+}
+
+#[tokio::test]
+async fn daemonset_consumes_one_uid_per_pod_and_preserves_five_hex_name_derivation() {
+    let db = setup_db_with_nodes(&["node-1", "node-2"]).await;
+    let created = db
+        .create_resource(
+            "apps/v1",
+            "DaemonSet",
+            Some("test-ns"),
+            "spy-ds",
+            make_daemonset("spy-ds", "spy-ds-uid"),
+        )
+        .await
+        .unwrap();
+    let identity =
+        crate::controllers::test_utils::ScriptedControllerIdentityGenerator::with_uids([
+            "abcde111-0000-4000-8000-000000000000",
+            "f0123222-0000-4000-8000-000000000000",
+        ]);
+
+    reconcile_daemonset_test_with_identity(&db, &created.data, &identity)
+        .await
+        .unwrap();
+
+    let pods = db
+        .list_resources(
+            "v1",
+            "Pod",
+            Some("test-ns"),
+            crate::datastore::ResourceListQuery::all(),
+        )
+        .await
+        .unwrap();
+    let mut names = pods
+        .items
+        .iter()
+        .map(|pod| pod.name.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, ["spy-ds-abcde", "spy-ds-f0123"]);
+    assert_eq!(identity.uid_calls(), 2);
 }
 
 async fn setup_db_with_node(node_name: &str) -> Datastore {
@@ -463,6 +515,8 @@ async fn test_daemonset_creates_controller_revision_for_template() {
 #[tokio::test]
 async fn test_daemonset_rollback_reuses_revision_and_preserves_matching_pod() {
     let db = setup_db_with_nodes(&["node-1", "node-2"]).await;
+    let identity_graph = crate::controllers::test_utils::ControllerIdentityTestGraph::default();
+    let identity = identity_graph.identity();
 
     let ds_v1 = json!({
         "apiVersion": "apps/v1",
@@ -490,7 +544,9 @@ async fn test_daemonset_rollback_reuses_revision_and_preserves_matching_pod() {
         )
         .await
         .unwrap();
-    reconcile_daemonset_test(&db, &created.data).await.unwrap();
+    reconcile_daemonset_test_with_identity(&db, &created.data, identity.as_ref())
+        .await
+        .unwrap();
 
     let after_v1 = db
         .get_resource("apps/v1", "DaemonSet", Some("test-ns"), "rollback-ds")
@@ -520,7 +576,7 @@ async fn test_daemonset_rollback_reuses_revision_and_preserves_matching_pod() {
         )
         .await
         .unwrap();
-    reconcile_daemonset_test(&db, &updated_v2.data)
+    reconcile_daemonset_test_with_identity(&db, &updated_v2.data, identity.as_ref())
         .await
         .unwrap();
 
@@ -578,7 +634,9 @@ async fn test_daemonset_rollback_reuses_revision_and_preserves_matching_pod() {
         )
         .await
         .unwrap();
-    reconcile_daemonset_test(&db, &rollback.data).await.unwrap();
+    reconcile_daemonset_test_with_identity(&db, &rollback.data, identity.as_ref())
+        .await
+        .unwrap();
 
     let pods_after_rollback = db
         .list_resources(
@@ -1313,6 +1371,8 @@ async fn test_daemonset_rolling_update_max_unavailable() {
 #[tokio::test]
 async fn test_daemonset_rolling_update_waits_for_old_pod_final_delete_before_replacement() {
     let db = setup_db_with_nodes(&["node-1", "node-2"]).await;
+    let identity_graph = crate::controllers::test_utils::ControllerIdentityTestGraph::default();
+    let identity = identity_graph.identity();
 
     let mut ds = make_daemonset("nonsurge-ds", "ds-nonsurge-rollout");
     ds["spec"]["updateStrategy"] = json!({
@@ -1325,7 +1385,9 @@ async fn test_daemonset_rolling_update_waits_for_old_pod_final_delete_before_rep
         .await
         .unwrap();
     let ds_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
-    reconcile_daemonset_test(&db, &ds_with_rv).await.unwrap();
+    reconcile_daemonset_test_with_identity(&db, &ds_with_rv, identity.as_ref())
+        .await
+        .unwrap();
     mark_all_daemonset_pods_ready(&db, "test-ns").await;
 
     let current_ds = db
@@ -1348,7 +1410,7 @@ async fn test_daemonset_rolling_update_waits_for_old_pod_final_delete_before_rep
         .unwrap();
     let updated_for_reconcile =
         crate::api::inject_resource_version(updated_ds.data, updated_ds.resource_version);
-    reconcile_daemonset_test(&db, &updated_for_reconcile)
+    reconcile_daemonset_test_with_identity(&db, &updated_for_reconcile, identity.as_ref())
         .await
         .unwrap();
 
@@ -1404,7 +1466,7 @@ async fn test_daemonset_rolling_update_waits_for_old_pod_final_delete_before_rep
         .unwrap();
     let ds_after_final_delete =
         crate::api::inject_resource_version(current_ds.data, current_ds.resource_version);
-    reconcile_daemonset_test(&db, &ds_after_final_delete)
+    reconcile_daemonset_test_with_identity(&db, &ds_after_final_delete, identity.as_ref())
         .await
         .unwrap();
 
@@ -1437,6 +1499,8 @@ async fn test_daemonset_rolling_update_waits_for_old_pod_final_delete_before_rep
 #[tokio::test]
 async fn test_daemonset_rolling_update_waits_when_new_pod_unavailable() {
     let db = setup_db_with_nodes(&["node-1", "node-2"]).await;
+    let identity_graph = crate::controllers::test_utils::ControllerIdentityTestGraph::default();
+    let identity = identity_graph.identity();
 
     let mut ds = make_daemonset("blocked-rollout-ds", "ds-blocked-rollout");
     ds["spec"]["updateStrategy"] = json!({
@@ -1458,7 +1522,9 @@ async fn test_daemonset_rolling_update_waits_when_new_pod_unavailable() {
     let mut ds_with_rv: serde_json::Value = (*created.data).clone();
     ds_with_rv["metadata"]["resourceVersion"] = json!(created.resource_version.to_string());
 
-    reconcile_daemonset_test(&db, &ds_with_rv).await.unwrap();
+    reconcile_daemonset_test_with_identity(&db, &ds_with_rv, identity.as_ref())
+        .await
+        .unwrap();
 
     let initial_pods = db
         .list_resources(
@@ -1499,7 +1565,7 @@ async fn test_daemonset_rolling_update_waits_when_new_pod_unavailable() {
     let mut updated_for_reconcile: serde_json::Value = (*updated_ds.data).clone();
     updated_for_reconcile["metadata"]["resourceVersion"] =
         json!(updated_ds.resource_version.to_string());
-    reconcile_daemonset_test(&db, &updated_for_reconcile)
+    reconcile_daemonset_test_with_identity(&db, &updated_for_reconcile, identity.as_ref())
         .await
         .unwrap();
 
@@ -1543,7 +1609,9 @@ async fn test_daemonset_rolling_update_waits_when_new_pod_unavailable() {
     let mut ds_for_second: serde_json::Value = (*ds_after_first.data).clone();
     ds_for_second["metadata"]["resourceVersion"] =
         json!(ds_after_first.resource_version.to_string());
-    reconcile_daemonset_test(&db, &ds_for_second).await.unwrap();
+    reconcile_daemonset_test_with_identity(&db, &ds_for_second, identity.as_ref())
+        .await
+        .unwrap();
 
     let ds_after_second = db
         .get_resource(
@@ -1558,7 +1626,9 @@ async fn test_daemonset_rolling_update_waits_when_new_pod_unavailable() {
     let mut ds_for_third: serde_json::Value = (*ds_after_second.data).clone();
     ds_for_third["metadata"]["resourceVersion"] =
         json!(ds_after_second.resource_version.to_string());
-    reconcile_daemonset_test(&db, &ds_for_third).await.unwrap();
+    reconcile_daemonset_test_with_identity(&db, &ds_for_third, identity.as_ref())
+        .await
+        .unwrap();
 
     let pods_after_second = db
         .list_resources(
@@ -1871,6 +1941,8 @@ async fn test_daemonset_skips_reconcile_when_deletion_timestamp_set() {
 #[tokio::test]
 async fn test_daemonset_replaces_failed_pod() {
     let db = setup_db_with_node("node-1").await;
+    let identity_graph = crate::controllers::test_utils::ControllerIdentityTestGraph::default();
+    let identity = identity_graph.identity();
 
     let ds = make_daemonset("fail-ds", "ds-uid-fail");
     let created = db
@@ -1886,7 +1958,9 @@ async fn test_daemonset_replaces_failed_pod() {
     let ds_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
 
     // First reconcile: creates 1 pod
-    reconcile_daemonset_test(&db, &ds_with_rv).await.unwrap();
+    reconcile_daemonset_test_with_identity(&db, &ds_with_rv, identity.as_ref())
+        .await
+        .unwrap();
 
     let pods = db
         .list_resources(
@@ -1924,7 +1998,9 @@ async fn test_daemonset_replaces_failed_pod() {
         .unwrap();
     let ds_with_rv2 =
         crate::api::inject_resource_version(current_ds.data, current_ds.resource_version);
-    reconcile_daemonset_test(&db, &ds_with_rv2).await.unwrap();
+    reconcile_daemonset_test_with_identity(&db, &ds_with_rv2, identity.as_ref())
+        .await
+        .unwrap();
 
     let pods_after = db
         .list_resources(

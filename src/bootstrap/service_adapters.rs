@@ -4,6 +4,7 @@ pub(crate) struct ApiServiceWriteAllocator {
     db: crate::datastore::DatastoreHandle,
     service_ipam: Arc<klights_controllers::service::ServiceIpam>,
     nodeport_alloc: Arc<klights_controllers::service::NodePortAllocator>,
+    identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
 }
 
 impl ApiServiceWriteAllocator {
@@ -11,11 +12,13 @@ impl ApiServiceWriteAllocator {
         db: crate::datastore::DatastoreHandle,
         service_ipam: Arc<klights_controllers::service::ServiceIpam>,
         nodeport_alloc: Arc<klights_controllers::service::NodePortAllocator>,
+        identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,
             service_ipam,
             nodeport_alloc,
+            identity,
         })
     }
 }
@@ -78,6 +81,7 @@ impl klights_reconcile_api::ServiceWriteAllocator for ApiServiceWriteAllocator {
                 &self.service_ipam,
                 &self.nodeport_alloc,
                 chrono::Utc::now(),
+                self.identity.as_ref(),
             )
             .await
             .map_err(|error| {

@@ -23,13 +23,21 @@ mod tests {
 
     #[test]
     fn test_replicaset_controller_name() {
-        assert_eq!(ReplicaSetController.name(), "replicaset");
+        assert_eq!(
+            ReplicaSetController::new(
+                crate::controllers::test_utils::deterministic_controller_identity()
+            )
+            .name(),
+            "replicaset"
+        );
     }
 
     #[tokio::test]
     async fn test_replicaset_controller_reconcile_creates_pods() {
         let db = crate::datastore::test_support::in_memory().await;
-        let controller = ReplicaSetController;
+        let controller = ReplicaSetController::new(
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        );
 
         let rs = store_and_prepare(
             &db,
@@ -81,7 +89,9 @@ mod tests {
     async fn test_replicaset_controller_reconcile_missing_spec_returns_error() {
         let db = crate::datastore::test_support::in_memory().await;
         let ctx = Context::new(std::sync::Arc::new(db), "test-node".to_string());
-        let controller = ReplicaSetController;
+        let controller = ReplicaSetController::new(
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        );
 
         let bad = json!({"metadata": {"name": "x", "namespace": "default", "uid": "u"}});
         assert!(controller.reconcile(bad, ctx).await.is_err());

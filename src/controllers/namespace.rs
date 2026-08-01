@@ -51,6 +51,7 @@ pub async fn init_default_namespaces_with_ca_path<S: NamespaceBootstrapStore + ?
     store: &S,
     ca_cert_path: &std::path::Path,
     now: chrono::DateTime<chrono::Utc>,
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
 ) -> Result<()> {
     // Read CA cert once (will be used for all namespaces)
     let ca_cert_pem = klights_supervisor::runtime_fs::read_utf8_async(file_process, ca_cert_path)
@@ -68,7 +69,7 @@ pub async fn init_default_namespaces_with_ca_path<S: NamespaceBootstrapStore + ?
                     creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
                         now,
                     )),
-                    uid: Some(uuid::Uuid::new_v4().to_string()),
+                    uid: Some(identity.new_uid()),
                     ..Default::default()
                 },
                 spec: Some(NamespaceSpec {
@@ -86,7 +87,7 @@ pub async fn init_default_namespaces_with_ca_path<S: NamespaceBootstrapStore + ?
             tracing::info!("Created default namespace: {}", ns_name);
 
             // Create default ServiceAccount in the namespace
-            create_default_service_account_at(store, ns_name, now).await?;
+            create_default_service_account_at(store, ns_name, now, identity).await?;
         }
 
         // Create kube-root-ca.crt ConfigMap in the namespace (whether new or existing)
@@ -98,7 +99,8 @@ pub async fn init_default_namespaces_with_ca_path<S: NamespaceBootstrapStore + ?
                 .is_some();
 
             if !cm_exists
-                && let Err(e) = create_kube_root_ca_configmap_at(store, ns_name, ca_pem, now).await
+                && let Err(e) =
+                    create_kube_root_ca_configmap_at(store, ns_name, ca_pem, now, identity).await
             {
                 tracing::warn!(
                     "Failed to create kube-root-ca.crt ConfigMap in namespace {}: {:#}",
@@ -109,8 +111,10 @@ pub async fn init_default_namespaces_with_ca_path<S: NamespaceBootstrapStore + ?
 
             // The aggregator auth ConfigMap is expected in kube-system for extension API servers.
             if ns_name == "kube-system"
-                && let Err(e) =
-                    reconcile_extension_apiserver_authentication_configmap(store, ca_pem, now).await
+                && let Err(e) = reconcile_extension_apiserver_authentication_configmap(
+                    store, ca_pem, now, identity,
+                )
+                .await
             {
                 tracing::warn!(
                     "Failed to reconcile extension-apiserver-authentication ConfigMap: {:#}",
@@ -135,14 +139,22 @@ pub async fn init_default_namespaces<S: NamespaceBootstrapStore + ?Sized>(
 ) -> Result<()> {
     let namespace = crate::paths::runtime_namespace();
     let ca_cert_path = crate::paths::ca_cert_path(&namespace);
-    init_default_namespaces_with_ca_path(file_process, store, &ca_cert_path, chrono::Utc::now())
-        .await
+    let identity = crate::controllers::test_utils::deterministic_controller_identity();
+    init_default_namespaces_with_ca_path(
+        file_process,
+        store,
+        &ca_cert_path,
+        chrono::Utc::now(),
+        identity.as_ref(),
+    )
+    .await
 }
 
 pub async fn create_default_service_account_at<S: NamespaceBootstrapStore + ?Sized>(
     store: &S,
     namespace: &str,
     now: chrono::DateTime<chrono::Utc>,
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
 ) -> Result<()> {
     let sa = serde_json::json!({
         "apiVersion": "v1",
@@ -151,7 +163,7 @@ pub async fn create_default_service_account_at<S: NamespaceBootstrapStore + ?Siz
             "name": "default",
             "namespace": namespace,
             "creationTimestamp": klights_cluster_core::k8s_time::format_time(now),
-            "uid": uuid::Uuid::new_v4().to_string()
+            "uid": identity.new_uid()
         },
         "secrets": []
     });
@@ -167,7 +179,8 @@ pub async fn create_default_service_account<S: NamespaceBootstrapStore + ?Sized>
     store: &S,
     namespace: &str,
 ) -> Result<()> {
-    create_default_service_account_at(store, namespace, chrono::Utc::now()).await
+    let identity = crate::controllers::test_utils::deterministic_controller_identity();
+    create_default_service_account_at(store, namespace, chrono::Utc::now(), identity.as_ref()).await
 }
 
 /// Reconcile the default ServiceAccount in a namespace.
@@ -179,6 +192,7 @@ pub async fn reconcile_default_service_account_at<S: NamespaceBootstrapStore + ?
     store: &S,
     namespace: &str,
     now: chrono::DateTime<chrono::Utc>,
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
 ) -> Result<()> {
     if namespace_absent_or_terminating(store, namespace).await? {
         return Ok(());
@@ -190,7 +204,7 @@ pub async fn reconcile_default_service_account_at<S: NamespaceBootstrapStore + ?
     {
         return Ok(());
     }
-    create_default_service_account_at(store, namespace, now).await
+    create_default_service_account_at(store, namespace, now, identity).await
 }
 
 #[cfg(test)]
@@ -198,7 +212,9 @@ pub async fn reconcile_default_service_account<S: NamespaceBootstrapStore + ?Siz
     store: &S,
     namespace: &str,
 ) -> Result<()> {
-    reconcile_default_service_account_at(store, namespace, chrono::Utc::now()).await
+    let identity = crate::controllers::test_utils::deterministic_controller_identity();
+    reconcile_default_service_account_at(store, namespace, chrono::Utc::now(), identity.as_ref())
+        .await
 }
 
 pub async fn create_kube_root_ca_configmap_at<S: NamespaceBootstrapStore + ?Sized>(
@@ -206,6 +222,7 @@ pub async fn create_kube_root_ca_configmap_at<S: NamespaceBootstrapStore + ?Size
     namespace: &str,
     ca_cert_pem: &str,
     now: chrono::DateTime<chrono::Utc>,
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
 ) -> Result<()> {
     let cm = serde_json::json!({
         "apiVersion": "v1",
@@ -214,7 +231,7 @@ pub async fn create_kube_root_ca_configmap_at<S: NamespaceBootstrapStore + ?Size
             "name": "kube-root-ca.crt",
             "namespace": namespace,
             "creationTimestamp": klights_cluster_core::k8s_time::format_time(now),
-            "uid": uuid::Uuid::new_v4().to_string()
+            "uid": identity.new_uid()
         },
         "data": {
             "ca.crt": ca_cert_pem
@@ -238,7 +255,15 @@ pub async fn create_kube_root_ca_configmap<S: NamespaceBootstrapStore + ?Sized>(
     namespace: &str,
     ca_cert_pem: &str,
 ) -> Result<()> {
-    create_kube_root_ca_configmap_at(store, namespace, ca_cert_pem, chrono::Utc::now()).await
+    let identity = crate::controllers::test_utils::deterministic_controller_identity();
+    create_kube_root_ca_configmap_at(
+        store,
+        namespace,
+        ca_cert_pem,
+        chrono::Utc::now(),
+        identity.as_ref(),
+    )
+    .await
 }
 
 /// Check if a namespace is absent or terminating.
@@ -265,6 +290,7 @@ pub async fn reconcile_kube_root_ca_with_path<S: NamespaceBootstrapStore + ?Size
     namespace: &str,
     ca_cert_path: &std::path::Path,
     now: chrono::DateTime<chrono::Utc>,
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
 ) -> Result<()> {
     if namespace_absent_or_terminating(store, namespace).await? {
         return Ok(());
@@ -289,7 +315,7 @@ pub async fn reconcile_kube_root_ca_with_path<S: NamespaceBootstrapStore + ?Size
             }
         };
 
-    create_kube_root_ca_configmap_at(store, namespace, &ca_pem, now).await
+    create_kube_root_ca_configmap_at(store, namespace, &ca_pem, now, identity).await
 }
 
 #[cfg(test)]
@@ -306,6 +332,7 @@ pub async fn reconcile_kube_root_ca<S: NamespaceBootstrapStore + ?Sized>(
         namespace,
         &ca_cert_path,
         chrono::Utc::now(),
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
     )
     .await
 }
@@ -320,6 +347,7 @@ pub async fn reconcile_kube_root_ca_data_with_path<S: NamespaceBootstrapStore + 
     namespace: &str,
     ca_cert_path: &std::path::Path,
     now: chrono::DateTime<chrono::Utc>,
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
 ) -> Result<()> {
     if namespace_absent_or_terminating(store, namespace).await? {
         return Ok(());
@@ -338,7 +366,7 @@ pub async fn reconcile_kube_root_ca_data_with_path<S: NamespaceBootstrapStore + 
     // Get current CM and update its data
     let Some(cm) = store.get_configmap(namespace, "kube-root-ca.crt").await? else {
         // CM doesn't exist, use the create path
-        return create_kube_root_ca_configmap_at(store, namespace, &ca_pem, now).await;
+        return create_kube_root_ca_configmap_at(store, namespace, &ca_pem, now, identity).await;
     };
 
     // Check if data already matches
@@ -381,6 +409,7 @@ pub async fn reconcile_kube_root_ca_data<S: NamespaceBootstrapStore + ?Sized>(
         namespace,
         &ca_cert_path,
         chrono::Utc::now(),
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
     )
     .await
 }
@@ -391,8 +420,9 @@ pub async fn create_extension_apiserver_authentication_configmap_at<
     store: &S,
     ca_cert_pem: &str,
     now: chrono::DateTime<chrono::Utc>,
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
 ) -> Result<()> {
-    let cm = extension_apiserver_authentication_configmap(ca_cert_pem, now);
+    let cm = extension_apiserver_authentication_configmap(ca_cert_pem, now, identity);
 
     store
         .create_configmap("kube-system", "extension-apiserver-authentication", cm)
@@ -409,8 +439,13 @@ pub async fn create_extension_apiserver_authentication_configmap<
     store: &S,
     ca_cert_pem: &str,
 ) -> Result<()> {
-    create_extension_apiserver_authentication_configmap_at(store, ca_cert_pem, chrono::Utc::now())
-        .await
+    create_extension_apiserver_authentication_configmap_at(
+        store,
+        ca_cert_pem,
+        chrono::Utc::now(),
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+    )
+    .await
 }
 
 async fn reconcile_extension_apiserver_authentication_configmap<
@@ -419,8 +454,9 @@ async fn reconcile_extension_apiserver_authentication_configmap<
     store: &S,
     ca_cert_pem: &str,
     now: chrono::DateTime<chrono::Utc>,
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
 ) -> Result<()> {
-    let desired = extension_apiserver_authentication_configmap(ca_cert_pem, now);
+    let desired = extension_apiserver_authentication_configmap(ca_cert_pem, now, identity);
     let desired_data = desired["data"].clone();
     let Some(existing) = store
         .get_configmap("kube-system", "extension-apiserver-authentication")
@@ -456,6 +492,7 @@ async fn reconcile_extension_apiserver_authentication_configmap<
 fn extension_apiserver_authentication_configmap(
     ca_cert_pem: &str,
     now: chrono::DateTime<chrono::Utc>,
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
 ) -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "v1",
@@ -464,7 +501,7 @@ fn extension_apiserver_authentication_configmap(
             "name": "extension-apiserver-authentication",
             "namespace": "kube-system",
             "creationTimestamp": klights_cluster_core::k8s_time::format_time(now),
-            "uid": uuid::Uuid::new_v4().to_string()
+            "uid": identity.new_uid()
         },
         "data": {
             "client-ca-file": ca_cert_pem,
@@ -560,6 +597,7 @@ mod tests {
                 db,
                 &self.ca_cert_path,
                 "2026-01-01T00:00:00Z".parse().expect("fixed test time"),
+                crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
             )
             .await
         }
@@ -576,6 +614,7 @@ mod tests {
                 namespace,
                 &self.ca_cert_path,
                 "2026-01-01T00:00:00Z".parse().expect("fixed test time"),
+                crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
             )
             .await
         }
@@ -671,6 +710,38 @@ mod tests {
             assert_eq!(sa_data["metadata"]["name"], "default");
             assert_eq!(sa_data["metadata"]["namespace"], ns_name);
         }
+    }
+
+    #[tokio::test]
+    async fn namespace_service_account_consumes_injected_uid_exactly_once() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let identity =
+            crate::controllers::test_utils::ScriptedControllerIdentityGenerator::with_uids([
+                "abcdef12-3456-4000-8000-000000000000",
+            ]);
+
+        create_default_service_account_at(
+            &db,
+            "identity-spy",
+            "2026-01-01T00:00:00Z".parse().expect("fixed test time"),
+            &identity,
+        )
+        .await
+        .unwrap();
+
+        let service_account = db
+            .get_resource("v1", "ServiceAccount", Some("identity-spy"), "default")
+            .await
+            .unwrap()
+            .expect("default ServiceAccount");
+        assert_eq!(
+            service_account
+                .data
+                .pointer("/metadata/uid")
+                .and_then(serde_json::Value::as_str),
+            Some("abcdef12-3456-4000-8000-000000000000"),
+        );
+        assert_eq!(identity.uid_calls(), 1);
     }
 
     #[tokio::test]

@@ -363,6 +363,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let api_runtime_inputs =
         crate::api::ApiRuntimeInputs::new(api_runtime_paths.clone(), config.api_slow_log_threshold)
             .context("invalid API runtime inputs")?;
+    let controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator> =
+        Arc::new(crate::resource_name::SystemControllerIdentityGenerator);
 
     // T2 step 2: leader-capable nodes gate one-time init on lease
     // acquisition. For a seed boot the raft node is already leader by
@@ -398,6 +400,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             db,
             &api_runtime_paths.ca_cert,
             chrono::Utc::now(),
+            controller_identity.as_ref(),
         )
         .await
         .context("Failed to initialize default namespaces")?;
@@ -508,6 +511,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         Some(services.clone()),
         Some(supervisor.clone()),
         Some(db_handle.clone()),
+        controller_identity.clone(),
     ));
     let non_pod_finalization: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort> = Arc::new(
         crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db_handle.clone()),
@@ -561,6 +565,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 scheduling_mode,
                 outbox: Some(outbox_runtime.clone()),
                 cluster_api: Some(leader_ports.resource_query.clone()),
+                controller_identity: controller_identity.clone(),
                 #[cfg(test)]
                 scheduler_bind_gate: None,
                 #[cfg(not(test))]
@@ -696,6 +701,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     scheduling_mode,
                     outbox: Some(outbox_runtime.clone()),
                     cluster_api: Some(leader_ports.resource_query.clone()),
+                    controller_identity: controller_identity.clone(),
                     #[cfg(test)]
                     scheduler_bind_gate: None,
                     #[cfg(not(test))]
@@ -783,6 +789,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         controller_coordination.clone(),
         Arc::from(config.node_name.as_str()),
         node_metrics.clone(),
+        controller_identity.clone(),
     ));
     let controller_dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new_complete(
         service_ipam.clone(),
@@ -791,6 +798,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         csr_issuer,
         hpa_controller,
         controller_dependencies,
+        controller_identity.clone(),
     ));
     side_effects.set_controller_dispatcher(controller_dispatcher.clone());
     local_api_client.set_controller_dispatcher(controller_dispatcher.clone());
@@ -947,6 +955,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
         supervisor.clone(),
         api_runtime_paths.ca_cert.clone(),
+        controller_identity.clone(),
     );
     #[cfg(test)]
     let watcher_state = Arc::new(api::ApiState::new(
@@ -1036,6 +1045,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 db_handle.clone(),
                 service_ipam.clone(),
                 nodeport_alloc.clone(),
+                controller_identity.clone(),
             ),
             #[cfg(test)]
             service_ipam.clone(),
@@ -1406,6 +1416,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             api_pod_repository.clone(),
             &crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db_handle.clone()),
             controller_coordination.as_ref(),
+            controller_identity.as_ref(),
             crate::coredns_bootstrap_adapter::CoreDnsBootstrapConfig {
                 tls_port: config.tls_port,
                 service_cidr: &config.service_cidr,
@@ -1743,6 +1754,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             db_handle.clone(),
             service_ipam.clone(),
             nodeport_alloc.clone(),
+            controller_identity.clone(),
         ),
         controller_dispatcher.clone(),
         crate::api_state_adapter::RootApiFailureMetrics::new(metrics.clone()),

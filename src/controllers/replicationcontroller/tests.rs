@@ -28,6 +28,7 @@ async fn reconcile_replicationcontroller(
         &store,
         pod_reader,
         pod_writer,
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
         pod_delete_sink,
         non_pod_finalization,
         rc,
@@ -395,17 +396,83 @@ async fn reconcile_rc_test(
     rc: &Value,
     node_name: &str,
 ) -> Result<()> {
+    let identity = crate::controllers::test_utils::deterministic_controller_identity();
+    reconcile_rc_test_with_identity(db, rc, node_name, identity.as_ref()).await
+}
+
+async fn reconcile_rc_test_with_identity(
+    db: &crate::datastore::sqlite::Datastore,
+    rc: &Value,
+    node_name: &str,
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
+) -> Result<()> {
     let repo = crate::controllers::test_utils::pod_repository_for_test(db);
-    reconcile_replicationcontroller(
-        db,
+    let store = crate::controllers::test_utils::controller_store_for_test(db);
+    super::reconcile_replicationcontroller(
+        &store,
         repo.as_ref(),
         repo.as_ref(),
+        identity,
         repo.as_ref(),
         crate::controllers::test_utils::non_pod_finalization_port_for_test(),
         rc,
-        node_name,
+        crate::controllers::test_reconcile_context(coordination(), node_name),
     )
     .await
+}
+
+#[tokio::test]
+async fn replicationcontroller_consumes_one_uid_per_pod_and_preserves_eight_hex_name_derivation() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let rc = json!({
+        "apiVersion": "v1",
+        "kind": "ReplicationController",
+        "metadata": {"name": "spy-rc", "namespace": "default", "uid": "spy-rc-uid"},
+        "spec": {
+            "replicas": 2,
+            "selector": {"app": "spy-rc"},
+            "template": {
+                "metadata": {"labels": {"app": "spy-rc"}},
+                "spec": {"containers": [{"name": "app", "image": "busybox"}]}
+            }
+        }
+    });
+    db.create_resource(
+        "v1",
+        "ReplicationController",
+        Some("default"),
+        "spy-rc",
+        rc.clone(),
+    )
+    .await
+    .unwrap();
+    let identity =
+        crate::controllers::test_utils::ScriptedControllerIdentityGenerator::with_uids([
+            "abcdef12-0000-4000-8000-000000000000",
+            "1234abcd-0000-4000-8000-000000000000",
+        ]);
+
+    reconcile_rc_test_with_identity(&db, &rc, "test-node", &identity)
+        .await
+        .unwrap();
+
+    let pods = db
+        .list_resources(
+            "v1",
+            "Pod",
+            Some("default"),
+            crate::datastore::ResourceListQuery::all(),
+        )
+        .await
+        .unwrap();
+    let mut names = pods
+        .items
+        .iter()
+        .map(|pod| pod.name.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, ["spy-rc-1234abcd", "spy-rc-abcdef12"]);
+    assert_eq!(identity.uid_calls(), 2);
 }
 
 #[tokio::test]
@@ -1295,6 +1362,8 @@ async fn test_rc_create_pod_has_apiversion_kind_status_and_labels() {
 #[tokio::test]
 async fn test_rc_releases_pod_when_selector_changes() {
     let db = crate::datastore::test_support::in_memory().await;
+    let identity_graph = crate::controllers::test_utils::ControllerIdentityTestGraph::default();
+    let identity = identity_graph.identity();
 
     db.create_resource(
         "v1",
@@ -1330,7 +1399,7 @@ async fn test_rc_releases_pod_when_selector_changes() {
     .await
     .unwrap();
 
-    reconcile_rc_test(&db, &rc_initial, "test-node")
+    reconcile_rc_test_with_identity(&db, &rc_initial, "test-node", identity.as_ref())
         .await
         .unwrap();
 
@@ -1374,7 +1443,7 @@ async fn test_rc_releases_pod_when_selector_changes() {
     .await
     .unwrap();
 
-    reconcile_rc_test(&db, &rc_updated, "test-node")
+    reconcile_rc_test_with_identity(&db, &rc_updated, "test-node", identity.as_ref())
         .await
         .unwrap();
 

@@ -75,6 +75,7 @@ pub struct PodRepositoryBuildConfig {
     pub scheduling_mode: PodSchedulingMode,
     pub outbox: Option<Arc<klights_kubelet::node_outbox::Outbox>>,
     pub cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
+    pub controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     #[cfg(test)]
     pub(crate) scheduler_bind_gate:
         Option<Arc<crate::pod_native_adapter::SchedulerBindGateForTest>>,
@@ -100,6 +101,7 @@ struct RootPodRepositoryComposition {
     metrics: Arc<SideEffectMetrics>,
     gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
+    controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     #[cfg(test)]
     scheduler_bind_gate: Option<Arc<crate::pod_native_adapter::SchedulerBindGateForTest>>,
 }
@@ -930,6 +932,7 @@ impl RootPodRepositoryComposition {
                 self.side_effects.clone(),
                 dependencies.store.clone(),
                 self.gc_coordination.clone(),
+                self.controller_identity.clone(),
             ),
         );
         let native = crate::pod_native_adapter::RootPodNativeAdapter::new(
@@ -1041,6 +1044,7 @@ pub(crate) fn build_pod_repository_parts(
         scheduling_mode,
         outbox,
         cluster_api,
+        controller_identity,
         #[cfg(test)]
         scheduler_bind_gate,
         #[cfg(not(test))]
@@ -1111,6 +1115,7 @@ pub(crate) fn build_pod_repository_parts(
         metrics: metrics.clone(),
         gc_coordination,
         wall_clock: Arc::new(klights_supervisor::SystemWallClock),
+        controller_identity,
         #[cfg(test)]
         scheduler_bind_gate,
     }

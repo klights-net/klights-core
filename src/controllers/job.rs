@@ -853,6 +853,7 @@ pub(crate) async fn reconcile_job(
     db: &(impl JobStore + ?Sized),
     pod_reader: &(impl PodQuery + ?Sized),
     pod_writer: &(impl JobPodMutation + ?Sized),
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     job: &Value,
@@ -1303,11 +1304,7 @@ pub(crate) async fn reconcile_job(
                     "{}-{}-{}",
                     name,
                     idx,
-                    uuid::Uuid::new_v4()
-                        .to_string()
-                        .chars()
-                        .take(5)
-                        .collect::<String>()
+                    identity.new_uid().chars().take(5).collect::<String>()
                 );
 
                 let idx_str = idx.to_string();
@@ -1376,11 +1373,7 @@ pub(crate) async fn reconcile_job(
                 let pod_name = format!(
                     "{}-{}",
                     name,
-                    uuid::Uuid::new_v4()
-                        .to_string()
-                        .chars()
-                        .take(5)
-                        .collect::<String>()
+                    identity.new_uid().chars().take(5).collect::<String>()
                 );
 
                 let pod = crate::controllers::common::build_child_pod(

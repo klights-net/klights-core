@@ -23,13 +23,21 @@ mod tests {
 
     #[test]
     fn test_deployment_controller_name() {
-        assert_eq!(DeploymentController.name(), "deployment");
+        assert_eq!(
+            DeploymentController::new(
+                crate::controllers::test_utils::deterministic_controller_identity()
+            )
+            .name(),
+            "deployment"
+        );
     }
 
     #[tokio::test]
     async fn test_deployment_controller_reconcile_creates_replicaset() {
         let db = crate::datastore::test_support::in_memory().await;
-        let controller = DeploymentController;
+        let controller = DeploymentController::new(
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        );
 
         let deployment = store_and_prepare(
             &db,
@@ -84,7 +92,9 @@ mod tests {
     async fn test_deployment_controller_reconcile_missing_metadata_returns_error() {
         let db = crate::datastore::test_support::in_memory().await;
         let ctx = Context::new(std::sync::Arc::new(db), "test-node".to_string());
-        let controller = DeploymentController;
+        let controller = DeploymentController::new(
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        );
 
         let bad_resource = json!({"spec": {}});
         assert!(controller.reconcile(bad_resource, ctx).await.is_err());

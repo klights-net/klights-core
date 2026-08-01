@@ -97,11 +97,23 @@ impl ControllerDispatcher {
     /// Create a new controller dispatcher with all available controllers
     #[cfg(test)]
     pub fn new(service_ipam: Arc<ServiceIpam>) -> Self {
-        Self::with_task_supervisor(
+        Self::new_with_identity(
+            service_ipam,
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_identity(
+        service_ipam: Arc<ServiceIpam>,
+        identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
+    ) -> Self {
+        Self::with_task_supervisor_and_identity(
             service_ipam,
             Arc::new(klights_supervisor::TaskSupervisor::new(
                 klights_supervisor::TaskCategoryConfig::default(),
             )),
+            identity,
         )
     }
 
@@ -110,11 +122,25 @@ impl ControllerDispatcher {
         service_ipam: Arc<ServiceIpam>,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
+        Self::with_task_supervisor_and_identity(
+            service_ipam,
+            task_supervisor,
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_task_supervisor_and_identity(
+        service_ipam: Arc<ServiceIpam>,
+        task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
+        identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
+    ) -> Self {
         Self::new_with_nodeport(
             service_ipam,
             Arc::new(NodePortAllocator::new()),
             task_supervisor,
             None,
+            identity,
         )
     }
 
@@ -124,6 +150,7 @@ impl ControllerDispatcher {
         nodeport_alloc: Arc<NodePortAllocator>,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
         csr_issuer: Option<Arc<dyn crate::controllers::csr_signer::CsrIssuer>>,
+        identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Self {
         let mut controllers: HashMap<(&'static str, &'static str), Arc<dyn Controller>> =
             HashMap::new();
@@ -131,29 +158,30 @@ impl ControllerDispatcher {
         // Register all controllers by (apiVersion, kind)
         controllers.insert(
             ("apps/v1", "Deployment"),
-            Arc::new(DeploymentController) as Arc<dyn Controller>,
+            Arc::new(DeploymentController::new(identity.clone())) as Arc<dyn Controller>,
         );
         controllers.insert(
             ("apps/v1", "ReplicaSet"),
-            Arc::new(ReplicaSetController) as Arc<dyn Controller>,
+            Arc::new(ReplicaSetController::new(identity.clone())) as Arc<dyn Controller>,
         );
         controllers.insert(
             ("apps/v1", "StatefulSet"),
-            Arc::new(StatefulSetController) as Arc<dyn Controller>,
+            Arc::new(StatefulSetController::new(identity.clone())) as Arc<dyn Controller>,
         );
         controllers.insert(
             ("apps/v1", "DaemonSet"),
-            Arc::new(DaemonSetController) as Arc<dyn Controller>,
+            Arc::new(DaemonSetController::new(identity.clone())) as Arc<dyn Controller>,
         );
         controllers.insert(
             ("batch/v1", "Job"),
-            Arc::new(JobController) as Arc<dyn Controller>,
+            Arc::new(JobController::new(identity.clone())) as Arc<dyn Controller>,
         );
         controllers.insert(
             ("v1", "Service"),
             Arc::new(ServiceController {
                 service_ipam: service_ipam.clone(),
                 nodeport_alloc: nodeport_alloc.clone(),
+                identity: identity.clone(),
             }) as Arc<dyn Controller>,
         );
         controllers.insert(
@@ -162,7 +190,7 @@ impl ControllerDispatcher {
         );
         controllers.insert(
             ("v1", "ReplicationController"),
-            Arc::new(ReplicationControllerController) as Arc<dyn Controller>,
+            Arc::new(ReplicationControllerController::new(identity.clone())) as Arc<dyn Controller>,
         );
         controllers.insert(
             ("policy/v1", "PodDisruptionBudget"),
@@ -170,11 +198,13 @@ impl ControllerDispatcher {
         );
         controllers.insert(
             ("autoscaling/v1", "HorizontalPodAutoscaler"),
-            Arc::new(HpaController) as Arc<dyn Controller>,
+            Arc::new(HpaController {
+                identity: identity.clone(),
+            }) as Arc<dyn Controller>,
         );
         controllers.insert(
             ("autoscaling/v2", "HorizontalPodAutoscaler"),
-            Arc::new(HpaController) as Arc<dyn Controller>,
+            Arc::new(HpaController { identity }) as Arc<dyn Controller>,
         );
         controllers.insert(
             ("apiregistration.k8s.io/v1", "APIService"),
@@ -209,25 +239,42 @@ impl ControllerDispatcher {
         nodeport_alloc: Arc<NodePortAllocator>,
         csr_issuer: Option<Arc<dyn crate::controllers::csr_signer::CsrIssuer>>,
         hpa_controller: Arc<dyn Controller>,
+        identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> HashMap<(&'static str, &'static str), Arc<dyn Controller>> {
         let mut controllers: HashMap<(&'static str, &'static str), Arc<dyn Controller>> =
             HashMap::new();
-        controllers.insert(("apps/v1", "Deployment"), Arc::new(DeploymentController));
-        controllers.insert(("apps/v1", "ReplicaSet"), Arc::new(ReplicaSetController));
-        controllers.insert(("apps/v1", "StatefulSet"), Arc::new(StatefulSetController));
-        controllers.insert(("apps/v1", "DaemonSet"), Arc::new(DaemonSetController));
-        controllers.insert(("batch/v1", "Job"), Arc::new(JobController));
+        controllers.insert(
+            ("apps/v1", "Deployment"),
+            Arc::new(DeploymentController::new(identity.clone())),
+        );
+        controllers.insert(
+            ("apps/v1", "ReplicaSet"),
+            Arc::new(ReplicaSetController::new(identity.clone())),
+        );
+        controllers.insert(
+            ("apps/v1", "StatefulSet"),
+            Arc::new(StatefulSetController::new(identity.clone())),
+        );
+        controllers.insert(
+            ("apps/v1", "DaemonSet"),
+            Arc::new(DaemonSetController::new(identity.clone())),
+        );
+        controllers.insert(
+            ("batch/v1", "Job"),
+            Arc::new(JobController::new(identity.clone())),
+        );
         controllers.insert(
             ("v1", "Service"),
             Arc::new(ServiceController {
                 service_ipam,
                 nodeport_alloc,
+                identity: identity.clone(),
             }),
         );
         controllers.insert(("v1", "PersistentVolumeClaim"), Arc::new(PVCController));
         controllers.insert(
             ("v1", "ReplicationController"),
-            Arc::new(ReplicationControllerController),
+            Arc::new(ReplicationControllerController::new(identity)),
         );
         controllers.insert(
             ("policy/v1", "PodDisruptionBudget"),
@@ -264,9 +311,15 @@ impl ControllerDispatcher {
         csr_issuer: Option<Arc<dyn crate::controllers::csr_signer::CsrIssuer>>,
         hpa_controller: Arc<dyn Controller>,
         dependencies: ControllerRuntimeDependencies,
+        identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Self {
-        let mut controllers =
-            Self::controller_registry(service_ipam, nodeport_alloc, csr_issuer, hpa_controller);
+        let mut controllers = Self::controller_registry(
+            service_ipam,
+            nodeport_alloc,
+            csr_issuer,
+            hpa_controller,
+            identity,
+        );
         let runtime = Arc::new(DispatcherRuntime::new(task_supervisor));
         let coordination = dependencies.coordination.clone();
         Self {
@@ -285,6 +338,7 @@ impl ControllerDispatcher {
         csr_issuer: Option<Arc<dyn crate::controllers::csr_signer::CsrIssuer>>,
         hpa_controller: Arc<dyn Controller>,
         dependencies: ControllerRuntimeDependencies,
+        identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Self {
         Self {
             controllers: Self::controller_registry(
@@ -292,6 +346,7 @@ impl ControllerDispatcher {
                 nodeport_alloc,
                 csr_issuer,
                 hpa_controller,
+                identity,
             ),
             runtime: Arc::new(DispatcherRuntime::new(task_supervisor.clone())),
             sync_ctx: Arc::new(Mutex::new(None)),

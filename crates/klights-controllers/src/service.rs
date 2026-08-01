@@ -586,6 +586,7 @@ pub async fn reconcile_service(
     service_ipam: &ServiceIpam,
 ) -> Result<Value> {
     let default_alloc = NodePortAllocator::new();
+    let identity = crate::identity::DeterministicControllerIdentityGenerator::default();
     reconcile_service_with_nodeport_at(
         db,
         pod_reader,
@@ -593,6 +594,7 @@ pub async fn reconcile_service(
         service_ipam,
         &default_alloc,
         chrono::Utc::now(),
+        &identity,
     )
     .await
 }
@@ -604,6 +606,7 @@ pub async fn reconcile_service_with_nodeport_at(
     service_ipam: &ServiceIpam,
     nodeport_alloc: &NodePortAllocator,
     now: chrono::DateTime<chrono::Utc>,
+    identity: &dyn crate::ControllerIdentityGenerator,
 ) -> Result<Value> {
     // Bounded optimistic-concurrency retry around Service allocation/defaulting.
     // The allocator does a read-then-write with a resourceVersion CAS, but under
@@ -618,8 +621,15 @@ pub async fn reconcile_service_with_nodeport_at(
     let mut updated_data = None;
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..SERVICE_ALLOC_MAX_ATTEMPTS {
-        match allocate_service_fields_for_api_write(db, service, service_ipam, nodeport_alloc, now)
-            .await
+        match allocate_service_fields_for_api_write(
+            db,
+            service,
+            service_ipam,
+            nodeport_alloc,
+            now,
+            identity,
+        )
+        .await
         {
             Ok(Some(data)) => {
                 updated_data = Some(data);
@@ -728,6 +738,7 @@ pub async fn reconcile_service_with_nodeport(
     service_ipam: &ServiceIpam,
     nodeport_alloc: &NodePortAllocator,
 ) -> Result<Value> {
+    let identity = crate::identity::DeterministicControllerIdentityGenerator::default();
     reconcile_service_with_nodeport_at(
         db,
         pod_reader,
@@ -735,6 +746,7 @@ pub async fn reconcile_service_with_nodeport(
         service_ipam,
         nodeport_alloc,
         chrono::Utc::now(),
+        &identity,
     )
     .await
 }
@@ -762,6 +774,7 @@ pub async fn allocate_service_fields_for_api_write(
     service_ipam: &ServiceIpam,
     nodeport_alloc: &NodePortAllocator,
     now: chrono::DateTime<chrono::Utc>,
+    identity: &dyn crate::ControllerIdentityGenerator,
 ) -> Result<Option<Value>> {
     let input_metadata = service
         .get("metadata")
@@ -782,6 +795,7 @@ pub async fn allocate_service_fields_for_api_write(
         live_service.data,
         live_service.resource_version,
         now,
+        identity,
     );
     let metadata = service
         .get("metadata")
@@ -820,8 +834,12 @@ pub async fn allocate_service_fields_for_api_write(
         (std::sync::Arc::new(service.clone()), current_rv)
     };
 
-    let service_with_rv =
-        crate::resource_projection::with_resource_version(updated_data.clone(), updated_rv, now);
+    let service_with_rv = crate::resource_projection::with_resource_version(
+        updated_data.clone(),
+        updated_rv,
+        now,
+        identity,
+    );
     Ok(Some(service_with_rv))
 }
 

@@ -11,6 +11,39 @@ struct GeneratedNameCollisionWriter {
     creates: Mutex<Vec<(String, String)>>,
 }
 
+struct SequenceIdentity {
+    names: Mutex<std::collections::VecDeque<String>>,
+    prefixes: Mutex<Vec<String>>,
+}
+
+impl SequenceIdentity {
+    fn new(names: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            names: Mutex::new(names.into_iter().collect()),
+            prefixes: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn prefixes(&self) -> Vec<String> {
+        self.prefixes.lock().unwrap().clone()
+    }
+}
+
+impl klights_controllers::ControllerIdentityGenerator for SequenceIdentity {
+    fn generate_name(&self, prefix: &str) -> String {
+        self.prefixes.lock().unwrap().push(prefix.to_string());
+        self.names
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("retry budget exceeded deterministic test names")
+    }
+
+    fn new_uid(&self) -> String {
+        panic!("ReplicaSet generated-name retries must not request a UID")
+    }
+}
+
 impl GeneratedNameCollisionWriter {
     fn new(collisions_before_success: usize) -> Self {
         Self {
@@ -95,21 +128,16 @@ fn pod_template() -> serde_json::Value {
 #[tokio::test]
 async fn generated_pod_create_retries_typed_already_exists_then_succeeds() {
     let writer = GeneratedNameCollisionWriter::new(2);
-    let mut generated = ["rs-first", "rs-second", "rs-third"].into_iter();
+    let identity = SequenceIdentity::new(["rs-first", "rs-second", "rs-third"].map(str::to_string));
 
-    super::create_pod_with_name_generator(
+    super::create_pod(
         &writer,
+        &identity,
         "rs",
         "rs-uid",
         "default",
         "test-node",
         &pod_template(),
-        || {
-            generated
-                .next()
-                .expect("retry budget exceeded test names")
-                .to_string()
-        },
     )
     .await
     .expect("a fresh generated name should succeed after collisions");
@@ -122,21 +150,22 @@ async fn generated_pod_create_retries_typed_already_exists_then_succeeds() {
             ("rs-third".to_string(), "rs-third".to_string()),
         ]
     );
+    assert_eq!(identity.prefixes(), vec!["rs-"; 3]);
 }
 
 #[tokio::test]
 async fn generated_pod_create_exhausts_exactly_eight_name_collisions() {
     let writer = GeneratedNameCollisionWriter::new(usize::MAX);
-    let mut generated = (0..8).map(|attempt| format!("rs-attempt-{attempt}"));
+    let identity = SequenceIdentity::new((0..8).map(|attempt| format!("rs-attempt-{attempt}")));
 
-    let error = super::create_pod_with_name_generator(
+    let error = super::create_pod(
         &writer,
+        &identity,
         "rs",
         "rs-uid",
         "default",
         "test-node",
         &pod_template(),
-        || generated.next().expect("more than eight names requested"),
     )
     .await
     .expect_err("eight generated-name collisions must return AlreadyExists");
@@ -146,26 +175,22 @@ async fn generated_pod_create_exhausts_exactly_eight_name_collisions() {
         .expect("typed controller error must survive retry exhaustion");
     assert!(controller_error.is_already_exists());
     assert_eq!(writer.create_names().len(), 8);
+    assert_eq!(identity.prefixes(), vec!["rs-"; 8]);
 }
 
 #[tokio::test]
 async fn generated_pod_retry_uses_a_fresh_name_without_mutating_the_conflict() {
     let writer = GeneratedNameCollisionWriter::new(1);
-    let mut generated = ["rs-occupied", "rs-replacement"].into_iter();
+    let identity = SequenceIdentity::new(["rs-occupied", "rs-replacement"].map(str::to_string));
 
-    super::create_pod_with_name_generator(
+    super::create_pod(
         &writer,
+        &identity,
         "rs",
         "rs-uid",
         "default",
         "test-node",
         &pod_template(),
-        || {
-            generated
-                .next()
-                .expect("retry must use exactly two names")
-                .to_string()
-        },
     )
     .await
     .expect("replacement generated name should be created");
@@ -176,4 +201,5 @@ async fn generated_pod_retry_uses_a_fresh_name_without_mutating_the_conflict() {
     assert_eq!(creates[1].0, "rs-replacement");
     assert_ne!(creates[0].0, creates[1].0);
     assert!(creates.iter().all(|(argument, body)| argument == body));
+    assert_eq!(identity.prefixes(), vec!["rs-"; 2]);
 }

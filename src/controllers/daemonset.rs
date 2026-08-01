@@ -584,6 +584,7 @@ pub(crate) async fn reconcile_daemonset(
     db: &(impl DaemonSetStore + ?Sized),
     pod_reader: &(impl PodQuery + ?Sized),
     pod_writer: &(impl DaemonSetPodMutation + ?Sized),
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     coordination: &klights_controllers::ControllerCoordination,
@@ -635,6 +636,7 @@ pub(crate) async fn reconcile_daemonset(
         live_resource.data,
         live_resource.resource_version,
         now,
+        identity,
     );
 
     let metadata = daemonset
@@ -983,11 +985,7 @@ pub(crate) async fn reconcile_daemonset(
         let pod_name = format!(
             "{}-{}",
             name,
-            uuid::Uuid::new_v4()
-                .to_string()
-                .chars()
-                .take(5)
-                .collect::<String>()
+            identity.new_uid().chars().take(5).collect::<String>()
         );
 
         let mut pod = crate::controllers::common::build_child_pod(

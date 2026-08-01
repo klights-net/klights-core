@@ -4,6 +4,7 @@ mod coordination;
 mod dispatcher;
 pub mod endpoints;
 pub mod gc;
+mod identity;
 mod lease_loop;
 pub mod resource_projection;
 pub mod scheduler;
@@ -15,4 +16,5 @@ pub use coordination::{
     ControllerCoordination, ControllerReconcileContext, CoordinatedControllerKind,
 };
 pub use dispatcher::DispatcherRuntime;
+pub use identity::ControllerIdentityGenerator;
 pub use lease_loop::run_under_lease;

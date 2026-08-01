@@ -14,7 +14,13 @@ async fn mirror_endpoints_to_endpointslice(
     db: &(impl EndpointReconcileStore + ?Sized),
     endpoints: &serde_json::Value,
 ) -> anyhow::Result<()> {
-    mirror_endpoints_to_endpointslice_at(db, endpoints, chrono::Utc::now()).await
+    mirror_endpoints_to_endpointslice_at(
+        db,
+        endpoints,
+        chrono::Utc::now(),
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+    )
+    .await
 }
 
 /// Regression for P0-E2E-20260424-03: targetPort=0 (Go int32 zero value from client-go

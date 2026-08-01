@@ -492,7 +492,17 @@ macro_rules! controller_wrapper {
         with_node, with_pod_repository,
         store = $store:ident, reader = $reader:ident, mutation = $mutation:ident
     ) => {
-        pub struct $struct_name;
+        pub struct $struct_name {
+            identity: ::std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
+        }
+
+        impl $struct_name {
+            pub(crate) fn new(
+                identity: ::std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
+            ) -> Self {
+                Self { identity }
+            }
+        }
 
         #[::async_trait::async_trait]
         impl $crate::controllers::Controller for $struct_name {
@@ -508,6 +518,7 @@ macro_rules! controller_wrapper {
                     ctx.$store(),
                     ctx.$reader(),
                     ctx.$mutation(),
+                    self.identity.as_ref(),
                     ctx.pod_delete_sink(),
                     ctx.reconcile_port().non_pod_finalization(),
                     &resource,
@@ -570,7 +581,17 @@ macro_rules! controller_wrapper {
         no_node, with_pod_repository,
         store = $store:ident, mutation = $mutation:ident
     ) => {
-        pub struct $struct_name;
+        pub struct $struct_name {
+            identity: ::std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
+        }
+
+        impl $struct_name {
+            pub(crate) fn new(
+                identity: ::std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
+            ) -> Self {
+                Self { identity }
+            }
+        }
 
         #[::async_trait::async_trait]
         impl $crate::controllers::Controller for $struct_name {
@@ -586,6 +607,7 @@ macro_rules! controller_wrapper {
                     ctx.$store(),
                     ctx.pod_query(),
                     ctx.$mutation(),
+                    self.identity.as_ref(),
                     ctx.pod_delete_sink(),
                     ctx.reconcile_port().non_pod_finalization(),
                     ctx.coordination(),

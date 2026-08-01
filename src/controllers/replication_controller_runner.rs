@@ -23,7 +23,10 @@ mod tests {
     #[test]
     fn test_replicationcontroller_controller_name() {
         assert_eq!(
-            ReplicationControllerController.name(),
+            ReplicationControllerController::new(
+                crate::controllers::test_utils::deterministic_controller_identity()
+            )
+            .name(),
             "replicationcontroller"
         );
     }
@@ -31,7 +34,9 @@ mod tests {
     #[tokio::test]
     async fn test_replicationcontroller_controller_creates_pods() {
         let db = crate::datastore::test_support::in_memory().await;
-        let controller = ReplicationControllerController;
+        let controller = ReplicationControllerController::new(
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        );
 
         let rc = db
             .create_resource(

@@ -15,6 +15,7 @@ use std::sync::Arc;
 pub struct ServiceController {
     pub service_ipam: Arc<service_core::ServiceIpam>,
     pub nodeport_alloc: Arc<service_core::NodePortAllocator>,
+    pub identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
 }
 
 #[async_trait]
@@ -31,6 +32,7 @@ impl Controller for ServiceController {
             &self.service_ipam,
             &self.nodeport_alloc,
             ctx.reconcile_time(),
+            self.identity.as_ref(),
         )
         .await?;
         ctx.network().service_router().request_services_sync()?;
@@ -49,6 +51,7 @@ mod tests {
         let controller = ServiceController {
             service_ipam: ipam,
             nodeport_alloc: Arc::new(service_core::NodePortAllocator::new()),
+            identity: crate::controllers::test_utils::deterministic_controller_identity(),
         };
         assert_eq!(controller.name(), "service");
     }
@@ -68,6 +71,7 @@ mod tests {
         let controller = ServiceController {
             service_ipam: ipam,
             nodeport_alloc: Arc::new(service_core::NodePortAllocator::new()),
+            identity: crate::controllers::test_utils::deterministic_controller_identity(),
         };
 
         let service = json!({
@@ -103,6 +107,7 @@ mod tests {
         let controller = ServiceController {
             service_ipam: ipam,
             nodeport_alloc: Arc::new(service_core::NodePortAllocator::new()),
+            identity: crate::controllers::test_utils::deterministic_controller_identity(),
         };
 
         let bad = json!({"spec": {"type": "ClusterIP"}});
@@ -116,6 +121,7 @@ mod tests {
         let controller = ServiceController {
             service_ipam: ipam,
             nodeport_alloc: Arc::new(service_core::NodePortAllocator::new()),
+            identity: crate::controllers::test_utils::deterministic_controller_identity(),
         };
         let service = json!({
             "apiVersion": "v1",

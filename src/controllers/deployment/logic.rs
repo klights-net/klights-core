@@ -251,6 +251,7 @@ struct ZeroReplicaOldReplicaSetRedrive<'a, S: ?Sized, R: ?Sized, W: ?Sized> {
     db: &'a S,
     pod_reader: &'a R,
     pod_writer: &'a W,
+    identity: &'a dyn klights_controllers::ControllerIdentityGenerator,
     pod_delete_sink: &'a dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &'a dyn klights_reconcile_api::GcNonPodFinalizationPort,
     coordination: &'a klights_controllers::ControllerCoordination,
@@ -306,11 +307,13 @@ async fn redrive_zero_replica_old_replicasets_with_live_pods(
             rs.data.clone(),
             rs.resource_version,
             ctx.wall_time,
+            ctx.identity,
         );
         crate::controllers::replicaset::reconcile_replicaset(
             ctx.db,
             ctx.pod_reader,
             ctx.pod_writer,
+            ctx.identity,
             ctx.pod_delete_sink,
             ctx.non_pod_finalization,
             &rs_with_metadata,
@@ -551,12 +554,14 @@ async fn scale_replicaset_resource(
         .ok_or_else(|| anyhow::anyhow!("ReplicaSet {} disappeared during scale", rs.name))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn reconcile_deployment(
     db: &(impl DeploymentStore + ?Sized),
     pod_reader: &(impl super::DeploymentPodReader + PodQuery + ?Sized),
     pod_writer: &(
          impl DeploymentPodMutation + crate::controllers::replicaset::ReplicaSetPodMutation + ?Sized
      ),
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     deployment: &Value,
@@ -601,6 +606,7 @@ pub(crate) async fn reconcile_deployment(
         live_deployment_resource.data.clone(),
         live_deployment_resource.resource_version,
         reconcile_context.wall_time,
+        identity,
     );
     let deployment = &live_deployment;
     let metadata = deployment
@@ -973,11 +979,13 @@ pub(crate) async fn reconcile_deployment(
                             updated.data,
                             updated.resource_version,
                             reconcile_context.wall_time,
+                            identity,
                         );
                     crate::controllers::replicaset::reconcile_replicaset(
                         db,
                         pod_reader,
                         pod_writer,
+                        identity,
                         pod_delete_sink,
                         non_pod_finalization,
                         &rs_with_metadata,
@@ -1026,11 +1034,13 @@ pub(crate) async fn reconcile_deployment(
                         updated.data,
                         updated.resource_version,
                         reconcile_context.wall_time,
+                        identity,
                     );
                 crate::controllers::replicaset::reconcile_replicaset(
                     db,
                     pod_reader,
                     pod_writer,
+                    identity,
                     pod_delete_sink,
                     non_pod_finalization,
                     &rs_with_metadata,
@@ -1168,11 +1178,13 @@ pub(crate) async fn reconcile_deployment(
                         updated.data,
                         updated.resource_version,
                         reconcile_context.wall_time,
+                        identity,
                     );
                 crate::controllers::replicaset::reconcile_replicaset(
                     db,
                     pod_reader,
                     pod_writer,
+                    identity,
                     pod_delete_sink,
                     non_pod_finalization,
                     &rs_with_metadata,
@@ -1207,11 +1219,13 @@ pub(crate) async fn reconcile_deployment(
                         old_rs.data.clone(),
                         old_rs.resource_version,
                         reconcile_context.wall_time,
+                        identity,
                     );
                 crate::controllers::replicaset::reconcile_replicaset(
                     db,
                     pod_reader,
                     pod_writer,
+                    identity,
                     pod_delete_sink,
                     non_pod_finalization,
                     &rs_with_metadata,
@@ -1241,11 +1255,13 @@ pub(crate) async fn reconcile_deployment(
                         updated.data,
                         updated.resource_version,
                         reconcile_context.wall_time,
+                        identity,
                     );
                 crate::controllers::replicaset::reconcile_replicaset(
                     db,
                     pod_reader,
                     pod_writer,
+                    identity,
                     pod_delete_sink,
                     non_pod_finalization,
                     &rs_with_metadata,
@@ -1292,11 +1308,13 @@ pub(crate) async fn reconcile_deployment(
                             updated.data,
                             updated.resource_version,
                             reconcile_context.wall_time,
+                            identity,
                         );
                     crate::controllers::replicaset::reconcile_replicaset(
                         db,
                         pod_reader,
                         pod_writer,
+                        identity,
                         pod_delete_sink,
                         non_pod_finalization,
                         &rs_with_metadata,
@@ -1402,11 +1420,13 @@ pub(crate) async fn reconcile_deployment(
                         updated.data,
                         updated.resource_version,
                         reconcile_context.wall_time,
+                        identity,
                     );
                 crate::controllers::replicaset::reconcile_replicaset(
                     db,
                     pod_reader,
                     pod_writer,
+                    identity,
                     pod_delete_sink,
                     non_pod_finalization,
                     &rs_with_metadata,
@@ -1567,11 +1587,13 @@ pub(crate) async fn reconcile_deployment(
             created_rs.data,
             created_rs.resource_version,
             reconcile_context.wall_time,
+            identity,
         );
         crate::controllers::replicaset::reconcile_replicaset(
             db,
             pod_reader,
             pod_writer,
+            identity,
             pod_delete_sink,
             non_pod_finalization,
             &rs_with_metadata,
@@ -1592,6 +1614,7 @@ pub(crate) async fn reconcile_deployment(
             db,
             pod_reader,
             pod_writer,
+            identity,
             pod_delete_sink,
             non_pod_finalization,
             coordination,

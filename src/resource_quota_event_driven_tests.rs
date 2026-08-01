@@ -33,6 +33,7 @@ async fn make_registry_and_repo() -> (
         None,
         None,
         Some(db_handle.clone()),
+        crate::controllers::test_utils::deterministic_controller_identity(),
     ));
     let pod_repo = Arc::new(crate::kubelet::pod_repository::PodRepository::new(
         db_handle.clone(),

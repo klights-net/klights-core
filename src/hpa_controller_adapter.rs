@@ -87,7 +87,9 @@ impl HpaMetrics for NodeApiHpaMetrics<'_> {
 }
 
 #[cfg(test)]
-pub struct HpaController;
+pub struct HpaController {
+    pub(crate) identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
+}
 
 #[cfg(test)]
 impl HpaController {
@@ -98,8 +100,9 @@ impl HpaController {
         _coordination: std::sync::Arc<klights_controllers::ControllerCoordination>,
         _node_name: std::sync::Arc<str>,
         _node_metrics: std::sync::Arc<dyn NodeMetrics>,
+        identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Self {
-        Self
+        Self { identity }
     }
 }
 
@@ -111,6 +114,7 @@ pub struct HpaController {
     coordination: std::sync::Arc<klights_controllers::ControllerCoordination>,
     node_name: std::sync::Arc<str>,
     node_metrics: std::sync::Arc<dyn NodeMetrics>,
+    identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
 }
 
 #[cfg(not(test))]
@@ -122,6 +126,7 @@ impl HpaController {
         coordination: std::sync::Arc<klights_controllers::ControllerCoordination>,
         node_name: std::sync::Arc<str>,
         node_metrics: std::sync::Arc<dyn NodeMetrics>,
+        identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Self {
         Self {
             db,
@@ -130,6 +135,7 @@ impl HpaController {
             coordination,
             node_name,
             node_metrics,
+            identity,
         }
     }
 }
@@ -151,6 +157,7 @@ impl Controller for HpaController {
                 &resource,
                 &self.node_name,
                 self.node_metrics.as_ref(),
+                self.identity.as_ref(),
                 ctx.reconcile_time(),
             )
             .await;
@@ -184,6 +191,7 @@ impl Controller for HpaController {
                 &resource,
                 ctx.node_name(),
                 node_metrics,
+                self.identity.as_ref(),
                 ctx.reconcile_time(),
             )
             .await
@@ -197,7 +205,10 @@ mod dispatch_tests {
 
     #[test]
     fn controller_name_is_stable() {
-        assert_eq!(HpaController.name(), "horizontalpodautoscaler");
+        let controller = HpaController {
+            identity: crate::controllers::test_utils::deterministic_controller_identity(),
+        };
+        assert_eq!(controller.name(), "horizontalpodautoscaler");
     }
 }
 
@@ -206,6 +217,7 @@ struct HpaControllerAdapter<'a> {
     pod_repository: &'a PodRepository,
     non_pod_finalization: &'a dyn klights_reconcile_api::GcNonPodFinalizationPort,
     coordination: &'a klights_controllers::ControllerCoordination,
+    identity: &'a dyn klights_controllers::ControllerIdentityGenerator,
 }
 
 #[async_trait]
@@ -291,6 +303,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                 self.db,
                 pods,
                 pods,
+                self.identity,
                 pods,
                 self.non_pod_finalization,
                 resource,
@@ -306,6 +319,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                 self.db,
                 pods,
                 pods,
+                self.identity,
                 pods,
                 self.non_pod_finalization,
                 resource,
@@ -321,6 +335,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                 self.db,
                 pods,
                 pods,
+                self.identity,
                 pods,
                 self.non_pod_finalization,
                 resource,
@@ -337,6 +352,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                     self.db,
                     pods,
                     pods,
+                    self.identity,
                     pods,
                     self.non_pod_finalization,
                     resource,
@@ -388,6 +404,7 @@ pub async fn reconcile_hpa(
         hpa,
         node_name,
         &crate::node_metrics_adapter::UnavailableNodeMetrics,
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
         chrono::Utc::now(),
     )
     .await
@@ -402,6 +419,7 @@ pub async fn reconcile_hpa_with_metrics(
     hpa: &Value,
     node_name: &str,
     node_metrics: &dyn NodeMetrics,
+    identity: &dyn klights_controllers::ControllerIdentityGenerator,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     reconcile_hpa_with_runtime(
@@ -410,6 +428,7 @@ pub async fn reconcile_hpa_with_metrics(
             pod_repository,
             non_pod_finalization,
             coordination,
+            identity,
         },
         hpa,
         node_name,

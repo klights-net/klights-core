@@ -12,6 +12,7 @@ async fn reconcile_rc_test(db: &Datastore, rc: &Value, node_name: &str) -> anyho
         &store,
         repo.as_ref(),
         repo.as_ref(),
+        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
         repo.as_ref(),
         crate::controllers::test_utils::non_pod_finalization_port_for_test(),
         rc,

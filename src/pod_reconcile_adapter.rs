@@ -27,6 +27,7 @@ pub(crate) struct PodReconcileAdapter {
     pod_reader: std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader>,
     non_pod_finalization: crate::gc_delete_adapter::GcNonPodFinalizationAdapter,
     coordination: std::sync::Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
+    identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
 }
 
 impl PodReconcileAdapter {
@@ -37,6 +38,7 @@ impl PodReconcileAdapter {
         metrics: std::sync::Arc<klights_controllers::side_effects::SideEffectMetrics>,
         side_effects: std::sync::Arc<klights_controllers::side_effects::SideEffectRegistry>,
         pod_reader: std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader>,
+        identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Self {
         Self::new_with_coordination(
             db,
@@ -45,6 +47,7 @@ impl PodReconcileAdapter {
             side_effects,
             pod_reader,
             std::sync::Arc::new(klights_controllers::ControllerCoordination::new()),
+            identity,
         )
     }
 
@@ -55,6 +58,7 @@ impl PodReconcileAdapter {
         side_effects: std::sync::Arc<klights_controllers::side_effects::SideEffectRegistry>,
         pod_reader: std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader>,
         coordination: std::sync::Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
+        identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Self {
         Self {
             non_pod_finalization: crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
@@ -73,6 +77,7 @@ impl PodReconcileAdapter {
             side_effects,
             pod_reader,
             coordination,
+            identity,
         }
     }
 }
@@ -287,6 +292,7 @@ impl NamespaceBootstrapSink for PodReconcileAdapter {
                 self.db.as_ref(),
                 &namespace,
                 chrono::Utc::now(),
+                self.identity.as_ref(),
             )
             .await
             .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))
@@ -304,6 +310,7 @@ impl NamespaceBootstrapSink for PodReconcileAdapter {
                 &namespace,
                 &ca_certificate,
                 chrono::Utc::now(),
+                self.identity.as_ref(),
             )
             .await
             .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))

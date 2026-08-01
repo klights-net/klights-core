@@ -1,5 +1,19 @@
 //! Kubernetes generated-name policy.
 
+/// Root-owned system entropy adapter for controller names and UIDs.
+#[derive(Debug, Default)]
+pub(crate) struct SystemControllerIdentityGenerator;
+
+impl klights_controllers::ControllerIdentityGenerator for SystemControllerIdentityGenerator {
+    fn generate_name(&self, prefix: &str) -> String {
+        generate(prefix)
+    }
+
+    fn new_uid(&self) -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+}
+
 /// Append the existing five-character lowercase alphanumeric suffix.
 pub fn generate(prefix: &str) -> String {
     use rand::distr::{Distribution, Uniform};
@@ -15,7 +29,8 @@ pub fn generate(prefix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::generate;
+    use super::{SystemControllerIdentityGenerator, generate};
+    use klights_controllers::ControllerIdentityGenerator;
 
     #[test]
     fn suffix_matches_kubernetes_name_contract() {
@@ -27,5 +42,19 @@ mod tests {
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         );
+    }
+
+    #[test]
+    fn system_uids_are_non_reused_rfc4122_version_4_values() {
+        let identity = SystemControllerIdentityGenerator;
+        let first = identity.new_uid();
+        let second = identity.new_uid();
+
+        assert_ne!(first, second);
+        for raw in [first, second] {
+            let uid = uuid::Uuid::parse_str(&raw).expect("system UID must parse as UUID");
+            assert_eq!(uid.get_version(), Some(uuid::Version::Random));
+            assert_eq!(uid.get_variant(), uuid::Variant::RFC4122);
+        }
     }
 }

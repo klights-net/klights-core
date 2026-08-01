@@ -166,10 +166,12 @@ pub(crate) async fn build_test_app_state_with_db(
     let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
+    let controller_identity = crate::controllers::test_utils::deterministic_controller_identity();
     let controller_dispatcher = Arc::new(
-        crate::controllers::ControllerDispatcher::with_task_supervisor(
+        crate::controllers::ControllerDispatcher::with_task_supervisor_and_identity(
             service_ipam.clone(),
             task_supervisor.clone(),
+            controller_identity.clone(),
         ),
     );
 
@@ -192,6 +194,7 @@ pub(crate) async fn build_test_app_state_with_db(
             None,
             Some(task_supervisor.clone()),
             Some(db_handle.clone()),
+            controller_identity.clone(),
         ));
     side_effects.set_controller_dispatcher(controller_dispatcher.clone());
     let pod_repository = std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(
@@ -235,6 +238,7 @@ pub(crate) async fn build_test_app_state_with_db(
         klights_supervisor::FileProcessExecutor::new(task_supervisor.clone()),
         task_supervisor.clone(),
         config.data_root.join("etc").join("ca.crt"),
+        controller_identity,
     );
     let network = crate::networking::test_support::mock_network(db_handle.clone());
     let bootstrap_token_authenticator = Arc::new(
@@ -311,6 +315,7 @@ pub(crate) async fn build_test_app_state_with_db(
                 db_handle.clone(),
                 service_ipam.clone(),
                 nodeport_alloc.clone(),
+                crate::controllers::test_utils::deterministic_controller_identity(),
             ),
             service_ipam,
             nodeport_alloc,

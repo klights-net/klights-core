@@ -48,9 +48,12 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
     ));
     let nodeport_alloc =
         std::sync::Arc::new(klights_controllers::service::NodePortAllocator::new());
-    let controller_dispatcher = std::sync::Arc::new(crate::controllers::ControllerDispatcher::new(
-        service_ipam.clone(),
-    ));
+    let controller_identity = crate::controllers::test_utils::deterministic_controller_identity();
+    let controller_dispatcher =
+        std::sync::Arc::new(crate::controllers::ControllerDispatcher::new_with_identity(
+            service_ipam.clone(),
+            controller_identity.clone(),
+        ));
     let task_supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
@@ -71,6 +74,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
             None,
             None,
             Some(db_handle.clone()),
+            controller_identity.clone(),
         ));
     let pod_repository = std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(
         db_handle.clone(),
@@ -108,6 +112,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
             .data_root
             .join("etc")
             .join("ca.crt"),
+        controller_identity,
     );
     let bootstrap_token_authenticator = std::sync::Arc::new(
         crate::bootstrap::auth_adapters::DatastoreBootstrapTokenAuthenticator::new(
@@ -184,6 +189,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
                 db_handle.clone(),
                 service_ipam.clone(),
                 nodeport_alloc.clone(),
+                crate::controllers::test_utils::deterministic_controller_identity(),
             ),
             service_ipam,
             nodeport_alloc,
