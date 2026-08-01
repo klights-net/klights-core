@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use serde_json::json;
 
@@ -36,7 +38,7 @@ async fn test_list_resources_with_field_selector_filters_events() {
             "v1",
             "Event",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            klights_cluster_store::ResourceListOptions::all(),
         )
         .await
         .unwrap();
@@ -48,7 +50,7 @@ async fn test_list_resources_with_field_selector_filters_events() {
             "v1",
             "Event",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 None,
                 Some("involvedObject.name=pod-a"),
                 None,

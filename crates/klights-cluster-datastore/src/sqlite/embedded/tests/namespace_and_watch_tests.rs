@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use serde_json::json;
 #[tokio::test]
@@ -306,7 +308,7 @@ async fn test_list_namespaces_page_uses_name_continue_token_after_selectors() {
         .list_namespaces_page(
             Some("env=prod"),
             None,
-            crate::datastore::ListPageRequest::try_new(Some(2), None).unwrap(),
+            klights_cluster_store::ListPageRequest::try_new(Some(2), None).unwrap(),
         )
         .await
         .unwrap();
@@ -325,7 +327,7 @@ async fn test_list_namespaces_page_uses_name_continue_token_after_selectors() {
         .list_namespaces_page(
             Some("env=prod"),
             None,
-            crate::datastore::ListPageRequest::try_new(Some(2), page1.continue_token.clone())
+            klights_cluster_store::ListPageRequest::try_new(Some(2), page1.continue_token.clone())
                 .unwrap(),
         )
         .await
@@ -917,7 +919,7 @@ async fn test_delete_namespace_refuses_remaining_pods_and_other_resources() {
         "Pod",
         Some("order-ns"),
         "p0-order-pod",
-        crate::datastore::ResourcePreconditions::uid(&pod.uid),
+        klights_cluster_core::ResourcePreconditions::uid(&pod.uid),
     )
     .await
     .unwrap();
@@ -1026,7 +1028,7 @@ async fn test_raw_watch_replay_object_resource_version_matches_watch_row() {
 
     let raw = db
         .list_raw_watch_events_since_checked_bounded(
-            &[crate::datastore::WatchTarget::namespaced_in_namespace(
+            &[klights_cluster_store::WatchTarget::namespaced_in_namespace(
                 "v1",
                 "ConfigMap",
                 "default",
@@ -1037,7 +1039,7 @@ async fn test_raw_watch_replay_object_resource_version_matches_watch_row() {
         .await
         .unwrap();
 
-    let crate::datastore::WatchReplayRead::Events(events) = raw else {
+    let klights_cluster_store::WatchReplayRead::Events(events) = raw else {
         panic!("fresh in-memory watch history must not be expired");
     };
     let event = events
@@ -1122,7 +1124,7 @@ async fn raft_namespace_put_replays_identical_row_and_watch_payloads() {
         },
     });
 
-    let commit = crate::datastore::test_support::test_live_commit(
+    let commit = crate::test_fixtures::live_apply::test_live_commit(
         51,
         vec![klights_cluster_core::LogApplyMutation::PutNamespace(
             klights_cluster_core::LogApplyNamespaceRow {
@@ -1195,7 +1197,7 @@ async fn raft_namespace_delete_replays_identical_watch_payloads() {
     let leader = Datastore::new_in_memory().await.unwrap();
     let follower = Datastore::new_in_memory().await.unwrap();
 
-    let put_commit = crate::datastore::test_support::test_live_commit(
+    let put_commit = crate::test_fixtures::live_apply::test_live_commit(
         51,
         vec![klights_cluster_core::LogApplyMutation::PutNamespace(
             klights_cluster_core::LogApplyNamespaceRow {
@@ -1223,7 +1225,7 @@ async fn raft_namespace_delete_replays_identical_watch_payloads() {
         .await
         .expect("follower namespace seed PUT must apply");
 
-    let delete_commit = crate::datastore::test_support::test_live_commit(
+    let delete_commit = crate::test_fixtures::live_apply::test_live_commit(
         52,
         vec![klights_cluster_core::LogApplyMutation::DeleteNamespace {
             name: "deterministic-ns".to_string(),
@@ -1292,7 +1294,7 @@ async fn raft_explicit_watch_event_replay_preserves_committed_payload_bytes() {
     committed_payload["object"]["metadata"]["resourceVersion"] = json!("1");
     let committed_bytes = serde_json::to_vec(&committed_payload).unwrap();
 
-    let commit = crate::datastore::test_support::test_live_commit(
+    let commit = crate::test_fixtures::live_apply::test_live_commit(
         10_024,
         vec![klights_cluster_core::LogApplyMutation::PutWatchEvent(
             klights_cluster_core::LogApplyWatchEventRow {
@@ -1370,7 +1372,7 @@ async fn raft_watch_gc_replays_identically() {
 
     for resource_version in [10_i64, 20, 30] {
         let name = format!("watch-gc-{resource_version}");
-        let commit = crate::datastore::test_support::test_live_commit(
+        let commit = crate::test_fixtures::live_apply::test_live_commit(
             resource_version,
             vec![klights_cluster_core::LogApplyMutation::PutWatchEvent(
                 klights_cluster_core::LogApplyWatchEventRow {
@@ -1396,7 +1398,7 @@ async fn raft_watch_gc_replays_identically() {
             .expect("follower watch GC seed must apply");
     }
 
-    let gc_commit = crate::datastore::test_support::test_live_commit(
+    let gc_commit = crate::test_fixtures::live_apply::test_live_commit(
         40,
         vec![klights_cluster_core::LogApplyMutation::GcWatchEvents {
             max_rows: 1,

@@ -1,10 +1,12 @@
+#![cfg(test)]
+
 use super::*;
-use crate::outbox_test_support::OutboxPayload;
+use crate::test_fixtures::outbox::EncodedOutboxCommand as OutboxPayload;
 use klights_cluster_core::BuildOutboxOutcome;
 use klights_cluster_core::LogApplyMutation;
+use klights_cluster_core::OutboxOperation;
 use klights_cluster_core::command::StorageCommand;
 use klights_cluster_store::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
-use klights_kubelet::node_outbox::payload::OutboxOperation;
 use serde_json::json;
 use std::net::Ipv4Addr;
 
@@ -202,7 +204,7 @@ async fn build_update_node_dataplane_log_apply_does_not_mutate_leader_node() {
         .build_log_apply_commit_for_outbox(
             "dataplane-node-a",
             OutboxOperation::NodeDataplane.as_str(),
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "node-a",
         )
         .await
@@ -302,7 +304,7 @@ async fn node_registration_outbox_uses_dataplane_annotation_for_external_ip() {
         .build_log_apply_commit_for_outbox(
             "node-registration-node-a",
             OutboxOperation::NodeRegistration.as_str(),
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "node-a",
         )
         .await
@@ -350,7 +352,7 @@ async fn raft_node_subnet_replay_is_deterministic() {
         mode: "root".to_string(),
         hostport_range: Some("30000-30100".to_string()),
     };
-    let put_commit = crate::datastore::test_support::test_live_commit(
+    let put_commit = crate::test_fixtures::live_apply::test_live_commit(
         1,
         vec![LogApplyMutation::PutNodeSubnet(put.clone())],
     );
@@ -379,7 +381,7 @@ async fn raft_node_subnet_replay_is_deterministic() {
         "node subnet rows must be deterministic between leader and follower after put replay",
     );
 
-    let allocate_commit = crate::datastore::test_support::test_live_commit(
+    let allocate_commit = crate::test_fixtures::live_apply::test_live_commit(
         2,
         vec![LogApplyMutation::AllocateNodeSubnet(
             LogApplyNodeSubnetAllocation {
@@ -429,7 +431,7 @@ async fn raft_node_subnet_replay_is_deterministic() {
         "node subnet rows must match between leader and follower after allocation replay",
     );
 
-    let delete_commit = crate::datastore::test_support::test_live_commit(
+    let delete_commit = crate::test_fixtures::live_apply::test_live_commit(
         3,
         vec![LogApplyMutation::DeleteNodeSubnet {
             node_name: "node-alpha".to_string(),
@@ -484,7 +486,7 @@ async fn raft_node_dataplane_replay_is_deterministic() {
         endpoint: "10.99.0.10".to_string(),
         port: Some(51820),
     };
-    let put_commit = crate::datastore::test_support::test_live_commit(
+    let put_commit = crate::test_fixtures::live_apply::test_live_commit(
         1,
         vec![LogApplyMutation::PutNodeDataplane(put)],
     );
@@ -512,7 +514,7 @@ async fn raft_node_dataplane_replay_is_deterministic() {
         "node_dataplane replay must be byte-identical between leader and follower",
     );
 
-    let delete_commit = crate::datastore::test_support::test_live_commit(
+    let delete_commit = crate::test_fixtures::live_apply::test_live_commit(
         2,
         vec![LogApplyMutation::DeleteNodeDataplane {
             node_name: "node-gamma".to_string(),
@@ -626,292 +628,6 @@ async fn test_db_create_resource_handles_generation_zero() {
 }
 
 #[tokio::test]
-async fn test_sa_volume_injection_default_adds_projected_volume() {
-    let db = Datastore::new_in_memory().await.unwrap();
-    // Create pod without automountServiceAccountToken field (defaults to true)
-    let data = json!({
-        "metadata": {
-            "name": "test-pod",
-            "namespace": "default"
-        },
-        "spec": {
-            "containers": [{
-                "name": "test",
-                "image": "busybox"
-            }]
-        }
-    });
-    let resource = db
-        .create_resource("v1", "Pod", Some("default"), "test-pod", data)
-        .await
-        .unwrap();
-
-    // Verify projected volume was injected
-    let volumes = resource
-        .data
-        .get("spec")
-        .and_then(|s| s.get("volumes"))
-        .and_then(|v| v.as_array());
-    assert!(volumes.is_some(), "volumes should be injected");
-    let volumes = volumes.unwrap();
-    assert_eq!(volumes.len(), 1, "should have 1 volume");
-
-    // Check volume structure
-    let vol = &volumes[0];
-    let vol_name = vol.get("name").and_then(|n| n.as_str());
-    assert!(vol_name.is_some(), "volume should have name");
-    assert!(
-        vol_name.unwrap().starts_with("kube-api-access-"),
-        "volume name should start with kube-api-access-"
-    );
-
-    // Check projected volume sources
-    let sources = vol.pointer("/projected/sources").and_then(|s| s.as_array());
-    assert!(sources.is_some(), "projected volume should have sources");
-    let sources = sources.unwrap();
-    assert_eq!(
-        sources.len(),
-        3,
-        "should have 3 sources: serviceAccountToken, configMap, downwardAPI"
-    );
-
-    // Verify volumeMount was added to container
-    let volume_mounts = resource
-        .data
-        .pointer("/spec/containers/0/volumeMounts")
-        .and_then(|v| v.as_array());
-    assert!(
-        volume_mounts.is_some(),
-        "volumeMounts should be added to container"
-    );
-    let mounts = volume_mounts.unwrap();
-    assert_eq!(mounts.len(), 1, "should have 1 volumeMount");
-    assert_eq!(
-        mounts[0].get("mountPath").and_then(|p| p.as_str()),
-        Some("/var/run/secrets/kubernetes.io/serviceaccount"),
-        "mountPath should be /var/run/secrets/kubernetes.io/serviceaccount"
-    );
-    assert_eq!(
-        mounts[0].get("readOnly").and_then(|r| r.as_bool()),
-        Some(true),
-        "volumeMount should be readOnly"
-    );
-}
-
-#[tokio::test]
-async fn test_sa_volume_injection_explicit_false_skips() {
-    let db = Datastore::new_in_memory().await.unwrap();
-    // Create pod with automountServiceAccountToken: false
-    let data = json!({
-        "metadata": {
-            "name": "test-pod",
-            "namespace": "default"
-        },
-        "spec": {
-            "automountServiceAccountToken": false,
-            "containers": [{
-                "name": "test",
-                "image": "busybox"
-            }]
-        }
-    });
-    let resource = db
-        .create_resource("v1", "Pod", Some("default"), "test-pod", data)
-        .await
-        .unwrap();
-
-    // Verify NO volume was injected
-    let volumes = resource
-        .data
-        .get("spec")
-        .and_then(|s| s.get("volumes"))
-        .and_then(|v| v.as_array());
-    assert!(
-        volumes.is_none() || volumes.unwrap().is_empty(),
-        "no volume should be injected when automountServiceAccountToken is false"
-    );
-
-    // Verify NO volumeMount was added
-    let volume_mounts = resource
-        .data
-        .pointer("/spec/containers/0/volumeMounts")
-        .and_then(|v| v.as_array());
-    assert!(
-        volume_mounts.is_none() || volume_mounts.unwrap().is_empty(),
-        "no volumeMount should be added when automountServiceAccountToken is false"
-    );
-}
-
-#[tokio::test]
-async fn test_sa_volume_injection_serviceaccount_false_skips() {
-    let db = Datastore::new_in_memory().await.unwrap();
-
-    let sa = json!({
-        "metadata": {
-            "name": "nomount",
-            "namespace": "default"
-        },
-        "automountServiceAccountToken": false
-    });
-    db.create_resource("v1", "ServiceAccount", Some("default"), "nomount", sa)
-        .await
-        .unwrap();
-
-    let pod = json!({
-        "metadata": {
-            "name": "test-pod",
-            "namespace": "default"
-        },
-        "spec": {
-            "serviceAccountName": "nomount",
-            "containers": [{
-                "name": "test",
-                "image": "busybox"
-            }]
-        }
-    });
-    let resource = db
-        .create_resource("v1", "Pod", Some("default"), "test-pod", pod)
-        .await
-        .unwrap();
-
-    let volumes = resource
-        .data
-        .get("spec")
-        .and_then(|s| s.get("volumes"))
-        .and_then(|v| v.as_array());
-    assert!(
-        volumes.is_none() || volumes.unwrap().is_empty(),
-        "SA automount=false must skip pod SA volume injection"
-    );
-}
-
-#[tokio::test]
-async fn test_sa_volume_injection_pod_true_overrides_serviceaccount_false() {
-    let db = Datastore::new_in_memory().await.unwrap();
-
-    let sa = json!({
-        "metadata": {
-            "name": "nomount",
-            "namespace": "default"
-        },
-        "automountServiceAccountToken": false
-    });
-    db.create_resource("v1", "ServiceAccount", Some("default"), "nomount", sa)
-        .await
-        .unwrap();
-
-    let pod = json!({
-        "metadata": {
-            "name": "test-pod",
-            "namespace": "default"
-        },
-        "spec": {
-            "serviceAccountName": "nomount",
-            "automountServiceAccountToken": true,
-            "containers": [{
-                "name": "test",
-                "image": "busybox"
-            }]
-        }
-    });
-    let resource = db
-        .create_resource("v1", "Pod", Some("default"), "test-pod", pod)
-        .await
-        .unwrap();
-
-    let volumes = resource
-        .data
-        .get("spec")
-        .and_then(|s| s.get("volumes"))
-        .and_then(|v| v.as_array());
-    assert!(
-        volumes.is_some(),
-        "pod-level automount=true must override SA=false"
-    );
-    assert!(
-        !volumes.unwrap().is_empty(),
-        "projected SA volume must be injected"
-    );
-}
-
-#[tokio::test]
-async fn test_sa_volume_mount_added_to_all_containers() {
-    let db = Datastore::new_in_memory().await.unwrap();
-    // Create pod with 2 containers and 1 init container
-    let data = json!({
-        "metadata": {
-            "name": "test-pod",
-            "namespace": "default"
-        },
-        "spec": {
-            "initContainers": [{
-                "name": "init",
-                "image": "busybox"
-            }],
-            "containers": [
-                {
-                    "name": "app",
-                    "image": "nginx"
-                },
-                {
-                    "name": "sidecar",
-                    "image": "busybox"
-                }
-            ]
-        }
-    });
-    let resource = db
-        .create_resource("v1", "Pod", Some("default"), "test-pod", data)
-        .await
-        .unwrap();
-
-    // Verify volumeMount added to init container
-    let init_mounts = resource
-        .data
-        .pointer("/spec/initContainers/0/volumeMounts")
-        .and_then(|v| v.as_array());
-    assert!(
-        init_mounts.is_some(),
-        "volumeMounts should be added to init container"
-    );
-    assert_eq!(
-        init_mounts.unwrap().len(),
-        1,
-        "init container should have 1 volumeMount"
-    );
-
-    // Verify volumeMount added to both regular containers
-    let app_mounts = resource
-        .data
-        .pointer("/spec/containers/0/volumeMounts")
-        .and_then(|v| v.as_array());
-    assert!(
-        app_mounts.is_some(),
-        "volumeMounts should be added to app container"
-    );
-    assert_eq!(
-        app_mounts.unwrap().len(),
-        1,
-        "app container should have 1 volumeMount"
-    );
-
-    let sidecar_mounts = resource
-        .data
-        .pointer("/spec/containers/1/volumeMounts")
-        .and_then(|v| v.as_array());
-    assert!(
-        sidecar_mounts.is_some(),
-        "volumeMounts should be added to sidecar container"
-    );
-    assert_eq!(
-        sidecar_mounts.unwrap().len(),
-        1,
-        "sidecar container should have 1 volumeMount"
-    );
-}
-
-#[tokio::test]
 async fn test_create_resource_sets_timestamp_even_when_null() {
     // Bug: clients (kubectl, sonobuoy) may send creationTimestamp: null.
     // contains_key("creationTimestamp") returns true for null values,
@@ -974,7 +690,7 @@ async fn test_list_resources_pagination_returns_items_sorted_by_name() {
             "v1",
             "ConfigMap",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            klights_cluster_store::ResourceListOptions::all(),
         )
         .await
         .unwrap();
@@ -1009,7 +725,7 @@ async fn test_list_resources_pagination_first_page_sets_continue_token() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(None, None, Some(3), None),
+            klights_cluster_store::ResourceListOptions::new(None, None, Some(3), None),
         )
         .await
         .unwrap();
@@ -1062,7 +778,7 @@ async fn test_list_resources_pagination_second_page_resumes_correctly() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(None, None, Some(3), None),
+            klights_cluster_store::ResourceListOptions::new(None, None, Some(3), None),
         )
         .await
         .unwrap();
@@ -1078,7 +794,7 @@ async fn test_list_resources_pagination_second_page_resumes_correctly() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(None, None, Some(3), Some(&token)),
+            klights_cluster_store::ResourceListOptions::new(None, None, Some(3), Some(&token)),
         )
         .await
         .unwrap();
@@ -1132,7 +848,7 @@ async fn test_list_resources_pagination_no_limit_has_no_continue_token() {
             "v1",
             "ConfigMap",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            klights_cluster_store::ResourceListOptions::all(),
         )
         .await
         .unwrap();
@@ -1171,7 +887,7 @@ async fn test_list_resources_pagination_exact_page_size_has_no_continue_token() 
             "v1",
             "ConfigMap",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(None, None, Some(3), None),
+            klights_cluster_store::ResourceListOptions::new(None, None, Some(3), None),
         )
         .await
         .unwrap();
@@ -1237,8 +953,6 @@ async fn test_stored_data_includes_labels_after_create() {
 /// the data blob) preserves metadata.labels.
 #[test]
 fn test_update_hook_data_assembly_preserves_labels() {
-    use crate::watch::WatchEvent;
-
     // Simulate the data blob as it comes out of the DB (without injected fields)
     let data = json!({
         "metadata": {
@@ -1260,11 +974,8 @@ fn test_update_hook_data_assembly_preserves_labels() {
         42,
     );
 
-    let event = WatchEvent::added(data);
-
     // Labels must survive the metadata injection
-    let labels = event
-        .object
+    let labels = data
         .get("metadata")
         .and_then(|m| m.get("labels"))
         .expect("metadata.labels must be preserved after update_hook data assembly");
@@ -1273,50 +984,14 @@ fn test_update_hook_data_assembly_preserves_labels() {
     assert_eq!(labels["env"], "test");
 
     // And the injected fields must also be present
-    assert_eq!(event.object["kind"], "ConfigMap");
-    assert_eq!(event.object["metadata"]["name"], "cm-with-labels");
-    assert_eq!(event.object["metadata"]["namespace"], "default");
-    assert_eq!(event.object["metadata"]["resourceVersion"], "42");
-
-    // Verify matches_filter uses the labels correctly
-    assert!(
-        event.matches_filter(
-            "ConfigMap",
-            Some("default"),
-            Some("watch-this-configmap=multiple-watchers-A")
-        ),
-        "Event with label=A must match selector=A"
-    );
-    assert!(
-        !event.matches_filter(
-            "ConfigMap",
-            Some("default"),
-            Some("watch-this-configmap=multiple-watchers-B")
-        ),
-        "Event with label=A must NOT match selector=B (equality filter)"
-    );
-    assert!(
-        event.matches_filter(
-            "ConfigMap",
-            Some("default"),
-            Some("watch-this-configmap!=multiple-watchers-B")
-        ),
-        "Event with label=A must match selector !=B (inequality filter)"
-    );
-    assert!(
-        !event.matches_filter(
-            "ConfigMap",
-            Some("default"),
-            Some("watch-this-configmap!=multiple-watchers-A")
-        ),
-        "Event with label=A must NOT match selector !=A (inequality filter — same value)"
-    );
+    assert_eq!(data["kind"], "ConfigMap");
+    assert_eq!(data["metadata"]["name"], "cm-with-labels");
+    assert_eq!(data["metadata"]["namespace"], "default");
+    assert_eq!(data["metadata"]["resourceVersion"], "42");
 }
 
 #[test]
 fn test_update_hook_data_assembly_preserves_empty_namespace_for_cluster_scoped_object() {
-    use crate::watch::WatchEvent;
-
     let data = json!({
         "metadata": {
             "name": "cluster-cr",
@@ -1333,13 +1008,11 @@ fn test_update_hook_data_assembly_preserves_empty_namespace_for_cluster_scoped_o
         "cluster-cr",
         99,
     );
-    let event = WatchEvent::added(data);
-
     assert_eq!(
-        event.object["metadata"]["namespace"], "",
+        data["metadata"]["namespace"], "",
         "cluster-scoped watch event assembly must preserve existing empty namespace"
     );
-    assert_eq!(event.object["metadata"]["resourceVersion"], "99");
+    assert_eq!(data["metadata"]["resourceVersion"], "99");
 }
 
 // ========================

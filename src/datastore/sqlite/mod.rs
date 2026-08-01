@@ -12,9 +12,9 @@ mod focused_ports;
 mod gc;
 mod merge_patch;
 mod outbox_codec;
-mod rv_helpers;
 #[cfg(test)]
-mod tests;
+mod post_commit_integration_tests;
+mod rv_helpers;
 mod watch;
 // DSB-04: broadcast mode probe. Dead code until DSB-HA-02 consumes it.
 pub(super) mod watch_mode;

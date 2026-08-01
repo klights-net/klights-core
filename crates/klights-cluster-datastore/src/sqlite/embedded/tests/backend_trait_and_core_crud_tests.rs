@@ -1,29 +1,28 @@
+#![cfg(test)]
+
 use super::*;
-#[cfg(test)]
-use crate::datastore::TestWatchStore;
-use crate::datastore::{
-    AppliedOutboxStore, ClusterResourceQueryStore, CurrentResourceVersionStore,
-    LeaderResourceMutationStore, MetaStore, NamespaceContentStore, NetworkMetadataStore,
-    OwnershipStore, PodCleanupStore, RawWatchReplayStore, ReplicationStore, ResourceBatchOperation,
-    ResourceBatchPutMode, ResourceListStore, ResourcePreconditions, StatusStore, WatchHistoryStore,
-    WatchMaintenanceStore, WatchReplayAnchorStore,
-};
-use klights_cluster_core::LogApplyCommit;
+use crate::sqlite::live_apply::RaftLogApplyOutcome;
 use klights_cluster_core::command::StorageCommand;
-use klights_cluster_datastore::sqlite::live_apply::RaftLogApplyOutcome;
-use klights_cluster_store::BackendLifecycleStore;
+use klights_cluster_core::{
+    LogApplyCommit, ResourceBatchOperation, ResourceBatchPutMode, ResourcePreconditions,
+};
+use klights_cluster_store::{
+    AppliedOutboxLedger, AuthoritativeSnapshotCapture, AuthoritativeSnapshotPersistence,
+    BackendLifecycleStore, ClusterMetadataMutation, ClusterMetadataRead, ClusterNamespaceMutation,
+    ClusterOwnershipRead, ClusterPodCleanupStore, ClusterResourceMutation, ClusterResourceRead,
+    ClusterResourceScopeRead, ClusterTopologyMutation, ClusterTopologyRead,
+    ClusterWatchMaintenance, DurableAllocatorRead, DurableRawWatchHistoryRead,
+    DurableWatchHistoryRead, DurableWatchRangeRead, NamespaceContentRead, NamespaceRequest,
+};
 use serde_json::json;
 
 fn apply_commit_in_tx_for_raft(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
 ) -> tokio_rusqlite::Result<RaftLogApplyOutcome> {
-    let codec = crate::outbox_response_codec_adapter::new_codec();
-    let context =
-        klights_cluster_datastore::sqlite::live_apply::TransactionContext::new(codec.as_ref());
-    klights_cluster_datastore::sqlite::live_apply::apply_commit_in_tx_for_raft_with_context(
-        tx, commit, &context,
-    )
+    let codec = crate::test_fixtures::outbox::new_codec();
+    let context = crate::sqlite::live_apply::TransactionContext::new(codec.as_ref());
+    crate::sqlite::live_apply::apply_commit_in_tx_for_raft_with_context(tx, commit, &context)
 }
 
 async fn table_column_info(
@@ -125,7 +124,7 @@ async fn watermarked_outbox_commit_appends_applied_outbox_ledger_mutation() {
             "metadata": {"name": "watermarked-no-ledger"}
         }),
     );
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
     let rv_before = db.get_current_resource_version().await.unwrap();
@@ -134,7 +133,7 @@ async fn watermarked_outbox_commit_appends_applied_outbox_ledger_mutation() {
         .build_log_apply_commit_for_outbox_with_watermark(
             "legacy-key-ignored-for-watermark",
             "PodMetadata",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "worker-a",
             Some(OutboxStreamWatermark {
                 client_id: "client-a".to_string(),
@@ -162,8 +161,8 @@ async fn watermarked_outbox_commit_appends_applied_outbox_ledger_mutation() {
 
 #[tokio::test]
 async fn watermarked_uid_bound_missing_pod_outbox_builds_watermark_only_commit() {
-    use crate::datastore::ResourcePreconditions;
     use klights_cluster_core::BuildOutboxOutcome;
+    use klights_cluster_core::ResourcePreconditions;
     use klights_cluster_core::{LogApplyMutation, OutboxStreamWatermark};
 
     let db = Datastore::new_in_memory().await.unwrap();
@@ -180,7 +179,7 @@ async fn watermarked_uid_bound_missing_pod_outbox_builds_watermark_only_commit()
         },
         observed_status_stamp: Some(42),
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -188,7 +187,7 @@ async fn watermarked_uid_bound_missing_pod_outbox_builds_watermark_only_commit()
         .build_log_apply_commit_for_outbox_with_watermark(
             "missing-pod-status",
             "PodStatus",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "worker-a",
             Some(OutboxStreamWatermark {
                 client_id: "worker-client".to_string(),
@@ -228,20 +227,20 @@ async fn stamped_worker_pod_status_merges_against_latest_preserving_scheduler_fi
         name: "stamped-status".into(),
         status: json!({"phase":"Running","podIP":"10.0.0.7","podIPs":[{"ip":"10.0.0.7"}]}),
         expected_rv: Some(created.resource_version),
-        preconditions: crate::datastore::ResourcePreconditions {
+        preconditions: klights_cluster_core::ResourcePreconditions {
             uid: Some("stamped-status-uid".into()),
             resource_version: Some(created.resource_version),
         },
         observed_status_stamp: Some(7),
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
     let BuildOutboxOutcome::NeedsPropose { commit, .. } = db
         .build_log_apply_commit_for_outbox(
             "stamped-status",
             "PodStatus",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -368,7 +367,7 @@ async fn outbox_commit_builders_materialize_committed_apply_v1_templates() {
         }),
     };
     let payload = || {
-        crate::outbox_test_support::OutboxPayload::from_command(command())
+        crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command())
             .encode_protobuf()
             .unwrap()
     };
@@ -380,7 +379,7 @@ async fn outbox_commit_builders_materialize_committed_apply_v1_templates() {
         .build_log_apply_commit_for_outbox(
             "v1-outbox-template",
             "CreateResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(v1_payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(v1_payload.as_ref()),
             "worker-a",
         )
         .await
@@ -410,9 +409,7 @@ async fn outbox_commit_builders_materialize_committed_apply_v1_templates() {
         .build_log_apply_commit_for_outbox_with_watermark(
             "v1-watermarked-outbox-template",
             "CreateResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(
-                watermarked_payload.as_ref(),
-            ),
+            crate::test_fixtures::outbox::test_outbox_command(watermarked_payload.as_ref()),
             "worker-a",
             Some(OutboxStreamWatermark {
                 client_id: "client-a".to_string(),
@@ -988,7 +985,7 @@ async fn raft_commit_builder_rejects_update_for_deleted_resource() {
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -996,7 +993,7 @@ async fn raft_commit_builder_rejects_update_for_deleted_resource() {
         .build_log_apply_commit_for_outbox(
             "raft-leader-stale-pvc-update",
             "UpdateResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await;
@@ -1065,7 +1062,7 @@ async fn stale_raft_pv_bind_is_rejected_and_preserves_concurrent_user_labels() {
         "uid": "pvc-label-race-uid"
     });
     stale_bind["status"] = json!({"phase": "Bound"});
-    let committed = crate::datastore::test_support::test_live_commit(
+    let committed = crate::test_fixtures::live_apply::test_live_commit(
         created.resource_version + 2,
         vec![klights_cluster_core::LogApplyMutation::PutResource(
             klights_cluster_core::LogApplyResourceRow {
@@ -1180,7 +1177,7 @@ async fn raft_commit_builder_applies_pod_status_outbox_against_latest_same_uid()
         preconditions: ResourcePreconditions::from_resource(&created),
         observed_status_stamp: Some(1),
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -1188,7 +1185,7 @@ async fn raft_commit_builder_applies_pod_status_outbox_against_latest_same_uid()
         .build_log_apply_commit_for_outbox(
             "raft-leader-stale-pod-status",
             "PodStatus",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "mn-replica",
         )
         .await
@@ -1258,7 +1255,7 @@ async fn raft_commit_builder_defers_resource_version_allocation_until_apply() {
             "data": {"k": "v"}
         }),
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -1266,7 +1263,7 @@ async fn raft_commit_builder_defers_resource_version_allocation_until_apply() {
         .build_log_apply_commit_for_outbox(
             "raft-leader-deferred-rv",
             "CreateResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -1349,14 +1346,15 @@ async fn strict_committed_apply_rejects_divergent_follower_resource_version() {
             "status": {"phase": "Pending"}
         }),
     };
-    let create_payload = crate::outbox_test_support::OutboxPayload::from_command(create_command)
-        .encode_protobuf()
-        .unwrap();
+    let create_payload =
+        crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(create_command)
+            .encode_protobuf()
+            .unwrap();
     let create_outcome = leader
         .build_log_apply_commit_for_outbox(
             "raft-leader-create-scheduled-later",
             "CreateResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(create_payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(create_payload.as_ref()),
             "leader",
         )
         .await
@@ -1394,14 +1392,15 @@ async fn strict_committed_apply_rejects_divergent_follower_resource_version() {
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
     };
-    let update_payload = crate::outbox_test_support::OutboxPayload::from_command(update_command)
-        .encode_protobuf()
-        .unwrap();
+    let update_payload =
+        crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(update_command)
+            .encode_protobuf()
+            .unwrap();
     let update_outcome = leader
         .build_log_apply_commit_for_outbox(
             "raft-leader-bind-scheduled-later",
             "UpdateResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(update_payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(update_payload.as_ref()),
             "leader",
         )
         .await
@@ -1468,14 +1467,14 @@ async fn raft_apply_rejects_duplicate_create_built_before_first_apply() {
                     "data": {"uid": uid}
                 }),
             };
-            let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+            let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
                 .encode_protobuf()
                 .unwrap();
             let outcome = db
                 .build_log_apply_commit_for_outbox(
                     idempotency_key,
                     "CreateResource",
-                    klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+                    crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
                     "leader",
                 )
                 .await
@@ -1550,14 +1549,14 @@ async fn raft_apply_rejects_stale_resource_version_built_before_prior_apply() {
                 expected_rv: created.resource_version,
                 preconditions: ResourcePreconditions::resource_version(created.resource_version),
             };
-            let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+            let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
                 .encode_protobuf()
                 .unwrap();
             let outcome = db
                 .build_log_apply_commit_for_outbox(
                     idempotency_key,
                     "UpdateResource",
-                    klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+                    crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
                     "leader",
                 )
                 .await
@@ -1638,14 +1637,14 @@ async fn raft_status_apply_built_before_metadata_update_preserves_live_metadata(
         },
         observed_status_stamp: None,
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "raft-status-metadata-race",
             "PodStatus",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -1740,8 +1739,8 @@ async fn stale_status_only_apply_rejects_and_preserves_live_job_status_scalars()
         .await
         .unwrap();
 
-    let payload =
-        crate::outbox_test_support::OutboxPayload::from_command(StorageCommand::UpdateStatus {
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(
+        StorageCommand::UpdateStatus {
             api_version: "batch/v1".into(),
             kind: "Job".into(),
             namespace: Some("default".into()),
@@ -1758,15 +1757,16 @@ async fn stale_status_only_apply_rejects_and_preserves_live_job_status_scalars()
                 resource_version: Some(created.resource_version),
             },
             observed_status_stamp: None,
-        })
-        .encode_protobuf()
-        .unwrap();
+        },
+    )
+    .encode_protobuf()
+    .unwrap();
 
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "stale-job-status-commit",
             "JobStatus",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -1847,7 +1847,7 @@ async fn stale_status_only_apply_rejects_incoming_nonterminal_job_condition_valu
         .await
         .unwrap();
 
-    let committed_status = crate::datastore::test_support::test_live_commit(
+    let committed_status = crate::test_fixtures::live_apply::test_live_commit(
         0,
         vec![klights_cluster_core::LogApplyMutation::PutResource(
             klights_cluster_core::LogApplyResourceRow {
@@ -1992,14 +1992,15 @@ async fn stale_committed_pod_bind_preserves_live_owner_references() {
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
     };
-    let bind_payload = crate::outbox_test_support::OutboxPayload::from_command(bind_command)
-        .encode_protobuf()
-        .unwrap();
+    let bind_payload =
+        crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(bind_command)
+            .encode_protobuf()
+            .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "stale-cycle-pod-bind",
             "UpdateResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(bind_payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(bind_payload.as_ref()),
             "leader",
         )
         .await
@@ -2115,14 +2116,15 @@ async fn stale_committed_pod_bind_preserves_stale_owner_ref_subset() {
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
     };
-    let bind_payload = crate::outbox_test_support::OutboxPayload::from_command(bind_command)
-        .encode_protobuf()
-        .unwrap();
+    let bind_payload =
+        crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(bind_command)
+            .encode_protobuf()
+            .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "stale-bind-pod-stale-owner-subset",
             "UpdateResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(bind_payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(bind_payload.as_ref()),
             "leader",
         )
         .await
@@ -2248,16 +2250,14 @@ async fn stale_committed_pod_put_same_node_preserves_live_owner_references() {
         preconditions: ResourcePreconditions::from_resource(&created),
     };
     let stale_same_node_payload =
-        crate::outbox_test_support::OutboxPayload::from_command(stale_same_node_command)
+        crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(stale_same_node_command)
             .encode_protobuf()
             .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "stale-same-node-pod-put",
             "UpdateResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(
-                stale_same_node_payload.as_ref(),
-            ),
+            crate::test_fixtures::outbox::test_outbox_command(stale_same_node_payload.as_ref()),
             "leader",
         )
         .await
@@ -2376,16 +2376,14 @@ async fn stale_committed_pod_put_with_explicit_empty_owner_references_clears_liv
         preconditions: ResourcePreconditions::from_resource(&created),
     };
     let stale_clear_payload =
-        crate::outbox_test_support::OutboxPayload::from_command(stale_clear_command)
+        crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(stale_clear_command)
             .encode_protobuf()
             .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "stale-explicit-owner-clear",
             "UpdateResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(
-                stale_clear_payload.as_ref(),
-            ),
+            crate::test_fixtures::outbox::test_outbox_command(stale_clear_payload.as_ref()),
             "leader",
         )
         .await
@@ -2473,16 +2471,14 @@ async fn stale_committed_pod_bind_does_not_rebind_already_bound_pod() {
         preconditions: ResourcePreconditions::from_resource(&created),
     };
     let stale_bind_payload =
-        crate::outbox_test_support::OutboxPayload::from_command(stale_bind_command)
+        crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(stale_bind_command)
             .encode_protobuf()
             .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "stale-rebind-pod-bind",
             "UpdateResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(
-                stale_bind_payload.as_ref(),
-            ),
+            crate::test_fixtures::outbox::test_outbox_command(stale_bind_payload.as_ref()),
             "leader",
         )
         .await
@@ -2558,7 +2554,7 @@ async fn stale_status_only_committed_pvc_apply_is_rejected_without_losing_live_c
         .await
         .unwrap();
 
-    let committed_status = crate::datastore::test_support::test_live_commit(
+    let committed_status = crate::test_fixtures::live_apply::test_live_commit(
         created.resource_version + 2,
         vec![klights_cluster_core::LogApplyMutation::PutResource(
             klights_cluster_core::LogApplyResourceRow {
@@ -2681,7 +2677,7 @@ async fn stale_status_only_apply_rejects_and_preserves_newer_pv_and_pvc_conditio
             .await
             .unwrap();
 
-        let committed_status = crate::datastore::test_support::test_live_commit(
+        let committed_status = crate::test_fixtures::live_apply::test_live_commit(
             0,
             vec![klights_cluster_core::LogApplyMutation::PutResource(
                 klights_cluster_core::LogApplyResourceRow {
@@ -2853,14 +2849,14 @@ async fn raft_status_apply_built_before_preemption_preserves_disruption_target()
         },
         observed_status_stamp: None,
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "raft-status-preemption-condition-race",
             "PodStatus",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -2962,19 +2958,19 @@ async fn raft_scale_patch_applies_against_live_resource_after_status_rv_race() {
         kind: "ReplicationController".to_string(),
         namespace: Some("default".to_string()),
         name: "scale-race-rc".to_string(),
-        patch_kind: crate::datastore::PatchKind::Merge,
+        patch_kind: klights_cluster_core::PatchKind::Merge,
         patch: json!({"spec": {"replicas": 2}}),
         preconditions: ResourcePreconditions::uid(created.uid.clone()),
         strict_resource_version: false,
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "raft-rc-scale-latest-patch",
             "PatchResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3062,7 +3058,7 @@ async fn raft_pod_delete_mark_patch_applies_against_live_resource_after_status_r
         kind: "Pod".to_string(),
         namespace: Some("default".to_string()),
         name: "delete-race-pod".to_string(),
-        patch_kind: crate::datastore::PatchKind::Merge,
+        patch_kind: klights_cluster_core::PatchKind::Merge,
         patch: json!({
             "metadata": {
                 "deletionTimestamp": "2026-06-21T00:20:09Z",
@@ -3072,14 +3068,14 @@ async fn raft_pod_delete_mark_patch_applies_against_live_resource_after_status_r
         preconditions: ResourcePreconditions::uid(created.uid.clone()),
         strict_resource_version: false,
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "raft-pod-delete-mark-latest-patch",
             "PatchResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3191,7 +3187,7 @@ async fn raft_zero_grace_pod_delete_mark_patch_replays_identical_watch_payloads(
         kind: "Pod".to_string(),
         namespace: Some("default".to_string()),
         name: "zero-grace-replay".to_string(),
-        patch_kind: crate::datastore::PatchKind::Merge,
+        patch_kind: klights_cluster_core::PatchKind::Merge,
         patch: json!({
             "metadata": {
                 "deletionTimestamp": "2026-06-21T01:02:03Z",
@@ -3201,14 +3197,14 @@ async fn raft_zero_grace_pod_delete_mark_patch_replays_identical_watch_payloads(
         strict_resource_version: false,
         preconditions: ResourcePreconditions::uid(created.uid.clone()),
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = leader
         .build_log_apply_commit_for_outbox(
             "raft-zero-grace-delete-mark-deterministic",
             "PatchResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3232,7 +3228,7 @@ async fn raft_zero_grace_pod_delete_mark_patch_replays_identical_watch_payloads(
 
     let leader_event = leader
         .list_watch_events_since(
-            &[crate::datastore::WatchTarget::namespaced_in_namespace(
+            &[klights_cluster_store::WatchTarget::namespaced_in_namespace(
                 "v1", "Pod", "default",
             )],
             1,
@@ -3244,7 +3240,7 @@ async fn raft_zero_grace_pod_delete_mark_patch_replays_identical_watch_payloads(
         .expect("leader delete-mark watch event");
     let follower_event = follower
         .list_watch_events_since(
-            &[crate::datastore::WatchTarget::namespaced_in_namespace(
+            &[klights_cluster_store::WatchTarget::namespaced_in_namespace(
                 "v1", "Pod", "default",
             )],
             1,
@@ -3362,7 +3358,7 @@ async fn raft_stale_pod_put_over_terminating_live_row_replays_identical_watch_pa
         {"type": "ContainersReady", "status": "True", "lastTransitionTime": "2026-06-21T00:00:02Z"},
         {"type": "Ready", "status": "True", "lastTransitionTime": "2026-06-21T00:00:02Z"}
     ]);
-    let commit = crate::datastore::test_support::test_live_commit(
+    let commit = crate::test_fixtures::live_apply::test_live_commit(
         committed_rv,
         vec![klights_cluster_core::LogApplyMutation::PutResource(
             klights_cluster_core::LogApplyResourceRow {
@@ -3396,7 +3392,7 @@ async fn raft_stale_pod_put_over_terminating_live_row_replays_identical_watch_pa
 
     let leader_event = leader
         .list_watch_events_since(
-            &[crate::datastore::WatchTarget::namespaced_in_namespace(
+            &[klights_cluster_store::WatchTarget::namespaced_in_namespace(
                 "v1", "Pod", "default",
             )],
             leader_created.resource_version,
@@ -3408,7 +3404,7 @@ async fn raft_stale_pod_put_over_terminating_live_row_replays_identical_watch_pa
         .expect("leader stale put watch event");
     let follower_event = follower
         .list_watch_events_since(
-            &[crate::datastore::WatchTarget::namespaced_in_namespace(
+            &[klights_cluster_store::WatchTarget::namespaced_in_namespace(
                 "v1", "Pod", "default",
             )],
             follower_created.resource_version,
@@ -3452,7 +3448,7 @@ async fn raft_resource_put_persists_row_and_watch_from_identical_payload_bytes()
         },
         "data": {"hello": "derived"},
     });
-    let commit = crate::datastore::test_support::test_live_commit(
+    let commit = crate::test_fixtures::live_apply::test_live_commit(
         41,
         vec![klights_cluster_core::LogApplyMutation::PutResource(
             klights_cluster_core::LogApplyResourceRow {
@@ -3501,7 +3497,7 @@ async fn raft_resource_put_persists_row_and_watch_from_identical_payload_bytes()
 }
 
 #[tokio::test]
-async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
+async fn destination_noop_patch_built_before_spec_update_preserves_live_spec() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db
         .create_resource(
@@ -3548,7 +3544,7 @@ async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
         kind: "Deployment".to_string(),
         namespace: Some("default".to_string()),
         name: "web".to_string(),
-        patch_kind: crate::datastore::PatchKind::Merge,
+        patch_kind: klights_cluster_core::PatchKind::Merge,
         patch: json!({
             "metadata": {
                 "annotations": {
@@ -3559,14 +3555,14 @@ async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
         preconditions: ResourcePreconditions::uid(created.uid.clone()),
         strict_resource_version: false,
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "raft-stale-deployment-revision-patch",
             "PatchResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3589,17 +3585,15 @@ async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
     .await
     .expect("client scale update applies before stale patch commit");
 
-    // Strict committed apply rejects the stale raw RV before normalization and
-    // must not roll back newer client-owned state.
+    // The focused persistence owner has already materialized this annotation,
+    // so its commit carries only the outbox ledger and must not roll back the
+    // newer client-owned state.
     let apply_result = db
         .apply_raft_log_apply_commit(commit)
         .await
         .expect("stale committed apply returns a deterministic outcome");
-    assert!(
-        apply_result.error_message.is_some(),
-        "stale committed apply must fail strict RV validation: {apply_result:?}"
-    );
-    assert_eq!(apply_result.applied_rv, None);
+    assert_eq!(apply_result.error_message, None);
+    assert!(!apply_result.public_resource_changed);
 
     let live = db
         .get_resource("apps/v1", "Deployment", Some("default"), "web")
@@ -3621,7 +3615,6 @@ async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
         Some("2"),
         "stale raft patch may apply its metadata annotation while preserving newer spec state"
     );
-    assert_eq!(apply_result.applied_rv, None);
 }
 
 #[tokio::test]
@@ -3643,14 +3636,14 @@ async fn raft_apply_same_idempotency_key_returns_same_rv_without_reapply() {
             "data": {"applied": "once"}
         }),
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "raft-idempotent-apply",
             "CreateResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3776,7 +3769,7 @@ async fn raft_outbox_build_rejects_incomplete_durable_ledger_row() {
             resource_version: None,
         },
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -3784,7 +3777,7 @@ async fn raft_outbox_build_rejects_incomplete_durable_ledger_row() {
         .build_log_apply_commit_for_outbox(
             "fresh-raft-placeholder-key",
             "PodMetadata",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await;
@@ -3835,7 +3828,7 @@ async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
             "data": {"winner": "second"}
         }),
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
     let idempotency_key = "raft-duplicate-retry-key";
@@ -3844,7 +3837,7 @@ async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
         .build_log_apply_commit_for_outbox(
             idempotency_key,
             "CreateResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3869,7 +3862,7 @@ async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
         .build_log_apply_commit_for_outbox(
             idempotency_key,
             "CreateResource",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await;
@@ -3910,7 +3903,7 @@ async fn raft_apply_terminal_conflict_without_outbox_returns_rejection_result() 
     .unwrap();
     let before_rv = db.get_current_resource_version().await.unwrap();
 
-    let commit = crate::datastore::test_support::test_live_commit(
+    let commit = crate::test_fixtures::live_apply::test_live_commit(
         0,
         vec![klights_cluster_core::LogApplyMutation::PutResource(
             klights_cluster_core::LogApplyResourceRow {
@@ -4013,7 +4006,7 @@ async fn raft_applied_outbox_replay_is_deterministic() {
     let leader = Datastore::new_in_memory().await.unwrap();
     let follower = Datastore::new_in_memory().await.unwrap();
 
-    let initial_put = crate::datastore::test_support::test_live_commit(
+    let initial_put = crate::test_fixtures::live_apply::test_live_commit(
         1,
         vec![
             klights_cluster_core::LogApplyMutation::PutAppliedOutbox(
@@ -4078,7 +4071,7 @@ async fn raft_applied_outbox_replay_is_deterministic() {
         "initial put rows must match expected snapshot"
     );
 
-    let delete = crate::datastore::test_support::test_live_commit(
+    let delete = crate::test_fixtures::live_apply::test_live_commit(
         2,
         vec![
             klights_cluster_core::LogApplyMutation::DeleteAppliedOutbox {
@@ -4106,7 +4099,7 @@ async fn raft_applied_outbox_replay_is_deterministic() {
     );
     assert_eq!(leader_rows, after_delete_expected);
 
-    let follow_up_put = crate::datastore::test_support::test_live_commit(
+    let follow_up_put = crate::test_fixtures::live_apply::test_live_commit(
         3,
         vec![klights_cluster_core::LogApplyMutation::PutAppliedOutbox(
             klights_cluster_core::LogApplyAppliedOutboxRow {
@@ -4129,7 +4122,7 @@ async fn raft_applied_outbox_replay_is_deterministic() {
         .await
         .unwrap();
 
-    let gc = crate::datastore::test_support::test_live_commit(
+    let gc = crate::test_fixtures::live_apply::test_live_commit(
         4,
         vec![klights_cluster_core::LogApplyMutation::GcAppliedOutbox {
             cutoff_ms: 10_000,
@@ -4198,7 +4191,7 @@ async fn raft_commit_builder_does_not_treat_api_node_update_as_node_status_refre
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::resource_version(created.resource_version),
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -4206,7 +4199,7 @@ async fn raft_commit_builder_does_not_treat_api_node_update_as_node_status_refre
         .build_log_apply_commit_for_outbox(
             "raft-leader-node-api-update",
             "PodStatus",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "mn-controlplane1",
         )
         .await
@@ -4304,7 +4297,7 @@ async fn pod_cleanup_intents_schema_is_cluster_uid_and_reason_bound() {
 #[tokio::test]
 async fn log_apply_replays_pod_cleanup_intents() {
     let db = Datastore::new_in_memory().await.unwrap();
-    db.apply_log_apply_commit(crate::datastore::test_support::test_live_commit(
+    db.apply_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
         7,
         vec![klights_cluster_core::LogApplyMutation::PutPodCleanupIntent(
             klights_cluster_core::LogApplyPodCleanupIntentRow {
@@ -4339,7 +4332,7 @@ async fn log_apply_replays_pod_cleanup_intents() {
     assert_eq!(rows[0].pod_uid, "lost-uid");
     assert_eq!(rows[0].reason, "NodeLost");
 
-    db.apply_log_apply_commit(crate::datastore::test_support::test_live_commit(
+    db.apply_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
         8,
         vec![
             klights_cluster_core::LogApplyMutation::DeletePodCleanupIntent(
@@ -4364,7 +4357,7 @@ async fn log_apply_replays_pod_cleanup_intents() {
     );
 
     for pod_name in ["lost-pod-a", "lost-pod-b"] {
-        db.apply_log_apply_commit(crate::datastore::test_support::test_live_commit(
+        db.apply_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
             9,
             vec![klights_cluster_core::LogApplyMutation::PutPodCleanupIntent(
                 klights_cluster_core::LogApplyPodCleanupIntentRow {
@@ -4400,7 +4393,7 @@ async fn log_apply_replays_pod_cleanup_intents() {
         2
     );
 
-    db.apply_log_apply_commit(crate::datastore::test_support::test_live_commit(
+    db.apply_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
         10,
         vec![
             klights_cluster_core::LogApplyMutation::DeletePodCleanupIntentsForNode {
@@ -4510,21 +4503,22 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .await
         .unwrap();
 
-    let payload =
-        crate::outbox_test_support::OutboxPayload::from_command(StorageCommand::FinalizeBoundPod {
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(
+        StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalizer-race".to_string(),
             pod_uid: "finalizer-race-uid".to_string(),
             node_name: "worker-a".to_string(),
             observed_resource_version: observed.resource_version,
-        })
-        .encode_protobuf()
-        .unwrap();
+        },
+    )
+    .encode_protobuf()
+    .unwrap();
     let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = db
         .build_log_apply_commit_for_outbox(
             "actor-finalize-finalizer-race",
             "PodMetadata",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4611,16 +4605,17 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     );
 
     let before_fresh_finalize_rv = db.get_current_resource_version().await.unwrap();
-    let fresh_payload =
-        crate::outbox_test_support::OutboxPayload::from_command(StorageCommand::FinalizeBoundPod {
+    let fresh_payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(
+        StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalizer-race".to_string(),
             pod_uid: "finalizer-race-uid".to_string(),
             node_name: "worker-a".to_string(),
             observed_resource_version: before_fresh_finalize_rv,
-        })
-        .encode_protobuf()
-        .unwrap();
+        },
+    )
+    .encode_protobuf()
+    .unwrap();
     let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit: fresh_commit,
         ..
@@ -4628,7 +4623,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .build_log_apply_commit_for_outbox(
             "actor-finalize-after-finalizer-drain",
             "PodMetadata",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(fresh_payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(fresh_payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4659,16 +4654,17 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
 
     let missing_rv = db.get_current_resource_version().await.unwrap();
     let missing_watch_count = watch_event_count(&db).await;
-    let missing_payload =
-        crate::outbox_test_support::OutboxPayload::from_command(StorageCommand::FinalizeBoundPod {
+    let missing_payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(
+        StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalizer-race".to_string(),
             pod_uid: "finalizer-race-uid".to_string(),
             node_name: "worker-a".to_string(),
             observed_resource_version: missing_rv,
-        })
-        .encode_protobuf()
-        .unwrap();
+        },
+    )
+    .encode_protobuf()
+    .unwrap();
     let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit: missing_commit,
         ..
@@ -4676,7 +4672,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .build_log_apply_commit_for_outbox(
             "actor-finalize-already-missing",
             "PodMetadata",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(missing_payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(missing_payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4718,16 +4714,17 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     .unwrap();
     let replacement_rv = db.get_current_resource_version().await.unwrap();
     let replacement_watch_count = watch_event_count(&db).await;
-    let stale_payload =
-        crate::outbox_test_support::OutboxPayload::from_command(StorageCommand::FinalizeBoundPod {
+    let stale_payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(
+        StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalizer-race".to_string(),
             pod_uid: "finalizer-race-uid".to_string(),
             node_name: "worker-a".to_string(),
             observed_resource_version: replacement_rv,
-        })
-        .encode_protobuf()
-        .unwrap();
+        },
+    )
+    .encode_protobuf()
+    .unwrap();
     let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit: replacement_commit,
         ..
@@ -4735,7 +4732,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .build_log_apply_commit_for_outbox(
             "actor-finalize-stale-replacement",
             "PodMetadata",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(stale_payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(stale_payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4769,23 +4766,24 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         "replacement-uid"
     );
 
-    let eligible_payload =
-        crate::outbox_test_support::OutboxPayload::from_command(StorageCommand::FinalizeBoundPod {
+    let eligible_payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(
+        StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalizer-race".to_string(),
             pod_uid: "replacement-uid".to_string(),
             node_name: "worker-a".to_string(),
             observed_resource_version: replacement_rv,
-        })
-        .encode_protobuf()
-        .unwrap();
+        },
+    )
+    .encode_protobuf()
+    .unwrap();
     let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit, applied_rv, ..
     } = db
         .build_log_apply_commit_for_outbox(
             "actor-finalize-fixed-contract",
             "PodMetadata",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(eligible_payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(eligible_payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4841,22 +4839,23 @@ async fn actor_finalize_bound_pod_serializes_a_status_write_after_proposal_build
         .await
         .unwrap();
 
-    let payload =
-        crate::outbox_test_support::OutboxPayload::from_command(StorageCommand::FinalizeBoundPod {
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(
+        StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalize-rv-race".to_string(),
             pod_uid: "finalize-rv-race-uid".to_string(),
             node_name: "worker-a".to_string(),
             observed_resource_version: observed.resource_version,
-        })
-        .encode_protobuf()
-        .unwrap();
+        },
+    )
+    .encode_protobuf()
+    .unwrap();
 
     let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = db
         .build_log_apply_commit_for_outbox(
             "actor-finalize-rv-race",
             "PodMetadata",
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4946,7 +4945,7 @@ async fn watermarked_actor_finalize_bound_pod_covers_eligibility() {
         let before_rv = db.get_current_resource_version().await.unwrap();
         let before_watch_count = watch_event_count(&db).await;
         let idempotency_key = format!("watermarked-finalize-{}", case.name);
-        let payload = crate::outbox_test_support::OutboxPayload::from_command(
+        let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(
             StorageCommand::FinalizeBoundPod {
                 namespace: "default".to_string(),
                 name: case.name.to_string(),
@@ -4963,7 +4962,7 @@ async fn watermarked_actor_finalize_bound_pod_covers_eligibility() {
             .build_log_apply_commit_for_outbox_with_watermark(
                 &idempotency_key,
                 "PodMetadata",
-                klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+                crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
                 "worker-a",
                 Some(klights_cluster_core::OutboxStreamWatermark {
                     client_id: format!("client-{}", case.name),
@@ -5149,7 +5148,7 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
     }))
     .unwrap();
 
-    let initial_put = crate::datastore::test_support::test_live_commit(
+    let initial_put = crate::test_fixtures::live_apply::test_live_commit(
         11,
         vec![
             klights_cluster_core::LogApplyMutation::PutPodCleanupIntent(
@@ -5235,7 +5234,7 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
     assert_eq!(leader_rows, follower_rows);
     assert_eq!(leader_rows, expected_after_put);
 
-    let delete = crate::datastore::test_support::test_live_commit(
+    let delete = crate::test_fixtures::live_apply::test_live_commit(
         12,
         vec![
             klights_cluster_core::LogApplyMutation::DeletePodCleanupIntent(
@@ -5280,7 +5279,7 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
     assert_eq!(leader_rows, follower_rows);
     assert_eq!(leader_rows, after_delete_expected);
 
-    let delete_node = crate::datastore::test_support::test_live_commit(
+    let delete_node = crate::test_fixtures::live_apply::test_live_commit(
         13,
         vec![
             klights_cluster_core::LogApplyMutation::DeletePodCleanupIntentsForNode {
@@ -5316,7 +5315,7 @@ async fn raft_cluster_meta_replay_is_deterministic() {
     let leader = Datastore::new_in_memory().await.unwrap();
     let follower = Datastore::new_in_memory().await.unwrap();
 
-    let commit = crate::datastore::test_support::test_live_commit(
+    let commit = crate::test_fixtures::live_apply::test_live_commit(
         1,
         vec![
             klights_cluster_core::LogApplyMutation::PutKlightsMeta {
@@ -5395,7 +5394,7 @@ async fn create_resource_populates_uid_column() {
             "v1",
             "ConfigMap",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            klights_cluster_store::ResourceListOptions::all(),
         )
         .await
         .unwrap();
@@ -5529,7 +5528,7 @@ async fn raft_patch_merge_preserves_metadata_identity_and_labels() {
                 kind: "Deployment".to_string(),
                 namespace: Some("kube-system".to_string()),
                 name: "coredns".to_string(),
-                patch_kind: crate::datastore::PatchKind::Merge,
+                patch_kind: klights_cluster_core::PatchKind::Merge,
                 patch: json!({
                     "metadata": {
                         "annotations": {
@@ -5643,7 +5642,7 @@ async fn update_resource_rejects_metadata_uid_change() {
         .expect_err("metadata.uid changes must be rejected");
 
     assert!(
-        klights_cluster_datastore::errors::is_conflict_error(&err),
+        crate::errors::is_conflict_error(&err),
         "expected conflict, got {err:#}"
     );
     let stored = db
@@ -5693,7 +5692,7 @@ async fn update_status_only_rejects_uid_precondition_mismatch() {
         .expect_err("stale uid precondition must reject status writes");
 
     assert!(
-        klights_cluster_datastore::errors::is_conflict_error(&err),
+        crate::errors::is_conflict_error(&err),
         "expected conflict, got {err:#}"
     );
     let stored = db
@@ -5820,8 +5819,8 @@ async fn patch_resource_latest_rejects_uid_precondition_mismatch() {
             "ConfigMap",
             Some("default"),
             "cm-patch-uid",
-            crate::datastore::ResourcePatchRequest::new(
-                crate::datastore::PatchKind::Merge,
+            klights_cluster_core::ResourcePatchRequest::new(
+                klights_cluster_core::PatchKind::Merge,
                 json!({"data":{"k":"v2"}}),
                 ResourcePreconditions {
                     uid: Some("uid-stale".to_string()),
@@ -5833,7 +5832,7 @@ async fn patch_resource_latest_rejects_uid_precondition_mismatch() {
         .expect_err("stale uid precondition must reject patches");
 
     assert!(
-        klights_cluster_datastore::errors::is_conflict_error(&err),
+        crate::errors::is_conflict_error(&err),
         "expected conflict, got {err:#}"
     );
     let stored = db
@@ -5866,8 +5865,8 @@ async fn patch_resource_latest_rejects_metadata_uid_change() {
             "ConfigMap",
             Some("default"),
             "cm-patch-immutable",
-            crate::datastore::ResourcePatchRequest::new(
-                crate::datastore::PatchKind::Merge,
+            klights_cluster_core::ResourcePatchRequest::new(
+                klights_cluster_core::PatchKind::Merge,
                 json!({"metadata":{"uid":"uid-replacement"}}),
                 ResourcePreconditions::default(),
             ),
@@ -5876,7 +5875,7 @@ async fn patch_resource_latest_rejects_metadata_uid_change() {
         .expect_err("metadata.uid changes must be rejected");
 
     assert!(
-        klights_cluster_datastore::errors::is_conflict_error(&err),
+        crate::errors::is_conflict_error(&err),
         "expected conflict, got {err:#}"
     );
 }
@@ -5909,7 +5908,7 @@ async fn delete_resource_rejects_uid_precondition_mismatch() {
         .expect_err("stale uid precondition must reject delete");
 
     assert!(
-        klights_cluster_datastore::errors::is_conflict_error(&err),
+        crate::errors::is_conflict_error(&err),
         "expected conflict, got {err:#}"
     );
     assert!(
@@ -5921,62 +5920,66 @@ async fn delete_resource_rejects_uid_precondition_mismatch() {
 }
 
 #[tokio::test]
-async fn test_datastore_backend_trait_object_crud() {
+async fn focused_resource_ports_support_crud() {
     let concrete = Datastore::new_in_memory().await.unwrap();
-    let backend: &dyn DatastoreBackend = &concrete;
-
-    let fetched = create_and_fetch_via_backend(backend).await.unwrap();
+    let fetched = create_and_fetch_via_focused_ports(&concrete).await.unwrap();
     assert!(fetched.is_some());
-    let rv = backend.get_current_resource_version().await.unwrap();
+    let rv = DurableAllocatorRead::read_allocator_state(concrete.focused_read_store().as_ref())
+        .await
+        .unwrap()
+        .position()
+        .resource_version;
     assert!(rv >= 1);
 }
 
 #[tokio::test]
 async fn focused_store_traits_cover_sqlite_backend() {
-    fn assert_traits<T>(_: &T)
+    fn assert_mutation_ports<T>(_: &T)
     where
-        T: ResourceStore
-            + ResourceListStore
-            + StatusStore
-            + OwnershipStore
-            + WatchHistoryStore
-            + NamespaceStore
-            + NamespaceContentStore
-            + NetworkMetadataStore
-            + ReplicationStore
-            + CurrentResourceVersionStore
-            + MetaStore
-            + BackendLifecycleStore
-            + ClusterResourceQueryStore
-            + LeaderResourceMutationStore
-            + WatchMaintenanceStore
-            + PodCleanupStore
-            + AppliedOutboxStore
-            + TestWatchStore,
+        T: ClusterResourceMutation
+            + ClusterNamespaceMutation
+            + ClusterWatchMaintenance
+            + ClusterTopologyMutation
+            + ClusterPodCleanupStore
+            + AppliedOutboxLedger
+            + ClusterMetadataMutation
+            + BackendLifecycleStore,
+    {
+    }
+
+    fn assert_read_ports<T>(_: &T)
+    where
+        T: ClusterResourceRead
+            + ClusterResourceScopeRead
+            + NamespaceContentRead
+            + ClusterOwnershipRead
+            + ClusterTopologyRead
+            + DurableAllocatorRead
+            + DurableWatchHistoryRead
+            + DurableWatchRangeRead
+            + DurableRawWatchHistoryRead,
+    {
+    }
+
+    fn assert_recovery_ports<T>(_: &T)
+    where
+        T: AuthoritativeSnapshotCapture + AuthoritativeSnapshotPersistence + ClusterMetadataRead,
     {
     }
 
     let db = Datastore::new_in_memory().await.unwrap();
-    assert_traits(&db);
-
-    fn assert_watch_store<T: WatchStore>(_: &T) {}
-    fn assert_watch_anchor<T: WatchReplayAnchorStore>(_: &T) {}
-    fn assert_raw_watch_replay<T: RawWatchReplayStore>(_: &T) {}
-    let handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
-    let watch_store = crate::datastore::DatastoreBackendWatchStore::new(handle);
-    assert_watch_store(&watch_store);
-    assert_watch_anchor(&watch_store);
-    assert_raw_watch_replay(&watch_store);
+    assert_mutation_ports(&db);
+    assert_read_ports(db.focused_read_store().as_ref());
+    assert_recovery_ports(db.focused_recovery_store().as_ref());
+    let _committed_apply: std::sync::Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply> =
+        db.focused_committed_apply();
 }
 
 #[tokio::test]
-async fn test_datastore_backend_advance_rv_via_trait_returns_at_least_min_rv() {
+async fn focused_watch_maintenance_advances_rv_past_minimum() {
     let concrete = Datastore::new_in_memory().await.unwrap();
-    let backend: &dyn DatastoreBackend = &concrete;
-
-    let target = backend.get_current_resource_version().await.unwrap() + 5;
-    let advanced = backend
-        .advance_resource_version_after(target)
+    let target = concrete.get_current_resource_version().await.unwrap() + 5;
+    let advanced = ClusterWatchMaintenance::advance_resource_version_after(&concrete, target)
         .await
         .unwrap();
     assert!(advanced > target);
@@ -5991,14 +5994,14 @@ async fn build_candidate_rv_commit(
         min_rv: before,
         new_rv: before + 1,
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             idempotency_key,
-            klights_kubelet::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_cluster_core::OutboxOperation::PodStatus.as_str(),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "mn-controlplane1",
         )
         .await
@@ -6073,14 +6076,14 @@ async fn raft_terminal_conflict_does_not_consume_candidate_resource_version() {
         name: "mn-controlplane2".to_string(),
         data: json!({"metadata": {"name": "mn-controlplane2"}}),
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "conflicting-node-registration",
-            klights_kubelet::node_outbox::payload::OutboxOperation::NodeRegistration.as_str(),
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_cluster_core::OutboxOperation::NodeRegistration.as_str(),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "mn-controlplane2",
         )
         .await
@@ -6111,26 +6114,32 @@ async fn raft_terminal_conflict_does_not_consume_candidate_resource_version() {
 }
 
 #[tokio::test]
-async fn test_datastore_backend_list_namespace_resources_via_trait_returns_inserted() {
+async fn focused_namespace_ports_return_inserted_resources() {
     let concrete = Datastore::new_in_memory().await.unwrap();
-    let backend: &dyn DatastoreBackend = &concrete;
+    ClusterNamespaceMutation::create_namespace(
+        &concrete,
+        "ns-trait",
+        json!({"metadata":{"name":"ns-trait"}}),
+    )
+    .await
+    .unwrap();
+    ClusterResourceMutation::create_resource(
+        &concrete,
+        "v1",
+        "ConfigMap",
+        Some("ns-trait"),
+        "cm-trait",
+        json!({"metadata":{"name":"cm-trait"},"data":{"k":"v"}}),
+    )
+    .await
+    .unwrap();
 
-    backend
-        .create_namespace("ns-trait", json!({"metadata":{"name":"ns-trait"}}))
-        .await
-        .unwrap();
-    backend
-        .create_resource(
-            "v1",
-            "ConfigMap",
-            Some("ns-trait"),
-            "cm-trait",
-            json!({"metadata":{"name":"cm-trait"},"data":{"k":"v"}}),
-        )
-        .await
-        .unwrap();
-
-    let items = backend.list_namespace_resources("ns-trait").await.unwrap();
+    let items = NamespaceContentRead::list_namespace_resources(
+        concrete.focused_read_store().as_ref(),
+        NamespaceRequest::try_new("ns-trait").unwrap(),
+    )
+    .await
+    .unwrap();
     assert!(
         items
             .iter()
@@ -6283,16 +6292,18 @@ async fn raft_allocate_node_subnet_resolves_lowest_free_24_at_apply_time() {
 }
 
 #[tokio::test]
-async fn test_datastore_handle_arc_dyn_clone_shares_state() {
+async fn focused_namespace_mutation_handle_clone_shares_state() {
     let concrete = Datastore::new_in_memory().await.unwrap();
-    let handle: DatastoreHandle = std::sync::Arc::new(concrete);
+    let handle: std::sync::Arc<dyn ClusterNamespaceMutation> =
+        std::sync::Arc::new(concrete.clone());
     let clone = handle.clone();
 
     handle
         .create_namespace("ns-handle", json!({"metadata":{"name":"ns-handle"}}))
         .await
         .unwrap();
-    let fetched = clone.get_namespace("ns-handle").await.unwrap();
+    drop(clone);
+    let fetched = concrete.get_namespace("ns-handle").await.unwrap();
     assert!(
         fetched.is_some(),
         "handle clones must observe shared writes"
@@ -6371,7 +6382,7 @@ async fn test_list() {
             "v1",
             "Pod",
             None,
-            crate::datastore::ResourceListQuery::all(),
+            klights_cluster_store::ResourceListOptions::all(),
         )
         .await
         .unwrap();
@@ -6404,7 +6415,7 @@ async fn test_label_selector() {
             "v1",
             "Pod",
             None,
-            crate::datastore::ResourceListQuery::new(Some("app=nginx"), None, None, None),
+            klights_cluster_store::ResourceListOptions::new(Some("app=nginx"), None, None, None),
         )
         .await
         .unwrap();
@@ -6600,7 +6611,7 @@ async fn test_delete_resource_hard_deletes() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            klights_cluster_store::ResourceListOptions::all(),
         )
         .await
         .unwrap();
@@ -6690,7 +6701,7 @@ async fn test_pagination_no_items_lost() {
                 "v1",
                 "Pod",
                 None,
-                crate::datastore::ResourceListQuery::new(
+                klights_cluster_store::ResourceListOptions::new(
                     None,
                     None,
                     Some(2),
@@ -6744,7 +6755,7 @@ async fn test_pagination_no_continue_when_exact() {
             "v1",
             "Pod",
             None,
-            crate::datastore::ResourceListQuery::new(None, None, Some(2), None),
+            klights_cluster_store::ResourceListOptions::new(None, None, Some(2), None),
         )
         .await
         .unwrap();
@@ -6787,7 +6798,7 @@ async fn test_pagination_with_label_selector_filters_then_paginates() {
             "v1",
             "Pod",
             None,
-            crate::datastore::ResourceListQuery::new(Some("app=web"), None, Some(2), None),
+            klights_cluster_store::ResourceListOptions::new(Some("app=web"), None, Some(2), None),
         )
         .await
         .unwrap();
@@ -6799,7 +6810,7 @@ async fn test_pagination_with_label_selector_filters_then_paginates() {
             "v1",
             "Pod",
             None,
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 Some("app=web"),
                 None,
                 Some(2),
@@ -6853,7 +6864,7 @@ async fn test_pagination_with_label_selector_remaining_count_across_pages() {
             "v1",
             "Pod",
             None,
-            crate::datastore::ResourceListQuery::new(Some("app=web"), None, Some(2), None),
+            klights_cluster_store::ResourceListOptions::new(Some("app=web"), None, Some(2), None),
         )
         .await
         .unwrap();
@@ -6869,7 +6880,7 @@ async fn test_pagination_with_label_selector_remaining_count_across_pages() {
             "v1",
             "Pod",
             None,
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 Some("app=web"),
                 None,
                 Some(2),
@@ -6890,7 +6901,7 @@ async fn test_pagination_with_label_selector_remaining_count_across_pages() {
             "v1",
             "Pod",
             None,
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 Some("app=web"),
                 None,
                 Some(2),
@@ -6941,7 +6952,7 @@ async fn test_selector_free_limited_list_does_not_decode_unreturned_namespaced_r
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(None, None, Some(1), None),
+            klights_cluster_store::ResourceListOptions::new(None, None, Some(1), None),
         )
         .await
         .unwrap();
@@ -6987,7 +6998,7 @@ async fn test_selector_free_limited_list_does_not_decode_unreturned_cluster_rows
             "v1",
             "Node",
             None,
-            crate::datastore::ResourceListQuery::new(None, None, Some(1), None),
+            klights_cluster_store::ResourceListOptions::new(None, None, Some(1), None),
         )
         .await
         .unwrap();
@@ -7016,7 +7027,7 @@ async fn test_pagination_no_limit_returns_all() {
             "v1",
             "Pod",
             None,
-            crate::datastore::ResourceListQuery::all(),
+            klights_cluster_store::ResourceListOptions::all(),
         )
         .await
         .unwrap();
@@ -7129,7 +7140,7 @@ async fn test_label_selector_in_operator() {
             "v1",
             "Pod",
             None,
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 Some("env in (prod,staging)"),
                 None,
                 None,
@@ -7168,7 +7179,12 @@ async fn test_label_selector_notin_operator() {
             "v1",
             "Pod",
             None,
-            crate::datastore::ResourceListQuery::new(Some("env notin (dev)"), None, None, None),
+            klights_cluster_store::ResourceListOptions::new(
+                Some("env notin (dev)"),
+                None,
+                None,
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -7203,7 +7219,7 @@ async fn test_label_selector_not_exists() {
             "v1",
             "Pod",
             None,
-            crate::datastore::ResourceListQuery::new(Some("!app"), None, None, None),
+            klights_cluster_store::ResourceListOptions::new(Some("!app"), None, None, None),
         )
         .await
         .unwrap();
@@ -7239,7 +7255,12 @@ async fn test_label_selector_multiple_requirements() {
             "v1",
             "Pod",
             None,
-            crate::datastore::ResourceListQuery::new(Some("app=nginx,env=prod"), None, None, None),
+            klights_cluster_store::ResourceListOptions::new(
+                Some("app=nginx,env=prod"),
+                None,
+                None,
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -7275,7 +7296,7 @@ async fn test_label_selector_exists_operator() {
             "v1",
             "Pod",
             None,
-            crate::datastore::ResourceListQuery::new(Some("app"), None, None, None),
+            klights_cluster_store::ResourceListOptions::new(Some("app"), None, None, None),
         )
         .await
         .unwrap();
@@ -7326,7 +7347,7 @@ async fn test_list_resources_cluster_wide_returns_all_namespaces() {
             "v1",
             "Pod",
             None,
-            crate::datastore::ResourceListQuery::all(),
+            klights_cluster_store::ResourceListOptions::all(),
         )
         .await
         .unwrap();
@@ -7342,7 +7363,7 @@ async fn test_list_resources_cluster_wide_returns_all_namespaces() {
             "v1",
             "Pod",
             Some("kube-system"),
-            crate::datastore::ResourceListQuery::all(),
+            klights_cluster_store::ResourceListOptions::all(),
         )
         .await
         .unwrap();
@@ -7392,22 +7413,22 @@ async fn namespaced_same_kind_name_can_exist_in_different_api_versions() {
     assert_eq!(beta.unwrap().api_version, "example.beta/v1");
 }
 
-fn accepts_resource_store(_store: &dyn crate::datastore::ResourceStore) {}
-fn accepts_watch_store(_store: &dyn crate::datastore::WatchStore) {}
-fn accepts_watch_anchor_store(_store: &dyn crate::datastore::WatchReplayAnchorStore) {}
-fn accepts_raw_watch_replay_store(_store: &dyn crate::datastore::RawWatchReplayStore) {}
-fn accepts_namespace_store(_store: &dyn crate::datastore::NamespaceStore) {}
+fn accepts_resource_mutation(_store: &dyn ClusterResourceMutation) {}
+fn accepts_resource_read(_store: &dyn ClusterResourceRead) {}
+fn accepts_allocator_read(_store: &dyn DurableAllocatorRead) {}
+fn accepts_snapshot_capture(_store: &dyn AuthoritativeSnapshotCapture) {}
+fn accepts_snapshot_restore(_store: &dyn AuthoritativeSnapshotPersistence) {}
 
 #[tokio::test]
 async fn datastore_implements_focused_backend_traits() {
     let db = Datastore::new_in_memory().await.unwrap();
-    accepts_resource_store(&db);
-    let handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
-    let watch_store = crate::datastore::DatastoreBackendWatchStore::new(handle);
-    accepts_watch_store(&watch_store);
-    accepts_watch_anchor_store(&watch_store);
-    accepts_raw_watch_replay_store(&watch_store);
-    accepts_namespace_store(&db);
+    accepts_resource_mutation(&db);
+    let reads = db.focused_read_store();
+    accepts_resource_read(reads.as_ref());
+    accepts_allocator_read(reads.as_ref());
+    let recovery = db.focused_recovery_store();
+    accepts_snapshot_capture(recovery.as_ref());
+    accepts_snapshot_restore(recovery.as_ref());
 }
 
 #[tokio::test]
@@ -7454,19 +7475,21 @@ async fn cluster_same_kind_name_can_exist_in_different_api_versions() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn from_executor_initializes_watch_and_fingerprint() {
+async fn from_executor_initializes_commit_observation_and_fingerprint() {
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let executor = klights_cluster_datastore::sqlite::open_in_memory(supervisor, "dsb03:fp-test")
+    let executor = crate::sqlite::open_in_memory(supervisor, "dsb03:fp-test")
         .await
         .unwrap();
-    let ds = Datastore::new_in_memory_with_watch_and_executor(executor)
-        .await
-        .unwrap();
-    let mut watch_rx = ds.subscribe_watch(klights_watch::WatchTopic::new("v1", "ConfigMap"));
-
-    // Verify watch subscription works
+    let ds = Datastore::new_in_memory_with_watch_and_executor_with_sink(
+        executor,
+        crate::test_fixtures::commit_observation::new_sink(),
+        crate::test_fixtures::outbox::new_codec(),
+        std::sync::Arc::new(klights_supervisor::SystemWallClock),
+    )
+    .await
+    .unwrap();
     ds.create_resource(
         "v1",
         "ConfigMap",
@@ -7477,8 +7500,13 @@ async fn from_executor_initializes_watch_and_fingerprint() {
     .await
     .unwrap();
 
-    let event = watch_rx.try_recv().expect("should receive broadcast event");
-    assert_eq!(event.object["metadata"]["name"].as_str(), Some("fp-test"));
+    let observations = crate::test_fixtures::commit_observation::recorded_observations(
+        ds.commit_sink.as_deref().expect("test commit sink"),
+    );
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].api_version(), "v1");
+    assert_eq!(observations[0].kind(), "ConfigMap");
+    assert!(observations[0].resource_version() > 0);
 }
 
 #[tokio::test]
@@ -7660,7 +7688,7 @@ fn no_begin_exclusive_outside_tests() {
 async fn gc_triggers_incremental_vacuum_after_sweep() {
     // This test exercises the path — incremental_vacuum is a no-op if no pages
     // need releasing, but it must not error.
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     // Insert enough events to create pages
     for i in 0..100 {
         db.create_resource(
@@ -7728,7 +7756,7 @@ async fn gc_promotes_inexact_replay_floor_to_exact_position() {
         "exact GC observations must promote legacy-inexact rows"
     );
 
-    let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+    let target = [klights_cluster_store::WatchTarget::namespaced_in_namespace(
         "v1",
         "ConfigMap",
         "promote",
@@ -7745,7 +7773,7 @@ async fn gc_promotes_inexact_replay_floor_to_exact_position() {
     assert!(
         matches!(
             replay,
-            crate::datastore::PositionedWatchReplayRead::Events(_)
+            klights_cluster_store::PositionedWatchReplayRead::Events(_)
         ),
         "fresh positioned handoff at the current event high-water must remain available"
     );
@@ -7753,7 +7781,7 @@ async fn gc_promotes_inexact_replay_floor_to_exact_position() {
 
 #[tokio::test]
 async fn scoped_replay_floor_allows_retained_in_scope_event_after_unrelated_gc() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
 
     for i in 0..20 {
         db.create_resource(
@@ -7792,7 +7820,7 @@ async fn scoped_replay_floor_allows_retained_in_scope_event_after_unrelated_gc()
 
     let replay = db
         .list_watch_events_since_checked(
-            &[crate::datastore::WatchTarget::namespaced_in_namespace(
+            &[klights_cluster_store::WatchTarget::namespaced_in_namespace(
                 "v1", "Pod", "app",
             )],
             since_rv,
@@ -7801,11 +7829,11 @@ async fn scoped_replay_floor_allows_retained_in_scope_event_after_unrelated_gc()
         .expect("checked replay");
 
     match replay {
-        crate::datastore::WatchReplayRead::Events(events) => {
+        klights_cluster_store::WatchReplayRead::Events(events) => {
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].resource.name, "frontend");
         }
-        crate::datastore::WatchReplayRead::Expired => {
+        klights_cluster_store::WatchReplayRead::Expired => {
             panic!("unrelated lower-RV churn must not expire app/Pod replay");
         }
     }
@@ -7813,7 +7841,7 @@ async fn scoped_replay_floor_allows_retained_in_scope_event_after_unrelated_gc()
 
 #[tokio::test]
 async fn checked_watch_replay_bounded_limits_events() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     let start_rv = db.get_current_resource_version().await.unwrap();
 
     for i in 0..5 {
@@ -7835,7 +7863,7 @@ async fn checked_watch_replay_bounded_limits_events() {
 
     let replay = db
         .list_watch_events_since_checked_bounded(
-            &[crate::datastore::WatchTarget::namespaced_in_namespace(
+            &[klights_cluster_store::WatchTarget::namespaced_in_namespace(
                 "v1", "Pod", "app",
             )],
             start_rv,
@@ -7845,7 +7873,7 @@ async fn checked_watch_replay_bounded_limits_events() {
         .expect("checked replay");
 
     match replay {
-        crate::datastore::WatchReplayRead::Events(events) => {
+        klights_cluster_store::WatchReplayRead::Events(events) => {
             assert_eq!(
                 events
                     .iter()
@@ -7854,7 +7882,7 @@ async fn checked_watch_replay_bounded_limits_events() {
                 vec!["pod-0", "pod-1", "pod-2"]
             );
         }
-        crate::datastore::WatchReplayRead::Expired => {
+        klights_cluster_store::WatchReplayRead::Expired => {
             panic!("fresh bounded replay should not expire");
         }
     }
@@ -7881,12 +7909,12 @@ async fn positioned_watch_replay_pages_one_hundred_same_revision_rows() {
         .collect();
     db.apply_resource_batch(operations).await.unwrap();
 
-    let targets = [crate::datastore::WatchTarget::namespaced_in_namespace(
+    let targets = [klights_cluster_store::WatchTarget::namespaced_in_namespace(
         "v1",
         "ConfigMap",
         "default",
     )];
-    let mut position = crate::datastore::WatchReplayPosition::from_resource_version(start_rv);
+    let mut position = klights_cluster_core::WatchReplayPosition::from_resource_version(start_rv);
     let mut names = Vec::new();
     loop {
         let replay = db
@@ -7897,7 +7925,7 @@ async fn positioned_watch_replay_pages_one_hundred_same_revision_rows() {
             )
             .await
             .unwrap();
-        let crate::datastore::PositionedWatchReplayRead::Events(replay) = replay else {
+        let klights_cluster_store::PositionedWatchReplayRead::Events(replay) = replay else {
             panic!("fresh positioned replay must not expire");
         };
         position = replay.next_position;
@@ -7925,13 +7953,13 @@ async fn positioned_watch_replay_pages_one_hundred_same_revision_rows() {
 #[tokio::test]
 async fn positioned_watch_replay_ignores_unrelated_scope_gc_floor() {
     let db = Datastore::new_in_memory().await.unwrap();
-    let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+    let target = [klights_cluster_store::WatchTarget::namespaced_in_namespace(
         "v1", "Secret", "quiet",
     )];
-    let start = crate::datastore::WatchReplayPosition::from_resource_version(
+    let start = klights_cluster_core::WatchReplayPosition::from_resource_version(
         db.get_current_resource_version().await.unwrap(),
     );
-    let crate::datastore::PositionedWatchReplayRead::Events(initial) = db
+    let klights_cluster_store::PositionedWatchReplayRead::Events(initial) = db
         .list_watch_events_after_position_checked_bounded(
             &target,
             start,
@@ -7965,10 +7993,10 @@ async fn positioned_watch_replay_ignores_unrelated_scope_gc_floor() {
         .await
         .unwrap()
     {
-        crate::datastore::PositionedWatchReplayRead::Events(replay) => {
+        klights_cluster_store::PositionedWatchReplayRead::Events(replay) => {
             assert!(replay.events.is_empty());
         }
-        crate::datastore::PositionedWatchReplayRead::Expired => {
+        klights_cluster_store::PositionedWatchReplayRead::Expired => {
             panic!("unrelated-scope GC must not expire a quiet scope");
         }
     }
@@ -7986,15 +8014,15 @@ async fn positioned_watch_replay_expires_after_its_scope_position_is_pruned() {
     )
     .await
     .unwrap();
-    let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+    let target = [klights_cluster_store::WatchTarget::namespaced_in_namespace(
         "v1",
         "ConfigMap",
         "target",
     )];
-    let start = crate::datastore::WatchReplayPosition::from_resource_version(
+    let start = klights_cluster_core::WatchReplayPosition::from_resource_version(
         db.get_current_resource_version().await.unwrap(),
     );
-    let crate::datastore::PositionedWatchReplayRead::Events(initial) = db
+    let klights_cluster_store::PositionedWatchReplayRead::Events(initial) = db
         .list_watch_events_after_position_checked_bounded(
             &target,
             start,
@@ -8027,7 +8055,7 @@ async fn positioned_watch_replay_expires_after_its_scope_position_is_pruned() {
         )
         .await
         .unwrap(),
-        crate::datastore::PositionedWatchReplayRead::Expired
+        klights_cluster_store::PositionedWatchReplayRead::Expired
     ));
 }
 
@@ -8075,7 +8103,7 @@ async fn migrated_legacy_floor_fails_closed_for_positioned_replay() {
     .await
     .unwrap();
 
-    let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+    let target = [klights_cluster_store::WatchTarget::namespaced_in_namespace(
         "v1",
         "ConfigMap",
         "legacy",
@@ -8084,7 +8112,9 @@ async fn migrated_legacy_floor_fails_closed_for_positioned_replay() {
     // A positioned cursor at the floor's RV cannot be honored: the boundary
     // is resource-version-only and must relist instead of replaying.
     let positioned =
-        crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(floor_rv, 1);
+        klights_cluster_core::WatchReplayPosition::from_resource_version_through_event_id(
+            floor_rv, 1,
+        );
     assert!(matches!(
         db.list_watch_events_after_position_checked_bounded(
             &target,
@@ -8093,7 +8123,7 @@ async fn migrated_legacy_floor_fails_closed_for_positioned_replay() {
         )
         .await
         .unwrap(),
-        crate::datastore::PositionedWatchReplayRead::Expired
+        klights_cluster_store::PositionedWatchReplayRead::Expired
     ));
 
     // The same boundary still permits scalar resource-version replay at or
@@ -8103,7 +8133,7 @@ async fn migrated_legacy_floor_fails_closed_for_positioned_replay() {
         .await
         .unwrap();
     assert!(
-        matches!(scalar, crate::datastore::WatchReplayRead::Events(_)),
+        matches!(scalar, klights_cluster_store::WatchReplayRead::Events(_)),
         "legacy RV-only floor must not expire an at-or-above scalar cursor"
     );
 }
@@ -8144,7 +8174,7 @@ async fn migrated_zero_event_floor_allows_fresh_positioned_handoff() {
     .await
     .unwrap();
 
-    let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+    let target = [klights_cluster_store::WatchTarget::namespaced_in_namespace(
         "v1",
         "ConfigMap",
         "quiet",
@@ -8162,7 +8192,7 @@ async fn migrated_zero_event_floor_allows_fresh_positioned_handoff() {
         )
         .await
         .unwrap(),
-        crate::datastore::PositionedWatchReplayRead::Events(_)
+        klights_cluster_store::PositionedWatchReplayRead::Events(_)
     ));
     assert!(matches!(
         db.list_raw_watch_events_after_position_checked_bounded(
@@ -8172,11 +8202,12 @@ async fn migrated_zero_event_floor_allows_fresh_positioned_handoff() {
         )
         .await
         .unwrap(),
-        crate::datastore::PositionedWatchReplayRead::Events(_)
+        klights_cluster_store::PositionedWatchReplayRead::Events(_)
     ));
 
-    let stale =
-        crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(floor_rv, 1);
+    let stale = klights_cluster_core::WatchReplayPosition::from_resource_version_through_event_id(
+        floor_rv, 1,
+    );
     assert!(matches!(
         db.list_watch_events_after_position_checked_bounded(
             &target,
@@ -8185,7 +8216,7 @@ async fn migrated_zero_event_floor_allows_fresh_positioned_handoff() {
         )
         .await
         .unwrap(),
-        crate::datastore::PositionedWatchReplayRead::Expired
+        klights_cluster_store::PositionedWatchReplayRead::Expired
     ));
 }
 
@@ -8363,7 +8394,7 @@ async fn restart_resumes_watch_within_retention_window() {
 
         // Replay from half the window
         let since_rv = last_rv - 10;
-        use crate::datastore::{WatchTarget, WatchTargetScope};
+        use klights_cluster_store::{WatchTarget, WatchTargetScope};
         let targets = vec![WatchTarget {
             api_version: "v1".into(),
             kind: "ConfigMap".into(),
@@ -8425,7 +8456,7 @@ async fn restart_returns_410_gone_when_rv_pre_dates_retention() {
         let ds = Datastore::new_persistent(db_dir, supervisor, None)
             .await
             .unwrap();
-        use crate::datastore::{WatchTarget, WatchTargetScope};
+        use klights_cluster_store::{WatchTarget, WatchTargetScope};
         let targets = vec![WatchTarget {
             api_version: "v1".into(),
             kind: "ConfigMap".into(),
@@ -8629,11 +8660,6 @@ async fn apply_resource_batch_candidate_rv_not_observable_before_apply() {
 #[tokio::test]
 async fn apply_resource_batch_emits_watch_events_consistent_with_single_commit() {
     let db = Datastore::new_in_memory().await.unwrap();
-    let mut rx = db.subscribe_watch(klights_watch::WatchTopic::new("v1", "Endpoints"));
-    let mut rx_eps = db.subscribe_watch(klights_watch::WatchTopic::new(
-        "discovery.k8s.io/v1",
-        "EndpointSlice",
-    ));
 
     db.apply_resource_batch(vec![
         ResourceBatchOperation::Put {
@@ -8656,14 +8682,21 @@ async fn apply_resource_batch_emits_watch_events_consistent_with_single_commit()
         },
     ]).await.unwrap();
 
-    let ev_ep = rx.try_recv().expect("Endpoints watch event must fire");
-    let ev_eps = rx_eps
-        .try_recv()
-        .expect("EndpointSlice watch event must fire");
+    let observations = crate::test_fixtures::commit_observation::recorded_observations(
+        db.commit_sink.as_deref().expect("test commit sink"),
+    );
+    assert_eq!(observations.len(), 2);
     assert_eq!(
-        ev_ep.resource_version(),
-        ev_eps.resource_version(),
+        observations[0].resource_version(),
+        observations[1].resource_version(),
         "batch watch events must all carry the same rv (single commit)"
+    );
+    assert_eq!(
+        observations
+            .iter()
+            .map(|observation| observation.kind())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["EndpointSlice", "Endpoints"]),
     );
 }
 
@@ -8798,7 +8831,7 @@ async fn list_all_watch_events_since_paged_matches_full_list_across_batch_bounda
 
     // Walk the table in pages of 3 — strictly smaller than the row count —
     // keyset-paging on (resource_version, id).
-    let mut paged: Vec<(i64, crate::datastore::types::CatchUpResource)> = Vec::new();
+    let mut paged: Vec<(i64, klights_cluster_store::CatchUpResource)> = Vec::new();
     let mut after_rv = 0i64;
     let mut after_id = 0i64;
     let page_size = std::num::NonZeroUsize::new(3).unwrap();

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use serde_json::json;
 
@@ -42,7 +44,7 @@ async fn apply_replicated_create_is_idempotent_when_watch_events_row_already_exi
         Some("default"),
         "replay-cm",
         cm.clone(),
-        crate::datastore::ReplicatedCreateOptions::new(
+        crate::test_fixtures::replicated_create::ReplicatedCreateOptions::new(
             42,
             Some("11111111-1111-1111-1111-111111111111".to_string()),
         ),
@@ -66,7 +68,7 @@ async fn apply_replicated_create_is_idempotent_when_watch_events_row_already_exi
         Some("default"),
         "replay-cm",
         cm.clone(),
-        crate::datastore::ReplicatedCreateOptions::new(
+        crate::test_fixtures::replicated_create::ReplicatedCreateOptions::new(
             42,
             Some("11111111-1111-1111-1111-111111111111".to_string()),
         ),
@@ -167,7 +169,7 @@ async fn event_listed_via_core_v1_includes_both_api_versions() {
             "v1",
             "Event",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            klights_cluster_store::ResourceListOptions::all(),
         )
         .await
         .unwrap();

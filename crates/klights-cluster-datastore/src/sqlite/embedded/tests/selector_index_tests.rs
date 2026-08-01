@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use serde_json::json;
 
@@ -61,7 +63,12 @@ async fn label_equality_uses_index_and_returns_matching_pods() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("app=nginx"), None, Some(10), None),
+            klights_cluster_store::ResourceListOptions::new(
+                Some("app=nginx"),
+                None,
+                Some(10),
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -82,7 +89,7 @@ async fn field_selector_spec_node_name_uses_index() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 None,
                 Some("spec.nodeName=node-1"),
                 Some(10),
@@ -108,7 +115,7 @@ async fn status_phase_uses_index() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 None,
                 Some("status.phase=Running"),
                 Some(10),
@@ -158,7 +165,7 @@ async fn combined_label_and_field_selector() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 Some("app=nginx"),
                 Some("spec.nodeName=node-1"),
                 Some(10),
@@ -191,7 +198,7 @@ async fn exists_label_selector_pushdown() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("app"), None, Some(10), None),
+            klights_cluster_store::ResourceListOptions::new(Some("app"), None, Some(10), None),
         )
         .await
         .unwrap();
@@ -219,7 +226,7 @@ async fn not_exists_label_selector_pushdown() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("!app"), None, Some(10), None),
+            klights_cluster_store::ResourceListOptions::new(Some("!app"), None, Some(10), None),
         )
         .await
         .unwrap();
@@ -264,7 +271,7 @@ async fn in_operator_pushdown() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 Some("tier in (frontend, backend)"),
                 None,
                 Some(10),
@@ -306,7 +313,12 @@ async fn inequality_stays_residual() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("app!=nginx"), None, Some(10), None),
+            klights_cluster_store::ResourceListOptions::new(
+                Some("app!=nginx"),
+                None,
+                Some(10),
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -347,7 +359,7 @@ async fn pagination_with_label_selector() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("app=nginx"), None, Some(3), None),
+            klights_cluster_store::ResourceListOptions::new(Some("app=nginx"), None, Some(3), None),
         )
         .await
         .unwrap();
@@ -363,7 +375,7 @@ async fn pagination_with_label_selector() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 Some("app=nginx"),
                 None,
                 Some(3),
@@ -416,7 +428,7 @@ async fn index_updated_on_resource_update() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("app=v1"), None, Some(10), None),
+            klights_cluster_store::ResourceListOptions::new(Some("app=v1"), None, Some(10), None),
         )
         .await
         .unwrap();
@@ -428,7 +440,7 @@ async fn index_updated_on_resource_update() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("app=v2"), None, Some(10), None),
+            klights_cluster_store::ResourceListOptions::new(Some("app=v2"), None, Some(10), None),
         )
         .await
         .unwrap();
@@ -458,7 +470,7 @@ async fn index_updated_on_status_update() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 None,
                 Some("status.phase=Pending"),
                 Some(10),
@@ -475,7 +487,7 @@ async fn index_updated_on_status_update() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 None,
                 Some("status.phase=Running"),
                 Some(10),
@@ -509,7 +521,12 @@ async fn index_cleaned_up_on_resource_delete() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("app=nginx"), None, Some(10), None),
+            klights_cluster_store::ResourceListOptions::new(
+                Some("app=nginx"),
+                None,
+                Some(10),
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -546,7 +563,12 @@ async fn index_updated_on_patch() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("app=patched"), None, Some(10), None),
+            klights_cluster_store::ResourceListOptions::new(
+                Some("app=patched"),
+                None,
+                Some(10),
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -557,7 +579,7 @@ async fn index_updated_on_patch() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("app=v1"), None, Some(10), None),
+            klights_cluster_store::ResourceListOptions::new(Some("app=v1"), None, Some(10), None),
         )
         .await
         .unwrap();
@@ -591,7 +613,7 @@ async fn cluster_scoped_node_field_selector() {
             "v1",
             "Node",
             None,
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 None,
                 Some("spec.unschedulable=true"),
                 Some(10),
@@ -658,7 +680,7 @@ async fn node_field_selector_unschedulable_false_matches_node_without_explicit_f
             "v1",
             "Node",
             None,
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 None,
                 Some("spec.unschedulable=false"),
                 Some(10),
@@ -697,7 +719,7 @@ async fn selector_with_limit_returns_correct_remaining_count() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("app=nginx"), None, Some(2), None),
+            klights_cluster_store::ResourceListOptions::new(Some("app=nginx"), None, Some(2), None),
         )
         .await
         .unwrap();
@@ -764,7 +786,7 @@ async fn metadata_annotation_patch_preserves_selector_visibility_and_owner_refs(
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 Some("name=agnhost-primary"),
                 None,
                 None,

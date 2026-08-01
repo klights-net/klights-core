@@ -323,7 +323,7 @@ impl DatastoreApplier for Datastore {
     }
 }
 
-fn dataplane_metadata_from_parts(
+pub fn dataplane_metadata_from_parts(
     node_name: String,
     mode: String,
     encryption: String,

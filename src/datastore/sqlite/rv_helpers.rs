@@ -2,13 +2,6 @@ use super::Datastore;
 use super::transaction_primitives;
 
 impl Datastore {
-    #[cfg(test)]
-    pub(super) fn next_resource_version_in_conn(
-        conn: &rusqlite::Connection,
-    ) -> rusqlite::Result<i64> {
-        transaction_primitives::next_resource_version_in_tx(conn)
-    }
-
     pub(super) fn current_resource_version_in_tx(
         tx: &rusqlite::Transaction<'_>,
     ) -> rusqlite::Result<i64> {

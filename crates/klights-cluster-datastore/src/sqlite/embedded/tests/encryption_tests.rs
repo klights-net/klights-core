@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! DSB-06 — SQLCipher encryption tests.
 //!
 //! All tests are gated behind `#[cfg(feature = "sqlcipher")]` and will
@@ -9,7 +11,7 @@
 
 #[cfg(feature = "sqlcipher")]
 mod encrypted {
-    use crate::datastore::sqlite::Datastore;
+    use crate::sqlite::embedded::Datastore;
     use klights_supervisor::sqlite_open as opener;
     use std::io::Write;
 
@@ -248,7 +250,7 @@ mod encrypted {
                     "v1",
                     "ConfigMap",
                     Some("default"),
-                    crate::datastore::ResourceListQuery::all(),
+                    klights_cluster_store::ResourceListOptions::all(),
                 )
                 .await
                 .unwrap()

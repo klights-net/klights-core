@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Leader-side lost-update guard for pipelined Pod status dispatch.
 //!
 //! The status outbox drops the live-RV precondition so a slow status apply no
@@ -9,9 +11,9 @@
 //! per Pod subject and no-ops any snapshot whose stamp is older-or-equal.
 
 use super::*;
-use crate::datastore::ResourcePreconditions;
+use klights_cluster_core::OutboxOperation;
+use klights_cluster_core::ResourcePreconditions;
 use klights_cluster_core::command::StorageCommand;
-use klights_kubelet::node_outbox::payload::OutboxOperation;
 use serde_json::json;
 
 const STATUS_OPS: &[OutboxOperation] = &[

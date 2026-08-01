@@ -617,6 +617,104 @@ mod cases {
     }
 
     #[tokio::test]
+    async fn raft_mode_serviceaccount_automount_false_skips_pod_projection() {
+        let (ds, _calls) = make_ds_with_inline_proposer().await;
+        ds.create_resource(
+            "v1",
+            "ServiceAccount",
+            Some("default"),
+            "nomount",
+            json!({
+                "apiVersion": "v1",
+                "kind": "ServiceAccount",
+                "metadata": {"name": "nomount", "namespace": "default"},
+                "automountServiceAccountToken": false
+            }),
+        )
+        .await
+        .expect("service account must commit");
+
+        let pod = ds
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "sa-disabled",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {"name": "sa-disabled", "namespace": "default"},
+                    "spec": {
+                        "serviceAccountName": "nomount",
+                        "containers": [{"name": "app", "image": "busybox"}]
+                    }
+                }),
+            )
+            .await
+            .expect("pod must commit");
+
+        assert!(
+            pod.data
+                .pointer("/spec/volumes")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(Vec::is_empty),
+            "ServiceAccount automount=false must suppress projected Pod credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_mode_pod_automount_true_overrides_serviceaccount_false() {
+        let (ds, _calls) = make_ds_with_inline_proposer().await;
+        ds.create_resource(
+            "v1",
+            "ServiceAccount",
+            Some("default"),
+            "nomount",
+            json!({
+                "apiVersion": "v1",
+                "kind": "ServiceAccount",
+                "metadata": {"name": "nomount", "namespace": "default"},
+                "automountServiceAccountToken": false
+            }),
+        )
+        .await
+        .expect("service account must commit");
+
+        let pod = ds
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "pod-override",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {"name": "pod-override", "namespace": "default"},
+                    "spec": {
+                        "serviceAccountName": "nomount",
+                        "automountServiceAccountToken": true,
+                        "containers": [{"name": "app", "image": "busybox"}]
+                    }
+                }),
+            )
+            .await
+            .expect("pod must commit");
+
+        assert!(
+            pod.data
+                .pointer("/spec/volumes")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|volumes| volumes.iter().any(|volume| {
+                    volume
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|name| name.starts_with("kube-api-access-"))
+                })),
+            "Pod automount=true must override ServiceAccount automount=false"
+        );
+    }
+
+    #[tokio::test]
     async fn no_op_watch_events_gc_does_not_allocate_local_raft_rv() {
         let inner: crate::datastore::backend::DatastoreHandle =
             Arc::new(crate::datastore::test_support::in_memory().await);

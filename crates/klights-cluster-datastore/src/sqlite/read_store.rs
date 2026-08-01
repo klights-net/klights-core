@@ -1145,7 +1145,7 @@ impl SqliteReadStore {
         }
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_test_instrumentation(
         executor: DbExecutor,
         fail_next_watch_position_observation: std::sync::Arc<std::sync::atomic::AtomicBool>,

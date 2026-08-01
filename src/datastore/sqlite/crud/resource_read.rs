@@ -25,27 +25,6 @@ impl Datastore {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_list_resources_snapshot_after_rows_pause_for_test(
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        limit: Option<i64>,
-        continue_token: Option<&str>,
-    ) -> std::sync::Arc<ListResourcesSnapshotPause> {
-        SqliteReadStore::install_list_resources_snapshot_after_rows_pause_for_test(
-            api_version,
-            kind,
-            namespace,
-            label_selector,
-            field_selector,
-            limit,
-            continue_token,
-        )
-    }
-
     pub async fn get_resource(
         &self,
         api_version: &str,

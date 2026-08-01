@@ -10,3 +10,6 @@ mod position_membership;
 pub mod redb;
 pub mod signing_key_state;
 pub mod sqlite;
+
+#[cfg(test)]
+pub mod test_fixtures;

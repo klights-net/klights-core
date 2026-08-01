@@ -272,4 +272,39 @@ mod tests {
             "default service-account mount must be injected separately"
         );
     }
+
+    #[test]
+    fn injects_default_mount_into_every_init_and_regular_container() {
+        let mut pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "multi-container", "namespace": "default"},
+            "spec": {
+                "initContainers": [{"name": "init", "image": "busybox"}],
+                "containers": [
+                    {"name": "app", "image": "nginx"},
+                    {"name": "sidecar", "image": "busybox"}
+                ]
+            }
+        });
+
+        inject_serviceaccount_volume(&mut pod);
+
+        for path in (0..1)
+            .map(|index| format!("/spec/initContainers/{index}/volumeMounts/0"))
+            .chain((0..2).map(|index| format!("/spec/containers/{index}/volumeMounts/0")))
+        {
+            let mount = pod
+                .pointer(&path)
+                .expect("every container must receive a mount");
+            assert_eq!(
+                mount.get("mountPath").and_then(serde_json::Value::as_str),
+                Some(SERVICEACCOUNT_MOUNT_PATH),
+            );
+            assert_eq!(
+                mount.get("readOnly").and_then(serde_json::Value::as_bool),
+                Some(true),
+            );
+        }
+    }
 }

@@ -114,6 +114,12 @@ mod bound_pod_finalization_adapter;
 mod deployment_store_adapter;
 
 #[cfg(test)]
+mod datastore_codec_integration_tests;
+#[cfg(test)]
+mod datastore_post_commit_integration_tests;
+#[cfg(test)]
+mod datastore_sqlite_compatibility_integration_tests;
+#[cfg(test)]
 mod deployment_replicaset_error_test;
 #[cfg(test)]
 mod grpc_test_proto_channel_sink;

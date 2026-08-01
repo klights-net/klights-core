@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use serde_json::json;
 
@@ -36,7 +38,7 @@ fn spawn_raw_create_with_watch_event(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
             rusqlite::params![api_version, kind, namespace, name, uid, rv, &row_data],
         )?;
-        klights_cluster_datastore::sqlite::selector_index::upsert_index_entries(
+        crate::sqlite::selector_index::upsert_index_entries(
             &tx,
             &api_version,
             &kind,
@@ -44,9 +46,9 @@ fn spawn_raw_create_with_watch_event(
             &name,
             &row_data,
         )?;
-        klights_cluster_datastore::sqlite::mutation_helpers::insert_watch_event_in_conn(
+        crate::sqlite::mutation_helpers::insert_watch_event_in_conn(
             &tx,
-            klights_cluster_datastore::sqlite::mutation_helpers::WatchEventInsert::new(
+            crate::sqlite::mutation_helpers::WatchEventInsert::new(
                 &api_version,
                 &kind,
                 Some(&namespace),
@@ -242,7 +244,7 @@ async fn list_resources_response_rv_covers_items_when_mutation_races_with_select
                 "v1",
                 "Pod",
                 Some("default"),
-                ResourceListQuery::new(Some("race=snapshot"), None, Some(500), None),
+                ResourceListOptions::new(Some("race=snapshot"), None, Some(500), None),
             )
             .await
             .unwrap()
@@ -332,7 +334,7 @@ async fn list_resources_response_rv_does_not_advance_past_concurrent_delete_snap
                 "v1",
                 "ConfigMap",
                 Some("default"),
-                ResourceListQuery::new(Some("race=snapshot-delete"), None, Some(500), None),
+                ResourceListOptions::new(Some("race=snapshot-delete"), None, Some(500), None),
             )
             .await
             .unwrap()
@@ -431,7 +433,7 @@ async fn list_resources_watch_position_is_atomic_with_row_snapshot() {
                 "v1",
                 "ConfigMap",
                 Some("default"),
-                ResourceListQuery::new(Some("race=watch-position"), None, Some(500), None),
+                ResourceListOptions::new(Some("race=watch-position"), None, Some(500), None),
             )
             .await
             .unwrap()
@@ -480,7 +482,7 @@ async fn list_resources_watch_position_is_atomic_with_row_snapshot() {
 
     let replay = db
         .list_watch_events_after_position_checked_bounded(
-            &[crate::datastore::WatchTarget::namespaced_in_namespace(
+            &[klights_cluster_store::WatchTarget::namespaced_in_namespace(
                 "v1",
                 "ConfigMap",
                 "default",
@@ -490,7 +492,7 @@ async fn list_resources_watch_position_is_atomic_with_row_snapshot() {
         )
         .await
         .unwrap();
-    let crate::datastore::PositionedWatchReplayRead::Events(replay) = replay else {
+    let klights_cluster_store::PositionedWatchReplayRead::Events(replay) = replay else {
         panic!("fresh post-LIST event must remain replayable");
     };
     assert_eq!(
@@ -539,12 +541,12 @@ async fn multi_target_watch_list_uses_one_snapshot_across_target_scans() {
         None,
     );
     let targets = vec![
-        crate::datastore::WatchTarget::namespaced_in_namespace(
+        klights_cluster_store::WatchTarget::namespaced_in_namespace(
             "widgets.test/v1",
             "Widget",
             "default",
         ),
-        crate::datastore::WatchTarget::namespaced_in_namespace(
+        klights_cluster_store::WatchTarget::namespaced_in_namespace(
             "widgets.test/v2",
             "Widget",
             "default",
@@ -600,7 +602,7 @@ async fn multi_target_watch_list_uses_one_snapshot_across_target_scans() {
         )
         .await
         .unwrap();
-    let crate::datastore::PositionedWatchReplayRead::Events(replay) = replay else {
+    let klights_cluster_store::PositionedWatchReplayRead::Events(replay) = replay else {
         panic!("post-snapshot multi-target event must remain replayable");
     };
     assert_eq!(
@@ -683,7 +685,7 @@ async fn list_resources_response_rv_stays_at_snapshot_despite_retained_delete_hi
             "v1",
             "ConfigMap",
             Some("default"),
-            ResourceListQuery::new(Some("race=retained-delete-floor"), None, Some(500), None),
+            ResourceListOptions::new(Some("race=retained-delete-floor"), None, Some(500), None),
         )
         .await
         .unwrap();
@@ -743,7 +745,7 @@ async fn list_resources_response_rv_allows_catch_up_for_post_list_delete() {
             "v1",
             "ConfigMap",
             Some("default"),
-            ResourceListQuery::new(Some("race=post-delete"), None, Some(500), None),
+            ResourceListOptions::new(Some("race=post-delete"), None, Some(500), None),
         )
         .await
         .unwrap();
@@ -760,7 +762,7 @@ async fn list_resources_response_rv_allows_catch_up_for_post_list_delete() {
 
     // Raft stamps the next sequential rv: the delete lands above the list rv.
     let delete_rv = list.resource_version + 1;
-    db.apply_log_apply_commit(crate::datastore::test_support::test_live_commit(
+    db.apply_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
         delete_rv,
         vec![klights_cluster_core::LogApplyMutation::DeleteResource(
             klights_cluster_core::LogApplyResourceKey {
@@ -818,14 +820,14 @@ async fn list_resources_response_rv_precedes_delete_committed_after_snapshot() {
         name: "cm-pending-delete".to_string(),
         preconditions: klights_cluster_core::ResourcePreconditions::uid(created.uid.clone()),
     };
-    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "pending-delete-list-watch",
-            klights_kubelet::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
-            klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            klights_cluster_core::OutboxOperation::PodStatus.as_str(),
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
             "mn-controlplane1",
         )
         .await
@@ -839,7 +841,7 @@ async fn list_resources_response_rv_precedes_delete_committed_after_snapshot() {
         panic!("expected a fresh delete commit");
     };
 
-    db.apply_log_apply_commit(crate::datastore::test_support::test_live_commit(
+    db.apply_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
         delete_rv + 1,
         vec![klights_cluster_core::LogApplyMutation::PutResource(
             klights_cluster_core::LogApplyResourceRow {
@@ -875,7 +877,7 @@ async fn list_resources_response_rv_precedes_delete_committed_after_snapshot() {
             "v1",
             "ConfigMap",
             Some("default"),
-            ResourceListQuery::new(
+            ResourceListOptions::new(
                 None,
                 Some("metadata.name=cm-pending-delete"),
                 Some(500),
@@ -961,7 +963,7 @@ async fn list_resources_response_rv_is_global_snapshot_not_max_item() {
             "v1",
             "Pod",
             Some("default"),
-            ResourceListQuery::new(None, None, Some(500), None),
+            ResourceListOptions::new(None, None, Some(500), None),
         )
         .await
         .unwrap();
@@ -1277,7 +1279,7 @@ async fn test_namespace_delete_cascades() {
         "Pod",
         Some("test-ns"),
         "test-pod",
-        crate::datastore::ResourcePreconditions::uid(&created_pod.uid),
+        klights_cluster_core::ResourcePreconditions::uid(&created_pod.uid),
     )
     .await
     .unwrap();
@@ -1346,7 +1348,7 @@ async fn list_with_metadata_name_selector_returns_exact_resource() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 None,
                 Some("metadata.name=pod-19"),
                 Some(1),
@@ -1400,7 +1402,7 @@ async fn list_with_metadata_name_and_residual_selector_returns_match() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 None,
                 Some("metadata.name=pod-7,status.phase=Running"),
                 Some(10),
@@ -1420,7 +1422,7 @@ async fn list_with_metadata_name_and_residual_selector_returns_match() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 None,
                 Some("metadata.name=pod-3,status.phase=Running"),
                 Some(10),
@@ -1476,7 +1478,7 @@ async fn test_label_selector_limit_returns_correct_page() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("app=nginx"), None, Some(2), None),
+            klights_cluster_store::ResourceListOptions::new(Some("app=nginx"), None, Some(2), None),
         )
         .await
         .unwrap();
@@ -1507,7 +1509,7 @@ async fn test_label_selector_limit_pagination_with_continue_token() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("app=nginx"), None, Some(2), None),
+            klights_cluster_store::ResourceListOptions::new(Some("app=nginx"), None, Some(2), None),
         )
         .await
         .unwrap();
@@ -1520,7 +1522,7 @@ async fn test_label_selector_limit_pagination_with_continue_token() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 Some("app=nginx"),
                 None,
                 Some(2),
@@ -1543,7 +1545,7 @@ async fn test_label_selector_limit_pagination_with_continue_token() {
                 "v1",
                 "Pod",
                 Some("default"),
-                crate::datastore::ResourceListQuery::new(
+                klights_cluster_store::ResourceListOptions::new(
                     Some("app=nginx"),
                     None,
                     Some(2),
@@ -1576,7 +1578,7 @@ async fn test_field_selector_limit_returns_correct_page() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 None,
                 Some("spec.nodeName=node-a"),
                 Some(2),
@@ -1603,7 +1605,7 @@ async fn test_field_selector_limit_pagination_with_continue_token() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 None,
                 Some("spec.nodeName=node-a"),
                 Some(2),
@@ -1620,7 +1622,7 @@ async fn test_field_selector_limit_pagination_with_continue_token() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(
+            klights_cluster_store::ResourceListOptions::new(
                 None,
                 Some("spec.nodeName=node-a"),
                 Some(2),
@@ -1645,7 +1647,7 @@ async fn test_label_selector_limit_exact_fit_no_continue() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("app=nginx"), None, Some(3), None),
+            klights_cluster_store::ResourceListOptions::new(Some("app=nginx"), None, Some(3), None),
         )
         .await
         .unwrap();
@@ -1669,7 +1671,12 @@ async fn test_label_selector_limit_exceeds_total() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("app=nginx"), None, Some(10), None),
+            klights_cluster_store::ResourceListOptions::new(
+                Some("app=nginx"),
+                None,
+                Some(10),
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -1734,7 +1741,7 @@ async fn residual_selector_limit_does_not_drop_match_after_candidate_window() {
                 "v1",
                 "ConfigMap",
                 Some("default"),
-                crate::datastore::ResourceListQuery::new(
+                klights_cluster_store::ResourceListOptions::new(
                     None,
                     Some("data.match=yes"),
                     Some(1),
@@ -1777,7 +1784,12 @@ async fn residual_selector_pagination_omits_remaining_item_count() {
             "v1",
             "ConfigMap",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(None, Some("data.match=yes"), Some(5), None),
+            klights_cluster_store::ResourceListOptions::new(
+                None,
+                Some("data.match=yes"),
+                Some(5),
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -1822,7 +1834,12 @@ async fn residual_selector_stops_after_limit_plus_one_matches() {
             "v1",
             "ConfigMap",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(None, Some("data.match=yes"), Some(3), None),
+            klights_cluster_store::ResourceListOptions::new(
+                None,
+                Some("data.match=yes"),
+                Some(3),
+                None,
+            ),
         )
         .await
         .unwrap();

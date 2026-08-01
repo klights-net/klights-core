@@ -5,7 +5,7 @@
 //! and `backend::` symbols visible to them.
 
 #[cfg(test)]
-mod applier;
+pub mod applier;
 mod cluster_replace;
 mod crud;
 mod focused_ports;
@@ -13,6 +13,8 @@ mod gc;
 mod merge_patch;
 mod outbox_codec;
 mod rv_helpers;
+#[cfg(test)]
+mod tests;
 mod watch;
 
 #[cfg(test)]
@@ -203,12 +205,6 @@ pub use watch::publish_pending;
 #[cfg(any(test, feature = "test-support"))]
 pub use watch::publish_pending_batch;
 
-#[cfg(test)]
-use crate::sqlite::filters::filter_by_field_selector;
-#[cfg(test)]
-use crate::sqlite::filters::parse_label_selector;
-#[cfg(test)]
-use crate::sqlite::filters::{resolve_field_path, split_selector};
 use crate::sqlite::scope::use_namespaced_table;
 use resource_shape::hydrate_watch_event_data;
 use resource_shape::{

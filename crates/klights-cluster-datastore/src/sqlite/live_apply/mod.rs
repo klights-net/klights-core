@@ -147,12 +147,12 @@ fn create_staged_post_commit(
         namespace,
         resource_version,
     );
-    #[cfg(not(feature = "test-support"))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         let _ = (name, event_type, data);
         staged
     }
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     {
         use bytes::Bytes;
         use serde::Serialize;
@@ -201,7 +201,7 @@ fn create_staged_post_commit(
     }
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 fn hydrate_staged_test_resource(
     mut data: serde_json::Value,
     api_version: &str,

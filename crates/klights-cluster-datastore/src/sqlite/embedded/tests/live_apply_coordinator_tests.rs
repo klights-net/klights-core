@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use klights_cluster_core::{
     LogApplyAppliedOutboxRow, LogApplyCommit, LogApplyMutation, LogApplyNodeDataplaneRow,
@@ -78,7 +80,7 @@ fn pod_status_commit_with_stamp(
     name: &str,
     uid: &str,
 ) -> LogApplyCommit {
-    crate::datastore::test_support::test_live_commit(
+    crate::test_fixtures::live_apply::test_live_commit(
         0,
         vec![
             LogApplyMutation::PutResource(LogApplyResourceRow {
@@ -106,7 +108,7 @@ fn pod_status_commit_with_stamp(
                 operation: "PodStatus".to_string(),
                 first_seen_ms: status_stamp,
                 applied_rv: None,
-                result_proto: crate::datastore::sqlite::outbox_codec::encode(
+                result_proto: crate::sqlite::embedded::outbox_codec::encode(
                     &klights_cluster_core::command::StorageResponse::Ack {
                         resource_version: 0,
                     },
@@ -192,7 +194,7 @@ async fn pod_status_apply_snapshot(
 }
 
 fn applied_outbox_ack_rv(row: &LogApplyAppliedOutboxRow) -> i64 {
-    match crate::datastore::sqlite::outbox_codec::decode(&row.result_proto)
+    match crate::sqlite::embedded::outbox_codec::decode(&row.result_proto)
         .expect("decode applied-outbox response")
     {
         klights_cluster_core::command::StorageResponse::Ack { resource_version } => {
@@ -210,7 +212,7 @@ async fn committed_apply_v1_allocates_one_rv_after_current_counter() {
 
     let result = db
         .apply_raft_log_apply_commit(committed_apply_v1(
-            crate::datastore::test_support::test_live_commit(
+            crate::test_fixtures::live_apply::test_live_commit(
                 0,
                 vec![v1_resource("v1-one", "v1-one-uid")],
             ),
@@ -250,7 +252,7 @@ async fn snapshot_replace_restores_history_then_allocates_a_newer_live_rv() {
         Some(ReplicatedSnapshotMetadata {
             cluster_id: String::new(),
             leader_epoch: 0,
-            membership: crate::datastore::ReplicatedMembershipState::LegacyOmitted,
+            membership: klights_cluster_store::ReplicatedMembershipState::LegacyOmitted,
             command_codec_activation_version: None,
         }),
     )
@@ -266,7 +268,7 @@ async fn snapshot_replace_restores_history_then_allocates_a_newer_live_rv() {
     );
     let applied = db
         .apply_raft_log_apply_commit(committed_apply_v1(
-            crate::datastore::test_support::test_live_commit(
+            crate::test_fixtures::live_apply::test_live_commit(
                 0,
                 vec![v1_resource("after-snapshot", "after-snapshot-uid")],
             ),
@@ -444,13 +446,13 @@ async fn legacy_snapshot_floor_allows_fresh_positioned_handoff() {
         .await
         .unwrap();
 
-    let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+    let target = [klights_cluster_store::WatchTarget::namespaced_in_namespace(
         "v1",
         "ConfigMap",
         "default",
     )];
     let fresh =
-        crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(10, 5);
+        klights_cluster_core::WatchReplayPosition::from_resource_version_through_event_id(10, 5);
     let replay = db
         .list_watch_events_after_position_checked_bounded(
             &target,
@@ -462,13 +464,13 @@ async fn legacy_snapshot_floor_allows_fresh_positioned_handoff() {
     assert!(
         matches!(
             replay,
-            crate::datastore::PositionedWatchReplayRead::Events(_)
+            klights_cluster_store::PositionedWatchReplayRead::Events(_)
         ),
         "fresh LIST-to-WATCH cursor at the snapshot high-water must not expire"
     );
 
     let stale =
-        crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(10, 4);
+        klights_cluster_core::WatchReplayPosition::from_resource_version_through_event_id(10, 4);
     assert!(matches!(
         db.list_watch_events_after_position_checked_bounded(
             &target,
@@ -477,7 +479,7 @@ async fn legacy_snapshot_floor_allows_fresh_positioned_handoff() {
         )
         .await
         .unwrap(),
-        crate::datastore::PositionedWatchReplayRead::Expired
+        klights_cluster_store::PositionedWatchReplayRead::Expired
     ));
 }
 
@@ -488,7 +490,7 @@ async fn stable_snapshot_floor_missing_exact_flag_keeps_positioned_handoff() {
         Vec::new(),
         10,
         Some(5),
-        Some(vec![crate::datastore::WatchReplayFloor {
+        Some(vec![klights_cluster_store::WatchReplayFloor {
             api_version: "v1".to_string(),
             kind: "ConfigMap".to_string(),
             namespace_key: "default".to_string(),
@@ -501,13 +503,13 @@ async fn stable_snapshot_floor_missing_exact_flag_keeps_positioned_handoff() {
     .await
     .unwrap();
 
-    let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+    let target = [klights_cluster_store::WatchTarget::namespaced_in_namespace(
         "v1",
         "ConfigMap",
         "default",
     )];
     let fresh =
-        crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(10, 5);
+        klights_cluster_core::WatchReplayPosition::from_resource_version_through_event_id(10, 5);
     assert!(matches!(
         db.list_watch_events_after_position_checked_bounded(
             &target,
@@ -516,11 +518,11 @@ async fn stable_snapshot_floor_missing_exact_flag_keeps_positioned_handoff() {
         )
         .await
         .unwrap(),
-        crate::datastore::PositionedWatchReplayRead::Events(_)
+        klights_cluster_store::PositionedWatchReplayRead::Events(_)
     ));
 
     let stale =
-        crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(10, 4);
+        klights_cluster_core::WatchReplayPosition::from_resource_version_through_event_id(10, 4);
     assert!(matches!(
         db.list_watch_events_after_position_checked_bounded(
             &target,
@@ -529,7 +531,7 @@ async fn stable_snapshot_floor_missing_exact_flag_keeps_positioned_handoff() {
         )
         .await
         .unwrap(),
-        crate::datastore::PositionedWatchReplayRead::Expired
+        klights_cluster_store::PositionedWatchReplayRead::Expired
     ));
 }
 
@@ -556,7 +558,7 @@ async fn zero_high_water_legacy_snapshot_does_not_block_future_positioned_handof
     let position = db.current_watch_replay_position().await.unwrap();
     assert!(position.event_id > 0);
 
-    let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+    let target = [klights_cluster_store::WatchTarget::namespaced_in_namespace(
         "v1",
         "ConfigMap",
         "default",
@@ -569,7 +571,7 @@ async fn zero_high_water_legacy_snapshot_does_not_block_future_positioned_handof
         )
         .await
         .unwrap(),
-        crate::datastore::PositionedWatchReplayRead::Events(_)
+        klights_cluster_store::PositionedWatchReplayRead::Events(_)
     ));
     assert!(matches!(
         db.list_watch_events_since_checked_bounded(
@@ -579,7 +581,7 @@ async fn zero_high_water_legacy_snapshot_does_not_block_future_positioned_handof
         )
         .await
         .unwrap(),
-        crate::datastore::WatchReplayRead::Expired
+        klights_cluster_store::WatchReplayRead::Expired
     ));
 }
 
@@ -589,7 +591,7 @@ async fn committed_apply_v1_multi_mutation_shares_one_rv() {
     enable_committed_apply_v1(&db).await;
     let result = db
         .apply_raft_log_apply_commit(committed_apply_v1(
-            crate::datastore::test_support::test_live_commit(
+            crate::test_fixtures::live_apply::test_live_commit(
                 0,
                 vec![
                     v1_resource("v1-left", "v1-left-uid"),
@@ -644,7 +646,7 @@ async fn raft_apply_stale_ordinary_put_returns_terminal_conflict_without_side_ef
         .unwrap()
         .len();
     let result = db
-            .apply_raft_log_apply_commit(committed_apply_v1(crate::datastore::test_support::test_live_commit(
+            .apply_raft_log_apply_commit(committed_apply_v1(crate::test_fixtures::live_apply::test_live_commit(
                 0,
                 vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                     api_version: "v1".into(), kind: "ConfigMap".into(), namespace: Some("default".into()), name: "stale-put".into(), uid: current.uid.clone(), resource_version: 0,
@@ -692,7 +694,7 @@ async fn raft_apply_stale_ordinary_patch_returns_terminal_conflict_without_side_
         .len();
     let result = db
         .apply_raft_log_apply_commit(committed_apply_v1(
-            crate::datastore::test_support::test_live_commit(
+            crate::test_fixtures::live_apply::test_live_commit(
                 0,
                 vec![LogApplyMutation::PatchResourceLatest(
                     LogApplyResourcePatch {
@@ -701,7 +703,7 @@ async fn raft_apply_stale_ordinary_patch_returns_terminal_conflict_without_side_
                         namespace: Some("default".into()),
                         name: "stale-patch".into(),
                         resource_version: 0,
-                        patch_kind: crate::datastore::PatchKind::Merge,
+                        patch_kind: klights_cluster_core::PatchKind::Merge,
                         patch: serde_json::json!({"data":{"v":"stale"}}),
                         require_existing: true,
                         precondition_uid: Some("stale-patch-uid".into()),
@@ -749,7 +751,7 @@ async fn raft_apply_stale_ordinary_delete_returns_terminal_conflict_without_side
         .len();
     let result = db
         .apply_raft_log_apply_commit(committed_apply_v1(
-            crate::datastore::test_support::test_live_commit(
+            crate::test_fixtures::live_apply::test_live_commit(
                 0,
                 vec![LogApplyMutation::DeleteResource(LogApplyResourceKey {
                     api_version: "v1".into(),
@@ -793,7 +795,7 @@ async fn raft_apply_stale_status_without_stamp_returns_terminal_conflict_without
         .await
         .unwrap()
         .len();
-    let result = db.apply_raft_log_apply_commit(committed_apply_v1(crate::datastore::test_support::test_live_commit(0, vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+    let result = db.apply_raft_log_apply_commit(committed_apply_v1(crate::test_fixtures::live_apply::test_live_commit(0, vec![LogApplyMutation::PutResource(LogApplyResourceRow {
             api_version:"v1".into(), kind:"Pod".into(), namespace:Some("default".into()), name:"stale-status".into(), uid:"stale-status-uid".into(), resource_version:0,
             data:serde_json::json!({"metadata":{"name":"stale-status","namespace":"default","uid":"stale-status-uid"},"spec":{"nodeName":"node-a"},"status":{"phase":"Failed"}}), require_absent:false, require_existing:true, precondition_uid:Some("stale-status-uid".into()), precondition_resource_version:Some(created.resource_version), status_only:true,
         })]))).await.unwrap();
@@ -1073,7 +1075,7 @@ async fn committed_apply_v1_conflict_and_duplicate_do_not_allocate_rv() {
     let before_conflict = db.get_current_resource_version().await.unwrap();
     let conflict = db
         .apply_raft_log_apply_commit(committed_apply_v1(
-            crate::datastore::test_support::test_live_commit(
+            crate::test_fixtures::live_apply::test_live_commit(
                 0,
                 vec![v1_resource("v1-existing", "new-uid")],
             ),
@@ -1093,7 +1095,7 @@ async fn committed_apply_v1_conflict_and_duplicate_do_not_allocate_rv() {
         operation: "PodStatus".to_string(),
         first_seen_ms: 1,
         applied_rv: None,
-        result_proto: crate::datastore::sqlite::outbox_codec::encode(
+        result_proto: crate::sqlite::embedded::outbox_codec::encode(
             &klights_cluster_core::command::StorageResponse::Ack {
                 resource_version: 0,
             },
@@ -1101,7 +1103,7 @@ async fn committed_apply_v1_conflict_and_duplicate_do_not_allocate_rv() {
         .unwrap(),
         status_stamp: None,
     };
-    let commit = committed_apply_v1(crate::datastore::test_support::test_live_commit(
+    let commit = committed_apply_v1(crate::test_fixtures::live_apply::test_live_commit(
         0,
         vec![LogApplyMutation::PutAppliedOutbox(outbox)],
     ));
@@ -1151,7 +1153,7 @@ async fn outbox_terminal_decision_commits_error_ledger_and_watermark_without_pub
             operation: "PodStatus".to_string(),
             first_seen_ms: 1,
             applied_rv: None,
-            result_proto: crate::datastore::sqlite::outbox_codec::encode(
+            result_proto: crate::sqlite::embedded::outbox_codec::encode(
                 &klights_cluster_core::command::StorageResponse::Ack {
                     resource_version: 0,
                 },
@@ -1208,7 +1210,7 @@ async fn outbox_terminal_decision_commits_error_ledger_and_watermark_without_pub
         .unwrap()
         .expect("terminal decision ledger row");
     assert!(matches!(
-        crate::datastore::sqlite::outbox_codec::decode(&terminal_row.result_proto),
+        crate::sqlite::embedded::outbox_codec::decode(&terminal_row.result_proto),
         Ok(klights_cluster_core::command::StorageResponse::Error { .. })
     ));
 
@@ -1308,7 +1310,7 @@ fn node_commit(resource_version: i64, name: &str, uid: &str) -> SnapshotRestoreO
 
 #[tokio::test]
 async fn replace_replicated_resource_state_applies_and_prunes_peer_state() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     db.allocate_node_subnet("stale", "10.43.0.0/16", "192.0.2.200")
         .await
         .unwrap();
@@ -1359,7 +1361,7 @@ async fn replace_replicated_resource_state_applies_and_prunes_peer_state() {
 
 #[tokio::test]
 async fn replace_replicated_resource_state_applies_peer_rows_at_snapshot_rv() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
 
     db.replace_replicated_resource_state(
         vec![
@@ -1382,7 +1384,7 @@ async fn replace_replicated_resource_state_applies_peer_rows_at_snapshot_rv() {
 
 #[tokio::test]
 async fn replace_replicated_resource_state_clears_stale_owner_ref_index_rows() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     let pod = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -1434,7 +1436,7 @@ async fn replace_replicated_resource_state_clears_stale_owner_ref_index_rows() {
 
 #[tokio::test]
 async fn replace_replicated_resource_state_restores_created_rv_from_watch_history() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
 
     db.replace_replicated_resource_state(
         vec![
@@ -1536,7 +1538,7 @@ async fn replace_replicated_resource_state_restores_created_rv_from_watch_histor
 
 #[tokio::test]
 async fn snapshot_replacement_sets_allocator_to_leader_high_water_exactly() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     for index in 0..8 {
         db.create_resource(
             "v1",
@@ -1610,7 +1612,7 @@ async fn snapshot_replacement_sets_allocator_to_leader_high_water_exactly() {
 
 #[tokio::test]
 async fn snapshot_replacement_rejects_high_water_below_restored_event_id() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     let err = db
         .replace_replicated_resource_state(
             vec![snapshot_watch_event(LogApplyWatchEventRow {
@@ -1643,7 +1645,7 @@ async fn snapshot_replacement_rejects_high_water_below_restored_event_id() {
 
 #[tokio::test]
 async fn snapshot_event_pages_follow_event_id_across_lower_resource_versions() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     let row = |event_id, resource_version, name: &str| {
         snapshot_watch_event(LogApplyWatchEventRow {
             event_id: Some(event_id),
@@ -1688,11 +1690,11 @@ async fn snapshot_event_pages_follow_event_id_across_lower_resource_versions() {
 
 #[tokio::test]
 async fn legacy_snapshot_without_floors_forces_relist_for_unknown_scopes() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     db.replace_replicated_resource_state(Vec::new(), 10, Some(5), None, None)
         .await
         .unwrap();
-    let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+    let target = [klights_cluster_store::WatchTarget::namespaced_in_namespace(
         "example.test/v1",
         "GoneResource",
         "gone-ns",
@@ -1701,7 +1703,7 @@ async fn legacy_snapshot_without_floors_forces_relist_for_unknown_scopes() {
     assert!(matches!(
         db.list_watch_events_after_position_checked_bounded(
             &target,
-            crate::datastore::WatchReplayPosition {
+            klights_cluster_core::WatchReplayPosition {
                 resource_version: 9,
                 event_id: 4,
                 resource_version_filter_through_event_id: 0,
@@ -1710,7 +1712,7 @@ async fn legacy_snapshot_without_floors_forces_relist_for_unknown_scopes() {
         )
         .await
         .unwrap(),
-        crate::datastore::PositionedWatchReplayRead::Expired
+        klights_cluster_store::PositionedWatchReplayRead::Expired
     ));
     assert!(matches!(
         db.list_watch_events_since_checked_bounded(
@@ -1720,14 +1722,14 @@ async fn legacy_snapshot_without_floors_forces_relist_for_unknown_scopes() {
         )
         .await
         .unwrap(),
-        crate::datastore::WatchReplayRead::Expired
+        klights_cluster_store::WatchReplayRead::Expired
     ));
     assert!(matches!(
         db.snapshot_resources_at_position(
             &target,
             None,
             None,
-            crate::datastore::WatchReplayPosition {
+            klights_cluster_core::WatchReplayPosition {
                 resource_version: 9,
                 event_id: 4,
                 resource_version_filter_through_event_id: 0,
@@ -1735,7 +1737,7 @@ async fn legacy_snapshot_without_floors_forces_relist_for_unknown_scopes() {
         )
         .await
         .unwrap(),
-        crate::datastore::SnapshotAtRv::Expired
+        klights_cluster_store::SnapshotAtRv::Expired
     ));
 }
 
@@ -1745,7 +1747,7 @@ async fn stale_uid_delete_does_not_remove_same_name_replacement() {
     // LogApplyResourceKey.uid points at an older (already-replaced)
     // Pod identity. The same-name replacement Pod with a different
     // UID must remain in cluster.db; the stale delete is a no-op.
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
 
     db.create_resource(
         "v1",
@@ -1765,7 +1767,7 @@ async fn stale_uid_delete_does_not_remove_same_name_replacement() {
     .await
     .unwrap();
 
-    db.apply_log_apply_commit(crate::datastore::test_support::test_live_commit(
+    db.apply_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
         5,
         vec![LogApplyMutation::DeleteResource(LogApplyResourceKey {
             api_version: "v1".to_string(),
@@ -1800,7 +1802,7 @@ async fn stale_uid_delete_does_not_remove_same_name_replacement() {
     // Replay the stale UID-A delete commit. With UID-qualified
     // deletes this must be a no-op; without the guard it would hit
     // by (api_version, kind, namespace, name) and remove UID-B's row.
-    db.apply_log_apply_commit(crate::datastore::test_support::test_live_commit(
+    db.apply_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
         7,
         vec![LogApplyMutation::DeleteResource(LogApplyResourceKey {
             api_version: "v1".to_string(),
@@ -1830,7 +1832,7 @@ async fn stale_uid_delete_does_not_remove_same_name_replacement() {
 /// structural presence and UID/resourceVersion preconditions.
 #[tokio::test]
 async fn raft_apply_missing_required_resource_returns_terminal_result() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     db.create_resource(
         "apps/v1",
         "Deployment",
@@ -1855,13 +1857,13 @@ async fn raft_apply_missing_required_resource_returns_terminal_result() {
         "Deployment",
         Some("default"),
         "stale-status",
-        crate::datastore::ResourcePreconditions::uid("deploy-uid"),
+        klights_cluster_core::ResourcePreconditions::uid("deploy-uid"),
     )
     .await
     .unwrap();
 
     let result = db
-        .apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+        .apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
             10,
             vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                 api_version: "apps/v1".to_string(),
@@ -1910,8 +1912,8 @@ async fn raft_apply_missing_required_resource_returns_terminal_result() {
 }
 
 #[tokio::test]
-async fn apply_log_apply_commit_broadcasts_explicit_watch_event() {
-    let db = crate::datastore::test_support::in_memory().await;
+async fn apply_log_apply_commit_observes_explicit_watch_event() {
+    let db = Datastore::new_in_memory().await.unwrap();
     db.create_resource(
         "v1",
         "Pod",
@@ -1930,7 +1932,10 @@ async fn apply_log_apply_commit_broadcasts_explicit_watch_event() {
     )
     .await
     .unwrap();
-    let mut watch_rx = db.subscribe_watch(klights_watch::WatchTopic::new("v1", "Pod"));
+    let observations_before = crate::test_fixtures::commit_observation::recorded_observations(
+        db.commit_sink.as_deref().expect("test commit sink"),
+    )
+    .len();
 
     let leader_watch_row = serde_json::json!({
         "apiVersion": "v1",
@@ -1947,7 +1952,7 @@ async fn apply_log_apply_commit_broadcasts_explicit_watch_event() {
         }
     });
 
-    db.apply_log_apply_commit(crate::datastore::test_support::test_live_commit(
+    db.apply_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
         7,
         vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
             event_id: None,
@@ -1964,14 +1969,21 @@ async fn apply_log_apply_commit_broadcasts_explicit_watch_event() {
     .unwrap();
     let applied_rv = db.get_current_resource_version().await.unwrap();
 
-    let event = watch_rx
-        .try_recv()
-        .expect("explicit watch-history apply must wake local watchers");
-    assert_eq!(event.event_type, crate::watch::EventType::Modified);
-    assert_eq!(event.resource_version(), Some(applied_rv));
+    let observations = crate::test_fixtures::commit_observation::recorded_observations(
+        db.commit_sink.as_deref().expect("test commit sink"),
+    );
+    let observation = observations
+        .get(observations_before)
+        .expect("explicit watch-history apply must emit a neutral post-commit observation");
+    assert_eq!(observation.resource_version(), applied_rv);
+    let event = observation
+        .test_event()
+        .expect("destination test observation retains the durable watch event");
+    assert_eq!(event.event_type(), "MODIFIED");
     assert_eq!(
         event
-            .object
+            .resource()
+            .data
             .pointer("/spec/nodeName")
             .and_then(|v| v.as_str()),
         Some("mn-controlplane3")
@@ -1980,7 +1992,7 @@ async fn apply_log_apply_commit_broadcasts_explicit_watch_event() {
 
 #[tokio::test]
 async fn apply_log_apply_commit_replays_explicit_watch_event_without_synthesizing() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     db.create_resource(
         "v1",
         "ConfigMap",
@@ -2023,7 +2035,7 @@ async fn apply_log_apply_commit_replays_explicit_watch_event_without_synthesizin
         "data": {"state": "leader-watch-history"}
     });
 
-    db.apply_log_apply_commit(crate::datastore::test_support::test_live_commit(
+    db.apply_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
         7,
         vec![
             LogApplyMutation::PutResource(LogApplyResourceRow {
@@ -2075,7 +2087,7 @@ async fn apply_log_apply_commit_replays_explicit_watch_event_without_synthesizin
 
 #[tokio::test]
 async fn apply_log_apply_commit_replays_explicit_watch_payload_without_synthesizing() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     let explicit_payload = serde_json::json!({
         "type": "ADDED",
         "object": {
@@ -2093,7 +2105,7 @@ async fn apply_log_apply_commit_replays_explicit_watch_payload_without_synthesiz
     });
     let expected_watch_payload = explicit_payload.clone();
 
-    db.apply_log_apply_commit(crate::datastore::test_support::test_live_commit(
+    db.apply_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
         11,
         vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
             event_id: None,
@@ -2145,7 +2157,7 @@ async fn committed_apply_v1_watch_event_payload_hydrates_only_resource_shape_eve
 
     let result = db
         .apply_raft_log_apply_commit(committed_apply_v1(
-            crate::datastore::test_support::test_live_commit(
+            crate::test_fixtures::live_apply::test_live_commit(
                 0,
                 vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
                     event_id: None,
@@ -2253,7 +2265,7 @@ async fn live_watch_envelope_hydrates_nested_object_with_committed_rv() {
 /// precondition the leader encoded (the follower missed an intermediate update).
 #[tokio::test]
 async fn committed_delete_applies_when_raw_resource_version_precondition_matches() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     db.create_resource(
         "v1",
         "ConfigMap",
@@ -2269,7 +2281,7 @@ async fn committed_delete_applies_when_raw_resource_version_precondition_matches
     .unwrap();
     // Strict committed apply validates the raw precondition before normalization.
     let result = db
-        .apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+        .apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
             50,
             vec![LogApplyMutation::DeleteResource(LogApplyResourceKey {
                 api_version: "v1".to_string(),
@@ -2298,7 +2310,7 @@ async fn committed_delete_applies_when_raw_resource_version_precondition_matches
 
 #[tokio::test]
 async fn committed_namespace_delete_errors_on_corrupt_stored_json_instead_of_emitting_null_event() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     db.create_namespace(
         "corrupt-delete-ns",
         serde_json::json!({
@@ -2324,7 +2336,7 @@ async fn committed_namespace_delete_errors_on_corrupt_stored_json_instead_of_emi
     .expect("corrupt stored JSON");
 
     let err = db
-        .apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+        .apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
             60,
             vec![LogApplyMutation::DeleteNamespace {
                 name: "corrupt-delete-ns".to_string(),
@@ -2342,7 +2354,7 @@ async fn committed_namespace_delete_errors_on_corrupt_stored_json_instead_of_emi
 /// Committed put applies when its raw UID/RV preconditions match.
 #[tokio::test]
 async fn committed_put_applies_with_matching_raw_preconditions() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     db.create_resource(
         "v1",
         "ConfigMap",
@@ -2358,7 +2370,7 @@ async fn committed_put_applies_with_matching_raw_preconditions() {
     .await
     .unwrap();
     let result = db
-        .apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+        .apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
             60,
             vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                 api_version: "v1".to_string(),
@@ -2410,7 +2422,7 @@ async fn committed_put_applies_with_matching_raw_preconditions() {
 
 #[tokio::test]
 async fn stale_same_uid_committed_put_does_not_revert_newer_client_owned_state() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     let created = db
         .create_resource(
             "apps/v1",
@@ -2448,7 +2460,7 @@ async fn stale_same_uid_committed_put_does_not_revert_newer_client_owned_state()
     .unwrap();
 
     let result = db
-        .apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+        .apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
             60,
             vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                 api_version: "apps/v1".to_string(),
@@ -2504,9 +2516,9 @@ async fn stale_same_uid_committed_put_does_not_revert_newer_client_owned_state()
 
 #[tokio::test]
 async fn stale_same_uid_generationless_committed_put_preserves_newer_configmap_state() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     let seed = db
-        .apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+        .apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
             10,
             vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                 api_version: "v1".to_string(),
@@ -2536,7 +2548,7 @@ async fn stale_same_uid_generationless_committed_put_preserves_newer_configmap_s
         .await
         .expect("seed generation-less ConfigMap from raft");
 
-    db.apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+    db.apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
         20,
         vec![LogApplyMutation::PutResource(LogApplyResourceRow {
             api_version: "v1".to_string(),
@@ -2568,7 +2580,7 @@ async fn stale_same_uid_generationless_committed_put_preserves_newer_configmap_s
     assert!(seed.error_message.is_none());
 
     let result = db
-        .apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+        .apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
             30,
             vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                 api_version: "v1".to_string(),
@@ -2620,7 +2632,7 @@ async fn stale_same_uid_generationless_committed_put_preserves_newer_configmap_s
 
 #[tokio::test]
 async fn newer_generation_committed_put_applies_after_status_only_rv_advance() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     let created = db
         .create_resource(
             "apps/v1",
@@ -2653,13 +2665,13 @@ async fn newer_generation_committed_put_applies_after_status_only_rv_advance() {
             "availableReplicas": 8,
             "observedGeneration": 2
         }),
-        crate::datastore::ResourcePreconditions::uid(created.uid.clone()),
+        klights_cluster_core::ResourcePreconditions::uid(created.uid.clone()),
     )
     .await
     .expect("status update advances RV before stale-precondition scale PUT apply");
 
     let result = db
-        .apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+        .apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
             60,
             vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                 api_version: "apps/v1".to_string(),
@@ -2718,7 +2730,7 @@ async fn newer_generation_committed_put_applies_after_status_only_rv_advance() {
 
 #[tokio::test]
 async fn stale_same_uid_pod_put_after_status_rv_advance_preserves_live_status() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     let created = db
         .create_resource(
             "v1",
@@ -2780,7 +2792,7 @@ async fn stale_same_uid_pod_put_after_status_rv_advance_preserves_live_status() 
                     "state": {"running": {"startedAt": "2026-07-05T09:32:10Z"}}
                 }]
             }),
-            crate::datastore::ResourcePreconditions::uid(created.uid.clone()),
+            klights_cluster_core::ResourcePreconditions::uid(created.uid.clone()),
         )
         .await
         .expect("kubelet status update should advance rv before stale put apply");
@@ -2790,7 +2802,7 @@ async fn stale_same_uid_pod_put_after_status_rv_advance_preserves_live_status() 
     );
 
     let result = db
-        .apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+        .apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
             60,
             vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                 api_version: "v1".to_string(),
@@ -2876,7 +2888,7 @@ async fn stale_same_uid_pod_put_after_status_rv_advance_preserves_live_status() 
 
 #[tokio::test]
 async fn committed_pod_put_preserves_existing_deletion_metadata_for_same_uid() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     db.create_resource(
         "v1",
         "Pod",
@@ -2924,7 +2936,7 @@ async fn committed_pod_put_preserves_existing_deletion_metadata_for_same_uid() {
     .unwrap();
 
     let result = db
-        .apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+        .apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
             60,
             vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                 api_version: "v1".to_string(),
@@ -3015,7 +3027,7 @@ async fn committed_pod_put_preserves_existing_deletion_metadata_for_same_uid() {
 
 #[tokio::test]
 async fn committed_pod_put_clears_finalizers_when_stale_rv_put_drain_was_committed() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     db.create_resource(
         "v1",
         "Pod",
@@ -3067,7 +3079,7 @@ async fn committed_pod_put_clears_finalizers_when_stale_rv_put_drain_was_committ
     .unwrap();
 
     let result = db
-            .apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+            .apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
                 72,
                 vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                     api_version: "v1".to_string(),
@@ -3148,7 +3160,7 @@ async fn committed_pod_put_clears_finalizers_when_stale_rv_put_drain_was_committ
 
 #[tokio::test]
 async fn committed_put_preserves_existing_deletion_metadata_for_non_pod_same_uid() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     db.create_resource(
         "apps/v1",
         "Deployment",
@@ -3195,7 +3207,7 @@ async fn committed_put_preserves_existing_deletion_metadata_for_non_pod_same_uid
     .unwrap();
 
     let result = db
-        .apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+        .apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
             61,
             vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                 api_version: "apps/v1".to_string(),
@@ -3272,7 +3284,7 @@ async fn committed_put_preserves_existing_deletion_metadata_for_non_pod_same_uid
 /// reconciling the follower toward the committed result before last_applied advances.
 #[tokio::test]
 async fn committed_patch_conflict_reconciles_to_committed_value_before_advancing() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     db.create_resource(
         "v1",
         "ConfigMap",
@@ -3290,7 +3302,7 @@ async fn committed_patch_conflict_reconciles_to_committed_value_before_advancing
     // Committed patch has precondition_rv=888 (leader rv). Follower has rv=1. The patch
     // must still be applied to the current local state.
     let result = db
-        .apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+        .apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
             70,
             vec![LogApplyMutation::PatchResourceLatest(
                 LogApplyResourcePatch {
@@ -3334,7 +3346,7 @@ async fn committed_patch_conflict_reconciles_to_committed_value_before_advancing
 /// signal), which is the prior buggy behavior.
 #[tokio::test]
 async fn committed_patch_conflict_does_not_advance_applied_index_with_divergence() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     db.create_resource(
         "v1",
         "ConfigMap",
@@ -3353,7 +3365,7 @@ async fn committed_patch_conflict_does_not_advance_applied_index_with_divergence
     // (no error_message). Without the fix the conflict is swallowed with error_message set,
     // which is the "advanced index with divergence" bug.
     let result = db
-        .apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+        .apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
             75,
             vec![LogApplyMutation::PatchResourceLatest(
                 LogApplyResourcePatch {
@@ -3388,10 +3400,10 @@ async fn committed_patch_conflict_does_not_advance_applied_index_with_divergence
 /// must advance last_applied silently without emitting a conflict.
 #[tokio::test]
 async fn idempotent_reapply_of_already_committed_state_advances_silently() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     // Apply a committed PUT once to establish local state.
     let first = db
-        .apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+        .apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
             80,
             vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                 api_version: "v1".to_string(),
@@ -3427,7 +3439,7 @@ async fn idempotent_reapply_of_already_committed_state_advances_silently() {
 
     // Re-apply the identical commit (simulating restart or redundant delivery).
     let second = db
-        .apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+        .apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
             80,
             vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                 api_version: "v1".to_string(),
@@ -3464,7 +3476,7 @@ async fn idempotent_reapply_of_already_committed_state_advances_silently() {
 
 #[tokio::test]
 async fn stale_raft_status_only_apply_preserves_newer_job_custom_condition_timestamp() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
     let created = db
         .create_resource(
             "batch/v1",
@@ -3525,12 +3537,12 @@ async fn stale_raft_status_only_apply_preserves_newer_job_custom_condition_times
             "startTime": "2026-06-30T18:14:00Z",
             "terminating": 0
         }),
-        crate::datastore::ResourcePreconditions::from_resource(&created),
+        klights_cluster_core::ResourcePreconditions::from_resource(&created),
     )
     .await
     .unwrap();
 
-    db.apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+    db.apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
         30,
         vec![LogApplyMutation::PutResource(LogApplyResourceRow {
             api_version: "batch/v1".to_string(),
@@ -3602,7 +3614,7 @@ async fn stale_raft_status_only_apply_preserves_newer_job_custom_condition_times
 #[tokio::test]
 async fn follower_converges_to_leader_fingerprint_without_snapshot_after_stale_delete() {
     // Simulate a follower that holds a row the leader committed as deleted.
-    let follower = crate::datastore::test_support::in_memory().await;
+    let follower = Datastore::new_in_memory().await.unwrap();
     follower
         .create_resource(
             "v1",
@@ -3624,7 +3636,7 @@ async fn follower_converges_to_leader_fingerprint_without_snapshot_after_stale_d
 
     // Leader backend has the resource deleted (empty). Committed delete arrives via log.
     let result = follower
-        .apply_raft_log_apply_commit(crate::datastore::test_support::test_live_commit(
+        .apply_raft_log_apply_commit(crate::test_fixtures::live_apply::test_live_commit(
             100,
             vec![LogApplyMutation::DeleteResource(LogApplyResourceKey {
                 api_version: "v1".to_string(),
@@ -3653,89 +3665,16 @@ async fn follower_converges_to_leader_fingerprint_without_snapshot_after_stale_d
     );
 }
 
-/// Applying the same committed entry encoded as JSON and as protobuf must produce identical
-/// cluster.db rows (api_version, kind, namespace, name, uid, rv, data).
-#[tokio::test]
-async fn committed_apply_json_and_protobuf_paths_produce_identical_rows() {
-    let commit = crate::datastore::test_support::test_live_commit(
-        110,
-        vec![LogApplyMutation::PutResource(LogApplyResourceRow {
-            api_version: "v1".to_string(),
-            kind: "ConfigMap".to_string(),
-            namespace: Some("default".to_string()),
-            name: "encoding-cm".to_string(),
-            uid: "cm-enc".to_string(),
-            resource_version: 110,
-            data: serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "ConfigMap",
-                "metadata": {
-                    "name": "encoding-cm",
-                    "namespace": "default",
-                    "uid": "cm-enc",
-                    "resourceVersion": "110"
-                },
-                "data": {"encoded": "true"}
-            }),
-            require_absent: false,
-            require_existing: false,
-            precondition_uid: None,
-            precondition_resource_version: None,
-            status_only: false,
-        })],
-    );
-
-    // JSON path
-    let json_bytes = klights_replication::log_apply_wire::encode_commit_json(&commit).unwrap();
-    let commit_from_json =
-        klights_replication::log_apply_wire::decode_commit_json(&json_bytes).unwrap();
-    let db_json = crate::datastore::test_support::in_memory().await;
-    db_json
-        .apply_raft_log_apply_commit(commit_from_json)
-        .await
-        .unwrap();
-    let row_json = db_json
-        .get_resource("v1", "ConfigMap", Some("default"), "encoding-cm")
-        .await
-        .unwrap()
-        .expect("json path must materialise row");
-
-    // Protobuf path
-    let proto_bytes = klights_replication::log_apply_wire::encode_commit_protobuf(&commit).unwrap();
-    let commit_from_proto =
-        klights_replication::log_apply_wire::decode_commit_protobuf(&proto_bytes).unwrap();
-    let db_proto = crate::datastore::test_support::in_memory().await;
-    db_proto
-        .apply_raft_log_apply_commit(commit_from_proto)
-        .await
-        .unwrap();
-    let row_proto = db_proto
-        .get_resource("v1", "ConfigMap", Some("default"), "encoding-cm")
-        .await
-        .unwrap()
-        .expect("proto path must materialise row");
-
-    assert_eq!(
-        row_json.uid, row_proto.uid,
-        "JSON and protobuf paths must produce identical uid"
-    );
-    assert_eq!(
-        row_json.resource_version, row_proto.resource_version,
-        "JSON and protobuf paths must produce identical rv"
-    );
-    assert_eq!(
-        row_json.data, row_proto.data,
-        "JSON and protobuf paths must produce identical data"
-    );
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancelled_caller_after_commit_still_publishes_and_retry_recovers_receipt() {
-    let db = crate::datastore::test_support::in_memory().await;
+async fn destination_cancelled_apply_records_observation_and_retry_recovers_receipt() {
+    let db = Datastore::new_in_memory().await.unwrap();
     enable_committed_apply_v1(&db).await;
-    let mut watch = db.subscribe_watch_signals(klights_watch::WatchTopic::new("v1", "ConfigMap"));
+    let observations_before = crate::test_fixtures::commit_observation::recorded_observations(
+        db.commit_sink.as_deref().expect("test commit sink"),
+    )
+    .len();
     let key = "cancel-after-commit";
-    let commit = committed_apply_v1(crate::datastore::test_support::test_live_commit(
+    let commit = committed_apply_v1(crate::test_fixtures::live_apply::test_live_commit(
         0,
         vec![
             v1_resource("cancelled-apply", "cancelled-uid"),
@@ -3745,7 +3684,7 @@ async fn cancelled_caller_after_commit_still_publishes_and_retry_recovers_receip
                 operation: "Create".to_string(),
                 first_seen_ms: 1,
                 applied_rv: None,
-                result_proto: crate::datastore::sqlite::outbox_codec::encode(
+                result_proto: crate::sqlite::embedded::outbox_codec::encode(
                     &klights_cluster_core::command::StorageResponse::Ack {
                         resource_version: 0,
                     },
@@ -3770,14 +3709,13 @@ async fn cancelled_caller_after_commit_still_publishes_and_retry_recovers_receip
         .unwrap()
         .expect("commit survived caller cancellation");
     let committed_position = db.current_watch_replay_position().await.unwrap();
+    let observations = crate::test_fixtures::commit_observation::recorded_observations(
+        db.commit_sink.as_deref().expect("test commit sink"),
+    );
     assert!(
-        watch
-            .recv()
-            .await
-            .unwrap()
-            .advances
+        observations[observations_before..]
             .iter()
-            .any(|advance| advance.high_rv == stored.resource_version)
+            .any(|observation| observation.resource_version() == stored.resource_version)
     );
 
     let receipt = db.apply_raft_log_apply_commit(commit).await.unwrap();
@@ -3790,9 +3728,12 @@ async fn cancelled_caller_after_commit_still_publishes_and_retry_recovers_receip
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancelled_snapshot_restore_after_commit_still_publishes_and_is_retryable() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let mut watch = db.subscribe_watch_signals(klights_watch::WatchTopic::new("v1", "ConfigMap"));
+async fn destination_cancelled_snapshot_records_observation_and_is_retryable() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let observations_before = crate::test_fixtures::commit_observation::recorded_observations(
+        db.commit_sink.as_deref().expect("test commit sink"),
+    )
+    .len();
     let restored = serde_json::json!({
         "metadata": {
             "name": "restored-after-cancel",
@@ -3843,14 +3784,13 @@ async fn cancelled_snapshot_restore_after_commit_still_publishes_and_is_retryabl
     task.abort();
     pause.resume();
     pause.published.notified().await;
+    let observations = crate::test_fixtures::commit_observation::recorded_observations(
+        db.commit_sink.as_deref().expect("test commit sink"),
+    );
     assert!(
-        watch
-            .recv()
-            .await
-            .unwrap()
-            .advances
+        observations[observations_before..]
             .iter()
-            .any(|advance| advance.high_rv == 5)
+            .any(|observation| observation.resource_version() == 5)
     );
     assert!(
         db.get_resource("v1", "ConfigMap", Some("default"), "restored-after-cancel")
@@ -3865,9 +3805,9 @@ async fn cancelled_snapshot_restore_after_commit_still_publishes_and_is_retryabl
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn post_commit_pause_is_scoped_to_its_datastore_instance() {
-    let paused_db = crate::datastore::test_support::in_memory().await;
-    let independent_db = crate::datastore::test_support::in_memory().await;
+async fn destination_post_commit_pause_is_scoped_to_its_store_instance() {
+    let paused_db = Datastore::new_in_memory().await.unwrap();
+    let independent_db = Datastore::new_in_memory().await.unwrap();
     let pause = paused_db.install_post_commit_publish_pause();
 
     let independent_commit =
