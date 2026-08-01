@@ -110,7 +110,7 @@ pub async fn deferred_outbox_pod_repository_for_test(
     ));
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = Arc::new(crate::side_effects::SideEffectRegistry::new());
-    let outbox = Arc::new(crate::node_outbox::Outbox::test_outbox().await);
+    let outbox = Arc::new(crate::outbox_test_support::test_outbox().await);
     let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
     Arc::new(
         crate::kubelet::pod_repository::PodRepository::new_with_scheduling_mode_and_outbox(

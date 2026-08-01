@@ -82,7 +82,7 @@ pub struct BootstrapRunArgs<'a> {
     pub pod_endpoint_store: Arc<dyn klights_node_store::PodEndpointStore>,
     pub assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
     pub replication_service_for_router: Option<Arc<klights_replication::ReplicationService>>,
-    pub outbox_runtime: Arc<crate::node_outbox::Outbox>,
+    pub outbox_runtime: Arc<klights_kubelet::node_outbox::Outbox>,
     pub node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
     pub node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
     pub network: Arc<crate::networking::Network>,
@@ -94,7 +94,7 @@ pub struct BootstrapRunArgs<'a> {
     pub dataplane_health: &'a klights_networking::dataplane_health::DataplaneHealth,
     pub cri_for_pod_watcher: Option<CriClient>,
     pub cri_for_api: Option<Arc<tokio::sync::Mutex<CriClient>>>,
-    pub cni_readiness: crate::kubelet::cni_readiness::CniReadiness,
+    pub cni_readiness: klights_kubelet::cni_readiness::CniReadiness,
     pub runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
     pub supervisor: Arc<TaskSupervisor>,
     pub grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
@@ -125,7 +125,7 @@ struct BootstrapNodeLeaderLabelStore {
 }
 
 #[async_trait::async_trait]
-impl crate::kubelet::node_leader_labels::NodeLeaderLabelStore for BootstrapNodeLeaderLabelStore {
+impl klights_kubelet::node_leader_labels::NodeLeaderLabelStore for BootstrapNodeLeaderLabelStore {
     async fn list_nodes(&self) -> Result<Vec<klights_cluster_core::Resource>> {
         self.db
             .list_resources(
@@ -475,7 +475,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     };
 
     let local_node_metrics = cri_for_api.clone().map(|cri| {
-        Arc::new(crate::kubelet::metrics::CriNodeMetricsSampler::new(
+        Arc::new(klights_kubelet::metrics::CriNodeMetricsSampler::new(
             cri,
             supervisor.clone(),
         )) as Arc<dyn klights_node_api::NodeMetricsSampler>
@@ -585,7 +585,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let registration_profile =
         crate::bootstrap::node_registration_profile::build(node_mode, &cli.role);
     let kubelet_capacity =
-        crate::kubelet::node_registration::NodeRegistrationHostFacts::capture_local(
+        klights_kubelet::node_registration::NodeRegistrationHostFacts::capture_local(
             &kubelet_file_process,
             &registration_profile,
         )
@@ -1148,13 +1148,13 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         } else {
             None
         };
-        let registration_addresses = kubelet::node::NodeRegistrationAddresses::new(
+        let registration_addresses = klights_kubelet::node::NodeRegistrationAddresses::new(
             node_ip.to_string(),
             config.external_endpoint.clone(),
         );
         let registration_profile =
             crate::bootstrap::node_registration_profile::build(node_mode, &cli.role);
-        let registration = kubelet::node::NodeRegistrationSnapshot::capture_local(
+        let registration = klights_kubelet::node::NodeRegistrationSnapshot::capture_local(
             &kubelet_services.local_execution().file_process,
             &config.node_name,
             &registration_profile,
@@ -1179,7 +1179,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let leader_peer_endpoint_observer_handle = if replication_service_for_router.is_some() {
         let endpoint_query = leader_ports.resource_query.clone();
         let endpoint_status: Arc<dyn klights_leader_api::LeaderNodeSelfStatus> =
-            Arc::new(crate::kubelet::node::OutboxNodeSelfStatusPublisher::new(
+            Arc::new(klights_kubelet::node::OutboxNodeSelfStatusPublisher::new(
                 config.node_name.clone(),
                 endpoint_query.clone(),
                 outbox_runtime.clone(),
@@ -1326,11 +1326,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                             "raft_shape_role_label_watcher: shape changed, re-stamping Node labels"
                         );
                         let registration_addresses =
-                            crate::kubelet::node::NodeRegistrationAddresses::new(
+                            klights_kubelet::node::NodeRegistrationAddresses::new(
                                 node_ip_task.clone(),
                                 external_endpoint_task.clone(),
                             );
-                        let registration = crate::kubelet::node::NodeRegistrationSnapshot::capture_local(
+                        let registration = klights_kubelet::node::NodeRegistrationSnapshot::capture_local(
                             &file_process_task,
                             &node_name,
                             &registration_profile_task,
@@ -1357,7 +1357,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                             );
                         }
                         if shape.is_leader
-                            && let Err(err) = crate::kubelet::node::clear_leader_label_from_other_nodes(
+                            && let Err(err) = klights_kubelet::node::clear_leader_label_from_other_nodes(
                                 &BootstrapNodeLeaderLabelStore {
                                     db: db_handle_task.clone(),
                                 },
@@ -1520,7 +1520,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 klights_supervisor::TaskCategory::Background,
                 "runtime_node_heartbeat",
                 async move {
-                    kubelet::node::run_heartbeat_with_lease_client(
+                    klights_kubelet::node::run_heartbeat_with_lease_client(
                         watch_source,
                         lease_client,
                         Arc::new(
@@ -1554,7 +1554,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 Some(leader_authority.clone()),
             );
         let node_status: Arc<dyn klights_leader_api::LeaderNodeSelfStatus> =
-            Arc::new(crate::kubelet::node::OutboxNodeSelfStatusPublisher::new(
+            Arc::new(klights_kubelet::node::OutboxNodeSelfStatusPublisher::new(
                 config.node_name.clone(),
                 query.clone(),
                 kubelet_services.status_delivery().outbox.clone(),
@@ -1811,7 +1811,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let grpc_node_query: Arc<dyn klights_leader_api::LeaderResourceQuery> =
             local_api_client.clone();
         let grpc_node_status: Arc<dyn klights_leader_api::LeaderNodeSelfStatus> =
-            Arc::new(crate::kubelet::node::OutboxNodeSelfStatusPublisher::new(
+            Arc::new(klights_kubelet::node::OutboxNodeSelfStatusPublisher::new(
                 config.node_name.clone(),
                 grpc_node_query.clone(),
                 outbox_runtime.clone(),

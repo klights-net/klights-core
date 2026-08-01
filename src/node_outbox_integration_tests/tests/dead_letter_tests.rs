@@ -6,7 +6,7 @@ use crate::datastore::node_local::selector;
 use crate::datastore::node_local::{
     DeadLetterTestInsert, LegacyDeliveryTestStore as _, NodeLocalStores, OutboxInsert,
 };
-use crate::node_outbox::payload::OutboxPayload;
+use crate::outbox_test_support::OutboxPayload;
 use klights_cluster_core::command::StorageCommand;
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 

@@ -78,7 +78,7 @@ impl RealPodDeletionFinalizer {
         store: Arc<crate::kubelet::pod_repository::store::PodStore>,
         gc_pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
         cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
-        outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
+        outbox: Option<Arc<klights_kubelet::outbox::Outbox>>,
         side_effects: Arc<crate::side_effects::SideEffectRegistry>,
         metrics: Arc<crate::side_effects::SideEffectMetrics>,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,

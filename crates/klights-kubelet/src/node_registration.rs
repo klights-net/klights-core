@@ -1,7 +1,7 @@
-use crate::kubelet::node;
-use crate::kubelet::node_config::{KubeletNodeRole, NodeRegistrationProfile};
-use crate::kubelet::outbox::OutboxOperation;
-use crate::kubelet::outbox::{Outbox, OutboxSendRoute};
+use crate::node;
+use crate::node_config::{KubeletNodeRole, NodeRegistrationProfile};
+use crate::outbox::OutboxOperation;
+use crate::outbox::{Outbox, OutboxSendRoute};
 use anyhow::{Context, Result};
 use klights_cluster_core::ResourcePreconditions;
 use klights_cluster_core::StorageCommand;
@@ -11,7 +11,7 @@ use klights_cluster_core::StorageCommand;
 /// Concrete datastore adaptation is owned by bootstrap composition; kubelet
 /// owns only the registration transaction it needs.
 #[async_trait::async_trait]
-pub(crate) trait NodeRegistrationStore: Send + Sync {
+pub trait NodeRegistrationStore: Send + Sync {
     async fn get_node(&self, node_name: &str) -> Result<Option<klights_cluster_core::Resource>>;
 
     async fn stamp_routing_metadata(
@@ -31,7 +31,7 @@ pub(crate) trait NodeRegistrationStore: Send + Sync {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NodeRegistrationAddresses {
+pub struct NodeRegistrationAddresses {
     internal_ip: String,
     external_ip: Option<String>,
 }
@@ -60,7 +60,7 @@ impl NodeRegistrationAddresses {
 /// receive these from the joiner; the leader must never substitute its own
 /// capacity, architecture, kernel, runtime, or build identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NodeRegistrationHostFacts {
+pub struct NodeRegistrationHostFacts {
     pub cpu_count: u32,
     pub memory_ki: u64,
     pub architecture: String,
@@ -73,8 +73,8 @@ pub(crate) struct NodeRegistrationHostFacts {
 }
 
 impl NodeRegistrationHostFacts {
-    pub fn node_capacity(&self) -> klights_kubelet::node_capacity::NodeCapacity {
-        klights_kubelet::node_capacity::NodeCapacity::new(self.memory_ki, u64::from(self.cpu_count))
+    pub fn node_capacity(&self) -> crate::node_capacity::NodeCapacity {
+        crate::node_capacity::NodeCapacity::new(self.memory_ki, u64::from(self.cpu_count))
     }
 
     pub async fn capture_local(
@@ -189,7 +189,7 @@ impl NodeRegistrationHostFacts {
 /// Registration metadata and host facts travel together so a remote writer
 /// cannot accidentally combine joiner identity with leader-local host data.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NodeRegistrationSnapshot {
+pub struct NodeRegistrationSnapshot {
     pub node_name: String,
     pub node_mode: klights_network_api::NodePeerMode,
     pub node_role: KubeletNodeRole,
@@ -348,108 +348,7 @@ fn unquote_os_release_value(value: &str) -> String {
 /// `klights.io/mode` and `klights.io/hostport-range` annotations so peers
 /// (root + rootless + hybrid) can discover each other's mode through Node
 /// metadata.
-#[cfg(test)]
-pub(crate) async fn register_node(
-    file_process: &klights_supervisor::FileProcessExecutor,
-    db: &dyn crate::datastore::DatastoreBackend,
-    node_name: &str,
-    profile: &NodeRegistrationProfile,
-    dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,
-    dataplane_external_ip: Option<&str>,
-) -> Result<()> {
-    let snapshot = capture_node_registration_snapshot(
-        file_process,
-        node_name,
-        profile,
-        dataplane_external_ip,
-        None,
-    )
-    .await;
-    crate::bootstrap::node_registration_adapter::register_node_snapshot(
-        db,
-        None,
-        dataplane_health,
-        &snapshot,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-pub(crate) async fn register_node_with_outbox(
-    file_process: &klights_supervisor::FileProcessExecutor,
-    db: &dyn crate::datastore::DatastoreBackend,
-    outbox: &crate::node_outbox::Outbox,
-    node_name: &str,
-    profile: &NodeRegistrationProfile,
-    dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,
-    dataplane_external_ip: Option<&str>,
-) -> Result<()> {
-    let snapshot = capture_node_registration_snapshot(
-        file_process,
-        node_name,
-        profile,
-        dataplane_external_ip,
-        None,
-    )
-    .await;
-    crate::bootstrap::node_registration_adapter::register_node_snapshot(
-        db,
-        Some(outbox),
-        dataplane_health,
-        &snapshot,
-    )
-    .await
-}
-
-#[cfg(test)]
-pub(crate) async fn register_node_at_addresses(
-    file_process: &klights_supervisor::FileProcessExecutor,
-    db: &dyn crate::datastore::DatastoreBackend,
-    node_name: &str,
-    profile: &NodeRegistrationProfile,
-    dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,
-    addresses: &NodeRegistrationAddresses,
-) -> Result<()> {
-    let snapshot = NodeRegistrationSnapshot::capture_local(
-        file_process,
-        node_name,
-        profile,
-        addresses.clone(),
-        None,
-        None,
-    )
-    .await;
-    crate::bootstrap::node_registration_adapter::register_node_snapshot(
-        db,
-        None,
-        dataplane_health,
-        &snapshot,
-    )
-    .await
-}
-
-#[cfg(test)]
-async fn capture_node_registration_snapshot(
-    file_process: &klights_supervisor::FileProcessExecutor,
-    node_name: &str,
-    profile: &NodeRegistrationProfile,
-    dataplane_external_ip: Option<&str>,
-    grpc_port: Option<u16>,
-) -> NodeRegistrationSnapshot {
-    let node_ip = crate::kubelet::node_ip::resolve_node_ip(node_name).await;
-    NodeRegistrationSnapshot::capture_local(
-        file_process,
-        node_name,
-        profile,
-        NodeRegistrationAddresses::new(node_ip, dataplane_external_ip.map(str::to_string)),
-        None,
-        grpc_port,
-    )
-    .await
-}
-
-pub(crate) async fn register_node_snapshot(
+pub async fn register_node_snapshot(
     db: &dyn NodeRegistrationStore,
     outbox: Option<&Outbox>,
     dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,

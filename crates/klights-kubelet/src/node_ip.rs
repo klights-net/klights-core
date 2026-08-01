@@ -1,5 +1,3 @@
-#[cfg(test)]
-use crate::datastore::DatastoreBackend;
 use klights_leader_api::LeaderResourceQuery;
 
 fn first_non_loopback_ip_from_iter<I>(iter: I) -> Option<String>
@@ -35,25 +33,6 @@ fn internal_ip_from_node(node: &serde_json::Value) -> Option<String> {
             }
             Some(ip.to_string())
         })
-}
-
-#[cfg(test)]
-pub async fn resolve_node_ip_from_db(db: &dyn DatastoreBackend, node_name: &str) -> Option<String> {
-    match db.get_resource("v1", "Node", None, node_name).await {
-        Ok(Some(node)) => internal_ip_from_node(&node.data),
-        Ok(None) => {
-            tracing::debug!(node_name, "node resource not found for InternalIP lookup");
-            None
-        }
-        Err(err) => {
-            tracing::debug!(
-                node_name,
-                error = %err,
-                "failed to read node resource for InternalIP lookup"
-            );
-            None
-        }
-    }
 }
 
 pub async fn resolve_node_ip_from_leader_api(
@@ -152,6 +131,37 @@ pub async fn discover_primary_route_ip() -> anyhow::Result<String> {
 mod tests {
     use super::first_non_loopback_ip_from_iter;
 
+    struct ExactNodeQuery(klights_cluster_core::Resource);
+
+    impl klights_leader_api::LeaderResourceQuery for ExactNodeQuery {
+        fn get_resource(
+            &self,
+            request: klights_leader_api::ResourceGetRequest,
+        ) -> klights_leader_api::ResourceQueryFuture<'_, Option<klights_cluster_core::Resource>>
+        {
+            Box::pin(async move {
+                let key = request.into_key();
+                Ok((key.api_version == "v1"
+                    && key.kind == "Node"
+                    && key.namespace.is_none()
+                    && key.name == self.0.name)
+                    .then(|| self.0.clone()))
+            })
+        }
+
+        fn list_resources(
+            &self,
+            _request: klights_leader_api::ResourceListRequest,
+        ) -> klights_leader_api::ResourceQueryFuture<'_, klights_leader_api::ResourceListResult>
+        {
+            Box::pin(async {
+                Err(klights_leader_api::ResourceQueryError::query_failed(
+                    "list is not used by node IP resolution",
+                ))
+            })
+        }
+    }
+
     #[test]
     fn picks_first_non_loopback_ip() {
         let addrs = vec![
@@ -186,44 +196,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_node_ip_from_db_prefers_node_internal_ip_over_hostname() {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-        db.create_resource(
-            "v1",
-            "Node",
-            None,
-            "dp",
-            serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "Node",
-                "metadata": {"name": "dp"},
-                "status": {
-                    "addresses": [
-                        {"type": "Hostname", "address": "dp"},
-                        {"type": "InternalIP", "address": "192.168.8.22"}
-                    ]
-                }
-            }),
-        )
-        .await
-        .unwrap();
-
-        let ip = super::resolve_node_ip_from_db(db.as_ref(), "dp")
-            .await
-            .unwrap();
-
-        assert_eq!(ip, "192.168.8.22");
-    }
-
-    #[tokio::test]
     async fn resolve_node_ip_from_leader_api_prefers_node_internal_ip() {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-        db.create_resource(
-            "v1",
-            "Node",
-            None,
-            "dp",
-            serde_json::json!({
+        let client = ExactNodeQuery(klights_cluster_core::Resource {
+            id: 1,
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: "dp".to_string(),
+            uid: "uid-dp".to_string(),
+            resource_version: 1,
+            data: std::sync::Arc::new(serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Node",
                 "metadata": {"name": "dp"},
@@ -233,15 +215,8 @@ mod tests {
                         {"type": "InternalIP", "address": "192.168.8.23"}
                     ]
                 }
-            }),
-        )
-        .await
-        .unwrap();
-        let client = crate::control_plane::client::local::LocalApiClient::new(
-            db,
-            "dp".to_string(),
-            crate::control_plane::client::local::always_leader_watch(),
-        );
+            })),
+        });
 
         let ip = super::resolve_node_ip_from_leader_api(&client, "dp")
             .await

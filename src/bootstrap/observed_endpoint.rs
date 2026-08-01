@@ -224,7 +224,7 @@ async fn observe_from_peer(
             .parse::<std::net::IpAddr>()
             .with_context(|| format!("observed endpoint must be an IP address: {endpoint}"))?;
         let endpoint_ip = endpoint_ip.to_string();
-        crate::kubelet::node::publish_node_external_ip_if_changed(
+        klights_kubelet::node::publish_node_external_ip_if_changed(
             deps.query.as_ref(),
             deps.node_status.as_ref(),
             &deps.config.node_name,

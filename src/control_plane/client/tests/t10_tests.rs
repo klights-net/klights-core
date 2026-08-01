@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use crate::control_plane::client::apply::{apply_outbox_transactionally, gc_applied_outbox};
 use crate::datastore::ResourcePreconditions;
-use crate::node_outbox::OutboxApplyResult;
-use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
+use crate::outbox_test_support::OutboxPayload;
+use klights_cluster_core::OutboxApplyOutcome as OutboxApplyResult;
 use klights_cluster_core::command::StorageCommand;
+use klights_kubelet::node_outbox::payload::OutboxOperation;
 
 fn pod_status_payload(uid: &str) -> Vec<u8> {
     let command = StorageCommand::UpdateStatus {
@@ -242,7 +243,7 @@ async fn pod_status_outbox_stale_rv_still_rejects_same_name_different_uid() {
     assert!(
         matches!(
             err,
-            crate::node_outbox::OutboxApplyError::UidMismatch { .. }
+            klights_cluster_core::OutboxApplyError::UidMismatch { .. }
         ),
         "same-name replacement must remain protected by UID precondition, got: {err:?}"
     );
@@ -601,7 +602,7 @@ async fn outbox_apply_rolls_back_mutation_when_ledger_insert_fails() {
         .expect_err("apply should fail for non-existent pod");
 
     assert!(
-        matches!(err, crate::node_outbox::OutboxApplyError::Retryable(_)),
+        matches!(err, klights_cluster_core::OutboxApplyError::Retryable(_)),
         "error should be retryable after atomic rollback, got: {err:?}"
     );
 
@@ -707,7 +708,7 @@ async fn outbox_apply_rejects_incomplete_ledger_row_without_age_based_recovery()
         .expect_err("unsupported incomplete ledger rows must not be reclaimed");
     assert!(matches!(
         err,
-        crate::node_outbox::OutboxApplyError::Retryable(_)
+        klights_cluster_core::OutboxApplyError::Retryable(_)
     ));
 
     let record = db
@@ -772,7 +773,7 @@ async fn outbox_apply_rejects_fresh_incomplete_ledger_row_without_consuming_it()
         .expect_err("fresh placeholder is still in-flight and must retry");
 
     assert!(
-        matches!(err, crate::node_outbox::OutboxApplyError::Retryable(_)),
+        matches!(err, klights_cluster_core::OutboxApplyError::Retryable(_)),
         "fresh placeholder must be retryable, got: {err:?}"
     );
 }

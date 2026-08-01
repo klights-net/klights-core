@@ -35,7 +35,7 @@ impl ClusterControlplaneJoinRegistration {
         request: &ControlplaneJoinRequest,
         voter_count_after: u32,
     ) -> anyhow::Result<()> {
-        use crate::kubelet::node::{
+        use klights_kubelet::node::{
             NodeRegistrationAddresses, NodeRegistrationHostFacts, NodeRegistrationSnapshot,
         };
 
@@ -52,7 +52,7 @@ impl ClusterControlplaneJoinRegistration {
             .rsplit(':')
             .next()
             .and_then(|port| port.parse::<u16>().ok());
-        let node_role = crate::kubelet::node_config::KubeletNodeRole::Controlplane {
+        let node_role = klights_kubelet::node_config::KubeletNodeRole::Controlplane {
             as_learner: request.as_learner,
         };
         let joiner_shape = RaftShape {

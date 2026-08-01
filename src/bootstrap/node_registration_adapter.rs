@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::datastore::DatastoreBackend;
-use crate::kubelet::node_registration::{NodeRegistrationSnapshot, NodeRegistrationStore};
+use klights_kubelet::node_registration::{NodeRegistrationSnapshot, NodeRegistrationStore};
 
 #[async_trait::async_trait]
 impl NodeRegistrationStore for DatastoreNodeRegistrationStore<'_> {
@@ -76,12 +76,12 @@ impl NodeRegistrationStore for WorkerNodeRegistrationStore<'_> {
 
 pub(crate) async fn register_node_snapshot(
     db: &dyn DatastoreBackend,
-    outbox: Option<&crate::node_outbox::Outbox>,
+    outbox: Option<&klights_kubelet::node_outbox::Outbox>,
     dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,
     snapshot: &NodeRegistrationSnapshot,
 ) -> Result<()> {
     let store = DatastoreNodeRegistrationStore { db };
-    crate::kubelet::node_registration::register_node_snapshot(
+    klights_kubelet::node_registration::register_node_snapshot(
         &store,
         outbox.map(|outbox| outbox as &dyn klights_leader_api::NodeOutbox),
         dataplane_health,
@@ -93,11 +93,11 @@ pub(crate) async fn register_node_snapshot(
 
 pub(crate) async fn register_worker_node_snapshot(
     store: &crate::control_plane::client::worker_store::WorkerStoreAdapter,
-    outbox: &crate::node_outbox::Outbox,
+    outbox: &klights_kubelet::node_outbox::Outbox,
     dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,
     snapshot: &NodeRegistrationSnapshot,
 ) -> Result<()> {
-    crate::kubelet::node_registration::register_node_snapshot(
+    klights_kubelet::node_registration::register_node_snapshot(
         &WorkerNodeRegistrationStore { store },
         Some(outbox as &dyn klights_leader_api::NodeOutbox),
         dataplane_health,

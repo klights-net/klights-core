@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use crate::kubelet::node_heartbeat::{
-    NodeHeartbeatClock, NodeHeartbeatEvent, NodeHeartbeatEventFuture, NodeHeartbeatEventSource,
-};
 use crate::kubelet::pod_watch_source::{PodWatchEvent, PodWatchSource, PodWatchStream};
 use futures::StreamExt as _;
+use klights_kubelet::node_heartbeat::{
+    NodeHeartbeatClock, NodeHeartbeatEvent, NodeHeartbeatEventFuture, NodeHeartbeatEventSource,
+};
 
 pub struct SystemNodeHeartbeatClock {
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
@@ -375,14 +375,14 @@ impl NodeHeartbeatEventSource for DatastorePodWatchSource {
     }
 }
 pub struct RootPodEventSink {
-    outbox: Option<Arc<crate::node_outbox::Outbox>>,
+    outbox: Option<Arc<klights_kubelet::node_outbox::Outbox>>,
     datastore: crate::datastore::DatastoreHandle,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
 impl RootPodEventSink {
     pub fn new(
-        outbox: Option<Arc<crate::node_outbox::Outbox>>,
+        outbox: Option<Arc<klights_kubelet::node_outbox::Outbox>>,
         datastore: crate::datastore::DatastoreHandle,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Self {
@@ -412,10 +412,12 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for RootPodEventSink {
                 "uid": key.uid,
             },
         });
-        crate::pod_events::emit_pod_event_with_outbox(
-            self.datastore.as_ref(),
+        let query =
+            crate::pod_event_adapter::DatastorePodEventAdapter::new(self.datastore.as_ref());
+        klights_kubelet::pod_events::emit_pod_event_with_outbox(
+            &query,
             self.outbox.as_deref(),
-            crate::pod_events::PodEventRecord {
+            klights_kubelet::pod_events::PodEventRecord {
                 pod: &pod,
                 reason,
                 message,
@@ -434,14 +436,14 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for RootPodEventSink {
 }
 
 pub struct WorkerPodEventSink {
-    outbox: Arc<crate::node_outbox::Outbox>,
+    outbox: Arc<klights_kubelet::node_outbox::Outbox>,
     resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
 impl WorkerPodEventSink {
     pub fn new(
-        outbox: Arc<crate::node_outbox::Outbox>,
+        outbox: Arc<klights_kubelet::node_outbox::Outbox>,
         resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Self {
@@ -471,10 +473,12 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for WorkerPodEventSink {
                 "uid": key.uid,
             },
         });
-        crate::pod_events::emit_worker_pod_event(
-            self.resource_query.as_ref(),
+        let query =
+            crate::pod_event_adapter::LeaderPodEventQuery::new(self.resource_query.as_ref());
+        klights_kubelet::pod_events::emit_worker_pod_event(
+            &query,
             self.outbox.as_ref(),
-            crate::pod_events::PodEventRecord {
+            klights_kubelet::pod_events::PodEventRecord {
                 pod: &pod,
                 reason,
                 message,

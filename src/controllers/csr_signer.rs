@@ -412,13 +412,14 @@ mod tests {
                 authoring_node: &str,
                 _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
             ) -> std::result::Result<
-                crate::node_outbox::OutboxApplyResult,
-                crate::node_outbox::OutboxApplyError,
+                klights_cluster_core::OutboxApplyOutcome,
+                klights_cluster_core::OutboxApplyError,
             > {
-                let operation = crate::node_outbox::payload::OutboxOperation::try_from(operation)
-                    .map_err(|err| {
-                    crate::node_outbox::OutboxApplyError::Retryable(err.to_string())
-                })?;
+                let operation =
+                    klights_kubelet::node_outbox::payload::OutboxOperation::try_from(operation)
+                        .map_err(|err| {
+                            klights_cluster_core::OutboxApplyError::Retryable(err.to_string())
+                        })?;
                 crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
                     self.inner.as_ref(),
                     idempotency_key,

@@ -29,10 +29,10 @@
 use std::sync::Arc;
 
 #[cfg(test)]
-use crate::node_outbox::payload::OutboxOperationExt as _;
-#[cfg(test)]
 use bytes::Bytes;
 use futures::StreamExt as _;
+#[cfg(test)]
+use klights_kubelet::node_outbox::payload::OutboxOperationExt as _;
 use klights_leader_api::{
     CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderCacheReadiness,
     LeaderNetworkTopologyQuery, LeaderNodeLeaseRenewal, LeaderNodeSubnetAllocation,
@@ -262,7 +262,7 @@ impl LeaderProxyApiClient {
     async fn deliver_test_outbox(
         &self,
         idempotency_key: &str,
-        operation: crate::node_outbox::payload::OutboxOperation,
+        operation: klights_kubelet::node_outbox::payload::OutboxOperation,
         payload: Bytes,
         client_id: &str,
         stream_id: i64,
@@ -732,8 +732,8 @@ mod tests {
     //! logic is pure and unit-testable.
 
     use super::*;
-    use crate::node_outbox::payload::OutboxOperation;
     use klights_cluster_core::StorageCommand;
+    use klights_kubelet::node_outbox::payload::OutboxOperation;
     use klights_leader_api::node_get_request;
     use klights_leader_api::{
         LeaderResourceCommand, ResourceCommandError, ResourceCommandFuture, ResourceCommandRequest,
@@ -1808,7 +1808,7 @@ mod tests {
 
     fn pod_status_minimal_payload() -> Bytes {
         use crate::datastore::ResourcePreconditions;
-        use crate::node_outbox::payload::OutboxPayload;
+        use crate::outbox_test_support::OutboxPayload;
         use klights_cluster_core::command::StorageCommand;
         let command = StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),

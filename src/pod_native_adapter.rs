@@ -220,10 +220,11 @@ impl PodSpecValidation for RootPodNativeAdapter {
 impl PodControlPlaneEventSink for RootPodNativeAdapter {
     fn emit_pod_event(&self, request: PodControlPlaneEventRequest) -> PodRepositoryFuture<'_, ()> {
         Box::pin(async move {
-            crate::pod_events::emit_control_plane_pod_event(
-                self.db.as_ref(),
-                self.db.as_ref(),
-                crate::pod_events::PodEventRecord {
+            let adapter = crate::pod_event_adapter::DatastorePodEventAdapter::new(self.db.as_ref());
+            klights_kubelet::pod_events::emit_control_plane_pod_event(
+                &adapter,
+                &adapter,
+                klights_kubelet::pod_events::PodEventRecord {
                     pod: request.pod.as_ref(),
                     reason: &request.reason,
                     message: &request.message,

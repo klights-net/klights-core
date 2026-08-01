@@ -1270,7 +1270,7 @@ mod cases {
         // as AlreadyApplied from the watermark — mutation applied exactly once,
         // never a second mutation.
         use crate::datastore::ResourcePreconditions;
-        use crate::node_outbox::payload::OutboxPayload;
+        use crate::outbox_test_support::OutboxPayload;
         use klights_leader_api::OutboxDeliveryResult as OutboxApplyResult;
 
         let (client, _service, db, handle) = client_and_service().await;
@@ -1662,18 +1662,21 @@ mod cases {
                 .unwrap()
             )
         );
-        let profile = crate::kubelet::node_config::NodeRegistrationProfile::new(
+        let profile = klights_kubelet::node_config::NodeRegistrationProfile::new(
             klights_network_api::NodePeerMode::Root,
-            crate::kubelet::node_config::KubeletNodeRole::Controlplane { as_learner: false },
+            klights_kubelet::node_config::KubeletNodeRole::Controlplane { as_learner: false },
             true,
             klights_types::BuildIdentity::new("v1.34.6+klights-test", "test-commit"),
         );
         let controlplane_registration =
-            crate::kubelet::node::NodeRegistrationSnapshot::capture_local(
+            klights_kubelet::node::NodeRegistrationSnapshot::capture_local(
                 &crate::kubelet::file_blocking::test_file_process_executor(),
                 "cp2",
                 &profile,
-                crate::kubelet::node::NodeRegistrationAddresses::new("127.0.0.1".to_string(), None),
+                klights_kubelet::node::NodeRegistrationAddresses::new(
+                    "127.0.0.1".to_string(),
+                    None,
+                ),
                 None,
                 Some(7679),
             )

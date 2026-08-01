@@ -125,7 +125,7 @@ async fn watermarked_outbox_commit_appends_applied_outbox_ledger_mutation() {
             "metadata": {"name": "watermarked-no-ledger"}
         }),
     );
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let rv_before = db.get_current_resource_version().await.unwrap();
@@ -180,7 +180,7 @@ async fn watermarked_uid_bound_missing_pod_outbox_builds_watermark_only_commit()
         },
         observed_status_stamp: Some(42),
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -234,7 +234,7 @@ async fn stamped_worker_pod_status_merges_against_latest_preserving_scheduler_fi
         },
         observed_status_stamp: Some(7),
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let BuildOutboxOutcome::NeedsPropose { commit, .. } = db
@@ -368,7 +368,7 @@ async fn outbox_commit_builders_materialize_committed_apply_v1_templates() {
         }),
     };
     let payload = || {
-        crate::node_outbox::payload::OutboxPayload::from_command(command())
+        crate::outbox_test_support::OutboxPayload::from_command(command())
             .encode_protobuf()
             .unwrap()
     };
@@ -988,7 +988,7 @@ async fn raft_commit_builder_rejects_update_for_deleted_resource() {
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -1180,7 +1180,7 @@ async fn raft_commit_builder_applies_pod_status_outbox_against_latest_same_uid()
         preconditions: ResourcePreconditions::from_resource(&created),
         observed_status_stamp: Some(1),
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -1258,7 +1258,7 @@ async fn raft_commit_builder_defers_resource_version_allocation_until_apply() {
             "data": {"k": "v"}
         }),
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -1349,7 +1349,7 @@ async fn strict_committed_apply_rejects_divergent_follower_resource_version() {
             "status": {"phase": "Pending"}
         }),
     };
-    let create_payload = crate::node_outbox::payload::OutboxPayload::from_command(create_command)
+    let create_payload = crate::outbox_test_support::OutboxPayload::from_command(create_command)
         .encode_protobuf()
         .unwrap();
     let create_outcome = leader
@@ -1394,7 +1394,7 @@ async fn strict_committed_apply_rejects_divergent_follower_resource_version() {
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
     };
-    let update_payload = crate::node_outbox::payload::OutboxPayload::from_command(update_command)
+    let update_payload = crate::outbox_test_support::OutboxPayload::from_command(update_command)
         .encode_protobuf()
         .unwrap();
     let update_outcome = leader
@@ -1468,7 +1468,7 @@ async fn raft_apply_rejects_duplicate_create_built_before_first_apply() {
                     "data": {"uid": uid}
                 }),
             };
-            let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+            let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
                 .encode_protobuf()
                 .unwrap();
             let outcome = db
@@ -1550,7 +1550,7 @@ async fn raft_apply_rejects_stale_resource_version_built_before_prior_apply() {
                 expected_rv: created.resource_version,
                 preconditions: ResourcePreconditions::resource_version(created.resource_version),
             };
-            let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+            let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
                 .encode_protobuf()
                 .unwrap();
             let outcome = db
@@ -1638,7 +1638,7 @@ async fn raft_status_apply_built_before_metadata_update_preserves_live_metadata(
         },
         observed_status_stamp: None,
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
@@ -1741,7 +1741,7 @@ async fn stale_status_only_apply_rejects_and_preserves_live_job_status_scalars()
         .unwrap();
 
     let payload =
-        crate::node_outbox::payload::OutboxPayload::from_command(StorageCommand::UpdateStatus {
+        crate::outbox_test_support::OutboxPayload::from_command(StorageCommand::UpdateStatus {
             api_version: "batch/v1".into(),
             kind: "Job".into(),
             namespace: Some("default".into()),
@@ -1992,7 +1992,7 @@ async fn stale_committed_pod_bind_preserves_live_owner_references() {
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
     };
-    let bind_payload = crate::node_outbox::payload::OutboxPayload::from_command(bind_command)
+    let bind_payload = crate::outbox_test_support::OutboxPayload::from_command(bind_command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
@@ -2115,7 +2115,7 @@ async fn stale_committed_pod_bind_preserves_stale_owner_ref_subset() {
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
     };
-    let bind_payload = crate::node_outbox::payload::OutboxPayload::from_command(bind_command)
+    let bind_payload = crate::outbox_test_support::OutboxPayload::from_command(bind_command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
@@ -2248,7 +2248,7 @@ async fn stale_committed_pod_put_same_node_preserves_live_owner_references() {
         preconditions: ResourcePreconditions::from_resource(&created),
     };
     let stale_same_node_payload =
-        crate::node_outbox::payload::OutboxPayload::from_command(stale_same_node_command)
+        crate::outbox_test_support::OutboxPayload::from_command(stale_same_node_command)
             .encode_protobuf()
             .unwrap();
     let outcome = db
@@ -2376,7 +2376,7 @@ async fn stale_committed_pod_put_with_explicit_empty_owner_references_clears_liv
         preconditions: ResourcePreconditions::from_resource(&created),
     };
     let stale_clear_payload =
-        crate::node_outbox::payload::OutboxPayload::from_command(stale_clear_command)
+        crate::outbox_test_support::OutboxPayload::from_command(stale_clear_command)
             .encode_protobuf()
             .unwrap();
     let outcome = db
@@ -2473,7 +2473,7 @@ async fn stale_committed_pod_bind_does_not_rebind_already_bound_pod() {
         preconditions: ResourcePreconditions::from_resource(&created),
     };
     let stale_bind_payload =
-        crate::node_outbox::payload::OutboxPayload::from_command(stale_bind_command)
+        crate::outbox_test_support::OutboxPayload::from_command(stale_bind_command)
             .encode_protobuf()
             .unwrap();
     let outcome = db
@@ -2853,7 +2853,7 @@ async fn raft_status_apply_built_before_preemption_preserves_disruption_target()
         },
         observed_status_stamp: None,
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
@@ -2967,7 +2967,7 @@ async fn raft_scale_patch_applies_against_live_resource_after_status_rv_race() {
         preconditions: ResourcePreconditions::uid(created.uid.clone()),
         strict_resource_version: false,
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
@@ -3072,7 +3072,7 @@ async fn raft_pod_delete_mark_patch_applies_against_live_resource_after_status_r
         preconditions: ResourcePreconditions::uid(created.uid.clone()),
         strict_resource_version: false,
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
@@ -3201,7 +3201,7 @@ async fn raft_zero_grace_pod_delete_mark_patch_replays_identical_watch_payloads(
         strict_resource_version: false,
         preconditions: ResourcePreconditions::uid(created.uid.clone()),
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = leader
@@ -3559,7 +3559,7 @@ async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
         preconditions: ResourcePreconditions::uid(created.uid.clone()),
         strict_resource_version: false,
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
@@ -3643,7 +3643,7 @@ async fn raft_apply_same_idempotency_key_returns_same_rv_without_reapply() {
             "data": {"applied": "once"}
         }),
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
@@ -3776,7 +3776,7 @@ async fn raft_outbox_build_rejects_incomplete_durable_ledger_row() {
             resource_version: None,
         },
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -3835,7 +3835,7 @@ async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
             "data": {"winner": "second"}
         }),
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let idempotency_key = "raft-duplicate-retry-key";
@@ -3874,7 +3874,7 @@ async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
         )
         .await;
     match retry {
-        Err(crate::node_outbox::OutboxApplyError::ConflictTerminal(msg))
+        Err(klights_cluster_core::OutboxApplyError::ConflictTerminal(msg))
             if msg.contains("already exists") && msg.contains("409 Conflict") => {}
         Err(err) => panic!(
             "retrying the same rejected key must return the cached terminal rejection, got error {err}"
@@ -4198,7 +4198,7 @@ async fn raft_commit_builder_does_not_treat_api_node_update_as_node_status_refre
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::resource_version(created.resource_version),
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -4510,17 +4510,16 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .await
         .unwrap();
 
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(
-        StorageCommand::FinalizeBoundPod {
+    let payload =
+        crate::outbox_test_support::OutboxPayload::from_command(StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalizer-race".to_string(),
             pod_uid: "finalizer-race-uid".to_string(),
             node_name: "worker-a".to_string(),
             observed_resource_version: observed.resource_version,
-        },
-    )
-    .encode_protobuf()
-    .unwrap();
+        })
+        .encode_protobuf()
+        .unwrap();
     let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = db
         .build_log_apply_commit_for_outbox(
             "actor-finalize-finalizer-race",
@@ -4612,17 +4611,16 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     );
 
     let before_fresh_finalize_rv = db.get_current_resource_version().await.unwrap();
-    let fresh_payload = crate::node_outbox::payload::OutboxPayload::from_command(
-        StorageCommand::FinalizeBoundPod {
+    let fresh_payload =
+        crate::outbox_test_support::OutboxPayload::from_command(StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalizer-race".to_string(),
             pod_uid: "finalizer-race-uid".to_string(),
             node_name: "worker-a".to_string(),
             observed_resource_version: before_fresh_finalize_rv,
-        },
-    )
-    .encode_protobuf()
-    .unwrap();
+        })
+        .encode_protobuf()
+        .unwrap();
     let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit: fresh_commit,
         ..
@@ -4661,17 +4659,16 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
 
     let missing_rv = db.get_current_resource_version().await.unwrap();
     let missing_watch_count = watch_event_count(&db).await;
-    let missing_payload = crate::node_outbox::payload::OutboxPayload::from_command(
-        StorageCommand::FinalizeBoundPod {
+    let missing_payload =
+        crate::outbox_test_support::OutboxPayload::from_command(StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalizer-race".to_string(),
             pod_uid: "finalizer-race-uid".to_string(),
             node_name: "worker-a".to_string(),
             observed_resource_version: missing_rv,
-        },
-    )
-    .encode_protobuf()
-    .unwrap();
+        })
+        .encode_protobuf()
+        .unwrap();
     let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit: missing_commit,
         ..
@@ -4721,17 +4718,16 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     .unwrap();
     let replacement_rv = db.get_current_resource_version().await.unwrap();
     let replacement_watch_count = watch_event_count(&db).await;
-    let stale_payload = crate::node_outbox::payload::OutboxPayload::from_command(
-        StorageCommand::FinalizeBoundPod {
+    let stale_payload =
+        crate::outbox_test_support::OutboxPayload::from_command(StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalizer-race".to_string(),
             pod_uid: "finalizer-race-uid".to_string(),
             node_name: "worker-a".to_string(),
             observed_resource_version: replacement_rv,
-        },
-    )
-    .encode_protobuf()
-    .unwrap();
+        })
+        .encode_protobuf()
+        .unwrap();
     let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit: replacement_commit,
         ..
@@ -4773,17 +4769,16 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         "replacement-uid"
     );
 
-    let eligible_payload = crate::node_outbox::payload::OutboxPayload::from_command(
-        StorageCommand::FinalizeBoundPod {
+    let eligible_payload =
+        crate::outbox_test_support::OutboxPayload::from_command(StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalizer-race".to_string(),
             pod_uid: "replacement-uid".to_string(),
             node_name: "worker-a".to_string(),
             observed_resource_version: replacement_rv,
-        },
-    )
-    .encode_protobuf()
-    .unwrap();
+        })
+        .encode_protobuf()
+        .unwrap();
     let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit, applied_rv, ..
     } = db
@@ -4846,17 +4841,16 @@ async fn actor_finalize_bound_pod_serializes_a_status_write_after_proposal_build
         .await
         .unwrap();
 
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(
-        StorageCommand::FinalizeBoundPod {
+    let payload =
+        crate::outbox_test_support::OutboxPayload::from_command(StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalize-rv-race".to_string(),
             pod_uid: "finalize-rv-race-uid".to_string(),
             node_name: "worker-a".to_string(),
             observed_resource_version: observed.resource_version,
-        },
-    )
-    .encode_protobuf()
-    .unwrap();
+        })
+        .encode_protobuf()
+        .unwrap();
 
     let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = db
         .build_log_apply_commit_for_outbox(
@@ -4952,7 +4946,7 @@ async fn watermarked_actor_finalize_bound_pod_covers_eligibility() {
         let before_rv = db.get_current_resource_version().await.unwrap();
         let before_watch_count = watch_event_count(&db).await;
         let idempotency_key = format!("watermarked-finalize-{}", case.name);
-        let payload = crate::node_outbox::payload::OutboxPayload::from_command(
+        let payload = crate::outbox_test_support::OutboxPayload::from_command(
             StorageCommand::FinalizeBoundPod {
                 namespace: "default".to_string(),
                 name: case.name.to_string(),
@@ -5997,13 +5991,13 @@ async fn build_candidate_rv_commit(
         min_rv: before,
         new_rv: before + 1,
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             idempotency_key,
-            crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
+            klights_kubelet::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
             klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "mn-controlplane1",
         )
@@ -6079,13 +6073,13 @@ async fn raft_terminal_conflict_does_not_consume_candidate_resource_version() {
         name: "mn-controlplane2".to_string(),
         data: json!({"metadata": {"name": "mn-controlplane2"}}),
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "conflicting-node-registration",
-            crate::node_outbox::payload::OutboxOperation::NodeRegistration.as_str(),
+            klights_kubelet::node_outbox::payload::OutboxOperation::NodeRegistration.as_str(),
             klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "mn-controlplane2",
         )

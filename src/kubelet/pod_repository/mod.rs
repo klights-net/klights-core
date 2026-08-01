@@ -271,7 +271,7 @@ pub(crate) struct PodRepositoryNetworkDependencies {
 }
 
 pub(crate) struct PodRepositoryDeliveryDependencies {
-    pub outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
+    pub outbox: Option<Arc<klights_kubelet::outbox::Outbox>>,
     pub cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     pub bound_pod_finalization: Arc<dyn klights_pod_api::BoundPodFinalization>,
 }
@@ -689,7 +689,7 @@ pub struct PodRepository {
     namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     supervisor: Arc<TaskSupervisor>,
-    outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
+    outbox: Option<Arc<klights_kubelet::outbox::Outbox>>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     host_ip: crate::kubelet::context::HostIpState,
     #[cfg(test)]
@@ -741,7 +741,7 @@ struct PodDeletionFinalizerDependencies {
     pdb_reconcile: Arc<dyn PodPdbReconcileSink>,
     namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
-    outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
+    outbox: Option<Arc<klights_kubelet::outbox::Outbox>>,
     bound_pod_finalization: Arc<dyn klights_pod_api::BoundPodFinalization>,
     mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
@@ -888,7 +888,7 @@ impl PodRepository {
         self.host_ip.clone()
     }
 
-    pub fn outbox(&self) -> Option<&crate::kubelet::outbox::Outbox> {
+    pub fn outbox(&self) -> Option<&klights_kubelet::outbox::Outbox> {
         self.outbox.as_deref()
     }
 
@@ -917,7 +917,7 @@ impl PodRepository {
         side_effects: Arc<SideEffectRegistry>,
         metrics: Arc<SideEffectMetrics>,
         scheduling_mode: PodSchedulingMode,
-        outbox: Option<Arc<crate::node_outbox::Outbox>>,
+        outbox: Option<Arc<klights_kubelet::node_outbox::Outbox>>,
     ) -> Self {
         let network_cache = empty_test_pod_network_cache();
         let assignment_bus = test_assignment_bus();
@@ -940,7 +940,7 @@ impl PodRepository {
         side_effects: Arc<SideEffectRegistry>,
         metrics: Arc<SideEffectMetrics>,
         scheduling_mode: PodSchedulingMode,
-        outbox: Option<Arc<crate::node_outbox::Outbox>>,
+        outbox: Option<Arc<klights_kubelet::node_outbox::Outbox>>,
         cluster_api: Arc<dyn LeaderResourceQuery>,
     ) -> Self {
         let pod_network_cache = empty_test_pod_network_cache();
@@ -969,7 +969,7 @@ impl PodRepository {
         pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
         assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
         scheduling_mode: PodSchedulingMode,
-        outbox: Option<Arc<crate::node_outbox::Outbox>>,
+        outbox: Option<Arc<klights_kubelet::node_outbox::Outbox>>,
     ) -> Self {
         Self::new_with_network_events_and_cluster_api(PodRepositoryBuildConfig {
             db,

@@ -7,12 +7,16 @@ use klights_leader_api::{
 };
 use tokio::sync::Mutex;
 
+use super::{OutboxDispatcherTestConstructor as _, OutboxTestConstructor as _};
 use crate::datastore::ResourcePreconditions;
 use crate::datastore::backend_kind::BackendKind;
 use crate::datastore::node_local::{LegacyDeliveryTestStore as _, NodeLocalStores, selector};
-use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
-use crate::node_outbox::{DispatchOutcome, Outbox, OutboxCommand, OutboxDispatcher, OutboxSubject};
+use crate::outbox_test_support::OutboxPayload;
 use klights_cluster_core::command::StorageCommand;
+use klights_kubelet::node_outbox::payload::OutboxOperation;
+use klights_kubelet::node_outbox::{
+    DispatchOutcome, Outbox, OutboxCommand, OutboxDispatcher, OutboxSubject,
+};
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
 fn supervisor() -> Arc<TaskSupervisor> {

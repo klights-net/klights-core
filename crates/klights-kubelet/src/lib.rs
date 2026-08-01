@@ -1,5 +1,6 @@
 //! Embedded kubelet implementation for klights.
 
+pub mod cni_readiness;
 pub mod containerd_manager;
 pub mod context;
 pub mod cri;
@@ -7,10 +8,23 @@ pub mod cri_events;
 pub mod env;
 pub mod lifecycle;
 pub mod log_rotation;
+pub mod metrics;
+pub mod node;
 pub mod node_capacity;
+pub mod node_config;
+pub mod node_heartbeat;
+pub mod node_ip;
+pub mod node_leader_labels;
+pub mod node_outbox;
+pub mod node_registration;
+mod node_role_labels;
+mod node_status_merge;
+mod node_status_projection;
+pub mod outbox;
 pub mod pod_creation_state;
 pub mod pod_deletion_finalizer;
 pub mod pod_dns;
+pub mod pod_events;
 pub mod pod_hosts;
 pub mod pod_lifecycle_actor;
 pub mod pod_lifecycle_core;
@@ -38,6 +52,8 @@ pub mod volume_registry;
 pub mod volume_sources;
 pub mod volumes;
 
+#[cfg(test)]
+mod node_conditions_tests;
 #[cfg(test)]
 mod phase15b2_red_tests;
 #[cfg(test)]

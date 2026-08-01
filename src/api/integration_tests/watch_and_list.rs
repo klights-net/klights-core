@@ -6772,13 +6772,13 @@ async fn test_guestbook_selector_watch_observes_raft_pod_status_outbox_update() 
         preconditions: crate::datastore::ResourcePreconditions::from_resource(&created),
         observed_status_stamp: Some(1),
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "guestbook-watch-raft-status",
-            crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
+            klights_kubelet::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
             klights_leader_rpc::storage_wire_codec::test_outbox_command(payload.as_ref()),
             node,
         )

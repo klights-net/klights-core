@@ -138,9 +138,9 @@ pub fn set_node_dataplane_annotations(
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn stamp_git_commit_annotation(node: &mut serde_json::Value, git_commit: &str) -> bool {
-    use crate::controllers::annotations::GIT_COMMIT_ANNOTATION;
+    use klights_network_api::GIT_COMMIT_ANNOTATION;
 
     let Some(node_object) = node.as_object_mut() else {
         return false;
@@ -179,11 +179,11 @@ pub(super) fn stamp_git_commit_annotation(node: &mut serde_json::Value, git_comm
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controllers::annotations::{
+    use klights_leader_api::{DataplaneEncryption, NetworkDataplane, NetworkNodeMode};
+    use klights_network_api::{
         DATAPLANE_ENCRYPTION_ANNOTATION, DATAPLANE_ENDPOINT_ANNOTATION, DATAPLANE_MODE_ANNOTATION,
         DATAPLANE_PORT_ANNOTATION, DATAPLANE_PUBLIC_KEY_ANNOTATION, GIT_COMMIT_ANNOTATION,
     };
-    use klights_leader_api::{DataplaneEncryption, NetworkDataplane, NetworkNodeMode};
     use std::net::IpAddr;
 
     #[test]

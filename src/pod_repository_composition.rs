@@ -73,7 +73,7 @@ pub struct PodRepositoryBuildConfig {
     pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
     pub assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
     pub scheduling_mode: PodSchedulingMode,
-    pub outbox: Option<Arc<crate::node_outbox::Outbox>>,
+    pub outbox: Option<Arc<klights_kubelet::node_outbox::Outbox>>,
     pub cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     #[cfg(test)]
     pub(crate) scheduler_bind_gate:
@@ -90,7 +90,7 @@ pub struct WorkerPodRepositoryBuildConfig {
     pub metrics: Arc<SideEffectMetrics>,
     pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
     pub assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
-    pub outbox: Arc<crate::node_outbox::Outbox>,
+    pub outbox: Arc<klights_kubelet::node_outbox::Outbox>,
 }
 
 struct RootPodRepositoryComposition {

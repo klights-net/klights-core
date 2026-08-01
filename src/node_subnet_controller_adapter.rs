@@ -130,7 +130,7 @@ impl NodeReadinessPublisher for KubeletNodeReadinessPublisher {
         health: &'a klights_network_api::DataplaneHealthSnapshot,
     ) -> NodeReadinessPublishFuture<'a> {
         Box::pin(async move {
-            let result = crate::kubelet::node::publish_node_network_conditions(
+            let result = klights_kubelet::node::publish_node_network_conditions(
                 self.query.as_ref(),
                 self.node_status.as_ref(),
                 node_name,
@@ -144,13 +144,13 @@ impl NodeReadinessPublisher for KubeletNodeReadinessPublisher {
                 ))
             })?;
             Ok(match result {
-                crate::kubelet::node::NodeNetworkRefreshResult::Updated => {
+                klights_kubelet::node::NodeNetworkRefreshResult::Updated => {
                     NodeReadinessPublishResult::Updated
                 }
-                crate::kubelet::node::NodeNetworkRefreshResult::Unchanged => {
+                klights_kubelet::node::NodeNetworkRefreshResult::Unchanged => {
                     NodeReadinessPublishResult::Unchanged
                 }
-                crate::kubelet::node::NodeNetworkRefreshResult::Missing => {
+                klights_kubelet::node::NodeNetworkRefreshResult::Missing => {
                     NodeReadinessPublishResult::Missing
                 }
             })

@@ -1,7 +1,6 @@
 //! Dataplane metadata helpers extracted from runtime.rs (R3 refactor).
 
 use crate::bootstrap::NodeMode;
-use crate::node_outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
 use crate::{KlightsConfig, datastore};
 
 use super::leader_control_stream::runtime_epoch_ms;
@@ -225,42 +224,21 @@ pub async fn publish_local_dataplane_metadata_self_heal(
 }
 
 pub async fn enqueue_worker_dataplane_metadata_outbox(
-    outbox: Option<&Outbox>,
+    outbox: Option<&klights_kubelet::node_outbox::Outbox>,
     node_name: &str,
     dataplane: &klights_leader_rpc::client::JoinDataplaneMetadata,
 ) -> anyhow::Result<()> {
-    let subject_key = format!("v1/Node/{node_name}/dataplane");
-    OutboxSendPlanner::new(outbox)
-        .route(OutboxCommand {
-            idempotency_key: format!("NodeDataplane:{subject_key}:{}", uuid::Uuid::new_v4()),
-            operation: crate::node_outbox::payload::OutboxOperation::NodeDataplane,
-            subject: OutboxSubject {
-                key: subject_key,
-                namespace: None,
-                name: node_name.to_string(),
-                uid: None,
-            },
-            pod_uid: String::new(),
-            command: klights_cluster_core::command::StorageCommand::UpdateNodeDataplane {
-                node_name: node_name.to_string(),
-                mode: match dataplane.mode {
-                    klights_leader_api::NetworkNodeMode::Root => "root",
-                    klights_leader_api::NetworkNodeMode::Rootless => "rootless",
-                }
-                .to_string(),
-                encryption: match dataplane.encryption {
-                    klights_leader_api::DataplaneEncryption::WireGuard => "enabled",
-                    klights_leader_api::DataplaneEncryption::Direct => "disabled",
-                }
-                .to_string(),
-                public_key: dataplane.public_key.clone(),
-                endpoint: dataplane.endpoint.clone(),
-                port: dataplane.port,
-            },
-            now_ms: runtime_epoch_ms(),
-        })
-        .await
-        .map(|_| ())
+    klights_kubelet::node_outbox::enqueue_node_dataplane_metadata(
+        outbox,
+        node_name,
+        dataplane.mode,
+        dataplane.encryption,
+        dataplane.public_key.clone(),
+        dataplane.endpoint.clone(),
+        dataplane.port,
+        runtime_epoch_ms(),
+    )
+    .await
 }
 
 #[cfg(test)]

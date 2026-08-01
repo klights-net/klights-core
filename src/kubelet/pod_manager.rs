@@ -56,14 +56,14 @@ mod event_forwarder;
 pub struct PodWatcherRuntimePorts {
     cri_runtime: Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>,
     container_control: Arc<dyn crate::kubelet::pod_runtime::cri::ContainerRuntimeControl>,
-    cni_readiness: crate::kubelet::cni_readiness::CniReadiness,
+    cni_readiness: klights_kubelet::cni_readiness::CniReadiness,
 }
 
 impl PodWatcherRuntimePorts {
     pub fn new(
         cri_runtime: Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>,
         container_control: Arc<dyn crate::kubelet::pod_runtime::cri::ContainerRuntimeControl>,
-        cni_readiness: crate::kubelet::cni_readiness::CniReadiness,
+        cni_readiness: klights_kubelet::cni_readiness::CniReadiness,
     ) -> Self {
         Self {
             cri_runtime,
@@ -147,7 +147,7 @@ async fn spawn_cri_event_forwarder(
 }
 
 async fn wait_for_cni_readiness(
-    readiness: crate::kubelet::cni_readiness::CniReadiness,
+    readiness: klights_kubelet::cni_readiness::CniReadiness,
     cancel_token: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     readiness.wait_ready(cancel_token).await
@@ -252,7 +252,7 @@ async fn run_pod_watcher_with_runtime(
 
     // Compute and cache the host IP for pod status from the registered Node
     // InternalIP. Node names are Kubernetes identities, not DNS names.
-    let node_ip = crate::kubelet::node_ip::resolve_node_ip_from_leader_api_or_hostname(
+    let node_ip = klights_kubelet::node_ip::resolve_node_ip_from_leader_api_or_hostname(
         status_delivery.resource_query.as_ref(),
         kubelet_config.node_name(),
     )

@@ -10,8 +10,8 @@
 
 use super::*;
 use crate::datastore::ResourcePreconditions;
-use crate::node_outbox::payload::OutboxOperation;
 use klights_cluster_core::command::StorageCommand;
+use klights_kubelet::node_outbox::payload::OutboxOperation;
 use serde_json::json;
 
 const STATUS_OPS: &[OutboxOperation] = &[

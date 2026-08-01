@@ -92,10 +92,10 @@ impl LeaderAuthority for TestBooleanWatchAuthority {
 }
 
 pub(crate) fn project_raft_shape(
-    declared_role: &crate::kubelet::node_config::KubeletNodeRole,
+    declared_role: &klights_kubelet::node_config::KubeletNodeRole,
     shape: &klights_cluster_core::RaftShape,
 ) -> NodeRoleProjection {
-    use crate::kubelet::node_config::KubeletNodeRole;
+    use klights_kubelet::node_config::KubeletNodeRole;
     if shape.is_learner {
         return NodeRoleProjection::Replica;
     }

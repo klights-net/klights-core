@@ -107,7 +107,7 @@ async fn start_controlplane_leader_control_stream_if_needed(
             )),
             klights_leader_rpc::client::NodeMetricsCapability::Available(std::sync::Arc::new(
                 crate::kubelet::remote_runtime::CriNodeMetricsRuntime::new(std::sync::Arc::new(
-                    crate::kubelet::metrics::CriNodeMetricsSampler::new(
+                    klights_kubelet::metrics::CriNodeMetricsSampler::new(
                         cri.clone(),
                         task_supervisor.clone(),
                     ),
@@ -790,7 +790,7 @@ mod tests {
         )
         .await
         .expect("open node-local test db");
-        let outbox = crate::node_outbox::Outbox::new(node_db.clone());
+        let outbox = crate::outbox_test_support::outbox_from_node_db(node_db.clone());
         let dataplane = klights_leader_rpc::client::JoinDataplaneMetadata {
             public_key: Some("worker-public-key".to_string()),
             endpoint: "192.0.2.55".to_string(),
@@ -813,7 +813,7 @@ mod tests {
         assert_eq!(row.subject_name, "worker-a");
         assert_eq!(row.subject_key, "v1/Node/worker-a/dataplane");
         let payload =
-            crate::node_outbox::payload::OutboxPayload::decode_protobuf(&row.payload_proto)
+            crate::outbox_test_support::OutboxPayload::decode_protobuf(&row.payload_proto)
                 .expect("decode dataplane outbox payload");
         match payload.command {
             klights_cluster_core::command::StorageCommand::UpdateNodeDataplane {

@@ -43,7 +43,8 @@ mod cases {
                         .inner
                         .build_log_apply_commit_for_command(
                             command,
-                            crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
+                            klights_kubelet::node_outbox::payload::OutboxOperation::PodStatus
+                                .as_str(),
                             "inline-proposer",
                         )
                         .await?;
@@ -65,8 +66,8 @@ mod cases {
                 authoring_node: &str,
                 _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
             ) -> std::result::Result<
-                crate::node_outbox::OutboxApplyResult,
-                crate::node_outbox::OutboxApplyError,
+                klights_cluster_core::OutboxApplyOutcome,
+                klights_cluster_core::OutboxApplyError,
             > {
                 self.calls
                     .lock()
@@ -76,9 +77,10 @@ mod cases {
                     crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
                         self.inner.as_ref(),
                         idempotency_key,
-                        crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
-                            |e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()),
-                        )?,
+                        klights_kubelet::node_outbox::payload::OutboxOperation::try_from(operation)
+                            .map_err(|e| {
+                                klights_cluster_core::OutboxApplyError::Retryable(e.to_string())
+                            })?,
                         command,
                         authoring_node,
                         None,
@@ -117,8 +119,8 @@ mod cases {
             _authoring_node: &str,
             _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
         ) -> std::result::Result<
-            crate::node_outbox::OutboxApplyResult,
-            crate::node_outbox::OutboxApplyError,
+            klights_cluster_core::OutboxApplyOutcome,
+            klights_cluster_core::OutboxApplyError,
         > {
             panic!("this operation must not submit an outbox proposal")
         }
@@ -2048,20 +2050,20 @@ mod cases {
                 resource_version: Some(1),
             },
         };
-        let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+        let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
             .encode_protobuf()
             .unwrap();
 
         let result = ds
             .apply_outbox_transactionally(
                 "lease-renew-key",
-                crate::node_outbox::payload::OutboxOperation::LeaseRenew.as_str(),
+                klights_kubelet::node_outbox::payload::OutboxOperation::LeaseRenew.as_str(),
                 klights_leader_rpc::storage_wire_codec::test_outbox_command(&payload),
                 "worker-1",
             )
             .await
             .unwrap();
-        let crate::node_outbox::OutboxApplyResult::Applied { applied_rv } = result else {
+        let klights_cluster_core::OutboxApplyOutcome::Applied { applied_rv } = result else {
             panic!("expected LeaseRenew to be accepted");
         };
         assert_eq!(applied_rv, 0);
@@ -2084,20 +2086,20 @@ mod cases {
             name: "from-outbox".into(),
             data: json!({"metadata": {"name": "from-outbox", "namespace": "default"}}),
         };
-        let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+        let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
             .encode_protobuf()
             .unwrap();
 
         let result = ds
             .apply_outbox_transactionally(
                 "create-from-outbox-key",
-                crate::node_outbox::payload::OutboxOperation::NodeRegistration.as_str(),
+                klights_kubelet::node_outbox::payload::OutboxOperation::NodeRegistration.as_str(),
                 klights_leader_rpc::storage_wire_codec::test_outbox_command(&payload),
                 "worker-1",
             )
             .await
             .unwrap();
-        let crate::node_outbox::OutboxApplyResult::Applied { .. } = result else {
+        let klights_cluster_core::OutboxApplyOutcome::Applied { .. } = result else {
             panic!("expected first outbox apply to mutate the leader");
         };
 
@@ -2209,17 +2211,18 @@ mod cases {
                 authoring_node: &str,
                 _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
             ) -> std::result::Result<
-                crate::node_outbox::OutboxApplyResult,
-                crate::node_outbox::OutboxApplyError,
+                klights_cluster_core::OutboxApplyOutcome,
+                klights_cluster_core::OutboxApplyError,
             > {
                 self.calls.lock().unwrap().push(command.clone());
                 let result =
                     crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
                         self.inner.as_ref(),
                         idempotency_key,
-                        crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
-                            |e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()),
-                        )?,
+                        klights_kubelet::node_outbox::payload::OutboxOperation::try_from(operation)
+                            .map_err(|e| {
+                                klights_cluster_core::OutboxApplyError::Retryable(e.to_string())
+                            })?,
                         command,
                         authoring_node,
                         None,
@@ -2291,8 +2294,8 @@ mod cases {
                 _authoring_node: &str,
                 _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
             ) -> std::result::Result<
-                crate::node_outbox::OutboxApplyResult,
-                crate::node_outbox::OutboxApplyError,
+                klights_cluster_core::OutboxApplyOutcome,
+                klights_cluster_core::OutboxApplyError,
             > {
                 unreachable!("resource batch routing should use propose_command")
             }
@@ -2372,17 +2375,18 @@ mod cases {
                 authoring_node: &str,
                 _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
             ) -> std::result::Result<
-                crate::node_outbox::OutboxApplyResult,
-                crate::node_outbox::OutboxApplyError,
+                klights_cluster_core::OutboxApplyOutcome,
+                klights_cluster_core::OutboxApplyError,
             > {
                 self.calls.lock().unwrap().push(command.clone());
                 let outcome =
                     crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
                         self.inner.as_ref(),
                         idempotency_key,
-                        crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
-                            |e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()),
-                        )?,
+                        klights_kubelet::node_outbox::payload::OutboxOperation::try_from(operation)
+                            .map_err(|e| {
+                                klights_cluster_core::OutboxApplyError::Retryable(e.to_string())
+                            })?,
                         command,
                         authoring_node,
                         None,
@@ -2399,7 +2403,7 @@ mod cases {
         let inner = proposer.inner.clone();
         let ds = SequencedDatastore::new(inner.clone(), proposer.clone());
 
-        let payload = crate::node_outbox::payload::OutboxPayload::from_command(
+        let payload = crate::outbox_test_support::OutboxPayload::from_command(
             StorageCommand::CreateResource {
                 api_version: "v1".into(),
                 kind: "ConfigMap".into(),
@@ -2414,13 +2418,13 @@ mod cases {
         let result = ds
             .apply_outbox_transactionally(
                 "outbox-key",
-                crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
+                klights_kubelet::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
                 klights_leader_rpc::storage_wire_codec::test_outbox_command(&payload),
                 "worker-1",
             )
             .await
             .expect("apply_outbox via proposer");
-        let crate::node_outbox::OutboxApplyResult::Applied { .. } = result else {
+        let klights_cluster_core::OutboxApplyOutcome::Applied { .. } = result else {
             panic!("expected Applied for first outbox apply");
         };
 
@@ -2487,23 +2491,26 @@ mod cases {
                 authoring_node: &str,
                 _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
             ) -> std::result::Result<
-                crate::node_outbox::OutboxApplyResult,
-                crate::node_outbox::OutboxApplyError,
+                klights_cluster_core::OutboxApplyOutcome,
+                klights_cluster_core::OutboxApplyError,
             > {
                 self.calls.lock().unwrap().push(command.variant_name());
                 let outcome =
                     crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
                         self.inner.as_ref(),
                         idempotency_key,
-                        crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
-                            |e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()),
-                        )?,
+                        klights_kubelet::node_outbox::payload::OutboxOperation::try_from(operation)
+                            .map_err(|e| {
+                                klights_cluster_core::OutboxApplyError::Retryable(e.to_string())
+                            })?,
                         command,
                         authoring_node,
                         None,
                     )
                     .await
-                    .map_err(|e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()))?;
+                    .map_err(|e| {
+                        klights_cluster_core::OutboxApplyError::Retryable(e.to_string())
+                    })?;
                 Ok(outcome.into_parts().0)
             }
         }
@@ -2929,10 +2936,10 @@ mod cases {
                 _a: &str,
                 _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
             ) -> std::result::Result<
-                crate::node_outbox::OutboxApplyResult,
-                crate::node_outbox::OutboxApplyError,
+                klights_cluster_core::OutboxApplyOutcome,
+                klights_cluster_core::OutboxApplyError,
             > {
-                Err(crate::node_outbox::OutboxApplyError::Retryable(
+                Err(klights_cluster_core::OutboxApplyError::Retryable(
                     "not the leader".into(),
                 ))
             }
@@ -2971,7 +2978,7 @@ mod cases {
     #[tokio::test]
     async fn raft_mode_follower_proposer_rejects_outbox_apply_no_local_mutation() {
         let (ds, inner) = make_ds_with_follower_proposer().await;
-        let payload = crate::node_outbox::payload::OutboxPayload::from_command(
+        let payload = crate::outbox_test_support::OutboxPayload::from_command(
             StorageCommand::CreateResource {
                 api_version: "v1".into(),
                 kind: "ConfigMap".into(),
@@ -2992,7 +2999,7 @@ mod cases {
             .await
             .expect_err("follower outbox must reject");
         assert!(
-            matches!(err, crate::node_outbox::OutboxApplyError::Retryable(_)),
+            matches!(err, klights_cluster_core::OutboxApplyError::Retryable(_)),
             "expected Retryable error, got: {err:?}"
         );
         assert!(

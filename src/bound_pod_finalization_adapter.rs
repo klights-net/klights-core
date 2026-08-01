@@ -15,11 +15,11 @@ use klights_reconcile_api::{
     GcPodDeleteError, GcPodDeleteFuture, GcPodDeleteRequest, GcPodDeleteSink,
 };
 
-use crate::kubelet::outbox::{
-    Outbox, OutboxCommand, OutboxOperation, OutboxSendPlanner, OutboxSubject,
-};
 use crate::kubelet::pod_repository::store::{
     ActorPodDeleteObservation, BoundPodDeleteOutcome, PodStore,
+};
+use klights_kubelet::outbox::{
+    Outbox, OutboxCommand, OutboxOperation, OutboxSendPlanner, OutboxSubject,
 };
 
 pub(crate) struct RootBoundPodFinalization {

@@ -2577,7 +2577,7 @@ mod tests {
         .await
         .expect("open node-local");
         let adapter = WorkerStoreAdapter::new(Arc::new(HandoffLeaderApi), "worker-a".to_string());
-        let outbox = crate::node_outbox::Outbox::new(node_local.clone());
+        let outbox = crate::outbox_test_support::outbox_from_node_db(node_local.clone());
         let pod = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
@@ -2592,10 +2592,12 @@ mod tests {
             }
         });
 
-        crate::pod_events::emit_worker_pod_event(
-            adapter.resource_query.as_ref(),
+        let query =
+            crate::pod_event_adapter::LeaderPodEventQuery::new(adapter.resource_query.as_ref());
+        klights_kubelet::pod_events::emit_worker_pod_event(
+            &query,
             &outbox,
-            crate::pod_events::PodEventRecord {
+            klights_kubelet::pod_events::PodEventRecord {
                 pod: &pod,
                 reason: "Started",
                 message: "Started container test-container",

@@ -7,16 +7,16 @@ use klights_leader_api::{
 use crate::datastore::DatastoreBackend;
 use crate::datastore::ResourcePreconditions;
 #[cfg(test)]
-use crate::node_outbox::payload::OutboxOperation;
-#[cfg(test)]
 use klights_cluster_core::OutboxStreamWatermark;
 use klights_cluster_core::command::StorageCommand;
+#[cfg(test)]
+use klights_kubelet::node_outbox::payload::OutboxOperation;
 
 #[cfg(test)]
 pub async fn apply_outbox_transactionally(
     db: &dyn crate::datastore::DatastoreBackend,
     idempotency_key: &str,
-    operation: crate::node_outbox::payload::OutboxOperation,
+    operation: klights_kubelet::node_outbox::payload::OutboxOperation,
     payload: &[u8],
     authoring_node: &str,
 ) -> std::result::Result<
@@ -24,7 +24,7 @@ pub async fn apply_outbox_transactionally(
     klights_cluster_core::OutboxApplyError,
 > {
     // Run UID-mismatch check here (allowed file for Pod DB calls)
-    let decoded = crate::node_outbox::payload::OutboxPayload::decode_protobuf(payload)
+    let decoded = crate::outbox_test_support::OutboxPayload::decode_protobuf(payload)
         .map_err(|e| klights_cluster_core::OutboxApplyError::Retryable(e.to_string()))?;
     reject_pod_uid_mismatch(db, &decoded.command)
         .await
@@ -56,10 +56,10 @@ pub async fn gc_applied_outbox(
     db: &dyn crate::datastore::DatastoreBackend,
     now_ms: i64,
     ttl_ms: i64,
-) -> Result<usize, crate::node_outbox::OutboxApplyError> {
+) -> Result<usize, klights_cluster_core::OutboxApplyError> {
     db.gc_applied_outbox(now_ms, ttl_ms)
         .await
-        .map_err(|e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()))
+        .map_err(|e| klights_cluster_core::OutboxApplyError::Retryable(e.to_string()))
 }
 
 #[cfg(test)]
@@ -95,7 +95,7 @@ pub async fn consume_terminal_outbox_sequence(
     let assigned_sequence = watermark.is_some();
     let payload = klights_leader_rpc::storage_wire_codec::encode_outbox_payload_protobuf(
         &klights_cluster_core::OutboxPayload::new(
-            crate::node_outbox::payload::terminal_decision_command(idempotency_key),
+            klights_kubelet::node_outbox::payload::terminal_decision_command(idempotency_key),
         ),
     )
     .map(Bytes::from)
@@ -165,7 +165,7 @@ async fn apply_outbox_to_local_leader_with_node_operation(
     authoring_node: &str,
     watermark: Option<OutboxStreamWatermark>,
 ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-    let command = crate::node_outbox::payload::OutboxPayload::decode_protobuf(&payload)
+    let command = crate::outbox_test_support::OutboxPayload::decode_protobuf(&payload)
         .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?
         .command;
     crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(

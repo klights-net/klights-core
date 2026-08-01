@@ -8,23 +8,6 @@ pub enum NodeHeartbeatEvent {
     ReplayExpired,
 }
 
-#[cfg(test)]
-pub(crate) fn build_lease(node_name: &str) -> serde_json::Value {
-    serde_json::json!({
-        "apiVersion": "coordination.k8s.io/v1",
-        "kind": "Lease",
-        "metadata": {
-            "name": node_name,
-            "namespace": "kube-node-lease"
-        },
-        "spec": {
-            "holderIdentity": node_name,
-            "leaseDurationSeconds": klights_cluster_core::DEFAULT_NODE_LEASE_DURATION_SECONDS,
-            "renewTime": klights_cluster_core::k8s_time::format_microtime(klights_supervisor::SystemWallClock::now_utc())
-        }
-    })
-}
-
 pub type NodeHeartbeatEventFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<NodeHeartbeatEvent>> + Send + 'a>>;
 
@@ -39,7 +22,7 @@ pub trait NodeHeartbeatClock: Send + Sync {
 // Derived from the canonical node-lease cadence so the renewal timer and the
 // staleness grace (GRACE = HEARTBEAT * MISSED) can never drift apart. Change
 // the cadence in one place: cluster-core's node lease contract.
-pub(crate) const NODE_HEARTBEAT_INTERVAL: Duration =
+pub const NODE_HEARTBEAT_INTERVAL: Duration =
     Duration::from_secs(klights_cluster_core::DEFAULT_NODE_HEARTBEAT_INTERVAL_SECONDS as u64);
 const NODE_HEARTBEAT_EVENT_RETRY_DELAY: Duration = Duration::from_secs(1);
 
@@ -158,6 +141,28 @@ pub(crate) async fn run_heartbeat_with_interval(
             }
         };
     }
+}
+
+#[cfg(feature = "test-support")]
+pub async fn run_heartbeat_with_interval_for_integration_test(
+    event_source: std::sync::Arc<dyn NodeHeartbeatEventSource>,
+    lease_client: std::sync::Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
+    clock: std::sync::Arc<dyn NodeHeartbeatClock>,
+    node_name: String,
+    cancel_token: tokio_util::sync::CancellationToken,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
+    heartbeat_interval: Duration,
+) {
+    run_heartbeat_with_interval(
+        event_source,
+        lease_client,
+        clock,
+        node_name,
+        cancel_token,
+        task_supervisor,
+        heartbeat_interval,
+    )
+    .await;
 }
 
 async fn next_heartbeat_event(

@@ -210,7 +210,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let _ = leader_endpoint;
 
     let ob_notify = std::sync::Arc::new(tokio::sync::Notify::new());
-    let outbox_stores = crate::node_outbox::OutboxStores::new(
+    let outbox_stores = klights_kubelet::node_outbox::OutboxStores::new(
         node_local.outbox_producer(),
         node_local.outbox_dispatcher(),
         node_local.pod_status_checkpoints(),
@@ -220,13 +220,13 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let outbox_codec = crate::outbox_payload_codec_adapter::new_codec();
     let outbox_wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock> =
         std::sync::Arc::new(klights_supervisor::SystemWallClock);
-    let outbox = std::sync::Arc::new(crate::node_outbox::Outbox::compose(
+    let outbox = std::sync::Arc::new(klights_kubelet::node_outbox::Outbox::compose(
         outbox_stores.clone(),
         outbox_codec.clone(),
         ob_notify.clone(),
         outbox_wall_clock.clone(),
     ));
-    crate::node_outbox::OutboxDispatcher::new(
+    klights_kubelet::node_outbox::OutboxDispatcher::new(
         outbox_stores,
         outbox_codec,
         remote_api_client.clone(),
@@ -236,7 +236,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     // bug-grpc: pipelined dispatch — keep multiple worker→leader
     // `apply_outbox` round-trips in flight (one per Status channel-lane
     // connection) instead of one row per WAN RTT.
-    .with_batch_mode(crate::node_outbox::DEFAULT_DISPATCH_INFLIGHT)
+    .with_batch_mode(klights_kubelet::node_outbox::DEFAULT_DISPATCH_INFLIGHT)
     .start(task_supervisor.clone(), shutdown_token.clone())
     .await
     .context("worker outbox")?;
@@ -315,10 +315,10 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     // leader before the node_subnet watcher's initial sync_peer_routes call,
     // which reads the Node via gRPC to write its dataplane-readiness conditions.
     let registration_addresses =
-        kubelet::node::NodeRegistrationAddresses::new(node_ip.clone(), None);
+        klights_kubelet::node::NodeRegistrationAddresses::new(node_ip.clone(), None);
     let registration_profile =
         crate::bootstrap::node_registration_profile::build(&node_mode, &cli.role);
-    let registration = kubelet::node::NodeRegistrationSnapshot::capture_local(
+    let registration = klights_kubelet::node::NodeRegistrationSnapshot::capture_local(
         &file_process,
         &config.node_name,
         &registration_profile,
@@ -349,7 +349,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             )),
             klights_leader_rpc::client::NodeMetricsCapability::Available(std::sync::Arc::new(
                 crate::kubelet::remote_runtime::CriNodeMetricsRuntime::new(std::sync::Arc::new(
-                    crate::kubelet::metrics::CriNodeMetricsSampler::new(
+                    klights_kubelet::metrics::CriNodeMetricsSampler::new(
                         cri.clone(),
                         task_supervisor.clone(),
                     ),
@@ -399,7 +399,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             remote_api_client.clone();
         let node_status_for_peer_watch: std::sync::Arc<
             dyn klights_leader_api::LeaderNodeSelfStatus,
-        > = std::sync::Arc::new(crate::kubelet::node::OutboxNodeSelfStatusPublisher::new(
+        > = std::sync::Arc::new(klights_kubelet::node::OutboxNodeSelfStatusPublisher::new(
             config.node_name.clone(),
             query_for_peer_watch.clone(),
             outbox.clone(),
@@ -461,7 +461,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         },
     );
     let kubelet_capacity =
-        crate::kubelet::node_registration::NodeRegistrationHostFacts::capture_local(
+        klights_kubelet::node_registration::NodeRegistrationHostFacts::capture_local(
             &file_process,
             &registration_profile,
         )
@@ -639,7 +639,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                 klights_supervisor::TaskCategory::Background,
                 "worker_node_heartbeat",
                 async move {
-                    kubelet::node::run_heartbeat_with_lease_client(
+                    klights_kubelet::node::run_heartbeat_with_lease_client(
                         watch_source,
                         lease_client,
                         std::sync::Arc::new(
@@ -841,7 +841,9 @@ mod tests {
         )
         .await
         .expect("open worker node-local store");
-        let outbox = std::sync::Arc::new(crate::node_outbox::Outbox::new(node_local.clone()));
+        let outbox = std::sync::Arc::new(crate::outbox_test_support::outbox_from_node_db(
+            node_local.clone(),
+        ));
 
         let parts = compose_worker_pod_repository_parts(
             crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {

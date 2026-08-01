@@ -3,7 +3,7 @@
 use crate::{KlightsConfig, paths, version};
 
 pub async fn discover_host_ip() -> anyhow::Result<String> {
-    crate::kubelet::node_ip::discover_primary_route_ip().await
+    klights_kubelet::node_ip::discover_primary_route_ip().await
 }
 
 pub fn print_ready_message(config: &KlightsConfig) {

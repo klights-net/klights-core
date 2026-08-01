@@ -18,7 +18,7 @@ use crate::controllers::annotations::{
 #[cfg(test)]
 use crate::datastore::DatastoreBackend;
 #[cfg(test)]
-use crate::node_outbox::Outbox;
+use klights_kubelet::node_outbox::Outbox;
 use klights_network_api::parse_node_peer_mode;
 #[cfg(test)]
 use klights_networking::dataplane_health::{DataplaneHealth, DataplaneHealthStatus};
@@ -815,7 +815,7 @@ async fn reconcile_local_readiness(
     if last_readiness.as_ref() == Some(&new_status) {
         return;
     }
-    match crate::kubelet::node::refresh_node_network_conditions(
+    match crate::node_output_integration_tests::refresh_node_network_conditions(
         db,
         outbox.map(|outbox| outbox as &dyn klights_leader_api::NodeOutbox),
         my_node_name,
@@ -823,7 +823,7 @@ async fn reconcile_local_readiness(
     )
     .await
     {
-        Ok(crate::kubelet::node::NodeNetworkRefreshResult::Updated) => {
+        Ok(klights_kubelet::node::NodeNetworkRefreshResult::Updated) => {
             tracing::info!(
                 node = %my_node_name,
                 ready = new_status.is_healthy(),
@@ -832,14 +832,14 @@ async fn reconcile_local_readiness(
             );
             *last_readiness = Some(new_status);
         }
-        Ok(crate::kubelet::node::NodeNetworkRefreshResult::Unchanged) => {
+        Ok(klights_kubelet::node::NodeNetworkRefreshResult::Unchanged) => {
             *last_readiness = Some(new_status);
             tracing::debug!(
                 node = %my_node_name,
                 "node_subnet: readiness refresh skipped (conditions unchanged)"
             );
         }
-        Ok(crate::kubelet::node::NodeNetworkRefreshResult::Missing) => {
+        Ok(klights_kubelet::node::NodeNetworkRefreshResult::Missing) => {
             // Node not found — do NOT memo the readiness. A future re-sync
             // (triggered by a Node watch event) must retry.
             tracing::debug!(

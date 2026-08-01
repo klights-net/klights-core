@@ -10,10 +10,10 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
-use crate::kubelet::outbox::OutboxOperation;
-use crate::kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
 use klights_cluster_core::StorageCommand;
 use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_kubelet::outbox::OutboxOperation;
+use klights_kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
 use klights_leader_api::LeaderResourceQuery;
 use klights_reconcile_api::{PodMutationReconcileRequest, PodMutationReconcileSink};
 

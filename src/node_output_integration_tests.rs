@@ -1,195 +1,30 @@
-use crate::kubelet::outbox::OutboxOperation;
-use crate::kubelet::outbox::{
-    Outbox, OutboxCommand, OutboxSendPlanner, OutboxSendRoute, OutboxSubject,
-};
-#[cfg(test)]
-use crate::node_outbox::payload::OutboxPayload;
-#[cfg(test)]
-use anyhow::Context;
-use anyhow::Result;
-use klights_cluster_core::ResourcePreconditions;
-use klights_cluster_core::StorageCommand;
-
-pub use crate::kubelet::node_heartbeat::run_heartbeat_with_lease_client;
-pub(crate) use crate::kubelet::node_leader_labels::clear_leader_label_from_other_nodes;
-pub(crate) use crate::kubelet::node_registration::{
-    NodeRegistrationAddresses, NodeRegistrationHostFacts, NodeRegistrationSnapshot,
-};
-#[cfg(test)]
-pub(crate) use crate::kubelet::node_registration::{
-    register_node_at_addresses, register_node_with_outbox,
-};
-pub(crate) use crate::kubelet::node_role_labels::role_label_keys_for_projection;
-pub(crate) use crate::kubelet::node_status_merge::preserve_existing_network_conditions;
-pub use crate::kubelet::node_status_merge::{
-    merge_existing_node_mutable_fields, merge_node_status_for_update, set_node_external_ip,
-};
-#[cfg(test)]
-pub(super) use crate::kubelet::node_status_projection::stamp_git_commit_annotation;
-pub(super) use crate::kubelet::node_status_projection::{
-    NodeNetworkConditions, apply_network_conditions,
-};
-pub use crate::kubelet::node_status_projection::{
-    set_node_dataplane_annotations, set_node_external_ip_from_dataplane_annotation,
-    set_node_pod_cidr,
+use anyhow::{Context as _, Result};
+use klights_cluster_core::{ResourcePreconditions, StorageCommand};
+use klights_kubelet::node::*;
+use klights_kubelet::node_registration::{NodeRegistrationAddresses, NodeRegistrationSnapshot};
+use klights_kubelet::outbox::{
+    Outbox, OutboxCommand, OutboxOperation, OutboxSendPlanner, OutboxSubject,
 };
 
-pub(super) fn parse_memory_ki(content: &str) -> Option<u64> {
-    content
-        .lines()
-        .find(|line| line.starts_with("MemTotal:"))
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|value| value.parse::<u64>().ok())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NodeNetworkRefreshResult {
-    Missing,
-    Unchanged,
-    Updated,
-}
-
-/// Worker-owned Node status publisher. It verifies the exact Node UID with a
-/// current-leader read, then durably enqueues one status-only command. Remote
-/// delivery and retries remain the outbox dispatcher's responsibility, so a
-/// retry reuses the persisted row's idempotency and stream identity.
-pub struct OutboxNodeSelfStatusPublisher {
-    node_name: String,
-    query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
-    outbox: std::sync::Arc<Outbox>,
-    wall_clock: std::sync::Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
-}
-
-impl OutboxNodeSelfStatusPublisher {
-    pub fn new(
-        node_name: impl Into<String>,
-        query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
-        outbox: std::sync::Arc<Outbox>,
-        wall_clock: std::sync::Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
-    ) -> Self {
-        Self {
-            node_name: node_name.into(),
-            query,
-            outbox,
-            wall_clock,
-        }
-    }
-}
-
-impl klights_leader_api::LeaderNodeSelfStatus for OutboxNodeSelfStatusPublisher {
-    fn submit_node_self_status(
-        &self,
-        request: klights_leader_api::NodeSelfStatusRequest,
-    ) -> klights_leader_api::NodeSelfStatusFuture<'_, klights_leader_api::NodeSelfStatusResult>
-    {
-        Box::pin(async move {
-            if request.node_name() != self.node_name {
-                return Err(klights_leader_api::NodeSelfStatusError::unauthorized(
-                    format!(
-                        "node {} cannot publish Node status for {}",
-                        self.node_name,
-                        request.node_name()
-                    ),
-                ));
-            }
-            let get = klights_leader_api::node_get_request(
-                &self.node_name,
-                klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+fn build_lease(node_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "coordination.k8s.io/v1",
+        "kind": "Lease",
+        "metadata": {
+            "name": node_name,
+            "namespace": "kube-node-lease"
+        },
+        "spec": {
+            "holderIdentity": node_name,
+            "leaseDurationSeconds": klights_cluster_core::DEFAULT_NODE_LEASE_DURATION_SECONDS,
+            "renewTime": klights_cluster_core::k8s_time::format_microtime(
+                klights_supervisor::SystemWallClock::now_utc()
             )
-            .map_err(|error| {
-                klights_leader_api::NodeSelfStatusError::retryable(error.to_string())
-            })?;
-            let current = self
-                .query
-                .get_resource(get)
-                .await
-                .map_err(|error| {
-                    klights_leader_api::NodeSelfStatusError::retryable(error.to_string())
-                })?
-                .ok_or(klights_leader_api::NodeSelfStatusError::NotFound)?;
-            if current.uid != request.node_uid() {
-                return Err(klights_leader_api::NodeSelfStatusError::UidMismatch);
-            }
-
-            let node_uid = request.node_uid().to_string();
-            let command = request.into_command();
-            self.outbox
-                .enqueue(OutboxCommand {
-                    idempotency_key: format!(
-                        "NodeStatus:v1/Node/{}/{}:{}",
-                        self.node_name,
-                        node_uid,
-                        uuid::Uuid::new_v4()
-                    ),
-                    operation: OutboxOperation::NodeStatus,
-                    subject: OutboxSubject {
-                        key: format!("v1/Node/{}/{}", self.node_name, node_uid),
-                        namespace: None,
-                        name: self.node_name.clone(),
-                        uid: Some(node_uid),
-                    },
-                    pod_uid: String::new(),
-                    command,
-                    now_ms: self.wall_clock.now_ms(),
-                })
-                .await
-                .map_err(|error| {
-                    klights_leader_api::NodeSelfStatusError::enqueue_failed(error.to_string())
-                })?;
-            Ok(klights_leader_api::NodeSelfStatusResult::Enqueued)
-        })
-    }
+        }
+    })
 }
 
-/// Re-evaluate and persist the local node's `Ready`/`NetworkUnavailable`
-/// conditions from the current dataplane health. Event-driven: called by the
-/// peer-route watcher when peer connectivity changes, so a node stops reporting
-/// Ready as soon as a Ready peer becomes unreachable and recovers once the
-/// WireGuard route is installed.
-///
-/// Writes go through the outbox when provided (mandatory on non-leader nodes,
-/// which must not originate local cluster.db writes); the direct path is only
-/// for the leader. Returns true if a write was issued.
-pub async fn publish_node_network_conditions(
-    query: &dyn klights_leader_api::LeaderResourceQuery,
-    publisher: &dyn klights_leader_api::LeaderNodeSelfStatus,
-    node_name: &str,
-    dataplane_health: &klights_network_api::DataplaneHealthSnapshot,
-    operation_now: chrono::DateTime<chrono::Utc>,
-) -> Result<NodeNetworkRefreshResult> {
-    let get = klights_leader_api::node_get_request(
-        node_name,
-        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
-    )?;
-    let Some(existing) = query.get_resource(get).await? else {
-        return Ok(NodeNetworkRefreshResult::Missing);
-    };
-    let conditions = NodeNetworkConditions::from_health(Some(dataplane_health));
-    let mut node = existing.data.as_ref().clone();
-    if !apply_network_conditions(&mut node, &conditions, operation_now) {
-        return Ok(NodeNetworkRefreshResult::Unchanged);
-    }
-    let status = node
-        .get("status")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    let request =
-        klights_leader_api::NodeSelfStatusRequest::try_new(StorageCommand::UpdateStatus {
-            api_version: "v1".to_string(),
-            kind: "Node".to_string(),
-            namespace: None,
-            name: node_name.to_string(),
-            status,
-            expected_rv: None,
-            preconditions: ResourcePreconditions::uid(existing.uid),
-            observed_status_stamp: None,
-        })?;
-    publisher.submit_node_self_status(request).await?;
-    Ok(NodeNetworkRefreshResult::Updated)
-}
-
-#[cfg(test)]
-pub async fn refresh_node_network_conditions(
+pub(crate) async fn refresh_node_network_conditions(
     db: &dyn crate::datastore::DatastoreBackend,
     outbox: Option<&Outbox>,
     node_name: &str,
@@ -198,13 +33,11 @@ pub async fn refresh_node_network_conditions(
     let Some(existing) = db.get_resource("v1", "Node", None, node_name).await? else {
         return Ok(NodeNetworkRefreshResult::Missing);
     };
-    let dataplane_health = dataplane_health.snapshot();
-    let conditions = NodeNetworkConditions::from_health(Some(&dataplane_health));
     let mut node = existing.data.as_ref().clone();
-    let commit_changed = stamp_git_commit_annotation(&mut node, "test-commit");
-    let status_changed = apply_network_conditions(
+    let commit_changed = stamp_git_commit_annotation_for_integration_test(&mut node, "test-commit");
+    let status_changed = project_network_conditions_for_integration_test(
         &mut node,
-        &conditions,
+        &dataplane_health.snapshot(),
         chrono::DateTime::from_timestamp(1_700_000_000, 0)
             .expect("fixed node condition test timestamp"),
     );
@@ -217,28 +50,33 @@ pub async fn refresh_node_network_conditions(
             .get("status")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
-        send_node_command(
-            Some(outbox),
-            OutboxOperation::NodeStatus,
-            node_name,
-            existing.uid.as_str(),
-            StorageCommand::UpdateStatus {
-                api_version: "v1".to_string(),
-                kind: "Node".to_string(),
-                namespace: None,
-                name: node_name.to_string(),
-                status,
-                expected_rv: None,
-                preconditions: ResourcePreconditions {
+        OutboxSendPlanner::new(Some(outbox))
+            .route(OutboxCommand {
+                idempotency_key: format!("NodeStatus:{node_name}:integration-test"),
+                operation: OutboxOperation::NodeStatus,
+                subject: OutboxSubject {
+                    key: format!("v1/Node/_/{node_name}"),
+                    namespace: None,
+                    name: node_name.to_string(),
                     uid: Some(existing.uid.clone()),
-                    resource_version: None,
                 },
-                observed_status_stamp: None,
-            },
-            1_700_000_000_000,
-        )
-        .await
-        .context("Failed to enqueue Node network condition refresh")?;
+                pod_uid: String::new(),
+                command: klights_cluster_core::StorageCommand::UpdateStatus {
+                    api_version: "v1".to_string(),
+                    kind: "Node".to_string(),
+                    namespace: None,
+                    name: node_name.to_string(),
+                    status,
+                    expected_rv: None,
+                    preconditions: klights_cluster_core::ResourcePreconditions::uid(
+                        existing.uid.clone(),
+                    ),
+                    observed_status_stamp: None,
+                },
+                now_ms: 1_700_000_000_000,
+            })
+            .await
+            .context("Failed to enqueue Node network condition refresh")?;
     } else {
         if !(commit_changed || status_changed) {
             return Ok(NodeNetworkRefreshResult::Unchanged);
@@ -249,7 +87,7 @@ pub async fn refresh_node_network_conditions(
             None,
             node_name,
             node,
-            ResourcePreconditions::from_resource(&existing),
+            klights_cluster_core::ResourcePreconditions::from_resource(&existing),
         )
         .await
         .context("Failed to update Node network conditions")?;
@@ -257,126 +95,59 @@ pub async fn refresh_node_network_conditions(
     Ok(NodeNetworkRefreshResult::Updated)
 }
 
-pub async fn refresh_current_git_commit_annotation_via_leader(
-    query: &dyn klights_leader_api::LeaderResourceQuery,
-    commands: &dyn klights_leader_api::LeaderResourceCommand,
+pub(crate) async fn register_node_at_addresses(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    db: &dyn crate::datastore::DatastoreBackend,
     node_name: &str,
-    git_commit: &str,
+    profile: &klights_kubelet::node_config::NodeRegistrationProfile,
+    dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,
+    addresses: &NodeRegistrationAddresses,
 ) -> Result<()> {
-    let get = klights_leader_api::node_get_request(
+    let snapshot = NodeRegistrationSnapshot::capture_local(
+        file_process,
         node_name,
-        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
-    )?;
-    let Some(current) = query.get_resource(get).await? else {
-        return Ok(());
-    };
-    let command = current_git_commit_annotation_patch_command(&current, git_commit);
-    let request = klights_leader_api::ResourceCommandRequest::try_new(command)?;
-    commands
-        .submit_resource_command(request)
-        .await
-        .map(|_| ())
-        .map_err(|error| {
-            anyhow::anyhow!("leader rejected Node git-commit annotation patch: {error}")
-        })
+        profile,
+        addresses.clone(),
+        None,
+        None,
+    )
+    .await;
+    crate::bootstrap::node_registration_adapter::register_node_snapshot(
+        db,
+        None,
+        dataplane_health,
+        &snapshot,
+    )
+    .await
 }
 
-fn current_git_commit_annotation_patch_command(
-    node: &klights_cluster_core::Resource,
-    git_commit: &str,
-) -> StorageCommand {
-    use klights_network_api::GIT_COMMIT_ANNOTATION;
-    StorageCommand::PatchResource {
-        api_version: "v1".to_string(),
-        kind: "Node".to_string(),
-        namespace: None,
-        name: node.name.clone(),
-        patch_kind: klights_cluster_core::PatchKind::Merge,
-        patch: serde_json::json!({
-            "metadata": {
-                "annotations": {
-                    GIT_COMMIT_ANNOTATION: git_commit,
-                }
-            }
-        }),
-        preconditions: ResourcePreconditions::from_resource(node),
-        strict_resource_version: true,
-    }
-}
-
-pub(super) async fn send_node_command(
-    outbox: Option<&Outbox>,
-    operation: OutboxOperation,
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn register_node_with_outbox(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    db: &dyn crate::datastore::DatastoreBackend,
+    outbox: &klights_kubelet::node_outbox::Outbox,
     node_name: &str,
-    node_uid: &str,
-    command: StorageCommand,
-    now_ms: i64,
-) -> Result<OutboxSendRoute> {
-    let subject_key = if node_uid.is_empty() {
-        format!("v1/Node/{node_name}")
-    } else {
-        format!("v1/Node/{node_name}/{node_uid}")
-    };
-    OutboxSendPlanner::new(outbox)
-        .route(OutboxCommand {
-            idempotency_key: format!(
-                "{}:{}:{}",
-                operation.as_str(),
-                subject_key,
-                uuid::Uuid::new_v4()
-            ),
-            operation,
-            subject: OutboxSubject {
-                key: subject_key,
-                namespace: None,
-                name: node_name.to_string(),
-                uid: (!node_uid.is_empty()).then(|| node_uid.to_string()),
-            },
-            pod_uid: String::new(),
-            command,
-            now_ms,
-        })
-        .await
-}
-
-pub async fn publish_node_external_ip_if_changed(
-    query: &dyn klights_leader_api::LeaderResourceQuery,
-    publisher: &dyn klights_leader_api::LeaderNodeSelfStatus,
-    node_name: &str,
-    external_ip: &str,
+    profile: &klights_kubelet::node_config::NodeRegistrationProfile,
+    dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,
+    dataplane_external_ip: Option<&str>,
 ) -> Result<()> {
-    let external_ip = external_ip.trim();
-    if external_ip.is_empty() {
-        return Ok(());
-    }
-    let get = klights_leader_api::node_get_request(
+    let node_ip = klights_kubelet::node_ip::resolve_node_ip(node_name).await;
+    let snapshot = NodeRegistrationSnapshot::capture_local(
+        file_process,
         node_name,
-        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
-    )?;
-    let Some(resource) = query.get_resource(get).await? else {
-        return Ok(());
-    };
-    let mut data = (*resource.data).clone();
-    if !set_node_external_ip(&mut data, external_ip) {
-        return Ok(());
-    }
-    let status = data
-        .get("status")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    let request =
-        klights_leader_api::NodeSelfStatusRequest::try_new(StorageCommand::UpdateStatus {
-            api_version: "v1".to_string(),
-            kind: "Node".to_string(),
-            namespace: None,
-            name: node_name.to_string(),
-            status,
-            expected_rv: None,
-            preconditions: ResourcePreconditions::uid(resource.uid),
-            observed_status_stamp: None,
-        })?;
-    publisher.submit_node_self_status(request).await?;
-    Ok(())
+        profile,
+        NodeRegistrationAddresses::new(node_ip, dataplane_external_ip.map(str::to_string)),
+        None,
+        None,
+    )
+    .await;
+    crate::bootstrap::node_registration_adapter::register_node_snapshot(
+        db,
+        Some(outbox),
+        dataplane_health,
+        &snapshot,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -384,8 +155,10 @@ mod tests {
     use super::*;
     use crate::datastore::DatastoreBackend;
     use crate::datastore::node_local::LegacyDeliveryTestStore as _;
-    use crate::kubelet::node_heartbeat::{
-        NODE_HEARTBEAT_INTERVAL, build_lease, run_heartbeat_with_interval,
+    use crate::outbox_test_support::OutboxPayload;
+    use klights_kubelet::node_heartbeat::{
+        NODE_HEARTBEAT_INTERVAL,
+        run_heartbeat_with_interval_for_integration_test as run_heartbeat_with_interval,
     };
     use klights_networking::dataplane_health::DataplaneHealth;
     use std::sync::{Arc as StdArc, Mutex};
@@ -398,7 +171,7 @@ mod tests {
     fn registration_profile(
         node_mode: &crate::bootstrap::NodeMode,
         node_role: &crate::bootstrap::NodeRole,
-    ) -> crate::kubelet::node_config::NodeRegistrationProfile {
+    ) -> klights_kubelet::node_config::NodeRegistrationProfile {
         let peer_mode = match node_mode {
             crate::bootstrap::NodeMode::Root => klights_network_api::NodePeerMode::Root,
             crate::bootstrap::NodeMode::Rootless { .. } => {
@@ -407,15 +180,15 @@ mod tests {
         };
         let role = match node_role {
             crate::bootstrap::NodeRole::Leader { .. } => {
-                crate::kubelet::node_config::KubeletNodeRole::Leader
+                klights_kubelet::node_config::KubeletNodeRole::Leader
             }
             crate::bootstrap::NodeRole::Controlplane { as_learner, .. } => {
-                crate::kubelet::node_config::KubeletNodeRole::Controlplane {
+                klights_kubelet::node_config::KubeletNodeRole::Controlplane {
                     as_learner: *as_learner,
                 }
             }
             crate::bootstrap::NodeRole::Worker { .. } => {
-                crate::kubelet::node_config::KubeletNodeRole::Worker
+                klights_kubelet::node_config::KubeletNodeRole::Worker
             }
         };
         let publish_external_ip = match node_role {
@@ -433,7 +206,7 @@ mod tests {
                 bootstrap: crate::bootstrap::node_role::LeaderBootstrap::Join { .. },
             } => true,
         };
-        crate::kubelet::node_config::NodeRegistrationProfile::new(
+        klights_kubelet::node_config::NodeRegistrationProfile::new(
             peer_mode,
             role,
             publish_external_ip,
@@ -452,13 +225,21 @@ mod tests {
         let file_process = crate::kubelet::file_blocking::test_file_process_executor();
         let profile = registration_profile(node_mode, node_role);
         let dataplane_health = dataplane_health.map(DataplaneHealth::snapshot);
-        crate::kubelet::node_registration::register_node(
+        let node_ip = klights_kubelet::node_ip::resolve_node_ip(node_name).await;
+        let snapshot = NodeRegistrationSnapshot::capture_local(
             &file_process,
-            db,
             node_name,
             &profile,
+            NodeRegistrationAddresses::new(node_ip, dataplane_external_ip.map(str::to_string)),
+            None,
+            None,
+        )
+        .await;
+        crate::bootstrap::node_registration_adapter::register_node_snapshot(
+            db,
+            None,
             dataplane_health.as_ref(),
-            dataplane_external_ip,
+            &snapshot,
         )
         .await
     }
@@ -474,13 +255,20 @@ mod tests {
         let file_process = crate::kubelet::file_blocking::test_file_process_executor();
         let profile = registration_profile(node_mode, node_role);
         let dataplane_health = dataplane_health.map(DataplaneHealth::snapshot);
-        crate::kubelet::node_registration::register_node_at_addresses(
+        let snapshot = NodeRegistrationSnapshot::capture_local(
             &file_process,
-            db,
             node_name,
             &profile,
+            addresses.clone(),
+            None,
+            None,
+        )
+        .await;
+        crate::bootstrap::node_registration_adapter::register_node_snapshot(
+            db,
+            None,
             dataplane_health.as_ref(),
-            addresses,
+            &snapshot,
         )
         .await
     }
@@ -1159,7 +947,7 @@ mod tests {
         let snapshot = NodeRegistrationSnapshot {
             node_name: "remote-cp".to_string(),
             node_mode: crate::controllers::annotations::NodePeerMode::Root,
-            node_role: crate::kubelet::node_config::KubeletNodeRole::Controlplane {
+            node_role: klights_kubelet::node_config::KubeletNodeRole::Controlplane {
                 as_learner: false,
             },
             publish_external_ip: true,
@@ -1889,7 +1677,7 @@ mod tests {
 
     struct FixedHeartbeatClock;
 
-    impl crate::kubelet::node_heartbeat::NodeHeartbeatClock for FixedHeartbeatClock {
+    impl klights_kubelet::node_heartbeat::NodeHeartbeatClock for FixedHeartbeatClock {
         fn now_microtime(&self) -> String {
             "2026-07-27T00:00:00.000000Z".to_string()
         }
@@ -1977,7 +1765,9 @@ mod tests {
         )
         .await
         .expect("open node-local db");
-        let outbox = std::sync::Arc::new(crate::node_outbox::Outbox::new(node_local.clone()));
+        let outbox = std::sync::Arc::new(crate::outbox_test_support::outbox_from_node_db(
+            node_local.clone(),
+        ));
         let publisher = OutboxNodeSelfStatusPublisher::new(
             "worker-a",
             leader_query,
@@ -2052,7 +1842,9 @@ mod tests {
         let publisher = OutboxNodeSelfStatusPublisher::new(
             "worker-a",
             leader_query,
-            std::sync::Arc::new(crate::node_outbox::Outbox::new(node_local.clone())),
+            std::sync::Arc::new(crate::outbox_test_support::outbox_from_node_db(
+                node_local.clone(),
+            )),
             std::sync::Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
         let request =

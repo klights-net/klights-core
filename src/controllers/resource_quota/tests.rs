@@ -14,8 +14,8 @@ async fn make_raft_resourcequota_datastore() -> (
     crate::datastore::sqlite::Datastore,
 ) {
     use crate::datastore::backend::DatastoreHandle;
-    use crate::node_outbox::payload::OutboxOperation;
     use klights_cluster_core::command::StorageCommand;
+    use klights_kubelet::node_outbox::payload::OutboxOperation;
 
     struct InlineProposer {
         inner: DatastoreHandle,
@@ -43,15 +43,15 @@ async fn make_raft_resourcequota_datastore() -> (
             authoring_node: &str,
             _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
         ) -> std::result::Result<
-            crate::node_outbox::OutboxApplyResult,
-            crate::node_outbox::OutboxApplyError,
+            klights_cluster_core::OutboxApplyOutcome,
+            klights_cluster_core::OutboxApplyError,
         > {
             let outcome =
                 crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
                     self.inner.as_ref(),
                     idempotency_key,
                     OutboxOperation::try_from(operation).map_err(|err| {
-                        crate::node_outbox::OutboxApplyError::Retryable(err.to_string())
+                        klights_cluster_core::OutboxApplyError::Retryable(err.to_string())
                     })?,
                     command,
                     authoring_node,

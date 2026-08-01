@@ -812,7 +812,7 @@ mod tests {
                     .inner
                     .build_log_apply_commit_for_command(
                         command,
-                        crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
+                        klights_kubelet::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
                         "orphan-race-proposer",
                     )
                     .await?;
@@ -876,18 +876,20 @@ mod tests {
             _authoring_node: &str,
             _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
         ) -> std::result::Result<
-            crate::node_outbox::OutboxApplyResult,
-            crate::node_outbox::OutboxApplyError,
+            klights_cluster_core::OutboxApplyOutcome,
+            klights_cluster_core::OutboxApplyError,
         > {
-            self.propose_command(command)
-                .await
-                .map_err(|err| crate::node_outbox::OutboxApplyError::Retryable(err.to_string()))?;
+            self.propose_command(command).await.map_err(|err| {
+                klights_cluster_core::OutboxApplyError::Retryable(err.to_string())
+            })?;
             let applied_rv = self
                 .inner
                 .get_current_resource_version()
                 .await
-                .map_err(|err| crate::node_outbox::OutboxApplyError::Retryable(err.to_string()))?;
-            Ok(crate::node_outbox::OutboxApplyResult::Applied { applied_rv })
+                .map_err(|err| {
+                    klights_cluster_core::OutboxApplyError::Retryable(err.to_string())
+                })?;
+            Ok(klights_cluster_core::OutboxApplyOutcome::Applied { applied_rv })
         }
     }
 

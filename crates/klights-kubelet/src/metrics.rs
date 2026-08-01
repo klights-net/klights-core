@@ -11,7 +11,7 @@ use std::time::Duration;
 const NODE_CPU_SAMPLE_DELAY: Duration = Duration::from_millis(100);
 
 async fn collect_local_cri_node_metrics_request(
-    cri: Option<Arc<tokio::sync::Mutex<super::cri::CriClient>>>,
+    cri: Option<Arc<tokio::sync::Mutex<crate::cri::CriClient>>>,
     request: NodeMetricsRequest,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
 ) -> Result<NodeMetricsResult, NodeMetricsError> {
@@ -53,14 +53,14 @@ async fn collect_local_cri_node_metrics_request(
     }
 }
 
-pub(crate) struct CriNodeMetricsSampler {
-    cri: Arc<tokio::sync::Mutex<super::cri::CriClient>>,
+pub struct CriNodeMetricsSampler {
+    cri: Arc<tokio::sync::Mutex<crate::cri::CriClient>>,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl CriNodeMetricsSampler {
-    pub(crate) fn new(
-        cri: Arc<tokio::sync::Mutex<super::cri::CriClient>>,
+    pub fn new(
+        cri: Arc<tokio::sync::Mutex<crate::cri::CriClient>>,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
         Self { cri, supervisor }

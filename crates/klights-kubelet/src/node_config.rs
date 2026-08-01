@@ -1,12 +1,12 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum KubeletNodeRole {
+pub enum KubeletNodeRole {
     Leader,
     Controlplane { as_learner: bool },
     Worker,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NodeRegistrationProfile {
+pub struct NodeRegistrationProfile {
     peer_mode: klights_network_api::NodePeerMode,
     role: KubeletNodeRole,
     publish_external_ip: bool,
@@ -14,7 +14,7 @@ pub(crate) struct NodeRegistrationProfile {
 }
 
 impl NodeRegistrationProfile {
-    pub(crate) fn new(
+    pub fn new(
         peer_mode: klights_network_api::NodePeerMode,
         role: KubeletNodeRole,
         publish_external_ip: bool,
@@ -28,23 +28,23 @@ impl NodeRegistrationProfile {
         }
     }
 
-    pub(crate) fn peer_mode(&self) -> klights_network_api::NodePeerMode {
+    pub fn peer_mode(&self) -> klights_network_api::NodePeerMode {
         self.peer_mode
     }
 
-    pub(crate) fn role(&self) -> KubeletNodeRole {
+    pub fn role(&self) -> KubeletNodeRole {
         self.role
     }
 
-    pub(crate) fn publish_external_ip(&self) -> bool {
+    pub fn publish_external_ip(&self) -> bool {
         self.publish_external_ip
     }
 
-    pub(crate) fn kubelet_version(&self) -> &str {
+    pub fn kubelet_version(&self) -> &str {
         self.build_identity.kubelet_version()
     }
 
-    pub(crate) fn git_commit(&self) -> &str {
+    pub fn git_commit(&self) -> &str {
         self.build_identity.git_commit()
     }
 }

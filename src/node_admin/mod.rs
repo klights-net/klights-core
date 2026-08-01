@@ -11,7 +11,7 @@ use serde::Serialize;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::node_outbox::payload::OutboxOperationExt as _;
+use klights_kubelet::node_outbox::payload::OutboxOperationExt as _;
 use klights_node_store::{
     DeadLetterEntry, DeadLetterKey, DeadLetterReplayRequest, DeadLetterStore,
 };
@@ -120,8 +120,9 @@ async fn dead_letter_replay(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
-    let operation = crate::node_outbox::payload::OutboxOperation::try_from(row.operation())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let operation =
+        klights_kubelet::node_outbox::payload::OutboxOperation::try_from(row.operation())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let payload =
         klights_leader_rpc::storage_wire_codec::decode_outbox_payload_protobuf(row.payload())
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -238,7 +239,7 @@ mod tests {
     }
 
     fn pod_status_payload() -> Vec<u8> {
-        crate::node_outbox::payload::OutboxPayload::from_command(
+        crate::outbox_test_support::OutboxPayload::from_command(
             klights_cluster_core::StorageCommand::UpdateStatus {
                 api_version: "v1".to_string(),
                 kind: "Pod".to_string(),

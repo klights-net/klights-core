@@ -1,5 +1,5 @@
 use crate::bootstrap::{NodeMode, NodeRole};
-use crate::kubelet::node_config::{KubeletNodeRole, NodeRegistrationProfile};
+use klights_kubelet::node_config::{KubeletNodeRole, NodeRegistrationProfile};
 
 /// Translate process-level role and mode flags into the kubelet-owned
 /// registration contract at the composition root.

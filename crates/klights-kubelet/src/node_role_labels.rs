@@ -1,5 +1,5 @@
-fn node_role_label_key(role: &crate::kubelet::node_config::KubeletNodeRole) -> &'static str {
-    use crate::kubelet::node_config::KubeletNodeRole;
+fn node_role_label_key(role: &crate::node_config::KubeletNodeRole) -> &'static str {
+    use crate::node_config::KubeletNodeRole;
     match role {
         KubeletNodeRole::Leader | KubeletNodeRole::Controlplane { .. } => {
             "node-role.kubernetes.io/leader"
@@ -9,11 +9,11 @@ fn node_role_label_key(role: &crate::kubelet::node_config::KubeletNodeRole) -> &
 }
 
 /// Project the backend-neutral control-plane role into Kubernetes Node labels.
-pub(crate) fn role_label_keys_for_projection(
-    role: &crate::kubelet::node_config::KubeletNodeRole,
+pub fn role_label_keys_for_projection(
+    role: &crate::node_config::KubeletNodeRole,
     projection: Option<klights_leader_api::NodeRoleProjection>,
 ) -> Vec<&'static str> {
-    use crate::kubelet::node_config::KubeletNodeRole;
+    use crate::node_config::KubeletNodeRole;
     use klights_leader_api::NodeRoleProjection;
 
     if matches!(role, KubeletNodeRole::Worker) {
@@ -39,7 +39,7 @@ pub(crate) fn role_label_keys_for_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kubelet::node_config::KubeletNodeRole;
+    use crate::node_config::KubeletNodeRole;
     use klights_leader_api::NodeRoleProjection;
 
     #[test]

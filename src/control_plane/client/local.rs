@@ -30,10 +30,10 @@ use crate::control_plane::client::{
 use crate::controllers::ControllerDispatcher;
 use crate::datastore::{DatastoreHandle, Resource};
 use crate::kubelet::pod_repository::store::PodStore;
-#[cfg(test)]
-use crate::node_outbox::payload::OutboxOperationExt as _;
 use klights_cluster_core::LogApplyPodCleanupIntentRow as StoredPodCleanupIntent;
 use klights_cluster_core::command::StorageCommand;
+#[cfg(test)]
+use klights_kubelet::node_outbox::payload::OutboxOperationExt as _;
 
 #[cfg(test)]
 type ProjectedTokenAsyncBoundary = Arc<
@@ -767,7 +767,7 @@ impl LocalApiClient {
     pub(crate) async fn deliver_test_outbox(
         &self,
         idempotency_key: &str,
-        operation: crate::node_outbox::payload::OutboxOperation,
+        operation: klights_kubelet::node_outbox::payload::OutboxOperation,
         payload: bytes::Bytes,
         client_id: &str,
         stream_id: i64,
@@ -1282,9 +1282,10 @@ mod inner_gate_tests {
     use crate::datastore::ReplicatedCreateOptions;
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::{DatastoreBackend, ResourceListQuery};
-    use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
+    use crate::outbox_test_support::OutboxPayload;
     use futures::StreamExt as _;
     use klights_cluster_core::command::StorageCommand;
+    use klights_kubelet::node_outbox::payload::OutboxOperation;
     use klights_leader_api::OutboxDeliveryError as OutboxApplyError;
     use klights_leader_api::{
         LeaderResourceCommand, ResourceCommandError, ResourceCommandRequest, ResourceCommandResult,

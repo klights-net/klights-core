@@ -51,7 +51,6 @@ pub mod node_admin;
 pub mod node_lease_tracker;
 mod node_lifecycle_controller_adapter;
 mod node_metrics_adapter;
-pub mod node_outbox;
 pub(crate) mod node_routing_metadata;
 mod node_subnet_controller_adapter;
 mod node_taint_manager_side_effect_adapter;
@@ -62,7 +61,6 @@ mod pdb_side_effect_adapter;
 pub mod pidfile;
 pub(crate) mod pod_api_service;
 mod pod_event_adapter;
-pub(crate) mod pod_events;
 mod pod_native_adapter;
 mod pod_native_orchestration;
 pub(crate) mod pod_readiness;
@@ -122,7 +120,13 @@ mod leader_rpc_client_integration_tests;
 #[cfg(test)]
 mod leader_rpc_server_tests;
 #[cfg(test)]
-mod node_conditions_tests;
+mod node_outbox_integration_tests;
+#[cfg(test)]
+mod node_output_integration_tests;
+#[cfg(test)]
+mod outbox_test_support;
+#[cfg(test)]
+mod pod_events_integration_tests;
 #[cfg(test)]
 mod raft_node_composition_tests;
 #[cfg(test)]

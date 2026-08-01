@@ -585,9 +585,10 @@ mod tests {
         ));
     }
     use crate::datastore::ResourcePreconditions;
-    use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
+    use crate::outbox_test_support::OutboxPayload;
     use klights_cluster_core::command::StorageCommand;
     use klights_cluster_store::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
+    use klights_kubelet::node_outbox::payload::OutboxOperation;
     use klights_leader_api::{
         OutboxDeliveryError as OutboxApplyError, OutboxDeliveryResult as OutboxApplyResult,
     };

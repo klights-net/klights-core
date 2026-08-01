@@ -1,9 +1,10 @@
 use super::*;
-use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
+use crate::outbox_test_support::OutboxPayload;
 use klights_cluster_core::BuildOutboxOutcome;
 use klights_cluster_core::LogApplyMutation;
 use klights_cluster_core::command::StorageCommand;
 use klights_cluster_store::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
+use klights_kubelet::node_outbox::payload::OutboxOperation;
 use serde_json::json;
 use std::net::Ipv4Addr;
 

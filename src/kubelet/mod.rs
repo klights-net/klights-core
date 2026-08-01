@@ -1,5 +1,4 @@
 pub mod cgroup_cleanup;
-pub mod cni_readiness;
 pub mod containerd_manager {
     pub use klights_kubelet::containerd_manager::*;
 }
@@ -16,17 +15,6 @@ pub mod file_blocking;
 pub mod log_rotation {
     pub use klights_kubelet::log_rotation::*;
 }
-pub(crate) mod metrics;
-pub mod node;
-pub(crate) mod node_config;
-pub mod node_heartbeat;
-pub mod node_ip;
-pub mod node_leader_labels;
-pub mod node_registration;
-pub mod node_role_labels;
-pub mod node_status_merge;
-pub mod node_status_projection;
-pub mod outbox;
 pub mod pod_cluster_runtime;
 pub mod pod_container_config;
 pub mod pod_creation_state {

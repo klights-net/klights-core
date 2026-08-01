@@ -107,7 +107,7 @@ pub struct DatastorePhase {
         Arc<dyn klights_leader_api::LeaderAuthenticatedOutboxDelivery>,
     pub replication_service: Option<Arc<klights_replication::ReplicationService>>,
     pub node_local: crate::datastore::node_local::NodeLocalStores,
-    pub outbox: Arc<crate::node_outbox::Outbox>,
+    pub outbox: Arc<klights_kubelet::node_outbox::Outbox>,
     pub node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
     pub node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
     /// P3-11c: when this node is a leader-class boot under raft mode,
@@ -636,13 +636,13 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 let registration_profile =
                     crate::bootstrap::node_registration_profile::build(node_mode, r);
                 let join_node_registration =
-                    crate::kubelet::node::NodeRegistrationSnapshot::capture_local(
+                    klights_kubelet::node::NodeRegistrationSnapshot::capture_local(
                         &klights_supervisor::FileProcessExecutor::from_supervisor(
                             supervisor.as_ref(),
                         ),
                         &config.node_name,
                         &registration_profile,
-                        crate::kubelet::node::NodeRegistrationAddresses::new(
+                        klights_kubelet::node::NodeRegistrationAddresses::new(
                             node_ip.to_string(),
                             config.external_endpoint.clone(),
                         ),
@@ -825,7 +825,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                                             tracing::warn!(error = %e, "failed to write ca.crt from join response");
                                         }
                                         if let Err(err) =
-                                            crate::kubelet::node::refresh_current_git_commit_annotation_via_leader(
+                                            klights_kubelet::node::refresh_current_git_commit_annotation_via_leader(
                                                 join_resource_query.as_ref(),
                                                 join_resource_commands.as_ref(),
                                                 &node_name,
@@ -935,7 +935,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
 
     let outbox = {
         let notify = Arc::new(tokio::sync::Notify::new());
-        let outbox_stores = crate::node_outbox::OutboxStores::new(
+        let outbox_stores = klights_kubelet::node_outbox::OutboxStores::new(
             node_local.outbox_producer(),
             node_local.outbox_dispatcher(),
             node_local.pod_status_checkpoints(),
@@ -945,87 +945,22 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         let outbox_codec = crate::outbox_payload_codec_adapter::new_codec();
         let outbox_wall_clock: Arc<dyn klights_supervisor::WallClock> =
             Arc::new(klights_supervisor::SystemWallClock);
-        let ob = Arc::new(crate::node_outbox::Outbox::compose(
+        let ob = Arc::new(klights_kubelet::node_outbox::Outbox::compose(
             outbox_stores.clone(),
             outbox_codec.clone(),
             notify.clone(),
             outbox_wall_clock.clone(),
         ));
-        let apply_client = outbox_delivery_client.clone();
-        let outbox_stores_for_retry = outbox_stores.clone();
-        let outbox_codec_for_retry = outbox_codec.clone();
-        let supervisor_for_retry = supervisor.clone();
-        let notify_for_retry = notify.clone();
-        let apply_client_for_retry = apply_client.clone();
-        let shutdown_token_for_retry = shutdown_token.clone();
-        let outbox_wall_clock_for_retry = outbox_wall_clock.clone();
-        match supervisor
-            .spawn_async(
-                klights_supervisor::TaskCategory::Background,
-                "outbox_dispatcher_bootstrap_retry",
-                async move {
-                    let mut delay = std::time::Duration::from_millis(500);
-                    let max_delay = std::time::Duration::from_secs(30);
-                    loop {
-                        let dispatcher = crate::node_outbox::OutboxDispatcher::production(
-                            outbox_stores_for_retry.clone(),
-                            outbox_codec_for_retry.clone(),
-                            apply_client_for_retry.clone(),
-                            notify_for_retry.clone(),
-                            outbox_wall_clock_for_retry.clone(),
-                        );
-                        match dispatcher
-                            .start(
-                                supervisor_for_retry.clone(),
-                                shutdown_token_for_retry.clone(),
-                            )
-                            .await
-                        {
-                            Ok(_) => {
-                                tracing::info!("Outbox dispatcher task started");
-                                return;
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    error = %err,
-                                    delay_ms = %delay.as_millis(),
-                                    "outbox dispatcher start failed; retrying"
-                                );
-                                if supervisor_for_retry
-                                    .timeout(
-                                        "outbox_dispatcher_retry_wait",
-                                        delay,
-                                        std::future::pending::<()>(),
-                                    )
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                let next_delay_ms =
-                                    (delay.as_millis() * 2).min(max_delay.as_millis());
-                                delay = std::time::Duration::from_millis(
-                                    next_delay_ms.try_into().unwrap_or(30_000),
-                                );
-                            }
-                        }
-                    }
-                },
-            )
-            .await
-        {
-            Ok(_) => {
-                tracing::debug!(
-                    "Outbox dispatcher startup is being retried in background if needed"
-                )
-            }
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "failed to spawn outbox dispatcher retry task; continuing with queued writes"
-                )
-            }
-        }
+        klights_kubelet::node_outbox::start_dispatcher_with_bootstrap_retry(
+            outbox_stores,
+            outbox_codec,
+            outbox_delivery_client.clone(),
+            notify,
+            outbox_wall_clock,
+            supervisor.clone(),
+            shutdown_token.clone(),
+        )
+        .await;
         ob
     };
     let (local_api_client, positioned_watch, authenticated_outbox_delivery) = local_services;

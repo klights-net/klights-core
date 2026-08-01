@@ -1154,7 +1154,7 @@ mod tests {
         let newer = leader
             .build_log_apply_commit_for_outbox_with_watermark(
                 "status-newer",
-                crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
+                klights_kubelet::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
                 pod_status_payload(
                     serde_json::json!({"phase": "Running", "message": "newer"}),
                     "uid-1",
@@ -1201,7 +1201,7 @@ mod tests {
         let stale = follower
             .build_log_apply_commit_for_outbox_with_watermark(
                 "status-stale-after-snapshot",
-                crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
+                klights_kubelet::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
                 pod_status_payload(
                     serde_json::json!({"phase": "Running", "message": "stale"}),
                     "uid-1",

@@ -20,7 +20,7 @@ pub struct NetworkPhase {
     pub _containerd_manager: Option<crate::kubelet::ContainerdManager>,
     pub cri_for_pod_watcher: Option<crate::kubelet::CriClient>,
     pub cri_for_api: Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
-    pub cni_readiness: crate::kubelet::cni_readiness::CniReadiness,
+    pub cni_readiness: klights_kubelet::cni_readiness::CniReadiness,
     pub dataplane_health: klights_networking::dataplane_health::DataplaneHealth,
     pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
     pub pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
@@ -79,7 +79,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         shutdown_token,
     } = args;
     let (cni_readiness_publisher, cni_readiness) =
-        crate::kubelet::cni_readiness::CniReadiness::channel();
+        klights_kubelet::cni_readiness::CniReadiness::channel();
     let (assignment_publisher, assignment_waiter) = assignment_bus_views();
     let mode = match node_mode {
         NodeMode::Root => networking::NetworkMode::Root,

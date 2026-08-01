@@ -1889,7 +1889,7 @@ async fn outbox_terminal_decision_rpc_rejects_smuggling_and_malformed_rows_in_or
         preconditions: ResourcePreconditions::uid("node-uid-1"),
         strict_resource_version: false,
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .expect("encode payload");
 
@@ -1897,7 +1897,7 @@ async fn outbox_terminal_decision_rpc_rejects_smuggling_and_malformed_rows_in_or
         .apply_outbox(request_with_node_client_cert(
             klights_internal_protobuf::ApplyOutboxRequest {
                 idempotency_key: "smuggled-node-patch".to_string(),
-                operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
+                operation: klights_kubelet::node_outbox::payload::OutboxOperation::NodeStatus
                     .as_str()
                     .to_string(),
                 payload_proto: payload,
@@ -1930,7 +1930,7 @@ async fn outbox_terminal_decision_rpc_rejects_smuggling_and_malformed_rows_in_or
     assert!(stored.data.pointer("/metadata/labels/smuggled").is_none());
 
     let valid_status_payload = || {
-        crate::node_outbox::payload::OutboxPayload::from_command(StorageCommand::UpdateStatus {
+        crate::outbox_test_support::OutboxPayload::from_command(StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
             kind: "Node".to_string(),
             namespace: None,
@@ -1946,7 +1946,7 @@ async fn outbox_terminal_decision_rpc_rejects_smuggling_and_malformed_rows_in_or
     grpc.apply_outbox(request_with_node_client_cert(
         klights_internal_protobuf::ApplyOutboxRequest {
             idempotency_key: "valid-after-smuggling".to_string(),
-            operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
+            operation: klights_kubelet::node_outbox::payload::OutboxOperation::NodeStatus
                 .as_str()
                 .to_string(),
             payload_proto: valid_status_payload(),
@@ -1965,7 +1965,7 @@ async fn outbox_terminal_decision_rpc_rejects_smuggling_and_malformed_rows_in_or
         .apply_outbox(request_with_node_client_cert(
             klights_internal_protobuf::ApplyOutboxRequest {
                 idempotency_key: "malformed-rpc-row".to_string(),
-                operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
+                operation: klights_kubelet::node_outbox::payload::OutboxOperation::NodeStatus
                     .as_str()
                     .to_string(),
                 payload_proto: vec![0xff, 0x00, 0x81],
@@ -1991,7 +1991,7 @@ async fn outbox_terminal_decision_rpc_rejects_smuggling_and_malformed_rows_in_or
     grpc.apply_outbox(request_with_node_client_cert(
         klights_internal_protobuf::ApplyOutboxRequest {
             idempotency_key: "valid-after-malformed".to_string(),
-            operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
+            operation: klights_kubelet::node_outbox::payload::OutboxOperation::NodeStatus
                 .as_str()
                 .to_string(),
             payload_proto: valid_status_payload(),
@@ -2041,7 +2041,7 @@ async fn node_effect_rpc_rejects_wrong_uid_before_committed_apply() {
         preconditions: ResourcePreconditions::uid("wrong-node-uid"),
         observed_status_stamp: None,
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .expect("encode payload");
 
@@ -2049,7 +2049,7 @@ async fn node_effect_rpc_rejects_wrong_uid_before_committed_apply() {
         .apply_outbox(request_with_node_client_cert(
             klights_internal_protobuf::ApplyOutboxRequest {
                 idempotency_key: "wrong-node-uid".to_string(),
-                operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
+                operation: klights_kubelet::node_outbox::payload::OutboxOperation::NodeStatus
                     .as_str()
                     .to_string(),
                 payload_proto: payload,
@@ -2115,7 +2115,7 @@ async fn grpc_apply_outbox_accepts_joining_controlplane_node_status() {
     ));
     let grpc = super::GrpcReplicationServer::new(service, db.clone());
     let payload =
-        crate::node_outbox::payload::OutboxPayload::from_command(StorageCommand::UpdateStatus {
+        crate::outbox_test_support::OutboxPayload::from_command(StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
             kind: "Node".to_string(),
             namespace: None,
@@ -2144,7 +2144,7 @@ async fn grpc_apply_outbox_accepts_joining_controlplane_node_status() {
         .apply_outbox(request_with_controlplane_client_cert(
             klights_internal_protobuf::ApplyOutboxRequest {
                 idempotency_key: "controlplane2-node-ready".to_string(),
-                operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
+                operation: klights_kubelet::node_outbox::payload::OutboxOperation::NodeStatus
                     .as_str()
                     .to_string(),
                 payload_proto: payload,
@@ -2197,7 +2197,7 @@ async fn outbox_transport_contract_rpc_rejects_unvalidated_stream_identity() {
         endpoint: "192.0.2.10".to_string(),
         port: Some(7679),
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .expect("encode dataplane payload");
 
@@ -2467,7 +2467,7 @@ async fn apply_outbox_rejects_node_dataplane_for_mismatched_author() {
         endpoint: "192.0.2.20".to_string(),
         port: Some(7679),
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -2475,7 +2475,7 @@ async fn apply_outbox_rejects_node_dataplane_for_mismatched_author() {
         .apply_outbox(request_with_node_client_cert(
             klights_internal_protobuf::ApplyOutboxRequest {
                 idempotency_key: "dataplane-worker-2-from-worker-1".to_string(),
-                operation: crate::node_outbox::payload::OutboxOperation::NodeDataplane
+                operation: klights_kubelet::node_outbox::payload::OutboxOperation::NodeDataplane
                     .as_str()
                     .to_string(),
                 payload_proto: payload,
@@ -2574,14 +2574,14 @@ async fn node_effect_observed_leader_endpoint_enqueues_external_ip_status() {
 
     let db = crate::datastore::test_support::in_memory().await;
     let addresses =
-        crate::kubelet::node::NodeRegistrationAddresses::new("172.31.10.2".to_string(), None);
-    let profile = crate::kubelet::node_config::NodeRegistrationProfile::new(
+        klights_kubelet::node::NodeRegistrationAddresses::new("172.31.10.2".to_string(), None);
+    let profile = klights_kubelet::node_config::NodeRegistrationProfile::new(
         klights_network_api::NodePeerMode::Root,
-        crate::kubelet::node_config::KubeletNodeRole::Leader,
+        klights_kubelet::node_config::KubeletNodeRole::Leader,
         false,
         klights_types::BuildIdentity::new("v0.0.0-test", "test-commit"),
     );
-    crate::kubelet::node::register_node_at_addresses(
+    crate::node_output_integration_tests::register_node_at_addresses(
         &crate::kubelet::file_blocking::test_file_process_executor(),
         &db,
         "leader-a",
@@ -2607,10 +2607,12 @@ async fn node_effect_observed_leader_endpoint_enqueues_external_ip_status() {
     )
     .await
     .expect("open node-local outbox");
-    let publisher = crate::kubelet::node::OutboxNodeSelfStatusPublisher::new(
+    let publisher = klights_kubelet::node::OutboxNodeSelfStatusPublisher::new(
         "leader-a",
         query.clone(),
-        Arc::new(crate::node_outbox::Outbox::new(node_local.clone())),
+        Arc::new(crate::outbox_test_support::outbox_from_node_db(
+            node_local.clone(),
+        )),
         Arc::new(TestWallClock),
     );
 
@@ -2630,9 +2632,9 @@ async fn node_effect_observed_leader_endpoint_enqueues_external_ip_status() {
         .expect("external IP status row");
     assert_eq!(
         row.operation,
-        crate::node_outbox::payload::OutboxOperation::NodeStatus.as_str()
+        klights_kubelet::node_outbox::payload::OutboxOperation::NodeStatus.as_str()
     );
-    let payload = crate::node_outbox::payload::OutboxPayload::decode_protobuf(&row.payload_proto)
+    let payload = crate::outbox_test_support::OutboxPayload::decode_protobuf(&row.payload_proto)
         .expect("decode status payload");
     let StorageCommand::UpdateStatus { status, .. } = payload.command else {
         panic!("external IP publication must be status-only")
@@ -3776,14 +3778,14 @@ async fn apply_outbox_pod_status_enqueues_matching_service() {
         },
         observed_status_stamp: None,
     };
-    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let response = grpc
         .apply_outbox(request_with_node_client_cert(
             klights_internal_protobuf::ApplyOutboxRequest {
                 idempotency_key: "pod-status-web-worker".to_string(),
-                operation: crate::node_outbox::payload::OutboxOperation::PodStatus
+                operation: klights_kubelet::node_outbox::payload::OutboxOperation::PodStatus
                     .as_str()
                     .to_string(),
                 payload_proto: payload,
