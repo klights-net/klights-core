@@ -6,7 +6,6 @@
 
 pub mod backend;
 pub mod backend_kind;
-pub mod diagnostics;
 pub mod domain;
 pub mod node_local;
 pub mod pod_serviceaccount;

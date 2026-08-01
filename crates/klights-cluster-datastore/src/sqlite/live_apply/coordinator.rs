@@ -1,5 +1,6 @@
 use super::state::{ApplyEffects, RaftClusterStateApplier, resolve_noop_put_resource_in_tx};
 use super::{queries, transaction_primitives};
+use crate::diagnostics::log_slow_log_apply_commit;
 use klights_cluster_core::{
     ClusterMutation, LogApplyCommit, LogApplyMutation, OutboxStreamWatermark, Resource,
     SnapshotRestoreOperation, WatchReplayPosition,
@@ -1097,28 +1098,6 @@ fn advance_metadata_rv_to_at_least_tx(
         )?;
     }
     Ok(())
-}
-
-fn log_slow_log_apply_commit(
-    elapsed: std::time::Duration,
-    resource_version: i64,
-    mutation_count: usize,
-    pending_watch_events: usize,
-    emit_watch_events: bool,
-) {
-    if elapsed.as_millis() < 50 {
-        return;
-    }
-    tracing::warn!(
-        target: "klights::datastore::slowdown",
-        operation = "log_apply_commit",
-        elapsed_ms = elapsed.as_millis(),
-        resource_version,
-        mutation_count,
-        pending_watch_events,
-        emit_watch_events,
-        "slow log_apply commit"
-    );
 }
 
 pub fn other_error(message: impl Into<String>) -> tokio_rusqlite::Error {

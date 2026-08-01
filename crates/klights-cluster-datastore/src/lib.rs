@@ -4,6 +4,7 @@
 //! migrations, and the supervised database-call boundary. Backend selection
 //! and composition remain the responsibility of the root `klights` package.
 
+pub mod diagnostics;
 pub mod errors;
 mod position_membership;
 pub mod redb;

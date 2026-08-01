@@ -1,6 +1,8 @@
 use serde_json::Value;
 #[cfg(test)]
 use tokio::sync::broadcast;
+#[cfg(test)]
+use tracing::Level;
 
 #[cfg(test)]
 use crate::watch::{WatchContentType, WatchEvent, WatchReceiver};
@@ -11,6 +13,40 @@ use klights_watch::WatchTopic;
 use super::CommitObservationSink;
 use super::{CatchUpResource, Datastore, StagedPostCommit};
 use klights_cluster_core::Resource;
+
+#[cfg(test)]
+fn log_watch_event_broadcast(event: &WatchEvent) {
+    if !tracing::enabled!(target: "klights::datastore::watch_event", Level::DEBUG) {
+        return;
+    }
+
+    let object = event.object.as_ref();
+    let metadata = object.get("metadata").unwrap_or(&Value::Null);
+    tracing::debug!(
+        target: "klights::datastore::watch_event",
+        event_type = %event.event_type,
+        api_version = value_str(object.get("apiVersion")),
+        kind = value_str(object.get("kind")),
+        namespace = value_str(metadata.get("namespace")),
+        name = value_str(metadata.get("name")),
+        uid = value_str(metadata.get("uid")),
+        resource_version = value_str(metadata.get("resourceVersion")),
+        generation = value_i64(metadata.get("generation")),
+        status_phase = value_str(object.pointer("/status/phase")),
+        status_observed_generation = value_i64(object.pointer("/status/observedGeneration")),
+        "broadcasting datastore watch event"
+    );
+}
+
+#[cfg(test)]
+fn value_str(value: Option<&Value>) -> &str {
+    value.and_then(Value::as_str).unwrap_or("")
+}
+
+#[cfg(test)]
+fn value_i64(value: Option<&Value>) -> Option<i64> {
+    value.and_then(Value::as_i64)
+}
 
 /// Free function to publish a pending watch event after DB commit.
 ///
@@ -42,7 +78,7 @@ pub fn publish_pending_batch(
             .filter_map(staged_test_event)
             .collect::<Vec<_>>();
         for event in &events {
-            crate::datastore::diagnostics::log_watch_event_broadcast(event);
+            log_watch_event_broadcast(event);
         }
         crate::watch_commit_observation_adapter::publish_test_events(sink, events);
     }
@@ -145,8 +181,8 @@ impl Datastore {
             uid: Resource::uid_from_data(&data),
             data: std::sync::Arc::new(data),
         };
-        crate::datastore::diagnostics::log_slow_watch_replay_decode(
-            crate::datastore::diagnostics::SlowWatchReplayDecode {
+        klights_cluster_datastore::diagnostics::log_slow_watch_replay_decode(
+            klights_cluster_datastore::diagnostics::SlowWatchReplayDecode {
                 elapsed: start.elapsed(),
                 data_len,
                 api_version: &resource.api_version,

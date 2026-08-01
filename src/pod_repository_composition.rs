@@ -666,8 +666,8 @@ impl crate::kubelet::pod_repository::store::PodPersistence for RootPodPersistenc
         name: &str,
         resource: &klights_cluster_core::Resource,
     ) {
-        crate::datastore::diagnostics::log_noop_resource_write(
-            crate::datastore::diagnostics::NoopResourceWrite {
+        crate::resource_write_diagnostics::log_noop_resource_write(
+            crate::resource_write_diagnostics::NoopResourceWrite {
                 operation: "pod_store_update_status",
                 api_version: "v1",
                 kind: "Pod",

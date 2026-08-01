@@ -279,8 +279,8 @@ where
         resource: &Resource,
         reason: &'static str,
     ) {
-        crate::datastore::diagnostics::log_noop_resource_write(
-            crate::datastore::diagnostics::NoopResourceWrite {
+        crate::resource_write_diagnostics::log_noop_resource_write(
+            crate::resource_write_diagnostics::NoopResourceWrite {
                 operation,
                 api_version: &resource.api_version,
                 kind: &resource.kind,

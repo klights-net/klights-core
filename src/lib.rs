@@ -82,6 +82,7 @@ mod resource_preconditions;
 mod resource_quota_admission_adapter;
 mod resource_quota_controller_adapter;
 mod resource_quota_side_effect_adapter;
+mod resource_write_diagnostics;
 pub mod scheduler;
 mod service_account_defaults_side_effect_adapter;
 mod service_pod_side_effect_adapter;

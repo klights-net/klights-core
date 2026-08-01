@@ -939,8 +939,8 @@ impl Datastore {
                     observed_status_stamp.is_some(),
                 );
                 if live.get("status") == Some(&next_status) {
-                    crate::datastore::diagnostics::log_noop_resource_write(
-                        crate::datastore::diagnostics::NoopResourceWrite {
+                    klights_cluster_datastore::diagnostics::log_noop_resource_write(
+                        klights_cluster_datastore::diagnostics::NoopResourceWrite {
                             operation: "build_raft_status_commit",
                             api_version: &api_version,
                             kind: &kind,
