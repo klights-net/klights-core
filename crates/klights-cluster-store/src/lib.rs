@@ -15,6 +15,8 @@ mod committed_apply;
 mod durable_recovery;
 mod namespace_content;
 mod ownership;
+mod persistence_contract;
+mod persistence_ports;
 mod pod_uid_precondition;
 mod post_commit;
 mod raw_watch_history;
@@ -56,13 +58,24 @@ pub use ownership::{
     ClusterOwnershipRead, OwnedKindRequest, OwnerNameKindRequest, OwnerUidRequest,
     OwnershipReadFuture,
 };
+pub use persistence_contract::{
+    CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation, ListPageRequest,
+    POD_CLEANUP_REASON_NODE_LOST, PositionedWatchReplay, PositionedWatchReplayRead,
+    ReplicatedMembershipState, ReplicatedSnapshotMetadata, ResourceList, ResourceListOptions,
+    SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget, WatchTargetScope,
+};
+pub use persistence_ports::{
+    AppliedOutboxLedger, ClusterMetadataMutation, ClusterNamespaceMutation, ClusterPodCleanupStore,
+    ClusterResourceMutation, ClusterTopologyMutation, ClusterWatchMaintenance,
+    CommittedOutboxApply,
+};
 pub use pod_uid_precondition::{
     PodUidPreconditionError, PodUidPreconditionFuture, PodUidPreconditionRead,
     PodUidPreconditionRequest, PodUidPreconditionState,
 };
-pub use post_commit::StagedPostCommit;
 #[cfg(feature = "test-support")]
 pub use post_commit::StagedResourceEvent;
+pub use post_commit::{CommitObservationSink, StagedPostCommit};
 pub use raw_watch_history::{
     DurableRawWatchEvent, DurableRawWatchHistoryRead, PositionedRawWatchHistoryPage,
     PositionedRawWatchHistoryRead, RawWatchEventsAfterPositionRequest, RawWatchEventsSinceRequest,

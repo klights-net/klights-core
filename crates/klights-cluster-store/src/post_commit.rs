@@ -1,5 +1,7 @@
 //! Neutral values staged by persistence for root-owned post-commit delivery.
 
+use std::any::Any;
+
 #[cfg(feature = "test-support")]
 use bytes::Bytes;
 #[cfg(feature = "test-support")]
@@ -15,6 +17,15 @@ pub struct StagedPostCommit {
     resource_version: i64,
     #[cfg(feature = "test-support")]
     test_event: Option<StagedResourceEvent>,
+}
+
+/// Synchronous, nonblocking post-commit observation port.
+///
+/// Persistence stages neutral facts and invokes this injected sink only after
+/// commit. Root composition owns active watch and reconciliation delivery.
+pub trait CommitObservationSink: Send + Sync {
+    fn observe(&self, observations: &[StagedPostCommit]);
+    fn as_any(&self) -> &dyn Any;
 }
 
 impl StagedPostCommit {
