@@ -136,9 +136,9 @@ impl RedbReadCore {
             let read = database.begin_read()?;
             if api_version == "v1" && kind == "Namespace" && namespace.is_none() {
                 let table = read.open_table(tables::NAMESPACES)?;
-                return Ok(table.get(name.as_str())?.map(|body| {
-                    resource_from_body("v1", "Namespace", None::<String>, &name, 0, body.value())
-                }));
+                return Ok(table
+                    .get(name.as_str())?
+                    .map(|body| namespace_from_body(&name, body.value())));
             }
             let key = resource_key(&api_version, &kind, namespace.as_deref(), &name);
             let table = read.open_table(if namespace.is_some() {
@@ -522,14 +522,7 @@ fn list_namespaces_in_read(
         {
             continue;
         }
-        let resource = resource_from_body(
-            "v1",
-            "Namespace",
-            None::<String>,
-            name.value(),
-            0,
-            body.value(),
-        );
+        let resource = namespace_from_body(name.value(), body.value());
         if labels.iter().all(|requirement| {
             requirement.matches(
                 resource
@@ -616,6 +609,17 @@ fn resource_from_body(
         resource_version,
         data: Arc::new(data),
     }
+}
+
+fn namespace_from_body(name: &str, body: &[u8]) -> Resource {
+    let mut resource = resource_from_body("v1", "Namespace", None::<String>, name, 0, body);
+    resource.resource_version = resource
+        .data
+        .pointer("/metadata/resourceVersion")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default();
+    resource
 }
 
 fn resource_from_data(

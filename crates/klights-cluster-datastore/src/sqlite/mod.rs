@@ -1,6 +1,7 @@
 //! SQLite cluster schema and explicit open adapters.
 
 mod apply_ledger;
+pub mod embedded;
 pub mod filters;
 mod fingerprint;
 pub mod live_apply;

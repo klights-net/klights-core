@@ -9,7 +9,40 @@ use serde_json::Value;
 use super::super::RedbAccessor;
 use super::super::mutation_helpers as helpers;
 use super::super::tables;
-use klights_cluster_core::Resource;
+use klights_cluster_core::{Resource, ResourcePreconditions};
+
+fn normalize_namespace(data: &mut Value, name: &str) -> Result<()> {
+    let object = data
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Namespace persistence requires a JSON object"))?;
+    object.insert("apiVersion".to_string(), Value::from("v1"));
+    object.insert("kind".to_string(), Value::from("Namespace"));
+    let metadata = object
+        .entry("metadata".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let metadata = metadata
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Namespace metadata must be a JSON object"))?;
+    metadata.insert("name".to_string(), Value::from(name));
+    metadata.remove("namespace");
+    Ok(())
+}
+
+fn namespace_resource_version(data: &Value) -> i64 {
+    data.pointer("/metadata/resourceVersion")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default()
+}
+
+fn stamp_namespace_resource_version(data: &mut Value, resource_version: i64) {
+    if let Some(metadata) = data.pointer_mut("/metadata").and_then(Value::as_object_mut) {
+        metadata.insert(
+            "resourceVersion".to_string(),
+            Value::from(resource_version.to_string()),
+        );
+    }
+}
 
 #[derive(Clone)]
 pub struct RedbOrdinaryNamespaceStore {
@@ -52,19 +85,28 @@ impl RedbOrdinaryNamespaceStore {
     pub async fn create_namespace(
         &self,
         name: &str,
-        data: Value,
+        mut data: Value,
     ) -> Result<(Resource, Option<klights_cluster_store::StagedPostCommit>)> {
+        normalize_namespace(&mut data, name)?;
+        helpers::ensure_uid(&mut data);
         let name_owned = name.to_string();
         self.db_call_with_post_commit("create_ns", move |db| {
             let name: &str = &name_owned;
-            let body = serde_json::to_vec(&data)?;
             let w = db.begin_write()?;
+            {
+                let t = w.open_table(tables::NAMESPACES)?;
+                if t.get(name)?.is_some() {
+                    return Err(crate::errors::DatastoreError::already_exists(format!(
+                        "namespaces \"{name}\" already exists"
+                    ))
+                    .into());
+                }
+            }
             let rv = helpers::incr_rv(&w)?;
+            stamp_namespace_resource_version(&mut data, rv);
+            let body = serde_json::to_vec(&data)?;
             {
                 let mut t = w.open_table(tables::NAMESPACES)?;
-                if t.get(name)?.is_some() {
-                    return Err(anyhow!("exists"));
-                }
                 t.insert(name, body.as_slice())?;
             }
             let ev = serde_json::json!({"apiVersion":"v1","kind":"Namespace","namespace":null,"name":name,"eventType":"ADDED","data":data});
@@ -97,20 +139,52 @@ impl RedbOrdinaryNamespaceStore {
         &self,
         name: &str,
         data: Value,
-        _expected_rv: i64,
+        expected_rv: i64,
     ) -> Result<Resource> {
+        self.update_namespace_with_preconditions(
+            name,
+            data,
+            ResourcePreconditions::resource_version(expected_rv),
+        )
+        .await
+    }
+
+    pub async fn update_namespace_with_preconditions(
+        &self,
+        name: &str,
+        mut data: Value,
+        preconditions: ResourcePreconditions,
+    ) -> Result<Resource> {
+        normalize_namespace(&mut data, name)?;
         let name_owned = name.to_string();
         self.db_call("update_ns_impl", move |db| {
             let name: &str = &name_owned;
-            let b = serde_json::to_vec(&data)?;
             let w = db.begin_write()?;
+            let current = {
+                let t = w.open_table(tables::NAMESPACES)?;
+                let Some(current) = t.get(name)? else {
+                    return Err(crate::errors::DatastoreError::not_found(format!(
+                        "Namespace {name} not found"
+                    ))
+                    .into());
+                };
+                serde_json::from_slice::<Value>(current.value())?
+            };
+            let current_rv = namespace_resource_version(&current);
+            helpers::validate_uid_immutable(&data, &current)?;
+            helpers::validate_resource_preconditions(
+                &preconditions,
+                &current,
+                current_rv,
+            )?;
+            helpers::preserve_server_metadata_fields_from_existing(&mut data, &current);
+            helpers::ensure_uid(&mut data);
             let rv = helpers::incr_rv(&w)?;
+            stamp_namespace_resource_version(&mut data, rv);
+            let body = serde_json::to_vec(&data)?;
             {
                 let mut t = w.open_table(tables::NAMESPACES)?;
-                if t.get(name)?.is_none() {
-                    return Err(anyhow!("not found"));
-                }
-                t.insert(name, b.as_slice())?;
+                t.insert(name, body.as_slice())?;
             }
             let ev = serde_json::json!({"apiVersion":"v1","kind":"Namespace","namespace":null,"name":name,"eventType":"MODIFIED","data":data});
             helpers::watch_insert(&w, rv, &ev)?;
@@ -130,10 +204,38 @@ impl RedbOrdinaryNamespaceStore {
     }
 
     pub async fn delete_namespace(&self, name: &str) -> Result<()> {
+        self.delete_namespace_observed_rv(name).await.map(|_| ())
+    }
+
+    pub async fn delete_namespace_observed_rv(&self, name: &str) -> Result<i64> {
+        self.delete_namespace_with_preconditions(name, ResourcePreconditions::default())
+            .await
+    }
+
+    pub async fn delete_namespace_with_preconditions(
+        &self,
+        name: &str,
+        preconditions: ResourcePreconditions,
+    ) -> Result<i64> {
         let name_owned = name.to_string();
         self.db_call("delete_ns_impl", move |db| {
             let name: &str = &name_owned;
             let w = db.begin_write()?;
+            let current = {
+                let table = w.open_table(tables::NAMESPACES)?;
+                let Some(current) = table.get(name)? else {
+                    return Err(crate::errors::DatastoreError::not_found(format!(
+                        "Namespace {name} not found"
+                    ))
+                    .into());
+                };
+                serde_json::from_slice::<Value>(current.value())?
+            };
+            helpers::validate_resource_preconditions(
+                &preconditions,
+                &current,
+                namespace_resource_version(&current),
+            )?;
             {
                 let res = w.open_table(tables::RES_NS)?;
                 for entry in res.iter()? {
@@ -151,8 +253,18 @@ impl RedbOrdinaryNamespaceStore {
                 let mut t = w.open_table(tables::NAMESPACES)?;
                 t.remove(name)?;
             }
+            let rv = helpers::incr_rv(&w)?;
+            let ev = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "namespace": null,
+                "name": name,
+                "eventType": "DELETED",
+                "data": current
+            });
+            helpers::watch_insert(&w, rv, &ev)?;
             w.commit()?;
-            Ok(())
+            Ok(rv)
         })
         .await
     }
@@ -213,7 +325,7 @@ mod tests {
         }
 
         async fn delete_ns_impl(&self, name: &str) -> Result<()> {
-            self.ordinary.delete_namespace(name).await
+            self.ordinary.delete_namespace(name).await.map(|_| ())
         }
 
         async fn list_namespace_resources_impl(&self, namespace: &str) -> Result<Vec<Resource>> {

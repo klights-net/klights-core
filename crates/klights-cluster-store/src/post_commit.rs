@@ -16,7 +16,7 @@ pub struct StagedPostCommit {
     namespace: Option<String>,
     resource_version: i64,
     #[cfg(feature = "test-support")]
-    test_event: Option<StagedResourceEvent>,
+    test_event: Option<Box<StagedResourceEvent>>,
 }
 
 /// Synchronous, nonblocking post-commit observation port.
@@ -68,17 +68,17 @@ impl StagedPostCommit {
         resource: Resource,
         encoded_json: Option<Bytes>,
     ) -> Self {
-        self.test_event = Some(StagedResourceEvent {
+        self.test_event = Some(Box::new(StagedResourceEvent {
             event_type: event_type.into(),
             resource,
             encoded_json,
-        });
+        }));
         self
     }
 
     #[cfg(feature = "test-support")]
-    pub const fn test_event(&self) -> Option<&StagedResourceEvent> {
-        self.test_event.as_ref()
+    pub fn test_event(&self) -> Option<&StagedResourceEvent> {
+        self.test_event.as_deref()
     }
 }
 

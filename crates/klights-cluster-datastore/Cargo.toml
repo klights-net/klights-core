@@ -10,7 +10,7 @@ publish.workspace = true
 
 [features]
 default = []
-test-support = []
+test-support = ["klights-cluster-store/test-support"]
 sqlcipher = [
     "rusqlite/bundled-sqlcipher-vendored-openssl",
     "klights-supervisor/sqlcipher",
