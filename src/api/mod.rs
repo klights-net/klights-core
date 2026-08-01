@@ -284,8 +284,6 @@ use crate::api::status::{
     update_volumeattachment_status,
 };
 use crate::api::watch_event::WatchEvent;
-#[cfg(test)]
-use crate::controllers;
 use klights_cluster_core::Resource;
 use klights_types::LabelSelector;
 

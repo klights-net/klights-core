@@ -2,6 +2,12 @@
 
 use std::sync::Arc;
 
+pub(crate) fn controller_store_for_test(
+    db: &crate::datastore::sqlite::Datastore,
+) -> crate::controller_runtime_adapter::RootControllerLeaderPort {
+    crate::controller_runtime_adapter::RootControllerLeaderPort::new(Arc::new(db.clone()))
+}
+
 struct TestGcNonPodFinalizationPort;
 
 impl klights_reconcile_api::GcNonPodFinalizationPort for TestGcNonPodFinalizationPort {

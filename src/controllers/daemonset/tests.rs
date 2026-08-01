@@ -14,8 +14,9 @@ fn active_pods(items: &[Resource]) -> Vec<&Resource> {
 /// in-memory `Datastore`.
 async fn reconcile_daemonset_test(db: &Datastore, daemonset: &Value) -> anyhow::Result<()> {
     let repo = crate::controllers::test_utils::pod_repository_for_test(db);
+    let store = crate::controllers::test_utils::controller_store_for_test(db);
     super::reconcile_daemonset(
-        db,
+        &store,
         repo.as_ref(),
         repo.as_ref(),
         repo.as_ref(),

@@ -46,7 +46,7 @@ mod tests {
         // Reconcile should succeed (not return error) and set failure condition
         let coordination = klights_controllers::ControllerCoordination::new();
         let result = crate::controllers::deployment::reconcile_deployment(
-            &db,
+            &crate::controllers::test_utils::controller_store_for_test(&db),
             __pod_repo.as_ref(),
             __pod_repo.as_ref(),
             __pod_repo.as_ref(),

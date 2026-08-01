@@ -28,7 +28,7 @@ where
 #[async_trait]
 impl<T> StatefulSetStore for T
 where
-    T: DatastoreBackend + Send + Sync + ?Sized,
+    T: DatastoreBackend + klights_controllers::gc::GcResourceStore + Send + Sync + ?Sized,
 {
     async fn get_statefulset(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
         DatastoreBackend::get_resource(self, "apps/v1", "StatefulSet", Some(namespace), name)

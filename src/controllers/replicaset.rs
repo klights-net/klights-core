@@ -6,7 +6,7 @@ use klights_reconcile_api::{ControllerStoreResult, GcPodDeleteSink};
 use serde_json::{Value, json};
 
 #[async_trait]
-pub trait ReplicaSetStore: crate::controllers::gc::GcResourceStore + Send + Sync {
+pub trait ReplicaSetStore: klights_controllers::gc::GcResourceStore + Send + Sync {
     async fn get_replicaset(
         &self,
         namespace: &str,
@@ -80,7 +80,7 @@ pub(crate) async fn reconcile_replicaset(
         None => return Ok(()),
     };
 
-    let live_resource = match crate::controllers::gc::reconcile_owner_references(
+    let live_resource = match klights_controllers::gc::reconcile_owner_references(
         db,
         live_resource.clone(),
         pod_delete_sink,
@@ -89,8 +89,8 @@ pub(crate) async fn reconcile_replicaset(
     )
     .await?
     {
-        crate::controllers::gc::OwnerReferenceReconcile::Deleted => return Ok(()),
-        crate::controllers::gc::OwnerReferenceReconcile::OwnerReferencesUpdated => {
+        klights_controllers::gc::OwnerReferenceReconcile::Deleted => return Ok(()),
+        klights_controllers::gc::OwnerReferenceReconcile::OwnerReferencesUpdated => {
             match db.get_replicaset(namespace, name).await? {
                 Some(r) => r,
                 None => return Ok(()),

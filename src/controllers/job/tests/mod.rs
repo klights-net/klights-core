@@ -23,8 +23,9 @@ async fn reconcile_job_test(
     let repo = crate::controllers::test_utils::pod_repository_for_test(db);
     let non_pod_finalization =
         crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(db.clone()));
+    let store = crate::controllers::test_utils::controller_store_for_test(db);
     super::reconcile_job(
-        db,
+        &store,
         repo.as_ref(),
         repo.as_ref(),
         repo.as_ref(),
@@ -246,7 +247,7 @@ async fn test_job_create_loop_observes_live_parallelism_scale_down() {
     let job_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
 
     super::reconcile_job(
-        &db,
+        &crate::controllers::test_utils::controller_store_for_test(&db),
         pod_reader.as_ref(),
         pod_writer.as_ref(),
         pod_reader.as_ref(),

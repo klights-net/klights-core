@@ -14,7 +14,6 @@ pub mod deployment;
 pub mod deployment_controller;
 mod dispatcher;
 pub mod endpoints_controller;
-pub mod gc;
 pub mod hpa;
 pub mod job;
 pub mod job_controller;

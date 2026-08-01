@@ -39,7 +39,7 @@ where
 #[async_trait]
 impl<T> JobStore for T
 where
-    T: DatastoreBackend + Send + Sync + ?Sized,
+    T: DatastoreBackend + klights_controllers::gc::GcResourceStore + Send + Sync + ?Sized,
 {
     async fn get_job(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
         DatastoreBackend::get_resource(self, "batch/v1", "Job", Some(namespace), name)

@@ -10,8 +10,9 @@ async fn reconcile_statefulset_test(
     node_name: &str,
 ) -> anyhow::Result<()> {
     let repo = crate::controllers::test_utils::pod_repository_for_test(db);
+    let store = crate::controllers::test_utils::controller_store_for_test(db);
     super::reconcile_statefulset(
-        db,
+        &store,
         repo.as_ref(),
         repo.as_ref(),
         repo.as_ref(),

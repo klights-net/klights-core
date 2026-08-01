@@ -739,14 +739,14 @@ async fn test_endpointslice_deleted_when_service_deleted_via_cascade() {
 
     // Now simulate cascade delete (what happens when Service is deleted)
     let coordination = klights_controllers::ControllerCoordination::new();
-    crate::controllers::gc::cascade_delete_with_uid(
+    klights_controllers::gc::cascade_delete_with_uid(
         &controller_store(&db),
         "test-service-uid-123",
         "v1",
         "test-service",
         "Service",
         Some("test".to_string()),
-        &crate::controllers::gc::NoOpGcPodDeleteSink,
+        &crate::gc_ownership_integration_tests::NoOpGcPodDeleteSink,
         &crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(
             db.clone(),
         )),

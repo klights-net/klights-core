@@ -3,14 +3,11 @@ use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_reconcile_api::ControllerStoreResult as Result;
 
 use crate::controller_store_error_adapter::map_controller_store_error;
-use crate::controllers::gc::GcResourceStore;
 use crate::datastore::{DatastoreBackend, ResourceListQuery};
+use klights_controllers::gc::GcResourceStore;
 
 #[async_trait]
-impl<T> GcResourceStore for T
-where
-    T: DatastoreBackend + Send + Sync + ?Sized,
-{
+impl GcResourceStore for dyn DatastoreBackend + '_ {
     async fn list_custom_resource_definitions(&self) -> Result<Vec<Resource>> {
         Ok(self
             .list_resources(

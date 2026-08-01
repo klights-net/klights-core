@@ -139,7 +139,7 @@ impl FinalizerLifecyclePort for DatastoreFinalizerLifecycleAdapter {
 
     fn orphan_children(&self, request: FinalizerOrphanRequest) -> FinalizerLifecycleFuture<'_, ()> {
         Box::pin(async move {
-            crate::controllers::gc::orphan_children(
+            klights_controllers::gc::orphan_children(
                 self.db.as_ref(),
                 &request.owner_uid,
                 request.target.api_version(),
@@ -158,7 +158,7 @@ impl FinalizerLifecyclePort for DatastoreFinalizerLifecycleAdapter {
     ) -> FinalizerLifecycleFuture<'_, ()> {
         Box::pin(async move {
             let resource = request.resource;
-            if let Err(error) = crate::controllers::gc::cascade_delete_with_uid(
+            if let Err(error) = klights_controllers::gc::cascade_delete_with_uid(
                 self.db.as_ref(),
                 &resource.uid,
                 &resource.api_version,
@@ -253,7 +253,7 @@ impl FinalizerLifecyclePort for BorrowedFinalizerLifecycleStore<'_> {
 
     fn orphan_children(&self, request: FinalizerOrphanRequest) -> FinalizerLifecycleFuture<'_, ()> {
         Box::pin(async move {
-            crate::controllers::gc::orphan_children(
+            klights_controllers::gc::orphan_children(
                 self.db,
                 &request.owner_uid,
                 request.target.api_version(),

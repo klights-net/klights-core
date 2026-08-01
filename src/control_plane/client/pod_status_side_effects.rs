@@ -268,7 +268,7 @@ async fn finalize_foreground_owners_after_pod_delete(
         return;
     };
     let deleted_resource = resource.clone();
-    if let Err(err) = crate::controllers::gc::finalize_foreground_owners_after_dependent_delete(
+    if let Err(err) = klights_controllers::gc::finalize_foreground_owners_after_dependent_delete(
         db,
         &deleted_resource,
         gc_pod_delete_sink,
@@ -322,7 +322,7 @@ async fn cascade_dependents_after_actor_pod_delete(
     if uid.is_empty() {
         return Err("committed bound Pod finalization receipt has no metadata.uid".to_string());
     }
-    crate::controllers::gc::cascade_delete_with_uid(
+    klights_controllers::gc::cascade_delete_with_uid(
         db,
         uid,
         &resource.api_version,

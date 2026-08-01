@@ -28,7 +28,7 @@ where
 #[async_trait]
 impl<T> DaemonSetStore for T
 where
-    T: DatastoreBackend + Send + Sync + ?Sized,
+    T: DatastoreBackend + klights_controllers::gc::GcResourceStore + Send + Sync + ?Sized,
 {
     async fn list_controller_revisions(&self, namespace: &str) -> Result<Vec<Resource>> {
         Ok(self

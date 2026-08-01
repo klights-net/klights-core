@@ -27,7 +27,7 @@ where
 #[async_trait]
 impl<T> DeploymentStore for T
 where
-    T: DatastoreBackend + Send + Sync + ?Sized,
+    T: DatastoreBackend + klights_controllers::gc::GcResourceStore + Send + Sync + ?Sized,
 {
     async fn list_replicasets(&self, namespace: &str) -> Result<Vec<Resource>> {
         Ok(self

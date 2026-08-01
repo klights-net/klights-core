@@ -6,7 +6,7 @@ use klights_reconcile_api::{ControllerStoreResult, compute_statefulset_update_re
 use serde_json::{Value, json};
 
 #[async_trait]
-pub trait StatefulSetStore: crate::controllers::gc::GcResourceStore + Send + Sync {
+pub trait StatefulSetStore: klights_controllers::gc::GcResourceStore + Send + Sync {
     async fn get_statefulset(
         &self,
         namespace: &str,
@@ -144,7 +144,7 @@ pub(crate) async fn reconcile_statefulset(
         Some(resource) => resource,
         None => return Ok(()),
     };
-    let live_resource = match crate::controllers::gc::reconcile_owner_references(
+    let live_resource = match klights_controllers::gc::reconcile_owner_references(
         db,
         live_resource.clone(),
         pod_delete_sink,
@@ -153,8 +153,8 @@ pub(crate) async fn reconcile_statefulset(
     )
     .await?
     {
-        crate::controllers::gc::OwnerReferenceReconcile::Deleted => return Ok(()),
-        crate::controllers::gc::OwnerReferenceReconcile::OwnerReferencesUpdated => {
+        klights_controllers::gc::OwnerReferenceReconcile::Deleted => return Ok(()),
+        klights_controllers::gc::OwnerReferenceReconcile::OwnerReferencesUpdated => {
             match db.get_statefulset(namespace, name).await? {
                 Some(resource) => resource,
                 None => return Ok(()),

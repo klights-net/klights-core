@@ -7,8 +7,9 @@ use serde_json::json;
 async fn reconcile_rc_test(db: &Datastore, rc: &Value, node_name: &str) -> anyhow::Result<()> {
     let repo = crate::controllers::test_utils::pod_repository_for_test(db);
     let coordination = klights_controllers::ControllerCoordination::new();
+    let store = crate::controllers::test_utils::controller_store_for_test(db);
     super::reconcile_replicationcontroller(
-        db,
+        &store,
         repo.as_ref(),
         repo.as_ref(),
         repo.as_ref(),
@@ -46,7 +47,7 @@ async fn test_rc_publishes_replica_failure_condition_on_create_failure() {
     let db = crate::datastore::test_support::in_memory().await;
     setup_db_with_rc(&db, "test-rc").await;
     update_replicationcontroller_status(
-        &db,
+        &crate::controllers::test_utils::controller_store_for_test(&db),
         "test-rc",
         "default",
         &[],
@@ -78,7 +79,7 @@ async fn test_rc_clears_replica_failure_condition_when_healthy() {
     let db = crate::datastore::test_support::in_memory().await;
     setup_db_with_rc(&db, "test-rc-ok").await;
     update_replicationcontroller_status(
-        &db,
+        &crate::controllers::test_utils::controller_store_for_test(&db),
         "test-rc-ok",
         "default",
         &[],

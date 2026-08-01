@@ -48,7 +48,7 @@ impl klights_reconcile_api::GcOwnerLifecyclePort for GcOwnerLifecycleAdapter {
         resource: Resource,
     ) -> klights_reconcile_api::ReconcileSinkFuture<'_> {
         Box::pin(async move {
-            crate::controllers::gc::reconcile_owner_references(
+            klights_controllers::gc::reconcile_owner_references(
                 self.db.as_ref(),
                 resource,
                 self.pod_delete_sink.as_ref(),
@@ -66,7 +66,7 @@ impl klights_reconcile_api::GcOwnerLifecyclePort for GcOwnerLifecycleAdapter {
         owner: klights_reconcile_api::GcOwnerIdentity,
     ) -> klights_reconcile_api::ReconcileSinkFuture<'_> {
         Box::pin(async move {
-            crate::controllers::gc::cascade_delete_with_uid(
+            klights_controllers::gc::cascade_delete_with_uid(
                 self.db.as_ref(),
                 &owner.uid,
                 &owner.api_version,
@@ -87,7 +87,7 @@ impl klights_reconcile_api::GcOwnerLifecyclePort for GcOwnerLifecycleAdapter {
         owner: klights_reconcile_api::GcOwnerIdentity,
     ) -> klights_reconcile_api::GcOwnerBoolFuture<'_> {
         Box::pin(async move {
-            crate::controllers::gc::owner_cascade_sweep_once(
+            klights_controllers::gc::owner_cascade_sweep_once(
                 self.db.as_ref(),
                 &owner.uid,
                 &owner.api_version,
@@ -108,7 +108,7 @@ impl klights_reconcile_api::GcOwnerLifecyclePort for GcOwnerLifecycleAdapter {
         owner: Resource,
     ) -> klights_reconcile_api::GcOwnerBoolFuture<'_> {
         Box::pin(async move {
-            crate::controllers::gc::finalize_foreground_owner_if_ready(
+            klights_controllers::gc::finalize_foreground_owner_if_ready(
                 self.db.as_ref(),
                 &owner,
                 self.pod_delete_sink.as_ref(),

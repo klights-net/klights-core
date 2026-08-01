@@ -4,8 +4,6 @@ use futures::StreamExt as _;
 use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 use klights_reconcile_api::{GcForegroundDeleteCoordination, GcPodDeleteRequest, GcPodDeleteSink};
-#[cfg(test)]
-use klights_reconcile_api::{GcPodDeleteError, GcPodDeleteFuture};
 use klights_types::PodIdentity;
 use std::collections::HashSet;
 
@@ -55,23 +53,6 @@ pub trait GcResourceStore: Send + Sync {
 }
 
 const OWNER_REF_UPDATE_MAX_CONFLICT_RETRIES: usize = 8;
-
-/// No-op sink for use in tests and contexts where Pod children will not
-/// be encountered. Returns a typed unavailable error if called for a Pod
-/// delete; tests involving Pod children must use a recording sink instead.
-#[cfg(test)]
-pub struct NoOpGcPodDeleteSink;
-
-#[cfg(test)]
-impl GcPodDeleteSink for NoOpGcPodDeleteSink {
-    fn request_gc_pod_delete(&self, _request: GcPodDeleteRequest) -> GcPodDeleteFuture<'_> {
-        Box::pin(async {
-            Err(GcPodDeleteError::unavailable(
-                "no-op sink must not be called for Pod deletes — use a recording sink for Pod tests",
-            ))
-        })
-    }
-}
 
 fn is_core_pod(resource: &Resource) -> bool {
     resource.api_version == "v1" && resource.kind == "Pod"
@@ -1757,4 +1738,121 @@ async fn finalize_foreground_owner_resource(
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[test]
+    fn builtin_owner_scope_is_deterministic() {
+        let cases = [
+            ("v1", "Pod", Some(OwnerScope::Namespaced)),
+            ("v1", "Namespace", Some(OwnerScope::Cluster)),
+            ("apps/v1", "Deployment", Some(OwnerScope::Namespaced)),
+            ("example.test/v1", "Widget", None),
+        ];
+
+        for (api_version, kind, expected) in cases {
+            assert_eq!(builtin_owner_scope(api_version, kind), expected);
+        }
+    }
+
+    #[test]
+    fn owner_reference_matching_preserves_uid_identity() {
+        let exact_uid = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "name": "replacement-name",
+            "uid": "owner-uid"
+        });
+        assert!(owner_ref_matches(
+            &exact_uid,
+            "owner-uid",
+            "apps/v1",
+            "owner",
+            "Deployment"
+        ));
+
+        let replacement = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "name": "owner",
+            "uid": "replacement-uid"
+        });
+        assert!(!owner_ref_matches(
+            &replacement,
+            "owner-uid",
+            "apps/v1",
+            "owner",
+            "Deployment"
+        ));
+    }
+
+    #[test]
+    fn empty_uid_owner_reference_matches_full_type_and_name() {
+        let reference = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "name": "owner",
+            "uid": ""
+        });
+        assert!(owner_ref_matches(
+            &reference,
+            "",
+            "apps/v1",
+            "owner",
+            "Deployment"
+        ));
+        assert!(!owner_ref_matches(
+            &reference,
+            "",
+            "apps/v1",
+            "owner",
+            "StatefulSet"
+        ));
+    }
+
+    #[test]
+    fn pod_and_termination_classification_uses_kubernetes_identity() {
+        let pod = Resource::from_data_lossy(Arc::new(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "occupied",
+                "namespace": "default",
+                "uid": "pod-uid",
+                "deletionTimestamp": "2026-08-01T00:00:00Z"
+            }
+        })));
+        assert!(is_core_pod(&pod));
+        assert!(has_deletion_timestamp(&pod));
+
+        let same_name_replacement = Resource::from_data_lossy(Arc::new(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "occupied",
+                "namespace": "default",
+                "uid": "replacement-uid"
+            }
+        })));
+        assert!(is_core_pod(&same_name_replacement));
+        assert!(!has_deletion_timestamp(&same_name_replacement));
+        assert_ne!(pod.uid, same_name_replacement.uid);
+    }
+
+    #[test]
+    fn cascade_owner_key_requires_uid_or_name_and_keeps_namespace() {
+        assert!(CascadeOwnerKey::new("", "apps/v1", "", "Deployment", None).is_none());
+        let key = CascadeOwnerKey::new(
+            "owner-uid",
+            "apps/v1",
+            "owner",
+            "Deployment",
+            Some("default".to_string()),
+        )
+        .expect("UID-qualified owner identity must be accepted");
+        assert_eq!(key.uid, "owner-uid");
+        assert_eq!(key.namespace.as_deref(), Some("default"));
+    }
+}

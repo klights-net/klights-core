@@ -39,7 +39,7 @@ where
 #[async_trait]
 impl<T> ReplicaSetStore for T
 where
-    T: DatastoreBackend + Send + Sync + ?Sized,
+    T: DatastoreBackend + klights_controllers::gc::GcResourceStore + Send + Sync + ?Sized,
 {
     async fn get_replicaset(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
         DatastoreBackend::get_resource(self, "apps/v1", "ReplicaSet", Some(namespace), name)

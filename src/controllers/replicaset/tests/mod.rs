@@ -19,8 +19,11 @@ where
 {
     let non_pod_finalization =
         crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(db.clone()));
+    let store = crate::controller_runtime_adapter::RootControllerLeaderPort::new(
+        std::sync::Arc::new(db.clone()),
+    );
     super::reconcile_replicaset(
-        db,
+        &store,
         pod_reader,
         pod_writer,
         pod_delete_sink,

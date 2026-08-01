@@ -18,7 +18,7 @@ use std::task::Poll;
 
 #[async_trait]
 pub trait ReplicationControllerStore:
-    crate::controllers::gc::GcResourceStore + Send + Sync
+    klights_controllers::gc::GcResourceStore + Send + Sync
 {
     async fn get_replication_controller(
         &self,
@@ -124,7 +124,7 @@ pub(crate) async fn reconcile_replicationcontroller(
         None => return Ok(()),
     };
 
-    let live_resource = match crate::controllers::gc::reconcile_owner_references(
+    let live_resource = match klights_controllers::gc::reconcile_owner_references(
         db,
         live_resource.clone(),
         pod_delete_sink,
@@ -133,8 +133,8 @@ pub(crate) async fn reconcile_replicationcontroller(
     )
     .await?
     {
-        crate::controllers::gc::OwnerReferenceReconcile::Deleted => return Ok(()),
-        crate::controllers::gc::OwnerReferenceReconcile::OwnerReferencesUpdated => {
+        klights_controllers::gc::OwnerReferenceReconcile::Deleted => return Ok(()),
+        klights_controllers::gc::OwnerReferenceReconcile::OwnerReferencesUpdated => {
             match db.get_replication_controller(namespace, rc_name).await? {
                 Some(resource) => resource,
                 None => return Ok(()),

@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 #[async_trait]
-pub trait JobStore: crate::controllers::gc::GcResourceStore + Send + Sync {
+pub trait JobStore: klights_controllers::gc::GcResourceStore + Send + Sync {
     async fn get_job(&self, namespace: &str, name: &str)
     -> ControllerStoreResult<Option<Resource>>;
     async fn update_job_status(
@@ -256,7 +256,7 @@ async fn delete_finished_job_for_ttl(
     }
 
     let marked = mark_job_foreground_deleting(db, resource, now).await?;
-    let _ = crate::controllers::gc::finalize_foreground_owner_if_ready(
+    let _ = klights_controllers::gc::finalize_foreground_owner_if_ready(
         db,
         &marked,
         pod_delete_sink,

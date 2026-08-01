@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tracing;
 
 #[async_trait]
-pub trait DaemonSetStore: crate::controllers::gc::GcResourceStore + Send + Sync {
+pub trait DaemonSetStore: klights_controllers::gc::GcResourceStore + Send + Sync {
     async fn list_controller_revisions(
         &self,
         namespace: &str,
@@ -610,7 +610,7 @@ pub(crate) async fn reconcile_daemonset(
         Some(resource) => resource,
         None => return Ok(()),
     };
-    let live_resource = match crate::controllers::gc::reconcile_owner_references(
+    let live_resource = match klights_controllers::gc::reconcile_owner_references(
         db,
         live_resource.clone(),
         pod_delete_sink,
@@ -619,8 +619,8 @@ pub(crate) async fn reconcile_daemonset(
     )
     .await?
     {
-        crate::controllers::gc::OwnerReferenceReconcile::Deleted => return Ok(()),
-        crate::controllers::gc::OwnerReferenceReconcile::OwnerReferencesUpdated => {
+        klights_controllers::gc::OwnerReferenceReconcile::Deleted => return Ok(()),
+        klights_controllers::gc::OwnerReferenceReconcile::OwnerReferencesUpdated => {
             match db
                 .get_resource("apps/v1", "DaemonSet", Some(namespace), name)
                 .await?

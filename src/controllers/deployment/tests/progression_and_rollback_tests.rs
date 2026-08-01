@@ -147,7 +147,7 @@ async fn test_reconcile_deployment_rolling_update_completes_after_pods_become_re
     for rs in rs_after_ready.items {
         let rs_with_rv = crate::api::inject_resource_version(rs.data, rs.resource_version);
         crate::controllers::replicaset::reconcile_replicaset(
-            &db,
+            &crate::controllers::test_utils::controller_store_for_test(&db),
             __pod_repo.as_ref(),
             __pod_repo.as_ref(),
             __pod_repo.as_ref(),
@@ -217,7 +217,7 @@ async fn test_reconcile_deployment_rolling_update_completes_after_pods_become_re
     for rs in rs_after_ready2.items {
         let rs_with_rv = crate::api::inject_resource_version(rs.data, rs.resource_version);
         crate::controllers::replicaset::reconcile_replicaset(
-            &db,
+            &crate::controllers::test_utils::controller_store_for_test(&db),
             __pod_repo.as_ref(),
             __pod_repo.as_ref(),
             __pod_repo.as_ref(),

@@ -223,7 +223,7 @@ async fn test_statefulset_create_loop_observes_live_scale_down() {
     let sts_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
 
     crate::controllers::statefulset::reconcile_statefulset(
-        &db,
+        &crate::controllers::test_utils::controller_store_for_test(&db),
         pod_reader.as_ref(),
         pod_writer.as_ref(),
         pod_reader.as_ref(),

@@ -3,6 +3,7 @@
 mod coordination;
 mod dispatcher;
 pub mod endpoints;
+pub mod gc;
 mod lease_loop;
 pub mod resource_projection;
 pub mod scheduler;

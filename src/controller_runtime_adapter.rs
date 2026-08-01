@@ -69,9 +69,9 @@ impl ControllerResourceQuery for RootControllerLeaderPort {
 }
 
 #[async_trait]
-impl crate::controllers::gc::GcResourceStore for RootControllerLeaderPort {
+impl klights_controllers::gc::GcResourceStore for RootControllerLeaderPort {
     async fn list_custom_resource_definitions(&self) -> Result<Vec<Resource>> {
-        crate::controllers::gc::GcResourceStore::list_custom_resource_definitions(
+        klights_controllers::gc::GcResourceStore::list_custom_resource_definitions(
             self.store.as_ref(),
         )
         .await
@@ -84,7 +84,7 @@ impl crate::controllers::gc::GcResourceStore for RootControllerLeaderPort {
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>> {
-        crate::controllers::gc::GcResourceStore::get_resource(
+        klights_controllers::gc::GcResourceStore::get_resource(
             self.store.as_ref(),
             api_version,
             kind,
@@ -104,7 +104,7 @@ impl crate::controllers::gc::GcResourceStore for RootControllerLeaderPort {
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        crate::controllers::gc::GcResourceStore::update_resource_with_preconditions(
+        klights_controllers::gc::GcResourceStore::update_resource_with_preconditions(
             self.store.as_ref(),
             api_version,
             kind,
@@ -126,7 +126,7 @@ impl crate::controllers::gc::GcResourceStore for RootControllerLeaderPort {
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        crate::controllers::gc::GcResourceStore::update_main_resource_with_preconditions(
+        klights_controllers::gc::GcResourceStore::update_main_resource_with_preconditions(
             self.store.as_ref(),
             api_version,
             kind,
@@ -143,7 +143,7 @@ impl crate::controllers::gc::GcResourceStore for RootControllerLeaderPort {
         owner_uid: &str,
         namespace: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        crate::controllers::gc::GcResourceStore::find_owned_resources(
+        klights_controllers::gc::GcResourceStore::find_owned_resources(
             self.store.as_ref(),
             owner_uid,
             namespace,
@@ -158,7 +158,7 @@ impl crate::controllers::gc::GcResourceStore for RootControllerLeaderPort {
         owner_kind: &str,
         namespace: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        crate::controllers::gc::GcResourceStore::find_owned_by_name_kind_empty_uid(
+        klights_controllers::gc::GcResourceStore::find_owned_by_name_kind_empty_uid(
             self.store.as_ref(),
             owner_api_version,
             owner_name,

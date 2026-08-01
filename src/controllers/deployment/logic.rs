@@ -18,7 +18,7 @@ const MAX_REPLICAS_ANNOTATION: &str = "deployment.kubernetes.io/max-replicas";
 
 #[async_trait]
 pub trait DeploymentStore:
-    crate::controllers::gc::GcResourceStore
+    klights_controllers::gc::GcResourceStore
     + crate::controllers::deployment::DeploymentFinalizeStore
     + crate::controllers::replicaset::ReplicaSetStore
     + Send
@@ -1549,7 +1549,7 @@ pub(crate) async fn reconcile_deployment(
         };
         created_rs_name = Some(rs_name.clone());
 
-        if crate::controllers::gc::reconcile_owner_references(
+        if klights_controllers::gc::reconcile_owner_references(
             db,
             created_rs.clone(),
             pod_delete_sink,
@@ -1557,7 +1557,7 @@ pub(crate) async fn reconcile_deployment(
             coordination,
         )
         .await?
-            == crate::controllers::gc::OwnerReferenceReconcile::Deleted
+            == klights_controllers::gc::OwnerReferenceReconcile::Deleted
         {
             return Ok(());
         }

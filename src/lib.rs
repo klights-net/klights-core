@@ -34,6 +34,8 @@ mod endpoint_reconcile_integration_tests;
 mod endpoint_slice_sync_side_effect_adapter;
 pub mod gc;
 mod gc_delete_adapter;
+#[cfg(test)]
+mod gc_ownership_integration_tests;
 mod gc_resource_store_adapter;
 mod generated_handler_adapter;
 #[cfg(test)]

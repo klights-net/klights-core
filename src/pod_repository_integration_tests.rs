@@ -12165,7 +12165,7 @@ async fn build_finalizer() -> RealPodDeletionFinalizer {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let store = Arc::new(PodStore::new(db));
     let gc_pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink> =
-        Arc::new(crate::controllers::gc::NoOpGcPodDeleteSink);
+        Arc::new(crate::gc_ownership_integration_tests::NoOpGcPodDeleteSink);
 
     RealPodDeletionFinalizer::new(
         store,
@@ -12214,7 +12214,7 @@ async fn deletion_finalizer_without_outbox_retries_later() {
     };
     let cluster_api = Arc::new(FakeLeaderApiClient::new(pod_resource));
     let gc_pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink> =
-        Arc::new(crate::controllers::gc::NoOpGcPodDeleteSink);
+        Arc::new(crate::gc_ownership_integration_tests::NoOpGcPodDeleteSink);
     let finalizer = RealPodDeletionFinalizer::new(
         store.clone(),
         gc_pod_delete_sink,
@@ -12558,7 +12558,7 @@ async fn deletion_finalizer_deletes_node_lost_terminal_with_uid_after_actor_clea
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn emptydir_survivor_diagnosis_records_mark_workqueue_and_actor_state() {
-    use crate::controllers::gc::cascade_delete_with_uid;
+    use klights_controllers::gc::cascade_delete_with_uid;
     use klights_reconcile_api::GcPodDeleteSink;
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;

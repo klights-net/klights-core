@@ -1,4 +1,11 @@
-use super::*;
+use anyhow::Result;
+use async_trait::async_trait;
+use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_controllers::gc::*;
+use klights_reconcile_api::{
+    ControllerStoreError, ControllerStoreResult, GcPodDeleteError, GcPodDeleteFuture,
+    GcPodDeleteRequest, GcPodDeleteSink,
+};
 
 use serde_json::json;
 use std::sync::{
@@ -14,13 +21,14 @@ fn test_gc_coordination() -> &'static klights_controllers::ControllerCoordinatio
 }
 
 async fn reconcile_owner_references(
-    db: &(impl GcResourceStore + ?Sized),
+    db: &crate::datastore::sqlite::Datastore,
     resource: Resource,
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<OwnerReferenceReconcile> {
-    super::reconcile_owner_references(
-        db,
+    let store = crate::controllers::test_utils::controller_store_for_test(db);
+    klights_controllers::gc::reconcile_owner_references(
+        &store,
         resource,
         pod_delete_sink,
         non_pod_finalization,
@@ -34,7 +42,7 @@ async fn reconcile_owner_references(
     reason = "test compatibility wrapper preserves the UID-qualified owner identity"
 )]
 async fn cascade_delete_with_uid(
-    db: &(impl GcResourceStore + ?Sized),
+    db: &crate::datastore::sqlite::Datastore,
     owner_uid: &str,
     owner_api_version: &str,
     owner_name: &str,
@@ -43,8 +51,9 @@ async fn cascade_delete_with_uid(
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<()> {
-    super::cascade_delete_with_uid(
-        db,
+    let store = crate::controllers::test_utils::controller_store_for_test(db);
+    klights_controllers::gc::cascade_delete_with_uid(
+        &store,
         owner_uid,
         owner_api_version,
         owner_name,
@@ -62,7 +71,7 @@ async fn cascade_delete_with_uid(
     reason = "test compatibility wrapper preserves the UID-qualified owner identity"
 )]
 async fn owner_cascade_sweep_once(
-    db: &(impl GcResourceStore + ?Sized),
+    db: &crate::datastore::sqlite::Datastore,
     owner_uid: &str,
     owner_api_version: &str,
     owner_name: &str,
@@ -71,8 +80,9 @@ async fn owner_cascade_sweep_once(
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<bool> {
-    super::owner_cascade_sweep_once(
-        db,
+    let store = crate::controllers::test_utils::controller_store_for_test(db);
+    klights_controllers::gc::owner_cascade_sweep_once(
+        &store,
         owner_uid,
         owner_api_version,
         owner_name,
@@ -90,7 +100,7 @@ async fn owner_cascade_sweep_once(
     reason = "test compatibility wrapper preserves the UID-qualified owner identity"
 )]
 async fn check_foreground_deletion_ready(
-    db: &(impl GcResourceStore + ?Sized),
+    db: &crate::datastore::sqlite::Datastore,
     owner_uid: &str,
     owner_api_version: &str,
     owner_name: &str,
@@ -99,8 +109,9 @@ async fn check_foreground_deletion_ready(
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<bool> {
-    super::check_foreground_deletion_ready(
-        db,
+    let store = crate::controllers::test_utils::controller_store_for_test(db);
+    klights_controllers::gc::check_foreground_deletion_ready(
+        &store,
         owner_uid,
         owner_api_version,
         owner_name,
@@ -114,13 +125,14 @@ async fn check_foreground_deletion_ready(
 }
 
 async fn finalize_foreground_owner_if_ready(
-    db: &(impl GcResourceStore + ?Sized),
+    db: &crate::datastore::sqlite::Datastore,
     owner: &Resource,
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<bool> {
-    super::finalize_foreground_owner_if_ready(
-        db,
+    let store = crate::controllers::test_utils::controller_store_for_test(db);
+    klights_controllers::gc::finalize_foreground_owner_if_ready(
+        &store,
         owner,
         pod_delete_sink,
         non_pod_finalization,
@@ -150,7 +162,8 @@ impl StatusChurningGcStore {
         namespace: Option<&str>,
         name: &str,
     ) -> ControllerStoreResult<()> {
-        let live = GcResourceStore::get_resource(&self.db, api_version, kind, namespace, name)
+        let store = &self.db as &dyn crate::datastore::DatastoreBackend;
+        let live = GcResourceStore::get_resource(store, api_version, kind, namespace, name)
             .await?
             .expect("status-race resource must remain live");
         let attempt = self.update_attempts.fetch_add(1, Ordering::SeqCst) + 1;
@@ -172,7 +185,10 @@ impl StatusChurningGcStore {
 #[async_trait]
 impl GcResourceStore for StatusChurningGcStore {
     async fn list_custom_resource_definitions(&self) -> ControllerStoreResult<Vec<Resource>> {
-        GcResourceStore::list_custom_resource_definitions(&self.db).await
+        GcResourceStore::list_custom_resource_definitions(
+            &self.db as &dyn crate::datastore::DatastoreBackend,
+        )
+        .await
     }
 
     async fn get_resource(
@@ -182,7 +198,14 @@ impl GcResourceStore for StatusChurningGcStore {
         namespace: Option<&str>,
         name: &str,
     ) -> ControllerStoreResult<Option<Resource>> {
-        GcResourceStore::get_resource(&self.db, api_version, kind, namespace, name).await
+        GcResourceStore::get_resource(
+            &self.db as &dyn crate::datastore::DatastoreBackend,
+            api_version,
+            kind,
+            namespace,
+            name,
+        )
+        .await
     }
 
     async fn update_resource_with_preconditions(
@@ -196,7 +219,7 @@ impl GcResourceStore for StatusChurningGcStore {
     ) -> ControllerStoreResult<Resource> {
         self.bump_status(api_version, kind, namespace, name).await?;
         GcResourceStore::update_resource_with_preconditions(
-            &self.db,
+            &self.db as &dyn crate::datastore::DatastoreBackend,
             api_version,
             kind,
             namespace,
@@ -234,7 +257,7 @@ impl GcResourceStore for StatusChurningGcStore {
             ));
         }
         GcResourceStore::update_main_resource_with_preconditions(
-            &self.db,
+            &self.db as &dyn crate::datastore::DatastoreBackend,
             api_version,
             kind,
             namespace,
@@ -250,7 +273,12 @@ impl GcResourceStore for StatusChurningGcStore {
         owner_uid: &str,
         namespace: Option<&str>,
     ) -> ControllerStoreResult<Vec<Resource>> {
-        GcResourceStore::find_owned_resources(&self.db, owner_uid, namespace).await
+        GcResourceStore::find_owned_resources(
+            &self.db as &dyn crate::datastore::DatastoreBackend,
+            owner_uid,
+            namespace,
+        )
+        .await
     }
 
     async fn find_owned_by_name_kind_empty_uid(
@@ -261,50 +289,13 @@ impl GcResourceStore for StatusChurningGcStore {
         namespace: Option<&str>,
     ) -> ControllerStoreResult<Vec<Resource>> {
         GcResourceStore::find_owned_by_name_kind_empty_uid(
-            &self.db,
+            &self.db as &dyn crate::datastore::DatastoreBackend,
             owner_api_version,
             owner_name,
             owner_kind,
             namespace,
         )
         .await
-    }
-}
-
-#[derive(Clone)]
-enum FakeNonPodResult {
-    Outcome(klights_reconcile_api::GcNonPodFinalizationOutcome),
-    Error(&'static str),
-}
-
-struct RecordingNonPodFinalization {
-    result: FakeNonPodResult,
-    requests: Mutex<Vec<klights_reconcile_api::GcNonPodFinalizationRequest>>,
-}
-
-impl RecordingNonPodFinalization {
-    fn new(result: FakeNonPodResult) -> Self {
-        Self {
-            result,
-            requests: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-impl klights_reconcile_api::GcNonPodFinalizationPort for RecordingNonPodFinalization {
-    fn finalize_non_pod(
-        &self,
-        request: klights_reconcile_api::GcNonPodFinalizationRequest,
-    ) -> klights_reconcile_api::GcNonPodFinalizationFuture<'_> {
-        Box::pin(async move {
-            self.requests.lock().unwrap().push(request);
-            match &self.result {
-                FakeNonPodResult::Outcome(outcome) => Ok(outcome.clone()),
-                FakeNonPodResult::Error(message) => Err(
-                    klights_reconcile_api::ReconcileSinkError::unavailable(*message),
-                ),
-            }
-        })
     }
 }
 
@@ -383,7 +374,7 @@ impl GcPodDeleteSink for FailOrLoseFirstGcPodDeleteSink {
 }
 
 /// No-op sink for existing tests that don't involve Pod children.
-struct NoOpGcPodDeleteSink;
+pub(crate) struct NoOpGcPodDeleteSink;
 
 impl GcPodDeleteSink for NoOpGcPodDeleteSink {
     fn request_gc_pod_delete(&self, _request: GcPodDeleteRequest) -> GcPodDeleteFuture<'_> {
@@ -393,136 +384,6 @@ impl GcPodDeleteSink for NoOpGcPodDeleteSink {
             ))
         })
     }
-}
-
-#[tokio::test]
-async fn non_pod_finalization_port_maps_all_outcomes_and_orphan_intent() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let resource = db
-        .create_resource(
-            "v1",
-            "ConfigMap",
-            Some("default"),
-            "gc-port-outcomes",
-            json!({
-                "apiVersion": "v1",
-                "kind": "ConfigMap",
-                "metadata": {
-                    "namespace": "default",
-                    "name": "gc-port-outcomes",
-                    "uid": "gc-port-outcomes-uid",
-                    "finalizers": ["orphan"]
-                }
-            }),
-        )
-        .await
-        .unwrap();
-
-    for (port_outcome, expected) in [
-        (
-            klights_reconcile_api::GcNonPodFinalizationOutcome::HardDeleted,
-            GcDeleteOutcome::HardDeleted,
-        ),
-        (
-            klights_reconcile_api::GcNonPodFinalizationOutcome::MarkedTerminating,
-            GcDeleteOutcome::MarkedTerminating,
-        ),
-        (
-            klights_reconcile_api::GcNonPodFinalizationOutcome::Gone,
-            GcDeleteOutcome::Gone,
-        ),
-    ] {
-        let port = RecordingNonPodFinalization::new(FakeNonPodResult::Outcome(port_outcome));
-        let outcome = delete_resource_for_gc(&db, &resource, &NoOpGcPodDeleteSink, &port)
-            .await
-            .unwrap();
-        assert_eq!(outcome, expected);
-        let requests = port.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].orphan_children);
-        assert_eq!(requests[0].resource.uid, resource.uid);
-    }
-}
-
-#[tokio::test]
-async fn non_pod_finalization_port_propagates_conflict_like_errors() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let resource = db
-        .create_resource(
-            "v1",
-            "ConfigMap",
-            Some("default"),
-            "gc-port-error",
-            json!({
-                "apiVersion": "v1",
-                "kind": "ConfigMap",
-                "metadata": {
-                    "namespace": "default",
-                    "name": "gc-port-error",
-                    "uid": "gc-port-error-uid"
-                }
-            }),
-        )
-        .await
-        .unwrap();
-    let port =
-        RecordingNonPodFinalization::new(FakeNonPodResult::Error("resourceVersion conflict"));
-
-    let error = delete_resource_for_gc(&db, &resource, &NoOpGcPodDeleteSink, &port)
-        .await
-        .expect_err("port failure must abort GC");
-
-    assert!(error.to_string().contains("resourceVersion conflict"));
-    assert!(!port.requests.lock().unwrap()[0].orphan_children);
-}
-
-#[tokio::test]
-async fn bound_pod_delete_routes_only_to_uid_bound_actor_sink() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let pod = db
-        .create_resource(
-            "v1",
-            "Pod",
-            Some("default"),
-            "bound-pod",
-            json!({
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": {
-                    "namespace": "default",
-                    "name": "bound-pod",
-                    "uid": "bound-pod-uid"
-                },
-                "spec": {"nodeName": "worker-a"}
-            }),
-        )
-        .await
-        .unwrap();
-    let pod_sink = RecordingGcPodDeleteSink::new();
-    let non_pod_port =
-        RecordingNonPodFinalization::new(FakeNonPodResult::Error("must not be called for Pod"));
-
-    let outcome = delete_resource_for_gc(&db, &pod, &pod_sink, &non_pod_port)
-        .await
-        .unwrap();
-
-    assert_eq!(outcome, GcDeleteOutcome::MarkedTerminating);
-    assert_eq!(
-        pod_sink.recorded_requests(),
-        vec![(
-            "default".to_string(),
-            "bound-pod".to_string(),
-            "bound-pod-uid".to_string()
-        )]
-    );
-    assert!(non_pod_port.requests.lock().unwrap().is_empty());
-    assert!(
-        db.get_resource("v1", "Pod", Some("default"), "bound-pod")
-            .await
-            .unwrap()
-            .is_some(),
-        "GC must not hard-delete a picked-up Pod row"
-    );
 }
 
 struct ConcurrentBlockingGcPodDeleteSink {
@@ -914,85 +775,6 @@ async fn test_cascade_delete_preserves_dependents_with_another_live_owner() {
 }
 
 #[tokio::test]
-async fn foreground_owner_ref_removal_retries_after_child_status_conflict() {
-    let db = crate::datastore::test_support::in_memory().await;
-
-    let stale_child = db
-        .create_resource(
-            "v1",
-            "Pod",
-            Some("default"),
-            "shared-pod",
-            json!({
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": {
-                    "name": "shared-pod",
-                    "namespace": "default",
-                    "uid": "shared-pod-uid",
-                    "ownerReferences": [
-                        {
-                            "apiVersion": "v1",
-                            "kind": "ReplicationController",
-                            "name": "rc-to-delete",
-                            "uid": "rc-delete-uid"
-                        },
-                        {
-                            "apiVersion": "v1",
-                            "kind": "ReplicationController",
-                            "name": "rc-to-stay",
-                            "uid": "rc-stay-uid"
-                        }
-                    ]
-                },
-                "status": {"phase": "Pending"}
-            }),
-        )
-        .await
-        .unwrap();
-
-    db.update_status_only(
-        "v1",
-        "Pod",
-        Some("default"),
-        "shared-pod",
-        json!({"phase": "Running"}),
-        Some(stale_child.resource_version),
-    )
-    .await
-    .unwrap();
-
-    remove_owner_ref_from_resource(
-        &db,
-        stale_child,
-        "rc-delete-uid",
-        "v1",
-        "rc-to-delete",
-        "ReplicationController",
-    )
-    .await
-    .expect("foreground GC ownerRef removal must retry after resourceVersion conflict");
-
-    let child = db
-        .get_resource("v1", "Pod", Some("default"), "shared-pod")
-        .await
-        .unwrap()
-        .expect("shared child must survive ownerRef removal");
-    let owner_refs = child
-        .data
-        .pointer("/metadata/ownerReferences")
-        .and_then(|refs| refs.as_array())
-        .expect("shared child must keep its live ownerRef");
-    assert_eq!(owner_refs.len(), 1);
-    assert_eq!(owner_refs[0]["uid"], "rc-stay-uid");
-    assert_eq!(
-        child.data.pointer("/status/phase").and_then(|v| v.as_str()),
-        Some("Running"),
-        "retry must preserve concurrent status updates"
-    );
-}
-
-#[tokio::test]
 async fn orphan_owner_ref_removal_survives_continuous_child_status_churn() {
     let db = crate::datastore::test_support::in_memory().await;
     let owner_uid = "deployment-status-churn-uid";
@@ -1122,119 +904,6 @@ async fn orphan_children_returns_error_when_owner_ref_update_does_not_commit() {
         error
             .to_string()
             .contains("injected owner-reference update failure")
-    );
-}
-
-#[tokio::test]
-async fn foreground_owner_ref_removal_skips_same_name_replacement_after_conflict() {
-    let db = crate::datastore::test_support::in_memory().await;
-
-    let stale_child = db
-        .create_resource(
-            "v1",
-            "Pod",
-            Some("default"),
-            "shared-pod",
-            json!({
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": {
-                    "name": "shared-pod",
-                    "namespace": "default",
-                    "uid": "old-shared-pod-uid",
-                    "ownerReferences": [
-                        {
-                            "apiVersion": "v1",
-                            "kind": "ReplicationController",
-                            "name": "rc-to-delete",
-                            "uid": "rc-delete-uid"
-                        },
-                        {
-                            "apiVersion": "v1",
-                            "kind": "ReplicationController",
-                            "name": "rc-to-stay",
-                            "uid": "rc-stay-uid"
-                        }
-                    ]
-                },
-                "status": {"phase": "Pending"}
-            }),
-        )
-        .await
-        .unwrap();
-
-    db.delete_resource_with_preconditions(
-        "v1",
-        "Pod",
-        Some("default"),
-        "shared-pod",
-        crate::datastore::ResourcePreconditions::uid("old-shared-pod-uid"),
-    )
-    .await
-    .unwrap();
-
-    db.create_resource(
-        "v1",
-        "Pod",
-        Some("default"),
-        "shared-pod",
-        json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {
-                "name": "shared-pod",
-                "namespace": "default",
-                "uid": "new-shared-pod-uid",
-                "ownerReferences": [
-                    {
-                        "apiVersion": "v1",
-                        "kind": "ReplicationController",
-                        "name": "rc-to-delete",
-                        "uid": "rc-delete-uid"
-                    },
-                    {
-                        "apiVersion": "v1",
-                        "kind": "ReplicationController",
-                        "name": "rc-to-stay",
-                        "uid": "rc-stay-uid"
-                    }
-                ]
-            },
-            "status": {"phase": "Running"}
-        }),
-    )
-    .await
-    .unwrap();
-
-    remove_owner_ref_from_resource(
-        &db,
-        stale_child,
-        "rc-delete-uid",
-        "v1",
-        "rc-to-delete",
-        "ReplicationController",
-    )
-    .await
-    .expect("foreground GC ownerRef removal must ignore same-name replacement conflicts");
-
-    let live = db
-        .get_resource("v1", "Pod", Some("default"), "shared-pod")
-        .await
-        .unwrap()
-        .expect("same-name replacement Pod must survive stale ownerRef removal");
-    assert_eq!(live.uid, "new-shared-pod-uid");
-    let owner_refs = live
-        .data
-        .pointer("/metadata/ownerReferences")
-        .and_then(|refs| refs.as_array())
-        .expect("replacement Pod ownerRefs must remain untouched");
-    assert_eq!(owner_refs.len(), 2);
-    assert!(
-        owner_refs.iter().any(|owner_ref| owner_ref
-            .pointer("/uid")
-            .and_then(|value| value.as_str())
-            == Some("rc-delete-uid")),
-        "stale ownerRef removal must not mutate a replacement UID"
     );
 }
 
@@ -1715,7 +1384,7 @@ async fn test_orphan_children_removes_owner_references() {
 
     // Orphan children
     orphan_children(
-        &db,
+        &crate::controllers::test_utils::controller_store_for_test(&db),
         owner_uid,
         "apps/v1",
         "owner",
@@ -1784,7 +1453,7 @@ async fn test_orphan_children_removes_empty_uid_ownerrefs_by_name_kind() {
     .unwrap();
 
     orphan_children(
-        &db,
+        &crate::controllers::test_utils::controller_store_for_test(&db),
         "",
         "apps/v1",
         "owner-empty-uid",
@@ -2597,9 +2266,10 @@ async fn assert_foreground_delete_reservation_released_after(
 
     let coordination = klights_controllers::ControllerCoordination::new();
     let sink = FailOrLoseFirstGcPodDeleteSink::new(first_result);
+    let store = crate::controllers::test_utils::controller_store_for_test(&db);
     for _ in 0..2 {
-        let ready = super::check_foreground_deletion_ready(
-            &db,
+        let ready = klights_controllers::gc::check_foreground_deletion_ready(
+            &store,
             &owner_uid,
             "apps/v1",
             &owner_name,

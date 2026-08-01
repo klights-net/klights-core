@@ -41,7 +41,7 @@ where
 #[async_trait]
 impl<T> ReplicationControllerStore for T
 where
-    T: DatastoreBackend + Send + Sync + ?Sized,
+    T: DatastoreBackend + klights_controllers::gc::GcResourceStore + Send + Sync + ?Sized,
 {
     async fn get_replication_controller(
         &self,

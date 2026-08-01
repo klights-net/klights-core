@@ -24,8 +24,9 @@ async fn reconcile_deployment(
     deployment: &serde_json::Value,
     node_name: &str,
 ) -> anyhow::Result<()> {
+    let store = crate::controllers::test_utils::controller_store_for_test(db);
     reconcile_deployment_core(
-        db,
+        &store,
         pod_reader,
         pod_writer,
         pod_delete_sink,
@@ -45,8 +46,9 @@ async fn reconcile_replicaset(
     replicaset: &serde_json::Value,
     node_name: &str,
 ) -> anyhow::Result<()> {
+    let store = crate::controllers::test_utils::controller_store_for_test(db);
     reconcile_replicaset_core(
-        db,
+        &store,
         pod_reader,
         pod_writer,
         pod_delete_sink,
@@ -1220,8 +1222,8 @@ async fn test_delete_deployment_cascade_deletes_replicaset_and_pods() {
     );
 
     // 3c. cascade_delete_with_uid (what the delete handler calls)
-    crate::controllers::gc::cascade_delete_with_uid(
-        &db,
+    klights_controllers::gc::cascade_delete_with_uid(
+        &crate::controllers::test_utils::controller_store_for_test(&db),
         owner_uid,
         "apps/v1",
         "my-deploy",
@@ -1400,8 +1402,8 @@ async fn test_delete_collection_deployment_cascade_deletes_replicaset_and_pods()
 
     // Step 3: After the fix, delete_collection must also cascade
     // Simulate what the fix adds: cascade_delete_with_uid after each delete_resource
-    crate::controllers::gc::cascade_delete_with_uid(
-        &db,
+    klights_controllers::gc::cascade_delete_with_uid(
+        &crate::controllers::test_utils::controller_store_for_test(&db),
         &deploy_uid,
         "apps/v1",
         "my-deploy",

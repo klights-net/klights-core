@@ -15,7 +15,7 @@ fn coordination() -> &'static klights_controllers::ControllerCoordination {
 }
 
 async fn reconcile_replicationcontroller(
-    db: &(impl ReplicationControllerStore + ?Sized),
+    db: &crate::datastore::sqlite::Datastore,
     pod_reader: &(impl klights_pod_api::PodQuery + ?Sized),
     pod_writer: &(impl ReplicationControllerPodMutation + ?Sized),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
@@ -23,8 +23,9 @@ async fn reconcile_replicationcontroller(
     rc: &Value,
     node_name: &str,
 ) -> Result<()> {
+    let store = crate::controllers::test_utils::controller_store_for_test(db);
     super::reconcile_replicationcontroller(
-        db,
+        &store,
         pod_reader,
         pod_writer,
         pod_delete_sink,
@@ -1455,7 +1456,7 @@ async fn test_rc_adopts_and_releases_through_leader_repository_with_worker_outbo
     .unwrap();
     let repository =
         crate::controllers::test_utils::deferred_outbox_pod_repository_for_test(&db).await;
-    let delete_sink = crate::controllers::gc::NoOpGcPodDeleteSink;
+    let delete_sink = crate::gc_ownership_integration_tests::NoOpGcPodDeleteSink;
 
     reconcile_replicationcontroller(
         &db,

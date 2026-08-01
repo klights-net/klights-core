@@ -318,7 +318,7 @@ impl PodGcReconcileSink for PodReconcileAdapter {
         pod_delete_sink: &'a dyn GcPodDeleteSink,
     ) -> ReconcileSinkFuture<'a> {
         Box::pin(async move {
-            crate::controllers::gc::reconcile_owner_references(
+            klights_controllers::gc::reconcile_owner_references(
                 self.db.as_ref(),
                 pod,
                 pod_delete_sink,
@@ -337,7 +337,7 @@ impl PodGcReconcileSink for PodReconcileAdapter {
         pod_delete_sink: &'a dyn GcPodDeleteSink,
     ) -> ReconcileSinkFuture<'a> {
         Box::pin(async move {
-            crate::controllers::gc::cascade_delete_with_uid(
+            klights_controllers::gc::cascade_delete_with_uid(
                 self.db.as_ref(),
                 &owner.uid,
                 "v1",
@@ -359,7 +359,7 @@ impl PodGcReconcileSink for PodReconcileAdapter {
         pod_delete_sink: &'a dyn GcPodDeleteSink,
     ) -> ReconcileSinkFuture<'a> {
         Box::pin(async move {
-            crate::controllers::gc::finalize_foreground_owners_after_dependent_delete(
+            klights_controllers::gc::finalize_foreground_owners_after_dependent_delete(
                 self.db.as_ref(),
                 &deleted_dependent,
                 pod_delete_sink,

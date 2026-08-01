@@ -3797,8 +3797,8 @@ async fn test_delete_with_orphan_policy_skips_cascade() {
     let orphan = opts.propagation_policy.as_deref() == Some("Orphan");
     assert!(orphan, "propagationPolicy=Orphan must trigger orphan path");
 
-    controllers::gc::orphan_children(
-        &db,
+    klights_controllers::gc::orphan_children(
+        &crate::controllers::test_utils::controller_store_for_test(&db),
         parent_uid,
         "apps/v1",
         "parent-deploy",
