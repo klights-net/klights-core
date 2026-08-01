@@ -15,7 +15,6 @@ use klights_supervisor::TaskSupervisor;
 mod applier;
 mod backend_impl;
 pub mod snapshot;
-mod snapshot_capture;
 pub mod watch;
 
 pub mod crud {
