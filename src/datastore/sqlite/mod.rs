@@ -234,8 +234,6 @@ use crate::datastore::pod_serviceaccount::{
 };
 #[cfg(test)]
 use klights_cluster_datastore::sqlite::filters::parse_label_selector;
-#[cfg(test)]
-use klights_cluster_datastore::sqlite::filters::split_selector;
 use klights_cluster_datastore::sqlite::scope::use_namespaced_table;
 use resource_shape::hydrate_watch_event_data;
 use resource_shape::{

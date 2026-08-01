@@ -136,7 +136,7 @@ mod sql_pushdown_tests {
 
 #[cfg(test)]
 mod field_filter_tests {
-    use super::{filter_by_field_selector, resolve_field_path};
+    use super::{filter_by_field_selector, resolve_field_path, split_selector};
     use klights_cluster_core::Resource;
     use serde_json::json;
 
@@ -562,5 +562,41 @@ mod field_filter_tests {
         let filtered = filter_by_field_selector(items, "involvedObject.name=pod-a");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "event-a");
+    }
+
+    #[test]
+    fn test_split_selector_simple_equality() {
+        let parts = split_selector("app=nginx");
+        assert_eq!(parts, vec!["app=nginx"]);
+    }
+
+    #[test]
+    fn test_split_selector_multiple_requirements() {
+        let parts = split_selector("app=nginx,version=v1");
+        assert_eq!(parts, vec!["app=nginx", "version=v1"]);
+    }
+
+    #[test]
+    fn test_split_selector_preserves_parenthesized_commas() {
+        let parts = split_selector("env in (prod,staging),app=web");
+        assert_eq!(parts, vec!["env in (prod,staging)", "app=web"]);
+    }
+
+    #[test]
+    fn test_split_selector_empty_string() {
+        let parts = split_selector("");
+        assert!(parts.is_empty());
+    }
+
+    #[test]
+    fn test_split_selector_single_exists() {
+        let parts = split_selector("has-gpu");
+        assert_eq!(parts, vec!["has-gpu"]);
+    }
+
+    #[test]
+    fn test_split_selector_notin_with_multiple_values() {
+        let parts = split_selector("env notin (dev,test,staging)");
+        assert_eq!(parts, vec!["env notin (dev,test,staging)"]);
     }
 }

@@ -1286,47 +1286,6 @@ async fn test_namespace_delete_cascades() {
 }
 
 // ========================
-// split_selector tests
-// ========================
-
-#[test]
-fn test_split_selector_simple_equality() {
-    let parts = split_selector("app=nginx");
-    assert_eq!(parts, vec!["app=nginx"]);
-}
-
-#[test]
-fn test_split_selector_multiple_requirements() {
-    let parts = split_selector("app=nginx,version=v1");
-    assert_eq!(parts, vec!["app=nginx", "version=v1"]);
-}
-
-#[test]
-fn test_split_selector_preserves_parenthesized_commas() {
-    // "in (a,b)" should NOT be split at the comma inside parens
-    let parts = split_selector("env in (prod,staging),app=web");
-    assert_eq!(parts, vec!["env in (prod,staging)", "app=web"]);
-}
-
-#[test]
-fn test_split_selector_empty_string() {
-    let parts = split_selector("");
-    assert!(parts.is_empty());
-}
-
-#[test]
-fn test_split_selector_single_exists() {
-    let parts = split_selector("has-gpu");
-    assert_eq!(parts, vec!["has-gpu"]);
-}
-
-#[test]
-fn test_split_selector_notin_with_multiple_values() {
-    let parts = split_selector("env notin (dev,test,staging)");
-    assert_eq!(parts, vec!["env notin (dev,test,staging)"]);
-}
-
-// ========================
 // parse_label_selector tests
 // ========================
 
