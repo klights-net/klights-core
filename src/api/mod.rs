@@ -44,6 +44,7 @@ mod pod_handlers;
 pub(crate) mod pod_repository_ports;
 mod pod_security;
 pub mod pod_subresources;
+mod policy_input_adapters;
 pub mod priority_fairness;
 pub(crate) mod query;
 mod quotas;

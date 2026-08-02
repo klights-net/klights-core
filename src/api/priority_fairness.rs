@@ -12,6 +12,7 @@ use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use k8s_native_service::policy_inputs::PriorityFairnessHttpInputs;
 use klights_auth::AuthenticatedIdentity;
 use klights_auth::request_attributes::AuthorizationRequest;
 use serde_json::Value;
@@ -43,7 +44,7 @@ pub enum ApfAdmission {
 }
 
 pub(in crate::api) async fn admit_request(
-    state: Arc<crate::api::ApiState>,
+    inputs: Arc<PriorityFairnessHttpInputs<ApiPriorityFairness>>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -52,11 +53,10 @@ pub(in crate::api) async fn admit_request(
         .get::<AuthenticatedIdentity>()
         .cloned()
         .unwrap_or_else(AuthenticatedIdentity::anonymous);
-    match state
-        .auth_policy()
-        .api_priority_fairness
+    match inputs
+        .policy()
         .admit(
-            state.resource_mutation().resource_query.as_ref(),
+            inputs.resource_query().as_ref(),
             &identity,
             request.method(),
             request.uri().path(),

@@ -78,7 +78,7 @@ fn is_pod_log_follow_request(path: &str, query: &str) -> bool {
 }
 
 pub(crate) struct NativeApiOuterLayers {
-    state: Arc<ApiState>,
+    authentication_inputs: Arc<k8s_native_service::policy_inputs::AuthenticationHttpInputs>,
     slow_log_threshold: Duration,
 }
 
@@ -86,12 +86,16 @@ impl NativeApiOuterLayers {
     pub(crate) fn finish(self, router: Router) -> Router {
         router
             .layer({
-                let auth_state = self.state;
+                let authentication_inputs = self.authentication_inputs;
                 middleware::from_fn(move |request: Request, next: Next| {
-                    let auth_state = auth_state.clone();
+                    let authentication_inputs = authentication_inputs.clone();
                     async move {
-                        crate::api::auth_middleware::authenticate_request(auth_state, request, next)
-                            .await
+                        crate::api::auth_middleware::authenticate_request(
+                            authentication_inputs,
+                            request,
+                            next,
+                        )
+                        .await
                     }
                 })
             })
@@ -107,6 +111,12 @@ impl NativeApiOuterLayers {
 pub(in crate::api) fn build_router_parts(state: ApiState) -> (Router, NativeApiOuterLayers) {
     let state = Arc::new(state);
     let slow_log_threshold = state.operational().config.runtime.slow_log_threshold;
+    let authentication_inputs =
+        Arc::new(crate::api::policy_input_adapters::authentication_http_inputs(&state));
+    let authorization_inputs =
+        Arc::new(crate::api::policy_input_adapters::authorization_http_inputs(&state));
+    let priority_fairness_inputs =
+        Arc::new(crate::api::policy_input_adapters::priority_fairness_http_inputs(&state));
     let operational_endpoints = klights_apiserver::OperationalEndpointHandlers::new(
         get(health_check),
         get(metrics_handler),
@@ -448,20 +458,30 @@ pub(in crate::api) fn build_router_parts(state: ApiState) -> (Router, NativeApiO
         // leader using the delegated identity; local follower reads and watch
         // requests continue through this local authorization chokepoint.
         .layer({
-            let authz_state = state.clone();
+            let authorization_inputs = authorization_inputs.clone();
             middleware::from_fn(move |request: Request, next: Next| {
-                let authz_state = authz_state.clone();
+                let authorization_inputs = authorization_inputs.clone();
                 async move {
-                    crate::api::auth_middleware::authorize_request(authz_state, request, next).await
+                    crate::api::auth_middleware::authorize_request(
+                        authorization_inputs,
+                        request,
+                        next,
+                    )
+                    .await
                 }
             })
         })
         .layer({
-            let apf_state = state.clone();
+            let priority_fairness_inputs = priority_fairness_inputs.clone();
             middleware::from_fn(move |request: Request, next: Next| {
-                let apf_state = apf_state.clone();
+                let priority_fairness_inputs = priority_fairness_inputs.clone();
                 async move {
-                    crate::api::priority_fairness::admit_request(apf_state, request, next).await
+                    crate::api::priority_fairness::admit_request(
+                        priority_fairness_inputs,
+                        request,
+                        next,
+                    )
+                    .await
                 }
             })
         });
@@ -470,7 +490,7 @@ pub(in crate::api) fn build_router_parts(state: ApiState) -> (Router, NativeApiO
     (
         router,
         NativeApiOuterLayers {
-            state,
+            authentication_inputs,
             slow_log_threshold,
         },
     )

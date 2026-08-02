@@ -171,8 +171,10 @@ pub async fn create_token_review(
         ));
     }
 
+    let authentication_inputs =
+        crate::api::policy_input_adapters::authentication_http_inputs(&state);
     match crate::api::auth_middleware::authenticate_token_for_review(
-        &state,
+        &authentication_inputs,
         &token,
         &requested_audiences,
     )

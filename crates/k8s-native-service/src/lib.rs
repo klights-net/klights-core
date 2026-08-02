@@ -9,6 +9,7 @@ mod error;
 mod extractor;
 pub mod generic_command;
 pub mod generic_read;
+pub mod policy_inputs;
 mod resource_projection;
 mod router;
 mod state;

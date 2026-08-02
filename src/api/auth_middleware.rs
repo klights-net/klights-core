@@ -7,10 +7,11 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use k8s_native_service::policy_inputs::{AuthenticationHttpInputs, AuthorizationHttpInputs};
 use klights_auth::{AuthenticationError, ImpersonationError};
 use klights_types::TlsClientCertificate;
 
-use super::{ApiState, AppError};
+use super::AppError;
 use klights_auth::AuthenticatedIdentity;
 use klights_auth::authentication::{
     AuthnRuntime, authenticate_forwarded_client_cert, authenticate_parts,
@@ -18,10 +19,6 @@ use klights_auth::authentication::{
 };
 use klights_auth::clock::SnapshotClock;
 use klights_auth::impersonation::ImpersonationRequest;
-use klights_leader_api::{
-    ClusterIdentityError, ClusterIdentityFuture, LeaderBoundTokenSubjectLookup,
-    LeaderServiceAccountSigningKeyState, ServiceAccountSigningKeyPem,
-};
 
 pub const FORWARDED_CLIENT_CERT_HEADER: &str = "x-remote-client-certificate";
 const IMPERSONATE_USER: &str = "impersonate-user";
@@ -29,136 +26,29 @@ const IMPERSONATE_GROUP: &str = "impersonate-group";
 const IMPERSONATE_UID: &str = "impersonate-uid";
 const IMPERSONATE_EXTRA_PREFIX: &str = "impersonate-extra-";
 
-struct ApiAuthResources<'a> {
-    state: &'a ApiState,
-}
-
-impl ApiAuthResources<'_> {
-    async fn resource_uid(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-    ) -> Result<Option<String>, ClusterIdentityError> {
-        crate::api::resource_query_ports::get_resource(
-            self.state.resource_mutation().resource_query.as_ref(),
-            api_version,
-            kind,
-            namespace,
-            name,
-        )
-        .await
-        .map_err(|error| {
-            ClusterIdentityError::dependency_failure(format!(
-                "credential subject lookup failed: {error:?}"
-            ))
-        })
-        .map(|resource| {
-            resource.and_then(|resource| {
-                resource
-                    .data
-                    .pointer("/metadata/uid")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
-        })
-    }
-}
-
-impl LeaderServiceAccountSigningKeyState for ApiAuthResources<'_> {
-    fn service_account_signing_key_pem(
-        &self,
-    ) -> ClusterIdentityFuture<'_, ServiceAccountSigningKeyPem> {
-        self.state
-            .operational()
-            .signing_keys
-            .service_account_signing_key_pem()
-    }
-}
-
-impl LeaderBoundTokenSubjectLookup for ApiAuthResources<'_> {
-    fn service_account_uid<'a>(
-        &'a self,
-        namespace: &'a str,
-        name: &'a str,
-    ) -> ClusterIdentityFuture<'a, Option<String>> {
-        Box::pin(async move {
-            self.resource_uid("v1", "ServiceAccount", Some(namespace), name)
-                .await
-        })
-    }
-
-    fn pod_uid<'a>(
-        &'a self,
-        namespace: &'a str,
-        name: &'a str,
-    ) -> ClusterIdentityFuture<'a, Option<String>> {
-        Box::pin(async move {
-            crate::api::pod_repository_ports::get_pod(
-                self.state.resource_mutation().pod_repository.as_ref(),
-                namespace,
-                name,
-            )
-            .await
-            .map(|pod| pod.map(|pod| pod.uid))
-            .map_err(|error| {
-                ClusterIdentityError::dependency_failure(format!(
-                    "bound Pod lookup failed: {error}"
-                ))
-            })
-        })
-    }
-
-    fn node_uid<'a>(&'a self, name: &'a str) -> ClusterIdentityFuture<'a, Option<String>> {
-        Box::pin(async move { self.resource_uid("v1", "Node", None, name).await })
-    }
-
-    fn secret_uid<'a>(
-        &'a self,
-        namespace: &'a str,
-        name: &'a str,
-    ) -> ClusterIdentityFuture<'a, Option<String>> {
-        Box::pin(async move {
-            self.resource_uid("v1", "Secret", Some(namespace), name)
-                .await
-        })
-    }
-}
-
-#[cfg(test)]
-async fn validate_sa_token_bindings(
-    state: &ApiState,
-    claims: &klights_auth::SaTokenClaims,
-) -> Result<(), AppError> {
-    klights_auth::authentication::validate_sa_token_bindings(&ApiAuthResources { state }, claims)
-        .await
-        .map_err(AppError::from)
-}
-
 pub(in crate::api) async fn authenticate_token_for_review(
-    state: &ApiState,
+    inputs: &AuthenticationHttpInputs,
     token: &str,
     audiences: &[String],
 ) -> Result<klights_auth::authentication::ReviewedTokenIdentity, AuthenticationError> {
-    let resources = ApiAuthResources { state };
-    let clock = SnapshotClock::new(state.operational().clock.now());
-    let auth_policy = state.auth_policy();
+    let policy = inputs.policy();
+    let runtime_inputs = inputs.runtime();
+    let clock = SnapshotClock::new(runtime_inputs.clock().now());
     let runtime = AuthnRuntime::new(
-        auth_policy.bootstrap_token_authenticator.as_ref(),
-        &resources,
-        &resources,
-        auth_policy.oidc_authenticator.as_deref(),
-        auth_policy.webhook_authenticator.as_deref(),
+        policy.bootstrap_token_authenticator().as_ref(),
+        runtime_inputs.signing_keys().as_ref(),
+        runtime_inputs.bound_token_subjects().as_ref(),
+        policy.oidc_authenticator().map(Arc::as_ref),
+        policy.webhook_authenticator().map(Arc::as_ref),
         &clock,
-        &state.operational().task_supervisor,
+        runtime_inputs.task_supervisor().as_ref(),
         false,
     );
     klights_auth::authentication::authenticate_token_for_review(&runtime, token, audiences).await
 }
 
 pub(in crate::api) async fn authenticate_request(
-    state: Arc<ApiState>,
+    inputs: Arc<AuthenticationHttpInputs>,
     mut request: Request,
     next: Next,
 ) -> Response {
@@ -170,7 +60,7 @@ pub(in crate::api) async fn authenticate_request(
     let client_cert = request.extensions().get::<TlsClientCertificate>().cloned();
     let is_trusted_proxy = match client_cert_is_trusted_proxy(
         client_cert.as_ref(),
-        &state.operational().task_supervisor,
+        inputs.runtime().task_supervisor().as_ref(),
     )
     .await
     {
@@ -188,18 +78,18 @@ pub(in crate::api) async fn authenticate_request(
         None => None,
     };
 
-    let resources = ApiAuthResources { state: &state };
-    let clock = SnapshotClock::new(state.operational().clock.now());
-    let auth_policy = state.auth_policy();
+    let policy = inputs.policy();
+    let runtime_inputs = inputs.runtime();
+    let clock = SnapshotClock::new(runtime_inputs.clock().now());
     let runtime = AuthnRuntime::new(
-        auth_policy.bootstrap_token_authenticator.as_ref(),
-        &resources,
-        &resources,
-        auth_policy.oidc_authenticator.as_deref(),
-        auth_policy.webhook_authenticator.as_deref(),
+        policy.bootstrap_token_authenticator().as_ref(),
+        runtime_inputs.signing_keys().as_ref(),
+        runtime_inputs.bound_token_subjects().as_ref(),
+        policy.oidc_authenticator().map(Arc::as_ref),
+        policy.webhook_authenticator().map(Arc::as_ref),
         &clock,
-        &state.operational().task_supervisor,
-        state.operational().config.anonymous_auth,
+        runtime_inputs.task_supervisor().as_ref(),
+        policy.anonymous_auth(),
     );
     let identity = match authenticate_parts(&runtime, extension_user, client_cert, authorization)
         .await
@@ -212,9 +102,9 @@ pub(in crate::api) async fn authenticate_request(
     let authenticated_identity = if is_trusted_proxy {
         if let Some(cert_der) = forwarded_client_cert {
             match authenticate_forwarded_client_cert(
-                auth_policy.cluster_ca_pem.as_deref().map(String::as_str),
+                policy.cluster_ca_pem().map(|pem| pem.as_str()),
                 &cert_der,
-                &state.operational().task_supervisor,
+                runtime_inputs.task_supervisor().as_ref(),
             )
             .await
             {
@@ -237,7 +127,7 @@ pub(in crate::api) async fn authenticate_request(
         Err(error) => return AppError::from(error).into_response(),
     };
     let effective_identity = match klights_auth::impersonation::effective_identity(
-        auth_policy.authorizer.as_ref(),
+        policy.authorizer().as_ref(),
         &authenticated_identity,
         impersonation,
     )
@@ -254,7 +144,7 @@ pub(in crate::api) async fn authenticate_request(
 
 /// Global authorization chokepoint for every routed and fallback request.
 pub(in crate::api) async fn authorize_request(
-    state: Arc<ApiState>,
+    inputs: Arc<AuthorizationHttpInputs<dyn crate::audit::AuditSink>>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -271,14 +161,13 @@ pub(in crate::api) async fn authorize_request(
         .cloned()
         .unwrap_or_else(AuthenticatedIdentity::anonymous);
 
-    let auth_policy = state.auth_policy();
-    let decision = auth_policy
-        .authorizer
+    let decision = inputs
+        .authorizer()
         .authorize(&identity, &authorization)
         .await;
-    let operation_now = klights_auth::clock::chrono_utc(state.operational().clock.now());
-    auth_policy
-        .audit_sink
+    let operation_now = klights_auth::clock::chrono_utc(inputs.clock().now());
+    inputs
+        .audit()
         .record(crate::audit::AuditEvent::authorization(
             &identity,
             &authorization,
@@ -511,6 +400,19 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    async fn validate_sa_token_bindings(
+        state: &crate::api::ApiState,
+        claims: &klights_auth::SaTokenClaims,
+    ) -> Result<(), AppError> {
+        let inputs = crate::api::policy_input_adapters::authentication_http_inputs(state);
+        klights_auth::authentication::validate_sa_token_bindings(
+            inputs.runtime().bound_token_subjects().as_ref(),
+            claims,
+        )
+        .await
+        .map_err(AppError::from)
+    }
 
     #[test]
     fn impersonation_header_extraction_is_api_owned_and_strict() {
