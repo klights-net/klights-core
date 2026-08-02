@@ -79,8 +79,8 @@ fn is_nl_absent_error(err: &rtnetlink::Error) -> bool {
 
 /// Root-mode owner of the rtnetlink connection, bridge and Pod CIDR link state.
 ///
-/// The temporary root `NetworkPlane` compatibility adapter retains CNI,
-/// WireGuard and trait dispatch until their later Phase 13 packets.
+/// Root composition combines this Linux link owner with CNI state and the
+/// selected peer dataplane behind the focused networking traits.
 pub struct RootDatapath {
     handle: rtnetlink::Handle,
     connection: klights_supervisor::SupervisedJoinHandle<()>,

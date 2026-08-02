@@ -1,6 +1,6 @@
 //! Status-only SQLite mutation primitive owned by the 10C.2 live packet.
 
-use super::{mutation_helpers, owner_ref_index, queries, transaction_primitives};
+use super::{mutation_helpers, mutation_queries, owner_ref_index, transaction_primitives};
 use crate::sqlite::selector_index;
 use klights_cluster_core::ResourcePreconditions;
 use serde_json::Value;
@@ -26,13 +26,13 @@ pub fn update_status_in_conn(
     let (id, current_rv, live_uid, current_bytes): (i64, i64, String, Vec<u8>) =
         if let Some(namespace) = namespace {
             conn.query_row(
-                queries::NAMESPACED_SELECT_STATUS_ROW,
+                mutation_queries::NAMESPACED_SELECT_STATUS_ROW,
                 rusqlite::params![api_version, kind, namespace, name],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?
         } else {
             conn.query_row(
-                queries::CLUSTER_SELECT_STATUS_ROW,
+                mutation_queries::CLUSTER_SELECT_STATUS_ROW,
                 rusqlite::params![api_version, kind, name],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?
@@ -78,12 +78,12 @@ pub fn update_status_in_conn(
     let new_rv = transaction_primitives::next_resource_version_in_tx(conn)?;
     let rows = if let Some(_namespace) = namespace {
         conn.execute(
-            queries::NAMESPACED_UPDATE_STATUS_BY_ID,
+            mutation_queries::NAMESPACED_UPDATE_STATUS_BY_ID,
             rusqlite::params![new_rv, &merged, id, current_rv, &live_uid],
         )?
     } else {
         conn.execute(
-            queries::CLUSTER_UPDATE_STATUS_BY_ID,
+            mutation_queries::CLUSTER_UPDATE_STATUS_BY_ID,
             rusqlite::params![new_rv, &merged, id, current_rv, &live_uid],
         )?
     };

@@ -1,4 +1,4 @@
-use super::super::queries;
+use super::super::mutation_queries;
 use klights_cluster_core::LogApplyAppliedOutboxRow;
 
 pub(super) struct OutboxLedgerStateApplier<'tx, 'conn> {
@@ -15,7 +15,7 @@ impl<'tx, 'conn> OutboxLedgerStateApplier<'tx, 'conn> {
         row: LogApplyAppliedOutboxRow,
     ) -> tokio_rusqlite::Result<()> {
         self.tx.execute(
-            queries::APPLIED_OUTBOX_UPSERT_EXACT,
+            mutation_queries::APPLIED_OUTBOX_UPSERT_EXACT,
             rusqlite::params![
                 row.idempotency_key,
                 row.subject_key,
@@ -34,7 +34,7 @@ impl<'tx, 'conn> OutboxLedgerStateApplier<'tx, 'conn> {
         idempotency_key: String,
     ) -> tokio_rusqlite::Result<()> {
         self.tx.execute(
-            queries::APPLIED_OUTBOX_DELETE_BY_KEY,
+            mutation_queries::APPLIED_OUTBOX_DELETE_BY_KEY,
             rusqlite::params![idempotency_key],
         )?;
         Ok(())
@@ -42,7 +42,7 @@ impl<'tx, 'conn> OutboxLedgerStateApplier<'tx, 'conn> {
 
     pub(super) fn gc_applied_outbox(&self, cutoff_ms: i64) -> tokio_rusqlite::Result<()> {
         self.tx.execute(
-            queries::APPLIED_OUTBOX_DELETE_EXPIRED,
+            mutation_queries::APPLIED_OUTBOX_DELETE_EXPIRED,
             rusqlite::params![cutoff_ms],
         )?;
         Ok(())

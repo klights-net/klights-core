@@ -1,7 +1,7 @@
 use super::super::mutation_helpers::{
     WatchEventInsert, insert_watch_event_in_conn, serde_to_sqlite_error,
 };
-use super::super::{create_staged_post_commit, queries};
+use super::super::{create_staged_post_commit, mutation_queries};
 use klights_cluster_core::LogApplyNamespaceRow;
 use klights_cluster_store::StagedPostCommit;
 use rusqlite::OptionalExtension;
@@ -25,7 +25,7 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
         let existing = self
             .tx
             .query_row(
-                queries::NAMESPACE_GET,
+                mutation_queries::NAMESPACE_GET,
                 rusqlite::params![&row.name],
                 |db_row| Ok((db_row.get::<_, i64>(1)?, db_row.get::<_, Vec<u8>>(3)?)),
             )
@@ -36,7 +36,7 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
             return Ok(None);
         }
         self.tx.execute(
-            queries::NAMESPACES_UPSERT_EXACT,
+            mutation_queries::NAMESPACES_UPSERT_EXACT,
             rusqlite::params![&row.name, &row.uid, row.resource_version, &data_bytes],
         )?;
         let event_type = if existing.is_some() {
@@ -79,7 +79,7 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
         let existing = self
             .tx
             .query_row(
-                queries::NAMESPACE_GET_DATA,
+                mutation_queries::NAMESPACE_GET_DATA,
                 rusqlite::params![name],
                 |row| row.get::<_, Vec<u8>>(0),
             )
@@ -88,7 +88,7 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
             return Ok(None);
         };
         self.tx
-            .execute(queries::NAMESPACE_DELETE, rusqlite::params![name])?;
+            .execute(mutation_queries::NAMESPACE_DELETE, rusqlite::params![name])?;
         if !emit_watch_events {
             return Ok(None);
         }
@@ -120,7 +120,7 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
     pub(super) fn delete_namespace_contents(&self, name: &str) -> tokio_rusqlite::Result<()> {
         let mut stmt = self
             .tx
-            .prepare(queries::NAMESPACE_RESOURCES_LIST_EXCLUDING_KIND)?;
+            .prepare(mutation_queries::NAMESPACE_RESOURCES_LIST_EXCLUDING_KIND)?;
         let rows = stmt
             .query_map(rusqlite::params![name, "Pod"], |row| {
                 Ok((
@@ -132,7 +132,7 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         self.tx.execute(
-            queries::NAMESPACE_RESOURCES_DELETE_NON_PODS,
+            mutation_queries::NAMESPACE_RESOURCES_DELETE_NON_PODS,
             rusqlite::params![name],
         )?;
         for (api_version, kind, namespace, resource_name) in rows {

@@ -1,4 +1,4 @@
-use super::super::queries;
+use super::super::mutation_queries;
 use klights_cluster_core::{
     LogApplyNodeDataplaneRow, LogApplyNodeSubnetAllocation, LogApplyNodeSubnetRow,
 };
@@ -18,7 +18,7 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
 
     pub(super) fn put_node_subnet(&self, row: LogApplyNodeSubnetRow) -> tokio_rusqlite::Result<()> {
         self.tx.execute(
-            queries::NODE_SUBNET_UPSERT_EXACT,
+            mutation_queries::NODE_SUBNET_UPSERT_EXACT,
             rusqlite::params![
                 row.node_name,
                 row.subnet,
@@ -41,8 +41,10 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
     }
 
     pub(super) fn delete_node_subnet(&self, node_name: String) -> tokio_rusqlite::Result<()> {
-        self.tx
-            .execute(queries::NODE_SUBNET_DELETE, rusqlite::params![node_name])?;
+        self.tx.execute(
+            mutation_queries::NODE_SUBNET_DELETE,
+            rusqlite::params![node_name],
+        )?;
         Ok(())
     }
 
@@ -51,7 +53,7 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
         row: LogApplyNodeDataplaneRow,
     ) -> tokio_rusqlite::Result<()> {
         self.tx.execute(
-            queries::NODE_DATAPLANE_UPSERT,
+            mutation_queries::NODE_DATAPLANE_UPSERT,
             rusqlite::params![
                 row.node_name,
                 row.mode,
@@ -66,8 +68,10 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
     }
 
     pub(super) fn delete_node_dataplane(&self, node_name: String) -> tokio_rusqlite::Result<()> {
-        self.tx
-            .execute(queries::NODE_DATAPLANE_DELETE, rusqlite::params![node_name])?;
+        self.tx.execute(
+            mutation_queries::NODE_DATAPLANE_DELETE,
+            rusqlite::params![node_name],
+        )?;
         Ok(())
     }
 
@@ -97,7 +101,7 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
         let existing = self
             .tx
             .query_row(
-                queries::NODE_SUBNET_SELECT_BY_NAME,
+                mutation_queries::NODE_SUBNET_SELECT_BY_NAME,
                 rusqlite::params![node_name_typed.as_str()],
                 |row| {
                     Ok(LogApplyNodeSubnetRow {

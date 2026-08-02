@@ -739,18 +739,6 @@ mod tests {
         assert!(subsystem.lifecycle_service.remove_pod_state(&key).await);
     }
 
-    /// Task 18.2: Verify the final validation marker exists.
-    /// The real validation is `./validate.sh` and the build invariant checks.
-    #[test]
-    fn final_validation_removes_temporary_compatibility_objects() {
-        // PodSubsystemConfig is the single construction input — verify
-        // the type exists and pod_repository::build_parts is available.
-        assert!(
-            std::mem::size_of::<crate::kubelet::pod_subsystem::PodSubsystemConfig>() > 0,
-            "PodSubsystemConfig must exist as the composition root input"
-        );
-    }
-
     /// Verify all object layer names are resolvable at compile time so the
     /// architecture remains discoverable from code.
     #[test]

@@ -1,5 +1,5 @@
 use super::state::{ApplyEffects, RaftClusterStateApplier, resolve_noop_put_resource_in_tx};
-use super::{queries, transaction_primitives};
+use super::{mutation_queries, transaction_primitives};
 use crate::diagnostics::log_slow_log_apply_commit;
 use klights_cluster_core::{
     ClusterMutation, LogApplyCommit, LogApplyMutation, OutboxStreamWatermark, Resource,
@@ -99,14 +99,14 @@ fn pod_state_in_tx(
     let bytes = match namespace.as_deref() {
         Some(namespace) => tx
             .query_row(
-                queries::NAMESPACED_GET_DATA_FOR_DELETE,
+                mutation_queries::NAMESPACED_GET_DATA_FOR_DELETE,
                 rusqlite::params!["v1", "Pod", namespace, name],
                 |row| row.get::<_, Vec<u8>>(2),
             )
             .optional()?,
         None => tx
             .query_row(
-                queries::CLUSTER_GET_DATA_FOR_DELETE,
+                mutation_queries::CLUSTER_GET_DATA_FOR_DELETE,
                 rusqlite::params!["v1", "Pod", name],
                 |row| row.get::<_, Vec<u8>>(2),
             )
@@ -231,7 +231,7 @@ pub fn apply_commit_in_tx_for_raft_with_context(
         klights_cluster_core::stamped_pod_status_subject_and_stamp(&commit)
     {
         let last_applied_stamp: Option<i64> = tx.query_row(
-            queries::APPLIED_OUTBOX_MAX_STATUS_STAMP_FOR_SUBJECT,
+            mutation_queries::APPLIED_OUTBOX_MAX_STATUS_STAMP_FOR_SUBJECT,
             rusqlite::params![subject_key],
             |row| row.get::<_, Option<i64>>(0),
         )?;
@@ -300,7 +300,7 @@ pub fn apply_commit_in_tx_for_raft_with_context(
                         ))
                     })?;
                 tx.execute(
-                    queries::APPLIED_OUTBOX_UPDATE_RESULT,
+                    mutation_queries::APPLIED_OUTBOX_UPDATE_RESULT,
                     rusqlite::params![
                         &template.idempotency_key,
                         &template.subject_key,
@@ -607,7 +607,7 @@ fn resolve_bound_pod_finalizations_in_tx(
         };
         let current = tx
             .query_row(
-                queries::NAMESPACED_GET,
+                mutation_queries::NAMESPACED_GET,
                 rusqlite::params!["v1", "Pod", &finalization.namespace, &finalization.name],
                 |row| {
                     Ok((
@@ -730,7 +730,7 @@ fn read_returned_resource_in_tx(
             name,
         } => tx
             .query_row(
-                queries::NAMESPACED_GET,
+                mutation_queries::NAMESPACED_GET,
                 rusqlite::params![api_version, kind, namespace, name],
                 |row| {
                     let data: Vec<u8> = row.get(7)?;
@@ -763,7 +763,7 @@ fn read_returned_resource_in_tx(
             name,
         } => tx
             .query_row(
-                queries::CLUSTER_GET,
+                mutation_queries::CLUSTER_GET,
                 rusqlite::params![api_version, kind, name],
                 |row| {
                     let data: Vec<u8> = row.get(6)?;
@@ -790,7 +790,7 @@ fn read_returned_resource_in_tx(
             .optional()
             .map_err(tokio_rusqlite::Error::from),
         ReturnedResourceTarget::Namespace { name } => tx
-            .query_row(queries::NAMESPACE_GET, [name], |row| {
+            .query_row(mutation_queries::NAMESPACE_GET, [name], |row| {
                 let data: Vec<u8> = row.get(3)?;
                 Ok(Resource {
                     id: 0,
@@ -1007,17 +1007,21 @@ fn applied_outbox_record_in_tx(
     tx: &rusqlite::Transaction<'_>,
     idempotency_key: &str,
 ) -> tokio_rusqlite::Result<Option<klights_cluster_core::LogApplyAppliedOutboxRow>> {
-    tx.query_row(queries::APPLIED_OUTBOX_GET, [idempotency_key], |row| {
-        Ok(klights_cluster_core::LogApplyAppliedOutboxRow {
-            idempotency_key: row.get(0)?,
-            subject_key: row.get(1)?,
-            operation: row.get(2)?,
-            first_seen_ms: row.get(3)?,
-            applied_rv: row.get(4)?,
-            result_proto: row.get(5)?,
-            status_stamp: row.get(6)?,
-        })
-    })
+    tx.query_row(
+        mutation_queries::APPLIED_OUTBOX_GET,
+        [idempotency_key],
+        |row| {
+            Ok(klights_cluster_core::LogApplyAppliedOutboxRow {
+                idempotency_key: row.get(0)?,
+                subject_key: row.get(1)?,
+                operation: row.get(2)?,
+                first_seen_ms: row.get(3)?,
+                applied_rv: row.get(4)?,
+                result_proto: row.get(5)?,
+                status_stamp: row.get(6)?,
+            })
+        },
+    )
     .optional()
     .map_err(tokio_rusqlite::Error::from)
 }
@@ -1090,10 +1094,12 @@ fn advance_metadata_rv_to_at_least_tx(
     tx: &rusqlite::Transaction<'_>,
     resource_version: i64,
 ) -> tokio_rusqlite::Result<()> {
-    let current_rv: i64 = tx.query_row(queries::METADATA_SELECT_RV_INT, [], |row| row.get(0))?;
+    let current_rv: i64 = tx.query_row(mutation_queries::METADATA_SELECT_RV_INT, [], |row| {
+        row.get(0)
+    })?;
     if current_rv < resource_version {
         tx.execute(
-            queries::METADATA_SET_RV,
+            mutation_queries::METADATA_SET_RV,
             rusqlite::params![resource_version.to_string()],
         )?;
     }

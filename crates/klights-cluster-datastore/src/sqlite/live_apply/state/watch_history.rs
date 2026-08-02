@@ -1,7 +1,7 @@
 use super::super::mutation_helpers::{
     WatchEventInsert, WatchEventPayload, insert_watch_event_in_conn,
 };
-use super::super::{create_staged_post_commit, queries};
+use super::super::{create_staged_post_commit, mutation_queries};
 use klights_cluster_core::LogApplyWatchEventRow;
 use std::collections::HashMap;
 
@@ -32,7 +32,9 @@ pub fn watch_events_min_scope_rows_in_conn(
     max_rows: i64,
 ) -> rusqlite::Result<i64> {
     let scope_count =
-        conn.query_row::<i64, _, _>(queries::WATCH_EVENTS_SCOPE_COUNT, [], |row| row.get(0))?;
+        conn.query_row::<i64, _, _>(mutation_queries::WATCH_EVENTS_SCOPE_COUNT, [], |row| {
+            row.get(0)
+        })?;
     Ok(watch_events_min_scope_rows_for_scope_count(
         max_rows,
         scope_count,
@@ -46,7 +48,7 @@ pub fn gc_watch_events_in_tx(
 ) -> rusqlite::Result<usize> {
     let (ids, floors) = {
         let min_scope_rows = watch_events_min_scope_rows_in_conn(tx, max_rows)?;
-        let mut stmt = tx.prepare(queries::WATCH_EVENTS_GC_CANDIDATES)?;
+        let mut stmt = tx.prepare(mutation_queries::WATCH_EVENTS_GC_CANDIDATES)?;
         let rows = stmt.query_map(
             rusqlite::params![max_rows, batch_cap, min_scope_rows],
             |row| {
@@ -78,7 +80,7 @@ pub fn gc_watch_events_in_tx(
 
     for ((api_version, kind, namespace_key), (floor_rv, floor_event_id)) in floors {
         tx.execute(
-            queries::WATCH_REPLAY_FLOOR_UPSERT,
+            mutation_queries::WATCH_REPLAY_FLOOR_UPSERT,
             rusqlite::params![api_version, kind, namespace_key, floor_rv, floor_event_id],
         )?;
     }

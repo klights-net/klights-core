@@ -1,4 +1,4 @@
-use super::super::queries;
+use super::super::mutation_queries;
 use klights_cluster_core::{LogApplyPodCleanupIntentKey, LogApplyPodCleanupIntentRow};
 
 pub(super) struct PodCleanupStateApplier<'tx, 'conn> {
@@ -17,7 +17,7 @@ impl<'tx, 'conn> PodCleanupStateApplier<'tx, 'conn> {
         let pod_data = serde_json::to_vec(&row.pod_data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
         self.tx.execute(
-            queries::POD_CLEANUP_INTENT_UPSERT,
+            mutation_queries::POD_CLEANUP_INTENT_UPSERT,
             rusqlite::params![
                 row.node_name,
                 row.namespace,
@@ -37,7 +37,7 @@ impl<'tx, 'conn> PodCleanupStateApplier<'tx, 'conn> {
         key: LogApplyPodCleanupIntentKey,
     ) -> tokio_rusqlite::Result<()> {
         self.tx.execute(
-            queries::POD_CLEANUP_INTENT_DELETE,
+            mutation_queries::POD_CLEANUP_INTENT_DELETE,
             rusqlite::params![
                 key.node_name,
                 key.namespace,
@@ -54,7 +54,7 @@ impl<'tx, 'conn> PodCleanupStateApplier<'tx, 'conn> {
         node_name: String,
     ) -> tokio_rusqlite::Result<()> {
         self.tx.execute(
-            queries::POD_CLEANUP_INTENTS_DELETE_BY_NODE,
+            mutation_queries::POD_CLEANUP_INTENTS_DELETE_BY_NODE,
             rusqlite::params![node_name],
         )?;
         Ok(())

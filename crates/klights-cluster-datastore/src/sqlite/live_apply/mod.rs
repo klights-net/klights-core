@@ -123,13 +123,9 @@ pub(crate) fn map_committed_apply_error(error: anyhow::Error) -> CommittedApplyE
     }
 }
 
-// Temporary root-local dependency aliases. Each names a lower packet that
-// moves before 10C.2; no Raft, replication, leader API, or broad datastore
-// owner is reachable through this module.
 use super::scope::use_namespaced_table;
 use super::{
-    mutation_helpers, mutation_queries as queries, owner_ref_index, resource_shape,
-    transaction_primitives,
+    mutation_helpers, mutation_queries, owner_ref_index, resource_shape, transaction_primitives,
 };
 
 fn create_staged_post_commit(

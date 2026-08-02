@@ -23,11 +23,10 @@ pub(crate) use backend::DatastoreBackendLifecyclePort;
 pub use backend::TestWatchStore;
 pub use backend::{
     AppliedOutboxStore, ClusterResourceQueryStore, CommittedOutboxApply,
-    CurrentResourceVersionStore, DatastoreBackend, DatastoreBackendMetaStore,
-    DatastoreBackendWatchStore, DatastoreHandle, DurableRecoveryStore, LeaderResourceMutationStore,
-    MetaStore, NamespaceContentStore, NamespaceStore, NetworkMetadataStore, OwnershipStore,
-    PodCleanupStore, RawWatchReplayStore, ReplicationStore, ResourceListStore, ResourceStore,
-    SnapshotExclusiveFence, SnapshotMutationFence, StatusStore, WatchBroadcastMode,
+    CurrentResourceVersionStore, DatastoreBackend, DatastoreHandle, DurableRecoveryStore,
+    LeaderResourceMutationStore, MetaStore, NamespaceContentStore, NamespaceStore,
+    NetworkMetadataStore, OwnershipStore, PodCleanupStore, RawWatchReplayStore, ReplicationStore,
+    ResourceListStore, ResourceStore, SnapshotExclusiveFence, SnapshotMutationFence, StatusStore,
     WatchHistoryStore, WatchMaintenanceStore, WatchReplayAnchorStore, WatchStore,
 };
 pub use klights_cluster_core::{

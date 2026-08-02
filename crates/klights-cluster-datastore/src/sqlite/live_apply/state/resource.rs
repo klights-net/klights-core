@@ -9,7 +9,7 @@ use super::super::mutation_helpers::{
     WatchEventInsert, insert_watch_event_in_conn, serde_to_sqlite_error,
 };
 use super::super::{ApplyConflictCode, apply_conflict_error, other_error};
-use super::super::{create_staged_post_commit, owner_ref_index, queries};
+use super::super::{create_staged_post_commit, mutation_queries, owner_ref_index};
 use crate::sqlite::selector_index;
 use klights_cluster_core::PatchKind;
 use klights_cluster_core::{LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow};
@@ -85,7 +85,7 @@ impl<'tx, 'conn> ResourceWriteSink<'tx, 'conn> {
         match identity.scope {
             ResourceScope::Namespaced(namespace) => {
                 self.tx.execute(
-                    queries::NAMESPACED_UPSERT_EXACT,
+                    mutation_queries::NAMESPACED_UPSERT_EXACT,
                     rusqlite::params![
                         identity.api_version,
                         identity.kind,
@@ -99,7 +99,7 @@ impl<'tx, 'conn> ResourceWriteSink<'tx, 'conn> {
             }
             ResourceScope::Cluster => {
                 self.tx.execute(
-                    queries::CLUSTER_UPSERT_EXACT,
+                    mutation_queries::CLUSTER_UPSERT_EXACT,
                     rusqlite::params![
                         identity.api_version,
                         identity.kind,
@@ -145,7 +145,7 @@ impl<'tx, 'conn> ResourceWriteSink<'tx, 'conn> {
         match identity.scope {
             ResourceScope::Namespaced(namespace) => {
                 self.tx.execute(
-                    queries::NAMESPACED_DELETE_BY_KEY,
+                    mutation_queries::NAMESPACED_DELETE_BY_KEY,
                     rusqlite::params![
                         identity.api_version,
                         identity.kind,
@@ -156,7 +156,7 @@ impl<'tx, 'conn> ResourceWriteSink<'tx, 'conn> {
             }
             ResourceScope::Cluster => {
                 self.tx.execute(
-                    queries::CLUSTER_DELETE_BY_KEY,
+                    mutation_queries::CLUSTER_DELETE_BY_KEY,
                     rusqlite::params![identity.api_version, identity.kind, identity.name],
                 )?;
             }
@@ -384,7 +384,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
             ResourceScope::Namespaced(namespace) => self
                 .tx
                 .query_row(
-                    queries::NAMESPACED_GET,
+                    mutation_queries::NAMESPACED_GET,
                     rusqlite::params![
                         identity.api_version,
                         identity.kind,
@@ -404,7 +404,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
             ResourceScope::Cluster => self
                 .tx
                 .query_row(
-                    queries::CLUSTER_GET,
+                    mutation_queries::CLUSTER_GET,
                     rusqlite::params![identity.api_version, identity.kind, identity.name],
                     |db_row| {
                         Ok((
