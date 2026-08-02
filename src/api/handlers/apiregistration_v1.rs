@@ -30,7 +30,7 @@ pub(in crate::api) async fn delete_collection_apiservices(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
-    crate::api::resource_command_ports::delete_non_pod_collection(
+    k8s_native_service::generic_command::delete_non_pod_collection(
         state.resource_mutation().resource_query.as_ref(),
         state.resource_mutation().resource_command.as_ref(),
         "apiregistration.k8s.io/v1",
@@ -41,7 +41,7 @@ pub(in crate::api) async fn delete_collection_apiservices(
     .await?;
     state.discovery().apiservice_proxy_cache.clear().await;
     Ok(Json(
-        crate::api::mutation::response::delete_collection_success_status(),
+        k8s_native_service::generic_command::delete_collection_success_status(),
     ))
 }
 
@@ -52,11 +52,11 @@ pub(in crate::api) async fn delete_apiservice_with_cache_invalidation(
     axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    let response = crate::api::generated_handlers::inners::delete_inner(
+    let response = k8s_native_service::generic_command::delete_inner(
         state.clone(),
         &identity,
-        crate::api::generated_handlers::inners::GeneratedDeleteInnerRequest {
-            target: crate::api::generated_handlers::inners::GeneratedNamedResource::new(
+        k8s_native_service::generic_command::GeneratedDeleteInnerRequest {
+            target: k8s_native_service::generic_command::GeneratedNamedResource::new(
                 "apiregistration.k8s.io/v1",
                 "APIService",
                 None,

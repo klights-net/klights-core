@@ -91,14 +91,14 @@ async fn dispatch_resource_quota_status_reconcile(
     if (api_version, kind) != ("v1", "ResourceQuota") {
         return;
     }
-    crate::api::mutation::dispatch_mutation_event(
+    k8s_native_service::generic_command::dispatch_mutation_event(
         state.resource_mutation().mutation_effects.as_ref(),
-        crate::api::mutation::MutationEvent {
+        k8s_native_service::generic_command::MutationEvent {
             operation: klights_reconcile_api::MutationOperation::Update,
             resource,
             old_resource: None,
             persisted: true,
-            dry_run: crate::api::mutation::DryRunMode::Live,
+            dry_run: k8s_native_service::generic_command::DryRunMode::Live,
             context: "resourcequota-status",
         },
     )

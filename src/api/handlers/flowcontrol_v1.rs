@@ -10,7 +10,7 @@ pub(in crate::api) async fn delete_collection_flowschemas(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
-    crate::api::resource_command_ports::delete_non_pod_collection(
+    k8s_native_service::generic_command::delete_non_pod_collection(
         state.resource_mutation().resource_query.as_ref(),
         state.resource_mutation().resource_command.as_ref(),
         "flowcontrol.apiserver.k8s.io/v1",
@@ -20,7 +20,7 @@ pub(in crate::api) async fn delete_collection_flowschemas(
     )
     .await?;
     Ok(Json(
-        crate::api::mutation::response::delete_collection_success_status(),
+        k8s_native_service::generic_command::delete_collection_success_status(),
     ))
 }
 
@@ -28,7 +28,7 @@ pub(in crate::api) async fn delete_collection_prioritylevelconfigurations(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
-    crate::api::resource_command_ports::delete_non_pod_collection(
+    k8s_native_service::generic_command::delete_non_pod_collection(
         state.resource_mutation().resource_query.as_ref(),
         state.resource_mutation().resource_command.as_ref(),
         "flowcontrol.apiserver.k8s.io/v1",
@@ -38,6 +38,6 @@ pub(in crate::api) async fn delete_collection_prioritylevelconfigurations(
     )
     .await?;
     Ok(Json(
-        crate::api::mutation::response::delete_collection_success_status(),
+        k8s_native_service::generic_command::delete_collection_success_status(),
     ))
 }

@@ -131,60 +131,6 @@ pub async fn maybe_hard_delete_pod_after_finalizers_drained(
     );
 }
 
-pub(in crate::api) async fn maybe_reconcile_service_after_controller_endpointslice_delete(
-    state: &std::sync::Arc<ApiState>,
-    namespace: &str,
-    deleted: &Value,
-) -> Result<(), AppError> {
-    let managed_by = deleted
-        .pointer("/metadata/labels/endpointslice.kubernetes.io~1managed-by")
-        .and_then(|v| v.as_str());
-    if managed_by != Some("endpointslice-controller.k8s.io") {
-        return Ok(());
-    }
-
-    let Some(service_name) = deleted
-        .pointer("/metadata/labels/kubernetes.io~1service-name")
-        .and_then(|v| v.as_str())
-        .filter(|name| !name.is_empty())
-    else {
-        return Ok(());
-    };
-
-    let Some(service) = crate::api::resource_query_ports::get_resource(
-        state.resource_mutation().resource_query.as_ref(),
-        "v1",
-        "Service",
-        Some(namespace),
-        service_name,
-    )
-    .await?
-    else {
-        return Ok(());
-    };
-
-    let spec = service.data.get("spec");
-    let service_type = spec
-        .and_then(|s| s.get("type"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("ClusterIP");
-    if service_type == "ExternalName" {
-        return Ok(());
-    }
-
-    klights_reconcile_api::ServiceReconcileSink::enqueue_service_reconcile_batch(
-        state.controller_reconcile().controller_dispatcher.as_ref(),
-        vec![klights_reconcile_api::ServiceReconcileKey::new(
-            namespace,
-            service_name,
-        )],
-    )
-    .await
-    .map_err(|err| crate::api::AppError::Internal(err.to_string()))?;
-
-    Ok(())
-}
-
 pub fn initialize_statefulset_revision_status_on_create(name: &str, body: &mut Value) {
     let Some(template) = body.pointer("/spec/template") else {
         return;

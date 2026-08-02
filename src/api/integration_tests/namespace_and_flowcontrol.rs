@@ -2613,7 +2613,7 @@ async fn test_single_delete_explicit_uid_race_returns_conflict_not_notfound() {
         crate::api::generated_handlers::inners::complete_non_foreground_delete_with_live_recheck(
             db.as_ref(),
             crate::api::generated_handlers::inners::GeneratedDeleteCompletionRequest {
-                target: crate::api::finalizer_delete::ResourceDeleteTarget {
+                target: k8s_native_service::generic_command::ResourceDeleteTarget {
                     api_version: "v1",
                     kind: "ConfigMap",
                     namespace: Some("default"),
@@ -3973,7 +3973,7 @@ async fn test_finalizer_delete_mark_retries_internal_rv_conflict_preserving_conc
         crate::api::generated_handlers::inners::complete_non_foreground_delete_with_live_recheck(
             db.as_ref(),
             crate::api::generated_handlers::inners::GeneratedDeleteCompletionRequest {
-                target: crate::api::finalizer_delete::ResourceDeleteTarget {
+                target: k8s_native_service::generic_command::ResourceDeleteTarget {
                     api_version: "v1",
                     kind: "ConfigMap",
                     namespace: Some("default"),
@@ -4081,7 +4081,7 @@ async fn test_delete_collection_finalizer_mark_retries_internal_rv_conflict_pres
         crate::api::generated_handlers::inners::complete_non_foreground_delete_with_live_recheck(
             db.as_ref(),
             crate::api::generated_handlers::inners::GeneratedDeleteCompletionRequest {
-                target: crate::api::finalizer_delete::ResourceDeleteTarget {
+                target: k8s_native_service::generic_command::ResourceDeleteTarget {
                     api_version: "v1",
                     kind: "ConfigMap",
                     namespace: Some("default"),
@@ -4187,7 +4187,7 @@ async fn test_single_delete_live_recheck_marks_when_same_uid_gains_finalizer() {
         crate::api::generated_handlers::inners::complete_non_foreground_delete_with_live_recheck(
             db.as_ref(),
             crate::api::generated_handlers::inners::GeneratedDeleteCompletionRequest {
-                target: crate::api::finalizer_delete::ResourceDeleteTarget {
+                target: k8s_native_service::generic_command::ResourceDeleteTarget {
                     api_version: "v1",
                     kind: "ConfigMap",
                     namespace: Some("default"),

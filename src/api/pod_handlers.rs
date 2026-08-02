@@ -6,12 +6,12 @@
 //! path through `PodApiService::api_create_pod`; for now this file mirrors the
 //! macro expansion bit-for-bit.
 
-use crate::api::mutation::write::{
+use crate::api::*;
+use async_trait::async_trait;
+use k8s_native_service::generic_command::{
     CreateStrategy, PatchStrategy, UpdateStrategy, WriteResult, create_with_strategy,
     patch_with_strategy, update_with_strategy,
 };
-use crate::api::*;
-use async_trait::async_trait;
 
 async fn dispatch_pod_handler_mutation_event(
     state: &Arc<ApiState>,
@@ -19,14 +19,14 @@ async fn dispatch_pod_handler_mutation_event(
     resource: &Value,
     context: &'static str,
 ) {
-    crate::api::mutation::dispatch_mutation_event(
+    k8s_native_service::generic_command::dispatch_mutation_event(
         state.resource_mutation().mutation_effects.as_ref(),
-        crate::api::mutation::MutationEvent {
+        k8s_native_service::generic_command::MutationEvent {
             operation,
             resource,
             old_resource: None,
             persisted: true,
-            dry_run: crate::api::mutation::DryRunMode::Live,
+            dry_run: k8s_native_service::generic_command::DryRunMode::Live,
             context,
         },
     )
@@ -239,7 +239,8 @@ pub(in crate::api) async fn create_pod(
         namespace: &namespace,
         query: &query,
     };
-    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    let dry_run =
+        k8s_native_service::generic_command::DryRunMode::from_create_update_query(&query)?;
     let result = create_with_strategy(&strategy, body, dry_run).await?;
     match result {
         WriteResult::Persisted(resource) => {
@@ -280,7 +281,8 @@ pub(in crate::api) async fn update_pod(
         name: &name,
         query: &query,
     };
-    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    let dry_run =
+        k8s_native_service::generic_command::DryRunMode::from_create_update_query(&query)?;
     let result = update_with_strategy(&strategy, body, dry_run).await?;
     let resource = match result {
         WriteResult::DryRun(b) | WriteResult::PersistedValue(b) => return Ok(Json(b)),
@@ -315,7 +317,8 @@ pub(in crate::api) async fn delete_pod(
     Query(query): Query<CreateUpdateQuery>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    let delete_intent = crate::api::mutation::DeleteIntent::from_query_and_body(&query, &body)?;
+    let delete_intent =
+        k8s_native_service::generic_command::DeleteIntent::from_query_and_body(&query, &body)?;
     // Note: propagation policy / orphanDependents are read at the macro-level
     // for non-Pod kinds. Pod delete defers cascade through PodWorkqueue, so
     // the option is captured into PodApiService once Pod delete gains an
@@ -345,7 +348,7 @@ pub(in crate::api) async fn delete_pod(
             )
             .await;
             let result =
-                crate::api::mutation::response::accepted_object(r.data, r.resource_version);
+                k8s_native_service::generic_command::accepted_object(r.data, r.resource_version);
             Ok((StatusCode::ACCEPTED, Json(result)))
         }
     }
@@ -384,7 +387,8 @@ pub(in crate::api) async fn patch_pod(
         query: &query,
         headers: &headers,
     };
-    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    let dry_run =
+        k8s_native_service::generic_command::DryRunMode::from_create_update_query(&query)?;
     let result = patch_with_strategy(&strategy, patch, dry_run).await?;
     let resource = match result {
         WriteResult::DryRun(b) | WriteResult::PersistedValue(b) => return Ok(Json(b)),
@@ -422,7 +426,8 @@ pub(in crate::api) async fn delete_collection_pods(
     Path(namespace): Path<String>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let dry_run = crate::api::mutation::DryRunMode::from_delete_collection_query(&query)?;
+    let dry_run =
+        k8s_native_service::generic_command::DryRunMode::from_delete_collection_query(&query)?;
     let is_dry_run = dry_run.is_all();
     klights_pod_api::PodApiMutation::delete_collection_pods(
         state.resource_mutation().pod_repository.as_ref(),
@@ -453,7 +458,7 @@ pub(in crate::api) async fn delete_collection_pods(
     }
 
     Ok(Json(
-        crate::api::mutation::response::delete_collection_success_status(),
+        k8s_native_service::generic_command::delete_collection_success_status(),
     ))
 }
 
@@ -663,7 +668,7 @@ impl CreateStrategy for PodCreateStrategy<'_> {
     async fn admit(
         &self,
         body: Value,
-        _dry_run: crate::api::mutation::DryRunMode,
+        _dry_run: k8s_native_service::generic_command::DryRunMode,
     ) -> Result<Value, AppError> {
         // Admission stays inside `PodApiWriter::api_create_pod`.
         Ok(body)
@@ -672,7 +677,7 @@ impl CreateStrategy for PodCreateStrategy<'_> {
     async fn persist_create(
         &self,
         body: Value,
-        dry_run: crate::api::mutation::DryRunMode,
+        dry_run: k8s_native_service::generic_command::DryRunMode,
     ) -> Result<WriteResult, AppError> {
         let resource_name = body
             .pointer("/metadata/name")
@@ -714,7 +719,7 @@ impl UpdateStrategy for PodUpdateStrategy<'_> {
         &self,
         _current: &klights_cluster_core::Resource,
         body: Value,
-        _dry_run: crate::api::mutation::DryRunMode,
+        _dry_run: k8s_native_service::generic_command::DryRunMode,
     ) -> Result<Value, AppError> {
         check_field_validation_strict_typed("v1", "Pod", self.query, &body)?;
         Ok(body)
@@ -724,7 +729,7 @@ impl UpdateStrategy for PodUpdateStrategy<'_> {
         &self,
         current: klights_cluster_core::Resource,
         body: Value,
-        dry_run: crate::api::mutation::DryRunMode,
+        dry_run: k8s_native_service::generic_command::DryRunMode,
     ) -> Result<WriteResult, AppError> {
         let outcome = klights_pod_api::PodApiMutation::update_pod(
             self.state.resource_mutation().pod_repository.as_ref(),
@@ -751,7 +756,7 @@ impl PatchStrategy for PodPatchStrategy<'_> {
     async fn apply_patch(
         &self,
         patch: Value,
-        dry_run: crate::api::mutation::DryRunMode,
+        dry_run: k8s_native_service::generic_command::DryRunMode,
     ) -> Result<WriteResult, AppError> {
         let content_type = self
             .headers

@@ -1978,18 +1978,22 @@ name = "k8s-native-service"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "futures",
  "k8s-openapi",
  "klights-auth",
  "klights-cluster-core",
+ "klights-kube-protobuf",
  "klights-leader-api",
  "klights-pod-api",
  "klights-reconcile-api",
  "klights-supervisor",
  "klights-types",
+ "prost",
  "rcgen",
  "reqwest",
  "serde",
@@ -1999,6 +2003,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

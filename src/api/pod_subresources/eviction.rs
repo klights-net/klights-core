@@ -142,7 +142,7 @@ fn validate_eviction_identity(
 }
 
 fn eviction_dry_run(query: &CreateUpdateQuery, body: &[String]) -> Result<bool, AppError> {
-    Ok(crate::api::mutation::DryRunMode::from_eviction(query, body)?.is_all())
+    Ok(k8s_native_service::generic_command::DryRunMode::from_eviction(query, body)?.is_all())
 }
 
 fn admission_response(

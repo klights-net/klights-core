@@ -15,7 +15,6 @@
 #[macro_use]
 pub mod macros;
 
-pub(crate) mod admission_ports;
 pub mod apiservice_proxy;
 pub(crate) mod auth_middleware;
 pub(crate) mod backend_proxy_headers;
@@ -26,10 +25,10 @@ mod debug;
 mod defaulting;
 pub mod discovery;
 mod extractors;
-pub mod finalizer_delete;
 mod gc_ports;
 pub(crate) mod generated_handler_ports;
 pub mod generated_handlers;
+mod generic_command_policy;
 mod handlers;
 pub mod helpers;
 #[cfg(test)]
@@ -37,7 +36,6 @@ mod integration_tests;
 pub(crate) mod metrics;
 #[cfg(test)]
 mod mod_tests;
-pub mod mutation;
 mod namespace;
 mod patch;
 #[cfg(test)]
@@ -51,7 +49,6 @@ pub(crate) mod query;
 mod quotas;
 mod rbac_admission;
 pub(crate) mod request_info;
-mod resource_command_ports;
 pub(crate) mod resource_query_ports;
 mod response;
 #[cfg(test)]
@@ -61,6 +58,7 @@ pub mod server_side_apply;
 mod state_composition;
 pub(crate) mod state_ports;
 pub mod status;
+mod status_command_ports;
 mod task_supervisor;
 #[cfg(test)]
 pub mod test_support;
@@ -135,6 +133,9 @@ pub use helpers::{
     set_namespace_terminating_status,
 };
 pub use k8s_native_service::AppError;
+pub use k8s_native_service::generic_command::{
+    DeleteOptions, DeletePreconditions, parse_delete_options_body, parse_delete_options_protobuf,
+};
 pub(crate) use k8s_native_service::{map_mutating_admission_error, map_validating_admission_error};
 pub(in crate::api) use namespace::{
     create_namespace, delete_namespace, finalize_namespace, get_namespace, list_namespaces,
@@ -189,12 +190,12 @@ pub(crate) use state_composition::{ApiRuntimeInputs, ApiRuntimePaths};
 pub(crate) use state_composition::{RootApiRole, build_router_from_root};
 pub(crate) use validation::run_admission_for_request;
 pub use validation::{
-    AdmissionContextRequest, DeleteOptions, apply_crd_defaults, apply_crd_pruning,
-    build_admission_context, check_content_type, check_cr_field_validation_strict,
+    AdmissionContextRequest, apply_crd_defaults, apply_crd_pruning, build_admission_context,
+    check_content_type, check_cr_field_validation_strict,
     check_deployment_strict_decode_from_raw_json, check_field_validation_strict,
     check_field_validation_strict_typed, check_immutable_fields, inject_resource_version,
-    parse_apply_yaml, parse_delete_options_body, prepare_admissionregistration_resource,
-    validate_builtin_field_selector, validate_builtin_resource_spec, validate_crd_field_selector,
+    parse_apply_yaml, prepare_admissionregistration_resource, validate_builtin_field_selector,
+    validate_builtin_resource_spec, validate_crd_field_selector,
     validate_pod_resource_requirements_immutable, validate_pod_sysctls,
     validate_priorityclass_update_immutable,
 };
@@ -227,7 +228,6 @@ use axum::{
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::api::discovery::{
     admissionregistration_v1_resources, api_group_by_name, api_groups, api_v1_resources,

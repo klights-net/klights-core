@@ -1,7 +1,14 @@
-use klights_cluster_core::{ResourcePatchRequest, ResourcePreconditions, StorageCommand};
-use klights_leader_api::{LeaderResourceCommand, ResourceCommandRequest, ResourceCommandResult};
+//! Focused generic resource command submission.
+//!
+//! The HTTP orchestration owns Kubernetes policy and response mapping. Durable
+//! command/result and CAS semantics remain owned by cluster-core/leader-api.
 
-use crate::api::AppError;
+use klights_cluster_core::{ResourcePatchRequest, ResourcePreconditions, StorageCommand};
+use klights_leader_api::{
+    LeaderResourceCommand, LeaderResourceQuery, ResourceCommandRequest, ResourceCommandResult,
+};
+
+use crate::AppError;
 
 fn resource_result(
     result: ResourceCommandResult,
@@ -15,7 +22,7 @@ fn resource_result(
     }
 }
 
-pub(crate) async fn create_namespace(
+pub async fn create_namespace(
     command: &dyn LeaderResourceCommand,
     name: &str,
     data: serde_json::Value,
@@ -31,7 +38,7 @@ pub(crate) async fn create_namespace(
     resource_result(result, "namespace create")
 }
 
-pub(crate) async fn update_namespace(
+pub async fn update_namespace(
     command: &dyn LeaderResourceCommand,
     name: &str,
     data: serde_json::Value,
@@ -49,7 +56,7 @@ pub(crate) async fn update_namespace(
     resource_result(result, "namespace update")
 }
 
-pub(crate) async fn delete_namespace(
+pub async fn delete_namespace(
     command: &dyn LeaderResourceCommand,
     name: &str,
 ) -> Result<(), AppError> {
@@ -68,7 +75,7 @@ pub(crate) async fn delete_namespace(
     }
 }
 
-pub(crate) async fn create_non_pod_resource(
+pub async fn create_non_pod_resource(
     command: &dyn LeaderResourceCommand,
     api_version: &str,
     kind: &str,
@@ -95,7 +102,7 @@ pub(crate) async fn create_non_pod_resource(
     resource_result(result, "resource create")
 }
 
-pub(crate) async fn update_non_pod_resource(
+pub async fn update_non_pod_resource(
     command: &dyn LeaderResourceCommand,
     api_version: &str,
     kind: &str,
@@ -124,33 +131,7 @@ pub(crate) async fn update_non_pod_resource(
     resource_result(result, "resource update")
 }
 
-pub(crate) async fn update_resource_status(
-    command: &dyn LeaderResourceCommand,
-    api_version: &str,
-    kind: &str,
-    namespace: Option<&str>,
-    name: &str,
-    status: serde_json::Value,
-    preconditions: ResourcePreconditions,
-) -> Result<klights_cluster_core::Resource, AppError> {
-    let request = ResourceCommandRequest::try_new(StorageCommand::UpdateStatus {
-        api_version: api_version.to_string(),
-        kind: kind.to_string(),
-        namespace: namespace.map(str::to_string),
-        name: name.to_string(),
-        status,
-        expected_rv: preconditions.resource_version,
-        preconditions,
-        observed_status_stamp: None,
-    })?;
-    let result = command
-        .submit_resource_command(request)
-        .await
-        .map_err(AppError::from)?;
-    resource_result(result, "resource status update")
-}
-
-pub(crate) async fn patch_non_pod_resource(
+pub async fn patch_non_pod_resource(
     command: &dyn LeaderResourceCommand,
     api_version: &str,
     kind: &str,
@@ -186,7 +167,7 @@ pub(crate) async fn patch_non_pod_resource(
     resource_result(result, "resource patch")
 }
 
-pub(crate) async fn delete_non_pod_resource(
+pub async fn delete_non_pod_resource(
     command: &dyn LeaderResourceCommand,
     api_version: &str,
     kind: &str,
@@ -213,15 +194,15 @@ pub(crate) async fn delete_non_pod_resource(
         .map_err(AppError::from)
 }
 
-pub(crate) async fn delete_non_pod_collection(
-    query: &dyn klights_leader_api::LeaderResourceQuery,
+pub async fn delete_non_pod_collection(
+    query: &dyn LeaderResourceQuery,
     command: &dyn LeaderResourceCommand,
     api_version: &str,
     kind: &str,
     namespace: Option<&str>,
     label_selector: Option<&str>,
 ) -> Result<(), AppError> {
-    let resources = crate::api::resource_query_ports::list_resources(
+    let resources = crate::generic_read::list_resources(
         query,
         api_version,
         kind,
@@ -255,8 +236,8 @@ mod tests {
 
     use klights_cluster_core::Resource;
     use klights_leader_api::{
-        LeaderResourceQuery, ResourceCommandError, ResourceCommandFuture, ResourceCommandRequest,
-        ResourceGetRequest, ResourceListRequest, ResourceListResult, ResourceQueryFuture,
+        ResourceCommandError, ResourceCommandFuture, ResourceGetRequest, ResourceListRequest,
+        ResourceListResult, ResourceQueryFuture,
     };
 
     use super::*;
@@ -300,14 +281,14 @@ mod tests {
         ) -> ResourceQueryFuture<'_, ResourceListResult> {
             Box::pin(async {
                 let resource = Resource::try_from_data(std::sync::Arc::new(serde_json::json!({
-                        "apiVersion": "v1",
-                        "kind": "ConfigMap",
-                        "metadata": {
-                            "name": "test-config",
-                            "namespace": "default",
-                            "uid": "config-uid",
-                            "resourceVersion": "7"
-                        }
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "test-config",
+                        "namespace": "default",
+                        "uid": "config-uid",
+                        "resourceVersion": "7"
+                    }
                 })))
                 .expect("fixture resource must have valid identity");
                 ResourceListResult::try_new(vec![resource], 0, None, None, None)
@@ -329,7 +310,6 @@ mod tests {
     #[tokio::test]
     async fn generic_delete_rejects_pods_before_command_submission() {
         let command = RecordingCommand::default();
-
         let error = delete_non_pod_resource(
             &command,
             "v1",
@@ -340,7 +320,6 @@ mod tests {
         )
         .await
         .expect_err("generic Pod deletion must fail closed");
-
         assert!(matches!(error, AppError::Forbidden(_)));
         assert_eq!(command.submissions.load(Ordering::Relaxed), 0);
     }
@@ -348,7 +327,6 @@ mod tests {
     #[tokio::test]
     async fn generic_create_rejects_pods_before_command_submission() {
         let command = RecordingCommand::default();
-
         let error = create_non_pod_resource(
             &command,
             "v1",
@@ -363,15 +341,47 @@ mod tests {
         )
         .await
         .expect_err("generic Pod creation must fail closed");
-
         assert!(matches!(error, AppError::Forbidden(_)));
+        assert_eq!(command.submissions.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn generic_update_and_patch_reject_pods_before_command_submission() {
+        let command = RecordingCommand::default();
+        let update_error = update_non_pod_resource(
+            &command,
+            "v1",
+            "Pod",
+            Some("default"),
+            "test-pod",
+            serde_json::json!({}),
+            7,
+        )
+        .await
+        .expect_err("generic Pod update must fail closed");
+        assert!(matches!(update_error, AppError::Forbidden(_)));
+
+        let patch_error = patch_non_pod_resource(
+            &command,
+            "v1",
+            "Pod",
+            Some("default"),
+            "test-pod",
+            ResourcePatchRequest::new(
+                klights_cluster_core::PatchKind::Merge,
+                serde_json::json!({}),
+                ResourcePreconditions::default(),
+            ),
+        )
+        .await
+        .expect_err("generic Pod patch must fail closed");
+        assert!(matches!(patch_error, AppError::Forbidden(_)));
         assert_eq!(command.submissions.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn collection_delete_uses_listed_resource_identity_preconditions() {
         let command = RecordingCommand::default();
-
         delete_non_pod_collection(
             &OneResourceQuery,
             &command,
@@ -408,7 +418,6 @@ mod tests {
         )
         .await
         .expect_err("collection delete must propagate command failure");
-
         assert!(matches!(error, AppError::ServiceUnavailable(_)));
     }
 }

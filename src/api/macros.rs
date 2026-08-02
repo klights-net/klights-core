@@ -7,7 +7,7 @@ macro_rules! cluster_delete_collection_handler {
             Query(query): Query<DeleteCollectionQuery>,
             axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
         ) -> Result<Json<Value>, AppError> {
-            crate::api::generated_handlers::inners::delete_collection_shared_inner(
+            k8s_native_service::generic_command::delete_collection_shared_inner(
                 state,
                 &identity,
                 $api_version,

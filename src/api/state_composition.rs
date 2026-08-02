@@ -14,21 +14,81 @@ pub(crate) struct ApiResourceMutationServices {
     pub(crate) list_resource_versions: Arc<dyn crate::api::query::ListResourceVersionPort>,
     pub(crate) namespace_lists: Arc<dyn crate::api::query::NamespaceListPort>,
     pub(crate) quota_runtime: Arc<dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime>,
-    pub(crate) admission: Arc<dyn crate::api::admission_ports::ResourceAdmissionPort>,
+    pub(crate) admission: Arc<dyn k8s_native_service::generic_command::ResourceAdmissionPort>,
     pub(crate) custom_resource_reads:
         Arc<dyn crate::api::custom_resource_ports::CustomResourceReadPort>,
     pub(crate) builtin_admission_defaults:
-        Arc<dyn crate::api::generated_handler_ports::BuiltinAdmissionDefaultsPort>,
+        Arc<dyn k8s_native_service::generic_command::BuiltinAdmissionDefaultsPort>,
     pub(crate) generated_lifecycle:
-        Arc<dyn crate::api::generated_handler_ports::GeneratedLifecyclePort>,
+        Arc<dyn k8s_native_service::generic_command::GeneratedLifecyclePort>,
     pub(crate) generated_mutations:
-        Arc<dyn crate::api::generated_handler_ports::GeneratedResourceMutationPort>,
+        Arc<dyn k8s_native_service::generic_command::GeneratedResourceMutationPort>,
     pub(crate) generated_watch: Arc<dyn crate::api::generated_handler_ports::GeneratedWatchPort>,
     pub(crate) gc_owner_lifecycle: Arc<dyn klights_reconcile_api::GcOwnerLifecyclePort>,
     #[cfg(not(test))]
     pub(crate) pod_repository: Arc<dyn crate::api::state_ports::ApiPodRepository>,
     #[cfg(test)]
     pub(crate) pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
+}
+
+impl k8s_native_service::generic_command::GenericCommandStore for ApiResourceMutationServices {
+    fn resource_query(&self) -> &dyn klights_leader_api::LeaderResourceQuery {
+        self.resource_query.as_ref()
+    }
+
+    fn resource_command(&self) -> &dyn klights_leader_api::LeaderResourceCommand {
+        self.resource_command.as_ref()
+    }
+
+    fn finalizer_lifecycle(&self) -> &dyn klights_reconcile_api::FinalizerLifecyclePort {
+        self.finalizer_lifecycle.as_ref()
+    }
+
+    fn generated_mutations(
+        &self,
+    ) -> &dyn k8s_native_service::generic_command::GeneratedResourceMutationPort {
+        self.generated_mutations.as_ref()
+    }
+
+    fn pod_mutation(&self) -> &dyn klights_pod_api::PodApiMutation {
+        self.pod_repository.as_ref()
+    }
+}
+
+impl k8s_native_service::generic_command::GenericCommandAdmission for ApiResourceMutationServices {
+    fn admission(&self) -> &dyn k8s_native_service::generic_command::ResourceAdmissionPort {
+        self.admission.as_ref()
+    }
+
+    fn quota_runtime(&self) -> &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime {
+        self.quota_runtime.as_ref()
+    }
+
+    fn builtin_admission_defaults(
+        &self,
+    ) -> &dyn k8s_native_service::generic_command::BuiltinAdmissionDefaultsPort {
+        self.builtin_admission_defaults.as_ref()
+    }
+}
+
+impl k8s_native_service::generic_command::GenericCommandLifecycle for ApiResourceMutationServices {
+    fn mutation_effects(&self) -> &dyn klights_reconcile_api::ResourceMutationEffectsPort {
+        self.mutation_effects.as_ref()
+    }
+
+    fn generated_lifecycle(
+        &self,
+    ) -> &dyn k8s_native_service::generic_command::GeneratedLifecyclePort {
+        self.generated_lifecycle.as_ref()
+    }
+
+    fn gc_owner_lifecycle(&self) -> &dyn klights_reconcile_api::GcOwnerLifecyclePort {
+        self.gc_owner_lifecycle.as_ref()
+    }
+
+    fn gc_owner_lifecycle_owned(&self) -> Arc<dyn klights_reconcile_api::GcOwnerLifecyclePort> {
+        self.gc_owner_lifecycle.clone()
+    }
 }
 
 impl k8s_native_service::discovery::DiscoveryResourceQuery for ApiResourceMutationServices {
@@ -412,6 +472,26 @@ impl k8s_native_service::generic_read::GenericReadControllerInputs
     }
 }
 
+impl k8s_native_service::generic_command::GenericCommandReconcile
+    for ApiControllerReconcileServices
+{
+    fn service_allocations(&self) -> &dyn klights_reconcile_api::ServiceWriteAllocator {
+        self.service_allocations.as_ref()
+    }
+
+    fn controller_dispatcher(&self) -> &dyn klights_reconcile_api::ControllerDispatcherPort {
+        self.controller_dispatcher.as_ref()
+    }
+
+    fn failure_metrics(&self) -> &dyn klights_reconcile_api::ReconcileFailureMetrics {
+        self.metrics.as_ref()
+    }
+
+    fn failure_metrics_owned(&self) -> Arc<dyn klights_reconcile_api::ReconcileFailureMetrics> {
+        self.metrics.clone()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ApiPodNodeSubresourceServices {
     pub(crate) services: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
@@ -677,6 +757,20 @@ impl k8s_native_service::generic_read::GenericReadOperationalInputs for ApiOpera
     }
 }
 
+impl k8s_native_service::generic_command::GenericCommandRuntime for ApiOperationalServices {
+    fn clock(&self) -> &dyn klights_auth::clock::Clock {
+        self.clock.as_ref()
+    }
+
+    fn task_supervisor(&self) -> &klights_supervisor::TaskSupervisor {
+        self.task_supervisor.as_ref()
+    }
+
+    fn task_supervisor_owned(&self) -> Arc<klights_supervisor::TaskSupervisor> {
+        self.task_supervisor.clone()
+    }
+}
+
 #[cfg(not(test))]
 pub(crate) enum RootApiRole {
     Leader,
@@ -716,14 +810,14 @@ pub(crate) fn build_router_from_root(
     list_resource_versions: Arc<dyn crate::api::query::ListResourceVersionPort>,
     namespace_lists: Arc<dyn crate::api::query::NamespaceListPort>,
     quota_runtime: Arc<dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime>,
-    admission: Arc<dyn crate::api::admission_ports::ResourceAdmissionPort>,
+    admission: Arc<dyn k8s_native_service::generic_command::ResourceAdmissionPort>,
     custom_resource_reads: Arc<dyn crate::api::custom_resource_ports::CustomResourceReadPort>,
     builtin_admission_defaults: Arc<
-        dyn crate::api::generated_handler_ports::BuiltinAdmissionDefaultsPort,
+        dyn k8s_native_service::generic_command::BuiltinAdmissionDefaultsPort,
     >,
-    generated_lifecycle: Arc<dyn crate::api::generated_handler_ports::GeneratedLifecyclePort>,
+    generated_lifecycle: Arc<dyn k8s_native_service::generic_command::GeneratedLifecyclePort>,
     generated_mutations: Arc<
-        dyn crate::api::generated_handler_ports::GeneratedResourceMutationPort,
+        dyn k8s_native_service::generic_command::GeneratedResourceMutationPort,
     >,
     generated_watch: Arc<dyn crate::api::generated_handler_ports::GeneratedWatchPort>,
     gc_owner_lifecycle: Arc<dyn klights_reconcile_api::GcOwnerLifecyclePort>,

@@ -4,8 +4,6 @@
 use crate::api::*;
 use std::sync::Arc;
 
-use super::inners::*;
-
 // ============================================================================
 // Thin axum-extractor wrapper macros. Each invocation generates one set of
 // per-resource handler functions that delegate to the shared `*_inner`
@@ -63,7 +61,7 @@ macro_rules! namespaced_resource_handlers {
             axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
             LenientJson(body): LenientJson<Value>,
         ) -> Result<(StatusCode, Json<Value>), AppError> {
-            create_inner(
+            k8s_native_service::generic_command::create_inner(
                 state,
                 &identity,
                 $api_version,
@@ -82,11 +80,11 @@ macro_rules! namespaced_resource_handlers {
             axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
             LenientJson(body): LenientJson<Value>,
         ) -> Result<Json<Value>, AppError> {
-            update_inner(
+            k8s_native_service::generic_command::update_inner(
                 state,
                 &identity,
-                GeneratedUpdateInnerRequest {
-                    target: GeneratedNamedResource::new(
+                k8s_native_service::generic_command::GeneratedUpdateInnerRequest {
+                    target: k8s_native_service::generic_command::GeneratedNamedResource::new(
                         $api_version,
                         $kind,
                         Some(&namespace),
@@ -106,11 +104,11 @@ macro_rules! namespaced_resource_handlers {
             axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
             body: Bytes,
         ) -> Result<(StatusCode, Json<Value>), AppError> {
-            delete_inner(
+            k8s_native_service::generic_command::delete_inner(
                 state,
                 &identity,
-                GeneratedDeleteInnerRequest {
-                    target: GeneratedNamedResource::new(
+                k8s_native_service::generic_command::GeneratedDeleteInnerRequest {
+                    target: k8s_native_service::generic_command::GeneratedNamedResource::new(
                         $api_version,
                         $kind,
                         Some(&namespace),
@@ -131,11 +129,11 @@ macro_rules! namespaced_resource_handlers {
             axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
             body: Bytes,
         ) -> Result<(StatusCode, Json<Value>), AppError> {
-            patch_inner(
+            k8s_native_service::generic_command::patch_inner(
                 state,
                 &identity,
-                GeneratedPatchInnerRequest {
-                    target: GeneratedNamedResource::new(
+                k8s_native_service::generic_command::GeneratedPatchInnerRequest {
+                    target: k8s_native_service::generic_command::GeneratedNamedResource::new(
                         $api_version,
                         $kind,
                         Some(&namespace),
@@ -155,7 +153,15 @@ macro_rules! namespaced_resource_handlers {
             Query(query): Query<DeleteCollectionQuery>,
             axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
         ) -> Result<Json<Value>, AppError> {
-            delete_collection_inner(state, &identity, $api_version, $kind, &namespace, query).await
+            k8s_native_service::generic_command::delete_collection_inner(
+                state,
+                &identity,
+                $api_version,
+                $kind,
+                &namespace,
+                query,
+            )
+            .await
         }
     };
 }
@@ -208,7 +214,16 @@ macro_rules! cluster_resource_handlers {
             axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
             LenientJson(body): LenientJson<Value>,
         ) -> Result<(StatusCode, Json<Value>), AppError> {
-            create_inner(state, &identity, $api_version, $kind, None, query, body).await
+            k8s_native_service::generic_command::create_inner(
+                state,
+                &identity,
+                $api_version,
+                $kind,
+                None,
+                query,
+                body,
+            )
+            .await
         }
 
         pub(in crate::api) async fn $update_fn(
@@ -218,11 +233,16 @@ macro_rules! cluster_resource_handlers {
             axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
             LenientJson(body): LenientJson<Value>,
         ) -> Result<Json<Value>, AppError> {
-            update_inner(
+            k8s_native_service::generic_command::update_inner(
                 state,
                 &identity,
-                GeneratedUpdateInnerRequest {
-                    target: GeneratedNamedResource::new($api_version, $kind, None, &name),
+                k8s_native_service::generic_command::GeneratedUpdateInnerRequest {
+                    target: k8s_native_service::generic_command::GeneratedNamedResource::new(
+                        $api_version,
+                        $kind,
+                        None,
+                        &name,
+                    ),
                     query,
                     body,
                 },
@@ -237,11 +257,16 @@ macro_rules! cluster_resource_handlers {
             axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
             body: Bytes,
         ) -> Result<(StatusCode, Json<Value>), AppError> {
-            delete_inner(
+            k8s_native_service::generic_command::delete_inner(
                 state,
                 &identity,
-                GeneratedDeleteInnerRequest {
-                    target: GeneratedNamedResource::new($api_version, $kind, None, &name),
+                k8s_native_service::generic_command::GeneratedDeleteInnerRequest {
+                    target: k8s_native_service::generic_command::GeneratedNamedResource::new(
+                        $api_version,
+                        $kind,
+                        None,
+                        &name,
+                    ),
                     query,
                     body,
                 },
@@ -257,11 +282,16 @@ macro_rules! cluster_resource_handlers {
             axum::Extension(identity): axum::Extension<klights_auth::AuthenticatedIdentity>,
             body: Bytes,
         ) -> Result<(StatusCode, Json<Value>), AppError> {
-            patch_inner(
+            k8s_native_service::generic_command::patch_inner(
                 state,
                 &identity,
-                GeneratedPatchInnerRequest {
-                    target: GeneratedNamedResource::new($api_version, $kind, None, &name),
+                k8s_native_service::generic_command::GeneratedPatchInnerRequest {
+                    target: k8s_native_service::generic_command::GeneratedNamedResource::new(
+                        $api_version,
+                        $kind,
+                        None,
+                        &name,
+                    ),
                     query,
                     headers,
                     body,

@@ -1,10 +1,10 @@
 use super::*;
-use crate::api::mutation::write::{
+use async_trait::async_trait;
+use axum::Extension;
+use k8s_native_service::generic_command::{
     CreateStrategy, PatchStrategy, UpdateStrategy, WriteResult, create_with_strategy,
     patch_with_strategy, update_with_strategy,
 };
-use async_trait::async_trait;
-use axum::Extension;
 use klights_auth::AuthenticatedIdentity;
 
 // Custom-resource authorization is enforced by the global `authorize_request`
@@ -1408,11 +1408,13 @@ async fn delete_collection_cr_inner(
     }
 
     let delete_intent =
-        crate::api::mutation::DeleteIntent::from_delete_collection_query_and_body(query, &body)?;
+        k8s_native_service::generic_command::DeleteIntent::from_delete_collection_query_and_body(
+            query, &body,
+        )?;
     let dry_run = delete_intent.dry_run;
     if dry_run.is_all() {
         return Ok(
-            Json(crate::api::mutation::response::delete_collection_success_status())
+            Json(k8s_native_service::generic_command::delete_collection_success_status())
                 .into_response(),
         );
     }
@@ -1449,17 +1451,20 @@ async fn delete_collection_cr_inner(
         ));
     }
 
-    let strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
+    let strategy = k8s_native_service::generic_command::FinalizerAwareDeleteStrategy {
         resource_query: state.resource_mutation().resource_query.as_ref(),
         lifecycle: state.resource_mutation().finalizer_lifecycle.as_ref(),
         operation_now: klights_auth::clock::chrono_utc(state.operational().clock.now()),
     };
-    let results =
-        crate::api::mutation::delete::delete_collection_items(&strategy, items, &delete_intent)
-            .await?;
+    let results = k8s_native_service::generic_command::delete_collection_items(
+        &strategy,
+        items,
+        &delete_intent,
+    )
+    .await?;
     for result in results {
         match result {
-            crate::api::mutation::delete::DeleteResult::HardDeleted(deleted) => {
+            k8s_native_service::generic_command::DeleteResult::HardDeleted(deleted) => {
                 dispatch_custom_resource_mutation_event(
                     state,
                     klights_reconcile_api::MutationOperation::HardDelete,
@@ -1487,7 +1492,7 @@ async fn delete_collection_cr_inner(
                     tracing::error!(name = %deleted.name, kind = %deleted.kind, error = %e, "{log_context}: cascade delete failed");
                 }
             }
-            crate::api::mutation::delete::DeleteResult::MarkedTerminating(marked) => {
+            k8s_native_service::generic_command::DeleteResult::MarkedTerminating(marked) => {
                 dispatch_custom_resource_mutation_event(
                     state,
                     klights_reconcile_api::MutationOperation::DeleteMark,
@@ -1496,11 +1501,14 @@ async fn delete_collection_cr_inner(
                 )
                 .await;
             }
-            crate::api::mutation::delete::DeleteResult::GoneOrUidChanged => {}
+            k8s_native_service::generic_command::DeleteResult::GoneOrUidChanged => {}
         }
     }
 
-    Ok(Json(crate::api::mutation::response::delete_collection_success_status()).into_response())
+    Ok(
+        Json(k8s_native_service::generic_command::delete_collection_success_status())
+            .into_response(),
+    )
 }
 
 pub async fn delete_collection_custom_resources(
@@ -1548,14 +1556,14 @@ async fn dispatch_custom_resource_mutation_event(
     resource: &serde_json::Value,
     context: &'static str,
 ) {
-    crate::api::mutation::dispatch_mutation_event(
+    k8s_native_service::generic_command::dispatch_mutation_event(
         state.resource_mutation().mutation_effects.as_ref(),
-        crate::api::mutation::MutationEvent {
+        k8s_native_service::generic_command::MutationEvent {
             operation,
             resource,
             old_resource: None,
             persisted: true,
-            dry_run: crate::api::mutation::DryRunMode::Live,
+            dry_run: k8s_native_service::generic_command::DryRunMode::Live,
             context,
         },
     )
@@ -1614,7 +1622,7 @@ impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
     async fn admit(
         &self,
         body: Value,
-        dry_run: crate::api::mutation::DryRunMode,
+        dry_run: k8s_native_service::generic_command::DryRunMode,
     ) -> Result<Value, AppError> {
         let CustomResourceType { info, .. } = self.scope.resource_type;
         let api_version = self.scope.resource_type.api_version();
@@ -1628,19 +1636,21 @@ impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
             .state
             .resource_mutation()
             .admission
-            .admit(crate::api::admission_ports::ResourceAdmissionRequest {
-                api_version,
-                kind: info.kind.clone(),
-                resource: None,
-                operation: "CREATE".to_string(),
-                namespace,
-                name,
-                object: body,
-                old_object: None,
-                dry_run: dry_run.is_all(),
-                subresource: None,
-                options: None,
-            })
+            .admit(
+                k8s_native_service::generic_command::ResourceAdmissionRequest {
+                    api_version,
+                    kind: info.kind.clone(),
+                    resource: None,
+                    operation: "CREATE".to_string(),
+                    namespace,
+                    name,
+                    object: body,
+                    old_object: None,
+                    dry_run: dry_run.is_all(),
+                    subresource: None,
+                    options: None,
+                },
+            )
             .await?;
         let CustomResourceType { group, version, .. } = self.scope.resource_type;
         apply_crd_pruning(
@@ -1657,7 +1667,7 @@ impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
     async fn persist_create(
         &self,
         body: Value,
-        dry_run: crate::api::mutation::DryRunMode,
+        dry_run: k8s_native_service::generic_command::DryRunMode,
     ) -> Result<WriteResult, AppError> {
         if dry_run.is_all() {
             return Ok(WriteResult::DryRun(body));
@@ -1705,7 +1715,7 @@ impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
             body,
         )
         .await?;
-        let resource = crate::api::resource_command_ports::create_non_pod_resource(
+        let resource = k8s_native_service::generic_command::create_non_pod_resource(
             self.state.resource_mutation().resource_command.as_ref(),
             &storage_api_version,
             &info.kind,
@@ -1771,7 +1781,7 @@ impl<'a> UpdateStrategy for CustomResourceUpdateStrategy<'a> {
         &self,
         current: &Resource,
         mut body: Value,
-        _dry_run: crate::api::mutation::DryRunMode,
+        _dry_run: k8s_native_service::generic_command::DryRunMode,
     ) -> Result<Value, AppError> {
         let CustomResourceType {
             info,
@@ -1785,19 +1795,21 @@ impl<'a> UpdateStrategy for CustomResourceUpdateStrategy<'a> {
             .state
             .resource_mutation()
             .admission
-            .admit(crate::api::admission_ports::ResourceAdmissionRequest {
-                api_version,
-                kind: info.kind.clone(),
-                resource: None,
-                operation: "UPDATE".to_string(),
-                namespace: ns.map(str::to_string),
-                name: Some(self.target.name.to_string()),
-                object: body,
-                old_object: Some((*current.data).clone()),
-                dry_run: false,
-                subresource: None,
-                options: None,
-            })
+            .admit(
+                k8s_native_service::generic_command::ResourceAdmissionRequest {
+                    api_version,
+                    kind: info.kind.clone(),
+                    resource: None,
+                    operation: "UPDATE".to_string(),
+                    namespace: ns.map(str::to_string),
+                    name: Some(self.target.name.to_string()),
+                    object: body,
+                    old_object: Some((*current.data).clone()),
+                    dry_run: false,
+                    subresource: None,
+                    options: None,
+                },
+            )
             .await?;
         apply_crd_pruning(
             self.state.resource_mutation().resource_query.as_ref(),
@@ -1807,8 +1819,11 @@ impl<'a> UpdateStrategy for CustomResourceUpdateStrategy<'a> {
             &mut body,
         )
         .await;
-        crate::api::mutation::write::prepare_custom_generation_for_update(&current.data, &mut body);
-        crate::api::finalizer_delete::preserve_deletion_timestamp_on_update(
+        k8s_native_service::generic_command::prepare_custom_generation_for_update(
+            &current.data,
+            &mut body,
+        );
+        k8s_native_service::generic_command::preserve_deletion_timestamp_on_update(
             &current.data,
             &mut body,
         );
@@ -1819,7 +1834,7 @@ impl<'a> UpdateStrategy for CustomResourceUpdateStrategy<'a> {
         &self,
         current: Resource,
         body: Value,
-        _dry_run: crate::api::mutation::DryRunMode,
+        _dry_run: k8s_native_service::generic_command::DryRunMode,
     ) -> Result<WriteResult, AppError> {
         let CustomResourceType {
             info,
@@ -1845,7 +1860,7 @@ impl<'a> UpdateStrategy for CustomResourceUpdateStrategy<'a> {
             body,
         )
         .await?;
-        let resource = crate::api::resource_command_ports::update_non_pod_resource(
+        let resource = k8s_native_service::generic_command::update_non_pod_resource(
             self.state.resource_mutation().resource_command.as_ref(),
             &stored_api_version,
             &info.kind,
@@ -1863,9 +1878,8 @@ impl<'a> UpdateStrategy for CustomResourceUpdateStrategy<'a> {
             "custom_update",
         )
         .await;
-        crate::api::finalizer_delete::finalize_after_update_if_ready(
+        k8s_native_service::generic_command::finalize_after_update_if_ready(
             self.state,
-            &stored_api_version,
             &info.kind,
             ns,
             self.target.name,
@@ -1902,7 +1916,7 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
     async fn apply_patch(
         &self,
         patch: Value,
-        dry_run: crate::api::mutation::DryRunMode,
+        dry_run: k8s_native_service::generic_command::DryRunMode,
     ) -> Result<WriteResult, AppError> {
         let CustomResourceType {
             info,
@@ -1963,19 +1977,21 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
                     .state
                     .resource_mutation()
                     .admission
-                    .admit(crate::api::admission_ports::ResourceAdmissionRequest {
-                        api_version: api_version.clone(),
-                        kind: info.kind.clone(),
-                        resource: None,
-                        operation: "CREATE".to_string(),
-                        namespace: ns.map(str::to_string),
-                        name: Some(self.target.name.to_string()),
-                        object: created_resource,
-                        old_object: None,
-                        dry_run: is_dry_run,
-                        subresource: None,
-                        options: None,
-                    })
+                    .admit(
+                        k8s_native_service::generic_command::ResourceAdmissionRequest {
+                            api_version: api_version.clone(),
+                            kind: info.kind.clone(),
+                            resource: None,
+                            operation: "CREATE".to_string(),
+                            namespace: ns.map(str::to_string),
+                            name: Some(self.target.name.to_string()),
+                            object: created_resource,
+                            old_object: None,
+                            dry_run: is_dry_run,
+                            subresource: None,
+                            options: None,
+                        },
+                    )
                     .await?;
                 apply_crd_pruning(
                     self.state.resource_mutation().resource_query.as_ref(),
@@ -2002,7 +2018,7 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
                     created_resource,
                 )
                 .await?;
-                let resource = crate::api::resource_command_ports::create_non_pod_resource(
+                let resource = k8s_native_service::generic_command::create_non_pod_resource(
                     self.state.resource_mutation().resource_command.as_ref(),
                     &storage_api_version,
                     &info.kind,
@@ -2041,19 +2057,21 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
             .state
             .resource_mutation()
             .admission
-            .admit(crate::api::admission_ports::ResourceAdmissionRequest {
-                api_version: api_version.clone(),
-                kind: info.kind.clone(),
-                resource: None,
-                operation: "UPDATE".to_string(),
-                namespace: ns.map(str::to_string),
-                name: Some(self.target.name.to_string()),
-                object: patched_resource,
-                old_object: Some((*current.data).clone()),
-                dry_run: is_dry_run,
-                subresource: None,
-                options: None,
-            })
+            .admit(
+                k8s_native_service::generic_command::ResourceAdmissionRequest {
+                    api_version: api_version.clone(),
+                    kind: info.kind.clone(),
+                    resource: None,
+                    operation: "UPDATE".to_string(),
+                    namespace: ns.map(str::to_string),
+                    name: Some(self.target.name.to_string()),
+                    object: patched_resource,
+                    old_object: Some((*current.data).clone()),
+                    dry_run: is_dry_run,
+                    subresource: None,
+                    options: None,
+                },
+            )
             .await?;
         apply_crd_pruning(
             self.state.resource_mutation().resource_query.as_ref(),
@@ -2063,11 +2081,11 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
             &mut patched_resource,
         )
         .await;
-        crate::api::mutation::write::prepare_custom_generation_for_update(
+        k8s_native_service::generic_command::prepare_custom_generation_for_update(
             &current.data,
             &mut patched_resource,
         );
-        crate::api::finalizer_delete::preserve_deletion_timestamp_on_update(
+        k8s_native_service::generic_command::preserve_deletion_timestamp_on_update(
             &current.data,
             &mut patched_resource,
         );
@@ -2085,7 +2103,7 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
             patched_resource,
         )
         .await?;
-        let resource = crate::api::resource_command_ports::update_non_pod_resource(
+        let resource = k8s_native_service::generic_command::update_non_pod_resource(
             self.state.resource_mutation().resource_command.as_ref(),
             &stored_api_version,
             &info.kind,
@@ -2103,9 +2121,8 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
             "custom_patch",
         )
         .await;
-        crate::api::finalizer_delete::finalize_after_update_if_ready(
+        k8s_native_service::generic_command::finalize_after_update_if_ready(
             self.state,
-            &stored_api_version,
             &info.kind,
             ns,
             self.target.name,
@@ -2144,7 +2161,7 @@ async fn create_cr_inner(
         query,
         log_context,
     };
-    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(query)?;
+    let dry_run = k8s_native_service::generic_command::DryRunMode::from_create_update_query(query)?;
     let (status, data) = create_with_strategy(&strategy, body, dry_run)
         .await?
         .into_response_parts(StatusCode::CREATED);
@@ -2220,7 +2237,8 @@ async fn delete_cr_inner(
     }
 
     let requested_api_version = resource_type.api_version();
-    let delete_intent = crate::api::mutation::DeleteIntent::from_query_and_body(query, &body)?;
+    let delete_intent =
+        k8s_native_service::generic_command::DeleteIntent::from_query_and_body(query, &body)?;
     let is_dry_run = delete_intent.dry_run.is_all();
     let mut options_value =
         serde_json::to_value(&delete_intent.options).unwrap_or_else(|_| serde_json::json!({}));
@@ -2248,33 +2266,37 @@ async fn delete_cr_inner(
     )
     .await?;
 
-    crate::api::mutation::delete::ensure_delete_preconditions_match(
+    k8s_native_service::generic_command::ensure_delete_preconditions_match(
         &resource,
         &delete_intent.preconditions,
     )?;
     let _ = state
         .resource_mutation()
         .admission
-        .admit(crate::api::admission_ports::ResourceAdmissionRequest {
-            api_version: requested_api_version.clone(),
-            kind: info.kind.clone(),
-            resource: None,
-            operation: "DELETE".to_string(),
-            namespace: ns.map(str::to_string),
-            name: Some(name.to_string()),
-            object: Value::Null,
-            old_object: Some((*resource.data).clone()),
-            dry_run: is_dry_run,
-            subresource: None,
-            options: Some(options_value),
-        })
+        .admit(
+            k8s_native_service::generic_command::ResourceAdmissionRequest {
+                api_version: requested_api_version.clone(),
+                kind: info.kind.clone(),
+                resource: None,
+                operation: "DELETE".to_string(),
+                namespace: ns.map(str::to_string),
+                name: Some(name.to_string()),
+                object: Value::Null,
+                old_object: Some((*resource.data).clone()),
+                dry_run: is_dry_run,
+                subresource: None,
+                options: Some(options_value),
+            },
+        )
         .await?;
 
     if is_dry_run {
-        return Ok(Json(crate::api::mutation::response::delete_success_status(
-            &info.kind, name,
-        ))
-        .into_response());
+        return Ok(
+            Json(k8s_native_service::generic_command::delete_success_status(
+                &info.kind, name,
+            ))
+            .into_response(),
+        );
     }
 
     let target_identity = klights_types::ResourceKey::new(
@@ -2283,12 +2305,12 @@ async fn delete_cr_inner(
         ns.map(str::to_string),
         name.to_string(),
     );
-    let delete_strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
+    let delete_strategy = k8s_native_service::generic_command::FinalizerAwareDeleteStrategy {
         resource_query: state.resource_mutation().resource_query.as_ref(),
         lifecycle: state.resource_mutation().finalizer_lifecycle.as_ref(),
         operation_now: klights_auth::clock::chrono_utc(state.operational().clock.now()),
     };
-    match crate::api::mutation::delete::delete_loaded_with_strategy(
+    match k8s_native_service::generic_command::delete_loaded_with_strategy(
         &delete_strategy,
         target_identity,
         resource,
@@ -2296,7 +2318,7 @@ async fn delete_cr_inner(
     )
     .await?
     {
-        crate::api::mutation::delete::DeleteResult::MarkedTerminating(updated) => {
+        k8s_native_service::generic_command::DeleteResult::MarkedTerminating(updated) => {
             dispatch_custom_resource_mutation_event(
                 state,
                 klights_reconcile_api::MutationOperation::DeleteMark,
@@ -2332,7 +2354,7 @@ async fn delete_cr_inner(
                     group,
                     plural,
                     &requested_api_version,
-                    crate::api::mutation::response::accepted_object(
+                    k8s_native_service::generic_command::accepted_object(
                         latest.data,
                         latest.resource_version,
                     ),
@@ -2341,8 +2363,8 @@ async fn delete_cr_inner(
                 return Ok((StatusCode::ACCEPTED, Json(normalized)).into_response());
             }
         }
-        crate::api::mutation::delete::DeleteResult::GoneOrUidChanged => {}
-        crate::api::mutation::delete::DeleteResult::HardDeleted(deleted) => {
+        k8s_native_service::generic_command::DeleteResult::GoneOrUidChanged => {}
+        k8s_native_service::generic_command::DeleteResult::HardDeleted(deleted) => {
             dispatch_custom_resource_mutation_event(
                 state,
                 klights_reconcile_api::MutationOperation::HardDelete,
@@ -2372,10 +2394,12 @@ async fn delete_cr_inner(
         }
     }
 
-    Ok(Json(crate::api::mutation::response::delete_success_status(
-        &info.kind, name,
-    ))
-    .into_response())
+    Ok(
+        Json(k8s_native_service::generic_command::delete_success_status(
+            &info.kind, name,
+        ))
+        .into_response(),
+    )
 }
 
 pub async fn delete_custom_resource(
@@ -2432,10 +2456,13 @@ async fn update_cr_inner(
         target,
         log_context,
     };
-    let (status, data) =
-        update_with_strategy(&strategy, body, crate::api::mutation::DryRunMode::Live)
-            .await?
-            .into_response_parts(StatusCode::OK);
+    let (status, data) = update_with_strategy(
+        &strategy,
+        body,
+        k8s_native_service::generic_command::DryRunMode::Live,
+    )
+    .await?
+    .into_response_parts(StatusCode::OK);
     Ok((status, Json(data)).into_response())
 }
 
@@ -2521,7 +2548,7 @@ async fn patch_cr_inner(
         apply_create_context,
         patch_context,
     };
-    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(query)?;
+    let dry_run = k8s_native_service::generic_command::DryRunMode::from_create_update_query(query)?;
     let (status, data) = patch_with_strategy(&strategy, patch, dry_run)
         .await?
         .into_response_parts(StatusCode::OK);

@@ -1,6 +1,5 @@
 use crate::api::*;
 use axum::http::HeaderMap;
-use klights_kube_protobuf as k8s_pb;
 use serde_json::Value;
 
 pub fn validate_crd_field_selector(
@@ -1516,127 +1515,6 @@ fn schema_unknown_field_error(field_path: &str) -> String {
     )
 }
 
-#[derive(Deserialize, serde::Serialize, Default)]
-pub struct DeleteOptions {
-    #[serde(rename = "propagationPolicy")]
-    pub propagation_policy: Option<String>,
-    #[serde(rename = "orphanDependents")]
-    pub orphan_dependents: Option<bool>,
-    #[serde(rename = "gracePeriodSeconds")]
-    pub _grace_period_seconds: Option<i64>,
-    pub preconditions: Option<DeletePreconditions>,
-}
-
-#[derive(Clone, Deserialize, serde::Serialize, Default)]
-pub struct DeletePreconditions {
-    pub uid: Option<String>,
-    #[serde(rename = "resourceVersion")]
-    pub resource_version: Option<String>,
-}
-
-impl DeleteOptions {
-    pub fn with_uid_precondition(uid: impl Into<String>) -> Self {
-        Self {
-            preconditions: Some(DeletePreconditions {
-                uid: Some(uid.into()),
-                resource_version: None,
-            }),
-            ..Default::default()
-        }
-    }
-
-    pub fn resource_preconditions(
-        &self,
-    ) -> Result<klights_cluster_core::ResourcePreconditions, String> {
-        let Some(preconditions) = &self.preconditions else {
-            return Ok(klights_cluster_core::ResourcePreconditions::default());
-        };
-        let resource_version = preconditions
-            .resource_version
-            .as_deref()
-            .map(|rv| {
-                rv.parse::<i64>().map_err(|_| {
-                    format!("invalid DeleteOptions preconditions.resourceVersion: {rv}")
-                })
-            })
-            .transpose()?;
-        Ok(klights_cluster_core::ResourcePreconditions {
-            uid: preconditions.uid.clone(),
-            resource_version,
-        })
-    }
-}
-
-pub fn parse_delete_options_body(body: &[u8]) -> DeleteOptions {
-    if body.is_empty() {
-        return DeleteOptions::default();
-    }
-
-    if let Ok(opts) = serde_json::from_slice::<DeleteOptions>(body) {
-        return opts;
-    }
-
-    if let Some(opts) = parse_delete_options_protobuf(body) {
-        return opts;
-    }
-
-    DeleteOptions::default()
-}
-
-pub fn parse_delete_options_protobuf(body: &[u8]) -> Option<DeleteOptions> {
-    use prost::Message;
-
-    fn map_pb_delete_options(
-        pb: k8s_pb::apimachinery::pkg::apis::meta::v1::DeleteOptions,
-    ) -> DeleteOptions {
-        DeleteOptions {
-            propagation_policy: pb.propagation_policy,
-            orphan_dependents: pb.orphan_dependents,
-            _grace_period_seconds: pb.grace_period_seconds,
-            preconditions: pb.preconditions.map(|p| DeletePreconditions {
-                uid: p.uid,
-                resource_version: p.resource_version,
-            }),
-        }
-    }
-
-    fn parse_unknown_payload(payload: &[u8]) -> Option<DeleteOptions> {
-        use prost::Message;
-
-        let unknown = klights_kube_protobuf::Unknown::decode(payload).ok()?;
-
-        if let Ok(opts) = serde_json::from_slice::<DeleteOptions>(&unknown.raw) {
-            return Some(opts);
-        }
-
-        k8s_pb::apimachinery::pkg::apis::meta::v1::DeleteOptions::decode(unknown.raw.as_slice())
-            .ok()
-            .map(map_pb_delete_options)
-    }
-
-    const K8S_MAGIC_PREFIX: [u8; 4] = [0x6b, 0x38, 0x73, 0x00];
-
-    if body.len() >= 4
-        && body[0..4] == K8S_MAGIC_PREFIX
-        && let Some(opts) = parse_unknown_payload(&body[4..])
-    {
-        return Some(opts);
-    }
-
-    if let Some(opts) = parse_unknown_payload(body) {
-        return Some(opts);
-    }
-
-    let pb_bytes = if body.len() >= 4 && body[0..4] == K8S_MAGIC_PREFIX {
-        &body[4..]
-    } else {
-        body
-    };
-    k8s_pb::apimachinery::pkg::apis::meta::v1::DeleteOptions::decode(pb_bytes)
-        .ok()
-        .map(map_pb_delete_options)
-}
-
 pub struct AdmissionContextRequest<'a> {
     pub api_version: &'a str,
     pub kind: &'a str,
@@ -1696,23 +1574,25 @@ pub fn build_admission_context(
 }
 
 pub(crate) async fn run_admission_for_request(
-    admission: &(impl crate::api::admission_ports::ResourceAdmissionPort + ?Sized),
+    admission: &(impl k8s_native_service::generic_command::ResourceAdmissionPort + ?Sized),
     ctx: crate::admission::AdmissionRequestContext,
 ) -> Result<Value, AppError> {
     admission
-        .admit(crate::api::admission_ports::ResourceAdmissionRequest {
-            api_version: ctx.api_version,
-            kind: ctx.kind,
-            resource: Some(ctx.resource),
-            operation: ctx.operation,
-            namespace: ctx.namespace,
-            name: ctx.name,
-            object: ctx.object,
-            old_object: ctx.old_object,
-            dry_run: ctx.dry_run.unwrap_or(false),
-            subresource: ctx.subresource,
-            options: ctx.options,
-        })
+        .admit(
+            k8s_native_service::generic_command::ResourceAdmissionRequest {
+                api_version: ctx.api_version,
+                kind: ctx.kind,
+                resource: Some(ctx.resource),
+                operation: ctx.operation,
+                namespace: ctx.namespace,
+                name: ctx.name,
+                object: ctx.object,
+                old_object: ctx.old_object,
+                dry_run: ctx.dry_run.unwrap_or(false),
+                subresource: ctx.subresource,
+                options: ctx.options,
+            },
+        )
         .await
 }
 

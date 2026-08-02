@@ -4,11 +4,12 @@ use klights_cluster_core::Resource;
 use serde_json::Value;
 
 use crate::api::AppError;
-use crate::api::generated_handler_ports::{
-    BuiltinAdmissionDefaultsPort, GeneratedHandlerFuture, GeneratedLifecyclePort,
-    GeneratedResourceMutationPort, GeneratedWatchPort, GeneratedWatchRequest,
-};
+use crate::api::generated_handler_ports::{GeneratedWatchPort, GeneratedWatchRequest};
 use crate::datastore::DatastoreHandle;
+use k8s_native_service::generic_command::{
+    BuiltinAdmissionDefaultsPort, GeneratedLifecyclePort, GeneratedResourceMutationPort,
+    GenericCommandFuture,
+};
 
 pub(crate) struct GeneratedHandlerAdapter {
     db: DatastoreHandle,
@@ -47,7 +48,7 @@ impl GeneratedHandlerAdapter {
 }
 
 impl BuiltinAdmissionDefaultsPort for GeneratedHandlerAdapter {
-    fn ensure_namespace_active(&self, namespace: String) -> GeneratedHandlerFuture<'_, ()> {
+    fn ensure_namespace_active(&self, namespace: String) -> GenericCommandFuture<'_, ()> {
         Box::pin(async move {
             let resource =
                 crate::datastore::DatastoreBackend::get_namespace(self.db.as_ref(), &namespace)
@@ -77,7 +78,7 @@ impl BuiltinAdmissionDefaultsPort for GeneratedHandlerAdapter {
         &self,
         namespace: String,
         mut pod: Value,
-    ) -> GeneratedHandlerFuture<'_, Value> {
+    ) -> GenericCommandFuture<'_, Value> {
         Box::pin(async move {
             crate::api::helpers::apply_pod_runtimeclass_admission(self.db.as_ref(), &mut pod)
                 .await?;
@@ -101,7 +102,7 @@ impl BuiltinAdmissionDefaultsPort for GeneratedHandlerAdapter {
         &self,
         namespace: String,
         mut claim: Value,
-    ) -> GeneratedHandlerFuture<'_, Value> {
+    ) -> GenericCommandFuture<'_, Value> {
         Box::pin(async move {
             crate::api::helpers::apply_default_storage_class_admission(
                 self.db.as_ref(),
@@ -123,7 +124,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
     fn rotate_bootstrap_token_secret(
         &self,
         resource: Resource,
-    ) -> GeneratedHandlerFuture<'_, Resource> {
+    ) -> GenericCommandFuture<'_, Resource> {
         Box::pin(async move {
             crate::bootstrap::bootstrap_token::rotate_bootstrap_token_secret_for_get(
                 self.db.as_ref(),
@@ -134,7 +135,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
         })
     }
 
-    fn reconcile_cluster_role_aggregation(&self) -> GeneratedHandlerFuture<'_, ()> {
+    fn reconcile_cluster_role_aggregation(&self) -> GenericCommandFuture<'_, ()> {
         Box::pin(async move {
             klights_controllers::rbac_reconcile::reconcile_cluster_role_aggregation(
                 self.db.as_ref(),
@@ -144,7 +145,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
         })
     }
 
-    fn create_default_service_account(&self, namespace: String) -> GeneratedHandlerFuture<'_, ()> {
+    fn create_default_service_account(&self, namespace: String) -> GenericCommandFuture<'_, ()> {
         Box::pin(async move {
             klights_controllers::namespace::create_default_service_account_at(
                 self.db.as_ref(),
@@ -157,7 +158,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
         })
     }
 
-    fn create_root_ca_config_map(&self, namespace: String) -> GeneratedHandlerFuture<'_, ()> {
+    fn create_root_ca_config_map(&self, namespace: String) -> GenericCommandFuture<'_, ()> {
         Box::pin(async move {
             let ca_cert_pem = klights_supervisor::runtime_fs::read_utf8_async(
                 &self.file_process,
@@ -177,7 +178,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
         })
     }
 
-    fn reconcile_root_ca_data(&self, namespace: String) -> GeneratedHandlerFuture<'_, ()> {
+    fn reconcile_root_ca_data(&self, namespace: String) -> GenericCommandFuture<'_, ()> {
         Box::pin(async move {
             klights_controllers::namespace::reconcile_kube_root_ca_data_with_path(
                 &self.file_process,
@@ -192,7 +193,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
         })
     }
 
-    fn reconcile_root_ca(&self, namespace: String) -> GeneratedHandlerFuture<'_, ()> {
+    fn reconcile_root_ca(&self, namespace: String) -> GenericCommandFuture<'_, ()> {
         Box::pin(async move {
             klights_controllers::namespace::reconcile_kube_root_ca_with_path(
                 &self.file_process,
@@ -207,7 +208,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
         })
     }
 
-    fn delete_node_cleanup_intents(&self, node_name: String) -> GeneratedHandlerFuture<'_, ()> {
+    fn delete_node_cleanup_intents(&self, node_name: String) -> GenericCommandFuture<'_, ()> {
         Box::pin(async move {
             self.db
                 .delete_pod_cleanup_intents_for_node(&node_name)
@@ -221,7 +222,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
         namespace: String,
         name: String,
         pod: Value,
-    ) -> GeneratedHandlerFuture<'_, ()> {
+    ) -> GenericCommandFuture<'_, ()> {
         Box::pin(async move {
             let deletion_started = pod
                 .pointer("/metadata/deletionTimestamp")
@@ -252,7 +253,7 @@ impl GeneratedResourceMutationPort for GeneratedHandlerAdapter {
         name: String,
         data: Value,
         preconditions: klights_cluster_core::ResourcePreconditions,
-    ) -> GeneratedHandlerFuture<'_, Resource> {
+    ) -> GenericCommandFuture<'_, Resource> {
         Box::pin(async move {
             self.db
                 .update_main_resource_with_preconditions(

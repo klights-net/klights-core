@@ -1,5 +1,6 @@
 #[cfg(test)]
 use crate::api::AppError;
+pub use k8s_native_service::generic_command::{CreateUpdateQuery, DeleteCollectionQuery};
 #[cfg(test)]
 pub use k8s_native_service::generic_read::{
     CONTINUE_TOKEN_TTL_SECS, ContinueResourceVersion, ContinueTokenData, ListResourceVersionMatch,
@@ -12,7 +13,6 @@ pub use k8s_native_service::generic_read::{
     NamespaceListRequest, NamespaceListSnapshot, ResolvedListPage,
     encode_response_continue_token_at, process_continue_token_at, resolve_list_page,
 };
-use serde::Deserialize;
 
 impl ListSnapshotResult<klights_leader_api::ResourceListResult>
     for crate::api::custom_resource_ports::CustomResourceListSnapshot
@@ -26,35 +26,6 @@ impl ListSnapshotResult<klights_leader_api::ResourceListResult>
             Self::Expired => ListSnapshotResolution::Expired,
         }
     }
-}
-
-#[derive(Deserialize)]
-pub struct CreateUpdateQuery {
-    #[serde(rename = "dryRun")]
-    pub dry_run: Option<String>,
-    #[serde(rename = "fieldManager")]
-    pub field_manager: Option<String>,
-    #[serde(rename = "fieldValidation")]
-    pub field_validation: Option<String>,
-    /// Server-side apply: take ownership of conflicting fields instead of
-    /// returning 409. Accepts `?force=true`.
-    pub force: Option<bool>,
-    #[serde(rename = "orphanDependents")]
-    pub orphan_dependents: Option<bool>,
-    #[serde(rename = "propagationPolicy")]
-    pub propagation_policy: Option<String>,
-    #[serde(rename = "gracePeriodSeconds")]
-    pub grace_period_seconds: Option<i64>,
-}
-
-#[derive(Deserialize)]
-pub struct DeleteCollectionQuery {
-    #[serde(rename = "labelSelector")]
-    pub label_selector: Option<String>,
-    #[serde(rename = "fieldSelector")]
-    pub field_selector: Option<String>,
-    #[serde(rename = "dryRun")]
-    pub dry_run: Option<String>,
 }
 
 #[cfg(test)]

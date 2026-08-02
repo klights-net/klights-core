@@ -275,7 +275,7 @@ impl StatusMutationWriter for DatastoreStatusMutationWriter {
         status: Value,
         preconditions: ResourcePreconditions,
     ) -> Result<(), AppError> {
-        crate::api::resource_command_ports::update_resource_status(
+        crate::api::status_command_ports::update_resource_status(
             self.state.resource_mutation().resource_command.as_ref(),
             &target.api_version,
             &target.kind,
@@ -294,7 +294,7 @@ impl StatusMutationWriter for DatastoreStatusMutationWriter {
         metadata_patch: Value,
         preconditions: ResourcePreconditions,
     ) -> Result<(), AppError> {
-        crate::api::resource_command_ports::patch_non_pod_resource(
+        k8s_native_service::generic_command::patch_non_pod_resource(
             self.state.resource_mutation().resource_command.as_ref(),
             &target.api_version,
             &target.kind,
@@ -587,7 +587,7 @@ impl ScaleMutationWriter for DatastoreScaleMutationWriter {
         } else {
             request
         };
-        crate::api::resource_command_ports::patch_non_pod_resource(
+        k8s_native_service::generic_command::patch_non_pod_resource(
             self.state.resource_mutation().resource_command.as_ref(),
             &target.api_version,
             &target.kind,
@@ -868,7 +868,7 @@ impl NamespaceStatusMutationWriter for DatastoreNamespaceStatusMutationWriter {
         body: Value,
         expected_rv: i64,
     ) -> Result<Resource> {
-        crate::api::resource_command_ports::update_namespace(
+        k8s_native_service::generic_command::update_namespace(
             self.state.resource_mutation().resource_command.as_ref(),
             &target.name,
             body,

@@ -552,7 +552,7 @@ async fn delete_service(
     .await?
     .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
 
-    crate::api::resource_command_ports::delete_non_pod_resource(
+    k8s_native_service::generic_command::delete_non_pod_resource(
         state.resource_mutation().resource_command.as_ref(),
         "v1",
         "Service",
@@ -578,7 +578,7 @@ async fn delete_service(
     .await
     {
         Ok(Some(endpoints)) => {
-            if let Err(error) = crate::api::resource_command_ports::delete_non_pod_resource(
+            if let Err(error) = k8s_native_service::generic_command::delete_non_pod_resource(
                 state.resource_mutation().resource_command.as_ref(),
                 "v1",
                 "Endpoints",
@@ -629,14 +629,14 @@ async fn delete_service(
         .request_service_routing_sync()
         .map_err(|error| AppError::Internal(error.to_string()))?;
 
-    crate::api::mutation::dispatch_mutation_event(
+    k8s_native_service::generic_command::dispatch_mutation_event(
         state.resource_mutation().mutation_effects.as_ref(),
-        crate::api::mutation::MutationEvent {
+        k8s_native_service::generic_command::MutationEvent {
             operation: klights_reconcile_api::MutationOperation::DeleteMark,
             resource: &resource.data,
             old_resource: None,
             persisted: true,
-            dry_run: crate::api::mutation::DryRunMode::Live,
+            dry_run: k8s_native_service::generic_command::DryRunMode::Live,
             context: "service_delete",
         },
     )

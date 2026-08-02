@@ -29,10 +29,10 @@ use crate::api::{AppError, DeleteOptions};
 use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_pod_api::{
     PodActorFinalizeRequest, PodApiCreateResult, PodApiDeleteOutcome, PodApiWriteOutcome,
-    PodDeleteMarkRequest, PodDeleteOptions, PodDeleteOrchestration, PodDeletePreconditions,
-    PodGetRequest, PodListRequest, PodMutationTarget, PodPersistence, PodPersistenceCreateRequest,
-    PodPersistenceReplaceRequest, PodQuery, PodRepositoryError, PodSpecValidation,
-    PodStatusPatchKind, preserve_pod_status_from_current,
+    PodDeleteMarkRequest, PodDeleteOptions, PodDeleteOrchestration, PodGetRequest, PodListRequest,
+    PodMutationTarget, PodPersistence, PodPersistenceCreateRequest, PodPersistenceReplaceRequest,
+    PodQuery, PodRepositoryError, PodSpecValidation, PodStatusPatchKind,
+    preserve_pod_status_from_current,
 };
 use klights_reconcile_api::{
     GcPodDeleteError, GcPodDeleteFuture, GcPodDeleteRequest, GcPodDeleteSink, PodGcReconcileSink,
@@ -50,18 +50,6 @@ struct PodApiCreateRequest {
     body: Value,
     dry_run: bool,
     run_admission: bool,
-}
-
-impl From<DeleteOptions> for PodDeleteOptions {
-    fn from(options: DeleteOptions) -> Self {
-        let preconditions = options.preconditions.unwrap_or_default();
-        Self::new(
-            options.propagation_policy,
-            options.orphan_dependents,
-            options._grace_period_seconds,
-            PodDeletePreconditions::new(preconditions.uid, preconditions.resource_version),
-        )
-    }
 }
 
 fn ensure_resource_preconditions_match(
@@ -156,7 +144,7 @@ pub struct PodNativeOrchestration {
     deletion: Arc<dyn PodDeleteOrchestration>,
     admission_resources: Arc<dyn AdmissionResourceStore>,
     spec_validation: Arc<dyn PodSpecValidation>,
-    admission: Arc<dyn crate::api::admission_ports::ResourceAdmissionPort>,
+    admission: Arc<dyn k8s_native_service::generic_command::ResourceAdmissionPort>,
     resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     quota_runtime: Arc<dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime>,
     supervisor: Arc<TaskSupervisor>,
@@ -172,7 +160,7 @@ pub struct PodNativeOrchestrationDependencies {
     pub deletion: Arc<dyn PodDeleteOrchestration>,
     pub admission_resources: Arc<dyn AdmissionResourceStore>,
     pub spec_validation: Arc<dyn PodSpecValidation>,
-    pub admission: Arc<dyn crate::api::admission_ports::ResourceAdmissionPort>,
+    pub admission: Arc<dyn k8s_native_service::generic_command::ResourceAdmissionPort>,
     pub resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     pub quota_runtime: Arc<dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime>,
     pub supervisor: Arc<TaskSupervisor>,

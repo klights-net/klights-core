@@ -14,7 +14,7 @@
 //! could bind themselves to cluster-admin. This runs as a built-in admission
 //! step on RBAC create/update before the object is persisted.
 
-use crate::api::{ApiState, AppError};
+use crate::api::AppError;
 use klights_auth::AuthenticatedIdentity;
 use klights_auth::rbac_rule_evaluator::{PolicyRule, rules_cover_all};
 use klights_auth::request_attributes::AuthorizationRequest;
@@ -22,10 +22,14 @@ use serde_json::Value;
 
 const RBAC_GROUP: &str = "rbac.authorization.k8s.io";
 
-/// Enforce the RBAC escalation/bind admission rules for a create or update of an
-/// `rbac.authorization.k8s.io` resource. A no-op for every other resource.
-pub async fn enforce_rbac_write_authorization(
-    state: &ApiState,
+pub(crate) struct RbacWriteAuthorizationInputs<'a> {
+    pub(crate) authorizer: &'a dyn klights_auth::authorizer::Authorizer,
+    pub(crate) policy_store: &'a dyn klights_auth::rbac_policy_store::RbacPolicyStore,
+    pub(crate) resource_query: &'a dyn klights_leader_api::LeaderResourceQuery,
+}
+
+pub(crate) async fn enforce_rbac_write_authorization_with_inputs(
+    inputs: &RbacWriteAuthorizationInputs<'_>,
     identity: &AuthenticatedIdentity,
     api_version: &str,
     kind: &str,
@@ -43,17 +47,17 @@ pub async fn enforce_rbac_write_authorization(
 
     match kind {
         "Role" | "ClusterRole" => {
-            enforce_role_escalation(state, identity, kind, namespace, object).await
+            enforce_role_escalation(inputs, identity, kind, namespace, object).await
         }
         "RoleBinding" | "ClusterRoleBinding" => {
-            enforce_binding_escalation(state, identity, kind, namespace, object).await
+            enforce_binding_escalation(inputs, identity, kind, namespace, object).await
         }
         _ => Ok(()),
     }
 }
 
 async fn enforce_role_escalation(
-    state: &ApiState,
+    inputs: &RbacWriteAuthorizationInputs<'_>,
     identity: &AuthenticatedIdentity,
     kind: &str,
     namespace: Option<&str>,
@@ -71,7 +75,7 @@ async fn enforce_role_escalation(
     } else {
         namespace
     };
-    let holder = holder_rules(state, identity, holder_ns).await;
+    let holder = holder_rules(inputs, identity, holder_ns).await;
 
     if rules_cover_all(&holder, &requested) {
         return Ok(());
@@ -83,7 +87,7 @@ async fn enforce_role_escalation(
     } else {
         "roles"
     };
-    if has_verb(state, identity, "escalate", resource, namespace, None).await {
+    if has_verb(inputs, identity, "escalate", resource, namespace, None).await {
         return Ok(());
     }
 
@@ -95,7 +99,7 @@ async fn enforce_role_escalation(
 }
 
 async fn enforce_binding_escalation(
-    state: &ApiState,
+    inputs: &RbacWriteAuthorizationInputs<'_>,
     identity: &AuthenticatedIdentity,
     kind: &str,
     namespace: Option<&str>,
@@ -117,13 +121,13 @@ async fn enforce_binding_escalation(
     }
 
     // Resolve the rules granted by the referenced role.
-    let role_rules = referenced_role_rules(state, ref_kind, ref_name, namespace).await;
+    let role_rules = referenced_role_rules(inputs, ref_kind, ref_name, namespace).await;
     if role_rules.is_empty() {
         // A role that grants nothing (or does not yet exist) cannot escalate.
         return Ok(());
     }
 
-    let holder = holder_rules(state, identity, namespace).await;
+    let holder = holder_rules(inputs, identity, namespace).await;
     if rules_cover_all(&holder, &role_rules) {
         return Ok(());
     }
@@ -135,7 +139,7 @@ async fn enforce_binding_escalation(
         "roles"
     };
     if has_verb(
-        state,
+        inputs,
         identity,
         "bind",
         ref_resource,
@@ -157,13 +161,12 @@ async fn enforce_binding_escalation(
 
 /// The effective rules the identity holds in the given scope, as `PolicyRule`s.
 async fn holder_rules(
-    state: &ApiState,
+    inputs: &RbacWriteAuthorizationInputs<'_>,
     identity: &AuthenticatedIdentity,
     namespace: Option<&str>,
 ) -> Vec<PolicyRule> {
-    let (resource_rules, non_resource_rules, _incomplete) = state
-        .auth_policy()
-        .rbac_policy_store
+    let (resource_rules, non_resource_rules, _incomplete) = inputs
+        .policy_store
         .enumerate_effective_rules(identity, namespace)
         .await;
     let mut rules: Vec<PolicyRule> = Vec::new();
@@ -191,7 +194,7 @@ async fn holder_rules(
 /// Load the rules of the role referenced by a binding. Returns an empty vec if
 /// the role does not exist (binding to a nonexistent role grants nothing).
 async fn referenced_role_rules(
-    state: &ApiState,
+    inputs: &RbacWriteAuthorizationInputs<'_>,
     ref_kind: &str,
     ref_name: &str,
     binding_namespace: Option<&str>,
@@ -199,7 +202,7 @@ async fn referenced_role_rules(
     let api_version = format!("{RBAC_GROUP}/v1");
     let resource = match ref_kind {
         "ClusterRole" => crate::api::resource_query_ports::get_resource(
-            state.resource_mutation().resource_query.as_ref(),
+            inputs.resource_query,
             &api_version,
             "ClusterRole",
             None,
@@ -213,7 +216,7 @@ async fn referenced_role_rules(
                 return Vec::new();
             };
             crate::api::resource_query_ports::get_resource(
-                state.resource_mutation().resource_query.as_ref(),
+                inputs.resource_query,
                 &api_version,
                 "Role",
                 Some(ns),
@@ -233,7 +236,7 @@ async fn referenced_role_rules(
 
 /// Does the identity hold `verb` on `resource` (optionally name-scoped)?
 async fn has_verb(
-    state: &ApiState,
+    inputs: &RbacWriteAuthorizationInputs<'_>,
     identity: &AuthenticatedIdentity,
     verb: &str,
     resource: &str,
@@ -242,8 +245,7 @@ async fn has_verb(
 ) -> bool {
     let request =
         AuthorizationRequest::resource(verb, RBAC_GROUP, "v1", resource, None, namespace, name);
-    state
-        .auth_policy()
+    inputs
         .authorizer
         .authorize(identity, &request)
         .await

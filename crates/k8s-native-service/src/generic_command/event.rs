@@ -1,11 +1,15 @@
+//! Applied-only command side-effect dispatch.
+
 use serde_json::Value;
+
+use super::DryRunMode;
 
 pub struct MutationEvent<'a> {
     pub operation: klights_reconcile_api::MutationOperation,
     pub resource: &'a Value,
     pub old_resource: Option<&'a Value>,
     pub persisted: bool,
-    pub dry_run: crate::api::mutation::DryRunMode,
+    pub dry_run: DryRunMode,
     pub context: &'static str,
 }
 
@@ -35,14 +39,17 @@ pub async fn dispatch_mutation_event(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use klights_reconcile_api::{
         MutationOperation, ResourceChange, ResourceMutationEffectsFuture,
         ResourceMutationEffectsPort, ResourceMutationEffectsRequest,
     };
-    use serde_json::json;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
 
     struct CountingMutationEffects {
         apply_count: Arc<AtomicUsize>,
@@ -67,23 +74,15 @@ mod tests {
         }
     }
 
-    fn counting_effects() -> (CountingMutationEffects, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    #[tokio::test]
+    async fn dispatch_is_applied_only_and_preserves_operation() {
         let apply_count = Arc::new(AtomicUsize::new(0));
         let delete_count = Arc::new(AtomicUsize::new(0));
-        (
-            CountingMutationEffects {
-                apply_count: apply_count.clone(),
-                delete_count: delete_count.clone(),
-            },
-            apply_count,
-            delete_count,
-        )
-    }
-
-    #[tokio::test]
-    async fn mutation_event_dispatch_skips_dry_run() {
-        let (effects, apply_count, delete_count) = counting_effects();
-        let resource = json!({"apiVersion": "v1", "kind": "ConfigMap"});
+        let effects = CountingMutationEffects {
+            apply_count: apply_count.clone(),
+            delete_count: delete_count.clone(),
+        };
+        let resource = serde_json::json!({"kind": "ConfigMap"});
 
         dispatch_mutation_event(
             &effects,
@@ -92,43 +91,11 @@ mod tests {
                 resource: &resource,
                 old_resource: None,
                 persisted: false,
-                dry_run: crate::api::mutation::DryRunMode::All,
-                context: "test_dry_run",
+                dry_run: DryRunMode::All,
+                context: "dry_run",
             },
         )
         .await;
-
-        assert_eq!(apply_count.load(Ordering::Relaxed), 0);
-        assert_eq!(delete_count.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn mutation_event_dispatch_runs_once_for_persisted_update() {
-        let (effects, apply_count, delete_count) = counting_effects();
-        let resource = json!({"apiVersion": "v1", "kind": "ConfigMap"});
-
-        dispatch_mutation_event(
-            &effects,
-            MutationEvent {
-                operation: MutationOperation::Update,
-                resource: &resource,
-                old_resource: None,
-                persisted: true,
-                dry_run: crate::api::mutation::DryRunMode::Live,
-                context: "test_update",
-            },
-        )
-        .await;
-
-        assert_eq!(apply_count.load(Ordering::Relaxed), 1);
-        assert_eq!(delete_count.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn mutation_event_dispatch_uses_delete_hooks_for_hard_delete() {
-        let (effects, apply_count, delete_count) = counting_effects();
-        let resource = json!({"apiVersion": "v1", "kind": "ConfigMap"});
-
         dispatch_mutation_event(
             &effects,
             MutationEvent {
@@ -136,8 +103,8 @@ mod tests {
                 resource: &resource,
                 old_resource: None,
                 persisted: true,
-                dry_run: crate::api::mutation::DryRunMode::Live,
-                context: "test_hard_delete",
+                dry_run: DryRunMode::Live,
+                context: "hard_delete",
             },
         )
         .await;

@@ -8,8 +8,8 @@ pub struct BindingQuery {
 }
 
 impl BindingQuery {
-    fn dry_run_mode(&self) -> Result<crate::api::mutation::DryRunMode, AppError> {
-        crate::api::mutation::DryRunMode::from_query(self.dry_run.as_deref())
+    fn dry_run_mode(&self) -> Result<k8s_native_service::generic_command::DryRunMode, AppError> {
+        k8s_native_service::generic_command::DryRunMode::from_query(self.dry_run.as_deref())
     }
 }
 

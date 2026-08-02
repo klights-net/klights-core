@@ -169,7 +169,8 @@ pub(in crate::api) async fn create_namespace(
     Query(query): Query<CreateUpdateQuery>,
     LenientJson(mut body): LenientJson<Value>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    let dry_run =
+        k8s_native_service::generic_command::DryRunMode::from_create_update_query(&query)?;
     let is_dry_run = dry_run.is_all();
     body = run_admission_for_request(
         state.resource_mutation().admission.as_ref(),
@@ -253,7 +254,7 @@ pub(in crate::api) async fn create_namespace(
     }
     ensure_namespace_status_phase_active(&mut body);
 
-    let resource = crate::api::resource_command_ports::create_namespace(
+    let resource = k8s_native_service::generic_command::create_namespace(
         state.resource_mutation().resource_command.as_ref(),
         &name,
         body,
@@ -337,7 +338,8 @@ pub(in crate::api) async fn update_namespace(
     .await?
     .ok_or_else(|| AppError::NotFound(format!("Namespace {} not found", name)))?;
 
-    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    let dry_run =
+        k8s_native_service::generic_command::DryRunMode::from_create_update_query(&query)?;
     let is_dry_run = dry_run.is_all();
     body = run_admission_for_request(
         state.resource_mutation().admission.as_ref(),
@@ -360,7 +362,7 @@ pub(in crate::api) async fn update_namespace(
         return Ok(Json(body));
     }
 
-    let resource = crate::api::resource_command_ports::update_namespace(
+    let resource = k8s_native_service::generic_command::update_namespace(
         state.resource_mutation().resource_command.as_ref(),
         &name,
         body,
@@ -387,14 +389,15 @@ pub(in crate::api) async fn finalize_namespace(
     .await?
     .ok_or_else(|| AppError::NotFound(format!("Namespace {} not found", name)))?;
 
-    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    let dry_run =
+        k8s_native_service::generic_command::DryRunMode::from_create_update_query(&query)?;
     if dry_run.is_all() {
         return Ok(Json(body));
     }
 
     // Finalize updates the finalizers list (spec.finalizers)
     // Extract finalizers from request body and update namespace
-    let resource = crate::api::resource_command_ports::update_namespace(
+    let resource = k8s_native_service::generic_command::update_namespace(
         state.resource_mutation().resource_command.as_ref(),
         &name,
         body,
@@ -420,7 +423,7 @@ pub(in crate::api) async fn finalize_namespace(
             .await?
             == 0
         {
-            crate::api::resource_command_ports::delete_namespace(
+            k8s_native_service::generic_command::delete_namespace(
                 state.resource_mutation().resource_command.as_ref(),
                 &resource.name,
             )
@@ -494,7 +497,8 @@ pub(in crate::api) async fn patch_namespace(
     )
     .await?
     .ok_or_else(|| AppError::NotFound(format!("Namespace {} not found", name)))?;
-    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    let dry_run =
+        k8s_native_service::generic_command::DryRunMode::from_create_update_query(&query)?;
     let is_dry_run = dry_run.is_all();
 
     let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
@@ -524,7 +528,7 @@ pub(in crate::api) async fn patch_namespace(
         return Ok(Json(patched));
     }
 
-    let resource = crate::api::resource_command_ports::update_namespace(
+    let resource = k8s_native_service::generic_command::update_namespace(
         state.resource_mutation().resource_command.as_ref(),
         &name,
         patched,
@@ -572,21 +576,21 @@ pub(in crate::api) async fn delete_namespace(
             .await?
             == 0
     {
-        crate::api::resource_command_ports::delete_namespace(
+        k8s_native_service::generic_command::delete_namespace(
             state.resource_mutation().resource_command.as_ref(),
             &name,
         )
         .await?;
         return Ok((
             StatusCode::OK,
-            Json(crate::api::mutation::response::delete_collection_success_status()),
+            Json(k8s_native_service::generic_command::delete_collection_success_status()),
         ));
     }
 
     let operation_now = klights_auth::clock::chrono_utc(state.operational().clock.now());
     let mut terminating: Value = (*current.data).clone();
     set_namespace_terminating_status_at(&mut terminating, false, operation_now);
-    let updated = crate::api::resource_command_ports::update_namespace(
+    let updated = k8s_native_service::generic_command::update_namespace(
         state.resource_mutation().resource_command.as_ref(),
         &name,
         terminating,
@@ -638,7 +642,7 @@ pub(in crate::api) async fn delete_namespace(
     }
     Ok((
         StatusCode::ACCEPTED,
-        Json(crate::api::mutation::response::accepted_delete_status()),
+        Json(k8s_native_service::generic_command::accepted_delete_status()),
     ))
 }
 

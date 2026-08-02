@@ -17,13 +17,6 @@ pub(crate) fn cascade_delete(
     gc.cascade_delete(owner)
 }
 
-pub(crate) async fn sweep_dependents(
-    gc: &dyn GcOwnerLifecyclePort,
-    owner: GcOwnerIdentity,
-) -> Result<bool, ReconcileSinkError> {
-    gc.sweep_dependents(owner).await
-}
-
 pub(crate) async fn finalize_foreground_owner(
     gc: &dyn GcOwnerLifecyclePort,
     owner: Resource,
@@ -113,7 +106,7 @@ mod tests {
         })))
         .expect("resource");
 
-        assert!(!sweep_dependents(&gc, owner).await.expect("sweep"));
+        assert!(!gc.sweep_dependents(owner).await.expect("sweep"));
         assert!(
             finalize_foreground_owner(&gc, resource)
                 .await

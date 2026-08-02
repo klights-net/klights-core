@@ -9,6 +9,7 @@
 //! Backward-compatible: all pub items are re-exported.
 
 pub mod helpers;
+#[cfg(test)]
 pub mod inners;
 pub mod macros;
 

@@ -452,7 +452,7 @@ impl ResourceAdmissionAdapter {
     fn execute_admission<'a>(
         &'a self,
         mut context: crate::admission::AdmissionRequestContext,
-    ) -> crate::api::admission_ports::ResourceAdmissionFuture<'a> {
+    ) -> k8s_native_service::generic_command::GenericCommandFuture<'a, Value> {
         Box::pin(async move {
             let engine = AdmissionEngine::new(
                 self.query.as_ref(),
@@ -473,11 +473,11 @@ impl ResourceAdmissionAdapter {
     }
 }
 
-impl crate::api::admission_ports::ResourceAdmissionPort for ResourceAdmissionAdapter {
+impl k8s_native_service::generic_command::ResourceAdmissionPort for ResourceAdmissionAdapter {
     fn admit(
         &self,
-        request: crate::api::admission_ports::ResourceAdmissionRequest,
-    ) -> crate::api::admission_ports::ResourceAdmissionFuture<'_> {
+        request: k8s_native_service::generic_command::ResourceAdmissionRequest,
+    ) -> k8s_native_service::generic_command::GenericCommandFuture<'_, Value> {
         let mut context =
             crate::api::build_admission_context(crate::api::AdmissionContextRequest {
                 api_version: &request.api_version,

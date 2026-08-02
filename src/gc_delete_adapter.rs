@@ -180,8 +180,8 @@ pub(crate) async fn complete_non_foreground_delete(
 ) -> Result<GcNonPodDeleteOutcome> {
     let lifecycle =
         crate::bootstrap::finalizer_lifecycle_adapter::BorrowedFinalizerLifecycleStore::new(db);
-    let request = crate::api::finalizer_delete::NonForegroundDeleteRequest {
-        target: crate::api::finalizer_delete::ResourceDeleteTarget {
+    let request = k8s_native_service::generic_command::NonForegroundDeleteRequest {
+        target: k8s_native_service::generic_command::ResourceDeleteTarget {
             api_version: &resource.api_version,
             kind: &resource.kind,
             namespace: resource.namespace.as_deref(),
@@ -194,18 +194,18 @@ pub(crate) async fn complete_non_foreground_delete(
         grace_seconds: 0,
         operation_now: klights_supervisor::SystemWallClock::now_utc(),
     };
-    match crate::api::finalizer_delete::complete_non_foreground_delete_with_live_recheck(
+    match k8s_native_service::generic_command::complete_non_foreground_delete_with_live_recheck(
         &lifecycle, request,
     )
     .await
     {
-        Ok(crate::api::finalizer_delete::DeleteCompletion::HardDeleted(_)) => {
+        Ok(k8s_native_service::generic_command::DeleteCompletion::HardDeleted(_)) => {
             Ok(GcNonPodDeleteOutcome::HardDeleted)
         }
-        Ok(crate::api::finalizer_delete::DeleteCompletion::MarkedTerminating(_)) => {
+        Ok(k8s_native_service::generic_command::DeleteCompletion::MarkedTerminating(_)) => {
             Ok(GcNonPodDeleteOutcome::MarkedTerminating)
         }
-        Ok(crate::api::finalizer_delete::DeleteCompletion::GoneOrUidChanged)
+        Ok(k8s_native_service::generic_command::DeleteCompletion::GoneOrUidChanged)
         | Err(crate::api::AppError::NotFound(_)) => Ok(GcNonPodDeleteOutcome::Gone),
         Err(error) => Err(anyhow::anyhow!("{error:?}")),
     }
