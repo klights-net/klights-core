@@ -166,7 +166,11 @@ pub(in crate::api) async fn list_pods(
     let items: Vec<Value> = list_items
         .into_iter()
         .map(|r| {
-            let mut data = inject_resource_version(r.data, r.resource_version);
+            let mut data = inject_resource_version_with_identity(
+                state.resource_mutation().identity.as_ref(),
+                r.data,
+                r.resource_version,
+            );
             normalize_resource_for_read("v1", "Pod", &mut data);
             data
         })
@@ -221,7 +225,11 @@ pub(in crate::api) async fn get_pod(
     .await?
     {
         Some(resource) => {
-            let mut data = inject_resource_version(resource.data, resource.resource_version);
+            let mut data = inject_resource_version_with_identity(
+                state.resource_mutation().identity.as_ref(),
+                resource.data,
+                resource.resource_version,
+            );
             normalize_resource_for_read("v1", "Pod", &mut data);
             Ok(K8sResponse::new(data, &headers))
         }
@@ -252,7 +260,11 @@ pub(in crate::api) async fn create_pod(
                 "pod_create",
             )
             .await;
-            let data = inject_resource_version(resource.data, resource.resource_version);
+            let data = inject_resource_version_with_identity(
+                state.resource_mutation().identity.as_ref(),
+                resource.data,
+                resource.resource_version,
+            );
             Ok((StatusCode::CREATED, Json(data)))
         }
         WriteResult::DryRun(body) | WriteResult::PersistedValue(body) => {
@@ -308,7 +320,11 @@ pub(in crate::api) async fn update_pod(
     )
     .await;
 
-    let data = inject_resource_version(resource.data, resource.resource_version);
+    let data = inject_resource_version_with_identity(
+        state.resource_mutation().identity.as_ref(),
+        resource.data,
+        resource.resource_version,
+    );
     Ok(Json(data))
 }
 
@@ -348,8 +364,11 @@ pub(in crate::api) async fn delete_pod(
                 "pod_delete_mark",
             )
             .await;
-            let result =
-                k8s_native_service::generic_command::accepted_object(r.data, r.resource_version);
+            let result = k8s_native_service::generic_command::accepted_object(
+                state.resource_mutation().identity.as_ref(),
+                r.data,
+                r.resource_version,
+            );
             Ok((StatusCode::ACCEPTED, Json(result)))
         }
     }
@@ -407,7 +426,11 @@ pub(in crate::api) async fn patch_pod(
     )
     .await;
 
-    let data = inject_resource_version(resource.data, resource.resource_version);
+    let data = inject_resource_version_with_identity(
+        state.resource_mutation().identity.as_ref(),
+        resource.data,
+        resource.resource_version,
+    );
     Ok(Json(data))
 }
 
@@ -588,7 +611,13 @@ pub(in crate::api) async fn list_all_pods(
     let (list_items, _, list_continue_token, remaining_item_count) = list.into_parts();
     let items: Vec<Value> = list_items
         .into_iter()
-        .map(|r| inject_resource_version(r.data, r.resource_version))
+        .map(|r| {
+            inject_resource_version_with_identity(
+                state.resource_mutation().identity.as_ref(),
+                r.data,
+                r.resource_version,
+            )
+        })
         .collect();
     let resource_version = response_rv.to_string();
 

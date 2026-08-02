@@ -12,6 +12,7 @@ mod error;
 mod extractor;
 pub mod generic_command;
 pub mod generic_read;
+mod identity;
 pub mod policy_inputs;
 pub mod priority_fairness;
 pub mod request_info;
@@ -32,6 +33,7 @@ pub use error::{
     AppError, StatusCause, map_mutating_admission_error, map_validating_admission_error,
 };
 pub use extractor::LenientJson;
+pub use identity::ApiIdentityGenerator;
 pub use resource_projection::inject_resource_version;
 pub use response::K8sResponse;
 pub use router::CurrentRouter;

@@ -179,6 +179,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
             None,
         ),
         crate::api::ApiResourceMutationServices {
+            identity: crate::api::test_support::deterministic_api_identity(),
             db: db_handle.clone(),
             watch_stream: std::sync::Arc::new(
                 crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
@@ -204,6 +205,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
                     db_handle.clone(),
                 ),
             admission: crate::resource_admission_adapter::ResourceAdmissionAdapter::new(
+                crate::api::test_support::deterministic_api_identity(),
                 db_handle.clone(),
             ),
             custom_resource_reads:

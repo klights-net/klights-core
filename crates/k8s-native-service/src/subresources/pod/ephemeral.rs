@@ -57,7 +57,11 @@ pub async fn get_pod_ephemeral_containers<S: GenericCommandState + 'static>(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Pod {}/{} not found", namespace, name)))?;
 
-    let pod_with_rv = inject_resource_version(pod.data, pod.resource_version);
+    let pod_with_rv = inject_resource_version(
+        state.command_store().identity(),
+        pod.data,
+        pod.resource_version,
+    );
     Ok(Json(pod_with_rv))
 }
 
@@ -73,6 +77,7 @@ pub async fn update_pod_ephemeral_containers<S: GenericCommandState + 'static>(
     let ns_owned = namespace.clone();
     let name_owned = name.clone();
     let supervisor = state.command_runtime().task_supervisor_owned();
+    let identity = state.command_store().identity_owned();
     let persist = move || {
         let state = state.clone();
         let ns = ns_owned.clone();
@@ -117,7 +122,7 @@ pub async fn update_pod_ephemeral_containers<S: GenericCommandState + 'static>(
         EPHEMERAL_CONFLICT_MAX_ATTEMPTS,
     )
     .await?;
-    let result = inject_resource_version(updated.data, updated.resource_version);
+    let result = inject_resource_version(identity.as_ref(), updated.data, updated.resource_version);
     Ok(Json(result))
 }
 
@@ -140,6 +145,7 @@ pub async fn patch_pod_ephemeral_containers<S: GenericCommandState + 'static>(
     let ns_owned = namespace.clone();
     let name_owned = name.clone();
     let supervisor = state.command_runtime().task_supervisor_owned();
+    let identity = state.command_store().identity_owned();
     let persist = move || {
         let state = state.clone();
         let ns = ns_owned.clone();
@@ -179,7 +185,7 @@ pub async fn patch_pod_ephemeral_containers<S: GenericCommandState + 'static>(
         EPHEMERAL_CONFLICT_MAX_ATTEMPTS,
     )
     .await?;
-    let result = inject_resource_version(updated.data, updated.resource_version);
+    let result = inject_resource_version(identity.as_ref(), updated.data, updated.resource_version);
     Ok(Json(result))
 }
 

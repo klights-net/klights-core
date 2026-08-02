@@ -85,6 +85,8 @@ pub trait GeneratedResourceMutationPort: Send + Sync {
 }
 
 pub trait GenericCommandStore: Send + Sync {
+    fn identity(&self) -> &dyn crate::ApiIdentityGenerator;
+    fn identity_owned(&self) -> std::sync::Arc<dyn crate::ApiIdentityGenerator>;
     fn resource_query(&self) -> &dyn klights_leader_api::LeaderResourceQuery;
     fn resource_command(&self) -> &dyn klights_leader_api::LeaderResourceCommand;
     fn finalizer_lifecycle(&self) -> &dyn klights_reconcile_api::FinalizerLifecyclePort;

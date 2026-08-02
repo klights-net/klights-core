@@ -40,6 +40,7 @@ const SPEC_BEARING_KINDS: &[&str] = &[
 ];
 
 pub fn prepare_create_metadata(
+    identity: &dyn crate::ApiIdentityGenerator,
     namespace: Option<&str>,
     body: &mut Value,
     resource_name: &str,
@@ -63,10 +64,7 @@ pub fn prepare_create_metadata(
         value.is_null() || value.as_str().is_some_and(|value| value.trim().is_empty())
     });
     if uid_missing_or_empty {
-        metadata.insert(
-            "uid".to_string(),
-            Value::String(uuid::Uuid::new_v4().to_string()),
-        );
+        metadata.insert("uid".to_string(), Value::String(identity.new_uid()));
     }
     if metadata.get("creationTimestamp").is_none_or(Value::is_null) {
         metadata.insert(
@@ -115,19 +113,23 @@ pub enum WriteResult {
 }
 
 impl WriteResult {
-    pub fn into_response_parts(self, default_status: StatusCode) -> (StatusCode, Value) {
+    pub fn into_response_parts(
+        self,
+        identity: &dyn crate::ApiIdentityGenerator,
+        default_status: StatusCode,
+    ) -> (StatusCode, Value) {
         match self {
             Self::DryRun(value) | Self::PersistedValue(value) => (default_status, value),
             Self::Persisted(resource) => (
                 default_status,
-                response::persisted_object(resource.data, resource.resource_version),
+                response::persisted_object(identity, resource.data, resource.resource_version),
             ),
             Self::Response { status, body } => (status, body),
         }
     }
 
-    pub fn into_response_value(self) -> Value {
-        self.into_response_parts(StatusCode::OK).1
+    pub fn into_response_value(self, identity: &dyn crate::ApiIdentityGenerator) -> Value {
+        self.into_response_parts(identity, StatusCode::OK).1
     }
 
     pub fn persisted_resource(&self) -> Option<&klights_cluster_core::Resource> {
@@ -215,10 +217,23 @@ mod tests {
 
     use super::*;
 
+    struct FixedIdentity;
+
+    impl crate::ApiIdentityGenerator for FixedIdentity {
+        fn generate_name(&self, prefix: &str) -> String {
+            format!("{prefix}fixed")
+        }
+
+        fn new_uid(&self) -> String {
+            "uid-fixed".to_string()
+        }
+    }
+
     #[test]
     fn prepare_create_metadata_stamps_identity_and_generation() {
         let mut body = serde_json::json!({"metadata": {}});
         prepare_create_metadata(
+            &FixedIdentity,
             Some("default"),
             &mut body,
             "cm1",
@@ -227,11 +242,7 @@ mod tests {
         assert_eq!(body["metadata"]["namespace"], "default");
         assert_eq!(body["metadata"]["name"], "cm1");
         assert_eq!(body["metadata"]["generation"], 1);
-        assert!(
-            body["metadata"]["uid"]
-                .as_str()
-                .is_some_and(|uid| !uid.is_empty())
-        );
+        assert_eq!(body["metadata"]["uid"], "uid-fixed");
     }
 
     #[test]

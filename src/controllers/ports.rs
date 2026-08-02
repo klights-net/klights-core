@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
-#[cfg(not(test))]
 use serde_json::Value;
 
 use klights_controllers::service::ServiceControllerStore;
@@ -102,8 +101,8 @@ pub(crate) struct ControllerRuntimeDependencies {
     pub(crate) node_name: Arc<str>,
 }
 
-#[cfg(not(test))]
-pub(crate) fn inject_resource_version(mut data: Value, resource_version: i64) -> Value {
+pub(crate) fn inject_resource_version(data: impl Into<Arc<Value>>, resource_version: i64) -> Value {
+    let mut data = Arc::unwrap_or_clone(data.into());
     if let Some(metadata) = data.get_mut("metadata").and_then(Value::as_object_mut) {
         metadata.insert(
             "resourceVersion".to_string(),
@@ -172,5 +171,18 @@ mod tests {
         assert_network_object_safe(None);
         assert_effect_object_safe(None);
         let _ = compose_fake_api;
+    }
+
+    #[test]
+    fn controller_projection_preserves_persisted_uid_without_api_fallback() {
+        let projected = inject_resource_version(
+            serde_json::json!({"metadata": {"uid": "persisted-api-object-uid"}}),
+            42,
+        );
+        assert_eq!(projected["metadata"]["uid"], "persisted-api-object-uid");
+        assert_eq!(projected["metadata"]["resourceVersion"], "42");
+
+        let missing_uid = inject_resource_version(serde_json::json!({"metadata": {}}), 43);
+        assert!(missing_uid["metadata"].get("uid").is_none());
     }
 }

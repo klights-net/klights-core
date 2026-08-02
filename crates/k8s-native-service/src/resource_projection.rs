@@ -1,6 +1,7 @@
 use serde_json::Value;
 
 pub fn inject_resource_version(
+    identity: &dyn crate::ApiIdentityGenerator,
     data: impl Into<std::sync::Arc<Value>>,
     resource_version: i64,
 ) -> Value {
@@ -17,10 +18,7 @@ pub fn inject_resource_version(
         if metadata.get("uid").is_none_or(|uid| {
             uid.is_null() || uid.as_str().is_some_and(|uid| uid.trim().is_empty())
         }) {
-            metadata.insert(
-                "uid".to_string(),
-                Value::String(uuid::Uuid::new_v4().to_string()),
-            );
+            metadata.insert("uid".to_string(), Value::String(identity.new_uid()));
         }
     }
     data

@@ -365,7 +365,11 @@ pub async fn create_inner<S: GenericCommandState + 'static>(
                 .await;
                 return Ok((
                     StatusCode::CREATED,
-                    Json(persisted_object(resource.data, resource.resource_version)),
+                    Json(persisted_object(
+                        state.command_store().identity(),
+                        resource.data,
+                        resource.resource_version,
+                    )),
                 ));
             }
 
@@ -410,7 +414,11 @@ pub async fn create_inner<S: GenericCommandState + 'static>(
                 context,
             )
             .await;
-            let data = persisted_object(resource.data, resource.resource_version);
+            let data = persisted_object(
+                state.command_store().identity(),
+                resource.data,
+                resource.resource_version,
+            );
             enqueue_generated_controller_after_mutation(state.as_ref(), &data).await;
             maybe_reconcile_cluster_role_aggregation(state.as_ref(), api_version, kind).await;
             Ok((StatusCode::CREATED, Json(data)))
@@ -592,7 +600,11 @@ pub async fn update_inner<S: GenericCommandState + 'static>(
             {
                 tracing::warn!(namespace, error = ?error, "failed to reconcile kube-root-ca.crt after data modification");
             }
-            let data = persisted_object(resource.data, resource.resource_version);
+            let data = persisted_object(
+                state.command_store().identity(),
+                resource.data,
+                resource.resource_version,
+            );
             if !(api_version == "v1" && kind == "Service") {
                 enqueue_generated_controller_after_mutation(state.as_ref(), &data).await;
             }
@@ -830,7 +842,11 @@ impl<S: GenericCommandState + ?Sized> PatchStrategy for BuiltinPatchStrategy<'_,
             maybe_reconcile_cluster_role_aggregation(self.state, api_version, kind).await;
             return Ok(WriteResult::Response {
                 status: StatusCode::CREATED,
-                body: persisted_object(resource.data, resource.resource_version),
+                body: persisted_object(
+                    self.state.command_store().identity(),
+                    resource.data,
+                    resource.resource_version,
+                ),
             });
         }
 
@@ -953,7 +969,11 @@ pub async fn patch_inner<S: GenericCommandState + 'static>(
                 context,
             )
             .await;
-            let data = persisted_object(resource.data.clone(), resource.resource_version);
+            let data = persisted_object(
+                state.command_store().identity(),
+                resource.data.clone(),
+                resource.resource_version,
+            );
             if !(api_version == "v1" && kind == "Service") {
                 enqueue_generated_controller_after_mutation(state.as_ref(), &data).await;
             }
@@ -962,7 +982,8 @@ pub async fn patch_inner<S: GenericCommandState + 'static>(
         }
         other => other,
     };
-    let (status, data) = result.into_response_parts(StatusCode::OK);
+    let (status, data) =
+        result.into_response_parts(state.command_store().identity(), StatusCode::OK);
     Ok((status, Json(data)))
 }
 
@@ -1183,6 +1204,7 @@ pub async fn delete_inner<S: GenericCommandState + 'static>(
                 Ok((
                     StatusCode::ACCEPTED,
                     Json(super::accepted_object(
+                        state.command_store().identity(),
                         resource.data,
                         resource.resource_version,
                     )),
@@ -1199,7 +1221,11 @@ pub async fn delete_inner<S: GenericCommandState + 'static>(
         );
         return Ok((
             StatusCode::OK,
-            Json(persisted_object(data, resource.resource_version)),
+            Json(persisted_object(
+                state.command_store().identity(),
+                data,
+                resource.resource_version,
+            )),
         ));
     }
 
@@ -1229,6 +1255,7 @@ pub async fn delete_inner<S: GenericCommandState + 'static>(
                 return Ok((
                     StatusCode::ACCEPTED,
                     Json(super::accepted_object(
+                        state.command_store().identity(),
                         updated.data,
                         updated.resource_version,
                     )),
@@ -1328,7 +1355,11 @@ pub async fn delete_inner<S: GenericCommandState + 'static>(
         )
         .await;
     }
-    let data = persisted_object(resource.data, resource.resource_version);
+    let data = persisted_object(
+        state.command_store().identity(),
+        resource.data,
+        resource.resource_version,
+    );
     maybe_reconcile_cluster_role_aggregation(state.as_ref(), api_version, kind).await;
     Ok((StatusCode::OK, Json(data)))
 }

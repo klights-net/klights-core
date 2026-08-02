@@ -577,7 +577,10 @@ impl ControllerDispatcher {
             }
         };
 
-        let value = crate::api::inject_resource_version(resource.data, resource.resource_version);
+        let value = crate::controllers::ports::inject_resource_version(
+            resource.data,
+            resource.resource_version,
+        );
         match self.reconcile_unlocked(&value, db_handle, node_name).await {
             Ok(()) => {
                 self.runtime.record_success(key).await;
@@ -1111,7 +1114,10 @@ mod tests {
             )
             .await
             .expect("create service");
-        let resource = crate::api::inject_resource_version(service.data, service.resource_version);
+        let resource = crate::controllers::ports::inject_resource_version(
+            service.data,
+            service.resource_version,
+        );
 
         let service_ipam = Arc::new(ServiceIpam::new("10.43.128.0/17"));
         let mut dispatcher = ControllerDispatcher::new(service_ipam);
@@ -1322,8 +1328,10 @@ mod tests {
             .await
             .unwrap();
 
-        let resource =
-            crate::api::inject_resource_version(deployment.data, deployment.resource_version);
+        let resource = crate::controllers::ports::inject_resource_version(
+            deployment.data,
+            deployment.resource_version,
+        );
         let db_handle = handle_for(db);
         let result = dispatcher
             .reconcile(&resource, &db_handle, "test-node")
@@ -1398,7 +1406,8 @@ mod tests {
             .set_pod_repository(crate::controllers::test_utils::pod_repository_for_test(&db))
             .await;
 
-        let resource = crate::api::inject_resource_version(job.data, job.resource_version);
+        let resource =
+            crate::controllers::ports::inject_resource_version(job.data, job.resource_version);
         dispatcher
             .reconcile(&resource, &db_handle, "test-node")
             .await

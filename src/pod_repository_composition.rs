@@ -76,6 +76,8 @@ pub struct PodRepositoryBuildConfig {
     pub outbox: Option<Arc<klights_kubelet::node_outbox::Outbox>>,
     pub cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     pub controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
+    #[cfg(not(test))]
+    pub api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
     #[cfg(test)]
     pub(crate) scheduler_bind_gate:
         Option<Arc<crate::pod_native_adapter::SchedulerBindGateForTest>>,
@@ -102,6 +104,7 @@ struct RootPodRepositoryComposition {
     gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
     controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
+    api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
     #[cfg(test)]
     scheduler_bind_gate: Option<Arc<crate::pod_native_adapter::SchedulerBindGateForTest>>,
 }
@@ -964,12 +967,14 @@ impl RootPodRepositoryComposition {
         ));
         let native_orchestration = Arc::new(PodNativeOrchestration::new(
             PodNativeOrchestrationDependencies {
+                identity: self.api_identity.clone(),
                 pod_query: pod_query.clone(),
                 persistence: persistence.clone(),
                 deletion: deletion.clone(),
                 admission_resources: native.clone(),
                 spec_validation: native.clone(),
                 admission: crate::resource_admission_adapter::ResourceAdmissionAdapter::new(
+                    self.api_identity.clone(),
                     self.db.clone(),
                 ),
                 resource_query: self.resource_query.clone(),
@@ -1045,6 +1050,8 @@ pub(crate) fn build_pod_repository_parts(
         outbox,
         cluster_api,
         controller_identity,
+        #[cfg(not(test))]
+        api_identity,
         #[cfg(test)]
         scheduler_bind_gate,
         #[cfg(not(test))]
@@ -1053,6 +1060,8 @@ pub(crate) fn build_pod_repository_parts(
     #[cfg(test)]
     let gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination> =
         Arc::new(klights_controllers::ControllerCoordination::new());
+    #[cfg(test)]
+    let api_identity = crate::api::test_support::deterministic_api_identity();
     let _ = scheduling_mode;
     #[cfg(not(test))]
     let resource_query = cluster_api
@@ -1116,6 +1125,7 @@ pub(crate) fn build_pod_repository_parts(
         gc_coordination,
         wall_clock: Arc::new(klights_supervisor::SystemWallClock),
         controller_identity,
+        api_identity,
         #[cfg(test)]
         scheduler_bind_gate,
     }

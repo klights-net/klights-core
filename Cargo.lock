@@ -2016,7 +2016,6 @@ dependencies = [
  "tower",
  "tracing",
  "urlencoding",
- "uuid",
 ]
 
 [[package]]

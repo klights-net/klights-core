@@ -1,16 +1,32 @@
 //! Kubernetes generated-name policy.
 
-/// Root-owned system entropy adapter for controller names and UIDs.
+/// Root-owned system entropy adapter for API and controller names and UIDs.
 #[derive(Debug, Default)]
-pub(crate) struct SystemControllerIdentityGenerator;
+pub(crate) struct SystemIdentityGenerator;
 
-impl klights_controllers::ControllerIdentityGenerator for SystemControllerIdentityGenerator {
+impl SystemIdentityGenerator {
+    fn new_uid_value() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+}
+
+impl klights_controllers::ControllerIdentityGenerator for SystemIdentityGenerator {
     fn generate_name(&self, prefix: &str) -> String {
         generate(prefix)
     }
 
     fn new_uid(&self) -> String {
-        uuid::Uuid::new_v4().to_string()
+        Self::new_uid_value()
+    }
+}
+
+impl k8s_native_service::ApiIdentityGenerator for SystemIdentityGenerator {
+    fn generate_name(&self, prefix: &str) -> String {
+        generate(prefix)
+    }
+
+    fn new_uid(&self) -> String {
+        Self::new_uid_value()
     }
 }
 
@@ -29,7 +45,7 @@ pub fn generate(prefix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SystemControllerIdentityGenerator, generate};
+    use super::{SystemIdentityGenerator, generate};
     use klights_controllers::ControllerIdentityGenerator;
 
     #[test]
@@ -46,7 +62,7 @@ mod tests {
 
     #[test]
     fn system_uids_are_non_reused_rfc4122_version_4_values() {
-        let identity = SystemControllerIdentityGenerator;
+        let identity = SystemIdentityGenerator;
         let first = identity.new_uid();
         let second = identity.new_uid();
 

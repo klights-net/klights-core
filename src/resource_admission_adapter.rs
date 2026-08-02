@@ -431,18 +431,23 @@ pub(crate) fn build_webhook_http_client(
 }
 
 pub(crate) struct ResourceAdmissionAdapter {
+    identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
     query: Arc<dyn AdmissionQuery>,
     target_resolver: Arc<dyn WebhookTargetResolver>,
     webhook_client: Arc<dyn AdmissionWebhookClient>,
 }
 
 impl ResourceAdmissionAdapter {
-    pub(crate) fn new(db: DatastoreHandle) -> Arc<Self> {
+    pub(crate) fn new(
+        identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
+        db: DatastoreHandle,
+    ) -> Arc<Self> {
         let query: Arc<dyn AdmissionQuery> = RootAdmissionQuery::new(db);
         let target_resolver: Arc<dyn WebhookTargetResolver> =
             RootWebhookTargetResolver::new(Arc::clone(&query));
         let webhook_client: Arc<dyn AdmissionWebhookClient> = RootAdmissionWebhookClient::new();
         Arc::new(Self {
+            identity,
             query,
             target_resolver,
             webhook_client,
@@ -457,6 +462,7 @@ impl ResourceAdmissionAdapter {
     ) -> k8s_native_service::generic_command::GenericCommandFuture<'a, Value> {
         Box::pin(async move {
             let engine = AdmissionEngine::new(
+                self.identity.as_ref(),
                 self.query.as_ref(),
                 self.target_resolver.as_ref(),
                 self.webhook_client.as_ref(),

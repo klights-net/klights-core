@@ -4,7 +4,11 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-pub fn persisted_object(data: impl Into<Arc<Value>>, resource_version: i64) -> Value {
+pub fn persisted_object(
+    identity: &dyn crate::ApiIdentityGenerator,
+    data: impl Into<Arc<Value>>,
+    resource_version: i64,
+) -> Value {
     let mut data = Arc::unwrap_or_clone(data.into());
     if let Some(metadata) = data
         .as_object_mut()
@@ -19,17 +23,18 @@ pub fn persisted_object(data: impl Into<Arc<Value>>, resource_version: i64) -> V
             value.is_null() || value.as_str().is_some_and(|value| value.trim().is_empty())
         });
         if uid_missing_or_empty {
-            metadata.insert(
-                "uid".to_string(),
-                Value::String(uuid::Uuid::new_v4().to_string()),
-            );
+            metadata.insert("uid".to_string(), Value::String(identity.new_uid()));
         }
     }
     data
 }
 
-pub fn accepted_object(data: impl Into<Arc<Value>>, resource_version: i64) -> Value {
-    persisted_object(data, resource_version)
+pub fn accepted_object(
+    identity: &dyn crate::ApiIdentityGenerator,
+    data: impl Into<Arc<Value>>,
+    resource_version: i64,
+) -> Value {
+    persisted_object(identity, data, resource_version)
 }
 
 pub fn delete_success_status(kind: &str, name: &str) -> Value {
@@ -67,6 +72,18 @@ pub fn accepted_delete_status() -> Value {
 mod tests {
     use super::*;
 
+    struct FixedIdentity;
+
+    impl crate::ApiIdentityGenerator for FixedIdentity {
+        fn generate_name(&self, prefix: &str) -> String {
+            format!("{prefix}fixed")
+        }
+
+        fn new_uid(&self) -> String {
+            "uid-fixed".to_string()
+        }
+    }
+
     #[test]
     fn accepted_object_response_preserves_resource_version() {
         let object = serde_json::json!({
@@ -74,7 +91,7 @@ mod tests {
             "kind": "ConfigMap",
             "metadata": {"name": "cm1", "namespace": "default"}
         });
-        let value = accepted_object(object, 44);
+        let value = accepted_object(&FixedIdentity, object, 44);
         assert_eq!(value["metadata"]["resourceVersion"], "44");
     }
 

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct ApiResourceMutationServices {
+    pub(crate) identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
     #[cfg(test)]
     pub(crate) db: crate::datastore::DatastoreHandle,
     pub(crate) watch_stream: Arc<dyn crate::api::watch_stream::WatchStreamSource>,
@@ -32,6 +33,14 @@ pub(crate) struct ApiResourceMutationServices {
 }
 
 impl k8s_native_service::generic_command::GenericCommandStore for ApiResourceMutationServices {
+    fn identity(&self) -> &dyn k8s_native_service::ApiIdentityGenerator {
+        self.identity.as_ref()
+    }
+
+    fn identity_owned(&self) -> Arc<dyn k8s_native_service::ApiIdentityGenerator> {
+        self.identity.clone()
+    }
+
     fn resource_query(&self) -> &dyn klights_leader_api::LeaderResourceQuery {
         self.resource_query.as_ref()
     }
@@ -176,8 +185,11 @@ impl k8s_native_service::generic_read::GenericReadResourceInputs for ApiResource
             } else {
                 resource
             };
-            let mut value =
-                crate::api::inject_resource_version(resource.data, resource.resource_version);
+            let mut value = crate::api::inject_resource_version_with_identity(
+                self.identity.as_ref(),
+                resource.data,
+                resource.resource_version,
+            );
             crate::api::normalize_resource_for_read(api_version, kind, &mut value);
             Ok(value)
         })
@@ -810,6 +822,7 @@ pub(crate) type RootApiRemoteNodeServices = (
 #[cfg(not(test))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_router_from_root(
+    identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
     authorizer: Arc<dyn klights_auth::authorizer::Authorizer>,
     rbac_policy_store: Arc<dyn klights_auth::rbac_policy_store::RbacPolicyStore>,
     bootstrap_token: Arc<dyn klights_leader_api::LeaderBootstrapTokenAuthentication>,
@@ -892,6 +905,7 @@ pub(crate) fn build_router_from_root(
             cluster_ca_pem,
         ),
         ApiResourceMutationServices {
+            identity,
             watch_stream,
             namespace_termination,
             resource_query,

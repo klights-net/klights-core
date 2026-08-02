@@ -221,13 +221,16 @@ pub(crate) use state_composition::{
 pub(crate) use state_composition::{ApiRuntimeInputs, ApiRuntimePaths};
 #[cfg(not(test))]
 pub(crate) use state_composition::{RootApiRole, build_router_from_root};
+#[cfg(test)]
+pub use validation::inject_resource_version;
+pub(crate) use validation::inject_resource_version_with_identity;
 pub(crate) use validation::run_admission_for_request;
 pub use validation::{
     AdmissionContextRequest, apply_crd_defaults, apply_crd_pruning, build_admission_context,
     check_content_type, check_cr_field_validation_strict,
     check_deployment_strict_decode_from_raw_json, check_field_validation_strict,
-    check_field_validation_strict_typed, check_immutable_fields, inject_resource_version,
-    parse_apply_yaml, prepare_admissionregistration_resource, validate_builtin_field_selector,
+    check_field_validation_strict_typed, check_immutable_fields, parse_apply_yaml,
+    prepare_admissionregistration_resource, validate_builtin_field_selector,
     validate_builtin_resource_spec, validate_crd_field_selector,
     validate_pod_resource_requirements_immutable, validate_pod_sysctls,
     validate_priorityclass_update_immutable,
@@ -489,7 +492,10 @@ pub fn compute_qos_class(pod: &Value) -> &'static str {
     }
 }
 
-pub fn resolve_resource_name(body: &mut serde_json::Value) -> Result<String, AppError> {
+pub fn resolve_resource_name(
+    identity: &dyn k8s_native_service::ApiIdentityGenerator,
+    body: &mut serde_json::Value,
+) -> Result<String, AppError> {
     // Try metadata.name first
     if let Some(name) = body
         .get("metadata")
@@ -506,7 +512,7 @@ pub fn resolve_resource_name(body: &mut serde_json::Value) -> Result<String, App
         .and_then(|m| m.get("generateName"))
         .and_then(|n| n.as_str())
     {
-        let generated_name = crate::resource_name::generate(prefix);
+        let generated_name = identity.generate_name(prefix);
 
         // Inject generated name into body's metadata.name
         if let Some(obj) = body.as_object_mut()

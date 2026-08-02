@@ -1729,7 +1729,8 @@ fn extract_yaml_duplicate_key_message(raw: &str) -> Option<String> {
 // Accepts `Arc<Value>` so callers can pass `resource.data` (the datastore
 // `Resource` body) directly without an upstream deep clone — we only pay
 // the clone here if the Arc has other live readers.
-pub fn inject_resource_version(
+pub(crate) fn inject_resource_version_with_identity(
+    identity: &dyn k8s_native_service::ApiIdentityGenerator,
     data: impl Into<std::sync::Arc<Value>>,
     resource_version: i64,
 ) -> Value {
@@ -1750,7 +1751,7 @@ pub fn inject_resource_version(
         if uid_missing_or_empty {
             meta_obj.insert(
                 "uid".to_string(),
-                serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
+                serde_json::Value::String(identity.new_uid()),
             );
         }
 
@@ -1760,6 +1761,25 @@ pub fn inject_resource_version(
         // Raft followers a per-process ambient-time effect.
     }
     data
+}
+
+#[cfg(test)]
+pub fn inject_resource_version(
+    data: impl Into<std::sync::Arc<Value>>,
+    resource_version: i64,
+) -> Value {
+    struct FixedProjectionIdentity;
+    impl k8s_native_service::ApiIdentityGenerator for FixedProjectionIdentity {
+        fn generate_name(&self, prefix: &str) -> String {
+            format!("{prefix}fixed")
+        }
+
+        fn new_uid(&self) -> String {
+            "00000000-0000-4000-8000-000000000001".to_string()
+        }
+    }
+
+    inject_resource_version_with_identity(&FixedProjectionIdentity, data, resource_version)
 }
 
 /// Validate that `name` is a valid DNS-style K8s metadata.name.

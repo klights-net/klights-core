@@ -313,6 +313,7 @@ fn crd_watch_frame_response(
 }
 
 struct CrdWatchProjection {
+    identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
     resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     conversion: Option<crate::api::crd_conversion::CrdConversionConfig>,
     group: String,
@@ -333,6 +334,7 @@ impl crate::api::custom_resource_ports::CustomResourceProjection for CrdWatchPro
             for resource in merge_custom_resource_watch_baseline(resources) {
                 let event = crate::api::custom_resource_ports::added_watch_event(resource);
                 let event = convert_custom_resource_watch_event_to_requested_version(
+                    self.identity.as_ref(),
                     self.resource_query.as_ref(),
                     self.conversion.as_ref(),
                     &self.group,
@@ -415,6 +417,7 @@ mod crd_watch_topic_tests {
 }
 
 async fn normalize_custom_resource_response_data(
+    identity: &dyn k8s_native_service::ApiIdentityGenerator,
     query: &dyn klights_leader_api::LeaderResourceQuery,
     conversion: Option<&crate::api::crd_conversion::CrdConversionConfig>,
     group: &str,
@@ -429,6 +432,7 @@ async fn normalize_custom_resource_response_data(
         .expect("conversion.checked in branch above is equivalent; kept for type narrowing");
     let mut objects = vec![std::mem::take(&mut data)];
     let normalized = convert_crd_objects_to_requested_version(
+        identity,
         query,
         conversion,
         group,
@@ -443,6 +447,7 @@ async fn normalize_custom_resource_response_data(
 }
 
 async fn normalize_custom_resource_storage_data(
+    identity: &dyn k8s_native_service::ApiIdentityGenerator,
     query: &dyn klights_leader_api::LeaderResourceQuery,
     conversion: Option<&crate::api::crd_conversion::CrdConversionConfig>,
     group: &str,
@@ -454,6 +459,7 @@ async fn normalize_custom_resource_storage_data(
         return Ok(data);
     };
     convert_crd_objects_to_requested_version(
+        identity,
         query,
         conversion,
         group,
@@ -559,6 +565,7 @@ async fn get_cr_inner(
 
     let mut data = std::sync::Arc::unwrap_or_clone(resource.data);
     data = normalize_custom_resource_response_data(
+        state.resource_mutation().identity.as_ref(),
         state.resource_mutation().resource_query.as_ref(),
         conversion.as_ref(),
         group,
@@ -827,6 +834,7 @@ async fn list_cr_inner(
         };
         {
             let projection = Arc::new(CrdWatchProjection {
+                identity: state.resource_mutation().identity.clone(),
                 resource_query: state.resource_mutation().resource_query.clone(),
                 conversion: conversion_for_watch.clone(),
                 group: group_for_watch.clone(),
@@ -1118,6 +1126,7 @@ async fn list_cr_inner(
                     .map(|r| std::sync::Arc::unwrap_or_clone(r.data))
                     .collect();
                 objects = convert_crd_objects_to_requested_version(
+                    state_conv.resource_mutation().identity.as_ref(),
                     state_conv.resource_mutation().resource_query.as_ref(),
                     &conv,
                     &group_owned,
@@ -1372,6 +1381,7 @@ async fn delete_collection_cr_inner(
             .map(|r| std::sync::Arc::unwrap_or_clone(r.data))
             .collect();
         objects = convert_crd_objects_to_requested_version(
+            state.resource_mutation().identity.as_ref(),
             state.resource_mutation().resource_query.as_ref(),
             conversion,
             group,
@@ -1707,6 +1717,7 @@ impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
             return Err(AppError::Conflict(format!("{} already exists", name)));
         }
         let storage_body = normalize_custom_resource_storage_data(
+            self.state.resource_mutation().identity.as_ref(),
             self.state.resource_mutation().resource_query.as_ref(),
             conversion.as_ref(),
             group,
@@ -1733,12 +1744,17 @@ impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
         )
         .await;
         let data = normalize_custom_resource_response_data(
+            self.state.resource_mutation().identity.as_ref(),
             self.state.resource_mutation().resource_query.as_ref(),
             conversion.as_ref(),
             group,
             plural,
             &api_version,
-            inject_resource_version(resource.data, resource.resource_version),
+            inject_resource_version_with_identity(
+                self.state.resource_mutation().identity.as_ref(),
+                resource.data,
+                resource.resource_version,
+            ),
         )
         .await?;
         Ok(WriteResult::Response {
@@ -1852,6 +1868,7 @@ impl<'a> UpdateStrategy for CustomResourceUpdateStrategy<'a> {
         )
         .await?;
         let storage_body = normalize_custom_resource_storage_data(
+            self.state.resource_mutation().identity.as_ref(),
             self.state.resource_mutation().resource_query.as_ref(),
             conversion.as_ref(),
             group,
@@ -1887,12 +1904,17 @@ impl<'a> UpdateStrategy for CustomResourceUpdateStrategy<'a> {
         )
         .await;
         let data = normalize_custom_resource_response_data(
+            self.state.resource_mutation().identity.as_ref(),
             self.state.resource_mutation().resource_query.as_ref(),
             conversion.as_ref(),
             group,
             plural,
             &api_version,
-            inject_resource_version(resource.data, resource.resource_version),
+            inject_resource_version_with_identity(
+                self.state.resource_mutation().identity.as_ref(),
+                resource.data,
+                resource.resource_version,
+            ),
         )
         .await?;
         Ok(WriteResult::Response {
@@ -2010,6 +2032,7 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
                 }
 
                 let storage_created_resource = normalize_custom_resource_storage_data(
+                    self.state.resource_mutation().identity.as_ref(),
                     self.state.resource_mutation().resource_query.as_ref(),
                     conversion.as_ref(),
                     group,
@@ -2036,12 +2059,17 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
                 )
                 .await;
                 let data = normalize_custom_resource_response_data(
+                    self.state.resource_mutation().identity.as_ref(),
                     self.state.resource_mutation().resource_query.as_ref(),
                     conversion.as_ref(),
                     group,
                     plural,
                     &api_version,
-                    inject_resource_version(resource.data, resource.resource_version),
+                    inject_resource_version_with_identity(
+                        self.state.resource_mutation().identity.as_ref(),
+                        resource.data,
+                        resource.resource_version,
+                    ),
                 )
                 .await?;
                 return Ok(WriteResult::Response {
@@ -2095,6 +2123,7 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
         }
 
         let storage_patched_resource = normalize_custom_resource_storage_data(
+            self.state.resource_mutation().identity.as_ref(),
             self.state.resource_mutation().resource_query.as_ref(),
             conversion.as_ref(),
             group,
@@ -2130,12 +2159,17 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
         )
         .await;
         let data = normalize_custom_resource_response_data(
+            self.state.resource_mutation().identity.as_ref(),
             self.state.resource_mutation().resource_query.as_ref(),
             conversion.as_ref(),
             group,
             plural,
             &api_version,
-            inject_resource_version(resource.data, resource.resource_version),
+            inject_resource_version_with_identity(
+                self.state.resource_mutation().identity.as_ref(),
+                resource.data,
+                resource.resource_version,
+            ),
         )
         .await?;
         Ok(WriteResult::Response {
@@ -2164,7 +2198,10 @@ async fn create_cr_inner(
     let dry_run = k8s_native_service::generic_command::DryRunMode::from_create_update_query(query)?;
     let (status, data) = create_with_strategy(&strategy, body, dry_run)
         .await?
-        .into_response_parts(StatusCode::CREATED);
+        .into_response_parts(
+            state.resource_mutation().identity.as_ref(),
+            StatusCode::CREATED,
+        );
     Ok((status, Json(data)).into_response())
 }
 
@@ -2349,12 +2386,14 @@ async fn delete_cr_inner(
             .await?
             {
                 let normalized = normalize_custom_resource_response_data(
+                    state.resource_mutation().identity.as_ref(),
                     state.resource_mutation().resource_query.as_ref(),
                     conversion.as_ref(),
                     group,
                     plural,
                     &requested_api_version,
                     k8s_native_service::generic_command::accepted_object(
+                        state.resource_mutation().identity.as_ref(),
                         latest.data,
                         latest.resource_version,
                     ),
@@ -2462,7 +2501,7 @@ async fn update_cr_inner(
         k8s_native_service::generic_command::DryRunMode::Live,
     )
     .await?
-    .into_response_parts(StatusCode::OK);
+    .into_response_parts(state.resource_mutation().identity.as_ref(), StatusCode::OK);
     Ok((status, Json(data)).into_response())
 }
 
@@ -2551,7 +2590,7 @@ async fn patch_cr_inner(
     let dry_run = k8s_native_service::generic_command::DryRunMode::from_create_update_query(query)?;
     let (status, data) = patch_with_strategy(&strategy, patch, dry_run)
         .await?
-        .into_response_parts(StatusCode::OK);
+        .into_response_parts(state.resource_mutation().identity.as_ref(), StatusCode::OK);
     Ok((status, Json(data)).into_response())
 }
 

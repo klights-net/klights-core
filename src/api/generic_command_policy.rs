@@ -184,7 +184,7 @@ impl GenericCommandPolicy for ApiResourceMutationServices {
                 )
                 .await?;
             }
-            let resource_name = resolve_resource_name(&mut body)?;
+            let resource_name = resolve_resource_name(self.identity.as_ref(), &mut body)?;
             if !validate_metadata_name_for_kind(api_version, kind, &resource_name) {
                 let detail = if metadata_name_uses_path_segment_validation(api_version, kind)
                     || kind == "IPAddress"
@@ -199,6 +199,7 @@ impl GenericCommandPolicy for ApiResourceMutationServices {
             }
             let operation_now = operation_now.expect("live create operation timestamp");
             k8s_native_service::generic_command::prepare_create_metadata(
+                self.identity.as_ref(),
                 namespace,
                 &mut body,
                 &resource_name,

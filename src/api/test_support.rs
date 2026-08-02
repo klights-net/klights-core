@@ -1,4 +1,29 @@
 #[cfg(test)]
+#[derive(Default)]
+pub(crate) struct DeterministicApiIdentity {
+    next: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl k8s_native_service::ApiIdentityGenerator for DeterministicApiIdentity {
+    fn generate_name(&self, prefix: &str) -> String {
+        let value = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{prefix}{value:05}")
+    }
+
+    fn new_uid(&self) -> String {
+        let value = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("00000000-0000-4000-8000-{value:012}")
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn deterministic_api_identity()
+-> std::sync::Arc<dyn k8s_native_service::ApiIdentityGenerator> {
+    std::sync::Arc::new(DeterministicApiIdentity::default())
+}
+
+#[cfg(test)]
 mod auth_fakes {
     use std::sync::Mutex;
 
@@ -302,6 +327,7 @@ pub(crate) async fn build_test_app_state_with_db(
             None,
         ),
         crate::api::ApiResourceMutationServices {
+            identity: deterministic_api_identity(),
             db: db_handle.clone(),
             watch_stream: Arc::new(
                 crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
@@ -327,6 +353,7 @@ pub(crate) async fn build_test_app_state_with_db(
                     db_handle.clone(),
                 ),
             admission: crate::resource_admission_adapter::ResourceAdmissionAdapter::new(
+                deterministic_api_identity(),
                 db_handle.clone(),
             ),
             custom_resource_reads:

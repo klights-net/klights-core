@@ -509,7 +509,11 @@ async fn create_crd_with_registration(
             resource
         }
     };
-    let data = inject_resource_version(response_resource.data, response_resource.resource_version);
+    let data = inject_resource_version_with_identity(
+        state.resource_mutation().identity.as_ref(),
+        response_resource.data,
+        response_resource.resource_version,
+    );
     Ok((StatusCode::CREATED, Json(data)))
 }
 
@@ -652,7 +656,11 @@ async fn update_crd_with_registration(
         tracing::error!("Failed to re-register CRD: {}", e);
     }
 
-    let data = inject_resource_version(resource.data, resource.resource_version);
+    let data = inject_resource_version_with_identity(
+        state.resource_mutation().identity.as_ref(),
+        resource.data,
+        resource.resource_version,
+    );
     Ok(Json(data))
 }
 
@@ -770,8 +778,11 @@ async fn patch_crd_with_registration(
                     resource
                 }
             };
-            let data =
-                inject_resource_version(response_resource.data, response_resource.resource_version);
+            let data = inject_resource_version_with_identity(
+                state.resource_mutation().identity.as_ref(),
+                response_resource.data,
+                response_resource.resource_version,
+            );
             return Ok(Json(data));
         }
     }

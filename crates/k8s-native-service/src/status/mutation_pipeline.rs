@@ -351,12 +351,16 @@ pub trait StatusMutationResponder: Send + Sync {
 }
 
 pub struct ResourceStatusResponder {
+    identity: Arc<dyn crate::ApiIdentityGenerator>,
     ensure_type_meta: bool,
 }
 
 impl ResourceStatusResponder {
-    pub fn new(ensure_type_meta: bool) -> Self {
-        Self { ensure_type_meta }
+    pub fn new(identity: Arc<dyn crate::ApiIdentityGenerator>, ensure_type_meta: bool) -> Self {
+        Self {
+            identity,
+            ensure_type_meta,
+        }
     }
 }
 
@@ -376,6 +380,7 @@ impl StatusMutationResponder for ResourceStatusResponder {
             std::sync::Arc::unwrap_or_clone(final_resource.data)
         };
         Ok(inject_resource_version(
+            self.identity.as_ref(),
             data,
             final_resource.resource_version,
         ))
@@ -990,7 +995,15 @@ pub trait NamespaceStatusMutationResponder: Send + Sync {
     ) -> Result<Value, AppError>;
 }
 
-pub struct NamespaceStatusResponder;
+pub struct NamespaceStatusResponder {
+    identity: Arc<dyn crate::ApiIdentityGenerator>,
+}
+
+impl NamespaceStatusResponder {
+    pub fn new(identity: Arc<dyn crate::ApiIdentityGenerator>) -> Self {
+        Self { identity }
+    }
+}
 
 impl NamespaceStatusMutationResponder for NamespaceStatusResponder {
     fn response(
@@ -999,6 +1012,7 @@ impl NamespaceStatusMutationResponder for NamespaceStatusResponder {
         updated: Resource,
     ) -> Result<Value, AppError> {
         Ok(inject_resource_version(
+            self.identity.as_ref(),
             updated.data,
             updated.resource_version,
         ))

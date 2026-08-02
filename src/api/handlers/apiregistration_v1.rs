@@ -22,7 +22,11 @@ pub(in crate::api) async fn get_apiservice_status(
     .await?
     .ok_or_else(|| AppError::NotFound("APIService not found".to_string()))?;
 
-    let data = inject_resource_version(resource.data, resource.resource_version);
+    let data = inject_resource_version_with_identity(
+        state.resource_mutation().identity.as_ref(),
+        resource.data,
+        resource.resource_version,
+    );
     Ok(K8sResponse::new(data, &headers))
 }
 

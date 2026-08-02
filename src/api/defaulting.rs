@@ -30,6 +30,7 @@ use serde_json::{Map, Value};
 /// `creationTimestamp` and `generation` are added only when absent / null /
 /// (for generation) zero.
 pub fn inject_create_metadata_at(
+    identity: &dyn k8s_native_service::ApiIdentityGenerator,
     ns: Option<&str>,
     body: &mut Value,
     resource_name: &str,
@@ -57,10 +58,7 @@ pub fn inject_create_metadata_at(
         .get("uid")
         .is_none_or(|v| v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty()));
     if uid_missing_or_empty {
-        meta_obj.insert(
-            "uid".to_string(),
-            Value::String(uuid::Uuid::new_v4().to_string()),
-        );
+        meta_obj.insert("uid".to_string(), Value::String(identity.new_uid()));
     }
     if meta_obj
         .get("creationTimestamp")
@@ -81,8 +79,13 @@ pub fn inject_create_metadata_at(
 }
 
 #[cfg(test)]
-pub fn inject_create_metadata(ns: Option<&str>, body: &mut Value, resource_name: &str) {
-    inject_create_metadata_at(ns, body, resource_name, test_operation_time());
+pub fn inject_create_metadata(
+    identity: &dyn k8s_native_service::ApiIdentityGenerator,
+    ns: Option<&str>,
+    body: &mut Value,
+    resource_name: &str,
+) {
+    inject_create_metadata_at(identity, ns, body, resource_name, test_operation_time());
 }
 
 /// Apply Pod-specific create-time defaults: terminationGracePeriodSeconds,

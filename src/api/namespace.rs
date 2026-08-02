@@ -14,7 +14,11 @@ pub(in crate::api) async fn get_namespace(
     )
     .await?
     .ok_or(AppError::NotFound(format!("namespace {} not found", name)))?;
-    let data = inject_resource_version(ns.data, ns.resource_version);
+    let data = inject_resource_version_with_identity(
+        state.resource_mutation().identity.as_ref(),
+        ns.data,
+        ns.resource_version,
+    );
     Ok(Json(data))
 }
 
@@ -137,7 +141,13 @@ pub(in crate::api) async fn list_namespaces(
     let items_with_rv: Vec<Value> = list_response
         .items
         .into_iter()
-        .map(|r| inject_resource_version(r.data, r.resource_version))
+        .map(|r| {
+            inject_resource_version_with_identity(
+                state.resource_mutation().identity.as_ref(),
+                r.data,
+                r.resource_version,
+            )
+        })
         .collect();
 
     let mut ns_metadata = serde_json::json!({
@@ -225,7 +235,7 @@ pub(in crate::api) async fn create_namespace(
             if uid_missing_or_empty {
                 meta_obj.insert(
                     "uid".to_string(),
-                    serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
+                    serde_json::Value::String(state.resource_mutation().identity.new_uid()),
                 );
             }
             if meta_obj
@@ -311,7 +321,11 @@ pub(in crate::api) async fn create_namespace(
         }
     }
 
-    let data = inject_resource_version(resource.data, resource.resource_version);
+    let data = inject_resource_version_with_identity(
+        state.resource_mutation().identity.as_ref(),
+        resource.data,
+        resource.resource_version,
+    );
     Ok((StatusCode::CREATED, Json(data)))
 }
 
@@ -370,7 +384,11 @@ pub(in crate::api) async fn update_namespace(
         current.resource_version,
     )
     .await?;
-    let data = inject_resource_version(resource.data, resource.resource_version);
+    let data = inject_resource_version_with_identity(
+        state.resource_mutation().identity.as_ref(),
+        resource.data,
+        resource.resource_version,
+    );
     Ok(Json(data))
 }
 
@@ -478,7 +496,11 @@ pub(in crate::api) async fn finalize_namespace(
         }
     }
 
-    let data = inject_resource_version(resource.data, resource.resource_version);
+    let data = inject_resource_version_with_identity(
+        state.resource_mutation().identity.as_ref(),
+        resource.data,
+        resource.resource_version,
+    );
     Ok(Json(data))
 }
 
@@ -536,7 +558,11 @@ pub(in crate::api) async fn patch_namespace(
         current.resource_version,
     )
     .await?;
-    let data = inject_resource_version(resource.data, resource.resource_version);
+    let data = inject_resource_version_with_identity(
+        state.resource_mutation().identity.as_ref(),
+        resource.data,
+        resource.resource_version,
+    );
     Ok(Json(data))
 }
 

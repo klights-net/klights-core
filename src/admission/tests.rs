@@ -115,7 +115,9 @@ macro_rules! admission_engine_for_db_handle {
         let admission_query: Arc<dyn AdmissionQuery> = RootAdmissionQuery::new($db_handle);
         let admission_resolver = RootWebhookTargetResolver::new(admission_query.clone());
         let admission_client = RootAdmissionWebhookClient::new();
+        let admission_identity = crate::api::test_support::deterministic_api_identity();
         let $engine = AdmissionEngine::new(
+            admission_identity.as_ref(),
             admission_query.as_ref(),
             admission_resolver.as_ref(),
             admission_client.as_ref(),
@@ -142,6 +144,7 @@ fn test_ctx(
 ) -> AdmissionRequestContext {
     let (group, version) = parse_api_group_version(api_version);
     AdmissionRequestContext {
+        request_uid: "test-request".to_string(),
         api_version: api_version.to_string(),
         api_group: group,
         version,
@@ -1292,7 +1295,8 @@ async fn test_admission_engine_accepts_focused_lookup_trait_object() {
     let query = FakeAdmissionQuery::default();
     let resolver = FakeWebhookTargetResolver;
     let client = FakeAdmissionWebhookClient::default();
-    let engine = AdmissionEngine::new(&query, &resolver, &client);
+    let identity = crate::api::test_support::deterministic_api_identity();
+    let engine = AdmissionEngine::new(identity.as_ref(), &query, &resolver, &client);
     let pod = json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -1334,7 +1338,8 @@ async fn test_admission_policy_uses_fake_query_target_and_client_ports() {
     };
     let resolver = FakeWebhookTargetResolver;
     let client = FakeAdmissionWebhookClient::default();
-    let engine = AdmissionEngine::new(&query, &resolver, &client);
+    let identity = crate::api::test_support::deterministic_api_identity();
+    let engine = AdmissionEngine::new(identity.as_ref(), &query, &resolver, &client);
     let pod = json!({
         "apiVersion": "v1",
         "kind": "Pod",

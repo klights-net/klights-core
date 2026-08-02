@@ -11,7 +11,11 @@ pub async fn get_pod_status<S: GenericCommandState + 'static>(
             let pod_data = resource.data;
             // K8s status subresource returns the full pod object
             // but clients typically only care about the status field
-            let pod_with_rv = inject_resource_version(pod_data, resource.resource_version);
+            let pod_with_rv = inject_resource_version(
+                state.command_store().identity(),
+                pod_data,
+                resource.resource_version,
+            );
             Ok(Json(pod_with_rv))
         }
         None => Err(AppError::NotFound(format!(
@@ -57,7 +61,11 @@ pub async fn patch_pod_status_subresource<S: GenericCommandState + 'static>(
         .await
         .map_err(|e| AppError::from(e).with_resource_context("v1", "Pod", &name))?;
 
-    let result = inject_resource_version(updated.data, updated.resource_version);
+    let result = inject_resource_version(
+        state.command_store().identity(),
+        updated.data,
+        updated.resource_version,
+    );
     Ok(Json(result))
 }
 
@@ -95,7 +103,11 @@ pub async fn update_pod_status_subresource<S: GenericCommandState + 'static>(
         .await
         .map_err(|e| AppError::from(e).with_resource_context("v1", "Pod", &name))?;
 
-    let result = inject_resource_version(updated.data, updated.resource_version);
+    let result = inject_resource_version(
+        state.command_store().identity(),
+        updated.data,
+        updated.resource_version,
+    );
     Ok(Json(result))
 }
 

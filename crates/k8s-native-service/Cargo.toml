@@ -52,7 +52,6 @@ tokio-tungstenite = { workspace = true }
 time = { workspace = true }
 tracing = { workspace = true }
 urlencoding = { workspace = true }
-uuid = { workspace = true, features = ["std", "v4"] }
 
 [dev-dependencies]
 rcgen = { workspace = true }

@@ -5,6 +5,18 @@
 use crate::api::defaulting::*;
 use serde_json::{Value, json};
 
+struct FixedIdentity;
+
+impl k8s_native_service::ApiIdentityGenerator for FixedIdentity {
+    fn generate_name(&self, prefix: &str) -> String {
+        format!("{prefix}fixed")
+    }
+
+    fn new_uid(&self) -> String {
+        "00000000-0000-4000-8000-000000000001".to_string()
+    }
+}
+
 // ============================================================================
 // inject_create_metadata
 // ============================================================================
@@ -12,7 +24,7 @@ use serde_json::{Value, json};
 #[test]
 fn inject_create_metadata_namespaced_stamps_namespace_name_and_uid() {
     let mut body = json!({"metadata": {}});
-    inject_create_metadata(Some("default"), &mut body, "my-pod");
+    inject_create_metadata(&FixedIdentity, Some("default"), &mut body, "my-pod");
     assert_eq!(body["metadata"]["namespace"], "default");
     assert_eq!(body["metadata"]["name"], "my-pod");
     assert!(body["metadata"]["uid"].as_str().unwrap().len() >= 32);
@@ -29,7 +41,7 @@ fn inject_create_metadata_namespaced_stamps_namespace_name_and_uid() {
 #[test]
 fn inject_create_metadata_cluster_omits_namespace() {
     let mut body = json!({"metadata": {}});
-    inject_create_metadata(None, &mut body, "node-1");
+    inject_create_metadata(&FixedIdentity, None, &mut body, "node-1");
     assert!(
         body["metadata"].get("namespace").is_none(),
         "cluster-scoped resource must not have namespace stamped"
@@ -41,7 +53,7 @@ fn inject_create_metadata_cluster_omits_namespace() {
 #[test]
 fn inject_create_metadata_no_metadata_object_is_noop() {
     let mut body = json!({"spec": {}});
-    inject_create_metadata(Some("default"), &mut body, "x");
+    inject_create_metadata(&FixedIdentity, Some("default"), &mut body, "x");
     assert!(
         body.get("metadata").is_none(),
         "must not synthesize metadata"
@@ -52,7 +64,7 @@ fn inject_create_metadata_no_metadata_object_is_noop() {
 fn inject_create_metadata_existing_uid_preserved() {
     let preset = "11111111-1111-1111-1111-111111111111";
     let mut body = json!({"metadata": {"uid": preset, "generation": 5}});
-    inject_create_metadata(Some("default"), &mut body, "x");
+    inject_create_metadata(&FixedIdentity, Some("default"), &mut body, "x");
     assert_eq!(body["metadata"]["uid"], preset);
     assert_eq!(body["metadata"]["generation"], 5, "non-zero gen preserved");
 }
@@ -60,7 +72,7 @@ fn inject_create_metadata_existing_uid_preserved() {
 #[test]
 fn inject_create_metadata_whitespace_uid_replaced() {
     let mut body = json!({"metadata": {"uid": "   "}});
-    inject_create_metadata(None, &mut body, "x");
+    inject_create_metadata(&FixedIdentity, None, &mut body, "x");
     let new_uid = body["metadata"]["uid"].as_str().unwrap();
     assert!(!new_uid.trim().is_empty());
     assert_ne!(new_uid, "   ");

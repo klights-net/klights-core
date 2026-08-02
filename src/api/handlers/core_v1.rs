@@ -597,7 +597,11 @@ async fn delete_service(
         }
     }
 
-    let data_with_uid = inject_resource_version(resource.data.clone(), resource.resource_version);
+    let data_with_uid = inject_resource_version_with_identity(
+        state.resource_mutation().identity.as_ref(),
+        resource.data.clone(),
+        resource.resource_version,
+    );
     let owner_uid = data_with_uid
         .get("metadata")
         .and_then(|m| m.get("uid"))
@@ -642,7 +646,11 @@ async fn delete_service(
     )
     .await;
 
-    let data = inject_resource_version(resource.data, resource.resource_version);
+    let data = inject_resource_version_with_identity(
+        state.resource_mutation().identity.as_ref(),
+        resource.data,
+        resource.resource_version,
+    );
     Ok(Json(data))
 }
 

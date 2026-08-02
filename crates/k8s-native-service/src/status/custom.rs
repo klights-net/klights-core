@@ -36,10 +36,10 @@ pub async fn patch_node_status<S: GenericCommandState + 'static>(
     let patch: Value = decode_patch_body(&body)?;
     let target = StatusMutationTarget::cluster("v1", "Node", &name);
     let pipeline = StatusMutationPipeline::new(
-        DatastoreStatusMutationWriter::new(state),
+        DatastoreStatusMutationWriter::new(state.clone()),
         ApiSubresourceStatusMergePolicy::new(Some(preserve_node_extended_resources)),
         LenientStatusResourceVersionPrecondition,
-        ResourceStatusResponder::new(false),
+        ResourceStatusResponder::new(state.command_store().identity_owned(), false),
     );
     let outcome = pipeline
         .execute(
@@ -175,7 +175,11 @@ pub async fn get_namespace_status<S: GenericCommandState + 'static>(
     .ok_or_else(|| AppError::NotFound(format!("Namespace {} not found", name)))?;
     let mut data: Value = std::sync::Arc::unwrap_or_clone(resource.data);
     ensure_namespace_status_phase_active(&mut data);
-    let result = inject_resource_version(data, resource.resource_version);
+    let result = inject_resource_version(
+        state.command_store().identity(),
+        data,
+        resource.resource_version,
+    );
     Ok(Json(result))
 }
 
@@ -185,10 +189,10 @@ pub async fn update_namespace_status<S: GenericCommandState + 'static>(
     LenientJson(body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
     let pipeline = NamespaceStatusMutationPipeline::new(
-        DatastoreNamespaceStatusMutationWriter::new(state),
+        DatastoreNamespaceStatusMutationWriter::new(state.clone()),
         NamespaceStatusMergePolicy,
         CurrentNamespaceResourceVersionPrecondition,
-        NamespaceStatusResponder,
+        NamespaceStatusResponder::new(state.command_store().identity_owned()),
     );
     pipeline
         .execute(
@@ -207,10 +211,10 @@ pub async fn patch_namespace_status<S: GenericCommandState + 'static>(
     let content_type = headers.get("content-type").and_then(|h| h.to_str().ok());
     let patch: Value = decode_patch_body(&body)?;
     let pipeline = NamespaceStatusMutationPipeline::new(
-        DatastoreNamespaceStatusMutationWriter::new(state),
+        DatastoreNamespaceStatusMutationWriter::new(state.clone()),
         NamespaceStatusMergePolicy,
         CurrentNamespaceResourceVersionPrecondition,
-        NamespaceStatusResponder,
+        NamespaceStatusResponder::new(state.command_store().identity_owned()),
     );
     pipeline
         .execute(

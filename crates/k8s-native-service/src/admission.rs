@@ -119,6 +119,7 @@ pub trait AdmissionWebhookClient: Send + Sync {
 /// Shared OO runner for mutating and validating admission webhooks.
 /// Mutating and validating paths share rule matching, selector checks and callout flow.
 pub struct AdmissionEngine<'a> {
+    identity: &'a dyn crate::ApiIdentityGenerator,
     query: &'a dyn AdmissionQuery,
     target_resolver: &'a dyn WebhookTargetResolver,
     webhook_client: &'a dyn AdmissionWebhookClient,
@@ -126,11 +127,13 @@ pub struct AdmissionEngine<'a> {
 
 impl<'a> AdmissionEngine<'a> {
     pub fn new(
+        identity: &'a dyn crate::ApiIdentityGenerator,
         query: &'a dyn AdmissionQuery,
         target_resolver: &'a dyn WebhookTargetResolver,
         webhook_client: &'a dyn AdmissionWebhookClient,
     ) -> Self {
         Self {
+            identity,
             query,
             target_resolver,
             webhook_client,
@@ -178,6 +181,9 @@ impl<'a> AdmissionEngine<'a> {
         context: &AdmissionRequestContext,
         is_mutating: bool,
     ) -> Result<Value> {
+        let mut context = context.clone();
+        context.request_uid = self.identity.new_uid();
+        let context = &context;
         if !is_admission_operation(&context.operation) {
             return Ok(context.object.clone());
         }

@@ -139,6 +139,7 @@ struct InitialPodSchedulingState {
 }
 
 pub struct PodNativeOrchestration {
+    identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
     pod_query: Arc<dyn PodQuery>,
     persistence: Arc<dyn PodPersistence>,
     deletion: Arc<dyn PodDeleteOrchestration>,
@@ -155,6 +156,7 @@ pub struct PodNativeOrchestration {
 }
 
 pub struct PodNativeOrchestrationDependencies {
+    pub identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
     pub pod_query: Arc<dyn PodQuery>,
     pub persistence: Arc<dyn PodPersistence>,
     pub deletion: Arc<dyn PodDeleteOrchestration>,
@@ -173,6 +175,7 @@ pub struct PodNativeOrchestrationDependencies {
 impl PodNativeOrchestration {
     pub fn new(dependencies: PodNativeOrchestrationDependencies) -> Self {
         let PodNativeOrchestrationDependencies {
+            identity,
             pod_query,
             persistence,
             deletion,
@@ -188,6 +191,7 @@ impl PodNativeOrchestration {
             wall_clock,
         } = dependencies;
         Self {
+            identity,
             pod_query,
             persistence,
             deletion,
@@ -302,7 +306,7 @@ impl PodNativeOrchestration {
             .await?;
 
         let resource_name = if name.trim().is_empty() {
-            resolve_resource_name(&mut body)?
+            resolve_resource_name(self.identity.as_ref(), &mut body)?
         } else {
             name
         };
@@ -324,10 +328,7 @@ impl PodNativeOrchestration {
                 .get("uid")
                 .is_none_or(|v| v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty()));
             if uid_missing_or_empty {
-                meta_obj.insert(
-                    "uid".to_string(),
-                    Value::String(uuid::Uuid::new_v4().to_string()),
-                );
+                meta_obj.insert("uid".to_string(), Value::String(self.identity.new_uid()));
             }
             if meta_obj
                 .get("creationTimestamp")

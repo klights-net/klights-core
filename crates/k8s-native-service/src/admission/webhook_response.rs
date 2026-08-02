@@ -4,7 +4,7 @@ use serde_json::Value;
 
 pub fn build_admission_review(context: &AdmissionRequestContext, object: &Value) -> Value {
     let mut request = serde_json::json!({
-        "uid": uuid::Uuid::new_v4().to_string(),
+        "uid": context.request_uid,
         "kind": {
             "group": context.api_group,
             "version": context.version,

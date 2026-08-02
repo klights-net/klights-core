@@ -3,6 +3,7 @@ use serde_json::Value;
 /// Admission request context shared by mutating and validating webhook execution.
 #[derive(Clone, Debug)]
 pub struct AdmissionRequestContext {
+    pub request_uid: String,
     pub api_version: String,
     pub api_group: String,
     pub version: String,
@@ -32,6 +33,7 @@ impl AdmissionRequestContext {
             .and_then(|n| n.as_str())
             .map(ToString::to_string);
         Self {
+            request_uid: "legacy-request".to_string(),
             api_version: api_version.to_string(),
             api_group: group,
             version,

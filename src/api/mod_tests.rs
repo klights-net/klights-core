@@ -4323,6 +4323,7 @@ async fn test_crd_conversion_service_webhook_uses_endpoint_target_port() {
     };
 
     let result = convert_crd_objects_to_requested_version(
+        crate::api::test_support::deterministic_api_identity().as_ref(),
         crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
         &conversion,
         "stable.example.com",
@@ -4447,6 +4448,7 @@ async fn test_crd_conversion_skips_objects_already_on_desired_version() {
     };
 
     let result = convert_crd_objects_to_requested_version(
+        crate::api::test_support::deterministic_api_identity().as_ref(),
         crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
         &conversion,
         "stable.example.com",
@@ -4554,6 +4556,7 @@ async fn test_crd_conversion_strategy_check_is_case_insensitive() {
     };
 
     let result = convert_crd_objects_to_requested_version(
+        crate::api::test_support::deterministic_api_identity().as_ref(),
         crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
         &conversion,
         "stable.example.com",
@@ -4588,6 +4591,7 @@ async fn test_crd_conversion_strategy_none_with_client_config_stamps_requested_v
     };
 
     let result = convert_crd_objects_to_requested_version(
+        crate::api::test_support::deterministic_api_identity().as_ref(),
         crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
         &conversion,
         "stable.example.com",
@@ -4682,6 +4686,7 @@ async fn test_crd_conversion_accepts_yaml_conversion_review_response() {
     };
 
     let result = convert_crd_objects_to_requested_version(
+        crate::api::test_support::deterministic_api_identity().as_ref(),
         crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
         &conversion,
         "stable.example.com",

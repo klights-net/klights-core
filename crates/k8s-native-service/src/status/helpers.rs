@@ -136,7 +136,7 @@ pub async fn update_status_subresource<S: GenericCommandState + 'static>(
         DatastoreStatusMutationWriter::new(state.clone()),
         ApiSubresourceStatusMergePolicy::new(None),
         LenientStatusResourceVersionPrecondition,
-        ResourceStatusResponder::new(true),
+        ResourceStatusResponder::new(state.command_store().identity_owned(), true),
     );
     let outcome = pipeline
         .execute(&target, &StatusPutOperation::new(body))
@@ -175,7 +175,7 @@ pub async fn patch_status_subresource<S: GenericCommandState + 'static>(
         DatastoreStatusMutationWriter::new(state.clone()),
         ApiSubresourceStatusMergePolicy::new(None),
         LenientStatusResourceVersionPrecondition,
-        ResourceStatusResponder::new(true),
+        ResourceStatusResponder::new(state.command_store().identity_owned(), true),
     );
     let outcome = pipeline
         .execute(
@@ -222,7 +222,11 @@ pub async fn get_namespaced_status_subresource<S: GenericCommandState + 'static>
     .await?
     .ok_or_else(|| AppError::NotFound(format!("{} {} not found", kind, name)))?;
 
-    let data = inject_resource_version(resource.data, resource.resource_version);
+    let data = inject_resource_version(
+        state.command_store().identity(),
+        resource.data,
+        resource.resource_version,
+    );
     Ok(K8sResponse::new(data, &headers))
 }
 
@@ -243,7 +247,11 @@ pub async fn get_cluster_status_subresource<S: GenericCommandState + 'static>(
     )
     .await?
     .ok_or_else(|| AppError::NotFound(format!("{} {} not found", kind, name)))?;
-    let result = inject_resource_version(resource.data, resource.resource_version);
+    let result = inject_resource_version(
+        state.command_store().identity(),
+        resource.data,
+        resource.resource_version,
+    );
     Ok(K8sResponse::new(result, &headers))
 }
 
@@ -259,10 +267,10 @@ pub async fn update_cluster_status_subresource_with_headers<S: GenericCommandSta
     let pre_merge = (api_version == "v1" && kind == "Node")
         .then_some(preserve_node_extended_resources as fn(Option<&Value>, &mut Value));
     let pipeline = StatusMutationPipeline::new(
-        DatastoreStatusMutationWriter::new(state),
+        DatastoreStatusMutationWriter::new(state.clone()),
         ApiSubresourceStatusMergePolicy::new(pre_merge),
         LenientStatusResourceVersionPrecondition,
-        ResourceStatusResponder::new(false),
+        ResourceStatusResponder::new(state.command_store().identity_owned(), false),
     );
     let outcome = pipeline
         .execute(&target, &StatusPutOperation::new(body))
@@ -408,10 +416,10 @@ pub async fn patch_cluster_status_subresource<S: GenericCommandState + 'static>(
     let pre_merge = (api_version == "v1" && kind == "Node")
         .then_some(preserve_node_extended_resources as fn(Option<&Value>, &mut Value));
     let pipeline = StatusMutationPipeline::new(
-        DatastoreStatusMutationWriter::new(state),
+        DatastoreStatusMutationWriter::new(state.clone()),
         ApiSubresourceStatusMergePolicy::new(pre_merge),
         LenientStatusResourceVersionPrecondition,
-        ResourceStatusResponder::new(false),
+        ResourceStatusResponder::new(state.command_store().identity_owned(), false),
     );
     let outcome = pipeline
         .execute(

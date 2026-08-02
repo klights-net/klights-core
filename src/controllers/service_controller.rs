@@ -91,8 +91,10 @@ mod tests {
             .create_resource("v1", "Service", Some("default"), "my-svc", service)
             .await
             .unwrap();
-        let service_with_rv =
-            crate::api::inject_resource_version(created.data, created.resource_version);
+        let service_with_rv = crate::controllers::ports::inject_resource_version(
+            created.data,
+            created.resource_version,
+        );
 
         let ctx = crate::datastore::test_support::test_context(&db);
         let result = controller.reconcile(service_with_rv, ctx).await;
@@ -140,8 +142,10 @@ mod tests {
             .create_resource("v1", "Service", Some("default"), "my-svc", service)
             .await
             .unwrap();
-        let service_with_rv =
-            crate::api::inject_resource_version(created.data, created.resource_version);
+        let service_with_rv = crate::controllers::ports::inject_resource_version(
+            created.data,
+            created.resource_version,
+        );
         let services = Arc::new(crate::networking::test_support::MockServiceRouter::new());
         let ctx = Context::with_services(
             std::sync::Arc::new(db.clone()),

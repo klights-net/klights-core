@@ -141,6 +141,7 @@ pub async fn load_crd_conversion_config(
 }
 
 pub async fn convert_crd_objects_to_requested_version(
+    identity: &dyn k8s_native_service::ApiIdentityGenerator,
     query: &dyn klights_leader_api::LeaderResourceQuery,
     conversion: &CrdConversionConfig,
     group: &str,
@@ -262,7 +263,7 @@ pub async fn convert_crd_objects_to_requested_version(
         "apiVersion": conversion_api_version,
         "kind": "ConversionReview",
         "request": {
-            "uid": uuid::Uuid::new_v4().to_string(),
+            "uid": identity.new_uid(),
             "desiredAPIVersion": desired_api_version,
             "objects": convert_objects,
         }
@@ -438,6 +439,7 @@ pub async fn gather_custom_resources_across_served_versions(
 }
 
 pub async fn convert_custom_resource_watch_event_to_requested_version(
+    identity: &dyn k8s_native_service::ApiIdentityGenerator,
     query: &dyn klights_leader_api::LeaderResourceQuery,
     conversion: Option<&CrdConversionConfig>,
     group: &str,
@@ -464,6 +466,7 @@ pub async fn convert_custom_resource_watch_event_to_requested_version(
     ))
     .unwrap_or_else(|arc| (*arc).clone());
     let mut converted = convert_crd_objects_to_requested_version(
+        identity,
         query,
         conversion,
         group,

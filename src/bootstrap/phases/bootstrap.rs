@@ -363,8 +363,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let api_runtime_inputs =
         crate::api::ApiRuntimeInputs::new(api_runtime_paths.clone(), config.api_slow_log_threshold)
             .context("invalid API runtime inputs")?;
+    let system_identity = Arc::new(crate::resource_name::SystemIdentityGenerator);
     let controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator> =
-        Arc::new(crate::resource_name::SystemControllerIdentityGenerator);
+        system_identity.clone();
+    let api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator> = system_identity;
 
     // T2 step 2: leader-capable nodes gate one-time init on lease
     // acquisition. For a seed boot the raft node is already leader by
@@ -566,6 +568,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 outbox: Some(outbox_runtime.clone()),
                 cluster_api: Some(leader_ports.resource_query.clone()),
                 controller_identity: controller_identity.clone(),
+                #[cfg(not(test))]
+                api_identity: api_identity.clone(),
                 #[cfg(test)]
                 scheduler_bind_gate: None,
                 #[cfg(not(test))]
@@ -702,6 +706,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     outbox: Some(outbox_runtime.clone()),
                     cluster_api: Some(leader_ports.resource_query.clone()),
                     controller_identity: controller_identity.clone(),
+                    #[cfg(not(test))]
+                    api_identity: api_identity.clone(),
                     #[cfg(test)]
                     scheduler_bind_gate: None,
                     #[cfg(not(test))]
@@ -1021,6 +1027,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             cluster_ca_pem.map(std::sync::Arc::new),
         ),
         crate::api::ApiResourceMutationServices {
+            identity: api_identity.clone(),
             #[cfg(test)]
             db: db_handle.clone(),
             watch_stream: Arc::new(
@@ -1052,6 +1059,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     db_handle.clone(),
                 ),
             admission: crate::resource_admission_adapter::ResourceAdmissionAdapter::new(
+                api_identity.clone(),
                 db_handle.clone(),
             ),
             custom_resource_reads:
@@ -1771,6 +1779,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .context("load root-owned ServiceAccount signing state")?;
     #[cfg(not(test))]
     let (api_router, api_outer_layers) = api::build_router_from_root(
+        api_identity.clone(),
         Arc::new(
             klights_auth::authorizer::AuthorizerChain::default_chain_with_rbac(
                 rbac_policy_store.clone(),
@@ -1803,7 +1812,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         crate::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
             db_handle.clone(),
         ),
-        crate::resource_admission_adapter::ResourceAdmissionAdapter::new(db_handle.clone()),
+        crate::resource_admission_adapter::ResourceAdmissionAdapter::new(
+            api_identity,
+            db_handle.clone(),
+        ),
         crate::custom_resource_read_adapter::CustomResourceReadAdapter::new(
             db_handle.clone(),
             watch_signals.clone(),
