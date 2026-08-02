@@ -34,7 +34,7 @@ fn is_timeout_error_text(error_text: &str) -> bool {
         || normalized.contains("timeout")
 }
 
-pub(crate) fn format_webhook_call_error(url: &str, error_text: &str, is_timeout: bool) -> String {
+pub fn format_webhook_call_error(url: &str, error_text: &str, is_timeout: bool) -> String {
     if is_timeout || is_timeout_error_text(error_text) {
         return format!(
             "Failed to call webhook at {}: context deadline exceeded: {}",

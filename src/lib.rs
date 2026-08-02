@@ -1,4 +1,6 @@
-pub mod admission;
+#[cfg(test)]
+#[path = "admission/tests.rs"]
+mod admission_tests;
 mod allocator;
 pub mod api;
 mod api_helpers_adapter;
@@ -8,7 +10,6 @@ mod api_state_adapter;
 #[path = "api_state_adapter.rs"]
 mod api_state_adapter_test_owner;
 mod apiservice_side_effect_adapter;
-pub mod audit;
 mod authority_adapter;
 pub mod cli;
 pub(crate) mod cluster_store_replication_adapter;

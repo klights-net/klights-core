@@ -152,7 +152,7 @@ pub async fn create_token_review(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<crate::api::response::K8sResponse, AppError> {
+) -> Result<k8s_native_service::response::K8sResponse, AppError> {
     if wants_table_format(&headers)? {
         return Err(AppError::NotAcceptable(
             "Table format is not supported for TokenReview".to_string(),
@@ -173,7 +173,7 @@ pub async fn create_token_review(
 
     let authentication_inputs =
         crate::api::policy_input_adapters::authentication_http_inputs(&state);
-    match crate::api::auth_middleware::authenticate_token_for_review(
+    match k8s_native_service::auth_http::authenticate_token_for_review(
         &authentication_inputs,
         &token,
         &requested_audiences,
@@ -183,14 +183,14 @@ pub async fn create_token_review(
         Ok(klights_auth::authentication::ReviewedTokenIdentity::ServiceAccount {
             claims,
             audiences,
-        }) => Ok(crate::api::response::K8sResponse::new(
+        }) => Ok(k8s_native_service::response::K8sResponse::new(
             authenticated_token_review(req_body, tokenreview_user_from_claims(&claims), audiences),
             &headers,
         )),
         Ok(klights_auth::authentication::ReviewedTokenIdentity::Other {
             identity,
             audiences,
-        }) => Ok(crate::api::response::K8sResponse::new(
+        }) => Ok(k8s_native_service::response::K8sResponse::new(
             authenticated_token_review(
                 req_body,
                 tokenreview_user_from_identity(&identity),
@@ -199,12 +199,12 @@ pub async fn create_token_review(
             &headers,
         )),
         Err(klights_auth::AuthenticationError::Unauthenticated { .. }) => {
-            Ok(crate::api::response::K8sResponse::new(
+            Ok(k8s_native_service::response::K8sResponse::new(
                 token_review_response(req_body, serde_json::json!({"authenticated": false})),
                 &headers,
             ))
         }
-        Err(error) => Ok(crate::api::response::K8sResponse::new(
+        Err(error) => Ok(k8s_native_service::response::K8sResponse::new(
             token_review_response(
                 req_body,
                 serde_json::json!({

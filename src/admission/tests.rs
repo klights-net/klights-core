@@ -1,5 +1,19 @@
-use super::*;
+use k8s_native_service::admission::request_context::{
+    is_admission_operation, parse_api_group_version,
+};
+use k8s_native_service::admission::selectors::{get_namespace_labels, matches_label_selector};
+use k8s_native_service::admission::webhook_response::{
+    apply_mutation, build_admission_review, ensure_webhook_allowed, is_admission_allowed,
+    webhook_denial_message, webhook_warnings,
+};
+use k8s_native_service::admission::webhook_rules::{
+    evaluate_match_conditions, matches_webhook_rules, should_call_webhook, should_reinvoke_webhook,
+    webhook_side_effects_allow_dry_run, webhook_timeout_seconds,
+};
+use k8s_native_service::admission::*;
+use serde_json::Value;
 use serde_json::json;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use crate::resource_admission_adapter::{
@@ -503,7 +517,7 @@ fn test_admission_webhook_objectselector_uses_cached_parse() {
     // the underlying webhook Value's objectSelector after caching MUST
     // NOT affect future calls — the cache is the source of truth, and a
     // stale cache reflects exactly the selector that was registered.
-    use crate::admission::webhook_rules::CachedWebhook;
+    use k8s_native_service::admission::webhook_rules::CachedWebhook;
 
     let mut webhook = json!({
         "name": "obj-selector.example.com",
@@ -530,7 +544,7 @@ fn test_admission_webhook_objectselector_uses_cached_parse() {
     let ctx = test_ctx("v1", "configmaps", "CREATE", Some("default"), None);
 
     assert!(
-        crate::admission::webhook_rules::should_call_cached_webhook(
+        k8s_native_service::admission::webhook_rules::should_call_cached_webhook(
             &cached,
             &ctx,
             &matching_resource,
@@ -539,7 +553,7 @@ fn test_admission_webhook_objectselector_uses_cached_parse() {
         .unwrap()
     );
     assert!(
-        !crate::admission::webhook_rules::should_call_cached_webhook(
+        !k8s_native_service::admission::webhook_rules::should_call_cached_webhook(
             &cached,
             &ctx,
             &non_matching_resource,
@@ -553,7 +567,7 @@ fn test_admission_webhook_objectselector_uses_cached_parse() {
     // The cached selector is unchanged, so the demo-labeled resource still matches
     // and the other-labeled one still doesn't.
     assert!(
-        crate::admission::webhook_rules::should_call_cached_webhook(
+        k8s_native_service::admission::webhook_rules::should_call_cached_webhook(
             &cached,
             &ctx,
             &matching_resource,
@@ -562,7 +576,7 @@ fn test_admission_webhook_objectselector_uses_cached_parse() {
         .unwrap()
     );
     assert!(
-        !crate::admission::webhook_rules::should_call_cached_webhook(
+        !k8s_native_service::admission::webhook_rules::should_call_cached_webhook(
             &cached,
             &ctx,
             &non_matching_resource,
@@ -574,7 +588,7 @@ fn test_admission_webhook_objectselector_uses_cached_parse() {
     // Re-cache after the mutation — now the OTHER label matches.
     let recached = CachedWebhook::from_value(webhook);
     assert!(
-        crate::admission::webhook_rules::should_call_cached_webhook(
+        k8s_native_service::admission::webhook_rules::should_call_cached_webhook(
             &recached,
             &ctx,
             &non_matching_resource,
@@ -586,7 +600,7 @@ fn test_admission_webhook_objectselector_uses_cached_parse() {
 
 #[test]
 fn test_admission_cached_webhook_objectselector_match_expressions() {
-    use crate::admission::webhook_rules::CachedWebhook;
+    use k8s_native_service::admission::webhook_rules::CachedWebhook;
 
     let webhook = json!({
         "name": "expr.example.com",
@@ -616,7 +630,7 @@ fn test_admission_cached_webhook_objectselector_match_expressions() {
         "metadata": {"name": "cm", "namespace": "default", "labels": {"tier": "data"}},
     });
     assert!(
-        crate::admission::webhook_rules::should_call_cached_webhook(
+        k8s_native_service::admission::webhook_rules::should_call_cached_webhook(
             &cached,
             &ctx,
             &fe_resource,
@@ -625,7 +639,7 @@ fn test_admission_cached_webhook_objectselector_match_expressions() {
         .unwrap()
     );
     assert!(
-        !crate::admission::webhook_rules::should_call_cached_webhook(
+        !k8s_native_service::admission::webhook_rules::should_call_cached_webhook(
             &cached,
             &ctx,
             &data_resource,

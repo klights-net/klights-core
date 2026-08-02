@@ -4,15 +4,13 @@
 //! current FlowSchema/PriorityLevelConfiguration resources on demand and
 //! maintains per-priority-level admission state.
 
-use crate::api::AppError;
-use crate::api::request_info::{ResolvedAuthz, resolve_request_info};
-#[cfg(test)]
-use crate::datastore::DatastoreBackend;
+use crate::AppError;
+use crate::policy_inputs::PriorityFairnessHttpInputs;
+use crate::request_info::{ResolvedAuthz, resolve_request_info};
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use k8s_native_service::policy_inputs::PriorityFairnessHttpInputs;
 use klights_auth::AuthenticatedIdentity;
 use klights_auth::request_attributes::AuthorizationRequest;
 use serde_json::Value;
@@ -43,7 +41,7 @@ pub enum ApfAdmission {
     Limited(PriorityLevelPermit),
 }
 
-pub(in crate::api) async fn admit_request(
+pub async fn admit_request(
     inputs: Arc<PriorityFairnessHttpInputs<ApiPriorityFairness>>,
     request: Request,
     next: Next,
@@ -95,7 +93,7 @@ impl ApiPriorityFairness {
             return Ok(ApfAdmission::Exempt);
         };
 
-        let priority_level = match crate::api::resource_query_ports::get_resource(
+        let priority_level = match crate::generic_read::get_resource(
             resource_query,
             FLOWCONTROL_API_VERSION,
             "PriorityLevelConfiguration",
@@ -143,7 +141,7 @@ impl ApiPriorityFairness {
         Arc::clone(state)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn try_acquire_limited_for_test(
         &self,
         priority_level: &str,
@@ -181,8 +179,8 @@ impl ApiPriorityFairness {
             .then(|| PriorityLevelPermit { state })
     }
 
-    #[cfg(test)]
-    pub(crate) fn occupy_limited_priority_level_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn occupy_limited_priority_level_for_test(
         &self,
         priority_level: &str,
         seats: usize,
@@ -209,8 +207,8 @@ impl ApiPriorityFairness {
         });
     }
 
-    #[cfg(test)]
-    pub(crate) fn queued_count_for_test(&self, priority_level: &str) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn queued_count_for_test(&self, priority_level: &str) -> usize {
         self.states
             .lock()
             .expect("APF priority-level state lock must not be poisoned")
@@ -218,8 +216,8 @@ impl ApiPriorityFairness {
             .map_or(0, |state| state.queued_count())
     }
 
-    #[cfg(test)]
-    pub(crate) fn executing_count_for_test(&self, priority_level: &str) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn executing_count_for_test(&self, priority_level: &str) -> usize {
         self.states
             .lock()
             .expect("APF priority-level state lock must not be poisoned")
@@ -395,7 +393,7 @@ impl PriorityLevelState {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn queued_count(&self) -> usize {
         self.inner
             .lock()
@@ -403,7 +401,7 @@ impl PriorityLevelState {
             .queued_count
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn executing_count(&self) -> usize {
         self.inner
             .lock()
@@ -730,7 +728,7 @@ async fn select_matching_flow_schema(
     identity: &AuthenticatedIdentity,
     request: &AuthorizationRequest,
 ) -> Option<Arc<Value>> {
-    let list = crate::api::resource_query_ports::list_all_resources(
+    let list = crate::generic_read::list_all_resources(
         resource_query,
         FLOWCONTROL_API_VERSION,
         "FlowSchema",
@@ -937,71 +935,102 @@ fn stable_hash(priority_level_name: &str, flow_schema_name: &str, flow_key: &str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::test_support;
     use klights_auth::request_attributes::AuthorizationRequest;
+    use klights_cluster_core::Resource;
+    use klights_leader_api::{
+        LeaderResourceQuery, ResourceGetRequest, ResourceListRequest, ResourceListResult,
+        ResourceQueryFuture,
+    };
 
-    async fn create_test_priority_level(
-        db: &dyn DatastoreBackend,
+    fn test_priority_level(
         name: &str,
         nominal_concurrency_shares: usize,
         limit_type: &str,
-    ) {
-        db.create_resource(
-            "flowcontrol.apiserver.k8s.io/v1",
-            "PriorityLevelConfiguration",
-            None,
-            name,
-            serde_json::json!({
-                "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
-                "kind": "PriorityLevelConfiguration",
-                "metadata": {"name": name},
-                "spec": {
-                    "type": "Limited",
-                    "limited": {
-                        "nominalConcurrencyShares": nominal_concurrency_shares,
-                        "limitResponse": {"type": limit_type}
-                    }
+    ) -> Resource {
+        Resource::try_from_data(Arc::new(serde_json::json!({
+            "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+            "kind": "PriorityLevelConfiguration",
+            "metadata": {"name": name},
+            "spec": {
+                "type": "Limited",
+                "limited": {
+                    "nominalConcurrencyShares": nominal_concurrency_shares,
+                    "limitResponse": {"type": limit_type}
                 }
-            }),
-        )
-        .await
-        .unwrap();
+            }
+        })))
+        .unwrap()
     }
 
-    async fn create_test_flowschema(
-        db: &dyn DatastoreBackend,
+    fn test_flowschema(
         name: &str,
         matching_precedence: i64,
         priority_level_name: &str,
         distinguisher_type: &str,
-    ) {
-        db.create_resource(
-            "flowcontrol.apiserver.k8s.io/v1",
-            "FlowSchema",
-            None,
-            name,
-            serde_json::json!({
-                "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
-                "kind": "FlowSchema",
-                "metadata": {"name": name},
-                "spec": {
-                    "matchingPrecedence": matching_precedence,
-                    "priorityLevelConfiguration": {"name": priority_level_name},
-                    "distinguisherMethod": {"type": distinguisher_type},
-                    "rules": [{
-                        "subjects": [{"kind": "User", "user": {"name": "*"}}],
-                        "resourceRules": [{
-                            "verbs": ["list"],
-                            "apiGroups": [""],
-                            "resources": ["namespaces"],
-                            "clusterScope": true
-                        }]
+    ) -> Resource {
+        Resource::try_from_data(Arc::new(serde_json::json!({
+            "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+            "kind": "FlowSchema",
+            "metadata": {"name": name},
+            "spec": {
+                "matchingPrecedence": matching_precedence,
+                "priorityLevelConfiguration": {"name": priority_level_name},
+                "distinguisherMethod": {"type": distinguisher_type},
+                "rules": [{
+                    "subjects": [{"kind": "User", "user": {"name": "*"}}],
+                    "resourceRules": [{
+                        "verbs": ["list"],
+                        "apiGroups": [""],
+                        "resources": ["namespaces"],
+                        "clusterScope": true
                     }]
-                }
-            }),
-        )
-        .await
-        .unwrap();
+                }]
+            }
+        })))
+        .unwrap()
+    }
+
+    struct FakeResourceQuery {
+        resources: Vec<Resource>,
+    }
+
+    impl LeaderResourceQuery for FakeResourceQuery {
+        fn get_resource(
+            &self,
+            request: ResourceGetRequest,
+        ) -> ResourceQueryFuture<'_, Option<Resource>> {
+            Box::pin(async move {
+                Ok(self
+                    .resources
+                    .iter()
+                    .find(|resource| {
+                        resource.api_version == request.key().api_version
+                            && resource.kind == request.key().kind
+                            && resource.namespace == request.key().namespace
+                            && resource.name == request.key().name
+                    })
+                    .cloned())
+            })
+        }
+
+        fn list_resources(
+            &self,
+            request: ResourceListRequest,
+        ) -> ResourceQueryFuture<'_, ResourceListResult> {
+            Box::pin(async move {
+                let items = self
+                    .resources
+                    .iter()
+                    .filter(|resource| {
+                        resource.api_version == request.api_version()
+                            && resource.kind == request.kind()
+                            && resource.namespace.as_deref() == request.namespace()
+                    })
+                    .cloned()
+                    .collect();
+                ResourceListResult::try_new(items, 0, None, None, None)
+            })
+        }
     }
 
     #[tokio::test]
@@ -1028,21 +1057,18 @@ mod tests {
 
     #[tokio::test]
     async fn flow_schema_matching_breaks_equal_precedence_by_name() {
-        let db = test_support::in_memory().await;
-
-        create_test_priority_level(&db, "pl-a", 1, "Reject").await;
-        create_test_priority_level(&db, "pl-b", 1, "Reject").await;
-        create_test_flowschema(&db, "b-schema", 10, "pl-b", "*").await;
-        create_test_flowschema(&db, "a-schema", 10, "pl-a", "*").await;
+        let resource_query = FakeResourceQuery {
+            resources: vec![
+                test_priority_level("pl-a", 1, "Reject"),
+                test_priority_level("pl-b", 1, "Reject"),
+                test_flowschema("b-schema", 10, "pl-b", "*"),
+                test_flowschema("a-schema", 10, "pl-a", "*"),
+            ],
+        };
 
         let identity = AuthenticatedIdentity::client_cert("alice".into(), vec![]);
         let request =
             AuthorizationRequest::resource("list", "", "v1", "namespaces", None, None, None);
-        let resource_query = crate::control_plane::client::local::LocalApiClient::new(
-            std::sync::Arc::new(db.clone()),
-            "test-node".to_string(),
-            crate::control_plane::client::local::always_leader_watch(),
-        );
         let selected = select_matching_flow_schema(&resource_query, &identity, &request)
             .await
             .expect("a matching FlowSchema must exist");

@@ -995,8 +995,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     node_policy_store,
                 ),
             ),
-            crate::audit::default_audit_sink(),
-            std::sync::Arc::new(crate::api::priority_fairness::ApiPriorityFairness::new()),
+            k8s_native_service::audit::default_audit_sink(),
+            std::sync::Arc::new(k8s_native_service::priority_fairness::ApiPriorityFairness::new()),
             rbac_policy_store,
             crate::api::ApiAuthenticators::new(
                 Arc::new(

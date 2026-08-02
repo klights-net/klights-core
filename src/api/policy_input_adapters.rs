@@ -145,7 +145,8 @@ pub(crate) fn authentication_http_inputs(state: &ApiState) -> AuthenticationHttp
     AuthenticationHttpInputs::new(policy, runtime)
 }
 
-pub(crate) type ApiAuthorizationHttpInputs = AuthorizationHttpInputs<dyn crate::audit::AuditSink>;
+pub(crate) type ApiAuthorizationHttpInputs =
+    AuthorizationHttpInputs<dyn k8s_native_service::audit::AuditSink>;
 
 pub(crate) fn authorization_http_inputs(state: &ApiState) -> ApiAuthorizationHttpInputs {
     AuthorizationHttpInputs::new(
@@ -156,7 +157,7 @@ pub(crate) fn authorization_http_inputs(state: &ApiState) -> ApiAuthorizationHtt
 }
 
 pub(crate) type ApiPriorityFairnessHttpInputs =
-    PriorityFairnessHttpInputs<crate::api::priority_fairness::ApiPriorityFairness>;
+    PriorityFairnessHttpInputs<k8s_native_service::priority_fairness::ApiPriorityFairness>;
 
 pub(crate) fn priority_fairness_http_inputs(state: &ApiState) -> ApiPriorityFairnessHttpInputs {
     PriorityFairnessHttpInputs::new(

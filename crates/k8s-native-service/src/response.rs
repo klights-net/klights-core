@@ -1,9 +1,11 @@
-use crate::api::AppError;
-use crate::api::watch_event::{EventType, WatchEvent};
+use crate::AppError;
+use crate::watch::{EventType, WatchEvent};
 use axum::{
     Json,
     body::Body,
-    http::HeaderMap,
+    extract::Request,
+    http::{HeaderMap, header},
+    middleware::Next,
     response::{IntoResponse, Response},
 };
 use serde_json::Value;
@@ -18,6 +20,58 @@ type UnaryResponseFormat = ResponseFormat;
 pub fn prefers_protobuf(headers: &HeaderMap) -> bool {
     negotiate_unary_response_format(headers, true)
         .is_ok_and(|format| format == UnaryResponseFormat::Protobuf)
+}
+
+/// Re-encode Kubernetes JSON error Status bodies as protobuf when requested.
+///
+/// This is the outermost native-service layer so it also covers 404/405
+/// fallbacks and authentication/authorization failures. Successful streaming
+/// responses are deliberately left untouched.
+pub async fn negotiate_error_protobuf(request: Request, next: Next) -> Response {
+    let wants_protobuf = prefers_protobuf(request.headers());
+    let response = next.run(request).await;
+    if !wants_protobuf {
+        return response;
+    }
+    let status = response.status();
+    if !(status.is_client_error() || status.is_server_error()) {
+        return response;
+    }
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| content_type.starts_with("application/json"));
+    if !is_json {
+        return response;
+    }
+
+    let (mut parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(_) => return (parts.status, "error reading response body").into_response(),
+    };
+    let value: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            parts.headers.remove(header::CONTENT_LENGTH);
+            return Response::from_parts(parts, Body::from(bytes));
+        }
+    };
+    match klights_kube_protobuf::encode_protobuf(&value) {
+        Ok(protobuf) => {
+            parts.headers.insert(
+                header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/vnd.kubernetes.protobuf"),
+            );
+            parts.headers.remove(header::CONTENT_LENGTH);
+            Response::from_parts(parts, Body::from(protobuf))
+        }
+        Err(_) => {
+            parts.headers.remove(header::CONTENT_LENGTH);
+            Response::from_parts(parts, Body::from(bytes))
+        }
+    }
 }
 
 fn protobuf_supported_for_value(value: &Value) -> bool {
@@ -908,21 +962,6 @@ pub fn generic_list_to_table_at(
 #[cfg(test)]
 fn test_wall_clock_now() -> time::OffsetDateTime {
     time::OffsetDateTime::now_utc()
-}
-
-#[cfg(test)]
-pub fn pod_list_to_table(items: Vec<Value>, resource_version: String) -> Value {
-    pod_list_to_table_at(items, resource_version, test_wall_clock_now())
-}
-
-#[cfg(test)]
-pub fn node_list_to_table(items: Vec<Value>, resource_version: String) -> Value {
-    node_list_to_table_at(items, resource_version, test_wall_clock_now())
-}
-
-#[cfg(test)]
-pub fn watch_event_to_table(event: WatchEvent, kind: &str) -> WatchEvent {
-    watch_event_to_table_at(event, kind, test_wall_clock_now())
 }
 
 #[cfg(test)]

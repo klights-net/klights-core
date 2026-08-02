@@ -90,7 +90,7 @@ impl NativeApiOuterLayers {
                 middleware::from_fn(move |request: Request, next: Next| {
                     let authentication_inputs = authentication_inputs.clone();
                     async move {
-                        crate::api::auth_middleware::authenticate_request(
+                        k8s_native_service::auth_http::authenticate_request(
                             authentication_inputs,
                             request,
                             next,
@@ -104,7 +104,9 @@ impl NativeApiOuterLayers {
             }))
             // Outermost: content-negotiate error Status bodies to protobuf.
             // This also wraps a fail-closed 503 from the authority shell.
-            .layer(middleware::from_fn(negotiate_error_protobuf))
+            .layer(middleware::from_fn(
+                k8s_native_service::response::negotiate_error_protobuf,
+            ))
     }
 }
 
@@ -462,7 +464,7 @@ pub(in crate::api) fn build_router_parts(state: ApiState) -> (Router, NativeApiO
             middleware::from_fn(move |request: Request, next: Next| {
                 let authorization_inputs = authorization_inputs.clone();
                 async move {
-                    crate::api::auth_middleware::authorize_request(
+                    k8s_native_service::auth_http::authorize_request(
                         authorization_inputs,
                         request,
                         next,
@@ -476,7 +478,7 @@ pub(in crate::api) fn build_router_parts(state: ApiState) -> (Router, NativeApiO
             middleware::from_fn(move |request: Request, next: Next| {
                 let priority_fairness_inputs = priority_fairness_inputs.clone();
                 async move {
-                    crate::api::priority_fairness::admit_request(
+                    k8s_native_service::priority_fairness::admit_request(
                         priority_fairness_inputs,
                         request,
                         next,
@@ -505,61 +507,6 @@ pub(in crate::api) fn build_router_inner(state: ApiState) -> Router {
 #[cfg(test)]
 pub(crate) fn build_router(state: ApiState) -> Router {
     build_router_inner(state)
-}
-
-/// Content-negotiate error responses: a JSON `metav1.Status` produced for a
-/// 4xx/5xx is re-encoded to `application/vnd.kubernetes.protobuf` when the
-/// client's `Accept` asked for protobuf. `AppError::into_response` cannot see
-/// the request headers, so negotiation happens here, in the outermost layer
-/// (covering the 404/405 fallbacks too). Success responses negotiate at their
-/// handler via `K8sResponse`; streaming 2xx (watch) are never touched.
-async fn negotiate_error_protobuf(request: Request, next: Next) -> Response {
-    let wants_protobuf = crate::api::response::prefers_protobuf(request.headers());
-    let response = next.run(request).await;
-    if !wants_protobuf {
-        return response;
-    }
-    let status = response.status();
-    if !(status.is_client_error() || status.is_server_error()) {
-        return response;
-    }
-    let is_json = response
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.starts_with("application/json"));
-    if !is_json {
-        return response;
-    }
-
-    // Buffer the (small) error body and try to re-encode it as a protobuf
-    // Status. On any failure, fall back to the original JSON bytes.
-    let (mut parts, body) = response.into_parts();
-    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(b) => b,
-        Err(_) => return (parts.status, "error reading response body").into_response(),
-    };
-    let value: Value = match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
-        Err(_) => {
-            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-            return Response::from_parts(parts, axum::body::Body::from(bytes));
-        }
-    };
-    match klights_kube_protobuf::encode_protobuf(&value) {
-        Ok(pb) => {
-            parts.headers.insert(
-                axum::http::header::CONTENT_TYPE,
-                "application/vnd.kubernetes.protobuf".parse().unwrap(),
-            );
-            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-            Response::from_parts(parts, axum::body::Body::from(pb))
-        }
-        Err(_) => {
-            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-            Response::from_parts(parts, axum::body::Body::from(bytes))
-        }
-    }
 }
 
 /// 404 for any path the router does not recognise, shaped as a metav1.Status.
@@ -904,33 +851,59 @@ mod status_tests {
 
     #[tokio::test]
     async fn error_response_negotiates_protobuf() {
+        use prost::Message as _;
+
         let state = crate::api::test_support::build_test_app_state().await;
         let app = crate::api::build_router(state);
 
-        // 404 with Accept: protobuf must return a protobuf-encoded Status.
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/no/such/path")
-                    .header("accept", "application/vnd.kubernetes.protobuf")
-                    .body(Body::empty())
-                    .unwrap(),
+        for (method, uri, expected_status, expected_reason, expected_code) in [
+            (
+                "GET",
+                "/no/such/path",
+                axum::http::StatusCode::NOT_FOUND,
+                "NotFound",
+                404,
+            ),
+            (
+                "POST",
+                "/api/v1",
+                axum::http::StatusCode::METHOD_NOT_ALLOWED,
+                "MethodNotAllowed",
+                405,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("accept", "application/vnd.kubernetes.protobuf")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok()),
+                Some("application/vnd.kubernetes.protobuf"),
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..4], b"k8s\0");
+            let envelope = klights_kube_protobuf::Unknown::decode(&body[4..]).unwrap();
+            let status = klights_kube_protobuf::apimachinery::pkg::apis::meta::v1::Status::decode(
+                &*envelope.raw,
             )
-            .await
             .unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
-        assert_eq!(
-            response
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok()),
-            Some("application/vnd.kubernetes.protobuf"),
-        );
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        // K8s protobuf wire format: "k8s\0" magic prefix.
-        assert_eq!(&body[..4], &[0x6b, 0x38, 0x73, 0x00]);
+            assert_eq!(status.reason.as_deref(), Some(expected_reason));
+            assert_eq!(status.code, Some(expected_code));
+        }
     }
 
     #[tokio::test]
@@ -950,7 +923,9 @@ mod status_tests {
                     Err::<(), crate::api::AppError>(crate::api::AppError::from(error))
                 }),
             )
-            .layer(middleware::from_fn(super::negotiate_error_protobuf));
+            .layer(middleware::from_fn(
+                k8s_native_service::response::negotiate_error_protobuf,
+            ));
 
         for (accept, expect_protobuf) in [
             ("application/json", false),

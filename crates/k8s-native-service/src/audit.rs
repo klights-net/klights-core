@@ -136,20 +136,20 @@ impl AuditSink for TracingAuditSink {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub struct MemoryAuditSink {
     events: std::sync::Mutex<Vec<AuditEvent>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl MemoryAuditSink {
     pub fn events(&self) -> Vec<AuditEvent> {
         self.events.lock().expect("audit events lock").clone()
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl AuditSink for MemoryAuditSink {
     fn record(&self, event: AuditEvent) {
         self.events.lock().expect("audit events lock").push(event);

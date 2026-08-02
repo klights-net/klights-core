@@ -2,7 +2,7 @@ use crate::admission::request_context::AdmissionRequestContext;
 use anyhow::Result;
 use serde_json::Value;
 
-pub(super) fn build_admission_review(context: &AdmissionRequestContext, object: &Value) -> Value {
+pub fn build_admission_review(context: &AdmissionRequestContext, object: &Value) -> Value {
     let mut request = serde_json::json!({
         "uid": uuid::Uuid::new_v4().to_string(),
         "kind": {
@@ -46,7 +46,7 @@ pub(super) fn build_admission_review(context: &AdmissionRequestContext, object: 
     })
 }
 
-pub(super) fn apply_mutation(resource: Value, response: Value) -> Result<Value> {
+pub fn apply_mutation(resource: Value, response: Value) -> Result<Value> {
     let patch = response
         .get("response")
         .and_then(|r| r.get("patch"))
@@ -73,7 +73,7 @@ pub(super) fn apply_mutation(resource: Value, response: Value) -> Result<Value> 
     }
 }
 
-pub(super) fn is_admission_allowed(response: &Value) -> bool {
+pub fn is_admission_allowed(response: &Value) -> bool {
     response
         .get("response")
         .and_then(|r| r.get("allowed"))
@@ -81,7 +81,7 @@ pub(super) fn is_admission_allowed(response: &Value) -> bool {
         .unwrap_or(true)
 }
 
-pub(super) fn webhook_denial_message(response: &Value) -> String {
+pub fn webhook_denial_message(response: &Value) -> String {
     fn clean_text(value: Option<&str>) -> Option<String> {
         let v = value?.trim();
         if v.is_empty() {
@@ -140,7 +140,7 @@ pub(super) fn webhook_denial_message(response: &Value) -> String {
         .unwrap_or_else(|| "webhook denied request".to_string())
 }
 
-pub(super) fn webhook_warnings(response: &Value) -> Vec<String> {
+pub fn webhook_warnings(response: &Value) -> Vec<String> {
     response
         .get("response")
         .and_then(|r| r.get("warnings"))
@@ -153,7 +153,7 @@ pub(super) fn webhook_warnings(response: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub(super) fn ensure_webhook_allowed(response: &Value) -> Result<()> {
+pub fn ensure_webhook_allowed(response: &Value) -> Result<()> {
     if !is_admission_allowed(response) {
         anyhow::bail!(
             "Admission denied by webhook: {}",

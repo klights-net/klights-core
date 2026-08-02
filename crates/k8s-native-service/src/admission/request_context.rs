@@ -49,11 +49,11 @@ impl AdmissionRequestContext {
     }
 }
 
-pub(super) fn is_admission_operation(operation: &str) -> bool {
+pub fn is_admission_operation(operation: &str) -> bool {
     matches!(operation, "CREATE" | "UPDATE" | "DELETE" | "CONNECT")
 }
 
-pub(super) fn is_webhook_configuration_resource(context: &AdmissionRequestContext) -> bool {
+pub fn is_webhook_configuration_resource(context: &AdmissionRequestContext) -> bool {
     context.api_group == "admissionregistration.k8s.io"
         && matches!(
             context.resource.as_str(),
@@ -61,7 +61,7 @@ pub(super) fn is_webhook_configuration_resource(context: &AdmissionRequestContex
         )
 }
 
-pub(super) fn parse_api_group_version(api_version: &str) -> (String, String) {
+pub fn parse_api_group_version(api_version: &str) -> (String, String) {
     if let Some((group, version)) = api_version.split_once('/') {
         (group.to_string(), version.to_string())
     } else {

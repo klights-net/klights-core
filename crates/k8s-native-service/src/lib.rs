@@ -4,18 +4,23 @@
 //! Kubernetes error/status adaptation. Route families and handlers migrate in
 //! their later packets.
 
+pub mod admission;
+pub mod audit;
+pub mod auth_http;
 pub mod discovery;
 mod error;
 mod extractor;
 pub mod generic_command;
 pub mod generic_read;
 pub mod policy_inputs;
+pub mod priority_fairness;
+pub mod request_info;
 mod resource_projection;
+pub mod response;
 mod router;
 mod state;
 pub mod status;
 pub mod subresources;
-mod unary_response;
 pub mod watch;
 
 pub use discovery::{
@@ -27,6 +32,6 @@ pub use error::{
 };
 pub use extractor::LenientJson;
 pub use resource_projection::inject_resource_version;
+pub use response::K8sResponse;
 pub use router::CurrentRouter;
 pub use state::ApiState;
-pub use unary_response::K8sResponse;

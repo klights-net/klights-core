@@ -1053,7 +1053,7 @@ pub fn prepare_admissionregistration_resource(
 ) -> Result<(), AppError> {
     validate_admissionregistration_resource(kind, body)?;
     if kind == "ValidatingAdmissionPolicy" {
-        crate::admission::apply_validating_admission_policy_typechecking_status(body);
+        k8s_native_service::admission::apply_validating_admission_policy_typechecking_status(body);
     }
     Ok(())
 }
@@ -1063,10 +1063,12 @@ pub fn validate_admissionregistration_resource(kind: &str, body: &Value) -> Resu
         "MutatingWebhookConfiguration" | "ValidatingWebhookConfiguration" => {
             validate_webhook_configuration(body)
         }
-        "ValidatingAdmissionPolicy" => crate::admission::validate_validating_admission_policy(body)
-            .map_err(AppError::UnprocessableEntity),
+        "ValidatingAdmissionPolicy" => {
+            { k8s_native_service::admission::validate_validating_admission_policy(body) }
+                .map_err(AppError::UnprocessableEntity)
+        }
         "ValidatingAdmissionPolicyBinding" => {
-            crate::admission::validate_validating_admission_policy_binding(body)
+            k8s_native_service::admission::validate_validating_admission_policy_binding(body)
                 .map_err(AppError::UnprocessableEntity)
         }
         _ => Ok(()),
@@ -1530,7 +1532,7 @@ pub struct AdmissionContextRequest<'a> {
 
 pub fn build_admission_context(
     request: AdmissionContextRequest<'_>,
-) -> crate::admission::AdmissionRequestContext {
+) -> k8s_native_service::admission::AdmissionRequestContext {
     let AdmissionContextRequest {
         api_version,
         kind,
@@ -1544,7 +1546,7 @@ pub fn build_admission_context(
         options,
     } = request;
 
-    let mut ctx = crate::admission::AdmissionRequestContext::from_legacy(
+    let mut ctx = k8s_native_service::admission::AdmissionRequestContext::from_legacy(
         &object,
         api_version,
         kind,
@@ -1575,7 +1577,7 @@ pub fn build_admission_context(
 
 pub(crate) async fn run_admission_for_request(
     admission: &(impl k8s_native_service::generic_command::ResourceAdmissionPort + ?Sized),
-    ctx: crate::admission::AdmissionRequestContext,
+    ctx: k8s_native_service::admission::AdmissionRequestContext,
 ) -> Result<Value, AppError> {
     admission
         .admit(

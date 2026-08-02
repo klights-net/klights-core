@@ -1,11 +1,11 @@
 use super::AdmissionQuery;
 use serde_json::Value;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::BTreeMap;
 
 /// Fetch namespace labels from DB for namespaceSelector matching.
-#[cfg(test)]
-pub(super) async fn get_namespace_labels(
+#[cfg(any(test, feature = "test-support"))]
+pub async fn get_namespace_labels(
     lookup: &dyn AdmissionQuery,
     namespace: &str,
 ) -> BTreeMap<String, String> {
@@ -31,7 +31,7 @@ pub(super) async fn get_namespace_labels(
 /// Fetch namespace labels in their native `serde_json::Map<String, Value>`
 /// shape so the cached `LabelSelector` can match against them without an
 /// intermediate BTreeMap rebuild on every webhook evaluation.
-pub(super) async fn get_namespace_labels_value(
+pub async fn get_namespace_labels_value(
     lookup: &dyn AdmissionQuery,
     namespace: &str,
 ) -> Option<serde_json::Map<String, Value>> {
@@ -54,8 +54,8 @@ pub(super) async fn get_namespace_labels_value(
 ///
 /// Test-only — production code uses `LabelSelector::from_k8s_selector`
 /// via `CachedWebhook` for the per-call admission path.
-#[cfg(test)]
-pub(super) fn matches_label_selector(selector: &Value, labels: &BTreeMap<String, String>) -> bool {
+#[cfg(any(test, feature = "test-support"))]
+pub fn matches_label_selector(selector: &Value, labels: &BTreeMap<String, String>) -> bool {
     if let Some(match_labels) = selector.get("matchLabels").and_then(|m| m.as_object()) {
         for (key, val) in match_labels {
             if labels.get(key).map(|s| s.as_str()) != val.as_str() {

@@ -8,11 +8,11 @@ use klights_cluster_core::Resource;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::admission::{
+use crate::datastore::{DatastoreHandle, ResourceListQuery};
+use k8s_native_service::admission::{
     AdmissionDependencyError, AdmissionEngine, AdmissionQuery, AdmissionResource,
     AdmissionWebhookClient, AdmissionWebhookRequest, WebhookTarget, WebhookTargetResolver,
 };
-use crate::datastore::{DatastoreHandle, ResourceListQuery};
 use klights_networking::service_routing::{Protocol, ServiceSpec};
 
 const CA_BUNDLE_CLIENT_CACHE_CAPACITY: usize = 32;
@@ -271,11 +271,13 @@ impl AdmissionWebhookClient for RootAdmissionWebhookClient {
             .send()
             .await
             .map_err(|error| {
-                AdmissionDependencyError::new(crate::admission::format_webhook_call_error(
-                    &url,
-                    &error.to_string(),
-                    error.is_timeout(),
-                ))
+                AdmissionDependencyError::new(
+                    k8s_native_service::admission::format_webhook_call_error(
+                        &url,
+                        &error.to_string(),
+                        error.is_timeout(),
+                    ),
+                )
             })?;
         if !response.status().is_success() {
             return Err(AdmissionDependencyError::new(format!(
@@ -451,7 +453,7 @@ impl ResourceAdmissionAdapter {
 impl ResourceAdmissionAdapter {
     fn execute_admission<'a>(
         &'a self,
-        mut context: crate::admission::AdmissionRequestContext,
+        mut context: k8s_native_service::admission::AdmissionRequestContext,
     ) -> k8s_native_service::generic_command::GenericCommandFuture<'a, Value> {
         Box::pin(async move {
             let engine = AdmissionEngine::new(

@@ -200,7 +200,7 @@ impl k8s_native_service::generic_read::GenericReadResourceInputs for ApiResource
                 .and_then(|resource_version| resource_version.parse::<i64>().ok())
                 .unwrap_or(0);
             let send_bookmarks = query.allow_watch_bookmarks.as_deref() == Some("true");
-            let table_format = crate::api::response::wants_table_format(&request.headers)?;
+            let table_format = k8s_native_service::response::wants_table_format(&request.headers)?;
             let protobuf_supported = crate::api::watch_stream::protobuf_watch_supported_for_request(
                 request.api_version,
                 request.kind,
@@ -253,34 +253,34 @@ impl k8s_native_service::generic_read::GenericReadResourceInputs for ApiResource
                 "operation time is outside the supported timestamp range: {error}"
             ))
         })?;
-        if crate::api::response::wants_table_format(&response.headers)? {
+        if k8s_native_service::response::wants_table_format(&response.headers)? {
             let table = match response.kind {
-                "Pod" => crate::api::response::pod_list_to_table_at(
+                "Pod" => k8s_native_service::response::pod_list_to_table_at(
                     response.items,
                     resource_version,
                     operation_now,
                 ),
-                "Node" => crate::api::response::node_list_to_table_at(
+                "Node" => k8s_native_service::response::node_list_to_table_at(
                     response.items,
                     resource_version,
                     operation_now,
                 ),
-                "ReplicaSet" => crate::api::response::replicaset_list_to_table_at(
+                "ReplicaSet" => k8s_native_service::response::replicaset_list_to_table_at(
                     response.items,
                     resource_version,
                     operation_now,
                 ),
-                "Deployment" => crate::api::response::deployment_list_to_table_at(
+                "Deployment" => k8s_native_service::response::deployment_list_to_table_at(
                     response.items,
                     resource_version,
                     operation_now,
                 ),
-                "StatefulSet" => crate::api::response::statefulset_list_to_table_at(
+                "StatefulSet" => k8s_native_service::response::statefulset_list_to_table_at(
                     response.items,
                     resource_version,
                     operation_now,
                 ),
-                _ => crate::api::response::generic_list_to_table_at(
+                _ => k8s_native_service::response::generic_list_to_table_at(
                     response.kind,
                     response.items,
                     resource_version,
@@ -343,8 +343,9 @@ impl ApiAuthenticators {
 #[derive(Clone)]
 pub(crate) struct ApiAuthPolicy {
     pub(crate) authorizer: Arc<dyn klights_auth::authorizer::Authorizer>,
-    pub(crate) audit_sink: Arc<dyn crate::audit::AuditSink>,
-    pub(crate) api_priority_fairness: Arc<crate::api::priority_fairness::ApiPriorityFairness>,
+    pub(crate) audit_sink: Arc<dyn k8s_native_service::audit::AuditSink>,
+    pub(crate) api_priority_fairness:
+        Arc<k8s_native_service::priority_fairness::ApiPriorityFairness>,
     pub(crate) rbac_policy_store: Arc<dyn klights_auth::rbac_policy_store::RbacPolicyStore>,
     pub(crate) bootstrap_token_authenticator:
         Arc<dyn klights_leader_api::LeaderBootstrapTokenAuthentication>,
@@ -357,8 +358,8 @@ pub(crate) struct ApiAuthPolicy {
 impl ApiAuthPolicy {
     pub(crate) fn new(
         authorizer: Arc<dyn klights_auth::authorizer::Authorizer>,
-        audit_sink: Arc<dyn crate::audit::AuditSink>,
-        api_priority_fairness: Arc<crate::api::priority_fairness::ApiPriorityFairness>,
+        audit_sink: Arc<dyn k8s_native_service::audit::AuditSink>,
+        api_priority_fairness: Arc<k8s_native_service::priority_fairness::ApiPriorityFairness>,
         rbac_policy_store: Arc<dyn klights_auth::rbac_policy_store::RbacPolicyStore>,
         authenticators: ApiAuthenticators,
         cluster_ca_pem: Option<Arc<String>>,
@@ -875,8 +876,8 @@ pub(crate) fn build_router_from_root(
     let state = ApiState::new(
         ApiAuthPolicy::new(
             authorizer,
-            crate::audit::default_audit_sink(),
-            Arc::new(crate::api::priority_fairness::ApiPriorityFairness::new()),
+            k8s_native_service::audit::default_audit_sink(),
+            Arc::new(k8s_native_service::priority_fairness::ApiPriorityFairness::new()),
             rbac_policy_store,
             ApiAuthenticators::new(bootstrap_token, oidc, webhook),
             cluster_ca_pem,

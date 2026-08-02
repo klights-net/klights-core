@@ -16,7 +16,6 @@
 pub mod macros;
 
 pub mod apiservice_proxy;
-pub(crate) mod auth_middleware;
 pub(crate) mod backend_proxy_headers;
 mod crd_conversion;
 pub(crate) mod custom_resource_ports;
@@ -45,13 +44,12 @@ pub(crate) mod pod_repository_ports;
 mod pod_security;
 pub mod pod_subresources;
 mod policy_input_adapters;
-pub mod priority_fairness;
+#[cfg(test)]
+mod policy_pipeline_integration_tests;
 pub(crate) mod query;
 mod quotas;
 mod rbac_admission;
-pub(crate) mod request_info;
 pub(crate) mod resource_query_ports;
-mod response;
 #[cfg(test)]
 mod response_tests;
 mod routes;
@@ -165,19 +163,47 @@ pub use query::{
 use query::{CreateUpdateQuery, DeleteCollectionQuery, ListQuery, process_continue_token_at};
 // Used only by mod_tests; the production list handlers now go through
 // `query::resolve_list_page`, which calls this internally.
+pub use k8s_native_service::response::K8sResponse;
+#[cfg(test)]
+pub use k8s_native_service::response::prefers_protobuf;
+pub(crate) use k8s_native_service::response::watch_event_to_table_at;
 #[cfg(test)]
 use query::resolve_list_response_resource_version;
 pub use quotas::{
     check_resource_quota_for_creation, check_resource_quota_for_pod_update,
     check_resource_quota_for_pvc_update,
 };
-pub use response::K8sResponse;
 #[cfg(test)]
-pub use response::prefers_protobuf;
-pub(crate) use response::watch_event_to_table_at;
+fn test_wall_clock_now() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc()
+}
 #[cfg(test)]
-use response::{node_list_to_table, pod_list_to_table, watch_event_to_table};
-use response::{pod_list_to_table_at, wants_table_format};
+fn pod_list_to_table(items: Vec<serde_json::Value>, resource_version: String) -> serde_json::Value {
+    k8s_native_service::response::pod_list_to_table_at(
+        items,
+        resource_version,
+        test_wall_clock_now(),
+    )
+}
+#[cfg(test)]
+fn node_list_to_table(
+    items: Vec<serde_json::Value>,
+    resource_version: String,
+) -> serde_json::Value {
+    k8s_native_service::response::node_list_to_table_at(
+        items,
+        resource_version,
+        test_wall_clock_now(),
+    )
+}
+#[cfg(test)]
+fn watch_event_to_table(
+    event: k8s_native_service::watch::WatchEvent,
+    kind: &str,
+) -> k8s_native_service::watch::WatchEvent {
+    k8s_native_service::response::watch_event_to_table_at(event, kind, test_wall_clock_now())
+}
+use k8s_native_service::response::{pod_list_to_table_at, wants_table_format};
 #[cfg(test)]
 pub(crate) use routes::build_router;
 #[cfg(test)]

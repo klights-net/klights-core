@@ -11,7 +11,7 @@ use std::sync::Arc;
 /// `Arc<Value>` for the raw payload keeps this type cheap to clone for
 /// reinvocation queues; the selectors are tiny and so are stored owned.
 #[derive(Clone, Debug)]
-pub(super) struct CachedWebhook {
+pub struct CachedWebhook {
     pub raw: Arc<Value>,
     object_selector: SelectorCache,
     namespace_selector: SelectorCache,
@@ -43,7 +43,7 @@ impl SelectorCache {
 }
 
 impl CachedWebhook {
-    pub(super) fn from_value(webhook: Value) -> Self {
+    pub fn from_value(webhook: Value) -> Self {
         let object_selector = SelectorCache::from_optional_selector(webhook_selector_value(
             &webhook,
             "objectSelector",
@@ -61,7 +61,7 @@ impl CachedWebhook {
         }
     }
 
-    pub(super) fn raw(&self) -> &Value {
+    pub fn raw(&self) -> &Value {
         &self.raw
     }
 }
@@ -74,14 +74,14 @@ fn webhook_selector_value<'a>(
     webhook.get(camel_case).or_else(|| webhook.get(snake_case))
 }
 
-pub(super) fn should_reinvoke_webhook(
+pub fn should_reinvoke_webhook(
     mutation_happened_after: bool,
     reinvocation_policy: Option<&str>,
 ) -> bool {
     mutation_happened_after && reinvocation_policy == Some("IfNeeded")
 }
 
-pub(super) fn webhook_key(configuration_name: Option<&str>, webhook: &Value) -> String {
+pub fn webhook_key(configuration_name: Option<&str>, webhook: &Value) -> String {
     format!(
         "{}/{}",
         configuration_name.unwrap_or(""),
@@ -99,7 +99,7 @@ pub(super) fn webhook_key(configuration_name: Option<&str>, webhook: &Value) -> 
 ///
 /// `ns_labels` is the namespace's labels JSON map (borrowed straight
 /// from the namespace resource), built once per request by the caller.
-pub(super) fn should_call_cached_webhook(
+pub fn should_call_cached_webhook(
     webhook: &CachedWebhook,
     context: &AdmissionRequestContext,
     resource: &Value,
@@ -152,8 +152,8 @@ pub(super) fn should_call_cached_webhook(
 /// tests that haven't migrated to `CachedWebhook` yet. Constructs the
 /// cache on the fly — fine for one-off test calls but the per-request
 /// admission loop should call `should_call_cached_webhook` directly.
-#[cfg(test)]
-pub(super) fn should_call_webhook(
+#[cfg(any(test, feature = "test-support"))]
+pub fn should_call_webhook(
     webhook: &Value,
     context: &AdmissionRequestContext,
     resource: &Value,
@@ -168,7 +168,7 @@ pub(super) fn should_call_webhook(
     should_call_cached_webhook(&cached, context, resource, ns_labels_value.as_ref())
 }
 
-pub(super) fn webhook_match_conditions(webhook: &Value) -> Option<&Vec<Value>> {
+pub fn webhook_match_conditions(webhook: &Value) -> Option<&Vec<Value>> {
     webhook
         .get("matchConditions")
         .or_else(|| webhook.get("match_conditions"))
@@ -176,7 +176,7 @@ pub(super) fn webhook_match_conditions(webhook: &Value) -> Option<&Vec<Value>> {
 }
 
 /// Check if webhook rules match this request context.
-pub(super) fn matches_webhook_rules(webhook: &Value, context: &AdmissionRequestContext) -> bool {
+pub fn matches_webhook_rules(webhook: &Value, context: &AdmissionRequestContext) -> bool {
     let rules = match webhook.get("rules").and_then(|r| r.as_array()) {
         Some(r) => r,
         None => return false,
@@ -250,7 +250,7 @@ pub(super) fn matches_webhook_rules(webhook: &Value, context: &AdmissionRequestC
     false
 }
 
-pub(super) fn resource_rule_matches(
+pub fn resource_rule_matches(
     rule_resource: &str,
     resource: &str,
     subresource: Option<&str>,
@@ -271,7 +271,7 @@ pub(super) fn resource_rule_matches(
     rule_resource == resource
 }
 
-pub(super) fn webhook_timeout_seconds(webhook: &Value) -> u64 {
+pub fn webhook_timeout_seconds(webhook: &Value) -> u64 {
     let raw = webhook
         .get("timeoutSeconds")
         .and_then(|t| t.as_u64())
@@ -282,14 +282,14 @@ pub(super) fn webhook_timeout_seconds(webhook: &Value) -> u64 {
     raw.clamp(1, 30)
 }
 
-pub(super) fn webhook_side_effects_allow_dry_run(webhook: &Value) -> bool {
+pub fn webhook_side_effects_allow_dry_run(webhook: &Value) -> bool {
     matches!(
         webhook.get("sideEffects").and_then(|s| s.as_str()),
         Some("None") | Some("NoneOnDryRun")
     )
 }
 
-pub(super) fn evaluate_match_conditions(
+pub fn evaluate_match_conditions(
     conditions: &[Value],
     context: &AdmissionRequestContext,
     resource: &Value,
@@ -325,7 +325,7 @@ pub(super) fn evaluate_match_conditions(
     );
 }
 
-pub(super) fn evaluate_match_condition_expression(
+pub fn evaluate_match_condition_expression(
     expression: &str,
     context: &AdmissionRequestContext,
     resource: &Value,
@@ -362,7 +362,7 @@ pub(super) fn evaluate_match_condition_expression(
     }
 }
 
-pub(super) fn should_track_reinvocable_webhook(
+pub fn should_track_reinvocable_webhook(
     mutation_happened_after: bool,
     reinvocation_policy: Option<&str>,
 ) -> bool {

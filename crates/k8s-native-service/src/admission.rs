@@ -1,16 +1,26 @@
+#[cfg(not(any(test, feature = "test-support")))]
 mod request_context;
+#[cfg(any(test, feature = "test-support"))]
+pub mod request_context;
+#[cfg(not(any(test, feature = "test-support")))]
 mod selectors;
+#[cfg(any(test, feature = "test-support"))]
+pub mod selectors;
 mod validating_policy;
 mod webhook_call;
+#[cfg(not(any(test, feature = "test-support")))]
 mod webhook_response;
+#[cfg(any(test, feature = "test-support"))]
+pub mod webhook_response;
+#[cfg(not(any(test, feature = "test-support")))]
 mod webhook_rules;
+#[cfg(any(test, feature = "test-support"))]
+pub mod webhook_rules;
 
 use anyhow::Result;
 pub use request_context::AdmissionRequestContext;
 use request_context::{is_admission_operation, is_webhook_configuration_resource};
 use selectors::get_namespace_labels_value;
-#[cfg(test)]
-use selectors::{get_namespace_labels, matches_label_selector};
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -20,35 +30,28 @@ pub use validating_policy::{
     validate_validating_admission_policy_binding,
 };
 use webhook_call::call_webhook;
-pub(crate) use webhook_call::format_webhook_call_error;
+pub use webhook_call::format_webhook_call_error;
 use webhook_response::{
     apply_mutation, build_admission_review, ensure_webhook_allowed, webhook_warnings,
 };
-#[cfg(test)]
-use webhook_response::{is_admission_allowed, webhook_denial_message};
 use webhook_rules::{
     CachedWebhook, should_call_cached_webhook, should_track_reinvocable_webhook, webhook_key,
     webhook_timeout_seconds,
 };
-#[cfg(test)]
-use webhook_rules::{
-    evaluate_match_conditions, matches_webhook_rules, should_call_webhook, should_reinvoke_webhook,
-    webhook_side_effects_allow_dry_run,
-};
 
 #[derive(Clone, Debug)]
-pub(crate) struct AdmissionResource {
-    pub(crate) name: String,
-    pub(crate) data: Arc<Value>,
+pub struct AdmissionResource {
+    pub name: String,
+    pub data: Arc<Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AdmissionDependencyError {
+pub struct AdmissionDependencyError {
     message: String,
 }
 
 impl AdmissionDependencyError {
-    pub(crate) fn new(message: impl Into<String>) -> Self {
+    pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -64,22 +67,22 @@ impl std::fmt::Display for AdmissionDependencyError {
 impl std::error::Error for AdmissionDependencyError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct WebhookTarget {
-    pub(crate) base_url: String,
-    pub(crate) dns_override: Option<(String, SocketAddr)>,
+pub struct WebhookTarget {
+    pub base_url: String,
+    pub dns_override: Option<(String, SocketAddr)>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct AdmissionWebhookRequest {
-    pub(crate) target: WebhookTarget,
-    pub(crate) client_config: Arc<Value>,
-    pub(crate) admission_review: Value,
-    pub(crate) timeout_seconds: u64,
+pub struct AdmissionWebhookRequest {
+    pub target: WebhookTarget,
+    pub client_config: Arc<Value>,
+    pub admission_review: Value,
+    pub timeout_seconds: u64,
 }
 
 /// Admission-policy reads. Concrete datastore adaptation belongs to root.
 #[async_trait::async_trait]
-pub(crate) trait AdmissionQuery: Send + Sync {
+pub trait AdmissionQuery: Send + Sync {
     async fn get_resource(
         &self,
         api_version: &str,
@@ -98,7 +101,7 @@ pub(crate) trait AdmissionQuery: Send + Sync {
 }
 
 #[async_trait::async_trait]
-pub(crate) trait WebhookTargetResolver: Send + Sync {
+pub trait WebhookTargetResolver: Send + Sync {
     async fn resolve(
         &self,
         client_config: &Value,
@@ -106,7 +109,7 @@ pub(crate) trait WebhookTargetResolver: Send + Sync {
 }
 
 #[async_trait::async_trait]
-pub(crate) trait AdmissionWebhookClient: Send + Sync {
+pub trait AdmissionWebhookClient: Send + Sync {
     async fn call(
         &self,
         request: AdmissionWebhookRequest,
@@ -122,7 +125,7 @@ pub struct AdmissionEngine<'a> {
 }
 
 impl<'a> AdmissionEngine<'a> {
-    pub(crate) fn new(
+    pub fn new(
         query: &'a dyn AdmissionQuery,
         target_resolver: &'a dyn WebhookTargetResolver,
         webhook_client: &'a dyn AdmissionWebhookClient,
@@ -134,7 +137,7 @@ impl<'a> AdmissionEngine<'a> {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn run_mutating(
         &self,
         resource: &Value,
@@ -145,7 +148,7 @@ impl<'a> AdmissionEngine<'a> {
         self.run(resource, api_version, kind, operation, true).await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn run_validating(
         &self,
         resource: &Value,
@@ -157,7 +160,7 @@ impl<'a> AdmissionEngine<'a> {
             .await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn run(
         &self,
         resource: &Value,
@@ -367,11 +370,3 @@ impl<'a> AdmissionEngine<'a> {
         Ok(mutated_resource)
     }
 }
-
-#[cfg(test)]
-fn parse_api_group_version(api_version: &str) -> (String, String) {
-    request_context::parse_api_group_version(api_version)
-}
-#[cfg(test)]
-#[cfg(test)]
-mod tests;
