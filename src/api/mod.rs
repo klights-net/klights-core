@@ -59,11 +59,9 @@ mod state_composition;
 pub(crate) mod state_ports;
 pub mod status;
 mod status_command_ports;
-mod task_supervisor;
 #[cfg(test)]
 pub mod test_support;
 mod validation;
-pub(crate) mod version;
 #[cfg(test)]
 mod watch_transport_parity_tests;
 pub(crate) mod watch_event {

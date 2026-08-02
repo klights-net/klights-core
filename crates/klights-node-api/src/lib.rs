@@ -1,5 +1,6 @@
 //! Transport-neutral node-facing API contracts for klights.
 
+mod node_admin;
 pub mod replication;
 
 use std::collections::BTreeMap;
@@ -10,6 +11,10 @@ use std::pin::Pin;
 
 use bytes::Bytes;
 
+pub use node_admin::{
+    NodeAdminError, NodeAdminFuture, NodeDeadLetter, NodeDeadLetterAdmin, NodeOutboxDiagnostics,
+    NodeOutboxStatus,
+};
 pub use replication::{
     FollowerCompletionContext, FollowerControlMessage, NodeOperationKind, RoutedNodeExecFrame,
     RoutedNodeExecRequest, RoutedNodeExecSyncRequest, RoutedNodeExecSyncResponse,

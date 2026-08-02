@@ -119,12 +119,35 @@ pub(in crate::api) fn build_router_parts(state: ApiState) -> (Router, NativeApiO
         Arc::new(crate::api::policy_input_adapters::authorization_http_inputs(&state));
     let priority_fairness_inputs =
         Arc::new(crate::api::policy_input_adapters::priority_fairness_http_inputs(&state));
+    let operational_role = match &state.operational().role {
+        crate::api::ApiNodeRole::Leader => klights_apiserver::OperationalNodeRole::Leader,
+        crate::api::ApiNodeRole::Controlplane {
+            leader_endpoints,
+            as_learner,
+        } => klights_apiserver::OperationalNodeRole::Controlplane {
+            leader_endpoints: leader_endpoints.clone(),
+            as_learner: *as_learner,
+        },
+        crate::api::ApiNodeRole::Worker { leader_endpoints } => {
+            klights_apiserver::OperationalNodeRole::Worker {
+                leader_endpoints: leader_endpoints.clone(),
+            }
+        }
+    };
+    let metrics = state.controller_reconcile().metrics.clone();
     let operational_endpoints = klights_apiserver::OperationalEndpointHandlers::new(
-        get(health_check),
-        get(metrics_handler),
-        get(version),
-        get(klights_status_handler),
-        crate::api::task_supervisor::routes(),
+        klights_apiserver::OperationalEndpointInputs::new(
+            operational_role,
+            Arc::new(move || metrics.render_prometheus()),
+            state.operational().config.version_info.clone(),
+            state.operational().cluster_status.clone(),
+            state
+                .operational()
+                .replication
+                .as_ref()
+                .map(|services| services.diagnostics.clone()),
+            state.operational().task_supervisor.clone(),
+        ),
     );
     let router = Router::new()
         .route(
@@ -522,18 +545,6 @@ async fn method_not_allowed_fallback() -> crate::api::AppError {
     )
 }
 
-async fn health_check() -> &'static str {
-    "ok"
-}
-
-async fn metrics_handler(State(state): State<Arc<ApiState>>) -> String {
-    state.controller_reconcile().metrics.render_prometheus()
-}
-
-async fn version(State(state): State<Arc<ApiState>>) -> Json<crate::api::version::VersionInfo> {
-    Json(state.operational().config.version_info.clone())
-}
-
 async fn openid_configuration(State(_state): State<Arc<ApiState>>) -> Json<Value> {
     let issuer = "https://kubernetes.default.svc.cluster.local";
     let jwks_uri = format!("{}/openid/v1/jwks", issuer);
@@ -625,81 +636,6 @@ fn build_openid_jwks(signing_key_pem: &str) -> Result<Value, AppError> {
             "kid": kid
         }]
     }))
-}
-
-/// 2A-12: Role/status surface for manual promotion.
-async fn klights_status_handler(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<Value>, AppError> {
-    let metadata = state
-        .operational()
-        .cluster_status
-        .cluster_status_metadata()
-        .await
-        .map_err(|error| {
-            AppError::InternalError(format!("failed to read cluster metadata: {error}"))
-        })?;
-    let role = match &state.operational().role {
-        crate::api::ApiNodeRole::Leader => "Leader",
-        crate::api::ApiNodeRole::Controlplane {
-            leader_endpoints,
-            as_learner: true,
-        } if !leader_endpoints.is_empty() => "Replica",
-        crate::api::ApiNodeRole::Controlplane {
-            leader_endpoints, ..
-        } if leader_endpoints.is_empty() => "ControlplaneSeed",
-        crate::api::ApiNodeRole::Controlplane { .. } => "ControlplaneJoin",
-        crate::api::ApiNodeRole::Worker { .. } => "Worker",
-    };
-    let leader_endpoint = match &state.operational().role {
-        crate::api::ApiNodeRole::Worker {
-            leader_endpoints, ..
-        }
-        | crate::api::ApiNodeRole::Controlplane {
-            leader_endpoints, ..
-        } => leader_endpoints.first().cloned(),
-        _ => None,
-    };
-    let follower_metrics = match &state.operational().replication {
-        Some(services) => {
-            klights_leader_api::LeaderFollowerDiagnostics::follower_diagnostics(
-                services.diagnostics.as_ref(),
-            )
-            .await
-        }
-        None => klights_leader_api::FollowerDiagnostics::default(),
-    };
-    let followers: Vec<Value> = follower_metrics
-        .followers
-        .into_iter()
-        .map(|follower| {
-            serde_json::json!({
-                "nodeName": follower.node_name,
-                "appliedResourceVersion": follower.applied_resource_version,
-                "lag": follower.lag,
-                "mode": follower.mode,
-                "encryption": follower.encryption,
-                "publicKey": follower.public_key,
-            })
-        })
-        .collect();
-
-    Ok(Json(serde_json::json!({
-        "role": role,
-        "leaderEndpoint": leader_endpoint,
-        "clusterId": metadata.cluster_id,
-        "leaderEpoch": metadata.leader_epoch,
-        "currentResourceVersion": metadata.current_resource_version,
-        "replicaLastAppliedResourceVersion": serde_json::Value::Null,
-        "streamState": if matches!(
-            state.operational().role,
-            crate::api::ApiNodeRole::Worker { .. }
-        ) { "streaming" } else { "local" },
-        "streamLag": serde_json::Value::Null,
-        "followers": followers,
-        "followerCount": follower_metrics.follower_count,
-        "maxFollowerLag": follower_metrics.max_lag,
-    })))
 }
 
 #[cfg(test)]

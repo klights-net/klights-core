@@ -81,9 +81,9 @@ pub fn git_tree_state() -> &'static str {
 
 /// Construct the HTTP adapter's Kubernetes `/version` payload from root-owned
 /// build inputs.
-pub(crate) fn api_version_info() -> crate::api::version::VersionInfo {
+pub(crate) fn api_version_info() -> klights_apiserver::VersionInfo {
     let (major, minor) = k8s_major_minor_version();
-    crate::api::version::VersionInfo::new(
+    klights_apiserver::VersionInfo::new(
         major,
         minor,
         git_version(),

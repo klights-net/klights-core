@@ -565,7 +565,7 @@ pub(crate) struct ApiOperationalConfig {
     pub(crate) node_name: String,
     pub(crate) anonymous_auth: bool,
     pub(crate) runtime: ApiRuntimeInputs,
-    pub(crate) version_info: crate::api::version::VersionInfo,
+    pub(crate) version_info: klights_apiserver::VersionInfo,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -635,7 +635,7 @@ impl ApiOperationalConfig {
         #[cfg(test)] node_name: String,
         anonymous_auth: bool,
         runtime: ApiRuntimeInputs,
-        version_info: crate::api::version::VersionInfo,
+        version_info: klights_apiserver::VersionInfo,
     ) -> Self {
         Self {
             #[cfg(test)]
@@ -656,7 +656,7 @@ impl ApiOperationalConfig {
             config.node_name,
             config.anonymous_auth,
             runtime,
-            crate::api::version::VersionInfo::new(
+            klights_apiserver::VersionInfo::new(
                 "1",
                 "34",
                 "v1.34.6+klights-test",
@@ -854,7 +854,7 @@ pub(crate) fn build_router_from_root(
     node_name: String,
     anonymous_auth: bool,
     runtime_inputs: ApiRuntimeInputs,
-    version_info: crate::api::version::VersionInfo,
+    version_info: klights_apiserver::VersionInfo,
     clock: Arc<dyn klights_auth::clock::Clock>,
     cluster_status: Arc<dyn klights_leader_api::LeaderClusterStatusMetadata>,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
