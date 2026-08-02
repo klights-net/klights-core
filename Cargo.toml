@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 publish.workspace = true
+autobins = false
 description = "A resource-efficient, event-driven Kubernetes-compatible cluster runtime."
 readme = "README.md"
 license.workspace = true
@@ -13,6 +14,10 @@ homepage = "https://github.com/klights-net/klights-core"
 documentation = "https://github.com/klights-net/klights-core/blob/main/README.md"
 keywords = ["kubernetes", "k8s", "rust", "containerd", "control-plane"]
 categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "klights"
+path = "src/main.rs"
 
 [workspace]
 resolver = "3"
