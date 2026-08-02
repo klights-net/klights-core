@@ -20,7 +20,7 @@ use super::{extract_scale_replicas, extract_scale_resource_version};
 
 // Scale endpoints are split from helpers to keep each file manageable.
 // Authorization for scale subresources is enforced by the global
-// `authorize_request` middleware chokepoint (see src/api/auth_middleware.rs).
+// native `authorize_request` middleware chokepoint (see `crate::auth_http`).
 
 /// Extract the selector string from a resource's spec.selector.
 /// For apps/v1 resources (Deployment, StatefulSet, ReplicaSet), the selector

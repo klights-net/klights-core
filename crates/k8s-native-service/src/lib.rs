@@ -1,12 +1,13 @@
-//! Transitional owner of the current Kubernetes-native service.
+//! Sole owner of the disposable Kubernetes-native HTTP service.
 //!
-//! Phase 17B.1 owns only the private state, opaque current-router handoff, and
-//! Kubernetes error/status adaptation. Route families and handlers migrate in
-//! their later packets.
+//! The permanent API-server shell composes this crate through focused ports and
+//! consumes its opaque router handoff; the private `current` implementation is
+//! not a compatibility surface.
 
 pub mod admission;
 pub mod audit;
 pub mod auth_http;
+mod current;
 pub mod discovery;
 mod error;
 mod extractor;
@@ -25,6 +26,21 @@ pub mod streaming;
 pub mod subresources;
 pub mod watch;
 
+pub use current::{
+    AdmissionContextRequest, AdmissionResourceStore, ApiRuntimeInputs, ApiRuntimePaths,
+    DeleteOptions, DeletePreconditions, NamespaceTerminationOutcome, NativeApiOuterLayers,
+    NativeApiRemoteNodeServices, apply_default_storage_class_admission,
+    apply_limitrange_defaults_to_pod, apply_patch, apply_pod_runtimeclass_admission,
+    apply_pod_service_account_defaults, apply_pod_spec_create_defaults, build_admission_context,
+    build_current_router, check_resource_quota_for_creation, check_resource_quota_for_pod_update,
+    compute_qos_class, enforce_limitrange_constraints_for_pod,
+    enforce_limitrange_constraints_for_pvc, enforce_pod_security_admission,
+    normalize_resource_for_storage, parse_delete_options_body, parse_delete_options_protobuf,
+    reconcile_namespace_termination_at, reconcile_namespace_termination_for_uid_with_outcome_at,
+    resolve_resource_name, run_admission_for_request, set_namespace_terminating_status_at,
+    validate_builtin_resource_spec, validate_dns_subdomain,
+    validate_pod_resource_requirements_immutable, validate_pod_sysctls,
+};
 pub use discovery::{
     api_group_by_name, api_groups, custom_resource_discovery, get_openapi_v2,
     get_openapi_v3_api_v1, get_openapi_v3_discovery, get_openapi_v3_group_version,
@@ -39,3 +55,18 @@ pub use response::K8sResponse;
 pub use router::CurrentRouter;
 pub use state::ApiState;
 pub use streaming::StreamingDependencies;
+
+/// Focused root-adapter contracts used to compose the current native service.
+pub mod ports {
+    pub use crate::current::custom_resource_ports::{
+        CustomResourceListSnapshot, CustomResourceProjection, CustomResourceReadFuture,
+        CustomResourceReadPort, CustomResourceSnapshotRequest, CustomResourceWaitFuture,
+        CustomResourceWatchTarget, added_watch_event, resource_event_to_watch_event,
+    };
+    pub use crate::current::generated_handler_ports::{GeneratedWatchPort, GeneratedWatchRequest};
+    pub use crate::current::helpers::AdmissionResourceStore;
+    pub use crate::current::state_ports::{
+        ApiFailureEntry, ApiFailureMetrics, ApiNodeLeaseObservations, ApiNodeLeaseObservedFuture,
+        ApiPodRepository,
+    };
+}

@@ -88,7 +88,7 @@ use klights_cluster_datastore::redb::live_committed_apply::outbox_watermark_key;
 
 #[async_trait]
 impl DatastoreBackend for RedbDatastore {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn commit_observation_sink(
         &self,
     ) -> std::sync::Arc<dyn crate::datastore::CommitObservationSink> {

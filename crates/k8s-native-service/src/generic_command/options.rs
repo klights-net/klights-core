@@ -412,3 +412,41 @@ mod tests {
         ));
     }
 }
+
+#[test]
+fn test_delete_options_orphan_dependents_query_triggers_orphan_path() {
+    // orphanDependents=true is the legacy K8s alias for propagationPolicy=Orphan
+    let orphan_dependents: Option<bool> = Some(true);
+    // No body, no query policy → falls back to default.
+    let policy: &str = "Background";
+    let orphan = policy == "Orphan" || orphan_dependents.is_some_and(|v| v);
+    assert!(orphan, "orphanDependents=true must trigger orphan path");
+}
+
+#[test]
+fn test_delete_options_protobuf_unknown_envelope_parses_orphan_policy() {
+    use prost::Message;
+
+    let pb = klights_kube_protobuf::apimachinery::pkg::apis::meta::v1::DeleteOptions {
+        propagation_policy: Some("Orphan".to_string()),
+        ..Default::default()
+    };
+    let mut raw = Vec::new();
+    pb.encode(&mut raw).unwrap();
+
+    let unknown = klights_kube_protobuf::Unknown {
+        type_meta: Some(klights_kube_protobuf::TypeMeta {
+            api_version: "v1".to_string(),
+            kind: "DeleteOptions".to_string(),
+        }),
+        raw,
+        content_encoding: String::new(),
+        content_type: String::new(),
+    };
+
+    let mut body = vec![0x6b, 0x38, 0x73, 0x00];
+    unknown.encode(&mut body).unwrap();
+
+    let opts = parse_delete_options_body(&body);
+    assert_eq!(opts.propagation_policy.as_deref(), Some("Orphan"));
+}

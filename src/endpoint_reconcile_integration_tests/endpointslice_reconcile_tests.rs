@@ -24,7 +24,8 @@ async fn test_mirror_endpoints_sets_owner_reference() {
         .create_resource("v1", "Endpoints", Some("default"), "my-svc", endpoints)
         .await
         .unwrap();
-    let endpoints = crate::api::inject_resource_version(created.data, created.resource_version);
+    let endpoints =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     mirror_endpoints_to_endpointslice(&controller_store(&db), &endpoints)
         .await
@@ -76,7 +77,7 @@ async fn test_mirror_endpoints_stale_snapshot_after_delete_does_not_recreate_sli
         .await
         .unwrap();
     let stale_snapshot =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     db.delete_resource("v1", "Endpoints", Some("default"), "gone-svc")
         .await

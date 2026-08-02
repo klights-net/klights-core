@@ -26,12 +26,12 @@ use crate::{
 
 mod backend_proxy_headers;
 mod exec;
-mod exec_spdy;
+pub(crate) mod exec_spdy;
 mod exec_ws;
 mod node_proxy;
 mod portforward;
 mod proxy;
-mod spdy_framing;
+pub(crate) mod spdy_framing;
 
 /// Complete focused capabilities used by Kubernetes streaming routes.
 #[derive(Clone)]

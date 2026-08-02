@@ -8,10 +8,11 @@
 //! The helpers also collapse the recurring `(Datastore, DatastoreHandle)` pair
 //! construction used by root-owned integration tests.
 
-#![cfg(test)]
+#![cfg(any(test, feature = "integration-test-harness"))]
 
 use super::sqlite::Datastore;
 use super::{DatastoreBackend, DatastoreHandle};
+#[cfg(test)]
 use klights_cluster_core::{LogApplyCommit, LogApplyMutation};
 use std::sync::Arc;
 
@@ -19,6 +20,7 @@ use std::sync::Arc;
 ///
 /// Public resource versions are allocated by committed apply, so legacy
 /// fixture RVs are deliberately erased before validation.
+#[cfg(test)]
 pub(crate) fn test_live_commit(
     candidate_resource_version: i64,
     mut mutations: Vec<LogApplyMutation>,
@@ -100,16 +102,20 @@ pub(crate) fn sqlite_passive_read_ports(
 
 /// Fail-closed datastore-free focused reads for tests that construct a local
 /// API client but declare its positioned-watch capability unused.
+#[cfg(test)]
 pub(crate) fn unused_fail_closed_passive_read_ports() -> crate::datastore::selector::PassiveReadPorts
 {
     let reads = Arc::new(UnusedFailClosedPassiveRead);
     crate::datastore::selector::PassiveReadPorts::new(reads.clone(), reads.clone(), reads)
 }
 
+#[cfg(test)]
 const UNUSED_READ_DIAGNOSTIC: &str = "positioned watch is declared unused by this test fixture";
 
+#[cfg(test)]
 struct UnusedFailClosedPassiveRead;
 
+#[cfg(test)]
 impl klights_cluster_store::ClusterResourceRead for UnusedFailClosedPassiveRead {
     fn get_resource(
         &self,
@@ -135,6 +141,7 @@ impl klights_cluster_store::ClusterResourceRead for UnusedFailClosedPassiveRead 
     }
 }
 
+#[cfg(test)]
 impl klights_cluster_store::DurableWatchHistoryRead for UnusedFailClosedPassiveRead {
     fn replay_watch_history(
         &self,
@@ -160,6 +167,7 @@ impl klights_cluster_store::DurableWatchHistoryRead for UnusedFailClosedPassiveR
     }
 }
 
+#[cfg(test)]
 impl klights_cluster_store::DurableAllocatorRead for UnusedFailClosedPassiveRead {
     fn read_allocator_state(
         &self,
@@ -271,6 +279,7 @@ mod tests {
 /// the target namespace always pre-exists before objects are created in it.
 /// Used by test harnesses that drive the API create path, which now enforces
 /// the upstream `NamespaceLifecycle` "namespace must exist" admission rule.
+#[cfg(test)]
 pub async fn ensure_namespace(db: &dyn DatastoreBackend, name: &str) {
     db.seed_namespace_for_test(name).await;
 }
@@ -278,6 +287,7 @@ pub async fn ensure_namespace(db: &dyn DatastoreBackend, name: &str) {
 /// Construct the focused controller test context used by the thin controller
 /// runner fixtures. This helper is test-only and does not add a production
 /// datastore-to-controller compatibility seam.
+#[cfg(test)]
 pub(crate) fn test_context(db: &Datastore) -> crate::controllers::Context {
     let db_handle = Arc::new(db.clone()) as DatastoreHandle;
     crate::controllers::Context::new(db_handle.clone(), "test-node".to_string())

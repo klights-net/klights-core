@@ -83,7 +83,7 @@ async fn test_service_stale_snapshot_after_delete_does_not_recreate_endpoints() 
         .await
         .unwrap();
     let stale_snapshot =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     db.delete_resource("v1", "Service", Some("default"), "stale-svc")
         .await
@@ -169,7 +169,7 @@ async fn service_reconcile_commits_endpointslice_and_legacy_endpoints_in_one_bat
         .await
         .unwrap();
     let service_snapshot =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     reconcile_service(
         &controller_store(&db),
@@ -788,7 +788,8 @@ async fn test_reconcile_service_defaults_single_stack_ip_family_fields() {
         .create_resource("v1", "Service", Some("default"), "family-defaults", service)
         .await
         .unwrap();
-    let service = crate::api::inject_resource_version(created.data, created.resource_version);
+    let service =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     let result = reconcile_service(
         &controller_store(&db),
@@ -1210,7 +1211,7 @@ async fn create_service_returns_error_when_allocation_fails() {
 // `enqueue_generated_controller_after_mutation`). `prepare_service_for_create`
 // performs allocation only and never enqueues, so it cannot observe the enqueue
 // here. Those two tests therefore live in
-// `src/api/handlers/core_v1_tests.rs` where the HTTP create path is driven and
+// `tests/native_api/cases/handlers/core_v1_tests.rs` where the HTTP create path is driven and
 // the enqueue is observed via `MockServiceRouter::sync_count`:
 //   - create_service_does_not_enqueue_reconcile_after_allocation_failure
 //   - create_service_success_response_contains_allocated_fields_and_enqueues_once
@@ -1263,9 +1264,9 @@ async fn prepare_service_for_create_populates_allocated_fields() {
 
 #[test]
 fn create_service_allocation_conflict_maps_to_kubernetes_409() {
-    use crate::api::AppError;
     use axum::http::StatusCode;
     use axum::response::IntoResponse as _;
+    use k8s_native_service::AppError;
     use klights_cluster_datastore::errors::DatastoreError;
 
     // When create_resource fails with DatastoreError::Conflict (duplicate name),

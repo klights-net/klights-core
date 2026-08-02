@@ -1130,7 +1130,8 @@ async fn test_mirror_endpoints_to_endpointslice_creates_matching_endpointslice()
         .create_resource("v1", "Endpoints", Some("test"), "my-service", endpoints)
         .await
         .unwrap();
-    let endpoints = crate::api::inject_resource_version(created.data, created.resource_version);
+    let endpoints =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     // Call mirroring function
     mirror_endpoints_to_endpointslice(&controller_store(&db), &endpoints)
@@ -1217,7 +1218,8 @@ async fn test_mirror_endpoints_to_endpointslice_updates_existing_mirror() {
         .create_resource("v1", "Endpoints", Some("test"), "my-service", endpoints_v1)
         .await
         .unwrap();
-    let endpoints_v1 = crate::api::inject_resource_version(created.data, created.resource_version);
+    let endpoints_v1 =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     mirror_endpoints_to_endpointslice(&controller_store(&db), &endpoints_v1)
         .await
         .unwrap();
@@ -1245,7 +1247,8 @@ async fn test_mirror_endpoints_to_endpointslice_updates_existing_mirror() {
         )
         .await
         .unwrap();
-    let endpoints_v2 = crate::api::inject_resource_version(updated.data, updated.resource_version);
+    let endpoints_v2 =
+        crate::controllers::inject_resource_version(updated.data, updated.resource_version);
     mirror_endpoints_to_endpointslice(&controller_store(&db), &endpoints_v2)
         .await
         .unwrap();

@@ -833,7 +833,8 @@ async fn test_replicationcontroller_create_loop_observes_live_scale_down() {
         )
         .await
         .unwrap();
-    let rc_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
+    let rc_with_rv =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     reconcile_replicationcontroller(
         &db,

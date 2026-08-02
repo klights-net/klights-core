@@ -21,7 +21,7 @@ pub const KEY_RAFT_TERM: &str = klights_cluster_store::RAFT_TERM_META_KEY;
 pub const KEY_RAFT_LEADER_HINT: &str = klights_cluster_store::RAFT_LEADER_HINT_META_KEY;
 
 /// Generate a new random cluster ID (UUID v4).
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 fn generate_cluster_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -36,7 +36,7 @@ use crate::datastore::backend::DatastoreBackend;
 /// `EnsureClusterMetadata` command. Joining controlplanes receive
 /// cluster state from raft, not local writes. Function retained for
 /// test helpers that exercise the direct-backend code path.
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub async fn ensure_cluster_metadata(db: &dyn DatastoreBackend) -> Result<()> {
     // Check if cluster_id already exists
     let existing = db.get_klights_meta(KEY_CLUSTER_ID).await?;

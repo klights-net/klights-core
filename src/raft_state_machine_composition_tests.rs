@@ -1220,7 +1220,7 @@ mod tests {
             resource.name,
             resource.uid,
             resource.resource_version,
-            crate::api::inject_resource_version(resource.data, resource.resource_version),
+            crate::controllers::inject_resource_version(resource.data, resource.resource_version),
         )
     }
 

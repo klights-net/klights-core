@@ -12,18 +12,6 @@ pub(crate) struct GcOwnerLifecycleAdapter {
 }
 
 impl GcOwnerLifecycleAdapter {
-    #[cfg(test)]
-    pub(crate) fn new(
-        db: DatastoreHandle,
-        pod_delete_sink: std::sync::Arc<crate::kubelet::pod_repository::PodRepository>,
-    ) -> Self {
-        Self::new_with_coordination(
-            db,
-            pod_delete_sink,
-            std::sync::Arc::new(klights_controllers::ControllerCoordination::new()),
-        )
-    }
-
     pub(crate) fn new_with_coordination(
         db: DatastoreHandle,
         pod_delete_sink: std::sync::Arc<crate::kubelet::pod_repository::PodRepository>,
@@ -206,7 +194,7 @@ pub(crate) async fn complete_non_foreground_delete(
             Ok(GcNonPodDeleteOutcome::MarkedTerminating)
         }
         Ok(k8s_native_service::generic_command::DeleteCompletion::GoneOrUidChanged)
-        | Err(crate::api::AppError::NotFound(_)) => Ok(GcNonPodDeleteOutcome::Gone),
+        | Err(k8s_native_service::AppError::NotFound(_)) => Ok(GcNonPodDeleteOutcome::Gone),
         Err(error) => Err(anyhow::anyhow!("{error:?}")),
     }
 }

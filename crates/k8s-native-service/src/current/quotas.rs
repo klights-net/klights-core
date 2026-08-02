@@ -1,0 +1,695 @@
+use crate::current::AppError;
+use serde_json::Value;
+
+fn kind_to_quota_info(kind: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    match kind {
+        "Pod" => Some(("pods", "", "pods")),
+        "Secret" => Some(("secrets", "", "secrets")),
+        "ConfigMap" => Some(("configmaps", "", "configmaps")),
+        "PersistentVolumeClaim" => Some(("persistentvolumeclaims", "", "persistentvolumeclaims")),
+        "Service" => Some(("services", "", "services")),
+        "ReplicationController" => Some(("replicationcontrollers", "", "replicationcontrollers")),
+        "ResourceQuota" => Some(("resourcequotas", "", "resourcequotas")),
+        "Endpoints" => Some(("endpoints", "", "endpoints")),
+        "ServiceAccount" => Some(("serviceaccounts", "", "serviceaccounts")),
+        "Deployment" => Some(("", "apps", "deployments")),
+        "ReplicaSet" => Some(("", "apps", "replicasets")),
+        "StatefulSet" => Some(("", "apps", "statefulsets")),
+        "DaemonSet" => Some(("", "apps", "daemonsets")),
+        "Job" => Some(("", "batch", "jobs")),
+        "CronJob" => Some(("", "batch", "cronjobs")),
+        "Ingress" => Some(("", "networking.k8s.io", "ingresses")),
+        "NetworkPolicy" => Some(("", "networking.k8s.io", "networkpolicies")),
+        _ => None,
+    }
+}
+
+fn pod_quota_bucket_and_resource(quota_key: &str) -> Option<(&'static str, &str)> {
+    if let Some(suffix) = quota_key.strip_prefix("requests.") {
+        if suffix == "storage" {
+            None
+        } else {
+            Some(("requests", suffix))
+        }
+    } else if let Some(suffix) = quota_key.strip_prefix("limits.") {
+        if suffix == "storage" {
+            None
+        } else {
+            Some(("limits", suffix))
+        }
+    } else if quota_key == "cpu" {
+        Some(("requests", "cpu"))
+    } else if quota_key == "memory" {
+        Some(("requests", "memory"))
+    } else if quota_key == "ephemeral-storage" {
+        Some(("requests", "ephemeral-storage"))
+    } else {
+        None
+    }
+}
+
+fn pod_container_has_resource(container: &Value, bucket: &str, resource_key: &str) -> bool {
+    container
+        .get("resources")
+        .and_then(|resources| resources.get(bucket))
+        .and_then(|resources| resources.get(resource_key))
+        .and_then(Value::as_str)
+        .is_some_and(|quantity| !quantity.is_empty())
+}
+
+fn pod_missing_required_quota_resource(pod: &Value, bucket: &str, resource_key: &str) -> bool {
+    let mut saw_container = false;
+
+    for field in ["/spec/containers", "/spec/initContainers"] {
+        let Some(containers) = pod.pointer(field).and_then(Value::as_array) else {
+            continue;
+        };
+        for container in containers {
+            saw_container = true;
+            if !pod_container_has_resource(container, bucket, resource_key) {
+                return true;
+            }
+        }
+    }
+
+    !saw_container
+}
+
+fn ensure_pod_specifies_quota_resource(
+    pod: &Value,
+    quota_key: &str,
+    bucket: &str,
+    resource_key: &str,
+) -> Result<(), AppError> {
+    if pod_missing_required_quota_resource(pod, bucket, resource_key) {
+        return Err(AppError::Forbidden(format!(
+            "must specify {} for every container when ResourceQuota tracks it",
+            quota_key
+        )));
+    }
+    Ok(())
+}
+
+fn pvc_requested_storage(
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
+    pvc: &Value,
+) -> Option<i64> {
+    pvc.pointer("/spec/resources/requests/storage")
+        .and_then(Value::as_str)
+        .and_then(|raw| runtime.parse_resource_quantity("storage", raw))
+}
+
+async fn check_pvc_storage_delta(
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
+    namespace: &str,
+    delta: i64,
+) -> Result<(), AppError> {
+    if delta <= 0 {
+        return Ok(());
+    }
+
+    let rq_list = match runtime
+        .list_resources("v1", "ResourceQuota", namespace)
+        .await
+    {
+        Ok(list) => list,
+        Err(_) => return Ok(()),
+    };
+
+    for rq_resource in rq_list {
+        if runtime.resource_quota_has_pod_scope_constraints(rq_resource.data.as_ref()) {
+            continue;
+        }
+        let Some(limit_raw) = rq_resource
+            .data
+            .pointer("/spec/hard/requests.storage")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Some(limit) = runtime.parse_resource_quantity("storage", limit_raw) else {
+            continue;
+        };
+
+        let used_raw = rq_resource
+            .data
+            .pointer("/status/used/requests.storage")
+            .and_then(Value::as_str)
+            .unwrap_or("0");
+        let used = runtime
+            .parse_resource_quantity("storage", used_raw)
+            .unwrap_or(0);
+        if used + delta > limit {
+            let requested_fmt = runtime.format_resource_quantity("storage", delta);
+            let used_fmt = runtime.format_resource_quantity("storage", used);
+            let limit_fmt = runtime.format_resource_quantity("storage", limit);
+            return Err(AppError::Forbidden(format!(
+                "exceeded quota: requests.storage, requested: {}, used: {}, limited: {}",
+                requested_fmt, used_fmt, limit_fmt
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn check_resource_quota_for_pvc_update(
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
+    namespace: &str,
+    old_pvc: &Value,
+    new_pvc: &Value,
+) -> Result<(), AppError> {
+    let old = pvc_requested_storage(runtime, old_pvc).unwrap_or(0);
+    let new = pvc_requested_storage(runtime, new_pvc).unwrap_or(0);
+    check_pvc_storage_delta(runtime, namespace, new.saturating_sub(old)).await
+}
+
+pub async fn check_resource_quota_for_pod_update(
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
+    namespace: &str,
+    old_pod: &Value,
+    new_pod: &Value,
+) -> Result<(), AppError> {
+    let rq_list = match runtime
+        .list_resources("v1", "ResourceQuota", namespace)
+        .await
+    {
+        Ok(list) => list,
+        Err(_) => return Ok(()),
+    };
+
+    for rq_resource in rq_list {
+        let hard = match rq_resource
+            .data
+            .pointer("/spec/hard")
+            .and_then(|h| h.as_object())
+        {
+            Some(h) => h.clone(),
+            None => continue,
+        };
+        let old_matches_scope =
+            runtime.pod_matches_resource_quota_scopes(old_pod, rq_resource.data.as_ref());
+        let new_matches_scope =
+            runtime.pod_matches_resource_quota_scopes(new_pod, rq_resource.data.as_ref());
+        let used_map = rq_resource
+            .data
+            .pointer("/status/used")
+            .and_then(|u| u.as_object());
+
+        for (quota_key, limit_value) in &hard {
+            let Some((bucket, resource_key)) = pod_quota_bucket_and_resource(quota_key) else {
+                continue;
+            };
+            let Some(limit_raw) = limit_value.as_str() else {
+                continue;
+            };
+            let Some(limit) = runtime.parse_resource_quantity(resource_key, limit_raw) else {
+                continue;
+            };
+
+            if new_matches_scope {
+                ensure_pod_specifies_quota_resource(new_pod, quota_key, bucket, resource_key)?;
+            }
+
+            let old_usage = if old_matches_scope {
+                runtime.calculate_pod_effective_resource_for_key(old_pod, bucket, resource_key)
+            } else {
+                0
+            };
+            let new_usage = if new_matches_scope {
+                runtime.calculate_pod_effective_resource_for_key(new_pod, bucket, resource_key)
+            } else {
+                0
+            };
+            if old_usage == 0 && new_usage == 0 {
+                continue;
+            }
+
+            let used_raw = used_map
+                .and_then(|map| map.get(quota_key))
+                .and_then(|v| v.as_str())
+                .unwrap_or("0");
+            let used = runtime
+                .parse_resource_quantity(resource_key, used_raw)
+                .unwrap_or(0);
+            let adjusted_used = used.saturating_sub(old_usage).saturating_add(new_usage);
+            if adjusted_used > limit {
+                let requested_delta = new_usage.saturating_sub(old_usage);
+                let requested_fmt =
+                    runtime.format_resource_quantity(resource_key, requested_delta.max(0));
+                let used_fmt =
+                    runtime.format_resource_quantity(resource_key, used.saturating_sub(old_usage));
+                let limit_fmt = runtime.format_resource_quantity(resource_key, limit);
+                return Err(AppError::Forbidden(format!(
+                    "exceeded quota: {}, requested: {}, used: {}, limited: {}",
+                    quota_key, requested_fmt, used_fmt, limit_fmt
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn count_nodeport_allocating_services(
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
+    namespace: &str,
+) -> i64 {
+    runtime
+        .list_resources("v1", "Service", namespace)
+        .await
+        .map(|resources| {
+            resources
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s.data.pointer("/spec/type").and_then(|t| t.as_str()),
+                        Some("NodePort") | Some("LoadBalancer")
+                    )
+                })
+                .count() as i64
+        })
+        .unwrap_or(0)
+}
+
+async fn count_services_of_type(
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
+    namespace: &str,
+    svc_type: &str,
+) -> i64 {
+    runtime
+        .list_resources("v1", "Service", namespace)
+        .await
+        .map(|resources| {
+            resources
+                .iter()
+                .filter(|s| s.data.pointer("/spec/type").and_then(|t| t.as_str()) == Some(svc_type))
+                .count() as i64
+        })
+        .unwrap_or(0)
+}
+
+async fn count_pods_matching_resource_quota(
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
+    namespace: &str,
+    pod_kind: &str,
+    resource_quota: &Value,
+) -> i64 {
+    runtime
+        .list_resources("v1", pod_kind, namespace)
+        .await
+        .map(|resources| {
+            resources
+                .iter()
+                .filter(|pod| !runtime.pod_has_deletion_timestamp(pod.data.as_ref()))
+                .filter(|pod| {
+                    runtime.pod_matches_resource_quota_scopes(pod.data.as_ref(), resource_quota)
+                })
+                .count() as i64
+        })
+        .unwrap_or(0)
+}
+
+pub async fn check_resource_quota_for_creation(
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
+    namespace: &str,
+    kind: &str,
+    body: &Value,
+) -> Result<(), AppError> {
+    let rq_list = match runtime
+        .list_resources("v1", "ResourceQuota", namespace)
+        .await
+    {
+        Ok(list) => list,
+        Err(_) => return Ok(()),
+    };
+
+    if kind == "PersistentVolumeClaim" {
+        let requested = pvc_requested_storage(runtime, body).unwrap_or(0);
+        check_pvc_storage_delta(runtime, namespace, requested).await?;
+    }
+
+    for rq_resource in rq_list {
+        let hard = match rq_resource
+            .data
+            .pointer("/spec/hard")
+            .and_then(|h| h.as_object())
+        {
+            Some(h) => h.clone(),
+            None => continue,
+        };
+
+        if kind == "Pod" {
+            if !runtime.pod_matches_resource_quota_scopes(body, rq_resource.data.as_ref()) {
+                continue;
+            }
+        } else if runtime.resource_quota_has_pod_scope_constraints(rq_resource.data.as_ref()) {
+            continue;
+        }
+
+        if let Some((direct_name, group, plural)) = kind_to_quota_info(kind) {
+            if !direct_name.is_empty()
+                && let Some(limit_str) = hard.get(direct_name)
+            {
+                let limit: i64 = limit_str
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(i64::MAX);
+                let current_count = if kind == "Pod" {
+                    count_pods_matching_resource_quota(
+                        runtime,
+                        namespace,
+                        kind,
+                        rq_resource.data.as_ref(),
+                    )
+                    .await
+                } else {
+                    runtime
+                        .list_resources("v1", kind, namespace)
+                        .await
+                        .map(|resources| resources.len() as i64)
+                        .unwrap_or(0)
+                };
+                if current_count >= limit {
+                    return Err(AppError::Forbidden(format!(
+                        "exceeded quota: {}, requested: 1, used: {}, limited: {}",
+                        direct_name, current_count, limit
+                    )));
+                }
+            }
+
+            let count_key = if group.is_empty() {
+                format!("count/{}", plural)
+            } else {
+                format!("count/{}.{}", plural, group)
+            };
+            if let Some(limit_str) = hard.get(&count_key) {
+                let limit: i64 = limit_str
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(i64::MAX);
+                let api_version = if group.is_empty() {
+                    "v1".to_string()
+                } else {
+                    format!("{}/v1", group)
+                };
+                let current_count = if kind == "Pod" {
+                    count_pods_matching_resource_quota(
+                        runtime,
+                        namespace,
+                        kind,
+                        rq_resource.data.as_ref(),
+                    )
+                    .await
+                } else {
+                    runtime
+                        .list_resources(&api_version, kind, namespace)
+                        .await
+                        .map(|resources| resources.len() as i64)
+                        .unwrap_or(0)
+                };
+                if current_count >= limit {
+                    return Err(AppError::Forbidden(format!(
+                        "exceeded quota: {}, requested: 1, used: {}, limited: {}",
+                        count_key, current_count, limit
+                    )));
+                }
+            }
+        }
+
+        if kind == "Pod" {
+            let used_map = rq_resource
+                .data
+                .pointer("/status/used")
+                .and_then(|u| u.as_object());
+            for (quota_key, limit_value) in &hard {
+                let Some((bucket, resource_key)) = pod_quota_bucket_and_resource(quota_key) else {
+                    continue;
+                };
+                let Some(limit_raw) = limit_value.as_str() else {
+                    continue;
+                };
+                let Some(limit) = runtime.parse_resource_quantity(resource_key, limit_raw) else {
+                    continue;
+                };
+                ensure_pod_specifies_quota_resource(body, quota_key, bucket, resource_key)?;
+                let requested =
+                    runtime.calculate_pod_effective_resource_for_key(body, bucket, resource_key);
+                if requested <= 0 {
+                    continue;
+                }
+
+                let used_raw = used_map
+                    .and_then(|map| map.get(quota_key))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0");
+                let used = runtime
+                    .parse_resource_quantity(resource_key, used_raw)
+                    .unwrap_or(0);
+                if used + requested > limit {
+                    let requested_fmt = runtime.format_resource_quantity(resource_key, requested);
+                    let used_fmt = runtime.format_resource_quantity(resource_key, used);
+                    let limit_fmt = runtime.format_resource_quantity(resource_key, limit);
+                    return Err(AppError::Forbidden(format!(
+                        "exceeded quota: {}, requested: {}, used: {}, limited: {}",
+                        quota_key, requested_fmt, used_fmt, limit_fmt
+                    )));
+                }
+            }
+        }
+
+        if kind == "Service" {
+            let svc_type = body
+                .pointer("/spec/type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("ClusterIP");
+            if matches!(svc_type, "NodePort" | "LoadBalancer")
+                && let Some(limit_str) = hard.get("services.nodeports")
+            {
+                let limit: i64 = limit_str
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(i64::MAX);
+                let current_count = count_nodeport_allocating_services(runtime, namespace).await;
+                if current_count >= limit {
+                    return Err(AppError::Forbidden(format!(
+                        "exceeded quota: services.nodeports, requested: 1, used: {}, limited: {}",
+                        current_count, limit
+                    )));
+                }
+            }
+            if svc_type == "LoadBalancer"
+                && let Some(limit_str) = hard.get("services.loadbalancers")
+            {
+                let limit: i64 = limit_str
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(i64::MAX);
+                let current_count =
+                    count_services_of_type(runtime, namespace, "LoadBalancer").await;
+                if current_count >= limit {
+                    return Err(AppError::Forbidden(format!(
+                        "exceeded quota: services.loadbalancers, requested: 1, used: {}, limited: {}",
+                        current_count, limit
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn check_service_type_quota(
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
+    namespace: &str,
+    service_body: &Value,
+) -> Result<(), AppError> {
+    let service_type = service_body
+        .pointer("/spec/type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("ClusterIP");
+    let is_nodeport = service_type == "NodePort";
+    let is_loadbalancer = service_type == "LoadBalancer";
+    if !is_nodeport && !is_loadbalancer {
+        return Ok(());
+    }
+
+    let rq_list = runtime
+        .list_resources("v1", "ResourceQuota", namespace)
+        .await
+        .unwrap_or_default();
+
+    for rq_resource in rq_list {
+        let hard = match rq_resource
+            .data
+            .pointer("/spec/hard")
+            .and_then(|h| h.as_object())
+        {
+            Some(h) => h.clone(),
+            None => continue,
+        };
+
+        if (is_nodeport || is_loadbalancer) && hard.contains_key("services.nodeports") {
+            let limit: i64 = hard
+                .get("services.nodeports")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(i64::MAX);
+            let all_svcs = runtime
+                .list_resources("v1", "Service", namespace)
+                .await
+                .unwrap_or_default();
+            let used = all_svcs
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s.data.pointer("/spec/type").and_then(|t| t.as_str()),
+                        Some("NodePort") | Some("LoadBalancer")
+                    )
+                })
+                .count() as i64;
+            if used >= limit {
+                return Err(AppError::Forbidden(format!(
+                    "exceeded quota: services.nodeports, used: {used}, limited: {limit}"
+                )));
+            }
+        }
+
+        if is_loadbalancer && hard.contains_key("services.loadbalancers") {
+            let limit: i64 = hard
+                .get("services.loadbalancers")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(i64::MAX);
+            let all_svcs = runtime
+                .list_resources("v1", "Service", namespace)
+                .await
+                .unwrap_or_default();
+            let used = all_svcs
+                .iter()
+                .filter(|s| {
+                    s.data.pointer("/spec/type").and_then(|t| t.as_str()) == Some("LoadBalancer")
+                })
+                .count() as i64;
+            if used >= limit {
+                return Err(AppError::Forbidden(format!(
+                    "exceeded quota: services.loadbalancers, used: {used}, limited: {limit}"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_kind_to_quota_info_returns_expected_tuples_for_known_kinds() {
+        assert_eq!(kind_to_quota_info("Pod"), Some(("pods", "", "pods")));
+        assert_eq!(
+            kind_to_quota_info("Deployment"),
+            Some(("", "apps", "deployments"))
+        );
+        assert_eq!(kind_to_quota_info("Job"), Some(("", "batch", "jobs")));
+        assert_eq!(
+            kind_to_quota_info("Ingress"),
+            Some(("", "networking.k8s.io", "ingresses"))
+        );
+    }
+
+    #[test]
+    fn test_kind_to_quota_info_returns_none_for_unknown_kinds() {
+        assert_eq!(kind_to_quota_info("Unknown"), None);
+        assert_eq!(kind_to_quota_info(""), None);
+        assert_eq!(kind_to_quota_info("pod"), None, "lowercase must not match");
+    }
+
+    #[test]
+    fn test_pod_quota_bucket_and_resource_strips_requests_and_limits_prefixes() {
+        assert_eq!(
+            pod_quota_bucket_and_resource("requests.cpu"),
+            Some(("requests", "cpu"))
+        );
+        assert_eq!(
+            pod_quota_bucket_and_resource("limits.memory"),
+            Some(("limits", "memory"))
+        );
+        assert_eq!(
+            pod_quota_bucket_and_resource("requests.ephemeral-storage"),
+            Some(("requests", "ephemeral-storage"))
+        );
+    }
+
+    #[test]
+    fn test_pod_quota_bucket_and_resource_implicit_keys_default_to_requests() {
+        assert_eq!(
+            pod_quota_bucket_and_resource("cpu"),
+            Some(("requests", "cpu"))
+        );
+        assert_eq!(
+            pod_quota_bucket_and_resource("memory"),
+            Some(("requests", "memory"))
+        );
+        assert_eq!(
+            pod_quota_bucket_and_resource("ephemeral-storage"),
+            Some(("requests", "ephemeral-storage"))
+        );
+    }
+
+    #[test]
+    fn test_pod_quota_bucket_and_resource_returns_none_for_unknown_keys() {
+        assert_eq!(pod_quota_bucket_and_resource("pods"), None);
+        assert_eq!(
+            pod_quota_bucket_and_resource("requests.storage"),
+            None,
+            "requests.storage is PVC storage quota, not a per-container Pod request"
+        );
+        assert_eq!(pod_quota_bucket_and_resource(""), None);
+        assert_eq!(
+            pod_quota_bucket_and_resource("requests."),
+            Some(("requests", ""))
+        );
+    }
+
+    #[test]
+    fn test_pod_missing_required_quota_resource_checks_requests_limits_and_init_containers() {
+        let pod = json!({
+            "spec": {
+                "containers": [{
+                    "name": "main",
+                    "resources": {
+                        "requests": {"cpu": "100m"},
+                        "limits": {"memory": "128Mi"}
+                    }
+                }],
+                "initContainers": [{
+                    "name": "init",
+                    "resources": {
+                        "requests": {"cpu": "50m"},
+                        "limits": {"memory": "64Mi"}
+                    }
+                }]
+            }
+        });
+
+        for (quota_key, expected_missing) in [
+            ("requests.cpu", false),
+            ("limits.memory", false),
+            ("cpu", false),
+            ("limits.cpu", true),
+            ("requests.memory", true),
+        ] {
+            let (bucket, resource_key) =
+                pod_quota_bucket_and_resource(quota_key).expect("pod quota key");
+            assert_eq!(
+                pod_missing_required_quota_resource(&pod, bucket, resource_key),
+                expected_missing,
+                "unexpected missing-resource result for {quota_key}"
+            );
+        }
+    }
+}

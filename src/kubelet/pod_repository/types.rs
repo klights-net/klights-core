@@ -46,8 +46,9 @@ pub struct PodNetworkAssignment {
 /// Patch content type for `PodSubresourceWriter::patch_status_from_api`
 /// and `PodApiWriter::api_patch_pod`.
 ///
-/// Mirrors the four arms of `crate::api::apply_patch` (see
-/// `src/api/helpers.rs`). Do not collapse to `klights_cluster_core::PatchKind`,
+/// Mirrors the four arms of `k8s_native_service::apply_patch` (see
+/// `crates/k8s-native-service/src/current/helpers.rs`). Do not collapse to
+/// `klights_cluster_core::PatchKind`,
 /// which only knows `Merge` and would regress patch semantics on Pod
 /// `/status`.
 #[derive(Debug, Clone, Copy)]
@@ -65,7 +66,7 @@ pub enum PodStatusPatchType {
 /// Map an HTTP `Content-Type` header value to the strongly-typed
 /// [`PodStatusPatchType`] enum used by `PodSubresourceWriter`.
 ///
-/// Mirrors the dispatch in `crate::api::apply_patch`:
+/// Mirrors the dispatch in `k8s_native_service::apply_patch`:
 /// - `application/json-patch+json` -> `JsonPatch` (RFC 6902)
 /// - `application/strategic-merge-patch+json` -> `StrategicMerge`
 /// - `application/apply-patch+yaml` -> `ApplyPatch` (server-side apply)

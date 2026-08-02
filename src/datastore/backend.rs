@@ -6,8 +6,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-#[cfg(test)]
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use std::sync::Arc;
 
 fn snapshot_replay_floor_cursor_key(
@@ -93,7 +92,7 @@ use klights_cluster_store::StagedPostCommit;
 
 pub use klights_cluster_store::{SnapshotExclusiveFence, SnapshotMutationFence};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub use klights_cluster_store::CommitObservationSink;
 
 /// `DatastoreBackend` is the runtime contract. Every state operation goes
@@ -105,7 +104,7 @@ pub use klights_cluster_store::CommitObservationSink;
 /// exists.
 #[async_trait]
 pub trait DatastoreBackend: Send + Sync {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn commit_observation_sink(&self) -> Arc<dyn CommitObservationSink>;
     /// Atomically observe both durable allocators and their persisted mode.
     async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {

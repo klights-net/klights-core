@@ -203,7 +203,8 @@ async fn test_concurrent_replicaset_reconcile_creates_only_desired_pods() {
         .create_resource("apps/v1", "ReplicaSet", Some("test-ns"), "race-rs", rs)
         .await
         .unwrap();
-    let rs_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
+    let rs_with_rv =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     let first = reconcile_replicaset(
         &db,
@@ -901,7 +902,8 @@ async fn test_replicaset_create_loop_observes_live_scale_down() {
         )
         .await
         .unwrap();
-    let rs_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
+    let rs_with_rv =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     reconcile_replicaset(
         &db,

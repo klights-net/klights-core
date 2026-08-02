@@ -470,12 +470,12 @@ impl ResourceAdmissionAdapter {
             let admitted = engine
                 .run_with_context(&context, true)
                 .await
-                .map_err(crate::api::map_mutating_admission_error)?;
+                .map_err(k8s_native_service::map_mutating_admission_error)?;
             context.object = admitted.clone();
             engine
                 .run_with_context(&context, false)
                 .await
-                .map_err(crate::api::map_validating_admission_error)?;
+                .map_err(k8s_native_service::map_validating_admission_error)?;
             Ok(admitted)
         })
     }
@@ -486,8 +486,8 @@ impl k8s_native_service::generic_command::ResourceAdmissionPort for ResourceAdmi
         &self,
         request: k8s_native_service::generic_command::ResourceAdmissionRequest,
     ) -> k8s_native_service::generic_command::GenericCommandFuture<'_, Value> {
-        let mut context =
-            crate::api::build_admission_context(crate::api::AdmissionContextRequest {
+        let mut context = k8s_native_service::build_admission_context(
+            k8s_native_service::AdmissionContextRequest {
                 api_version: &request.api_version,
                 kind: &request.kind,
                 operation: &request.operation,
@@ -498,7 +498,8 @@ impl k8s_native_service::generic_command::ResourceAdmissionPort for ResourceAdmi
                 dry_run: request.dry_run,
                 subresource: request.subresource.as_deref(),
                 options: request.options,
-            });
+            },
+        );
         if let Some(resource) = request.resource {
             context.resource = resource;
         }

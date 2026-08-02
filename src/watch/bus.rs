@@ -20,14 +20,14 @@
 //! Datastore mutation paths publish through it after commit, and production
 //! consumers subscribe by topic instead of receiving the full cluster firehose.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use std::collections::HashMap;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use std::sync::Mutex;
 
 #[cfg(test)]
 use futures::future::select_all;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use tokio::sync::broadcast;
 #[cfg(test)]
 use tokio::sync::broadcast::error::RecvError;
@@ -59,7 +59,7 @@ impl klights_watch::WatchSignalEvent for WatchEvent {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 fn event_topic(event: &WatchEvent) -> Option<WatchTopic> {
     Some(WatchTopic::new(
         event.object.get("apiVersion")?.as_str()?,
@@ -70,28 +70,28 @@ fn event_topic(event: &WatchEvent) -> Option<WatchTopic> {
 /// Per-topic broadcast fan-out. This is the only Kubernetes watch
 /// publish/subscribe surface.
 pub struct WatchBus {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     topics: Mutex<HashMap<WatchTopic, broadcast::Sender<WatchEvent>>>,
     signal_hub: klights_watch::WatchSignalHub,
     /// Per-topic buffer capacity. Far smaller than the old global 8192/kind is
     /// viable because a topic only carries its own kind's events; the durable
     /// `watch_events` replay still backstops a lagging receiver.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     capacity: usize,
 }
 
 impl WatchBus {
     pub fn new(capacity: usize) -> Self {
         Self {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "integration-test-harness"))]
             topics: Mutex::new(HashMap::new()),
             signal_hub: klights_watch::WatchSignalHub::new(capacity),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "integration-test-harness"))]
             capacity: capacity.max(1),
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     /// Subscribe to exactly one topic. The topic sender is created lazily on
     /// first subscribe. The returned receiver only ever observes events for
     /// `topic`; drop it to release the slot (the topic self-collects on the
@@ -122,7 +122,7 @@ impl WatchBus {
     /// subscriber is registered for that topic (idle-silent: no topic, no
     /// wakeups). Once a topic's last receiver has dropped, the send fails and
     /// the topic is collected so memory tracks only active kinds.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub fn publish(&self, event: WatchEvent) {
         let Some(topic) = event_topic(&event) else {
             return;
@@ -148,7 +148,7 @@ impl WatchBus {
         self.lock().len()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn lock(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<WatchTopic, broadcast::Sender<WatchEvent>>> {

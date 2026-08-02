@@ -550,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn raft_leader_proxy_reflects_initial_state() {
+    fn authority_router_reflects_initial_local_state() {
         let (_, is_leader_rx) = tokio::sync::watch::channel(true);
         let (_, leader_addr_rx) =
             tokio::sync::watch::channel(Some("https://10.99.0.10:7679".to_string()));
@@ -560,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn raft_leader_proxy_follower_state() {
+    fn authority_router_reflects_forward_state() {
         let (_, is_leader_rx) = tokio::sync::watch::channel(false);
         let (_, leader_addr_rx) =
             tokio::sync::watch::channel(Some("https://10.99.0.10:7679".to_string()));
@@ -573,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn raft_leader_proxy_no_leader() {
+    fn authority_router_reflects_unavailable_state() {
         let (_, is_leader_rx) = tokio::sync::watch::channel(false);
         let (_, leader_addr_rx) = tokio::sync::watch::channel(None::<String>);
         let proxy = HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, None);
@@ -583,7 +583,7 @@ mod tests {
 
     #[tokio::test]
     async fn service_unavailable_is_kubernetes_status_response() {
-        let response = service_unavailable("no raft leader elected");
+        let response = service_unavailable("no cluster authority available");
         assert_eq!(
             response.status(),
             axum::http::StatusCode::SERVICE_UNAVAILABLE
@@ -609,6 +609,189 @@ mod tests {
         assert_eq!(body["status"], "Failure");
         assert_eq!(body["reason"], "ServiceUnavailable");
         assert_eq!(body["code"], 503);
+    }
+
+    #[tokio::test]
+    async fn follower_authority_router_does_not_fallback_local_for_pod_logs_without_authority() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use axum::body::{Body, to_bytes};
+        use tower::ServiceExt;
+
+        let (_, is_leader_rx) = tokio::sync::watch::channel(false);
+        let (_, leader_addr_rx) = tokio::sync::watch::channel(None::<String>);
+        let authority_router =
+            Arc::new(HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, None));
+        let downstream_reached = Arc::new(AtomicBool::new(false));
+        let downstream = downstream_reached.clone();
+        let app = wrap_authority_router(
+            axum::Router::new().fallback(move || {
+                let downstream = downstream.clone();
+                async move {
+                    downstream.store(true, Ordering::SeqCst);
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
+            Some(authority_router),
+        );
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/namespaces/default/pods/remote-log-no-leader/log?container=main")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(
+            !downstream_reached.load(Ordering::SeqCst),
+            "a follower without an authority must not invoke the local handler"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("no current cluster authority"),
+            "the authority shell must return its fail-closed Kubernetes Status"
+        );
+    }
+
+    #[test]
+    fn authority_proxy_stamps_authenticated_client_certificate_identity_headers() {
+        let mut identity = klights_auth::AuthenticatedIdentity::client_cert(
+            "admin-user".to_string(),
+            vec!["system:masters".to_string(), "developers".to_string()],
+        );
+        identity.uid = Some("uid-7".to_string());
+        let request = stamp_delegated_identity_headers(
+            reqwest::Client::new().get("https://authority.invalid/api/v1/pods"),
+            &identity,
+        )
+        .build()
+        .unwrap();
+        assert_eq!(request.headers()["x-remote-user"], "admin-user");
+        assert_eq!(request.headers()["x-remote-uid"], "uid-7");
+        let groups: Vec<_> = request
+            .headers()
+            .get_all("x-remote-group")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert!(groups.contains(&"system:masters"));
+        assert!(groups.contains(&"developers"));
+    }
+
+    #[tokio::test]
+    async fn health_endpoints_bypass_remote_authority_routing() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (_, local_rx) = tokio::sync::watch::channel(false);
+        let (_, endpoint_rx) = tokio::sync::watch::channel(None::<String>);
+        let app = wrap_authority_router(
+            axum::Router::new().fallback(|| async { axum::http::StatusCode::NO_CONTENT }),
+            Some(Arc::new(HttpAuthorityRouter::new(
+                local_rx,
+                endpoint_rx,
+                None,
+            ))),
+        );
+        for path in ["/healthz", "/livez", "/readyz"] {
+            let response = app
+                .clone()
+                .oneshot(axum::http::Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_authority_fails_closed_for_read_watch_and_write() {
+        use axum::body::Body;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tower::ServiceExt;
+
+        let (_, local_rx) = tokio::sync::watch::channel(false);
+        let (_, endpoint_rx) = tokio::sync::watch::channel(None::<String>);
+        let reached = Arc::new(AtomicBool::new(false));
+        let downstream = reached.clone();
+        let app = wrap_authority_router(
+            axum::Router::new().fallback(move || {
+                downstream.store(true, Ordering::SeqCst);
+                async { axum::http::StatusCode::NO_CONTENT }
+            }),
+            Some(Arc::new(HttpAuthorityRouter::new(
+                local_rx,
+                endpoint_rx,
+                None,
+            ))),
+        );
+        for (method, uri) in [
+            ("GET", "/api/v1/pods/x"),
+            ("GET", "/api/v1/pods"),
+            ("GET", "/api/v1/pods?watch=true"),
+            ("POST", "/api/v1/namespaces/default/configmaps"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        assert!(!reached.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn unreachable_remote_authority_returns_retryable_503_without_local_side_effects() {
+        use axum::body::Body;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tower::ServiceExt;
+
+        let (_, local_rx) = tokio::sync::watch::channel(false);
+        let (_, endpoint_rx) = tokio::sync::watch::channel(Some("http://127.0.0.1:9".to_string()));
+        let reached = Arc::new(AtomicBool::new(false));
+        let downstream = reached.clone();
+        let app = wrap_authority_router(
+            axum::Router::new().fallback(move || {
+                downstream.store(true, Ordering::SeqCst);
+                async { axum::http::StatusCode::NO_CONTENT }
+            }),
+            Some(Arc::new(HttpAuthorityRouter::new(
+                local_rx,
+                endpoint_rx,
+                None,
+            ))),
+        );
+        let response = app
+            .oneshot(
+                axum::http::Request::post("/api/v1/namespaces/default/configmaps")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(response.headers()["retry-after"], "1");
+        assert!(!reached.load(Ordering::SeqCst));
     }
 
     /// A long-lived streaming GET (e.g. `kubectl logs -f`, which is a chunked

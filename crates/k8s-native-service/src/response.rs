@@ -1711,3 +1711,7 @@ mod table_printer_tests {
         assert_eq!(table["rows"][0]["object"]["metadata"]["name"], "kubernetes");
     }
 }
+
+#[cfg(test)]
+#[path = "response_phase17g_tests.rs"]
+mod phase17g_tests;

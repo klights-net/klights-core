@@ -147,4 +147,231 @@ pub async fn start_node_admin(
 }
 
 #[cfg(test)]
-mod legacy_tests;
+mod tests {
+    use super::*;
+
+    use crate::datastore::backend_kind::BackendKind;
+    use crate::datastore::node_local::sqlite::DeadLetterTestInsert;
+    use crate::datastore::node_local::{
+        LegacyDeliveryTestStore as _, NodeLocalStores, OutboxInsert, selector,
+    };
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
+
+    fn supervisor() -> Arc<TaskSupervisor> {
+        Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))
+    }
+
+    fn pod_status_classification() -> klights_node_store::OutboxClassification {
+        klights_node_store::OutboxClassification::try_new(
+            klights_node_store::OutboxPriority::Workload,
+            klights_node_store::OutboxSupersedability::PodStatus,
+            klights_node_store::TerminalDeleteClassification::NotTerminalDelete,
+            klights_node_store::OutboxSequencePolicy::PerSubject,
+        )
+        .expect("valid Pod status classification")
+    }
+
+    fn pod_status_payload() -> Vec<u8> {
+        crate::outbox_test_support::OutboxPayload::from_command(
+            klights_cluster_core::StorageCommand::UpdateStatus {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: "web".to_string(),
+                status: serde_json::json!({"phase": "Running"}),
+                expected_rv: None,
+                preconditions: klights_cluster_core::ResourcePreconditions::uid("uid-1"),
+                observed_status_stamp: Some(1),
+            },
+        )
+        .encode_protobuf()
+        .expect("encode test Pod status outbox envelope")
+    }
+
+    async fn node_db(connection_key: &'static str) -> NodeLocalStores {
+        selector::open_node_local(
+            BackendKind::Sqlite,
+            None,
+            supervisor(),
+            None,
+            connection_key,
+        )
+        .await
+        .expect("open node-local test db")
+    }
+
+    async fn node_db_with_dead_letter() -> (NodeLocalStores, i64) {
+        let ndb = node_db("sqlite:node-admin-adapter-test").await;
+        ndb.legacy_enqueue_outbox(OutboxInsert {
+            idempotency_key: "node-admin-dl-key".to_string(),
+            enqueued_ms: 1000,
+            subject_key: "v1/Pod/default/web/uid-1".to_string(),
+            subject_api_version: "v1".to_string(),
+            subject_kind: "Pod".to_string(),
+            subject_namespace: Some("default".to_string()),
+            subject_name: "web".to_string(),
+            subject_uid: Some("uid-1".to_string()),
+            pod_uid: "uid-1".to_string(),
+            operation: "PodStatus".to_string(),
+            payload_proto: pod_status_payload(),
+            next_due_ms: 1000,
+            classification: pod_status_classification(),
+        })
+        .await
+        .expect("enqueue for dead letter");
+        ndb.legacy_move_outbox_to_dead_letter_if_max_attempts("node-admin-dl-key", 0)
+            .await
+            .expect("move to dead letter");
+        let id = ndb
+            .legacy_list_dead_letter()
+            .await
+            .expect("list dead letter")
+            .first()
+            .expect("dead letter row")
+            .id;
+        (ndb, id)
+    }
+
+    async fn node_db_with_unassigned_dead_letter() -> (NodeLocalStores, i64) {
+        let (ndb, sqlite) = selector::open_node_local_with_sqlite(
+            BackendKind::Sqlite,
+            None,
+            supervisor(),
+            None,
+            "sqlite:node-admin-unassigned-dead-letter-adapter-test",
+        )
+        .await
+        .expect("open node-local test db");
+        sqlite
+            .expect("SQLite backend")
+            .insert_dead_letter_test_only(DeadLetterTestInsert {
+                idempotency_key: "node-admin-unassigned-dl-key",
+                operation: "PodStatus",
+                subject_key: "v1/Pod/default/web/uid-1",
+                subject_api_version: "v1",
+                subject_kind: "Pod",
+                subject_namespace: Some("default"),
+                subject_name: "web",
+                subject_uid: Some("uid-1"),
+                pod_uid: "uid-1",
+                payload_proto: &[1, 2, 3],
+                attempts: 720,
+                last_error: "max attempts",
+                moved_at_ms: 2_000,
+            })
+            .await
+            .expect("insert unassigned dead letter");
+        let id = ndb
+            .legacy_list_dead_letter()
+            .await
+            .expect("list dead letter")
+            .first()
+            .expect("dead letter row")
+            .id;
+        (ndb, id)
+    }
+
+    fn adapter(node_db: &NodeLocalStores, notify: Arc<Notify>) -> Arc<RootNodeAdmin> {
+        RootNodeAdmin::new(node_db.dead_letters(), notify)
+    }
+
+    #[tokio::test]
+    async fn outbox_status_adapter_returns_persisted_metrics() {
+        let ndb = node_db("sqlite:node-admin-status-adapter-test").await;
+        ndb.identity()
+            .set_node_meta("outbox_dispatch_total", "42")
+            .await
+            .expect("write dispatch counter");
+        ndb.identity()
+            .set_node_meta("outbox_dispatch_errors_total", "7")
+            .await
+            .expect("write error counter");
+        ndb.legacy_enqueue_outbox(OutboxInsert {
+            idempotency_key: "status-test-key".to_string(),
+            enqueued_ms: 1000,
+            subject_key: "v1/Pod/default/web/uid-1".to_string(),
+            subject_api_version: "v1".to_string(),
+            subject_kind: "Pod".to_string(),
+            subject_namespace: Some("default".to_string()),
+            subject_name: "web".to_string(),
+            subject_uid: Some("uid-1".to_string()),
+            pod_uid: "uid-1".to_string(),
+            operation: "PodStatus".to_string(),
+            payload_proto: Vec::new(),
+            next_due_ms: 1000,
+            classification: pod_status_classification(),
+        })
+        .await
+        .expect("enqueue");
+
+        let status = adapter(&ndb, Arc::new(Notify::new()))
+            .outbox_status()
+            .await
+            .expect("read status through root adapter");
+        assert_eq!(status.pending, 1);
+        assert_eq!(status.dispatch_total, 42);
+        assert_eq!(status.dispatch_errors_total, 7);
+        assert!(status.dead_letter_total >= 0);
+    }
+
+    #[tokio::test]
+    async fn dead_letter_list_adapter_preserves_row_identity() {
+        let (ndb, _) = node_db_with_dead_letter().await;
+        let rows = adapter(&ndb, Arc::new(Notify::new()))
+            .list_dead_letters()
+            .await
+            .expect("list through root adapter");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].idempotency_key, "node-admin-dl-key");
+        assert_eq!(rows[0].subject_uid.as_deref(), Some("uid-1"));
+    }
+
+    #[tokio::test]
+    async fn dead_letter_replay_adapter_requeues_and_wakes_dispatcher() {
+        let (ndb, id) = node_db_with_dead_letter().await;
+        let notify = Arc::new(Notify::new());
+        assert!(
+            adapter(&ndb, notify.clone())
+                .replay_dead_letter(id)
+                .await
+                .expect("replay through root adapter")
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified())
+            .await
+            .expect("successful replay must wake the idle dispatcher");
+        assert!(
+            ndb.legacy_list_dead_letter()
+                .await
+                .expect("list dead letter")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_letter_delete_adapter_removes_unassigned_row() {
+        let (ndb, id) = node_db_with_unassigned_dead_letter().await;
+        assert!(
+            adapter(&ndb, Arc::new(Notify::new()))
+                .delete_dead_letter(id)
+                .await
+                .expect("delete through root adapter")
+        );
+        assert!(
+            ndb.legacy_list_dead_letter()
+                .await
+                .expect("list dead letter")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_letter_replay_adapter_reports_missing_row() {
+        let ndb = node_db("sqlite:node-admin-missing-adapter-test").await;
+        assert!(
+            !adapter(&ndb, Arc::new(Notify::new()))
+                .replay_dead_letter(99_999)
+                .await
+                .expect("missing replay through root adapter")
+        );
+    }
+}

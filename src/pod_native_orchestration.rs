@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::api::{
+use k8s_native_service::{
     AdmissionContextRequest, AdmissionResourceStore, apply_limitrange_defaults_to_pod, apply_patch,
     apply_pod_runtimeclass_admission, apply_pod_service_account_defaults,
     apply_pod_spec_create_defaults, build_admission_context, check_resource_quota_for_creation,
@@ -25,7 +25,7 @@ use crate::api::{
     run_admission_for_request, validate_builtin_resource_spec, validate_dns_subdomain,
     validate_pod_resource_requirements_immutable, validate_pod_sysctls,
 };
-use crate::api::{AppError, DeleteOptions};
+use k8s_native_service::{AppError, DeleteOptions};
 use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_pod_api::{
     PodActorFinalizeRequest, PodApiCreateResult, PodApiDeleteOutcome, PodApiWriteOutcome,
@@ -1495,7 +1495,7 @@ impl GcPodDeleteSink for PodNativeOrchestration {
     fn request_gc_pod_delete(&self, request: GcPodDeleteRequest) -> GcPodDeleteFuture<'_> {
         Box::pin(async move {
             let identity = request.into_identity();
-            let options = crate::api::DeleteOptions::with_uid_precondition(&identity.uid);
+            let options = k8s_native_service::DeleteOptions::with_uid_precondition(&identity.uid);
             match self
                 .api_delete_pod_for_gc(&identity.namespace, &identity.name, options, false)
                 .await

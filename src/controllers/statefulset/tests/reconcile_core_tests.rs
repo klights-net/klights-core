@@ -235,7 +235,8 @@ async fn test_statefulset_create_loop_observes_live_scale_down() {
         )
         .await
         .unwrap();
-    let sts_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
+    let sts_with_rv =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     klights_controllers::statefulset::reconcile_statefulset(
         &crate::controllers::test_utils::controller_store_for_test(&db),

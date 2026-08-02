@@ -1,6 +1,10 @@
 use super::*;
 use std::sync::OnceLock;
 
+#[cfg(test)]
+#[path = "openapi_phase17g_tests.rs"]
+mod phase17g_tests;
+
 /// Static portion of the OpenAPI v3 path map. Computed once; CRD-driven
 /// entries are merged in per request because CRDs change at runtime.
 fn static_openapi_v3_paths() -> &'static serde_json::Map<String, Value> {

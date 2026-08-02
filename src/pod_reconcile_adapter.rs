@@ -69,8 +69,9 @@ impl PodReconcileAdapter {
                 db.clone(),
             ),
             #[cfg(test)]
-            namespace_lifecycle:
-                crate::api_state_adapter_test_owner::RootNamespaceTerminationStore::new(db.clone()),
+            namespace_lifecycle: crate::api_state_adapter::RootNamespaceTerminationStore::new(
+                db.clone(),
+            ),
             db,
             dispatcher,
             metrics,
@@ -255,23 +256,25 @@ impl NamespaceTerminationSink for PodReconcileAdapter {
     ) -> NamespaceTerminationFuture<'_> {
         Box::pin(async move {
             let outcome = match request.expected_uid {
-                Some(uid) => crate::api::reconcile_namespace_termination_for_uid_with_outcome_at(
-                    self.namespace_lifecycle.as_ref(),
-                    &request.namespace,
-                    &uid,
-                    self.metrics.as_ref(),
-                    klights_supervisor::SystemWallClock::now_utc(),
-                )
-                .await
-                .map(|outcome| match outcome {
-                    crate::api::NamespaceTerminationOutcome::Finalized => {
-                        NamespaceTerminationOutcome::Finalized
-                    }
-                    crate::api::NamespaceTerminationOutcome::StillPending => {
-                        NamespaceTerminationOutcome::StillPending
-                    }
-                }),
-                None => crate::api::reconcile_namespace_termination_at(
+                Some(uid) => {
+                    k8s_native_service::reconcile_namespace_termination_for_uid_with_outcome_at(
+                        self.namespace_lifecycle.as_ref(),
+                        &request.namespace,
+                        &uid,
+                        self.metrics.as_ref(),
+                        klights_supervisor::SystemWallClock::now_utc(),
+                    )
+                    .await
+                    .map(|outcome| match outcome {
+                        k8s_native_service::NamespaceTerminationOutcome::Finalized => {
+                            NamespaceTerminationOutcome::Finalized
+                        }
+                        k8s_native_service::NamespaceTerminationOutcome::StillPending => {
+                            NamespaceTerminationOutcome::StillPending
+                        }
+                    })
+                }
+                None => k8s_native_service::reconcile_namespace_termination_at(
                     self.namespace_lifecycle.as_ref(),
                     &request.namespace,
                     self.metrics.as_ref(),

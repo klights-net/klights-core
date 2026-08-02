@@ -766,36 +766,60 @@ async fn node_lost_cleanup_enqueues_owning_replicaset_after_node_lost_mark() {
     // non-zero eviction grace (the default is now 0 = immediate cleanup).
     let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
     let _grace = EnvVarGuard::set("KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS", "30");
-    let state = crate::api::test_support::build_test_app_state().await;
-    state
-        .resource_mutation()
-        .db
-        .create_resource(
-            "v1",
-            "Node",
+    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
+    ));
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
+    let dispatcher = std::sync::Arc::new(crate::controllers::ControllerDispatcher::new(
+        std::sync::Arc::new(klights_controllers::service::ServiceIpam::new(
+            "10.43.128.0/17",
+        )),
+    ));
+    let side_effects =
+        std::sync::Arc::new(crate::side_effect_registry_composition::default_registry(
+            metrics.clone(),
             None,
-            "worker-a",
-            json!({
-                "apiVersion": "v1",
-                "kind": "Node",
-                "metadata": {"name": "worker-a"},
-                "status": {
-                    "conditions": [{
-                        "type": "Ready",
-                        "status": "True",
-                        "reason": "KubeletReady",
-                        "message": "klights is ready",
-                        "lastHeartbeatTime": "2026-05-13T06:34:14Z",
-                        "lastTransitionTime": "2026-05-13T06:34:14Z"
-                    }]
-                }
-            }),
-        )
-        .await
-        .unwrap();
-    state
-        .controller_reconcile()
-        .node_lease_tracker
+            Some(supervisor.clone()),
+            Some(db_handle.clone()),
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        ));
+    side_effects.set_controller_dispatcher(dispatcher.clone());
+    let pod_repository = std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(
+        db_handle,
+        supervisor,
+        side_effects.clone(),
+        metrics,
+    ));
+    side_effects.set_pod_ports(pod_repository.clone(), pod_repository.clone());
+    let tracker = klights_controllers::node_lease::NodeLeaseTracker::new_at(
+        Utc.with_ymd_and_hms(2026, 5, 13, 6, 34, 14).unwrap(),
+    );
+
+    db.create_resource(
+        "v1",
+        "Node",
+        None,
+        "worker-a",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "worker-a"},
+            "status": {
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "True",
+                    "reason": "KubeletReady",
+                    "message": "klights is ready",
+                    "lastHeartbeatTime": "2026-05-13T06:34:14Z",
+                    "lastTransitionTime": "2026-05-13T06:34:14Z"
+                }]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    tracker
         .record_from_lease_object(
             "worker-a",
             &json!({
@@ -811,131 +835,106 @@ async fn node_lost_cleanup_enqueues_owning_replicaset_after_node_lost_mark() {
         )
         .await
         .unwrap();
-    state
-            .resource_mutation().db
-            .create_resource(
-                "apps/v1",
-                "ReplicaSet",
-                Some("default"),
-                "owned-rs",
-                json!({
+    db.create_resource(
+        "apps/v1",
+        "ReplicaSet",
+        Some("default"),
+        "owned-rs",
+        json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "owned-rs",
+                "namespace": "default",
+                "uid": "owned-rs-uid"
+            },
+            "spec": {
+                "replicas": 1,
+                "selector": {"matchLabels": {"app": "lost"}},
+                "template": {
+                    "metadata": {"labels": {"app": "lost"}},
+                    "spec": {"containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10"}]}
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "lost-pod",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": "lost-pod",
+                "uid": "lost-pod-uid",
+                "creationTimestamp": "2026-05-13T06:30:00Z",
+                "labels": {"app": "lost"},
+                "ownerReferences": [{
                     "apiVersion": "apps/v1",
                     "kind": "ReplicaSet",
-                    "metadata": {
-                        "name": "owned-rs",
-                        "namespace": "default",
-                        "uid": "owned-rs-uid"
+                    "name": "owned-rs",
+                    "uid": "owned-rs-uid",
+                    "controller": true
+                }]
+            },
+            "spec": {
+                "nodeName": "worker-a",
+                "containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10"}]
+            },
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    {
+                        "type": "ContainersReady",
+                        "status": "True",
+                        "lastTransitionTime": "2026-05-13T06:30:10Z"
                     },
-                    "spec": {
-                        "replicas": 1,
-                        "selector": {"matchLabels": {"app": "lost"}},
-                        "template": {
-                            "metadata": {"labels": {"app": "lost"}},
-                            "spec": {"containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10"}]}
-                        }
+                    {
+                        "type": "Ready",
+                        "status": "True",
+                        "lastTransitionTime": "2026-05-13T06:30:10Z"
                     }
-                }),
-            )
-            .await
-            .unwrap();
-    state
-        .resource_mutation()
-        .db
-        .create_resource(
-            "v1",
-            "Pod",
-            Some("default"),
-            "lost-pod",
-            json!({
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": {
-                    "namespace": "default",
-                    "name": "lost-pod",
-                    "uid": "lost-pod-uid",
-                    "creationTimestamp": "2026-05-13T06:30:00Z",
-                    "labels": {"app": "lost"},
-                    "ownerReferences": [{
-                        "apiVersion": "apps/v1",
-                        "kind": "ReplicaSet",
-                        "name": "owned-rs",
-                        "uid": "owned-rs-uid",
-                        "controller": true
-                    }]
-                },
-                "spec": {
-                    "nodeName": "worker-a",
-                    "containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10"}]
-                },
-                "status": {
-                    "phase": "Running",
-                    "conditions": [
-                        {
-                            "type": "ContainersReady",
-                            "status": "True",
-                            "lastTransitionTime": "2026-05-13T06:30:10Z"
-                        },
-                        {
-                            "type": "Ready",
-                            "status": "True",
-                            "lastTransitionTime": "2026-05-13T06:30:10Z"
-                        }
-                    ]
-                }
-            }),
-        )
-        .await
-        .unwrap();
+                ]
+            }
+        }),
+    )
+    .await
+    .unwrap();
 
     let pods = crate::controller_runtime_adapter::RootControllerPodPort::new_for_test(
-        state.resource_mutation().pod_repository.clone(),
+        pod_repository.clone(),
     );
     klights_controllers::node_lifecycle::reconcile_node_lifecycle_once_with_tracker(
-        state.resource_mutation().db.as_ref() as &dyn crate::datastore::DatastoreBackend,
-        &TestNodeLifecycleStatus(state.resource_mutation().db.as_ref()),
+        &db as &dyn crate::datastore::DatastoreBackend,
+        &TestNodeLifecycleStatus(&db),
         &pods,
-        state.controller_reconcile().node_lease_tracker.as_ref(),
+        &tracker,
         Utc.with_ymd_and_hms(2026, 5, 13, 6, 34, 56).unwrap(),
         klights_controllers::node_lifecycle::NodeLifecyclePodActions {
-            mutation_reconcile: Some(
-                state
-                    .resource_mutation()
-                    .pod_repository
-                    .mutation_reconcile_port()
-                    .as_ref(),
-            ),
+            mutation_reconcile: Some(pod_repository.mutation_reconcile_port().as_ref()),
             lifecycle: None,
             eviction_grace: std::time::Duration::ZERO,
         },
     )
     .await
     .unwrap();
-    let pre_cleanup_keys = state
-        .controller_reconcile()
-        .controller_dispatcher
-        .pending_reconcile_keys()
-        .await;
+    let pre_cleanup_keys = dispatcher.pending_reconcile_keys().await;
     for _ in 0..pre_cleanup_keys.len() {
-        let _ = state
-            .controller_reconcile()
-            .controller_dispatcher
-            .take_reconcile_key_for_test()
-            .await;
+        let _ = dispatcher.take_reconcile_key_for_test().await;
     }
     klights_controllers::node_lifecycle::reconcile_node_lifecycle_once_with_tracker(
-        state.resource_mutation().db.as_ref() as &dyn crate::datastore::DatastoreBackend,
-        &TestNodeLifecycleStatus(state.resource_mutation().db.as_ref()),
+        &db as &dyn crate::datastore::DatastoreBackend,
+        &TestNodeLifecycleStatus(&db),
         &pods,
-        state.controller_reconcile().node_lease_tracker.as_ref(),
+        &tracker,
         Utc.with_ymd_and_hms(2026, 5, 13, 6, 35, 26).unwrap(),
         klights_controllers::node_lifecycle::NodeLifecyclePodActions {
-            mutation_reconcile: Some(
-                state
-                    .resource_mutation()
-                    .pod_repository
-                    .mutation_reconcile_port()
-                    .as_ref(),
-            ),
+            mutation_reconcile: Some(pod_repository.mutation_reconcile_port().as_ref()),
             lifecycle: None,
             eviction_grace: std::time::Duration::ZERO,
         },
@@ -943,20 +942,14 @@ async fn node_lost_cleanup_enqueues_owning_replicaset_after_node_lost_mark() {
     .await
     .unwrap();
 
-    let lost_pod = state
-        .resource_mutation()
-        .db
+    let lost_pod = db
         .get_resource("v1", "Pod", Some("default"), "lost-pod")
         .await
         .unwrap()
         .expect("controller must preserve the Pod row for actor-owned finalization");
     assert_eq!(lost_pod.data["status"]["phase"], "Failed");
     assert_eq!(lost_pod.data["status"]["reason"], "NodeLost");
-    let keys = state
-        .controller_reconcile()
-        .controller_dispatcher
-        .pending_reconcile_keys()
-        .await;
+    let keys = dispatcher.pending_reconcile_keys().await;
     assert!(
         keys.iter().any(|key| {
             key.api_version() == "apps/v1"

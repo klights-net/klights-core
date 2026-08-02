@@ -1,6 +1,5 @@
-use crate::api::{AdmissionResourceStore, NamespaceTerminationMetrics};
-use crate::datastore::{DatastoreBackend, ResourceListQuery};
-use async_trait::async_trait;
+#[cfg(test)]
+use crate::datastore::DatastoreBackend;
 
 #[cfg(test)]
 fn namespace_lifecycle_error(
@@ -143,58 +142,3 @@ macro_rules! impl_namespace_lifecycle_store {
 impl_namespace_lifecycle_store!(dyn DatastoreBackend + '_);
 #[cfg(test)]
 impl_namespace_lifecycle_store!(crate::datastore::sqlite::Datastore);
-
-impl NamespaceTerminationMetrics for klights_controllers::side_effects::SideEffectMetrics {
-    fn record_namespace_delete_failure(&self) {
-        self.namespace_delete_failures_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-impl<T> NamespaceTerminationMetrics for std::sync::Arc<T>
-where
-    T: NamespaceTerminationMetrics + ?Sized,
-{
-    fn record_namespace_delete_failure(&self) {
-        self.as_ref().record_namespace_delete_failure();
-    }
-}
-
-#[async_trait]
-impl<T> AdmissionResourceStore for T
-where
-    T: DatastoreBackend + ?Sized,
-{
-    async fn get_admission_resource(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-    ) -> Result<Option<klights_cluster_core::Resource>, klights_leader_api::ResourceQueryError>
-    {
-        self.get_resource(api_version, kind, namespace, name)
-            .await
-            .map_err(|error| {
-                klights_leader_api::ResourceQueryError::retryable(format!(
-                    "admission resource read failed: {error}"
-                ))
-            })
-    }
-
-    async fn list_admission_resources(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-    ) -> Result<Vec<klights_cluster_core::Resource>, klights_leader_api::ResourceQueryError> {
-        self.list_resources(api_version, kind, namespace, ResourceListQuery::all())
-            .await
-            .map(|listing| listing.items)
-            .map_err(|error| {
-                klights_leader_api::ResourceQueryError::retryable(format!(
-                    "admission resource list failed: {error}"
-                ))
-            })
-    }
-}

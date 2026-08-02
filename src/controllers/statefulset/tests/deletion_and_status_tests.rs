@@ -50,7 +50,7 @@ async fn test_statefulset_infers_current_revision_from_pods_when_status_missing(
         .await
         .unwrap();
 
-    let first = crate::api::inject_resource_version(created.data, created.resource_version);
+    let first = crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_statefulset_test(&db, &first, "test-node")
         .await
         .unwrap();
@@ -76,7 +76,8 @@ async fn test_statefulset_infers_current_revision_from_pods_when_status_missing(
         .await
         .unwrap();
 
-    let second = crate::api::inject_resource_version(updated.data, updated.resource_version);
+    let second =
+        crate::controllers::inject_resource_version(updated.data, updated.resource_version);
     reconcile_statefulset_test(&db, &second, "test-node")
         .await
         .unwrap();

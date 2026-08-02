@@ -14,7 +14,7 @@ async fn test_reconcile_deployment_rolling_update_completes_after_pods_become_re
         .await
         .unwrap();
     let deploy_with_rv =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -46,7 +46,7 @@ async fn test_reconcile_deployment_rolling_update_completes_after_pods_become_re
         .await
         .unwrap();
     let deploy_with_rv =
-        crate::api::inject_resource_version(updated.data, updated.resource_version);
+        crate::controllers::inject_resource_version(updated.data, updated.resource_version);
 
     // First reconcile: creates new RS with initial replicas
     reconcile_deployment(
@@ -95,7 +95,7 @@ async fn test_reconcile_deployment_rolling_update_completes_after_pods_become_re
         .unwrap()
         .unwrap();
     let deploy_with_rv2 =
-        crate::api::inject_resource_version(current2.data, current2.resource_version);
+        crate::controllers::inject_resource_version(current2.data, current2.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -145,7 +145,7 @@ async fn test_reconcile_deployment_rolling_update_completes_after_pods_become_re
         .await
         .unwrap();
     for rs in rs_after_ready.items {
-        let rs_with_rv = crate::api::inject_resource_version(rs.data, rs.resource_version);
+        let rs_with_rv = crate::controllers::inject_resource_version(rs.data, rs.resource_version);
         klights_controllers::replicaset::reconcile_replicaset(
             &crate::controllers::test_utils::controller_store_for_test(&db),
             __pod_repo.as_ref(),
@@ -166,7 +166,7 @@ async fn test_reconcile_deployment_rolling_update_completes_after_pods_become_re
         .unwrap()
         .unwrap();
     let deploy_with_rv3 =
-        crate::api::inject_resource_version(current3.data, current3.resource_version);
+        crate::controllers::inject_resource_version(current3.data, current3.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -216,7 +216,7 @@ async fn test_reconcile_deployment_rolling_update_completes_after_pods_become_re
         .await
         .unwrap();
     for rs in rs_after_ready2.items {
-        let rs_with_rv = crate::api::inject_resource_version(rs.data, rs.resource_version);
+        let rs_with_rv = crate::controllers::inject_resource_version(rs.data, rs.resource_version);
         klights_controllers::replicaset::reconcile_replicaset(
             &crate::controllers::test_utils::controller_store_for_test(&db),
             __pod_repo.as_ref(),
@@ -236,7 +236,7 @@ async fn test_reconcile_deployment_rolling_update_completes_after_pods_become_re
         .unwrap()
         .unwrap();
     let deploy_with_rv4 =
-        crate::api::inject_resource_version(current4.data, current4.resource_version);
+        crate::controllers::inject_resource_version(current4.data, current4.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -399,7 +399,7 @@ async fn test_deployment_stale_snapshot_after_delete_does_not_recreate_replicase
         .await
         .unwrap();
     let stale_snapshot =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     db.delete_resource("apps/v1", "Deployment", Some("default"), "stale-deploy")
         .await
@@ -464,7 +464,7 @@ async fn test_reconcile_deployment_adopts_existing_owned_replicaset() {
         )
         .await
         .unwrap();
-    let deploy_with_rv = crate::api::inject_resource_version(
+    let deploy_with_rv = crate::controllers::inject_resource_version(
         created_deploy.data.clone(),
         created_deploy.resource_version,
     );
@@ -573,7 +573,7 @@ async fn test_reconcile_deployment_adopts_orphan_matching_replicaset() {
     .await
     .unwrap();
 
-    let deploy_with_rv = crate::api::inject_resource_version(
+    let deploy_with_rv = crate::controllers::inject_resource_version(
         created_deploy.data.clone(),
         created_deploy.resource_version,
     );

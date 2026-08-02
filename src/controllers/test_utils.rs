@@ -45,7 +45,7 @@ pub async fn store_and_prepare(
         )
         .await
         .unwrap();
-    crate::api::inject_resource_version(created.data, created.resource_version)
+    crate::controllers::inject_resource_version(created.data, created.resource_version)
 }
 
 /// Build a `PodRepository` over the supplied in-memory `Datastore` for use

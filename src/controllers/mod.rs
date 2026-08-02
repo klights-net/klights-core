@@ -16,6 +16,8 @@ pub mod statefulset_controller;
 #[cfg(test)]
 pub mod test_utils;
 pub(crate) use dispatcher::ControllerDispatcher;
+#[cfg(test)]
+pub(crate) use ports::inject_resource_version;
 pub(crate) use ports::{
     ControllerEffectPort, ControllerNetworkPort, ControllerReconcilePort, ControllerResourceQuery,
     ControllerRuntimeDependencies, DeploymentControllerPodMutation, DeploymentControllerPodReader,

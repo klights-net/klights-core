@@ -130,7 +130,7 @@ mod tests {
         FollowerDiagnostics, FollowerDiagnosticsFuture, LeaderClusterStatusMetadata,
         LeaderFollowerDiagnostics,
     };
-    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
     use tower::ServiceExt;
 
     use super::*;
@@ -171,9 +171,24 @@ mod tests {
         }
     }
 
-    fn app() -> Router {
+    fn app_with(
+        role: OperationalNodeRole,
+        follower_diagnostics: Option<Arc<dyn LeaderFollowerDiagnostics>>,
+    ) -> Router {
+        app_with_supervisor(
+            role,
+            follower_diagnostics,
+            Arc::new(TaskSupervisor::new(TaskCategoryConfig::default())),
+        )
+    }
+
+    fn app_with_supervisor(
+        role: OperationalNodeRole,
+        follower_diagnostics: Option<Arc<dyn LeaderFollowerDiagnostics>>,
+        task_supervisor: Arc<TaskSupervisor>,
+    ) -> Router {
         let inputs = OperationalEndpointInputs::new(
-            OperationalNodeRole::Leader,
+            role,
             Arc::new(|| "metric_total 2\n".to_string()),
             VersionInfo::new(
                 "1",
@@ -186,13 +201,17 @@ mod tests {
                 "test-target",
             ),
             Arc::new(ClusterStatus),
-            Some(Arc::new(Followers)),
-            Arc::new(TaskSupervisor::new(TaskCategoryConfig::default())),
+            follower_diagnostics,
+            task_supervisor,
         );
         mount_operational_endpoints(
             Router::new().route("/api", get(|| async { "native" })),
             OperationalEndpointHandlers::new(inputs),
         )
+    }
+
+    fn app() -> Router {
+        app_with(OperationalNodeRole::Leader, Some(Arc::new(Followers)))
     }
 
     async fn json(response: axum::response::Response) -> serde_json::Value {
@@ -243,6 +262,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(to_bytes(native.into_body(), 16).await.unwrap(), "native");
+    }
+
+    #[tokio::test]
+    async fn join_token_route_is_removed() {
+        let response = app()
+            .oneshot(
+                Request::get("/klights/v1/join-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn worker_status_reports_streaming_state() {
+        let response = app_with(
+            OperationalNodeRole::Worker {
+                leader_endpoints: vec!["127.0.0.1:17443".to_string()],
+            },
+            None,
+        )
+        .oneshot(
+            Request::get("/klights/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let status = json(response).await;
+        assert_eq!(status["role"], "Worker");
+        assert_eq!(status["streamState"], "streaming");
+        assert_eq!(status["leaderEndpoint"], "127.0.0.1:17443");
     }
 
     #[tokio::test]
@@ -299,5 +353,122 @@ mod tests {
             .unwrap();
         assert_eq!(updated.status(), StatusCode::OK);
         assert_eq!(json(updated).await["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn task_supervisor_category_and_task_endpoints_are_queryable() {
+        let app = app();
+        for path in [
+            "/klights/v1/task-supervisor/categories",
+            "/klights/v1/task-supervisor/categories/background/tasks",
+            "/klights/v1/task-supervisor/tasks",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .header("x-remote-group", "system:masters")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert!(json(response).await.is_array());
+        }
+    }
+
+    #[tokio::test]
+    async fn task_supervisor_db_query_logging_toggle_round_trips() {
+        let app = app();
+        let update = app
+            .clone()
+            .oneshot(
+                Request::put("/klights/v1/task-supervisor/db-query-logging")
+                    .header("x-remote-group", "system:masters")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"enabled":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::OK);
+        assert_eq!(json(update).await["enabled"], true);
+
+        let get = app
+            .oneshot(
+                Request::get("/klights/v1/task-supervisor/db-query-logging")
+                    .header("x-remote-group", "system:masters")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(json(get).await["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn task_supervisor_active_background_and_other_tasks_are_queryable() {
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let app = app_with_supervisor(
+            OperationalNodeRole::Leader,
+            Some(Arc::new(Followers)),
+            supervisor.clone(),
+        );
+        let (background_tx, background_rx) = tokio::sync::oneshot::channel::<()>();
+        let (other_tx, other_rx) = tokio::sync::oneshot::channel::<()>();
+        let background = supervisor
+            .spawn_async(
+                TaskCategory::Background,
+                "queryable_background",
+                async move {
+                    let _ = background_rx.await;
+                },
+            )
+            .await
+            .unwrap();
+        let other = supervisor
+            .spawn_async(TaskCategory::Others, "queryable_other", async move {
+                let _ = other_rx.await;
+            })
+            .await
+            .unwrap();
+
+        for (path, expected) in [
+            (
+                "/klights/v1/task-supervisor/categories/background/tasks",
+                "queryable_background",
+            ),
+            (
+                "/klights/v1/task-supervisor/categories/others/tasks",
+                "queryable_other",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .header("x-remote-group", "system:masters")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                json(response)
+                    .await
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| { row["name"].as_str() == Some(expected) })
+            );
+        }
+
+        let _ = background_tx.send(());
+        let _ = other_tx.send(());
+        let _ = background.join().await;
+        let _ = other.join().await;
     }
 }

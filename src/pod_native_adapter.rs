@@ -12,11 +12,11 @@ use klights_pod_api::{
     PodRepositoryFuture, PodSpecValidation, PodStatusPersistence, PodStatusWriteRequest,
 };
 
-use crate::api::AdmissionResourceStore;
 use crate::datastore::{DatastoreHandle, ResourceListQuery};
 use crate::kubelet::pod_repository::delete_coordinator::PodDeleteCoordinator;
 use crate::kubelet::pod_repository::state_only_writer::StateOnlyWriter;
 use crate::kubelet::pod_repository::store::PodStore;
+use k8s_native_service::AdmissionResourceStore;
 
 #[cfg(test)]
 pub(crate) struct SchedulerBindGateForTest {

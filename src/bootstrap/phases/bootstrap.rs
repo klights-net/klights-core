@@ -29,8 +29,6 @@ fn publish_leadership_if_changed(
 }
 
 pub struct BootstrapPhase {
-    #[cfg(test)]
-    pub _watcher_state: Arc<crate::api::ApiState>,
     pub _node_lifecycle_start_resource_version: i64,
     pub pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
     pub pod_api_service: Arc<crate::pod_api_service::PodApiService>,
@@ -355,14 +353,17 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         is_leader_tx,
         is_leader_rx,
     } = args;
-    use crate::{api, kubelet};
+    use crate::kubelet;
     #[cfg(not(test))]
     let service_account_signing_key_path = runtime_paths.service_account_signing_key();
-    let api_runtime_paths = crate::api::ApiRuntimePaths::from_data_root(config.data_root.clone())
-        .context("invalid API runtime path layout")?;
-    let api_runtime_inputs =
-        crate::api::ApiRuntimeInputs::new(api_runtime_paths.clone(), config.api_slow_log_threshold)
-            .context("invalid API runtime inputs")?;
+    let api_runtime_paths =
+        k8s_native_service::ApiRuntimePaths::from_data_root(config.data_root.clone())
+            .context("invalid API runtime path layout")?;
+    let api_runtime_inputs = k8s_native_service::ApiRuntimeInputs::new(
+        api_runtime_paths.clone(),
+        config.api_slow_log_threshold,
+    )
+    .context("invalid API runtime inputs")?;
     let system_identity = Arc::new(crate::resource_name::SystemIdentityGenerator);
     let controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator> =
         system_identity.clone();
@@ -400,7 +401,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         klights_controllers::namespace::init_default_namespaces_with_ca_path(
             &klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
             db,
-            &api_runtime_paths.ca_cert,
+            api_runtime_paths.ca_cert(),
             chrono::Utc::now(),
             controller_identity.as_ref(),
         )
@@ -498,10 +499,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         ));
 
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-    #[cfg(not(test))]
     let namespace_lifecycle_store =
         crate::api_state_adapter::RootNamespaceTerminationStore::new(db_handle.clone());
-    #[cfg(not(test))]
     local_api_client.set_namespace_termination(
         crate::api_state_adapter::RootNamespaceTerminationReconciler::new(
             namespace_lifecycle_store.clone(),
@@ -855,7 +854,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     // Load the cluster CA cert once: the follower proxy uses it to verify the
     // leader's serving cert, and the leader uses it to cryptographically
     // re-authenticate client certificates forwarded by follower proxies.
-    let ca_cert_path = api_runtime_paths.ca_cert.clone();
+    let ca_cert_path = api_runtime_paths.ca_cert().to_path_buf();
     let cluster_ca_pem = supervisor
         .run_blocking_file_keyed("proxy_read_ca_cert", ca_cert_path.display().to_string(), {
             let p = ca_cert_path.clone();
@@ -867,8 +866,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let authority_router = if raft_node.is_some() {
         let ca_cert_pem = cluster_ca_pem.clone();
         let proxy_client_identity = klights_apiserver::load_proxy_client_identity(
-            &api_runtime_paths.api_proxy_cert,
-            &api_runtime_paths.api_proxy_key,
+            api_runtime_paths.api_proxy_cert(),
+            api_runtime_paths.api_proxy_key(),
             supervisor.as_ref(),
         )
         .await;
@@ -902,37 +901,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         );
     let node_port_forward =
         klights_kubelet::node_api::port_forward::local_node_port_forward(supervisor.clone());
-    #[cfg(test)]
-    let api_role = match &cli.role {
-        crate::bootstrap::NodeRole::Leader { .. } => crate::api::ApiNodeRole::Leader,
-        crate::bootstrap::NodeRole::Controlplane {
-            leader_endpoints,
-            as_learner,
-            ..
-        } => crate::api::ApiNodeRole::Controlplane {
-            leader_endpoints: leader_endpoints.clone(),
-            as_learner: *as_learner,
-        },
-        crate::bootstrap::NodeRole::Worker {
-            leader_endpoints, ..
-        } => crate::api::ApiNodeRole::Worker {
-            leader_endpoints: leader_endpoints.clone(),
-        },
-    };
-    #[cfg(test)]
-    let api_replication = replication_service_for_router.clone().map(|replication| {
-        let runtime = crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(
-            replication.clone(),
-        );
-        crate::api::ApiRemoteNodeServices::new(runtime.clone(), runtime, replication)
-    });
-    #[cfg(test)]
-    let api_config = Arc::new(crate::api::ApiOperationalConfig::new(
-        config.node_name.clone(),
-        config.anonymous_auth,
-        api_runtime_inputs.clone(),
-        crate::version::api_version_info(),
-    ));
     let finalizer_lifecycle =
         crate::bootstrap::finalizer_lifecycle_adapter::DatastoreFinalizerLifecycleAdapter::new_with_coordination(
             db_handle.clone(),
@@ -960,188 +928,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         positioned_watch.clone(),
         klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
         supervisor.clone(),
-        api_runtime_paths.ca_cert.clone(),
+        api_runtime_paths.ca_cert().to_path_buf(),
         controller_identity.clone(),
     );
-    #[cfg(test)]
-    let api_pod_logs = {
-        let pod_logs_root = crate::paths::pod_logs_root_path(&config.containerd_namespace);
-        let clock: Arc<dyn klights_supervisor::WallClock> =
-            Arc::new(klights_supervisor::SystemWallClock);
-        crate::node_log_runtime_adapter::pod_log_capabilities(
-            Arc::new(
-                klights_kubelet::node_api::logs::LocalNodeLogRuntime::new_with_pod_event_store(
-                    pod_logs_root.clone(),
-                    supervisor.clone(),
-                    clock.clone(),
-                    klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(Arc::new(
-                        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
-                            leader_ports.watch.clone(),
-                        ),
-                    )),
-                ),
-            ),
-            Arc::new(
-                klights_kubelet::node_api::logs::LocalNodeLogRuntime::new_without_pod_event_store(
-                    pod_logs_root,
-                    supervisor.clone(),
-                    clock,
-                ),
-            ),
-            supervisor.clone(),
-            config.node_name.clone(),
-        )
-    };
-    #[cfg(test)]
-    let watcher_streaming = k8s_native_service::StreamingDependencies::new(
-        api_pod_repository.clone(),
-        None,
-        api_replication
-            .as_ref()
-            .map(|services| services.exec.clone()),
-        node_port_forward.clone(),
-        Arc::<str>::from(config.node_name.as_str()),
-        supervisor.clone(),
-    );
-    #[cfg(test)]
-    let watcher_state = Arc::new(api::ApiState::new(
-        crate::api::ApiAuthPolicy::new(
-            std::sync::Arc::new(
-                klights_auth::authorizer::AuthorizerChain::default_chain_with_rbac(
-                    rbac_policy_store.clone(),
-                    node_policy_store,
-                ),
-            ),
-            k8s_native_service::audit::default_audit_sink(),
-            std::sync::Arc::new(k8s_native_service::priority_fairness::ApiPriorityFairness::new()),
-            rbac_policy_store,
-            crate::api::ApiAuthenticators::new(
-                Arc::new(
-                    crate::bootstrap::auth_adapters::DatastoreBootstrapTokenAuthenticator::new(
-                        db_handle.clone(),
-                    ),
-                ),
-                oidc_authenticator,
-                webhook_authenticator,
-            ),
-            cluster_ca_pem.map(std::sync::Arc::new),
-        ),
-        crate::api::ApiResourceMutationServices {
-            identity: api_identity.clone(),
-            #[cfg(test)]
-            db: db_handle.clone(),
-            watch_stream: Arc::new(
-                crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
-                    db_handle.clone(),
-                    watch_signals.clone(),
-                    positioned_watch.clone(),
-                ),
-            ),
-            #[cfg(not(test))]
-            namespace_termination: crate::api_state_adapter::RootNamespaceTerminationStore::new(
-                db_handle.clone(),
-            ),
-            #[cfg(test)]
-            namespace_termination:
-                crate::api_state_adapter_test_owner::RootNamespaceTerminationStore::new(
-                    db_handle.clone(),
-                ),
-            resource_query: leader_ports.resource_query.clone(),
-            resource_command: resource_commands.clone(),
-            finalizer_lifecycle,
-            mutation_effects,
-            list_resource_versions,
-            namespace_lists: crate::list_query_adapter::DatastoreNamespaceListPort::new(
-                db_handle.clone(),
-            ),
-            quota_runtime:
-                crate::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
-                    db_handle.clone(),
-                ),
-            admission: crate::resource_admission_adapter::ResourceAdmissionAdapter::new(
-                api_identity.clone(),
-                db_handle.clone(),
-            ),
-            custom_resource_reads:
-                crate::custom_resource_read_adapter::CustomResourceReadAdapter::new(
-                    db_handle.clone(),
-                    watch_signals.clone(),
-                    positioned_watch.clone(),
-                    supervisor.clone(),
-                ),
-            builtin_admission_defaults: generated_handler_adapter.clone(),
-            generated_lifecycle: generated_handler_adapter.clone(),
-            generated_mutations: generated_handler_adapter.clone(),
-            generated_watch: generated_handler_adapter,
-            gc_owner_lifecycle: Arc::new(gc_owner_lifecycle),
-            #[cfg(not(test))]
-            pod_repository: crate::api_state_adapter::RootApiPodRepository::new(
-                api_pod_repository.clone(),
-                pod_api_service.clone(),
-                pod_subresource_service.clone(),
-            ),
-            #[cfg(test)]
-            pod_repository: api_pod_repository.clone(),
-        },
-        crate::api::ApiDiscoveryAggregationServices::new(
-            crd_registry.clone(),
-            Arc::new(tokio::sync::OnceCell::new()),
-            Arc::new(api::apiservice_proxy::ApiServiceProxyCache::default()),
-        ),
-        crate::api::ApiControllerReconcileServices::new(
-            crate::bootstrap::service_adapters::ApiServiceWriteAllocator::new(
-                db_handle.clone(),
-                service_ipam.clone(),
-                nodeport_alloc.clone(),
-                controller_identity.clone(),
-            ),
-            #[cfg(test)]
-            service_ipam.clone(),
-            #[cfg(test)]
-            nodeport_alloc.clone(),
-            controller_dispatcher.clone(),
-            #[cfg(not(test))]
-            crate::api_state_adapter::RootApiFailureMetrics::new(metrics.clone()),
-            #[cfg(test)]
-            metrics.clone(),
-            #[cfg(not(test))]
-            crate::api_state_adapter::RootApiNodeLeaseObservations::new(node_lease_tracker.clone()),
-            #[cfg(test)]
-            node_lease_tracker.clone(),
-        ),
-        crate::api::ApiPodNodeSubresourceServices::new(
-            Arc::new(
-                crate::bootstrap::network_adapters::ApiServiceRoutingSyncAdapter::new(
-                    services.clone(),
-                ),
-            ),
-            api_pod_logs,
-            None,
-            node_metrics.clone(),
-            #[cfg(test)]
-            Some(pod_lifecycle_router.clone()),
-            Some(pod_lifecycle_router.clone()),
-            Some(
-                crate::bootstrap::operational_adapters::ApiPodStartRetryDiagnostics::new(
-                    pod_start_retry_state.clone(),
-                ),
-            ),
-        ),
-        crate::api::ApiOperationalServices::new(
-            api_role,
-            api_replication.clone(),
-            api_config,
-            Arc::new(klights_auth::clock::SystemClock),
-            crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(
-                db_handle.clone(),
-            ),
-            supervisor.clone(),
-            klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
-            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
-            api_authority.clone(),
-        ),
-        watcher_streaming,
-    ));
     let kubelet_config = crate::kubelet::context::KubeletConfig::try_new(
         config.service_cidr.clone(),
         config.node_name.clone(),
@@ -1710,24 +1499,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             supervisor.clone(),
         ) as Arc<dyn klights_node_api::NodeExec>
     });
-    #[cfg(not(test))]
-    let root_api_role = match &cli.role {
-        crate::bootstrap::NodeRole::Leader { .. } => crate::api::RootApiRole::Leader,
-        crate::bootstrap::NodeRole::Controlplane {
-            leader_endpoints,
-            as_learner,
-            ..
-        } => crate::api::RootApiRole::Controlplane {
-            leader_endpoints: leader_endpoints.clone(),
-            as_learner: *as_learner,
-        },
-        crate::bootstrap::NodeRole::Worker {
-            leader_endpoints, ..
-        } => crate::api::RootApiRole::Worker {
-            leader_endpoints: leader_endpoints.clone(),
-        },
-    };
-    #[cfg(not(test))]
     let root_api_replication = replication_service_for_router.clone().map(|replication| {
         let runtime = crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter::new(
             replication.clone(),
@@ -1735,10 +1506,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         (
             runtime.clone() as Arc<dyn klights_node_api::NodeExec>,
             runtime as Arc<dyn klights_node_api::NodeLog>,
-            replication as Arc<dyn klights_leader_api::LeaderFollowerDiagnostics>,
         )
     });
-    #[cfg(not(test))]
     let api_pod_logs = {
         let pod_logs_root = crate::paths::pod_logs_root_path(&config.containerd_namespace);
         let clock: Arc<dyn klights_supervisor::WallClock> =
@@ -1777,8 +1546,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         )
         .await
         .context("load root-owned ServiceAccount signing state")?;
-    #[cfg(not(test))]
-    let (api_router, api_outer_layers) = api::build_router_from_root(
+    #[cfg(test)]
+    let api_signing_keys =
+        crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test();
+    let (api_router, api_outer_layers) = k8s_native_service::build_current_router(
         api_identity.clone(),
         Arc::new(
             klights_auth::authorizer::AuthorizerChain::default_chain_with_rbac(
@@ -1855,40 +1626,53 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 pod_start_retry_state.clone(),
             ),
         ),
-        root_api_role,
         root_api_replication,
         config.node_name.clone(),
         config.anonymous_auth,
         api_runtime_inputs,
-        crate::version::api_version_info(),
         Arc::new(klights_auth::clock::SystemClock),
-        crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(db_handle.clone()),
         supervisor.clone(),
         api_signing_keys,
         api_authority,
     );
-    #[cfg(test)]
-    let state_with_cri = {
-        let mut state = (*watcher_state).clone();
-        state.pod_node_subresources_mut().local_node_exec = local_node_exec.clone();
-        *state.streaming_mut() = k8s_native_service::StreamingDependencies::new(
-            api_pod_repository.clone(),
-            local_node_exec,
-            api_replication
-                .as_ref()
-                .map(|services| services.exec.clone()),
-            node_port_forward.clone(),
-            Arc::<str>::from(config.node_name.as_str()),
-            supervisor.clone(),
-        );
-        state
+    let operational_role = match &cli.role {
+        crate::bootstrap::NodeRole::Leader { .. } => klights_apiserver::OperationalNodeRole::Leader,
+        crate::bootstrap::NodeRole::Controlplane {
+            leader_endpoints,
+            as_learner,
+            ..
+        } => klights_apiserver::OperationalNodeRole::Controlplane {
+            leader_endpoints: leader_endpoints.clone(),
+            as_learner: *as_learner,
+        },
+        crate::bootstrap::NodeRole::Worker {
+            leader_endpoints, ..
+        } => klights_apiserver::OperationalNodeRole::Worker {
+            leader_endpoints: leader_endpoints.clone(),
+        },
     };
-    #[cfg(test)]
-    let (api_router, api_outer_layers) = api::build_router_parts(state_with_cri);
-    let api_router = api_outer_layers.finish(klights_apiserver::wrap_authority_router(
-        api_router,
-        authority_router,
-    ));
+    let operational_metrics = metrics.clone();
+    let operational_endpoints = klights_apiserver::OperationalEndpointHandlers::new(
+        klights_apiserver::OperationalEndpointInputs::new(
+            operational_role,
+            Arc::new(move || operational_metrics.render_prometheus()),
+            crate::version::api_version_info(),
+            crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(
+                db_handle.clone(),
+            ),
+            replication_service_for_router.as_ref().map(|replication| {
+                replication.clone() as Arc<dyn klights_leader_api::LeaderFollowerDiagnostics>
+            }),
+            supervisor.clone(),
+        ),
+    );
+    let api_router = klights_apiserver::mount_operational_endpoints(
+        api_router.into_router(),
+        operational_endpoints,
+    );
+    let api_router = api_outer_layers.finish_with_shell(api_router, move |router| {
+        klights_apiserver::wrap_authority_router(router, authority_router)
+    });
     let app = if let Some(rs) = replication_service_for_router {
         // P3-11c: if raft mode is active on this leader-class boot,
         // wire the RaftNode-backed Raft RPC dispatcher and the
@@ -1970,8 +1754,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     };
 
     Ok(BootstrapPhase {
-        #[cfg(test)]
-        _watcher_state: watcher_state,
         pod_repository: api_pod_repository,
         pod_api_service,
         pod_scheduling,

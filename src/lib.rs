@@ -2,13 +2,8 @@
 #[path = "admission/tests.rs"]
 mod admission_tests;
 mod allocator;
-pub mod api;
 mod api_helpers_adapter;
-#[cfg(not(test))]
 mod api_state_adapter;
-#[cfg(test)]
-#[path = "api_state_adapter.rs"]
-mod api_state_adapter_test_owner;
 mod apiservice_side_effect_adapter;
 mod authority_adapter;
 pub mod cli;
@@ -42,6 +37,8 @@ mod generated_handler_adapter;
 mod grpc_test_support;
 mod hpa_controller_adapter;
 mod hpa_side_effect_adapter;
+#[cfg(feature = "integration-test-harness")]
+pub mod integration_test_harness;
 mod job_side_effect_adapter;
 mod job_store_adapter;
 pub mod kubelet;
@@ -99,12 +96,6 @@ mod watch_commit_observation_adapter;
 mod watch_stream_adapter;
 mod workload_pod_side_effect_adapter;
 
-#[cfg(test)]
-mod api_handler_tests;
-#[cfg(test)]
-mod crd_status_tests;
-#[cfg(test)]
-mod crd_tests;
 #[cfg(test)]
 mod cronjob_event_driven_scheduler_tests;
 // Deployment script invariants are covered by the base-repo source guard run

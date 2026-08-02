@@ -402,8 +402,8 @@ pub(super) fn map_repository_error(
 mod tests {
     use axum::response::IntoResponse;
 
-    use crate::api::AppError;
     use crate::pod_native_orchestration::map_api_error_to_pod_repository;
+    use k8s_native_service::AppError;
 
     #[tokio::test]
     async fn pod_repository_error_round_trips_kubernetes_http_categories() {

@@ -39,11 +39,16 @@ hyper = { workspace = true, features = ["client"] }
 hyper-util = { workspace = true }
 k8s-openapi = { workspace = true }
 json-patch = { workspace = true }
+paste = { workspace = true }
 prost = { workspace = true }
+rcgen = { workspace = true }
 reqwest = { workspace = true }
+rsa = { workspace = true }
 rust-cel-parser = { workspace = true }
 serde = { workspace = true }
+serde_ignored = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
@@ -54,7 +59,10 @@ tracing = { workspace = true }
 urlencoding = { workspace = true }
 
 [dev-dependencies]
-rcgen = { workspace = true }
+proptest = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 tower = { workspace = true }

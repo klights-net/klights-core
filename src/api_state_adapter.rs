@@ -3,11 +3,11 @@ use std::sync::Arc;
 use klights_cluster_core::Resource;
 use serde_json::Value;
 
-use crate::api::state_ports::{
+use crate::datastore::DatastoreHandle;
+use k8s_native_service::ports::{
     ApiFailureEntry, ApiFailureMetrics, ApiNodeLeaseObservations, ApiNodeLeaseObservedFuture,
     ApiPodRepository,
 };
-use crate::datastore::DatastoreHandle;
 
 fn validate_effect_authority() -> anyhow::Result<()> {
     klights_leader_api::validate_authority_if_scoped()
@@ -210,7 +210,7 @@ impl klights_reconcile_api::NamespaceTerminationSink for RootNamespaceTerminatio
         Box::pin(async move {
             let outcome = match request.expected_uid {
                 Some(uid) => {
-                    crate::api::reconcile_namespace_termination_for_uid_with_outcome_at(
+                    k8s_native_service::reconcile_namespace_termination_for_uid_with_outcome_at(
                         self.store.as_ref(),
                         &request.namespace,
                         &uid,
@@ -219,23 +219,23 @@ impl klights_reconcile_api::NamespaceTerminationSink for RootNamespaceTerminatio
                     )
                     .await
                 }
-                None => crate::api::reconcile_namespace_termination_at(
+                None => k8s_native_service::reconcile_namespace_termination_at(
                     self.store.as_ref(),
                     &request.namespace,
                     self.metrics.as_ref(),
                     klights_supervisor::SystemWallClock::now_utc(),
                 )
                 .await
-                .map(|()| crate::api::NamespaceTerminationOutcome::Finalized),
+                .map(|()| k8s_native_service::NamespaceTerminationOutcome::Finalized),
             }
             .map_err(|error| {
                 klights_reconcile_api::ReconcileSinkError::unavailable(format!("{error:?}"))
             })?;
             Ok(match outcome {
-                crate::api::NamespaceTerminationOutcome::Finalized => {
+                k8s_native_service::NamespaceTerminationOutcome::Finalized => {
                     klights_reconcile_api::NamespaceTerminationOutcome::Finalized
                 }
-                crate::api::NamespaceTerminationOutcome::StillPending => {
+                k8s_native_service::NamespaceTerminationOutcome::StillPending => {
                     klights_reconcile_api::NamespaceTerminationOutcome::StillPending
                 }
             })
@@ -245,16 +245,15 @@ impl klights_reconcile_api::NamespaceTerminationSink for RootNamespaceTerminatio
 
 pub(crate) struct RootApiPodRepository {
     inner: Arc<crate::kubelet::pod_repository::PodRepository>,
-    api: Arc<crate::pod_api_service::PodApiService>,
-    subresource: Arc<crate::pod_subresource_service::PodSubresourceService>,
+    api: Arc<dyn klights_pod_api::PodApiMutation>,
+    subresource: Arc<dyn klights_pod_api::PodSubresourceMutation>,
 }
 
 impl RootApiPodRepository {
-    #[cfg(not(test))]
     pub(crate) fn new(
         inner: Arc<crate::kubelet::pod_repository::PodRepository>,
-        api: Arc<crate::pod_api_service::PodApiService>,
-        subresource: Arc<crate::pod_subresource_service::PodSubresourceService>,
+        api: Arc<dyn klights_pod_api::PodApiMutation>,
+        subresource: Arc<dyn klights_pod_api::PodSubresourceMutation>,
     ) -> Arc<Self> {
         Arc::new(Self {
             inner,
@@ -475,19 +474,10 @@ pub(crate) struct RootApiFailureMetrics {
 }
 
 impl RootApiFailureMetrics {
-    #[cfg(not(test))]
     pub(crate) fn new(
         inner: Arc<klights_controllers::side_effects::SideEffectMetrics>,
     ) -> Arc<Self> {
         Arc::new(Self { inner })
-    }
-}
-
-impl crate::api::NamespaceTerminationMetrics for RootApiFailureMetrics {
-    fn record_namespace_delete_failure(&self) {
-        klights_reconcile_api::ReconcileFailureMetrics::record_namespace_delete_failure(
-            self.inner.as_ref(),
-        );
     }
 }
 
@@ -532,7 +522,6 @@ pub(crate) struct RootApiNodeLeaseObservations {
 }
 
 impl RootApiNodeLeaseObservations {
-    #[cfg(not(test))]
     pub(crate) fn new(inner: Arc<klights_controllers::node_lease::NodeLeaseTracker>) -> Arc<Self> {
         Arc::new(Self { inner })
     }

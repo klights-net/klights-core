@@ -50,9 +50,14 @@ mod tests {
 
         // Reconcile against a namespace that never existed. The function
         // should silently no-op (Ok), not error and not bump failure counter.
-        crate::api::reconcile_namespace_termination(&db, "ghost-ns", &metrics)
-            .await
-            .expect("reconcile against missing namespace must be ok");
+        k8s_native_service::reconcile_namespace_termination_at(
+            &db,
+            "ghost-ns",
+            metrics.as_ref(),
+            chrono::DateTime::UNIX_EPOCH,
+        )
+        .await
+        .expect("reconcile against missing namespace must be ok");
 
         assert_eq!(
             metrics
@@ -91,9 +96,14 @@ mod tests {
             .await
             .expect("create ns");
 
-        crate::api::reconcile_namespace_termination(&db, ns_name, &metrics)
-            .await
-            .expect("reconcile ok");
+        k8s_native_service::reconcile_namespace_termination_at(
+            &db,
+            ns_name,
+            metrics.as_ref(),
+            chrono::DateTime::UNIX_EPOCH,
+        )
+        .await
+        .expect("reconcile ok");
 
         assert_eq!(
             metrics

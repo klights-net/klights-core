@@ -3,13 +3,13 @@ use std::sync::Arc;
 use klights_cluster_core::Resource;
 use serde_json::Value;
 
-use crate::api::AppError;
-use crate::api::generated_handler_ports::{GeneratedWatchPort, GeneratedWatchRequest};
-use crate::datastore::DatastoreHandle;
+use crate::datastore::{DatastoreHandle, ResourceListQuery};
+use k8s_native_service::AppError;
 use k8s_native_service::generic_command::{
     BuiltinAdmissionDefaultsPort, GeneratedLifecyclePort, GeneratedResourceMutationPort,
     GenericCommandFuture,
 };
+use k8s_native_service::ports::{GeneratedWatchPort, GeneratedWatchRequest};
 
 pub(crate) struct GeneratedHandlerAdapter {
     db: DatastoreHandle,
@@ -80,20 +80,11 @@ impl BuiltinAdmissionDefaultsPort for GeneratedHandlerAdapter {
         mut pod: Value,
     ) -> GenericCommandFuture<'_, Value> {
         Box::pin(async move {
-            crate::api::helpers::apply_pod_runtimeclass_admission(self.db.as_ref(), &mut pod)
+            k8s_native_service::apply_pod_runtimeclass_admission(self, &mut pod).await?;
+            k8s_native_service::apply_limitrange_defaults_to_pod(self, &namespace, &mut pod)
                 .await?;
-            crate::api::helpers::apply_limitrange_defaults_to_pod(
-                self.db.as_ref(),
-                &namespace,
-                &mut pod,
-            )
-            .await?;
-            crate::api::helpers::enforce_limitrange_constraints_for_pod(
-                self.db.as_ref(),
-                &namespace,
-                &pod,
-            )
-            .await?;
+            k8s_native_service::enforce_limitrange_constraints_for_pod(self, &namespace, &pod)
+                .await?;
             Ok(pod)
         })
     }
@@ -104,19 +95,48 @@ impl BuiltinAdmissionDefaultsPort for GeneratedHandlerAdapter {
         mut claim: Value,
     ) -> GenericCommandFuture<'_, Value> {
         Box::pin(async move {
-            crate::api::helpers::apply_default_storage_class_admission(
-                self.db.as_ref(),
-                &mut claim,
-            )
-            .await?;
-            crate::api::helpers::enforce_limitrange_constraints_for_pvc(
-                self.db.as_ref(),
-                &namespace,
-                &claim,
-            )
-            .await?;
+            k8s_native_service::apply_default_storage_class_admission(self, &mut claim).await?;
+            k8s_native_service::enforce_limitrange_constraints_for_pvc(self, &namespace, &claim)
+                .await?;
             Ok(claim)
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl k8s_native_service::ports::AdmissionResourceStore for GeneratedHandlerAdapter {
+    async fn get_admission_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Resource>, klights_leader_api::ResourceQueryError> {
+        self.db
+            .get_resource(api_version, kind, namespace, name)
+            .await
+            .map_err(|error| {
+                klights_leader_api::ResourceQueryError::retryable(format!(
+                    "admission resource read failed: {error}"
+                ))
+            })
+    }
+
+    async fn list_admission_resources(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+    ) -> Result<Vec<Resource>, klights_leader_api::ResourceQueryError> {
+        self.db
+            .list_resources(api_version, kind, namespace, ResourceListQuery::all())
+            .await
+            .map(|listing| listing.items)
+            .map_err(|error| {
+                klights_leader_api::ResourceQueryError::retryable(format!(
+                    "admission resource list failed: {error}"
+                ))
+            })
     }
 }
 
@@ -276,8 +296,8 @@ impl GeneratedWatchPort for GeneratedHandlerAdapter {
         request: GeneratedWatchRequest,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = axum::body::Body> + Send + '_>> {
         Box::pin(async move {
-            crate::api::watch_stream::build_label_selector_watch_stream(
-                crate::api::watch_stream::LabelSelectorWatchStreamRequest {
+            k8s_native_service::watch::build_label_selector_watch_stream(
+                k8s_native_service::watch::LabelSelectorWatchStreamRequest {
                     source: self.watch_source.clone(),
                     task_supervisor: self.task_supervisor.clone(),
                     api_version: &request.api_version,
@@ -289,7 +309,7 @@ impl GeneratedWatchPort for GeneratedHandlerAdapter {
                     label_selector: request.label_selector,
                     field_selector: request.field_selector,
                     table_format: request.table_format,
-                    table_renderer: crate::api::watch_event_to_table_at,
+                    table_renderer: k8s_native_service::response::watch_event_to_table_at,
                     stream_format: request.stream_format,
                     timeout_seconds: request.timeout_seconds,
                     emit_initial_state_for_resource_version_zero: request

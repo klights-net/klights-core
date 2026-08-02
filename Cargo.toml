@@ -328,6 +328,14 @@ sqlite = []
 redb = []
 linux-network = []
 containerd = []
+integration-test-harness = [
+    "k8s-native-service/test-support",
+    "klights-auth/test-support",
+    "klights-cluster-datastore/test-support",
+    "klights-cluster-store/test-support",
+    "klights-kubelet/test-support",
+    "klights-networking/test-support",
+]
 sqlcipher = [
     "sqlite",
     "rusqlite/bundled-sqlcipher-vendored-openssl",

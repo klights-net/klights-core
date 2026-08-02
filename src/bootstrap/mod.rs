@@ -20,7 +20,7 @@ pub(crate) mod node_registration_profile;
 pub mod node_role;
 pub mod observed_endpoint;
 pub(crate) mod operational_adapters;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub(crate) mod outbox_apply_adapter;
 pub mod phases;
 pub mod runtime;

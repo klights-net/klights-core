@@ -41,7 +41,7 @@ mod tests {
             .unwrap();
 
         let deployment_with_rv =
-            crate::api::inject_resource_version(created.data, created.resource_version);
+            crate::controllers::inject_resource_version(created.data, created.resource_version);
 
         // Reconcile should succeed (not return error) and set failure condition
         let coordination = klights_controllers::ControllerCoordination::new();

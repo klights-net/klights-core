@@ -10,7 +10,7 @@ mod rootless_plane_integration_tests;
 #[cfg(test)]
 #[path = "service_routing/tests.rs"]
 mod service_routing_adapter_tests;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub mod test_support;
 
 #[cfg(test)]

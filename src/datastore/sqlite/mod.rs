@@ -9,7 +9,7 @@ use serde_json::Value;
 #[cfg(test)]
 use tokio::sync::broadcast;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use super::backend::CommitObservationSink;
 use super::backend::DatastoreBackend;
 use super::types::{
@@ -24,7 +24,7 @@ use klights_cluster_core::{
 };
 use klights_cluster_datastore::sqlite::embedded::Datastore as PassiveDatastore;
 use klights_cluster_store::ClusterMetadataRead;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use klights_cluster_store::StagedPostCommit;
 #[cfg(test)]
 use klights_watch::WatchTopic;
@@ -64,7 +64,7 @@ impl Datastore {
             cluster_db_path,
             supervisor,
             key_file,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "integration-test-harness"))]
             crate::watch_commit_observation_adapter::new_sink(),
             crate::outbox_response_codec_adapter::new_codec(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),
@@ -76,11 +76,13 @@ impl Datastore {
         cluster_db_path: &std::path::Path,
         supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
         key_file: Option<&std::path::Path>,
-        #[cfg(test)] commit_sink: std::sync::Arc<dyn CommitObservationSink>,
+        #[cfg(any(test, feature = "integration-test-harness"))] commit_sink: std::sync::Arc<
+            dyn CommitObservationSink,
+        >,
         outbox_codec: std::sync::Arc<dyn klights_cluster_store::OutboxResponseCodec>,
         wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "integration-test-harness"))]
         let passive = PassiveDatastore::new_persistent_paths_with_sink(
             cluster_db_path,
             supervisor,
@@ -90,7 +92,7 @@ impl Datastore {
             wall_clock,
         )
         .await?;
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "integration-test-harness")))]
         let passive = PassiveDatastore::new_persistent_paths(
             cluster_db_path,
             supervisor,
@@ -104,11 +106,13 @@ impl Datastore {
 
     pub async fn new_in_memory_with_watch_and_executor_with_sink(
         executor: klights_supervisor::DbExecutor,
-        #[cfg(test)] commit_sink: std::sync::Arc<dyn CommitObservationSink>,
+        #[cfg(any(test, feature = "integration-test-harness"))] commit_sink: std::sync::Arc<
+            dyn CommitObservationSink,
+        >,
         outbox_codec: std::sync::Arc<dyn klights_cluster_store::OutboxResponseCodec>,
         wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "integration-test-harness"))]
         let passive = PassiveDatastore::new_in_memory_with_watch_and_executor_with_sink(
             executor,
             commit_sink,
@@ -116,7 +120,7 @@ impl Datastore {
             wall_clock,
         )
         .await?;
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "integration-test-harness")))]
         let passive = PassiveDatastore::new_in_memory_with_watch_and_executor(
             executor,
             outbox_codec,
@@ -126,7 +130,7 @@ impl Datastore {
         Ok(Self(passive))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub async fn new_in_memory() -> Result<Self> {
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
@@ -328,7 +332,7 @@ pub fn create_staged_post_commit(
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub fn staged_test_event(pending: &StagedPostCommit) -> Option<crate::watch::WatchEvent> {
     let staged = pending.test_event()?;
     let mut event = crate::watch::WatchEvent::from_type(
@@ -346,7 +350,7 @@ pub fn staged_test_event(pending: &StagedPostCommit) -> Option<crate::watch::Wat
     Some(event)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub fn staged_post_commit_from_event(event: crate::watch::WatchEvent) -> StagedPostCommit {
     let resource = Resource::try_from_data(event.object.clone())
         .expect("test watch event must carry canonical resource identity");
@@ -366,7 +370,7 @@ pub fn staged_post_commit_from_event(event: crate::watch::WatchEvent) -> StagedP
 
 #[async_trait]
 impl DatastoreBackend for Datastore {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn commit_observation_sink(&self) -> std::sync::Arc<dyn CommitObservationSink> {
         PassiveDatastore::commit_observation_sink(self)
             .expect("test datastore must install a commit observation sink")

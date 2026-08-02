@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
-use crate::api::apply_patch;
+use k8s_native_service::apply_patch;
 use klights_cluster_core::Resource;
 use klights_pod_api::{
     PodGetRequest, PodPersistence, PodPersistenceReplaceRequest, PodQuery, PodRepositoryError,

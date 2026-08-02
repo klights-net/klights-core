@@ -1,5 +1,5 @@
-use crate::api::watch_stream::{WatchSourceListFuture, WatchSourceWaitFuture, WatchStreamSource};
 use crate::datastore::{DatastoreHandle, ResourceListQuery};
+use k8s_native_service::watch::{WatchSourceListFuture, WatchSourceWaitFuture, WatchStreamSource};
 
 pub(crate) struct DatastoreWatchStreamAdapter {
     db: DatastoreHandle,
@@ -97,7 +97,7 @@ async fn wait_until_fresh(
     }
     let sleep = task_supervisor.sleep(
         "watch_read_freshness_wait",
-        crate::api::watch_stream::READ_FRESHNESS_TIMEOUT,
+        k8s_native_service::watch::READ_FRESHNESS_TIMEOUT,
     );
     tokio::pin!(sleep);
     loop {

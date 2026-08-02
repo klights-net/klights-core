@@ -16,7 +16,11 @@ pub(crate) mod snapshot_export;
 pub mod sqlite;
 pub mod types;
 
+#[cfg(any(test, feature = "integration-test-harness"))]
+pub use backend::CommitObservationSink;
 pub(crate) use backend::DatastoreBackendLifecyclePort;
+#[cfg(test)]
+pub use backend::TestWatchStore;
 pub use backend::{
     AppliedOutboxStore, ClusterResourceQueryStore, CommittedOutboxApply,
     CurrentResourceVersionStore, DatastoreBackend, DatastoreBackendMetaStore,
@@ -26,8 +30,6 @@ pub use backend::{
     SnapshotExclusiveFence, SnapshotMutationFence, StatusStore, WatchBroadcastMode,
     WatchHistoryStore, WatchMaintenanceStore, WatchReplayAnchorStore, WatchStore,
 };
-#[cfg(test)]
-pub use backend::{CommitObservationSink, TestWatchStore};
 pub use klights_cluster_core::{
     PatchKind, PositionedWatchEvent, Resource, ResourceBatchOperation, ResourceBatchPutMode,
     ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
@@ -44,8 +46,10 @@ pub use types::{
     SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget, WatchTargetScope,
 };
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub mod test_support;
 
 #[cfg(test)]
-pub use sqlite::{create_staged_post_commit, staged_post_commit_from_event, staged_test_event};
+pub use sqlite::create_staged_post_commit;
+#[cfg(any(test, feature = "integration-test-harness"))]
+pub use sqlite::{staged_post_commit_from_event, staged_test_event};

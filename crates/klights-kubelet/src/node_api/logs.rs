@@ -1746,6 +1746,10 @@ impl Drop for LocalPodLogStreamSession {
 }
 
 #[cfg(test)]
+#[path = "logs_phase17g_tests.rs"]
+mod logs_phase17g_tests;
+
+#[cfg(test)]
 mod tests {
     use std::time::Duration;
 

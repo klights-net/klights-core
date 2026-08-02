@@ -32,3 +32,50 @@ pub(crate) fn classify_namespace(
         NamespaceCreateEligibility::Allowed
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_in_missing_namespace_is_forbidden() {
+        assert_eq!(
+            classify_namespace("ghost", None),
+            NamespaceCreateEligibility::Missing
+        );
+    }
+
+    #[test]
+    fn create_in_existing_active_namespace_is_allowed() {
+        let namespace = serde_json::json!({"metadata": {"name": "team-a"}});
+        assert_eq!(
+            classify_namespace("team-a", Some(&namespace)),
+            NamespaceCreateEligibility::Allowed
+        );
+    }
+
+    #[test]
+    fn create_in_immortal_system_namespace_is_allowed_even_without_row() {
+        for namespace in ["default", "kube-system", "kube-public", "kube-node-lease"] {
+            assert_eq!(
+                classify_namespace(namespace, None),
+                NamespaceCreateEligibility::Allowed,
+                "protected namespace {namespace} must remain eligible"
+            );
+        }
+    }
+
+    #[test]
+    fn create_in_terminating_namespace_is_forbidden() {
+        let namespace = serde_json::json!({
+            "metadata": {
+                "name": "team-b",
+                "deletionTimestamp": "2026-06-13T00:00:00Z"
+            }
+        });
+        assert_eq!(
+            classify_namespace("team-b", Some(&namespace)),
+            NamespaceCreateEligibility::Terminating
+        );
+    }
+}

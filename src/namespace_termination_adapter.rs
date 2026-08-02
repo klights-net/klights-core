@@ -34,7 +34,7 @@ pub(crate) fn effect(db: DatastoreHandle, metrics: Arc<SideEffectMetrics>) -> Ar
     #[cfg(not(test))]
     let store = crate::api_state_adapter::RootNamespaceTerminationStore::new(db);
     #[cfg(test)]
-    let store = crate::api_state_adapter_test_owner::RootNamespaceTerminationStore::new(db);
+    let store = crate::api_state_adapter::RootNamespaceTerminationStore::new(db);
     Arc::new(NamespaceTerminationEffect { store, metrics })
 }
 
@@ -43,7 +43,7 @@ pub(crate) async fn reconcile(
     namespace: &str,
     metrics: &SideEffectMetrics,
 ) -> Result<()> {
-    crate::api::reconcile_namespace_termination_at(
+    k8s_native_service::reconcile_namespace_termination_at(
         store,
         namespace,
         metrics,

@@ -329,7 +329,8 @@ async fn test_job_create_loop_observes_live_parallelism_scale_down() {
         .create_resource("batch/v1", "Job", Some("default"), "scale-down-job", job)
         .await
         .unwrap();
-    let job_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
+    let job_with_rv =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     super::reconcile_job(
         &crate::controllers::test_utils::controller_store_for_test(&db),

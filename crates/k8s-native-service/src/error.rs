@@ -532,4 +532,29 @@ mod tests {
         assert_eq!(causes[0]["field"], "spec.containers");
         assert_eq!(causes[0]["message"], "Required value");
     }
+
+    #[test]
+    fn test_map_validating_admission_error_returns_forbidden() {
+        let mapped =
+            map_validating_admission_error(anyhow::anyhow!("Admission denied by webhook: blocked"));
+        assert!(matches!(mapped, AppError::Forbidden(message) if message.contains("blocked")));
+    }
+
+    #[tokio::test]
+    async fn test_anyhow_409_already_exists_maps_to_already_exists_reason() {
+        let error = AppError::from(anyhow::anyhow!("Resource already exists (409 Conflict)"));
+        let (status, body) = body_of(error).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["reason"], "AlreadyExists");
+    }
+
+    #[tokio::test]
+    async fn test_anyhow_409_version_conflict_maps_to_conflict_reason() {
+        let error = AppError::from(anyhow::anyhow!(
+            "Resource not found or version conflict (409 Conflict)"
+        ));
+        let (status, body) = body_of(error).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["reason"], "Conflict");
+    }
 }

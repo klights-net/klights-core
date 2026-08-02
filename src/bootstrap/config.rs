@@ -335,7 +335,7 @@ impl KlightsConfig {
     }
 
     /// Test-friendly default with in-memory DB.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub fn test_default() -> Self {
         let ns = "klights-test";
         Self {

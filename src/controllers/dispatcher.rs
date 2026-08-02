@@ -452,7 +452,7 @@ impl ControllerDispatcher {
         self.runtime.take_next().await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub async fn dispatch_next_key_for_test(
         &self,
         db_handle: &crate::datastore::DatastoreHandle,
@@ -463,7 +463,13 @@ impl ControllerDispatcher {
             self.runtime.begin_key_dispatch(&key).await,
             "test dispatcher cannot drain a key that is already in flight"
         );
+        #[cfg(test)]
         self.dispatch_key(&key, db_handle, node_name).await;
+        #[cfg(not(test))]
+        {
+            let _ = (db_handle, node_name);
+            self.dispatch_key(&key).await;
+        }
         self.runtime.finish_key_dispatch(key.clone()).await;
         key
     }
@@ -577,10 +583,8 @@ impl ControllerDispatcher {
             }
         };
 
-        let value = crate::controllers::ports::inject_resource_version(
-            resource.data,
-            resource.resource_version,
-        );
+        let value =
+            crate::controllers::inject_resource_version(resource.data, resource.resource_version);
         match self.reconcile_unlocked(&value, db_handle, node_name).await {
             Ok(()) => {
                 self.runtime.record_success(key).await;
@@ -1114,10 +1118,8 @@ mod tests {
             )
             .await
             .expect("create service");
-        let resource = crate::controllers::ports::inject_resource_version(
-            service.data,
-            service.resource_version,
-        );
+        let resource =
+            crate::controllers::inject_resource_version(service.data, service.resource_version);
 
         let service_ipam = Arc::new(ServiceIpam::new("10.43.128.0/17"));
         let mut dispatcher = ControllerDispatcher::new(service_ipam);
@@ -1328,7 +1330,7 @@ mod tests {
             .await
             .unwrap();
 
-        let resource = crate::controllers::ports::inject_resource_version(
+        let resource = crate::controllers::inject_resource_version(
             deployment.data,
             deployment.resource_version,
         );
@@ -1406,8 +1408,7 @@ mod tests {
             .set_pod_repository(crate::controllers::test_utils::pod_repository_for_test(&db))
             .await;
 
-        let resource =
-            crate::controllers::ports::inject_resource_version(job.data, job.resource_version);
+        let resource = crate::controllers::inject_resource_version(job.data, job.resource_version);
         dispatcher
             .reconcile(&resource, &db_handle, "test-node")
             .await

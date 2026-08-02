@@ -1327,7 +1327,8 @@ async fn test_daemonset_rolling_update_waits_for_old_pod_final_delete_before_rep
         .create_resource("apps/v1", "DaemonSet", Some("test-ns"), "nonsurge-ds", ds)
         .await
         .unwrap();
-    let ds_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
+    let ds_with_rv =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_daemonset_test_with_identity(&db, &ds_with_rv, identity.as_ref())
         .await
         .unwrap();
@@ -1352,7 +1353,7 @@ async fn test_daemonset_rolling_update_waits_for_old_pod_final_delete_before_rep
         .await
         .unwrap();
     let updated_for_reconcile =
-        crate::api::inject_resource_version(updated_ds.data, updated_ds.resource_version);
+        crate::controllers::inject_resource_version(updated_ds.data, updated_ds.resource_version);
     reconcile_daemonset_test_with_identity(&db, &updated_for_reconcile, identity.as_ref())
         .await
         .unwrap();
@@ -1408,7 +1409,7 @@ async fn test_daemonset_rolling_update_waits_for_old_pod_final_delete_before_rep
         .unwrap()
         .unwrap();
     let ds_after_final_delete =
-        crate::api::inject_resource_version(current_ds.data, current_ds.resource_version);
+        crate::controllers::inject_resource_version(current_ds.data, current_ds.resource_version);
     reconcile_daemonset_test_with_identity(&db, &ds_after_final_delete, identity.as_ref())
         .await
         .unwrap();
@@ -1898,7 +1899,8 @@ async fn test_daemonset_replaces_failed_pod() {
         )
         .await
         .unwrap();
-    let ds_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
+    let ds_with_rv =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     // First reconcile: creates 1 pod
     reconcile_daemonset_test_with_identity(&db, &ds_with_rv, identity.as_ref())
@@ -1940,7 +1942,7 @@ async fn test_daemonset_replaces_failed_pod() {
         .unwrap()
         .unwrap();
     let ds_with_rv2 =
-        crate::api::inject_resource_version(current_ds.data, current_ds.resource_version);
+        crate::controllers::inject_resource_version(current_ds.data, current_ds.resource_version);
     reconcile_daemonset_test_with_identity(&db, &ds_with_rv2, identity.as_ref())
         .await
         .unwrap();
@@ -2000,7 +2002,8 @@ async fn test_daemonset_respects_pod_resourcequota() {
         .create_resource("apps/v1", "DaemonSet", Some("test-ns"), "quota-ds", ds)
         .await
         .unwrap();
-    let ds_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
+    let ds_with_rv =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     let result = reconcile_daemonset_test(&db, &ds_with_rv).await;
     assert!(

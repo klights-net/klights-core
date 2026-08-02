@@ -228,7 +228,9 @@ pub mod workqueue;
 mod tests;
 
 #[cfg(test)]
-pub(crate) use crate::pod_repository_composition::{PodRepositoryBuildConfig, PodSchedulingMode};
+pub(crate) use crate::pod_repository_composition::PodRepositoryBuildConfig;
+#[cfg(test)]
+pub(crate) use crate::pod_repository_composition::PodSchedulingMode;
 pub use types::{
     PodApiCreateRequest, PodApiCreateResult, PodApiDeleteOutcome, PodApiUpdateOutcome,
     PodNetworkAssignment, PodStatusPatchType, PodStatusUpdate, RuntimeReconcileStatus,
@@ -692,7 +694,7 @@ pub struct PodRepository {
     outbox: Option<Arc<klights_kubelet::outbox::Outbox>>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     host_ip: crate::kubelet::context::HostIpState,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     deletion_finalizer: Arc<dyn PodDeletionFinalizer>,
 }
 
@@ -1079,7 +1081,7 @@ impl PodRepository {
             supervisor: supervisor.clone(),
             deferred_runtime: status.deferred_runtime_handle(),
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "integration-test-harness"))]
         let deletion_finalizer =
             compose_pod_deletion_finalizer(deletion_finalizer_dependencies.clone());
 
@@ -1107,14 +1109,14 @@ impl PodRepository {
             outbox,
             cluster_api,
             host_ip,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "integration-test-harness"))]
             deletion_finalizer,
         };
         let background = PodRepositoryBackground::new(workqueue);
         facade::PodRepositoryParts::new(repository, background, deletion_finalizer_dependencies)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub async fn finalize_pod_deletion_after_actor_cleanup(
         &self,
         ns: &str,
@@ -1133,7 +1135,7 @@ impl PodRepository {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub fn deletion_finalizer(
         &self,
     ) -> Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer> {

@@ -17,7 +17,7 @@ async fn current_statefulset(
         .await
         .unwrap()
         .unwrap();
-    crate::api::inject_resource_version(sts.data, sts.resource_version)
+    crate::controllers::inject_resource_version(sts.data, sts.resource_version)
 }
 
 async fn reconcile_current_statefulset(
@@ -435,7 +435,8 @@ async fn test_statefulset_canary_update_with_partition() {
         .await
         .unwrap();
 
-    let sts_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
+    let sts_with_rv =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     // Initial reconcile - creates 3 pods with nginx:1.0
     reconcile_statefulset_test(&db, &sts_with_rv, "test-node")
@@ -518,7 +519,8 @@ async fn test_statefulset_canary_update_with_partition() {
         .await
         .unwrap();
 
-    let sts_with_rv2 = crate::api::inject_resource_version(updated.data, updated.resource_version);
+    let sts_with_rv2 =
+        crate::controllers::inject_resource_version(updated.data, updated.resource_version);
 
     // Reconcile with updated template - should only update pod-2.
     reconcile_statefulset_test(&db, &sts_with_rv2, "test-node")
@@ -644,7 +646,8 @@ async fn test_statefulset_partitioned_recreate_preserves_current_revision_templa
         )
         .await
         .unwrap();
-    let sts_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
+    let sts_with_rv =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     for _ in 0..3 {
         reconcile_statefulset_test(&db, &sts_with_rv, "test-node")
@@ -876,7 +879,8 @@ async fn test_statefulset_rolling_update_waits_for_actor_finalization() {
         .await
         .unwrap();
 
-    let sts_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
+    let sts_with_rv =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_statefulset_test(&db, &sts_with_rv, "test-node")
         .await
         .unwrap();
@@ -951,7 +955,8 @@ async fn test_statefulset_rolling_update_waits_for_actor_finalization() {
         .await
         .unwrap();
 
-    let sts_with_rv2 = crate::api::inject_resource_version(updated.data, updated.resource_version);
+    let sts_with_rv2 =
+        crate::controllers::inject_resource_version(updated.data, updated.resource_version);
 
     // Rolling update advances one ordinal per reconcile.
     reconcile_statefulset_test(&db, &sts_with_rv2, "test-node")
@@ -1030,7 +1035,8 @@ async fn test_statefulset_on_delete_strategy_skips_rolling_update() {
         .await
         .unwrap();
 
-    let sts_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
+    let sts_with_rv =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_statefulset_test(&db, &sts_with_rv, "test-node")
         .await
         .unwrap();
@@ -1069,7 +1075,8 @@ async fn test_statefulset_on_delete_strategy_skips_rolling_update() {
         .await
         .unwrap();
 
-    let sts_with_rv2 = crate::api::inject_resource_version(updated.data, updated.resource_version);
+    let sts_with_rv2 =
+        crate::controllers::inject_resource_version(updated.data, updated.resource_version);
     reconcile_statefulset_test(&db, &sts_with_rv2, "test-node")
         .await
         .unwrap();
@@ -1135,7 +1142,8 @@ async fn test_statefulset_status_includes_revision_info() {
         .await
         .unwrap();
 
-    let sts_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
+    let sts_with_rv =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_statefulset_test(&db, &sts_with_rv, "test-node")
         .await
         .unwrap();
@@ -1197,7 +1205,8 @@ async fn test_statefulset_rolling_update_keeps_current_revision_until_ready() {
         .await
         .unwrap();
 
-    let sts_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
+    let sts_with_rv =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_statefulset_test(&db, &sts_with_rv, "test-node")
         .await
         .unwrap();
@@ -1226,7 +1235,7 @@ async fn test_statefulset_rolling_update_keeps_current_revision_until_ready() {
         .await
         .unwrap()
         .unwrap();
-    let sts_with_rv2 = crate::api::inject_resource_version(
+    let sts_with_rv2 = crate::controllers::inject_resource_version(
         after_spec_update.data,
         after_spec_update.resource_version,
     );

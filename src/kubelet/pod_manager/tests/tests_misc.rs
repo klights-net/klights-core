@@ -23,20 +23,15 @@ fn pod_watcher_limits_pod_events_to_local_node_field_selector() {
 
 #[tokio::test]
 async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_aware_handler() {
-    let mut state = crate::api::test_support::build_test_app_state().await;
-    state.pod_node_subresources_mut().pod_lifecycle_router = Some(std::sync::Arc::new(
-        crate::kubelet::pod_lifecycle_router::PodLifecycleRouter::new_test_default(
-            state.operational().task_supervisor.clone(),
-            crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
-        ),
+    let db = crate::datastore::test_support::in_memory().await;
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
 
     let (is_leader_tx, is_leader_rx) = tokio::sync::watch::channel(false);
 
     // Seed a Pending PVC with no matching PV yet, then create the matching PV.
-    let pvc = state
-        .resource_mutation()
-        .db
+    let pvc = db
         .create_resource(
             "v1",
             "PersistentVolumeClaim",
@@ -54,9 +49,7 @@ async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_awar
         )
         .await
         .unwrap();
-    let pv = state
-        .resource_mutation()
-        .db
+    let pv = db
         .create_resource(
             "v1",
             "PersistentVolume",
@@ -78,9 +71,9 @@ async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_awar
 
     let persistent_volume_event_handler =
         crate::kubelet::pod_watch_handlers::DatastorePersistentVolumeEventHandler::new(
-            state.resource_mutation().db.clone(),
+            std::sync::Arc::new(db.clone()),
             is_leader_rx,
-            state.operational().file_process.clone(),
+            klights_supervisor::FileProcessExecutor::new(supervisor),
         );
 
     // The runtime context no longer carries a reconciliation boolean;
@@ -92,9 +85,7 @@ async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_awar
             "ctx-pv",
         )
         .await;
-    let pvc_as_follower = state
-        .resource_mutation()
-        .db
+    let pvc_as_follower = db
         .get_resource("v1", "PersistentVolumeClaim", Some("default"), "ctx-pvc")
         .await
         .unwrap()
@@ -115,9 +106,7 @@ async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_awar
             "ctx-pvc",
         )
         .await;
-    let pvc_as_leader = state
-        .resource_mutation()
-        .db
+    let pvc_as_leader = db
         .get_resource("v1", "PersistentVolumeClaim", Some("default"), "ctx-pvc")
         .await
         .unwrap()

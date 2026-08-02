@@ -2,18 +2,6 @@
 
 use std::sync::Arc;
 
-impl From<crate::api::pod_repository_ports::ApiPodList> for crate::datastore::ResourceList {
-    fn from(list: crate::api::pod_repository_ports::ApiPodList) -> Self {
-        Self {
-            items: list.items,
-            resource_version: list.resource_version,
-            watch_replay_position: None,
-            continue_token: list.continue_token,
-            remaining_item_count: list.remaining_item_count,
-        }
-    }
-}
-
 use crate::datastore::DatastoreHandle;
 use crate::kubelet::pod_repository::delete_coordinator::PodDeleteCoordinator;
 use crate::kubelet::pod_repository::state_only_writer::{StateOnlyWriter, StatusOnlyWriterService};
@@ -1061,7 +1049,8 @@ pub(crate) fn build_pod_repository_parts(
     let gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination> =
         Arc::new(klights_controllers::ControllerCoordination::new());
     #[cfg(test)]
-    let api_identity = crate::api::test_support::deterministic_api_identity();
+    let api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator> =
+        Arc::new(crate::resource_name::SystemIdentityGenerator);
     let _ = scheduling_mode;
     #[cfg(not(test))]
     let resource_query = cluster_api

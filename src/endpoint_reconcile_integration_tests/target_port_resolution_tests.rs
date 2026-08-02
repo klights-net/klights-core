@@ -76,7 +76,8 @@ async fn test_mirror_endpoints_to_endpointslice_sets_empty_name_for_unnamed_port
         .create_resource("v1", "Endpoints", Some("test"), "manual-service", endpoints)
         .await
         .unwrap();
-    let endpoints = crate::api::inject_resource_version(created.data, created.resource_version);
+    let endpoints =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     mirror_endpoints_to_endpointslice(&controller_store(&db), &endpoints)
         .await

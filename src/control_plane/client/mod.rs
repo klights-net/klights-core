@@ -969,7 +969,7 @@ mod tests {
             .expect("read namespace")
             .expect("namespace exists");
         let mut terminating = std::sync::Arc::unwrap_or_clone(namespace.data);
-        crate::api::set_namespace_terminating_status_at(
+        k8s_native_service::set_namespace_terminating_status_at(
             &mut terminating,
             false,
             klights_supervisor::SystemWallClock::now_utc(),
@@ -1030,10 +1030,8 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         );
         client.set_namespace_termination(
-            crate::api_state_adapter_test_owner::RootNamespaceTerminationReconciler::new(
-                crate::api_state_adapter_test_owner::RootNamespaceTerminationStore::new(Arc::new(
-                    db.clone(),
-                )),
+            crate::api_state_adapter::RootNamespaceTerminationReconciler::new(
+                crate::api_state_adapter::RootNamespaceTerminationStore::new(Arc::new(db.clone())),
                 klights_controllers::side_effects::SideEffectMetrics::new(),
             ),
         );

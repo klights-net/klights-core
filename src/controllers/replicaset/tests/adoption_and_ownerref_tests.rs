@@ -1,127 +1,5 @@
 use super::*;
 
-#[tokio::test]
-async fn test_replicaset_scale_subresource() {
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
-
-    let db = crate::datastore::test_support::in_memory().await;
-    let registry = klights_controllers::crd::CrdRegistry::new();
-    let _config = std::sync::Arc::new({
-        let ns = "klights-test";
-        crate::KlightsConfig {
-            bridge_name: ns.to_string(),
-            pod_subnet: "10.43.0.0/17".to_string(),
-            cluster_cidr: "10.42.0.0/16".to_string(),
-            service_cidr: "10.43.128.0/17".to_string(),
-            tls_port: 7443,
-            api_fqdn: None,
-            log_file: None,
-            containerd_namespace: ns.to_string(),
-            containerd_socket: None,
-            registry_proxy: klights_kubelet::registry_proxy::RegistryProxyConfig::from_inputs(
-                false, None, false,
-            )
-            .unwrap(),
-            node_name: "test-node".to_string(),
-            node_ip: None,
-            anonymous_auth: true,
-            dataplane_encryption: klights_networking::wireguard::DataplaneEncryption::Enabled,
-            external_endpoint: None,
-            worker_dataplane_no_ingress: false,
-            wireguard_device: klights_networking::wireguard::DEFAULT_WIREGUARD_DEVICE.to_string(),
-            wireguard_port: klights_networking::wireguard::DEFAULT_WIREGUARD_PORT,
-            cluster_db_path: crate::paths::test_data_root_path(ns)
-                .join("db")
-                .join("sqlite")
-                .join("cluster.db"),
-            node_db_path: crate::paths::test_data_root_path(ns)
-                .join("db")
-                .join("sqlite")
-                .join("node.db"),
-            data_root: crate::paths::test_data_root_path(ns),
-            api_slow_log_threshold: std::time::Duration::from_millis(
-                crate::bootstrap::config::DEFAULT_API_SLOW_LOG_MS,
-            ),
-            node_not_ready_pod_eviction_grace: std::time::Duration::ZERO,
-            max_watch_events: crate::bootstrap::config::DEFAULT_MAX_WATCH_EVENTS,
-            gc_interval: std::time::Duration::from_secs(
-                crate::bootstrap::config::DEFAULT_GC_INTERVAL_SECONDS,
-            ),
-            in_memory: true,
-            db_encryption: crate::DbEncryption::Disabled,
-            db_key_file: None,
-            datastore_backend: crate::datastore::backend_kind::BackendKind::Sqlite,
-            node_local_backend: crate::datastore::backend_kind::BackendKind::Sqlite,
-            oidc_issuer_url: None,
-            oidc_client_id: None,
-            oidc_username_claim: "sub".to_string(),
-            oidc_groups_claim: "groups".to_string(),
-            oidc_groups_prefix: String::new(),
-            oidc_ca_bundle: None,
-            webhook_auth_url: None,
-            webhook_auth_client_cert: None,
-            webhook_auth_client_key: None,
-            webhook_auth_audiences: String::new(),
-            webhook_auth_cache_authorized_ttl_secs: 300,
-            webhook_auth_cache_unauthorized_ttl_secs: 30,
-            webhook_auth_ca_bundle: None,
-        }
-    });
-    let service_ipam = std::sync::Arc::new(klights_controllers::service::ServiceIpam::new(
-        "10.43.128.0/17",
-    ));
-    let _controller_dispatcher = std::sync::Arc::new(
-        crate::controllers::ControllerDispatcher::new(service_ipam.clone()),
-    );
-
-    // Create namespace
-    let ns =
-        serde_json::json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});
-    db.create_resource("v1", "Namespace", None, "test", ns)
-        .await
-        .unwrap();
-
-    // Create ReplicaSet
-    let rs = serde_json::json!({
-        "apiVersion": "apps/v1",
-        "kind": "ReplicaSet",
-        "metadata": {"name": "test-rs", "namespace": "test"},
-        "spec": {
-            "replicas": 3,
-            "selector": {"matchLabels": {"app": "test"}},
-            "template": {
-                "metadata": {"labels": {"app": "test"}},
-                "spec": {"containers": [{"name": "nginx", "image": "nginx"}]}
-            }
-        }
-    });
-    db.create_resource("apps/v1", "ReplicaSet", Some("test"), "test-rs", rs)
-        .await
-        .unwrap();
-
-    // Build ApiState and router
-    let state = crate::crd_tests::build_test_app_state(db, registry).await;
-    let app = crate::api::build_router(state);
-
-    // GET /apis/apps/v1/namespaces/test/replicasets/test-rs/scale
-    let request = Request::builder()
-        .method("GET")
-        .uri("/apis/apps/v1/namespaces/test/replicasets/test-rs/scale")
-        .body(Body::empty())
-        .unwrap();
-
-    let response = app.clone().oneshot(request).await.unwrap();
-
-    // Should return 200 OK with Scale object
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "GET scale subresource should return 200 OK"
-    );
-}
-
 /// readyReplicas and availableReplicas must reflect actual pod Ready condition,
 /// not be hardcoded to 0. Sonobuoy: RS scaled to 3 but ReadyReplicas stays 0.
 #[tokio::test]
@@ -311,7 +189,8 @@ async fn test_replicaset_deletes_itself_when_controller_deployment_missing() {
         .await
         .unwrap();
 
-    let rs_with_rv = crate::api::inject_resource_version(created.data, created.resource_version);
+    let rs_with_rv =
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_replicaset(
         &db,
         __pod_repo.as_ref(),

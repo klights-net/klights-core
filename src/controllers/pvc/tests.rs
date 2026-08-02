@@ -17,7 +17,8 @@ async fn get_pvc(db: &dyn DatastoreBackend, namespace: &str, name: &str) -> Valu
         .unwrap()
         .unwrap();
 
-    let pvc: Value = crate::api::inject_resource_version(resource.data, resource.resource_version);
+    let pvc: Value =
+        crate::controllers::inject_resource_version(resource.data, resource.resource_version);
     pvc
 }
 
@@ -29,7 +30,8 @@ async fn get_pv(db: &dyn DatastoreBackend, name: &str) -> Value {
         .unwrap()
         .unwrap();
 
-    let pv: Value = crate::api::inject_resource_version(resource.data, resource.resource_version);
+    let pv: Value =
+        crate::controllers::inject_resource_version(resource.data, resource.resource_version);
     pv
 }
 
@@ -73,7 +75,7 @@ async fn test_pvc_stale_snapshot_after_delete_does_not_bind_pv() {
         .await
         .unwrap();
     let stale_snapshot =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     db.delete_resource("v1", "PersistentVolumeClaim", Some("default"), "stale-pvc")
         .await

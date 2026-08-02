@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::api::query::{
+use k8s_native_service::generic_read::{
     ListResourceVersionFuture, ListResourceVersionPort, NamespaceListFuture, NamespaceListPage,
     NamespaceListPort, NamespaceListRequest, NamespaceListSnapshot,
 };
@@ -52,7 +52,7 @@ impl NamespaceListPort for DatastoreNamespaceListPort {
         Box::pin(async move {
             let page =
                 crate::datastore::ListPageRequest::try_new(request.limit, request.continue_token)
-                    .map_err(crate::api::AppError::from)?;
+                    .map_err(k8s_native_service::AppError::from)?;
             self.db
                 .list_namespaces_page(
                     request.label_selector.as_deref(),
@@ -61,7 +61,7 @@ impl NamespaceListPort for DatastoreNamespaceListPort {
                 )
                 .await
                 .map(Self::page)
-                .map_err(crate::api::AppError::from)
+                .map_err(k8s_native_service::AppError::from)
         })
     }
 
@@ -87,7 +87,7 @@ impl NamespaceListPort for DatastoreNamespaceListPort {
                     crate::datastore::SnapshotAtRv::Current => NamespaceListSnapshot::Current,
                     crate::datastore::SnapshotAtRv::Expired => NamespaceListSnapshot::Expired,
                 })
-                .map_err(crate::api::AppError::from)
+                .map_err(k8s_native_service::AppError::from)
         })
     }
 }

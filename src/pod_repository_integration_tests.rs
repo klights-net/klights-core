@@ -3324,7 +3324,11 @@ async fn set_pod_status_reconciles_namespace_termination_for_late_pod() {
         .unwrap()
         .expect("namespace present");
     let mut terminating: serde_json::Value = std::sync::Arc::unwrap_or_clone(namespace.data);
-    crate::api::set_namespace_terminating_status(&mut terminating, false);
+    k8s_native_service::set_namespace_terminating_status_at(
+        &mut terminating,
+        false,
+        chrono::DateTime::UNIX_EPOCH,
+    );
     db.update_namespace("term-status", terminating, namespace.resource_version)
         .await
         .unwrap();
@@ -3373,9 +3377,14 @@ async fn set_pod_status_reconciles_namespace_termination_for_late_pod() {
         "actor finalization should remove the terminating late Pod"
     );
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-    crate::api::reconcile_namespace_termination(db.as_ref(), "term-status", metrics.as_ref())
-        .await
-        .unwrap();
+    k8s_native_service::reconcile_namespace_termination_at(
+        db.as_ref(),
+        "term-status",
+        metrics.as_ref(),
+        chrono::DateTime::UNIX_EPOCH,
+    )
+    .await
+    .unwrap();
     assert!(
         db.get_namespace("term-status").await.unwrap().is_none(),
         "namespace should be hard-deleted after actor-owned Pod removal"
@@ -10768,7 +10777,7 @@ async fn api_delete_pod_sets_deletion_timestamp_and_default_grace_30s() {
         .api_delete_pod(
             "default",
             "del-default",
-            crate::api::DeleteOptions::default(),
+            k8s_native_service::DeleteOptions::default(),
             false,
         )
         .await
@@ -10826,7 +10835,7 @@ async fn api_delete_pod_zero_grace_marks_terminating_pod_unready() {
         .api_delete_pod(
             "default",
             "del-ready",
-            crate::api::DeleteOptions {
+            k8s_native_service::DeleteOptions {
                 propagation_policy: None,
                 orphan_dependents: None,
                 _grace_period_seconds: Some(0),
@@ -10931,7 +10940,7 @@ async fn api_delete_pod_cascades_pod_owner_cycle_without_reentrant_stack_growth(
     repo.api_delete_pod(
         "default",
         "pod1",
-        crate::api::DeleteOptions::default(),
+        k8s_native_service::DeleteOptions::default(),
         false,
     )
     .await
@@ -10984,7 +10993,7 @@ async fn api_delete_pod_replaces_null_deletion_timestamp_with_real_timestamp() {
         .api_delete_pod(
             "default",
             "del-null",
-            crate::api::DeleteOptions::default(),
+            k8s_native_service::DeleteOptions::default(),
             false,
         )
         .await
@@ -11017,7 +11026,7 @@ async fn api_delete_pod_uses_options_grace_period_when_provided() {
     use super::PodApiWriter;
     let repo = build_repo().await;
     let _ = create_basic_pod_via_api(&repo, "del-60").await;
-    let opts = crate::api::DeleteOptions {
+    let opts = k8s_native_service::DeleteOptions {
         propagation_policy: None,
         orphan_dependents: None,
         _grace_period_seconds: Some(60),
@@ -11039,7 +11048,7 @@ async fn api_delete_pod_does_not_hard_delete_before_requested_grace_period() {
     use super::{PodApiWriter, PodReader};
     let repo = build_repo().await;
     let _ = create_basic_pod_via_api(&repo, "del-grace-five").await;
-    let opts = crate::api::DeleteOptions {
+    let opts = k8s_native_service::DeleteOptions {
         propagation_policy: None,
         orphan_dependents: None,
         _grace_period_seconds: Some(5),
@@ -11069,7 +11078,7 @@ async fn api_delete_pod_dry_run_does_not_persist() {
         .api_delete_pod(
             "default",
             "del-dry",
-            crate::api::DeleteOptions::default(),
+            k8s_native_service::DeleteOptions::default(),
             true,
         )
         .await
@@ -11094,7 +11103,7 @@ async fn api_delete_pod_retries_when_status_update_advances_resource_version_dur
         .api_delete_pod(
             "default",
             "del-status-race",
-            crate::api::DeleteOptions::default(),
+            k8s_native_service::DeleteOptions::default(),
             false,
         )
         .await
@@ -11141,7 +11150,7 @@ async fn api_delete_pod_without_resource_version_precondition_survives_raft_stat
         .api_delete_pod(
             "default",
             "del-raft-status-race",
-            crate::api::DeleteOptions::default(),
+            k8s_native_service::DeleteOptions::default(),
             false,
         )
         .await
@@ -11190,7 +11199,7 @@ async fn api_delete_pod_zero_grace_without_resource_version_precondition_survive
         .api_delete_pod(
             "default",
             "del-zero-grace-raft-status-race",
-            crate::api::DeleteOptions {
+            k8s_native_service::DeleteOptions {
                 _grace_period_seconds: Some(0),
                 preconditions: None,
                 ..Default::default()
@@ -11533,20 +11542,20 @@ fn ordinary_pod_error_mapping_preserves_kubernetes_error_categories() {
     use klights_pod_api::PodRepositoryError;
 
     assert!(matches!(
-        crate::api::AppError::from(PodRepositoryError::not_found("default", "web")),
-        crate::api::AppError::NotFound(_)
+        k8s_native_service::AppError::from(PodRepositoryError::not_found("default", "web")),
+        k8s_native_service::AppError::NotFound(_)
     ));
     assert!(matches!(
-        crate::api::AppError::from(PodRepositoryError::uid_mismatch("old", "new")),
-        crate::api::AppError::Conflict(_)
+        k8s_native_service::AppError::from(PodRepositoryError::uid_mismatch("old", "new")),
+        k8s_native_service::AppError::Conflict(_)
     ));
     assert!(matches!(
-        crate::api::AppError::from(PodRepositoryError::conflict("resource changed")),
-        crate::api::AppError::Conflict(_)
+        k8s_native_service::AppError::from(PodRepositoryError::conflict("resource changed")),
+        k8s_native_service::AppError::Conflict(_)
     ));
     assert!(matches!(
-        crate::api::AppError::from(PodRepositoryError::unavailable("leader unavailable")),
-        crate::api::AppError::ServiceUnavailable(_)
+        k8s_native_service::AppError::from(PodRepositoryError::unavailable("leader unavailable")),
+        k8s_native_service::AppError::ServiceUnavailable(_)
     ));
 }
 
@@ -12801,14 +12810,14 @@ async fn gc_conflicts_are_identity_changed_only_after_an_authoritative_reread() 
     .unwrap();
 
     for conflict in [
-        crate::api::AppError::Conflict("resourceVersion conflict".to_string()),
-        crate::api::AppError::Status {
+        k8s_native_service::AppError::Conflict("resourceVersion conflict".to_string()),
+        k8s_native_service::AppError::Status {
             code: axum::http::StatusCode::CONFLICT,
             reason: "Conflict",
             message: "admission conflict".to_string(),
             details: json!({}),
         },
-        crate::api::AppError::Conflict("retry budget exhausted".to_string()),
+        k8s_native_service::AppError::Conflict("retry budget exhausted".to_string()),
     ] {
         let same_uid = crate::pod_native_orchestration::classify_gc_pod_delete_error(
             repo.store.as_ref(),
@@ -12825,7 +12834,7 @@ async fn gc_conflicts_are_identity_changed_only_after_an_authoritative_reread() 
     let replacement = crate::pod_native_orchestration::classify_gc_pod_delete_error(
         repo.store.as_ref(),
         &PodIdentity::new("default", "current", "uid-old"),
-        crate::api::AppError::Conflict("UID precondition conflict".to_string()),
+        k8s_native_service::AppError::Conflict("UID precondition conflict".to_string()),
     )
     .await;
     assert!(matches!(
@@ -12836,7 +12845,7 @@ async fn gc_conflicts_are_identity_changed_only_after_an_authoritative_reread() 
     let absent = crate::pod_native_orchestration::classify_gc_pod_delete_error(
         repo.store.as_ref(),
         &PodIdentity::new("default", "absent", "uid-old"),
-        crate::api::AppError::Conflict("delete conflict".to_string()),
+        k8s_native_service::AppError::Conflict("delete conflict".to_string()),
     )
     .await;
     assert!(matches!(absent, GcPodDeleteError::NotFound { .. }));

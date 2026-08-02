@@ -22,6 +22,10 @@ use crate::resource_admission_adapter::{
     lock_ca_bundle_cache_for_test,
 };
 
+fn deterministic_api_identity() -> Arc<dyn k8s_native_service::ApiIdentityGenerator> {
+    Arc::new(crate::resource_name::SystemIdentityGenerator)
+}
+
 #[derive(Default)]
 struct FakeAdmissionQuery {
     resources: Vec<AdmissionResource>,
@@ -115,7 +119,7 @@ macro_rules! admission_engine_for_db_handle {
         let admission_query: Arc<dyn AdmissionQuery> = RootAdmissionQuery::new($db_handle);
         let admission_resolver = RootWebhookTargetResolver::new(admission_query.clone());
         let admission_client = RootAdmissionWebhookClient::new();
-        let admission_identity = crate::api::test_support::deterministic_api_identity();
+        let admission_identity = deterministic_api_identity();
         let $engine = AdmissionEngine::new(
             admission_identity.as_ref(),
             admission_query.as_ref(),
@@ -1295,7 +1299,7 @@ async fn test_admission_engine_accepts_focused_lookup_trait_object() {
     let query = FakeAdmissionQuery::default();
     let resolver = FakeWebhookTargetResolver;
     let client = FakeAdmissionWebhookClient::default();
-    let identity = crate::api::test_support::deterministic_api_identity();
+    let identity = deterministic_api_identity();
     let engine = AdmissionEngine::new(identity.as_ref(), &query, &resolver, &client);
     let pod = json!({
         "apiVersion": "v1",
@@ -1338,7 +1342,7 @@ async fn test_admission_policy_uses_fake_query_target_and_client_ports() {
     };
     let resolver = FakeWebhookTargetResolver;
     let client = FakeAdmissionWebhookClient::default();
-    let identity = crate::api::test_support::deterministic_api_identity();
+    let identity = deterministic_api_identity();
     let engine = AdmissionEngine::new(identity.as_ref(), &query, &resolver, &client);
     let pod = json!({
         "apiVersion": "v1",

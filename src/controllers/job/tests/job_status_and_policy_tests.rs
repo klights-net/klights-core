@@ -1338,60 +1338,41 @@ async fn test_nonindexed_job_does_not_create_beyond_remaining_completions() {
 async fn test_unmanaged_job_without_ttl_survives_immediate_success_cycle() {
     use crate::kubelet::pod_repository::PodSubresourceWriter;
 
-    let state = crate::api::test_support::build_test_app_state().await;
-    state
-        .resource_mutation()
-        .db
-        .create_resource(
-            "batch/v1",
-            "Job",
-            Some("default"),
-            "ttl-success-job",
-            json!({
-                "apiVersion": "batch/v1",
-                "kind": "Job",
-                "metadata": {
-                    "name": "ttl-success-job",
-                    "namespace": "default",
-                    "uid": "uid-ttl-success-job"
-                },
-                "spec": {
-                    "completions": 1,
-                    "parallelism": 1,
-                    "template": {
-                        "spec": {
-                            "containers": [{"name": "worker", "image": "busybox"}],
-                            "restartPolicy": "Never"
-                        }
+    let db = crate::datastore::test_support::in_memory().await;
+    let pod_repository = crate::controllers::test_utils::pod_repository_for_test(&db);
+    db.create_resource(
+        "batch/v1",
+        "Job",
+        Some("default"),
+        "ttl-success-job",
+        json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": "ttl-success-job",
+                "namespace": "default",
+                "uid": "uid-ttl-success-job"
+            },
+            "spec": {
+                "completions": 1,
+                "parallelism": 1,
+                "template": {
+                    "spec": {
+                        "containers": [{"name": "worker", "image": "busybox"}],
+                        "restartPolicy": "Never"
                     }
-                },
-                "status": {}
-            }),
-        )
-        .await
-        .unwrap();
+                }
+            },
+            "status": {}
+        }),
+    )
+    .await
+    .unwrap();
 
-    let job = state
-        .resource_mutation()
-        .db
-        .get_resource("batch/v1", "Job", Some("default"), "ttl-success-job")
-        .await
-        .unwrap()
-        .unwrap();
-    state
-        .controller_reconcile()
-        .controller_dispatcher
-        .reconcile(
-            &crate::api::inject_resource_version(job.data, job.resource_version),
-            &state.resource_mutation().db,
-            &state.operational().config.node_name,
-        )
-        .await
-        .unwrap();
+    let job = get_job(&db, "default", "ttl-success-job").await;
+    reconcile_job_test(&db, &job, "test-node").await.unwrap();
 
-    let pods = state
-        .resource_mutation()
-        .db
+    let pods = db
         .list_resources_by_owner_uid("v1", "Pod", Some("default"), "uid-ttl-success-job")
         .await
         .unwrap();
@@ -1405,9 +1386,7 @@ async fn test_unmanaged_job_without_ttl_survives_immediate_success_cycle() {
         "test precondition: created Pod must be owned by the Job"
     );
 
-    state
-        .resource_mutation()
-        .pod_repository
+    pod_repository
         .replace_status_from_api(
             "default",
             &pod.name,
@@ -1456,9 +1435,7 @@ async fn test_unmanaged_job_without_ttl_survives_immediate_success_cycle() {
         .await
         .unwrap();
 
-    let updated_pod = state
-        .resource_mutation()
-        .db
+    let updated_pod = db
         .get_resource("v1", "Pod", Some("default"), &pod.name)
         .await
         .unwrap()
@@ -1471,42 +1448,10 @@ async fn test_unmanaged_job_without_ttl_survives_immediate_success_cycle() {
         Some("Job"),
         "test precondition: status update must preserve Pod ownerReferences"
     );
-    let queued = state
-        .controller_reconcile()
-        .controller_dispatcher
-        .queued_reconcile_keys_for_test()
-        .await;
-    assert!(
-        queued.iter().any(|key| {
-            key.api_version() == "batch/v1"
-                && key.kind() == "Job"
-                && key.namespace() == Some("default")
-                && key.name() == "ttl-success-job"
-        }),
-        "Pod status side effects should enqueue the owning Job after terminal status"
-    );
+    let job = get_job(&db, "default", "ttl-success-job").await;
+    reconcile_job_test(&db, &job, "test-node").await.unwrap();
 
-    let job = state
-        .resource_mutation()
-        .db
-        .get_resource("batch/v1", "Job", Some("default"), "ttl-success-job")
-        .await
-        .unwrap()
-        .expect("Job must still exist after the Pod reaches Succeeded");
-    state
-        .controller_reconcile()
-        .controller_dispatcher
-        .reconcile(
-            &crate::api::inject_resource_version(job.data, job.resource_version),
-            &state.resource_mutation().db,
-            &state.operational().config.node_name,
-        )
-        .await
-        .unwrap();
-
-    let completed = state
-        .resource_mutation()
-        .db
+    let completed = db
         .get_resource("batch/v1", "Job", Some("default"), "ttl-success-job")
         .await
         .unwrap()

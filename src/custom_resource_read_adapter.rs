@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::api::custom_resource_ports::{
+use k8s_native_service::ports::{
     CustomResourceListSnapshot, CustomResourceProjection, CustomResourceReadFuture,
     CustomResourceReadPort, CustomResourceSnapshotRequest, CustomResourceWaitFuture,
     CustomResourceWatchTarget,
@@ -56,7 +56,7 @@ fn datastore_target(target: &CustomResourceWatchTarget) -> crate::datastore::Wat
 
 fn leader_list_result(
     list: crate::datastore::ResourceList,
-) -> Result<klights_leader_api::ResourceListResult, crate::api::AppError> {
+) -> Result<klights_leader_api::ResourceListResult, k8s_native_service::AppError> {
     klights_leader_api::ResourceListResult::try_new(
         list.items,
         list.resource_version,
@@ -64,7 +64,7 @@ fn leader_list_result(
         list.continue_token,
         list.remaining_item_count,
     )
-    .map_err(crate::api::AppError::from)
+    .map_err(k8s_native_service::AppError::from)
 }
 
 impl CustomResourceReadPort for CustomResourceReadAdapter {
@@ -109,7 +109,7 @@ impl CustomResourceReadPort for CustomResourceReadAdapter {
             self.db
                 .list_resources_for_watch_targets(&targets, label_selector.as_deref())
                 .await
-                .map_err(crate::api::AppError::from)
+                .map_err(k8s_native_service::AppError::from)
                 .and_then(leader_list_result)
         })
     }
@@ -163,7 +163,7 @@ impl CustomResourceReadPort for CustomResourceReadAdapter {
         kind: String,
     ) -> CustomResourceWaitFuture<'_> {
         Box::pin(async move {
-            crate::api::watch_stream::wait_until_datastore_fresh(
+            k8s_native_service::watch::wait_until_datastore_fresh(
                 &self.watch_source,
                 target_rv,
                 &api_version,
@@ -190,7 +190,7 @@ impl CustomResourceReadPort for CustomResourceReadAdapter {
                 )
                 .await
                 .map(|list| list.resource_version)
-                .map_err(crate::api::AppError::from)
+                .map_err(k8s_native_service::AppError::from)
         })
     }
 }

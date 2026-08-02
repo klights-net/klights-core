@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use crate::datastore::CommitObservationSink;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use crate::watch::WatchBus;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use klights_cluster_store::StagedPostCommit;
 
 pub(crate) struct WatchCommitWiring {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub(crate) sink: Arc<dyn CommitObservationSink>,
     pub(crate) signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     pub(crate) wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>,
@@ -26,7 +26,7 @@ pub(crate) fn new_wiring() -> WatchCommitWiring {
         follower_progress: follower_progress.clone(),
     });
     WatchCommitWiring {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "integration-test-harness"))]
         sink: Arc::new(WatchCommitObservationSink::new(
             wakeups.clone(),
             hub.clone(),
@@ -37,7 +37,7 @@ pub(crate) fn new_wiring() -> WatchCommitWiring {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub(crate) fn new_sink() -> Arc<WatchCommitObservationSink> {
     let hub = Arc::new(klights_watch::WatchSignalHub::new(1024));
     Arc::new(WatchCommitObservationSink::new(
@@ -46,7 +46,7 @@ pub(crate) fn new_sink() -> Arc<WatchCommitObservationSink> {
     ))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub(crate) fn test_signal_source(
     db: &crate::datastore::DatastoreHandle,
 ) -> Arc<dyn klights_watch::WatchSignalSubscribe> {
@@ -64,39 +64,37 @@ pub(crate) fn subscribe(
     source.subscribe(topic)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub(crate) struct WatchCommitObservationSink {
     wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     bus: WatchBus,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 impl WatchCommitObservationSink {
     fn new(
         wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>,
         signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     ) -> Self {
-        #[cfg(not(test))]
-        let _ = signals;
         Self {
             wakeups,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "integration-test-harness"))]
             signals,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "integration-test-harness"))]
             bus: WatchBus::new(1024),
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub(crate) fn signal_source(&self) -> Arc<dyn klights_watch::WatchSignalSubscribe> {
         self.signals.clone()
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 impl CommitObservationSink for WatchCommitObservationSink {
     fn observe(&self, observations: &[StagedPostCommit]) {
         let advances = observations
@@ -111,7 +109,7 @@ impl CommitObservationSink for WatchCommitObservationSink {
             })
             .collect::<Vec<_>>();
         self.wakeups.wake(&advances);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "integration-test-harness"))]
         for event in observations
             .iter()
             .filter_map(crate::datastore::staged_test_event)
@@ -120,7 +118,7 @@ impl CommitObservationSink for WatchCommitObservationSink {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -228,7 +226,7 @@ pub(crate) fn publish_test_events(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub(crate) fn subscribe_test_events(
     sink: &dyn CommitObservationSink,
     topic: klights_watch::WatchTopic,

@@ -178,7 +178,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     let opened_passive = crate::datastore::selector::open_with_sink(
         passive_store_open_request(config),
         supervisor.clone(),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "integration-test-harness"))]
         watch_commit_wiring.sink,
         crate::outbox_response_codec_adapter::new_codec(),
     )

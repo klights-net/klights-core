@@ -21,7 +21,7 @@ async fn test_reconcile_deployment_creates_replicaset() {
 
     // Inject resource version for reconcile
     let deploy_with_rv =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     reconcile_deployment(
         &db,
@@ -91,7 +91,7 @@ async fn test_reconcile_deployment_rs_has_pod_template_hash() {
         .await
         .unwrap();
     let deploy_with_rv =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
 
     reconcile_deployment(
         &db,
@@ -202,7 +202,7 @@ async fn test_reconcile_deployment_scales_replicaset() {
         .unwrap();
 
     let deploy_with_rv =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -247,7 +247,7 @@ async fn test_reconcile_deployment_scales_replicaset() {
         .unwrap();
 
     let deploy_with_rv =
-        crate::api::inject_resource_version(updated.data, updated.resource_version);
+        crate::controllers::inject_resource_version(updated.data, updated.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -290,7 +290,7 @@ async fn test_reconcile_deployment_no_duplicate_replicasets() {
         .unwrap();
 
     let deploy_with_rv =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -311,7 +311,7 @@ async fn test_reconcile_deployment_no_duplicate_replicasets() {
 
     // Reconcile again with same replicas
     let deploy_with_rv2 =
-        crate::api::inject_resource_version(current.data, current.resource_version);
+        crate::controllers::inject_resource_version(current.data, current.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -369,7 +369,7 @@ async fn test_reconcile_deployment_zero_replicas_creates_no_pods() {
         .unwrap();
 
     let deploy_with_rv =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -424,7 +424,7 @@ async fn test_reconcile_deployment_status_has_progressing_condition() {
         .unwrap();
 
     let deploy_with_rv =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -485,7 +485,7 @@ async fn test_reconcile_deployment_status_noops_when_condition_state_unchanged()
         .unwrap();
 
     let deploy_with_rv =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         pod_repo.as_ref(),
@@ -503,7 +503,8 @@ async fn test_reconcile_deployment_status_noops_when_condition_state_unchanged()
         .unwrap()
         .unwrap();
 
-    let first_with_rv = crate::api::inject_resource_version(first.data, first.resource_version);
+    let first_with_rv =
+        crate::controllers::inject_resource_version(first.data, first.resource_version);
     reconcile_deployment(
         &db,
         pod_repo.as_ref(),
@@ -530,7 +531,8 @@ async fn test_reconcile_deployment_status_noops_when_condition_state_unchanged()
         "test must settle the legitimate Progressing condition transition"
     );
 
-    let second_with_rv = crate::api::inject_resource_version(second.data, second.resource_version);
+    let second_with_rv =
+        crate::controllers::inject_resource_version(second.data, second.resource_version);
     reconcile_deployment(
         &db,
         pod_repo.as_ref(),
@@ -643,7 +645,7 @@ async fn test_reconcile_deployment_observes_generation_before_pod_create() {
         .unwrap();
 
     let deploy_with_rv =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     let writer = ObservedGenerationBeforeCreateWriter {
         db: db.clone(),
         inner: pod_repo.clone(),
@@ -786,7 +788,7 @@ async fn test_reconcile_deployment_rollout_observed_generation_waits_for_new_rep
         .await
         .unwrap();
     let deploy_with_rv =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         pod_repo.as_ref(),
@@ -838,7 +840,7 @@ async fn test_reconcile_deployment_rollout_observed_generation_waits_for_new_rep
         checked: std::sync::atomic::AtomicBool::new(false),
     };
     let deploy_with_rv =
-        crate::api::inject_resource_version(updated.data, updated.resource_version);
+        crate::controllers::inject_resource_version(updated.data, updated.resource_version);
     reconcile_deployment(
         &db,
         &reader,
@@ -890,7 +892,7 @@ async fn test_reconcile_deployment_status_replicas_reflects_new_rs_pods() {
         .unwrap();
 
     let deploy_with_rv =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1025,7 +1027,7 @@ async fn test_reconcile_deployment_status_ignores_terminal_node_lost_pods() {
     }
 
     let deploy_with_rv =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         pod_repo.as_ref(),
@@ -1063,7 +1065,7 @@ async fn test_reconcile_deployment_status_includes_newly_created_rs() {
         .unwrap();
 
     let deploy_with_rv =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1104,7 +1106,7 @@ async fn test_reconcile_deployment_scale_down_to_zero() {
         .unwrap();
 
     let deploy_with_rv =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1148,7 +1150,7 @@ async fn test_reconcile_deployment_scale_down_to_zero() {
         .unwrap();
 
     let deploy_with_rv =
-        crate::api::inject_resource_version(updated.data, updated.resource_version);
+        crate::controllers::inject_resource_version(updated.data, updated.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1235,7 +1237,7 @@ async fn test_reconcile_deployment_rolling_update_creates_new_replicaset() {
         .unwrap();
 
     let deploy_with_rv =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1282,7 +1284,7 @@ async fn test_reconcile_deployment_rolling_update_creates_new_replicaset() {
         .unwrap();
 
     let deploy_with_rv =
-        crate::api::inject_resource_version(updated.data, updated.resource_version);
+        crate::controllers::inject_resource_version(updated.data, updated.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1369,7 +1371,7 @@ async fn test_recreate_strategy_does_not_scale_new_rs_until_old_rs_zero() {
         .unwrap();
 
     let deploy_with_rv =
-        crate::api::inject_resource_version(created.data, created.resource_version);
+        crate::controllers::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1403,7 +1405,7 @@ async fn test_recreate_strategy_does_not_scale_new_rs_until_old_rs_zero() {
         .unwrap();
 
     let deploy_with_rv =
-        crate::api::inject_resource_version(updated.data, updated.resource_version);
+        crate::controllers::inject_resource_version(updated.data, updated.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),

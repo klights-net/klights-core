@@ -26,10 +26,12 @@ impl RedbDatastore {
     pub async fn new_persistent_with_sink(
         path: &std::path::Path,
         supervisor: Arc<TaskSupervisor>,
-        #[cfg(test)] commit_sink: Arc<dyn crate::datastore::CommitObservationSink>,
+        #[cfg(any(test, feature = "integration-test-harness"))] commit_sink: Arc<
+            dyn crate::datastore::CommitObservationSink,
+        >,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "integration-test-harness"))]
         let passive = PassiveRedbDatastore::new_persistent_with_sink(
             path,
             supervisor,
@@ -37,24 +39,26 @@ impl RedbDatastore {
             wall_clock,
         )
         .await?;
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "integration-test-harness")))]
         let passive = PassiveRedbDatastore::new_persistent(path, supervisor, wall_clock).await?;
         Ok(Self(passive))
     }
 
     pub async fn new_in_memory_with_supervisor_and_sink(
         supervisor: Arc<TaskSupervisor>,
-        #[cfg(test)] commit_sink: Arc<dyn crate::datastore::CommitObservationSink>,
+        #[cfg(any(test, feature = "integration-test-harness"))] commit_sink: Arc<
+            dyn crate::datastore::CommitObservationSink,
+        >,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "integration-test-harness"))]
         let passive = PassiveRedbDatastore::new_in_memory_with_supervisor_and_sink(
             supervisor,
             commit_sink,
             wall_clock,
         )
         .await?;
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "integration-test-harness")))]
         let passive =
             PassiveRedbDatastore::new_in_memory_with_supervisor(supervisor, wall_clock).await?;
         Ok(Self(passive))
