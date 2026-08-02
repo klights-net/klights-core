@@ -1,5 +1,4 @@
 use super::*;
-use crate::api::AdmissionContextRequest;
 
 #[derive(Deserialize)]
 pub struct BindingQuery {
@@ -8,13 +7,13 @@ pub struct BindingQuery {
 }
 
 impl BindingQuery {
-    fn dry_run_mode(&self) -> Result<k8s_native_service::generic_command::DryRunMode, AppError> {
-        k8s_native_service::generic_command::DryRunMode::from_query(self.dry_run.as_deref())
+    fn dry_run_mode(&self) -> Result<crate::generic_command::DryRunMode, AppError> {
+        crate::generic_command::DryRunMode::from_query(self.dry_run.as_deref())
     }
 }
 
-pub(in crate::api) async fn pod_binding(
-    State(state): State<Arc<ApiState>>,
+pub async fn pod_binding<S: GenericCommandState + 'static>(
+    State(state): State<Arc<S>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<BindingQuery>,
     body: Bytes,
@@ -28,34 +27,33 @@ pub(in crate::api) async fn pod_binding(
         serde_json::from_slice(&body)
             .map_err(|e| AppError::BadRequest(format!("failed to parse binding JSON: {e}")))?
     };
-    let mut admission_context = build_admission_context(AdmissionContextRequest {
-        api_version: "v1",
-        kind: "Binding",
-        operation: "CREATE",
-        namespace: Some(namespace.clone()),
-        name: Some(name.clone()),
-        object: binding,
-        old_object: None,
-        dry_run,
-        subresource: Some("binding"),
-        options: None,
-    });
-    admission_context.resource = "pods".to_string();
-    let binding = run_admission_for_request(
-        state.resource_mutation().admission.as_ref(),
-        admission_context,
-    )
-    .await?;
-    klights_pod_api::PodApiMutation::bind_pod(
-        state.resource_mutation().pod_repository.as_ref(),
-        klights_pod_api::PodBindingRequest {
+    let binding = state
+        .command_admission()
+        .admission()
+        .admit(ResourceAdmissionRequest {
+            api_version: "v1".to_string(),
+            kind: "Binding".to_string(),
+            resource: Some("pods".to_string()),
+            operation: "CREATE".to_string(),
+            namespace: Some(namespace.clone()),
+            name: Some(name.clone()),
+            object: binding,
+            old_object: None,
+            dry_run,
+            subresource: Some("binding".to_string()),
+            options: None,
+        })
+        .await?;
+    state
+        .command_store()
+        .pod_mutation()
+        .bind_pod(klights_pod_api::PodBindingRequest {
             namespace,
             name,
             binding,
             dry_run,
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     Ok((
         StatusCode::CREATED,

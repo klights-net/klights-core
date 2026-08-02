@@ -57,6 +57,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
     let task_supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
+    let config = crate::KlightsConfig::test_default();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
@@ -119,6 +120,36 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
             db_handle.clone(),
         ),
     );
+    let pod_logs = {
+        let root = config.data_root.join("logs").join("pods");
+        let clock: std::sync::Arc<dyn klights_supervisor::WallClock> =
+            std::sync::Arc::new(klights_supervisor::SystemWallClock);
+        crate::node_log_runtime_adapter::pod_log_capabilities(
+            std::sync::Arc::new(
+                klights_kubelet::node_api::logs::LocalNodeLogRuntime::new_with_pod_event_store(
+                    root.clone(),
+                    task_supervisor.clone(),
+                    clock.clone(),
+                    klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(
+                        std::sync::Arc::new(
+                            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
+                                std::sync::Arc::new(positioned_watch.clone()),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            std::sync::Arc::new(
+                klights_kubelet::node_api::logs::LocalNodeLogRuntime::new_without_pod_event_store(
+                    root,
+                    task_supervisor.clone(),
+                    clock,
+                ),
+            ),
+            task_supervisor.clone(),
+            config.node_name.clone(),
+        )
+    };
     let network = crate::networking::test_support::mock_network(db_handle.clone());
     crate::api::ApiState::new(
         crate::api::ApiAuthPolicy::new(
@@ -205,11 +236,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
                     network.services().clone(),
                 ),
             ),
-            klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(std::sync::Arc::new(
-                crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(std::sync::Arc::new(
-                    positioned_watch,
-                )),
-            )),
+            pod_logs,
             None,
             std::sync::Arc::new(crate::node_metrics_adapter::UnavailableNodeMetrics),
             klights_kubelet::node_api::port_forward::local_node_port_forward(
@@ -222,10 +249,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
         crate::api::ApiOperationalServices::new(
             crate::api::ApiNodeRole::Leader,
             None,
-            {
-                let config = crate::KlightsConfig::test_default();
-                crate::api::ApiOperationalConfig::from_test(config)
-            },
+            crate::api::ApiOperationalConfig::from_test(config),
             std::sync::Arc::new(klights_auth::clock::SystemClock),
             crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(
                 db_handle.clone(),

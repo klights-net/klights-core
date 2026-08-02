@@ -90,6 +90,11 @@ pub trait GenericCommandStore: Send + Sync {
     fn finalizer_lifecycle(&self) -> &dyn klights_reconcile_api::FinalizerLifecyclePort;
     fn generated_mutations(&self) -> &dyn GeneratedResourceMutationPort;
     fn pod_mutation(&self) -> &dyn klights_pod_api::PodApiMutation;
+    fn pod_subresource_mutation(&self) -> &dyn klights_pod_api::PodSubresourceMutation;
+    fn pod_eviction_admission(
+        &self,
+    ) -> std::sync::Arc<dyn klights_reconcile_api::PodEvictionAdmissionSink>;
+    fn pod_eviction_delete(&self) -> &dyn klights_pod_api::PodEvictionDelete;
 }
 
 pub trait GenericCommandAdmission: Send + Sync {
@@ -126,6 +131,13 @@ pub struct PreparedCreate {
 }
 
 pub trait GenericCommandPolicy: Send + Sync {
+    fn apply_patch(
+        &self,
+        current: &Value,
+        patch: &Value,
+        content_type: Option<&str>,
+    ) -> Result<Value, AppError>;
+
     fn decode_patch<'a>(
         &'a self,
         headers: &'a axum::http::HeaderMap,

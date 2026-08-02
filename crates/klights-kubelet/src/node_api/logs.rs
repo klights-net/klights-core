@@ -1431,8 +1431,12 @@ pub struct LocalNodeLogRuntime {
 }
 
 impl LocalNodeLogRuntime {
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn new_for_test(
+    /// Constructs the local node-log implementation without a Pod event source.
+    ///
+    /// This mode preserves the existing filesystem terminal behavior while
+    /// leaving Pod-lifecycle-aware follow termination to callers that can
+    /// provide [`PodLogFollowWatchSource`].
+    pub fn new_without_pod_event_store(
         pod_logs_root: PathBuf,
         task_supervisor: Arc<TaskSupervisor>,
         clock: Arc<dyn klights_supervisor::WallClock>,
@@ -1443,6 +1447,15 @@ impl LocalNodeLogRuntime {
             clock,
             pod_log_follow_watch: None,
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_for_test(
+        pod_logs_root: PathBuf,
+        task_supervisor: Arc<TaskSupervisor>,
+        clock: Arc<dyn klights_supervisor::WallClock>,
+    ) -> Self {
+        Self::new_without_pod_event_store(pod_logs_root, task_supervisor, clock)
     }
 
     pub fn new_with_pod_event_store(
@@ -1734,7 +1747,136 @@ impl Drop for LocalPodLogStreamSession {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    struct RecordingWatchPort {
+        requests: Arc<std::sync::Mutex<Vec<klights_leader_api::WatchRequest>>>,
+    }
+
+    impl PodLogFollowWatchPort for RecordingWatchPort {
+        fn open_pod_watch(&self) -> klights_leader_api::LeaderWatchFuture<'_> {
+            Box::pin(async move {
+                let request = klights_leader_api::WatchRequest::try_new(
+                    "v1", "Pod", None, None, None, None, None,
+                )?;
+                self.requests.lock().unwrap().push(request);
+                Ok(klights_leader_api::WatchStream::positioned(
+                    Box::pin(futures::stream::empty()),
+                    klights_leader_api::WatchResumeCursor::try_new(Some(41), None)?,
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn phase17c_follow_cursor_preserves_positioned_leader_watch_handoff() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let source = PodLogFollowWatchSource::new(Arc::new(RecordingWatchPort {
+            requests: requests.clone(),
+        }));
+
+        let cursor = build_pod_log_follow_event_cursor(&source).await.unwrap();
+
+        assert_eq!(
+            cursor
+                .accepted_cursor()
+                .and_then(|cursor| cursor.resource_version()),
+            Some(41)
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].api_version(), "v1");
+        assert_eq!(requests[0].kind(), "Pod");
+        assert_eq!(requests[0].start_resource_version(), None);
+        assert_eq!(requests[0].start_watch_replay_position(), None);
+    }
+
+    #[test]
+    fn phase17c_replacement_pod_uid_does_not_terminate_old_log_follow() {
+        let (_tx, receiver) = tokio::sync::broadcast::channel(1);
+        let termination = PodLogFollowTermination::new_for_test(
+            receiver,
+            "default".to_string(),
+            "same-name".to_string(),
+            "old-uid".to_string(),
+            "main".to_string(),
+            false,
+        );
+        let replacement = klights_leader_api::ResourceEvent::try_new(
+            klights_leader_api::WatchEventType::Deleted,
+            klights_cluster_core::Resource::try_from_data(Arc::new(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "same-name",
+                    "uid": "replacement-uid"
+                }
+            })))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+
+        assert!(!pod_log_follow_event_is_terminal(
+            &termination,
+            &replacement
+        ));
+    }
+
+    #[tokio::test]
+    async fn phase17c_no_watch_runtime_preserves_file_follow_until_cancel_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let supervisor = Arc::new(TaskSupervisor::new(Default::default()));
+        let runtime = LocalNodeLogRuntime::new_without_pod_event_store(
+            temp.path().to_path_buf(),
+            supervisor.clone(),
+            Arc::new(klights_supervisor::SystemWallClock),
+        );
+        assert!(runtime.pod_log_follow_watch.is_none());
+
+        let target = NodeLogTarget::try_new("node-a", "default", "pod-a", "uid-a", "main").unwrap();
+        let log_path = runtime.log_path(&target);
+        let request = NodeLogRequest::new(
+            target,
+            klights_node_api::NodeLogOptions::new(
+                Some("true".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        );
+        let mut session = runtime.open_logs(request).await.unwrap();
+        tokio::fs::create_dir_all(std::path::Path::new(&log_path).parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(
+            &log_path,
+            b"2026-08-02T00:00:00.000000000Z stdout F complete\n",
+        )
+        .await
+        .unwrap();
+
+        let data = tokio::time::timeout(Duration::from_secs(2), session.recv_frame())
+            .await
+            .expect("no-watch log follow must observe the closed file")
+            .unwrap()
+            .expect("log follow must emit data before its terminal frame");
+        assert_eq!(data.content(), b"complete\n");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), session.recv_frame())
+                .await
+                .is_err(),
+            "without a Pod event source the file follower remains open until cancellation"
+        );
+        session.cancel().await.unwrap();
+        supervisor.shutdown(Duration::from_secs(1)).await;
+    }
 
     #[tokio::test]
     async fn local_log_session_cancel_and_drop_stop_the_owned_producer() {

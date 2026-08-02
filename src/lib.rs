@@ -51,6 +51,7 @@ pub mod networking;
 mod networking_state_adapter;
 pub mod node_admin;
 mod node_lifecycle_controller_adapter;
+mod node_log_runtime_adapter;
 mod node_metrics_adapter;
 pub(crate) mod node_routing_metadata;
 mod node_subnet_controller_adapter;

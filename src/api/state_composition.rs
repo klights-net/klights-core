@@ -53,6 +53,18 @@ impl k8s_native_service::generic_command::GenericCommandStore for ApiResourceMut
     fn pod_mutation(&self) -> &dyn klights_pod_api::PodApiMutation {
         self.pod_repository.as_ref()
     }
+
+    fn pod_subresource_mutation(&self) -> &dyn klights_pod_api::PodSubresourceMutation {
+        self.pod_repository.as_ref()
+    }
+
+    fn pod_eviction_admission(&self) -> Arc<dyn klights_reconcile_api::PodEvictionAdmissionSink> {
+        self.pod_repository.eviction_admission_port()
+    }
+
+    fn pod_eviction_delete(&self) -> &dyn klights_pod_api::PodEvictionDelete {
+        self.pod_repository.as_ref()
+    }
 }
 
 impl k8s_native_service::generic_command::GenericCommandAdmission for ApiResourceMutationServices {
@@ -495,7 +507,7 @@ impl k8s_native_service::generic_command::GenericCommandReconcile
 #[derive(Clone)]
 pub(crate) struct ApiPodNodeSubresourceServices {
     pub(crate) services: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
-    pub(crate) pod_log_follow_watch: klights_kubelet::node_api::logs::PodLogFollowWatchSource,
+    pub(crate) pod_logs: Arc<k8s_native_service::subresources::pod::logs::PodLogCapabilities>,
     pub(crate) local_node_exec: Option<Arc<dyn klights_node_api::NodeExec>>,
     pub(crate) node_metrics: Arc<dyn klights_node_api::NodeMetrics>,
     pub(crate) node_port_forward: Arc<dyn klights_node_api::NodePortForward>,
@@ -511,7 +523,7 @@ impl ApiPodNodeSubresourceServices {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         services: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
-        pod_log_follow_watch: klights_kubelet::node_api::logs::PodLogFollowWatchSource,
+        pod_logs: Arc<k8s_native_service::subresources::pod::logs::PodLogCapabilities>,
         local_node_exec: Option<Arc<dyn klights_node_api::NodeExec>>,
         node_metrics: Arc<dyn klights_node_api::NodeMetrics>,
         node_port_forward: Arc<dyn klights_node_api::NodePortForward>,
@@ -523,7 +535,7 @@ impl ApiPodNodeSubresourceServices {
     ) -> Self {
         Self {
             services,
-            pod_log_follow_watch,
+            pod_logs,
             local_node_exec,
             node_metrics,
             node_port_forward,
@@ -583,6 +595,7 @@ impl ApiRuntimePaths {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn pod_log_dir(
         &self,
         namespace: &str,
@@ -828,7 +841,7 @@ pub(crate) fn build_router_from_root(
     metrics: Arc<dyn crate::api::state_ports::ApiFailureMetrics>,
     node_lease_tracker: Arc<dyn crate::api::state_ports::ApiNodeLeaseObservations>,
     services: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
-    pod_log_follow_watch: klights_kubelet::node_api::logs::PodLogFollowWatchSource,
+    pod_logs: Arc<k8s_native_service::subresources::pod::logs::PodLogCapabilities>,
     local_node_exec: Option<Arc<dyn klights_node_api::NodeExec>>,
     node_metrics: Arc<dyn klights_node_api::NodeMetrics>,
     node_port_forward: Arc<dyn klights_node_api::NodePortForward>,
@@ -900,7 +913,7 @@ pub(crate) fn build_router_from_root(
         ),
         ApiPodNodeSubresourceServices::new(
             services,
-            pod_log_follow_watch,
+            pod_logs,
             local_node_exec,
             node_metrics,
             node_port_forward,

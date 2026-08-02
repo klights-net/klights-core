@@ -1,23 +1,17 @@
 use super::*;
 
-pub(in crate::api) async fn get_pod_status(
-    State(state): State<Arc<ApiState>>,
+pub async fn get_pod_status<S: GenericCommandState + 'static>(
+    State(state): State<Arc<S>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
-    let pod = crate::api::pod_repository_ports::get_pod(
-        state.resource_mutation().pod_repository.as_ref(),
-        &namespace,
-        &name,
-    )
-    .await?;
+    let pod = get_pod(state.as_ref(), &namespace, &name).await?;
 
     match pod {
         Some(resource) => {
             let pod_data = resource.data;
             // K8s status subresource returns the full pod object
             // but clients typically only care about the status field
-            let pod_with_rv =
-                crate::api::inject_resource_version(pod_data, resource.resource_version);
+            let pod_with_rv = inject_resource_version(pod_data, resource.resource_version);
             Ok(Json(pod_with_rv))
         }
         None => Err(AppError::NotFound(format!(
@@ -28,8 +22,8 @@ pub(in crate::api) async fn get_pod_status(
 }
 
 // PATCH /api/v1/namespaces/{ns}/pods/{name}/status
-pub(in crate::api) async fn patch_pod_status_subresource(
-    State(state): State<Arc<ApiState>>,
+pub async fn patch_pod_status_subresource<S: GenericCommandState + 'static>(
+    State(state): State<Arc<S>>,
     Path((namespace, name)): Path<(String, String)>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
@@ -46,44 +40,36 @@ pub(in crate::api) async fn patch_pod_status_subresource(
         .map_err(|e| AppError::BadRequest(format!("Invalid patch body: {}", e)))?;
     let requested_rv = metadata_resource_version(&patch_value);
 
-    let pod = crate::api::pod_repository_ports::get_pod(
-        state.resource_mutation().pod_repository.as_ref(),
-        &namespace,
-        &name,
-    )
-    .await?
-    .ok_or_else(|| AppError::NotFound(format!("Pod {}/{} not found", namespace, name)))?;
+    let pod = get_pod(state.as_ref(), &namespace, &name)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Pod {}/{} not found", namespace, name)))?;
 
-    let updated = klights_pod_api::PodSubresourceMutation::patch_status(
-        state.resource_mutation().pod_repository.as_ref(),
-        klights_pod_api::PodStatusPatchRequest {
+    let updated = state
+        .command_store()
+        .pod_subresource_mutation()
+        .patch_status(klights_pod_api::PodStatusPatchRequest {
             namespace: namespace.clone(),
             name: name.clone(),
             patch: patch_value,
             patch_kind: patch_type,
             expected_resource_version: requested_rv.unwrap_or(pod.resource_version),
-        },
-    )
-    .await
-    .map_err(|e| AppError::from(e).with_resource_context("v1", "Pod", &name))?;
+        })
+        .await
+        .map_err(|e| AppError::from(e).with_resource_context("v1", "Pod", &name))?;
 
-    let result = crate::api::inject_resource_version(updated.data, updated.resource_version);
+    let result = inject_resource_version(updated.data, updated.resource_version);
     Ok(Json(result))
 }
 
 // PUT /api/v1/namespaces/{ns}/pods/{name}/status
-pub(in crate::api) async fn update_pod_status_subresource(
-    State(state): State<Arc<ApiState>>,
+pub async fn update_pod_status_subresource<S: GenericCommandState + 'static>(
+    State(state): State<Arc<S>>,
     Path((namespace, name)): Path<(String, String)>,
-    crate::api::LenientJson(body): crate::api::LenientJson<Value>,
+    LenientJson(body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
-    let pod = crate::api::pod_repository_ports::get_pod(
-        state.resource_mutation().pod_repository.as_ref(),
-        &namespace,
-        &name,
-    )
-    .await?
-    .ok_or_else(|| AppError::NotFound(format!("Pod {}/{} not found", namespace, name)))?;
+    let pod = get_pod(state.as_ref(), &namespace, &name)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Pod {}/{} not found", namespace, name)))?;
 
     // PUT /status overwrites the existing status with the caller's. If the
     // request body omits `status`, preserve today's behaviour and reuse
@@ -96,20 +82,20 @@ pub(in crate::api) async fn update_pod_status_subresource(
         .unwrap_or(Value::Null);
     let requested_rv = metadata_resource_version(&body);
 
-    let updated = klights_pod_api::PodSubresourceMutation::replace_status(
-        state.resource_mutation().pod_repository.as_ref(),
-        klights_pod_api::PodStatusReplaceRequest {
+    let updated = state
+        .command_store()
+        .pod_subresource_mutation()
+        .replace_status(klights_pod_api::PodStatusReplaceRequest {
             namespace: namespace.clone(),
             name: name.clone(),
             expected_uid: None,
             status: new_status,
             expected_resource_version: requested_rv.unwrap_or(pod.resource_version),
-        },
-    )
-    .await
-    .map_err(|e| AppError::from(e).with_resource_context("v1", "Pod", &name))?;
+        })
+        .await
+        .map_err(|e| AppError::from(e).with_resource_context("v1", "Pod", &name))?;
 
-    let result = crate::api::inject_resource_version(updated.data, updated.resource_version);
+    let result = inject_resource_version(updated.data, updated.resource_version);
     Ok(Json(result))
 }
 

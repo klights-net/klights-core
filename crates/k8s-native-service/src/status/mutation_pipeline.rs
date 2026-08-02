@@ -6,7 +6,8 @@ use axum::{Json, body::Bytes};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde_json::Value;
 
-use crate::api::{ApiState, AppError, apply_patch, inject_resource_version};
+use crate::generic_command::GenericCommandState;
+use crate::{AppError, inject_resource_version};
 use klights_cluster_core::{
     PatchKind, Resource, ResourcePatchRequest, ResourcePreconditions, StatusApplyFreshness,
     StatusApplyOrigin, merge_status_for_apply,
@@ -89,7 +90,11 @@ impl StatusMutationDecoder for K8sStatusMutationDecoder {
 
 pub trait StatusMutationOperation: Send + Sync {
     fn operation_name(&self) -> &'static str;
-    fn working_document(&self, current: &Resource) -> Result<Value, AppError>;
+    fn working_document(
+        &self,
+        current: &Resource,
+        patcher: &dyn PatchApplication,
+    ) -> Result<Value, AppError>;
     fn precondition_document(&self) -> &Value;
     fn status_value(&self, working_document: &Value) -> Option<Value>;
     fn metadata_patch(&self, current: &Resource, working_document: &Value) -> Option<Value>;
@@ -110,7 +115,11 @@ impl StatusMutationOperation for StatusPutOperation {
         "update"
     }
 
-    fn working_document(&self, _current: &Resource) -> Result<Value, AppError> {
+    fn working_document(
+        &self,
+        _current: &Resource,
+        _patcher: &dyn PatchApplication,
+    ) -> Result<Value, AppError> {
         Ok(self.body.clone())
     }
 
@@ -161,8 +170,12 @@ impl StatusMutationOperation for StatusPatchOperation {
         "patch"
     }
 
-    fn working_document(&self, current: &Resource) -> Result<Value, AppError> {
-        apply_patch(&current.data, &self.patch, self.content_type.as_deref())
+    fn working_document(
+        &self,
+        current: &Resource,
+        patcher: &dyn PatchApplication,
+    ) -> Result<Value, AppError> {
+        patcher.apply_patch(&current.data, &self.patch, self.content_type.as_deref())
     }
 
     fn precondition_document(&self) -> &Value {
@@ -229,8 +242,17 @@ impl StatusMutationMergePolicy for ApiSubresourceStatusMergePolicy {
     }
 }
 
+pub trait PatchApplication: Send + Sync {
+    fn apply_patch(
+        &self,
+        current: &Value,
+        patch: &Value,
+        content_type: Option<&str>,
+    ) -> Result<Value, AppError>;
+}
+
 #[async_trait]
-pub trait StatusMutationWriter: Send + Sync {
+pub trait StatusMutationWriter: PatchApplication + Send + Sync {
     async fn get(&self, target: &StatusMutationTarget) -> Result<Option<Resource>, AppError>;
     async fn write_status(
         &self,
@@ -246,21 +268,34 @@ pub trait StatusMutationWriter: Send + Sync {
     ) -> Result<(), AppError>;
 }
 
-pub struct DatastoreStatusMutationWriter {
-    state: Arc<ApiState>,
+pub struct DatastoreStatusMutationWriter<S> {
+    state: Arc<S>,
 }
 
-impl DatastoreStatusMutationWriter {
-    pub(in crate::api) fn new(state: Arc<ApiState>) -> Self {
+impl<S> DatastoreStatusMutationWriter<S> {
+    pub fn new(state: Arc<S>) -> Self {
         Self { state }
     }
 }
 
+impl<S: GenericCommandState> PatchApplication for DatastoreStatusMutationWriter<S> {
+    fn apply_patch(
+        &self,
+        current: &Value,
+        patch: &Value,
+        content_type: Option<&str>,
+    ) -> Result<Value, AppError> {
+        self.state
+            .command_policy()
+            .apply_patch(current, patch, content_type)
+    }
+}
+
 #[async_trait]
-impl StatusMutationWriter for DatastoreStatusMutationWriter {
+impl<S: GenericCommandState> StatusMutationWriter for DatastoreStatusMutationWriter<S> {
     async fn get(&self, target: &StatusMutationTarget) -> Result<Option<Resource>, AppError> {
-        crate::api::resource_query_ports::get_resource(
-            self.state.resource_mutation().resource_query.as_ref(),
+        crate::generic_read::get_resource(
+            self.state.command_store().resource_query(),
             &target.api_version,
             &target.kind,
             target.namespace.as_deref(),
@@ -275,8 +310,8 @@ impl StatusMutationWriter for DatastoreStatusMutationWriter {
         status: Value,
         preconditions: ResourcePreconditions,
     ) -> Result<(), AppError> {
-        crate::api::status_command_ports::update_resource_status(
-            self.state.resource_mutation().resource_command.as_ref(),
+        crate::generic_command::update_resource_status(
+            self.state.command_store().resource_command(),
             &target.api_version,
             &target.kind,
             target.namespace.as_deref(),
@@ -294,8 +329,8 @@ impl StatusMutationWriter for DatastoreStatusMutationWriter {
         metadata_patch: Value,
         preconditions: ResourcePreconditions,
     ) -> Result<(), AppError> {
-        k8s_native_service::generic_command::patch_non_pod_resource(
-            self.state.resource_mutation().resource_command.as_ref(),
+        crate::generic_command::patch_non_pod_resource(
+            self.state.command_store().resource_command(),
             &target.api_version,
             &target.kind,
             target.namespace.as_deref(),
@@ -332,7 +367,7 @@ impl StatusMutationResponder for ResourceStatusResponder {
         final_resource: Resource,
     ) -> Result<Value, AppError> {
         let data = if self.ensure_type_meta {
-            crate::api::status::ensure_type_meta(
+            super::helpers::ensure_type_meta(
                 final_resource.data.clone(),
                 &target.api_version,
                 &target.kind,
@@ -394,7 +429,7 @@ where
             .get(target)
             .await?
             .ok_or_else(|| AppError::NotFound(target.not_found_message()))?;
-        let working = operation.working_document(&current)?;
+        let working = operation.working_document(&current, &self.writer)?;
         let expected_rv = self
             .precondition
             .expected_resource_version(operation.precondition_document());
@@ -475,7 +510,11 @@ impl ScaleMutationTarget {
 }
 
 pub trait ScaleMutationOperation: Send + Sync {
-    fn desired_replicas(&self, current_scale: &Value) -> Result<i32, AppError>;
+    fn desired_replicas(
+        &self,
+        current_scale: &Value,
+        patcher: &dyn PatchApplication,
+    ) -> Result<i32, AppError>;
     fn expected_resource_version(&self) -> Result<Option<i64>, AppError>;
     fn strict_resource_version(&self) -> bool;
 }
@@ -491,7 +530,11 @@ impl ScalePutOperation {
 }
 
 impl ScaleMutationOperation for ScalePutOperation {
-    fn desired_replicas(&self, _current_scale: &Value) -> Result<i32, AppError> {
+    fn desired_replicas(
+        &self,
+        _current_scale: &Value,
+        _patcher: &dyn PatchApplication,
+    ) -> Result<i32, AppError> {
         extract_scale_replicas(&self.body)
     }
 
@@ -519,8 +562,13 @@ impl ScalePatchOperation {
 }
 
 impl ScaleMutationOperation for ScalePatchOperation {
-    fn desired_replicas(&self, current_scale: &Value) -> Result<i32, AppError> {
-        let patched = apply_patch(current_scale, &self.patch, self.content_type.as_deref())?;
+    fn desired_replicas(
+        &self,
+        current_scale: &Value,
+        patcher: &dyn PatchApplication,
+    ) -> Result<i32, AppError> {
+        let patched =
+            patcher.apply_patch(current_scale, &self.patch, self.content_type.as_deref())?;
         extract_scale_replicas(&patched)
     }
 
@@ -534,7 +582,7 @@ impl ScaleMutationOperation for ScalePatchOperation {
 }
 
 #[async_trait]
-pub trait ScaleMutationWriter: Send + Sync {
+pub trait ScaleMutationWriter: PatchApplication + Send + Sync {
     async fn get(&self, target: &ScaleMutationTarget) -> Result<Option<Resource>>;
     async fn write_replicas(
         &self,
@@ -546,21 +594,34 @@ pub trait ScaleMutationWriter: Send + Sync {
     async fn enqueue_reconcile(&self, resource: &Resource);
 }
 
-pub struct DatastoreScaleMutationWriter {
-    state: Arc<ApiState>,
+pub struct DatastoreScaleMutationWriter<S> {
+    state: Arc<S>,
 }
 
-impl DatastoreScaleMutationWriter {
-    pub(in crate::api) fn new(state: Arc<ApiState>) -> Self {
+impl<S> DatastoreScaleMutationWriter<S> {
+    pub fn new(state: Arc<S>) -> Self {
         Self { state }
     }
 }
 
+impl<S: GenericCommandState> PatchApplication for DatastoreScaleMutationWriter<S> {
+    fn apply_patch(
+        &self,
+        current: &Value,
+        patch: &Value,
+        content_type: Option<&str>,
+    ) -> Result<Value, AppError> {
+        self.state
+            .command_policy()
+            .apply_patch(current, patch, content_type)
+    }
+}
+
 #[async_trait]
-impl ScaleMutationWriter for DatastoreScaleMutationWriter {
+impl<S: GenericCommandState> ScaleMutationWriter for DatastoreScaleMutationWriter<S> {
     async fn get(&self, target: &ScaleMutationTarget) -> Result<Option<Resource>> {
-        crate::api::resource_query_ports::get_resource(
-            self.state.resource_mutation().resource_query.as_ref(),
+        crate::generic_read::get_resource(
+            self.state.command_store().resource_query(),
             &target.api_version,
             &target.kind,
             Some(&target.namespace),
@@ -587,8 +648,8 @@ impl ScaleMutationWriter for DatastoreScaleMutationWriter {
         } else {
             request
         };
-        k8s_native_service::generic_command::patch_non_pod_resource(
-            self.state.resource_mutation().resource_command.as_ref(),
+        crate::generic_command::patch_non_pod_resource(
+            self.state.command_store().resource_command(),
             &target.api_version,
             &target.kind,
             Some(&target.namespace),
@@ -602,8 +663,8 @@ impl ScaleMutationWriter for DatastoreScaleMutationWriter {
 
     async fn enqueue_reconcile(&self, resource: &Resource) {
         self.state
-            .controller_reconcile()
-            .controller_dispatcher
+            .command_reconcile()
+            .controller_dispatcher()
             .enqueue(&resource.data)
             .await;
     }
@@ -720,7 +781,7 @@ where
             .await?
             .ok_or_else(|| AppError::NotFound(target.not_found_message()))?;
         let current_scale = self.responder.current_scale(target, &current)?;
-        let replicas = operation.desired_replicas(&current_scale)?;
+        let replicas = operation.desired_replicas(&current_scale, &self.writer)?;
         let expected_resource_version = operation.expected_resource_version()?;
         let updated = self
             .writer
@@ -753,7 +814,11 @@ impl NamespaceStatusMutationTarget {
 
 pub trait NamespaceStatusMutationOperation: Send + Sync {
     fn operation_name(&self) -> &'static str;
-    fn working_document(&self, current: &Resource) -> Result<Value, AppError>;
+    fn working_document(
+        &self,
+        current: &Resource,
+        patcher: &dyn PatchApplication,
+    ) -> Result<Value, AppError>;
     fn precondition_document(&self) -> &Value;
 }
 
@@ -765,8 +830,12 @@ where
         StatusMutationOperation::operation_name(self)
     }
 
-    fn working_document(&self, current: &Resource) -> Result<Value, AppError> {
-        StatusMutationOperation::working_document(self, current)
+    fn working_document(
+        &self,
+        current: &Resource,
+        patcher: &dyn PatchApplication,
+    ) -> Result<Value, AppError> {
+        StatusMutationOperation::working_document(self, current, patcher)
     }
 
     fn precondition_document(&self) -> &Value {
@@ -800,6 +869,25 @@ pub trait NamespaceStatusMutationMergePolicy: Send + Sync {
 
 pub struct NamespaceStatusMergePolicy;
 
+pub(super) fn ensure_namespace_status_phase_active(data: &mut Value) {
+    let Some(object) = data.as_object_mut() else {
+        return;
+    };
+    let status = object
+        .entry("status".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !status.is_object() {
+        *status = serde_json::json!({});
+    }
+    if let Some(status) = status.as_object_mut()
+        && status.get("phase").is_none_or(|phase| {
+            phase.is_null() || phase.as_str().is_some_and(|phase| phase.trim().is_empty())
+        })
+    {
+        status.insert("phase".to_string(), Value::String("Active".to_string()));
+    }
+}
+
 impl NamespaceStatusMutationMergePolicy for NamespaceStatusMergePolicy {
     fn merge<O>(
         &self,
@@ -822,13 +910,13 @@ impl NamespaceStatusMutationMergePolicy for NamespaceStatusMergePolicy {
         } else {
             working_document
         };
-        crate::api::ensure_namespace_status_phase_active(&mut merged);
+        ensure_namespace_status_phase_active(&mut merged);
         Ok(merged)
     }
 }
 
 #[async_trait]
-pub trait NamespaceStatusMutationWriter: Send + Sync {
+pub trait NamespaceStatusMutationWriter: PatchApplication + Send + Sync {
     async fn get(&self, target: &NamespaceStatusMutationTarget) -> Result<Option<Resource>>;
     async fn update(
         &self,
@@ -838,21 +926,36 @@ pub trait NamespaceStatusMutationWriter: Send + Sync {
     ) -> Result<Resource>;
 }
 
-pub struct DatastoreNamespaceStatusMutationWriter {
-    state: Arc<ApiState>,
+pub struct DatastoreNamespaceStatusMutationWriter<S> {
+    state: Arc<S>,
 }
 
-impl DatastoreNamespaceStatusMutationWriter {
-    pub(in crate::api) fn new(state: Arc<ApiState>) -> Self {
+impl<S> DatastoreNamespaceStatusMutationWriter<S> {
+    pub fn new(state: Arc<S>) -> Self {
         Self { state }
     }
 }
 
+impl<S: GenericCommandState> PatchApplication for DatastoreNamespaceStatusMutationWriter<S> {
+    fn apply_patch(
+        &self,
+        current: &Value,
+        patch: &Value,
+        content_type: Option<&str>,
+    ) -> Result<Value, AppError> {
+        self.state
+            .command_policy()
+            .apply_patch(current, patch, content_type)
+    }
+}
+
 #[async_trait]
-impl NamespaceStatusMutationWriter for DatastoreNamespaceStatusMutationWriter {
+impl<S: GenericCommandState> NamespaceStatusMutationWriter
+    for DatastoreNamespaceStatusMutationWriter<S>
+{
     async fn get(&self, target: &NamespaceStatusMutationTarget) -> Result<Option<Resource>> {
-        crate::api::resource_query_ports::get_resource(
-            self.state.resource_mutation().resource_query.as_ref(),
+        crate::generic_read::get_resource(
+            self.state.command_store().resource_query(),
             "v1",
             "Namespace",
             None,
@@ -868,8 +971,8 @@ impl NamespaceStatusMutationWriter for DatastoreNamespaceStatusMutationWriter {
         body: Value,
         expected_rv: i64,
     ) -> Result<Resource> {
-        k8s_native_service::generic_command::update_namespace(
-            self.state.resource_mutation().resource_command.as_ref(),
+        crate::generic_command::update_namespace(
+            self.state.command_store().resource_command(),
             &target.name,
             body,
             expected_rv,
@@ -944,7 +1047,7 @@ where
             .get(target)
             .await?
             .ok_or_else(|| AppError::NotFound(target.not_found_message()))?;
-        let working = operation.working_document(&current)?;
+        let working = operation.working_document(&current, &self.writer)?;
         let expected_rv = self
             .precondition
             .expected_resource_version(&current, operation.precondition_document());
@@ -1082,4 +1185,59 @@ fn selector_string_from_flat_selector(resource: &Resource) -> String {
                 .join(",")
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phase17c_scale_response_preserves_resource_version_and_status_shape() {
+        let response = build_scale_response(
+            "web",
+            "default",
+            42,
+            3,
+            2,
+            "app=web,tier=frontend".to_string(),
+        );
+
+        assert_eq!(response["apiVersion"], "autoscaling/v1");
+        assert_eq!(response["kind"], "Scale");
+        assert_eq!(response["metadata"]["name"], "web");
+        assert_eq!(response["metadata"]["namespace"], "default");
+        assert_eq!(response["metadata"]["resourceVersion"], "42");
+        assert_eq!(response["spec"]["replicas"], 3);
+        assert_eq!(response["status"]["replicas"], 2);
+        assert_eq!(response["status"]["selector"], "app=web,tier=frontend");
+    }
+
+    #[test]
+    fn phase17c_scale_resource_version_validation_remains_exact() {
+        let cases = [
+            (serde_json::json!({}), None),
+            (
+                serde_json::json!({"metadata": {"resourceVersion": ""}}),
+                None,
+            ),
+            (
+                serde_json::json!({"metadata": {"resourceVersion": "17"}}),
+                Some(17),
+            ),
+        ];
+
+        for (body, expected) in cases {
+            assert_eq!(extract_scale_resource_version(&body).unwrap(), expected);
+        }
+        let error = extract_scale_resource_version(
+            &serde_json::json!({"metadata": {"resourceVersion": "not-an-integer"}}),
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert!(matches!(
+            error,
+            AppError::BadRequest(message)
+                if message == "metadata.resourceVersion must be an integer string"
+        ));
+    }
 }

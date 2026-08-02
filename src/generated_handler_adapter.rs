@@ -289,6 +289,7 @@ impl GeneratedWatchPort for GeneratedHandlerAdapter {
                     label_selector: request.label_selector,
                     field_selector: request.field_selector,
                     table_format: request.table_format,
+                    table_renderer: crate::api::watch_event_to_table_at,
                     stream_format: request.stream_format,
                     timeout_seconds: request.timeout_seconds,
                     emit_initial_state_for_resource_version_zero: request

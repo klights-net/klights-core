@@ -49,47 +49,39 @@ where
     ))
 }
 
-pub(in crate::api) async fn get_pod_ephemeral_containers(
-    State(state): State<Arc<ApiState>>,
+pub async fn get_pod_ephemeral_containers<S: GenericCommandState + 'static>(
+    State(state): State<Arc<S>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
-    let pod = crate::api::pod_repository_ports::get_pod(
-        state.resource_mutation().pod_repository.as_ref(),
-        &namespace,
-        &name,
-    )
-    .await?
-    .ok_or_else(|| AppError::NotFound(format!("Pod {}/{} not found", namespace, name)))?;
+    let pod = get_pod(state.as_ref(), &namespace, &name)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Pod {}/{} not found", namespace, name)))?;
 
-    let pod_with_rv = crate::api::inject_resource_version(pod.data, pod.resource_version);
+    let pod_with_rv = inject_resource_version(pod.data, pod.resource_version);
     Ok(Json(pod_with_rv))
 }
 
 // PUT /api/v1/namespaces/{ns}/pods/{name}/ephemeralcontainers
-pub(in crate::api) async fn update_pod_ephemeral_containers(
-    State(state): State<Arc<ApiState>>,
+pub async fn update_pod_ephemeral_containers<S: GenericCommandState + 'static>(
+    State(state): State<Arc<S>>,
     Path((namespace, name)): Path<(String, String)>,
-    crate::api::LenientJson(body): crate::api::LenientJson<Value>,
+    LenientJson(body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
     // Read-merge-write with bounded 409-conflict retry. Each attempt re-reads
     // the Pod (fresh resourceVersion) so a concurrent kubelet status write no
     // longer fails the stale-RV precondition.
     let ns_owned = namespace.clone();
     let name_owned = name.clone();
-    let supervisor = state.operational().task_supervisor.clone();
+    let supervisor = state.command_runtime().task_supervisor_owned();
     let persist = move || {
         let state = state.clone();
         let ns = ns_owned.clone();
         let name = name_owned.clone();
         let body = body.clone();
         Box::pin(async move {
-            let pod = crate::api::pod_repository_ports::get_pod(
-                state.resource_mutation().pod_repository.as_ref(),
-                &ns,
-                &name,
-            )
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("Pod {}/{} not found", ns, name)))?;
+            let pod = get_pod(state.as_ref(), &ns, &name)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("Pod {}/{} not found", ns, name)))?;
 
             // K8s spec: ephemeral containers are append-only — existing
             // containers cannot be removed or modified. Validation lives in the
@@ -125,13 +117,13 @@ pub(in crate::api) async fn update_pod_ephemeral_containers(
         EPHEMERAL_CONFLICT_MAX_ATTEMPTS,
     )
     .await?;
-    let result = crate::api::inject_resource_version(updated.data, updated.resource_version);
+    let result = inject_resource_version(updated.data, updated.resource_version);
     Ok(Json(result))
 }
 
 // PATCH /api/v1/namespaces/{ns}/pods/{name}/ephemeralcontainers
-pub(in crate::api) async fn patch_pod_ephemeral_containers(
-    State(state): State<Arc<ApiState>>,
+pub async fn patch_pod_ephemeral_containers<S: GenericCommandState + 'static>(
+    State(state): State<Arc<S>>,
     Path((namespace, name)): Path<(String, String)>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
@@ -147,24 +139,23 @@ pub(in crate::api) async fn patch_pod_ephemeral_containers(
     // the Pod (fresh resourceVersion) and re-applies the patch.
     let ns_owned = namespace.clone();
     let name_owned = name.clone();
-    let supervisor = state.operational().task_supervisor.clone();
+    let supervisor = state.command_runtime().task_supervisor_owned();
     let persist = move || {
         let state = state.clone();
         let ns = ns_owned.clone();
         let name = name_owned.clone();
         let patch_value = patch_value.clone();
         Box::pin(async move {
-            let pod = crate::api::pod_repository_ports::get_pod(
-                state.resource_mutation().pod_repository.as_ref(),
-                &ns,
-                &name,
-            )
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("Pod {}/{} not found", ns, name)))?;
+            let pod = get_pod(state.as_ref(), &ns, &name)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("Pod {}/{} not found", ns, name)))?;
 
             // Apply the patch to the full pod (immutability validation lives in
             // the handler; the repository only persists).
-            let patched = crate::api::apply_patch(&pod.data, &patch_value, content_type)?;
+            let patched =
+                state
+                    .command_policy()
+                    .apply_patch(&pod.data, &patch_value, content_type)?;
 
             // Extract only spec.ephemeralContainers from the patch result.
             // K8s behavior: append-only by container name; existing ephemeral
@@ -188,7 +179,7 @@ pub(in crate::api) async fn patch_pod_ephemeral_containers(
         EPHEMERAL_CONFLICT_MAX_ATTEMPTS,
     )
     .await?;
-    let result = crate::api::inject_resource_version(updated.data, updated.resource_version);
+    let result = inject_resource_version(updated.data, updated.resource_version);
     Ok(Json(result))
 }
 
@@ -256,8 +247,8 @@ fn merge_append_only_ephemeral_containers(
 /// matching today's behaviour for empty PUT/PATCH bodies. The repository
 /// itself bumps `metadata.generation` when the new list grows, so the
 /// handler does not need a second write.
-async fn persist_ephemeral_containers(
-    state: &Arc<ApiState>,
+async fn persist_ephemeral_containers<S: GenericCommandState + ?Sized>(
+    state: &Arc<S>,
     namespace: &str,
     name: &str,
     pod: &klights_cluster_core::Resource,
@@ -275,27 +266,27 @@ async fn persist_ephemeral_containers(
             .unwrap_or_default(),
     };
 
-    klights_pod_api::PodSubresourceMutation::update_ephemeral_containers(
-        state.resource_mutation().pod_repository.as_ref(),
-        klights_pod_api::PodEphemeralContainersRequest {
+    state
+        .command_store()
+        .pod_subresource_mutation()
+        .update_ephemeral_containers(klights_pod_api::PodEphemeralContainersRequest {
             namespace: namespace.to_string(),
             name: name.to_string(),
             containers: to_persist,
             expected_resource_version: pod.resource_version,
-        },
-    )
-    .await
-    .map_err(|error| {
-        // Surface optimistic-concurrency conflicts as Kubernetes 409 Conflict so
-        // the bounded retry loop (and clients) can distinguish a transient
-        // status-write race from a real internal failure.
-        match error {
-            klights_pod_api::PodRepositoryError::Conflict { message } => {
-                AppError::Conflict(format!("ephemeralcontainers update conflict: {message}"))
+        })
+        .await
+        .map_err(|error| {
+            // Surface optimistic-concurrency conflicts as Kubernetes 409 Conflict so
+            // the bounded retry loop (and clients) can distinguish a transient
+            // status-write race from a real internal failure.
+            match error {
+                klights_pod_api::PodRepositoryError::Conflict { message } => {
+                    AppError::Conflict(format!("ephemeralcontainers update conflict: {message}"))
+                }
+                other => AppError::from(other),
             }
-            other => AppError::from(other),
-        }
-    })
+        })
 }
 
 /// Kubernetes subresource clients can send ephemeral container updates in

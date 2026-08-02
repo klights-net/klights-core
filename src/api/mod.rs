@@ -54,6 +54,8 @@ mod response;
 #[cfg(test)]
 mod response_tests;
 mod routes;
+#[cfg(test)]
+mod scale_status_integration_tests;
 pub mod server_side_apply;
 mod state_composition;
 pub(crate) mod state_ports;
@@ -64,8 +66,14 @@ mod task_supervisor;
 pub mod test_support;
 mod validation;
 pub(crate) mod version;
-mod watch_event;
-pub(crate) mod watch_stream;
+#[cfg(test)]
+mod watch_transport_parity_tests;
+pub(crate) mod watch_event {
+    pub use k8s_native_service::watch::{EventType, WatchEvent};
+}
+pub(crate) mod watch_stream {
+    pub use k8s_native_service::watch::*;
+}
 
 #[cfg(test)]
 mod defaulting_tests;
@@ -165,9 +173,10 @@ pub use quotas::{
 pub use response::K8sResponse;
 #[cfg(test)]
 pub use response::prefers_protobuf;
+pub(crate) use response::watch_event_to_table_at;
 #[cfg(test)]
 use response::{node_list_to_table, pod_list_to_table, watch_event_to_table};
-use response::{pod_list_to_table_at, wants_table_format, watch_event_to_table_at};
+use response::{pod_list_to_table_at, wants_table_format};
 #[cfg(test)]
 pub(crate) use routes::build_router;
 #[cfg(test)]

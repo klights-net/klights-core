@@ -79,6 +79,7 @@ pub(in crate::api) async fn list_namespaces(
             label_selector,
             field_selector,
             table_format: false,
+            table_renderer: crate::api::watch_event_to_table_at,
             stream_format,
             timeout_seconds: query.timeout_seconds,
             emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,

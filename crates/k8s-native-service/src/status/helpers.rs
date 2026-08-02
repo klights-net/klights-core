@@ -8,12 +8,16 @@ use axum::{
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::api::status::{
+use super::{
     ApiSubresourceStatusMergePolicy, DatastoreStatusMutationWriter,
     LenientStatusResourceVersionPrecondition, ResourceStatusResponder, StatusMutationPipeline,
     StatusMutationTarget, StatusPatchOperation, StatusPutOperation,
 };
-use crate::api::{ApiState, AppError, K8sResponse, LenientJson, inject_resource_version};
+use crate::{
+    AppError, K8sResponse, LenientJson,
+    generic_command::{GenericCommandState, dispatch_mutation_event},
+    generic_read, inject_resource_version,
+};
 
 pub fn ensure_type_meta(
     obj: impl Into<std::sync::Arc<Value>>,
@@ -56,8 +60,8 @@ pub fn decode_patch_body(body: &Bytes) -> Result<Value, AppError> {
     }
 }
 
-async fn enqueue_post_status_reconcile(
-    state: &ApiState,
+async fn enqueue_post_status_reconcile<S: GenericCommandState>(
+    state: &S,
     api_version: &str,
     kind: &str,
     resource_data: &Value,
@@ -76,14 +80,14 @@ async fn enqueue_post_status_reconcile(
     }
 
     state
-        .controller_reconcile()
-        .controller_dispatcher
+        .command_reconcile()
+        .controller_dispatcher()
         .enqueue(resource_data)
         .await;
 }
 
-async fn dispatch_resource_quota_status_reconcile(
-    state: &ApiState,
+async fn dispatch_resource_quota_status_reconcile<S: GenericCommandState>(
+    state: &S,
     api_version: &str,
     kind: &str,
     resource: &Value,
@@ -91,14 +95,14 @@ async fn dispatch_resource_quota_status_reconcile(
     if (api_version, kind) != ("v1", "ResourceQuota") {
         return;
     }
-    k8s_native_service::generic_command::dispatch_mutation_event(
-        state.resource_mutation().mutation_effects.as_ref(),
-        k8s_native_service::generic_command::MutationEvent {
+    dispatch_mutation_event(
+        state.command_lifecycle().mutation_effects(),
+        crate::generic_command::MutationEvent {
             operation: klights_reconcile_api::MutationOperation::Update,
             resource,
             old_resource: None,
             persisted: true,
-            dry_run: k8s_native_service::generic_command::DryRunMode::Live,
+            dry_run: crate::generic_command::DryRunMode::Live,
             context: "resourcequota-status",
         },
     )
@@ -118,8 +122,8 @@ async fn dispatch_resource_quota_status_reconcile(
 /// read-modify-write window, so a concurrent user `kubectl scale` (PATCH on
 /// `.spec.replicas`) cannot be lost between the controller's read and the
 /// status write.
-pub(in crate::api) async fn update_status_subresource(
-    state: Arc<ApiState>,
+pub async fn update_status_subresource<S: GenericCommandState + 'static>(
+    state: Arc<S>,
     api_version: String,
     kind: String,
     namespace: String,
@@ -156,8 +160,8 @@ pub(in crate::api) async fn update_status_subresource(
     Ok(K8sResponse::new(outcome.response, &headers))
 }
 
-pub(in crate::api) async fn patch_status_subresource(
-    state: Arc<ApiState>,
+pub async fn patch_status_subresource<S: GenericCommandState + 'static>(
+    state: Arc<S>,
     api_version: String,
     kind: String,
     namespace: String,
@@ -200,16 +204,16 @@ pub(in crate::api) async fn patch_status_subresource(
 
 // Generic cluster-scoped status helpers moved for cross-module re-use.
 /// Generic status GET handler for namespaced resources.
-pub(in crate::api) async fn get_namespaced_status_subresource(
-    state: Arc<ApiState>,
+pub async fn get_namespaced_status_subresource<S: GenericCommandState + 'static>(
+    state: Arc<S>,
     api_version: String,
     kind: String,
     namespace: String,
     name: String,
     headers: HeaderMap,
 ) -> Result<K8sResponse, AppError> {
-    let resource = crate::api::resource_query_ports::get_resource(
-        state.resource_mutation().resource_query.as_ref(),
+    let resource = generic_read::get_resource(
+        state.command_store().resource_query(),
         &api_version,
         &kind,
         Some(&namespace),
@@ -223,15 +227,15 @@ pub(in crate::api) async fn get_namespaced_status_subresource(
 }
 
 /// Generic status GET handler for cluster-scoped resources.
-pub(in crate::api) async fn get_cluster_status_subresource(
-    state: Arc<ApiState>,
+pub async fn get_cluster_status_subresource<S: GenericCommandState + 'static>(
+    state: Arc<S>,
     api_version: String,
     kind: String,
     name: String,
     headers: HeaderMap,
 ) -> Result<K8sResponse, AppError> {
-    let resource = crate::api::resource_query_ports::get_resource(
-        state.resource_mutation().resource_query.as_ref(),
+    let resource = generic_read::get_resource(
+        state.command_store().resource_query(),
         &api_version,
         &kind,
         None,
@@ -243,8 +247,8 @@ pub(in crate::api) async fn get_cluster_status_subresource(
     Ok(K8sResponse::new(result, &headers))
 }
 
-pub(in crate::api) async fn update_cluster_status_subresource_with_headers(
-    state: Arc<ApiState>,
+pub async fn update_cluster_status_subresource_with_headers<S: GenericCommandState + 'static>(
+    state: Arc<S>,
     api_version: String,
     kind: String,
     name: String,
@@ -391,8 +395,8 @@ mod tests {
 }
 
 /// Generic status PATCH handler for cluster-scoped resources.
-pub(in crate::api) async fn patch_cluster_status_subresource(
-    state: Arc<ApiState>,
+pub async fn patch_cluster_status_subresource<S: GenericCommandState + 'static>(
+    state: Arc<S>,
     api_version: String,
     kind: String,
     name: String,
@@ -423,13 +427,13 @@ pub(in crate::api) async fn patch_cluster_status_subresource(
 #[macro_export]
 macro_rules! namespaced_status_update_handler {
     ($fn_name:ident, $api_version:expr_2021, $kind:expr_2021) => {
-        pub(in super::super) async fn $fn_name(
-            State(state): State<Arc<ApiState>>,
+        pub async fn $fn_name<S: $crate::generic_command::GenericCommandState + 'static>(
+            State(state): State<Arc<S>>,
             Path((namespace, name)): Path<(String, String)>,
             headers: HeaderMap,
             LenientJson(body): LenientJson<Value>,
         ) -> Result<K8sResponse, AppError> {
-            $crate::api::status::update_status_subresource(
+            $crate::status::update_status_subresource(
                 state,
                 $api_version.to_string(),
                 $kind.to_string(),
@@ -446,14 +450,14 @@ macro_rules! namespaced_status_update_handler {
 #[macro_export]
 macro_rules! namespaced_status_patch_handler {
     ($fn_name:ident, $api_version:expr_2021, $kind:expr_2021) => {
-        pub(in super::super) async fn $fn_name(
-            State(state): State<Arc<ApiState>>,
+        pub async fn $fn_name<S: $crate::generic_command::GenericCommandState + 'static>(
+            State(state): State<Arc<S>>,
             Path((namespace, name)): Path<(String, String)>,
             headers: HeaderMap,
             body: Bytes,
         ) -> Result<K8sResponse, AppError> {
-            let patch: Value = $crate::api::status::decode_patch_body(&body)?;
-            $crate::api::status::patch_status_subresource(
+            let patch: Value = $crate::status::decode_patch_body(&body)?;
+            $crate::status::patch_status_subresource(
                 state,
                 $api_version.to_string(),
                 $kind.to_string(),
@@ -470,12 +474,12 @@ macro_rules! namespaced_status_patch_handler {
 #[macro_export]
 macro_rules! namespaced_status_get_handler {
     ($fn_name:ident, $api_version:expr_2021, $kind:expr_2021) => {
-        pub(in super::super) async fn $fn_name(
-            State(state): State<Arc<ApiState>>,
+        pub async fn $fn_name<S: $crate::generic_command::GenericCommandState + 'static>(
+            State(state): State<Arc<S>>,
             Path((namespace, name)): Path<(String, String)>,
             headers: HeaderMap,
         ) -> Result<K8sResponse, AppError> {
-            $crate::api::status::get_namespaced_status_subresource(
+            $crate::status::get_namespaced_status_subresource(
                 state,
                 $api_version.to_string(),
                 $kind.to_string(),
@@ -491,12 +495,12 @@ macro_rules! namespaced_status_get_handler {
 #[macro_export]
 macro_rules! cluster_status_get_handler {
     ($fn_name:ident, $api_version:expr_2021, $kind:expr_2021) => {
-        pub(in super::super) async fn $fn_name(
-            State(state): State<Arc<ApiState>>,
+        pub async fn $fn_name<S: $crate::generic_command::GenericCommandState + 'static>(
+            State(state): State<Arc<S>>,
             Path(name): Path<String>,
             headers: HeaderMap,
         ) -> Result<K8sResponse, AppError> {
-            $crate::api::status::get_cluster_status_subresource(
+            $crate::status::get_cluster_status_subresource(
                 state,
                 $api_version.to_string(),
                 $kind.to_string(),
@@ -511,13 +515,13 @@ macro_rules! cluster_status_get_handler {
 #[macro_export]
 macro_rules! cluster_status_update_handler {
     ($fn_name:ident, $api_version:expr_2021, $kind:expr_2021) => {
-        pub(in super::super) async fn $fn_name(
-            State(state): State<Arc<ApiState>>,
+        pub async fn $fn_name<S: $crate::generic_command::GenericCommandState + 'static>(
+            State(state): State<Arc<S>>,
             Path(name): Path<String>,
             headers: HeaderMap,
             LenientJson(body): LenientJson<Value>,
         ) -> Result<K8sResponse, AppError> {
-            $crate::api::status::update_cluster_status_subresource_with_headers(
+            $crate::status::update_cluster_status_subresource_with_headers(
                 state,
                 $api_version.to_string(),
                 $kind.to_string(),
@@ -533,14 +537,14 @@ macro_rules! cluster_status_update_handler {
 #[macro_export]
 macro_rules! cluster_status_patch_handler {
     ($fn_name:ident, $api_version:expr_2021, $kind:expr_2021) => {
-        pub(in super::super) async fn $fn_name(
-            State(state): State<Arc<ApiState>>,
+        pub async fn $fn_name<S: $crate::generic_command::GenericCommandState + 'static>(
+            State(state): State<Arc<S>>,
             Path(name): Path<String>,
             headers: HeaderMap,
             body: Bytes,
         ) -> Result<K8sResponse, AppError> {
-            let patch: Value = $crate::api::status::decode_patch_body(&body)?;
-            $crate::api::status::patch_cluster_status_subresource(
+            let patch: Value = $crate::status::decode_patch_body(&body)?;
+            $crate::status::patch_cluster_status_subresource(
                 state,
                 $api_version.to_string(),
                 $kind.to_string(),
@@ -582,13 +586,13 @@ namespaced_status_patch_handler!(patch_service_status, "v1", "Service");
 namespaced_status_update_handler!(update_ingress_status, "networking.k8s.io/v1", "Ingress");
 namespaced_status_patch_handler!(patch_ingress_status, "networking.k8s.io/v1", "Ingress");
 
-pub(in crate::api) async fn update_node_status(
-    State(state): State<Arc<ApiState>>,
+pub async fn update_node_status<S: GenericCommandState + 'static>(
+    State(state): State<Arc<S>>,
     Path(name): Path<String>,
     headers: HeaderMap,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<K8sResponse, AppError> {
-    crate::api::status::update_cluster_status_subresource_with_headers(
+    update_cluster_status_subresource_with_headers(
         state,
         "v1".to_string(),
         "Node".to_string(),

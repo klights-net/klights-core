@@ -6,10 +6,16 @@
 
 pub mod discovery;
 mod error;
+mod extractor;
 pub mod generic_command;
 pub mod generic_read;
+mod resource_projection;
 mod router;
 mod state;
+pub mod status;
+pub mod subresources;
+mod unary_response;
+pub mod watch;
 
 pub use discovery::{
     api_group_by_name, api_groups, custom_resource_discovery, get_openapi_v2,
@@ -18,5 +24,8 @@ pub use discovery::{
 pub use error::{
     AppError, StatusCause, map_mutating_admission_error, map_validating_admission_error,
 };
+pub use extractor::LenientJson;
+pub use resource_projection::inject_resource_version;
 pub use router::CurrentRouter;
 pub use state::ApiState;
+pub use unary_response::K8sResponse;

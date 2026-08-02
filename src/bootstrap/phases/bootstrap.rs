@@ -958,6 +958,35 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         controller_identity.clone(),
     );
     #[cfg(test)]
+    let api_pod_logs = {
+        let pod_logs_root = crate::paths::pod_logs_root_path(&config.containerd_namespace);
+        let clock: Arc<dyn klights_supervisor::WallClock> =
+            Arc::new(klights_supervisor::SystemWallClock);
+        crate::node_log_runtime_adapter::pod_log_capabilities(
+            Arc::new(
+                klights_kubelet::node_api::logs::LocalNodeLogRuntime::new_with_pod_event_store(
+                    pod_logs_root.clone(),
+                    supervisor.clone(),
+                    clock.clone(),
+                    klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(Arc::new(
+                        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
+                            leader_ports.watch.clone(),
+                        ),
+                    )),
+                ),
+            ),
+            Arc::new(
+                klights_kubelet::node_api::logs::LocalNodeLogRuntime::new_without_pod_event_store(
+                    pod_logs_root,
+                    supervisor.clone(),
+                    clock,
+                ),
+            ),
+            supervisor.clone(),
+            config.node_name.clone(),
+        )
+    };
+    #[cfg(test)]
     let watcher_state = Arc::new(api::ApiState::new(
         crate::api::ApiAuthPolicy::new(
             std::sync::Arc::new(
@@ -1067,11 +1096,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     services.clone(),
                 ),
             ),
-            klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(Arc::new(
-                crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
-                    leader_ports.watch.clone(),
-                ),
-            )),
+            api_pod_logs,
             None,
             node_metrics.clone(),
             node_port_forward,
@@ -1695,6 +1720,37 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         )
     });
     #[cfg(not(test))]
+    let api_pod_logs = {
+        let pod_logs_root = crate::paths::pod_logs_root_path(&config.containerd_namespace);
+        let clock: Arc<dyn klights_supervisor::WallClock> =
+            Arc::new(klights_supervisor::SystemWallClock);
+        let local_http: Arc<dyn klights_node_api::NodeLogRuntime> = Arc::new(
+            klights_kubelet::node_api::logs::LocalNodeLogRuntime::new_with_pod_event_store(
+                pod_logs_root.clone(),
+                supervisor.clone(),
+                clock.clone(),
+                klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(Arc::new(
+                    crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
+                        leader_ports.watch.clone(),
+                    ),
+                )),
+            ),
+        );
+        let local_websocket: Arc<dyn klights_node_api::NodeLogRuntime> = Arc::new(
+            klights_kubelet::node_api::logs::LocalNodeLogRuntime::new_without_pod_event_store(
+                pod_logs_root,
+                supervisor.clone(),
+                clock,
+            ),
+        );
+        crate::node_log_runtime_adapter::pod_log_capabilities(
+            local_http,
+            local_websocket,
+            supervisor.clone(),
+            config.node_name.clone(),
+        )
+    };
+    #[cfg(not(test))]
     let api_signing_keys =
         crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::load(
             &service_account_signing_key_path,
@@ -1766,11 +1822,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         Arc::new(
             crate::bootstrap::network_adapters::ApiServiceRoutingSyncAdapter::new(services.clone()),
         ),
-        klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(Arc::new(
-            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
-                leader_ports.watch.clone(),
-            ),
-        )),
+        api_pod_logs,
         local_node_exec,
         node_metrics.clone(),
         node_port_forward,

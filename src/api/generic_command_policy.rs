@@ -56,6 +56,15 @@ impl GenericCommandAuthorization for ApiAuthPolicy {
 }
 
 impl GenericCommandPolicy for ApiResourceMutationServices {
+    fn apply_patch(
+        &self,
+        current: &Value,
+        patch: &Value,
+        content_type: Option<&str>,
+    ) -> Result<Value, AppError> {
+        apply_patch(current, patch, content_type)
+    }
+
     fn decode_patch<'a>(
         &'a self,
         headers: &'a HeaderMap,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::api::query::CreateUpdateQuery;
+use crate::generic_command::CreateUpdateQuery;
 
 #[derive(Default, serde::Deserialize)]
 struct EvictionDeleteOptions {
@@ -21,8 +21,8 @@ struct EvictionPreconditions {
     resource_version: Option<String>,
 }
 
-pub(in crate::api) async fn pod_eviction(
-    State(state): State<Arc<ApiState>>,
+pub async fn pod_eviction<S: GenericCommandState + 'static>(
+    State(state): State<Arc<S>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     body: Bytes,
@@ -54,15 +54,7 @@ pub(in crate::api) async fn pod_eviction(
         .unwrap_or_default();
     let dry_run = eviction_dry_run(&query, &delete_options.dry_run)?;
 
-    let request =
-        klights_pod_api::PodGetRequest::try_by_name(&namespace, &name).map_err(AppError::from)?;
-    let Some(pod) = klights_pod_api::PodQuery::get_pod(
-        state.resource_mutation().pod_repository.as_ref(),
-        request,
-    )
-    .await
-    .map_err(AppError::from)?
-    else {
+    let Some(pod) = get_pod(state.as_ref(), &namespace, &name).await? else {
         return Err(AppError::NotFound(format!(
             "pod {namespace}/{name} not found"
         )));
@@ -80,9 +72,8 @@ pub(in crate::api) async fn pod_eviction(
     );
 
     let admission = state
-        .resource_mutation()
-        .pod_repository
-        .eviction_admission_port()
+        .command_store()
+        .pod_eviction_admission()
         .admit_pod_eviction(klights_reconcile_api::PodEvictionAdmissionRequest { pod, dry_run })
         .await
         .map_err(|error| AppError::ServiceUnavailable(error.to_string()))?;
@@ -90,18 +81,20 @@ pub(in crate::api) async fn pod_eviction(
         return Ok(response);
     }
 
-    let outcome = klights_pod_api::PodEvictionDelete::delete_for_eviction(
-        state.resource_mutation().pod_repository.as_ref(),
-        klights_pod_api::PodEvictionDeleteRequest::try_new(
-            &namespace,
-            &name,
-            pod_delete_options,
-            dry_run,
+    let outcome = state
+        .command_store()
+        .pod_eviction_delete()
+        .delete_for_eviction(
+            klights_pod_api::PodEvictionDeleteRequest::try_new(
+                &namespace,
+                &name,
+                pod_delete_options,
+                dry_run,
+            )
+            .map_err(AppError::from)?,
         )
-        .map_err(AppError::from)?,
-    )
-    .await
-    .map_err(AppError::from)?;
+        .await
+        .map_err(AppError::from)?;
 
     if matches!(
         outcome,
@@ -142,7 +135,7 @@ fn validate_eviction_identity(
 }
 
 fn eviction_dry_run(query: &CreateUpdateQuery, body: &[String]) -> Result<bool, AppError> {
-    Ok(k8s_native_service::generic_command::DryRunMode::from_eviction(query, body)?.is_all())
+    Ok(crate::generic_command::DryRunMode::from_eviction(query, body)?.is_all())
 }
 
 fn admission_response(
@@ -248,5 +241,40 @@ mod tests {
             response.headers().get(axum::http::header::RETRY_AFTER),
             Some(&axum::http::HeaderValue::from_static("10"))
         );
+    }
+
+    #[test]
+    fn phase17c_eviction_identity_remains_bound_to_url_coordinates() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "apiVersion": "policy/v1",
+                    "kind": "Pod",
+                    "metadata": {"name": "victim", "namespace": "default"}
+                }),
+                "request body must be a policy/v1 Eviction",
+            ),
+            (
+                serde_json::json!({
+                    "apiVersion": "policy/v1",
+                    "kind": "Eviction",
+                    "metadata": {"name": "replacement", "namespace": "default"}
+                }),
+                "name in URL does not match name in Eviction object",
+            ),
+            (
+                serde_json::json!({
+                    "apiVersion": "policy/v1",
+                    "kind": "Eviction",
+                    "metadata": {"name": "victim", "namespace": "other"}
+                }),
+                "namespace in URL does not match namespace in Eviction object",
+            ),
+        ];
+
+        for (body, expected) in cases {
+            let error = validate_eviction_identity(&body, "default", "victim").unwrap_err();
+            assert!(matches!(error, AppError::BadRequest(message) if message == expected));
+        }
     }
 }

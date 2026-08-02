@@ -56,6 +56,32 @@ pub async fn update_namespace(
     resource_result(result, "namespace update")
 }
 
+pub async fn update_resource_status(
+    command: &dyn LeaderResourceCommand,
+    api_version: &str,
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+    status: serde_json::Value,
+    preconditions: ResourcePreconditions,
+) -> Result<klights_cluster_core::Resource, AppError> {
+    let request = ResourceCommandRequest::try_new(StorageCommand::UpdateStatus {
+        api_version: api_version.to_string(),
+        kind: kind.to_string(),
+        namespace: namespace.map(str::to_string),
+        name: name.to_string(),
+        status,
+        expected_rv: preconditions.resource_version,
+        preconditions,
+        observed_status_stamp: None,
+    })?;
+    let result = command
+        .submit_resource_command(request)
+        .await
+        .map_err(AppError::from)?;
+    resource_result(result, "resource status update")
+}
+
 pub async fn delete_namespace(
     command: &dyn LeaderResourceCommand,
     name: &str,

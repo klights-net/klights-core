@@ -246,6 +246,34 @@ pub(crate) async fn build_test_app_state_with_db(
             db_handle.clone(),
         ),
     );
+    let pod_logs = {
+        let root = config.data_root.join("logs").join("pods");
+        let clock: Arc<dyn klights_supervisor::WallClock> =
+            Arc::new(klights_supervisor::SystemWallClock);
+        crate::node_log_runtime_adapter::pod_log_capabilities(
+            Arc::new(
+                klights_kubelet::node_api::logs::LocalNodeLogRuntime::new_with_pod_event_store(
+                    root.clone(),
+                    task_supervisor.clone(),
+                    clock.clone(),
+                    klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(Arc::new(
+                        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
+                            positioned_watch.clone(),
+                        )),
+                    )),
+                ),
+            ),
+            Arc::new(
+                klights_kubelet::node_api::logs::LocalNodeLogRuntime::new_without_pod_event_store(
+                    root,
+                    task_supervisor.clone(),
+                    clock,
+                ),
+            ),
+            task_supervisor.clone(),
+            config.node_name.clone(),
+        )
+    };
     crate::api::ApiState::new(
         crate::api::ApiAuthPolicy::new(
             std::sync::Arc::new(AllowAllAuthorizer),
@@ -331,11 +359,7 @@ pub(crate) async fn build_test_app_state_with_db(
                     network.services().clone(),
                 ),
             ),
-            klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(Arc::new(
-                crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
-                    positioned_watch,
-                )),
-            )),
+            pod_logs,
             None,
             Arc::new(crate::node_metrics_adapter::UnavailableNodeMetrics),
             klights_kubelet::node_api::port_forward::local_node_port_forward(
