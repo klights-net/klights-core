@@ -7,6 +7,7 @@ mod api_state_adapter;
 mod apiservice_side_effect_adapter;
 mod authority_adapter;
 pub mod cli;
+mod cluster_engine;
 pub(crate) mod cluster_store_replication_adapter;
 mod cni_socket_adapter;
 pub mod control_plane;
@@ -96,6 +97,8 @@ mod watch_commit_observation_adapter;
 mod watch_stream_adapter;
 mod workload_pod_side_effect_adapter;
 
+#[cfg(test)]
+mod cluster_engine_composition_tests;
 #[cfg(test)]
 mod cronjob_event_driven_scheduler_tests;
 // Deployment script invariants are covered by the base-repo source guard run

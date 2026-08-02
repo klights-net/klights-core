@@ -141,6 +141,9 @@ async fn start_controlplane_leader_control_stream_if_needed(
 // ── Leader / full-stack boot ─────────────────────────────────────────────
 
 pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
+    // Root engine selection is a synchronous fail-closed gate. Every worker
+    // listener and every leader store/Raft construction path begins below.
+    crate::cluster_engine::run_selected(|| ())?;
     match &cli.role {
         NodeRole::Worker { .. } => return crate::bootstrap::worker_runtime::run_worker(cli).await,
         NodeRole::Leader { .. } | NodeRole::Controlplane { .. } => {}
