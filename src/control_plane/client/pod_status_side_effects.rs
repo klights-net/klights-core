@@ -185,9 +185,29 @@ async fn enqueue_pod_status_side_effects_with_endpoint_change(
         enqueue_service_keys(service_sink, service_keys).await;
         return;
     };
-    let workload_keys = match crate::side_effects::workload_pod::workload_reconcile_keys_for_pod(
+    let workload_store = crate::workload_pod_side_effect_adapter::borrowed_store(db);
+    let workload_keys =
+        match klights_controllers::side_effects::workload_pod::workload_reconcile_keys_for_pod(
+            &resource.data,
+            &workload_store,
+            namespace,
+        )
+        .await
+        {
+            Ok(keys) => keys,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    namespace,
+                    "failed to derive workload owner keys for pod status side effects"
+                );
+                Vec::new()
+            }
+        };
+    let job_store = crate::job_side_effect_adapter::borrowed_store(db);
+    let job_keys = match klights_controllers::side_effects::job::job_reconcile_keys_for_pod(
         &resource.data,
-        db,
+        &job_store,
         namespace,
     )
     .await
@@ -197,25 +217,11 @@ async fn enqueue_pod_status_side_effects_with_endpoint_change(
             tracing::warn!(
                 error = %err,
                 namespace,
-                "failed to derive workload owner keys for pod status side effects"
+                "failed to derive Job keys for pod status side effects"
             );
             Vec::new()
         }
     };
-    let job_keys =
-        match crate::side_effects::job::job_reconcile_keys_for_pod(&resource.data, db, namespace)
-            .await
-        {
-            Ok(keys) => keys,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    namespace,
-                    "failed to derive Job keys for pod status side effects"
-                );
-                Vec::new()
-            }
-        };
     let pdb_keys = pdb_reconcile_keys_for_namespace(db, namespace).await;
     let mut controller_keys = workload_keys;
     controller_keys.extend(job_keys);

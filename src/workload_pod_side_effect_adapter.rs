@@ -6,7 +6,9 @@ use klights_cluster_core::Resource;
 use serde_json::Value;
 
 use crate::datastore::{DatastoreBackend, DatastoreHandle, ResourceListQuery};
-use crate::side_effects::workload_pod::{WorkloadPodStore, workload_reconcile_keys_for_pod};
+use klights_controllers::side_effects::workload_pod::{
+    WorkloadPodStore, workload_reconcile_keys_for_pod,
+};
 use klights_controllers::side_effects::{ControllerDispatcherSlot, SideEffect};
 
 /// Enqueues the explicit controller owner of a mutated Pod.
@@ -43,45 +45,54 @@ impl SideEffect for WorkloadPodReconcileEffect {
             return Ok(());
         };
 
+        let store = borrowed_store(self.db.as_ref());
         dispatcher
             .enqueue_reconcile_batch(
-                workload_reconcile_keys_for_pod(resource, self.db.as_ref(), namespace).await?,
+                workload_reconcile_keys_for_pod(resource, &store, namespace).await?,
             )
             .await?;
         Ok(())
     }
 }
 
+struct BorrowedWorkloadPodStore<'a> {
+    db: &'a dyn DatastoreBackend,
+}
+
+pub(crate) fn borrowed_store(db: &dyn DatastoreBackend) -> impl WorkloadPodStore + '_ {
+    BorrowedWorkloadPodStore { db }
+}
+
 #[async_trait]
-impl<T> WorkloadPodStore for T
-where
-    T: DatastoreBackend + ?Sized,
-{
+impl WorkloadPodStore for BorrowedWorkloadPodStore<'_> {
     async fn get_replica_set(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        self.get_resource("apps/v1", "ReplicaSet", Some(namespace), name)
+        self.db
+            .get_resource("apps/v1", "ReplicaSet", Some(namespace), name)
             .await
     }
 
     async fn list_replica_sets(&self, namespace: &str) -> Result<Vec<Resource>> {
-        self.list_resources(
-            "apps/v1",
-            "ReplicaSet",
-            Some(namespace),
-            ResourceListQuery::all(),
-        )
-        .await
-        .map(|listing| listing.items)
+        self.db
+            .list_resources(
+                "apps/v1",
+                "ReplicaSet",
+                Some(namespace),
+                ResourceListQuery::all(),
+            )
+            .await
+            .map(|listing| listing.items)
     }
 
     async fn list_replication_controllers(&self, namespace: &str) -> Result<Vec<Resource>> {
-        self.list_resources(
-            "v1",
-            "ReplicationController",
-            Some(namespace),
-            ResourceListQuery::all(),
-        )
-        .await
-        .map(|listing| listing.items)
+        self.db
+            .list_resources(
+                "v1",
+                "ReplicationController",
+                Some(namespace),
+                ResourceListQuery::all(),
+            )
+            .await
+            .map(|listing| listing.items)
     }
 }
 

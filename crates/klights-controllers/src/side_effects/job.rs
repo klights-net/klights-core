@@ -7,11 +7,11 @@ use klights_reconcile_api::ReconcileKey;
 use serde_json::Value;
 
 #[async_trait]
-pub(crate) trait JobSideEffectStore: Send + Sync {
+pub trait JobSideEffectStore: Send + Sync {
     async fn list_jobs(&self, namespace: &str) -> Result<Vec<Resource>>;
 }
 
-pub(crate) async fn job_reconcile_keys_for_pod<Store: JobSideEffectStore + ?Sized>(
+pub async fn job_reconcile_keys_for_pod<Store: JobSideEffectStore + ?Sized>(
     pod: &Value,
     store: &Store,
     namespace: &str,
@@ -69,17 +69,4 @@ fn job_selector_for_pod_side_effect(job: &Value) -> Option<klights_types::LabelS
         serde_json::json!({ "matchLabels": labels })
     };
     klights_types::LabelSelector::from_k8s_selector(&selector).ok()
-}
-
-#[cfg(test)]
-mod tests {
-    #[tokio::test]
-    async fn test_job_reconcile_name() {
-        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-        let effect = crate::job_side_effect_adapter::effect(
-            db_handle,
-            klights_controllers::side_effects::ControllerDispatcherSlot::new(),
-        );
-        assert_eq!(effect.name(), "job_reconcile");
-    }
 }

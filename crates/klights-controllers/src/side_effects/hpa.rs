@@ -8,11 +8,11 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 #[async_trait]
-pub(crate) trait HpaSideEffectStore: Send + Sync {
+pub trait HpaSideEffectStore: Send + Sync {
     async fn list_hpas(&self, api_version: &'static str, namespace: &str) -> Result<Vec<Resource>>;
 }
 
-pub(crate) async fn hpa_reconcile_keys_for_resource<Store: HpaSideEffectStore + ?Sized>(
+pub async fn hpa_reconcile_keys_for_resource<Store: HpaSideEffectStore + ?Sized>(
     resource: &Value,
     store: &Store,
 ) -> Result<Vec<ReconcileKey>> {
@@ -158,33 +158,56 @@ fn hpa_targets_resource(hpa: &Value, target: TargetRef<'_>) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Arc;
+
+    struct FakeHpaStore {
+        hpas: Vec<Resource>,
+    }
+
+    #[async_trait]
+    impl HpaSideEffectStore for FakeHpaStore {
+        async fn list_hpas(
+            &self,
+            api_version: &'static str,
+            namespace: &str,
+        ) -> Result<Vec<Resource>> {
+            Ok(self
+                .hpas
+                .iter()
+                .filter(|hpa| {
+                    hpa.api_version == api_version && hpa.namespace.as_deref() == Some(namespace)
+                })
+                .cloned()
+                .collect())
+        }
+    }
+
+    fn hpa(api_version: &str, namespace: &str, name: &str, target_name: &str) -> Resource {
+        Resource::try_from_data(Arc::new(json!({
+            "apiVersion": api_version,
+            "kind": "HorizontalPodAutoscaler",
+            "metadata": {"name": name, "namespace": namespace},
+            "spec": {
+                "scaleTargetRef": {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": target_name
+                },
+                "maxReplicas": 5
+            }
+        })))
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn hpa_target_mutation_enqueues_matching_hpa_versions_only() {
-        let db = crate::datastore::test_support::in_memory().await;
-        for (api_version, name, target_name) in [
-            ("autoscaling/v1", "web-v1", "web"),
-            ("autoscaling/v2", "web-v2", "web"),
-            ("autoscaling/v2", "api-v2", "api"),
-        ] {
-            db.create_resource(
-                api_version,
-                "HorizontalPodAutoscaler",
-                Some("default"),
-                name,
-                json!({
-                    "apiVersion": api_version,
-                    "kind": "HorizontalPodAutoscaler",
-                    "metadata": {"name": name, "namespace": "default"},
-                    "spec": {
-                        "scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": target_name},
-                        "maxReplicas": 5
-                    }
-                }),
-            )
-            .await
-            .unwrap();
-        }
+        let store = FakeHpaStore {
+            hpas: vec![
+                hpa("autoscaling/v1", "default", "web-v1", "web"),
+                hpa("autoscaling/v2", "default", "web-v2", "web"),
+                hpa("autoscaling/v2", "default", "api-v2", "api"),
+            ],
+        };
 
         let keys = hpa_reconcile_keys_for_resource(
             &json!({
@@ -192,7 +215,7 @@ mod tests {
                 "kind": "Deployment",
                 "metadata": {"name": "web", "namespace": "default"}
             }),
-            &db,
+            &store,
         )
         .await
         .unwrap();
@@ -214,26 +237,12 @@ mod tests {
 
     #[tokio::test]
     async fn pod_mutation_enqueues_all_namespace_hpas() {
-        let db = crate::datastore::test_support::in_memory().await;
-        for (namespace, name) in [("default", "web"), ("other", "other")] {
-            db.create_resource(
-                "autoscaling/v2",
-                "HorizontalPodAutoscaler",
-                Some(namespace),
-                name,
-                json!({
-                    "apiVersion": "autoscaling/v2",
-                    "kind": "HorizontalPodAutoscaler",
-                    "metadata": {"name": name, "namespace": namespace},
-                    "spec": {
-                        "scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": name},
-                        "maxReplicas": 5
-                    }
-                }),
-            )
-            .await
-            .unwrap();
-        }
+        let store = FakeHpaStore {
+            hpas: vec![
+                hpa("autoscaling/v2", "default", "web", "web"),
+                hpa("autoscaling/v2", "other", "other", "other"),
+            ],
+        };
 
         let keys = hpa_reconcile_keys_for_resource(
             &json!({
@@ -241,7 +250,7 @@ mod tests {
                 "kind": "Pod",
                 "metadata": {"name": "web-0", "namespace": "default"}
             }),
-            &db,
+            &store,
         )
         .await
         .unwrap();

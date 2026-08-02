@@ -6,8 +6,10 @@ use klights_pod_api::{PodListRequest, PodQuery};
 use serde_json::Value;
 
 use crate::datastore::{DatastoreBackend, DatastoreHandle};
-use crate::side_effects::pdb::{PdbSideEffectPort, apply_pdb_event, pdb_event_namespace};
 use klights_controllers::pdb;
+use klights_controllers::side_effects::pdb::{
+    PdbSideEffectPort, apply_pdb_event, pdb_event_namespace,
+};
 use klights_controllers::side_effects::{PodSideEffectPortsSlot, SideEffect};
 
 #[cfg(test)]
@@ -94,4 +96,17 @@ pub(crate) fn effect(
     pod_repository: PodSideEffectPortsSlot,
 ) -> Arc<dyn SideEffect> {
     Arc::new(PdbReconcileEffect { db, pod_repository })
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    #[tokio::test]
+    async fn test_pdb_reconcile_name() {
+        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let effect = super::effect(
+            db_handle,
+            klights_controllers::side_effects::PodSideEffectPortsSlot::new(),
+        );
+        assert_eq!(effect.name(), "pdb_reconcile");
+    }
 }

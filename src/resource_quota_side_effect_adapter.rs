@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::datastore::{DatastoreBackend, DatastoreHandle};
-use crate::side_effects::resource_quota::{
+use klights_controllers::side_effects::resource_quota::{
     ResourceQuotaSideEffectPort, apply_resource_quota_event,
 };
 use klights_controllers::side_effects::{PodSideEffectPortsSlot, SideEffect};
@@ -73,4 +73,17 @@ pub(crate) fn effect(
     pod_repository: PodSideEffectPortsSlot,
 ) -> Arc<dyn SideEffect> {
     Arc::new(ResourceQuotaEffect { db, pod_repository })
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    #[tokio::test]
+    async fn test_resource_quota_recount_name() {
+        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let effect = super::effect(
+            db_handle,
+            klights_controllers::side_effects::PodSideEffectPortsSlot::new(),
+        );
+        assert_eq!(effect.name(), "resource_quota_recount");
+    }
 }

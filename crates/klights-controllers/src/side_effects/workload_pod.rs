@@ -1,21 +1,21 @@
 //! Side effect to reconcile workload controllers after Pod metadata mutations.
 
+use crate::workqueue::controller_kind_static;
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
-use klights_controllers::workqueue::controller_kind_static;
 use klights_reconcile_api::ReconcileKey;
 use serde_json::Value;
 use std::collections::HashSet;
 
 #[async_trait]
-pub(crate) trait WorkloadPodStore: Send + Sync {
+pub trait WorkloadPodStore: Send + Sync {
     async fn get_replica_set(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
     async fn list_replica_sets(&self, namespace: &str) -> Result<Vec<Resource>>;
     async fn list_replication_controllers(&self, namespace: &str) -> Result<Vec<Resource>>;
 }
 
-pub(crate) async fn workload_reconcile_keys_for_pod<Store: WorkloadPodStore + ?Sized>(
+pub async fn workload_reconcile_keys_for_pod<Store: WorkloadPodStore + ?Sized>(
     pod: &Value,
     store: &Store,
     namespace: &str,
@@ -28,7 +28,7 @@ pub(crate) async fn workload_reconcile_keys_for_pod<Store: WorkloadPodStore + ?S
     Ok(keys)
 }
 
-pub(crate) fn workload_owner_keys_for_pod(pod: &Value, namespace: &str) -> Vec<ReconcileKey> {
+pub fn workload_owner_keys_for_pod(pod: &Value, namespace: &str) -> Vec<ReconcileKey> {
     let Some(owner_refs) = pod
         .pointer("/metadata/ownerReferences")
         .and_then(|v| v.as_array())

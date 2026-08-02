@@ -150,7 +150,7 @@ impl PodMutationReconcileSink for PodReconcileAdapter {
                             .unwrap_or("default");
                         dispatcher
                             .enqueue_reconcile_batch(
-                                crate::side_effects::workload_pod::workload_owner_keys_for_pod(
+                                klights_controllers::side_effects::workload_pod::workload_owner_keys_for_pod(
                                     &updated.data,
                                     namespace,
                                 ),

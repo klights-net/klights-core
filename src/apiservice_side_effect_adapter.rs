@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use klights_cluster_core::Resource;
 use serde_json::Value;
 
-use crate::datastore::{DatastoreBackend, DatastoreHandle, ResourceListQuery};
-use crate::side_effects::apiservice::{
+use crate::datastore::{DatastoreHandle, ResourceListQuery};
+use klights_controllers::side_effects::apiservice::{
     ApiServiceSideEffectStore, apiservice_reconcile_keys_for_resource,
 };
 use klights_controllers::side_effects::{ControllerDispatcherSlot, SideEffect};
@@ -30,28 +30,24 @@ impl SideEffect for ApiServiceReconcileEffect {
             return Ok(());
         };
         dispatcher
-            .enqueue_reconcile_batch(
-                apiservice_reconcile_keys_for_resource(resource, self.db.as_ref()).await?,
-            )
+            .enqueue_reconcile_batch(apiservice_reconcile_keys_for_resource(resource, self).await?)
             .await?;
         Ok(())
     }
 }
 
 #[async_trait]
-impl<T> ApiServiceSideEffectStore for T
-where
-    T: DatastoreBackend + ?Sized,
-{
+impl ApiServiceSideEffectStore for ApiServiceReconcileEffect {
     async fn list_apiservices(&self) -> Result<Vec<Resource>> {
-        self.list_resources(
-            "apiregistration.k8s.io/v1",
-            "APIService",
-            None,
-            ResourceListQuery::all(),
-        )
-        .await
-        .map(|listing| listing.items)
+        self.db
+            .list_resources(
+                "apiregistration.k8s.io/v1",
+                "APIService",
+                None,
+                ResourceListQuery::all(),
+            )
+            .await
+            .map(|listing| listing.items)
     }
 }
 

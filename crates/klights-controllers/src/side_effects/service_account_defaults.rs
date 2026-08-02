@@ -5,13 +5,11 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 #[async_trait]
-pub(crate) trait DefaultServiceAccountPort: Send + Sync {
+pub trait DefaultServiceAccountPort: Send + Sync {
     async fn ensure_default_service_account(&self, namespace: &str) -> Result<()>;
 }
 
-pub(crate) async fn apply_default_service_account_delete<
-    Port: DefaultServiceAccountPort + ?Sized,
->(
+pub async fn apply_default_service_account_delete<Port: DefaultServiceAccountPort + ?Sized>(
     resource: &Value,
     port: &Port,
 ) -> Result<()> {

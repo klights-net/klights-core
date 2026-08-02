@@ -5,18 +5,18 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 #[async_trait]
-pub(crate) trait PdbSideEffectPort: Send + Sync {
+pub trait PdbSideEffectPort: Send + Sync {
     async fn reconcile_namespace(&self, namespace: &str) -> Result<()>;
 }
 
-pub(crate) fn pdb_event_namespace(resource: &Value) -> Option<&str> {
+pub fn pdb_event_namespace(resource: &Value) -> Option<&str> {
     resource
         .pointer("/metadata/namespace")
         .and_then(|v| v.as_str())
         .filter(|namespace| !namespace.is_empty())
 }
 
-pub(crate) async fn apply_pdb_event<Port: PdbSideEffectPort + ?Sized>(
+pub async fn apply_pdb_event<Port: PdbSideEffectPort + ?Sized>(
     resource: &Value,
     port: &Port,
 ) -> Result<()> {
@@ -41,16 +41,6 @@ mod tests {
             self.namespaces.lock().unwrap().push(namespace.to_string());
             Ok(())
         }
-    }
-
-    #[tokio::test]
-    async fn test_pdb_reconcile_name() {
-        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-        let effect = crate::pdb_side_effect_adapter::effect(
-            db_handle,
-            klights_controllers::side_effects::PodSideEffectPortsSlot::new(),
-        );
-        assert_eq!(effect.name(), "pdb_reconcile");
     }
 
     #[tokio::test]

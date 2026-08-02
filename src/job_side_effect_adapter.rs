@@ -6,7 +6,7 @@ use klights_cluster_core::Resource;
 use serde_json::Value;
 
 use crate::datastore::{DatastoreBackend, DatastoreHandle, ResourceListQuery};
-use crate::side_effects::job::{JobSideEffectStore, job_reconcile_keys_for_pod};
+use klights_controllers::side_effects::job::{JobSideEffectStore, job_reconcile_keys_for_pod};
 use klights_controllers::side_effects::{ControllerDispatcherSlot, SideEffect};
 
 /// Reconciles namespace Jobs after Pod create/update/delete events.
@@ -43,22 +43,27 @@ impl SideEffect for JobReconcileEffect {
             return Ok(());
         };
 
+        let store = borrowed_store(self.db.as_ref());
         dispatcher
-            .enqueue_reconcile_batch(
-                job_reconcile_keys_for_pod(resource, self.db.as_ref(), namespace).await?,
-            )
+            .enqueue_reconcile_batch(job_reconcile_keys_for_pod(resource, &store, namespace).await?)
             .await?;
         Ok(())
     }
 }
 
+struct BorrowedJobSideEffectStore<'a> {
+    db: &'a dyn DatastoreBackend,
+}
+
+pub(crate) fn borrowed_store(db: &dyn DatastoreBackend) -> impl JobSideEffectStore + '_ {
+    BorrowedJobSideEffectStore { db }
+}
+
 #[async_trait]
-impl<T> JobSideEffectStore for T
-where
-    T: DatastoreBackend + ?Sized,
-{
+impl JobSideEffectStore for BorrowedJobSideEffectStore<'_> {
     async fn list_jobs(&self, namespace: &str) -> Result<Vec<Resource>> {
-        self.list_resources("batch/v1", "Job", Some(namespace), ResourceListQuery::all())
+        self.db
+            .list_resources("batch/v1", "Job", Some(namespace), ResourceListQuery::all())
             .await
             .map(|listing| listing.items)
     }
@@ -72,4 +77,17 @@ pub(crate) fn effect(
         db,
         controller_dispatcher,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn test_job_reconcile_name() {
+        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let effect = super::effect(
+            db_handle,
+            klights_controllers::side_effects::ControllerDispatcherSlot::new(),
+        );
+        assert_eq!(effect.name(), "job_reconcile");
+    }
 }

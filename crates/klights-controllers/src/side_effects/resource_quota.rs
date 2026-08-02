@@ -5,11 +5,11 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 #[async_trait]
-pub(crate) trait ResourceQuotaSideEffectPort: Send + Sync {
+pub trait ResourceQuotaSideEffectPort: Send + Sync {
     async fn recount_namespace(&self, namespace: &str) -> Result<()>;
 }
 
-pub(crate) async fn apply_resource_quota_event<Port: ResourceQuotaSideEffectPort + ?Sized>(
+pub async fn apply_resource_quota_event<Port: ResourceQuotaSideEffectPort + ?Sized>(
     resource: &Value,
     port: &Port,
 ) -> Result<()> {
@@ -53,16 +53,6 @@ mod tests {
             self.namespaces.lock().unwrap().push(namespace.to_string());
             Ok(())
         }
-    }
-
-    #[tokio::test]
-    async fn test_resource_quota_recount_name() {
-        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-        let effect = crate::resource_quota_side_effect_adapter::effect(
-            db_handle,
-            klights_controllers::side_effects::PodSideEffectPortsSlot::new(),
-        );
-        assert_eq!(effect.name(), "resource_quota_recount");
     }
 
     #[tokio::test]

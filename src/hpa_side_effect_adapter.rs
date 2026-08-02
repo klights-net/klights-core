@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use klights_cluster_core::Resource;
 use serde_json::Value;
 
-use crate::datastore::{DatastoreBackend, DatastoreHandle, ResourceListQuery};
-use crate::side_effects::hpa::{HpaSideEffectStore, hpa_reconcile_keys_for_resource};
+use crate::datastore::{DatastoreHandle, ResourceListQuery};
+use klights_controllers::side_effects::hpa::{HpaSideEffectStore, hpa_reconcile_keys_for_resource};
 use klights_controllers::side_effects::{ControllerDispatcherSlot, SideEffect};
 
 struct HpaReconcileEffect {
@@ -27,28 +27,24 @@ impl SideEffect for HpaReconcileEffect {
         };
 
         dispatcher
-            .enqueue_reconcile_batch(
-                hpa_reconcile_keys_for_resource(resource, self.db.as_ref()).await?,
-            )
+            .enqueue_reconcile_batch(hpa_reconcile_keys_for_resource(resource, self).await?)
             .await?;
         Ok(())
     }
 }
 
 #[async_trait]
-impl<T> HpaSideEffectStore for T
-where
-    T: DatastoreBackend + ?Sized,
-{
+impl HpaSideEffectStore for HpaReconcileEffect {
     async fn list_hpas(&self, api_version: &'static str, namespace: &str) -> Result<Vec<Resource>> {
-        self.list_resources(
-            api_version,
-            "HorizontalPodAutoscaler",
-            Some(namespace),
-            ResourceListQuery::all(),
-        )
-        .await
-        .map(|listing| listing.items)
+        self.db
+            .list_resources(
+                api_version,
+                "HorizontalPodAutoscaler",
+                Some(namespace),
+                ResourceListQuery::all(),
+            )
+            .await
+            .map(|listing| listing.items)
     }
 }
 

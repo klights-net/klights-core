@@ -7,13 +7,11 @@ use klights_reconcile_api::ReconcileKey;
 use serde_json::Value;
 
 #[async_trait]
-pub(crate) trait ApiServiceSideEffectStore: Send + Sync {
+pub trait ApiServiceSideEffectStore: Send + Sync {
     async fn list_apiservices(&self) -> Result<Vec<Resource>>;
 }
 
-pub(crate) async fn apiservice_reconcile_keys_for_resource<
-    Store: ApiServiceSideEffectStore + ?Sized,
->(
+pub async fn apiservice_reconcile_keys_for_resource<Store: ApiServiceSideEffectStore + ?Sized>(
     resource: &Value,
     store: &Store,
 ) -> Result<Vec<ReconcileKey>> {
@@ -83,46 +81,54 @@ fn apiservice_targets_service(apiservice: &Value, namespace: &str, name: &str) -
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Arc;
+
+    struct FakeApiServiceStore {
+        apiservices: Vec<Resource>,
+    }
+
+    #[async_trait]
+    impl ApiServiceSideEffectStore for FakeApiServiceStore {
+        async fn list_apiservices(&self) -> Result<Vec<Resource>> {
+            Ok(self.apiservices.clone())
+        }
+    }
+
+    fn fixture() -> FakeApiServiceStore {
+        FakeApiServiceStore {
+            apiservices: [
+                (
+                    "v1alpha1.ready.example.com",
+                    "ready.example.com",
+                    "ready-service",
+                ),
+                (
+                    "v1alpha1.other.example.com",
+                    "other.example.com",
+                    "other-service",
+                ),
+            ]
+            .into_iter()
+            .map(|(name, group, service)| {
+                Resource::try_from_data(Arc::new(json!({
+                    "apiVersion": "apiregistration.k8s.io/v1",
+                    "kind": "APIService",
+                    "metadata": {"name": name},
+                    "spec": {
+                        "group": group,
+                        "version": "v1alpha1",
+                        "service": {"namespace": "default", "name": service}
+                    }
+                })))
+                .unwrap()
+            })
+            .collect(),
+        }
+    }
 
     #[tokio::test]
     async fn service_mutation_enqueues_matching_apiservice_only() {
-        let db = crate::datastore::test_support::in_memory().await;
-        db.create_resource(
-            "apiregistration.k8s.io/v1",
-            "APIService",
-            None,
-            "v1alpha1.ready.example.com",
-            json!({
-                "apiVersion": "apiregistration.k8s.io/v1",
-                "kind": "APIService",
-                "metadata": {"name": "v1alpha1.ready.example.com"},
-                "spec": {
-                    "group": "ready.example.com",
-                    "version": "v1alpha1",
-                    "service": {"namespace": "default", "name": "ready-service"}
-                }
-            }),
-        )
-        .await
-        .unwrap();
-        db.create_resource(
-            "apiregistration.k8s.io/v1",
-            "APIService",
-            None,
-            "v1alpha1.other.example.com",
-            json!({
-                "apiVersion": "apiregistration.k8s.io/v1",
-                "kind": "APIService",
-                "metadata": {"name": "v1alpha1.other.example.com"},
-                "spec": {
-                    "group": "other.example.com",
-                    "version": "v1alpha1",
-                    "service": {"namespace": "default", "name": "other-service"}
-                }
-            }),
-        )
-        .await
-        .unwrap();
+        let store = fixture();
 
         let keys = apiservice_reconcile_keys_for_resource(
             &json!({
@@ -130,7 +136,7 @@ mod tests {
                 "kind": "Service",
                 "metadata": {"namespace": "default", "name": "ready-service"}
             }),
-            &db,
+            &store,
         )
         .await
         .unwrap();
@@ -147,43 +153,7 @@ mod tests {
 
     #[tokio::test]
     async fn endpointslice_mutation_enqueues_matching_apiservice_only() {
-        let db = crate::datastore::test_support::in_memory().await;
-        db.create_resource(
-            "apiregistration.k8s.io/v1",
-            "APIService",
-            None,
-            "v1alpha1.ready.example.com",
-            json!({
-                "apiVersion": "apiregistration.k8s.io/v1",
-                "kind": "APIService",
-                "metadata": {"name": "v1alpha1.ready.example.com"},
-                "spec": {
-                    "group": "ready.example.com",
-                    "version": "v1alpha1",
-                    "service": {"namespace": "default", "name": "ready-service"}
-                }
-            }),
-        )
-        .await
-        .unwrap();
-        db.create_resource(
-            "apiregistration.k8s.io/v1",
-            "APIService",
-            None,
-            "v1alpha1.other.example.com",
-            json!({
-                "apiVersion": "apiregistration.k8s.io/v1",
-                "kind": "APIService",
-                "metadata": {"name": "v1alpha1.other.example.com"},
-                "spec": {
-                    "group": "other.example.com",
-                    "version": "v1alpha1",
-                    "service": {"namespace": "default", "name": "other-service"}
-                }
-            }),
-        )
-        .await
-        .unwrap();
+        let store = fixture();
 
         let keys = apiservice_reconcile_keys_for_resource(
             &json!({
@@ -195,7 +165,7 @@ mod tests {
                     "labels": {"kubernetes.io/service-name": "ready-service"}
                 }
             }),
-            &db,
+            &store,
         )
         .await
         .unwrap();
