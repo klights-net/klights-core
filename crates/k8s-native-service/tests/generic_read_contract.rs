@@ -16,6 +16,15 @@ use klights_leader_api::{
     LeaderResourceQuery, ResourceGetRequest, ResourceListRequest, ResourceListResult,
     ResourceQueryFuture,
 };
+use klights_node_api::{
+    ExecSetupError, NodeExec, NodeExecFuture, NodeExecRequest, NodeExecSession,
+    NodeExecSyncRequest, NodeExecSyncResult, NodePortForward, NodePortForwardFuture,
+    NodePortForwardRequest, NodePortForwardSession, NodePortForwardSetupError,
+};
+use klights_pod_api::{
+    PodGetRequest, PodListRequest, PodListResult, PodOwnerListRequest, PodQuery,
+    PodRepositoryError, PodRepositoryFuture,
+};
 use serde_json::{Value, json};
 
 #[derive(Default)]
@@ -27,6 +36,60 @@ struct Captures {
 struct FakeResources {
     resource: Resource,
     captures: Mutex<Captures>,
+}
+
+struct UnavailableStreaming;
+
+impl PodQuery for UnavailableStreaming {
+    fn get_pod(&self, _request: PodGetRequest) -> PodRepositoryFuture<'_, Option<Resource>> {
+        Box::pin(async { Err(PodRepositoryError::unavailable("unused test dependency")) })
+    }
+
+    fn list_pods(&self, _request: PodListRequest) -> PodRepositoryFuture<'_, PodListResult> {
+        Box::pin(async { Err(PodRepositoryError::unavailable("unused test dependency")) })
+    }
+
+    fn list_pods_by_owner_uid(
+        &self,
+        _request: PodOwnerListRequest,
+    ) -> PodRepositoryFuture<'_, Vec<Resource>> {
+        Box::pin(async { Err(PodRepositoryError::unavailable("unused test dependency")) })
+    }
+}
+
+impl NodeExec for UnavailableStreaming {
+    fn exec_sync(&self, _request: NodeExecSyncRequest) -> NodeExecFuture<'_, NodeExecSyncResult> {
+        Box::pin(async { Err(ExecSetupError::unavailable("unused test dependency")) })
+    }
+
+    fn open_exec(&self, _request: NodeExecRequest) -> NodeExecFuture<'_, Box<dyn NodeExecSession>> {
+        Box::pin(async { Err(ExecSetupError::unavailable("unused test dependency")) })
+    }
+}
+
+impl NodePortForward for UnavailableStreaming {
+    fn open_port_forward(
+        &self,
+        _request: NodePortForwardRequest,
+    ) -> NodePortForwardFuture<'_, Box<dyn NodePortForwardSession>> {
+        Box::pin(async {
+            Err(NodePortForwardSetupError::unavailable(
+                "unused test dependency",
+            ))
+        })
+    }
+}
+
+fn streaming_dependencies() -> k8s_native_service::StreamingDependencies {
+    let unavailable = Arc::new(UnavailableStreaming);
+    k8s_native_service::StreamingDependencies::new(
+        unavailable.clone(),
+        None,
+        None,
+        unavailable,
+        Arc::<str>::from("test-node"),
+        Arc::new(klights_supervisor::TaskSupervisor::new(Default::default())),
+    )
 }
 
 impl FakeResources {
@@ -173,6 +236,7 @@ fn state() -> Arc<ApiState<(), FakeResources, (), FakeControllers, (), FakeOpera
         FakeControllers,
         (),
         FakeOperational,
+        streaming_dependencies(),
     ))
 }
 

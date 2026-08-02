@@ -20,6 +20,7 @@ pub mod response;
 mod router;
 mod state;
 pub mod status;
+pub mod streaming;
 pub mod subresources;
 pub mod watch;
 
@@ -35,3 +36,4 @@ pub use resource_projection::inject_resource_version;
 pub use response::K8sResponse;
 pub use router::CurrentRouter;
 pub use state::ApiState;
+pub use streaming::StreamingDependencies;

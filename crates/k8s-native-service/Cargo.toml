@@ -34,7 +34,8 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 cel = { workspace = true }
 futures = { workspace = true }
-hyper = { workspace = true }
+flate2 = { workspace = true }
+hyper = { workspace = true, features = ["client"] }
 hyper-util = { workspace = true }
 k8s-openapi = { workspace = true }
 json-patch = { workspace = true }
@@ -46,6 +47,7 @@ serde_json = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tokio-tungstenite = { workspace = true }
 time = { workspace = true }
 tracing = { workspace = true }

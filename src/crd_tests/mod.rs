@@ -151,6 +151,16 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
         )
     };
     let network = crate::networking::test_support::mock_network(db_handle.clone());
+    let node_port_forward =
+        klights_kubelet::node_api::port_forward::local_node_port_forward(task_supervisor.clone());
+    let streaming = k8s_native_service::StreamingDependencies::new(
+        pod_repository.clone(),
+        None,
+        None,
+        node_port_forward,
+        std::sync::Arc::<str>::from(config.node_name.as_str()),
+        task_supervisor.clone(),
+    );
     crate::api::ApiState::new(
         crate::api::ApiAuthPolicy::new(
             std::sync::Arc::new(crate::api::test_support::AllowAllAuthorizer),
@@ -239,9 +249,6 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
             pod_logs,
             None,
             std::sync::Arc::new(crate::node_metrics_adapter::UnavailableNodeMetrics),
-            klights_kubelet::node_api::port_forward::local_node_port_forward(
-                task_supervisor.clone(),
-            ),
             None,
             None,
             None,
@@ -259,6 +266,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
             crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             None,
         ),
+        streaming,
     )
 }
 

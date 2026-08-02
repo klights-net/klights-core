@@ -1,3 +1,5 @@
+//! Kubernetes WebSocket exec/attach channel adaptation.
+
 use super::*;
 
 use klights_node_api::{

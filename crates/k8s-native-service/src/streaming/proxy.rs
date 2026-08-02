@@ -1,3 +1,5 @@
+//! Kubernetes Pod and Service proxy HTTP adaptation.
+
 use super::*;
 
 /// Maximum size for proxied request bodies (pod/service/APIService proxy).
@@ -195,33 +197,42 @@ fn proxy_retry_policy(method: &axum::http::Method) -> (usize, std::time::Duratio
 }
 
 /// GET/POST/PUT/DELETE/PATCH /api/v1/namespaces/{ns}/pods/{name}/proxy
-pub(in crate::api) async fn pod_proxy(
-    State(state): State<Arc<ApiState>>,
+pub async fn pod_proxy<S>(
+    State(state): State<Arc<S>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<ProxyQuery>,
     req: Request,
-) -> Result<Response, AppError> {
+) -> Result<Response, AppError>
+where
+    S: StreamingState + 'static,
+{
     pod_proxy_inner(state, &namespace, &name, "", query.port, req).await
 }
 
 /// GET/POST/PUT/DELETE/PATCH /api/v1/namespaces/{ns}/pods/{name}/proxy/{*path}
-pub(in crate::api) async fn pod_proxy_with_path(
-    State(state): State<Arc<ApiState>>,
+pub async fn pod_proxy_with_path<S>(
+    State(state): State<Arc<S>>,
     Path((namespace, name, proxy_path)): Path<(String, String, String)>,
     Query(query): Query<ProxyQuery>,
     req: Request,
-) -> Result<Response, AppError> {
+) -> Result<Response, AppError>
+where
+    S: StreamingState + 'static,
+{
     pod_proxy_inner(state, &namespace, &name, &proxy_path, query.port, req).await
 }
 
-pub(in crate::api) async fn pod_proxy_inner(
-    state: Arc<ApiState>,
+pub async fn pod_proxy_inner<S>(
+    state: Arc<S>,
     namespace: &str,
     name_param: &str,
     proxy_path: &str,
     port_override: Option<u16>,
     req: Request,
-) -> Result<Response, AppError> {
+) -> Result<Response, AppError>
+where
+    S: StreamingState + 'static,
+{
     if let Some(resp) = maybe_redirect_proxy_root(&req, proxy_path) {
         return Ok(resp);
     }
@@ -233,8 +244,8 @@ pub(in crate::api) async fn pod_proxy_inner(
     let effective_port_override = port_override.or(parsed.port_num);
 
     // Look up the pod
-    let pod = crate::api::pod_repository_ports::get_pod(
-        state.resource_mutation().pod_repository.as_ref(),
+    let pod = get_pod(
+        state.streaming_dependencies().pod_query.as_ref(),
         namespace,
         name,
     )
@@ -321,7 +332,7 @@ pub(in crate::api) async fn pod_proxy_inner(
         req,
         &target_url,
         allow_default_port_fallback && port != 8080,
-        state.operational().task_supervisor.clone(),
+        state.streaming_dependencies().task_supervisor.clone(),
     )
     .await
 }
@@ -372,7 +383,7 @@ async fn service_proxy_request_with_readiness_retries(
 }
 
 /// Forward an HTTP request to the target URL and return the response.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn proxy_request(
     req: Request,
     target_url: &str,
@@ -381,7 +392,7 @@ pub async fn proxy_request(
     proxy_request_with_fallback(req, target_url, false, task_supervisor).await
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn proxy_request_with_fallback(
     req: Request,
     target_url: &str,
@@ -392,7 +403,7 @@ pub async fn proxy_request_with_fallback(
         .await
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn proxy_request_with_fallback_port(
     req: Request,
     target_url: &str,
@@ -739,8 +750,7 @@ async fn send_proxy_request(
 
     // Forward end-to-end headers. Body framing and hop-by-hop headers are
     // recomputed for the buffered outbound request.
-    let header_policy =
-        crate::api::backend_proxy_headers::BackendProxyHeaderPolicy::workload_backend();
+    let header_policy = backend_proxy_headers::BackendProxyHeaderPolicy::workload_backend();
     for (key, value) in req_headers {
         if header_policy.should_forward(key) {
             builder = builder.header(key, value);
@@ -842,8 +852,7 @@ pub async fn send_proxy_request_https(
         .map_err(|e| AppError::Internal(format!("Failed to build HTTPS proxy client: {e}")))?;
 
     let mut request_builder = client.request(method, &url);
-    let header_policy =
-        crate::api::backend_proxy_headers::BackendProxyHeaderPolicy::workload_backend();
+    let header_policy = backend_proxy_headers::BackendProxyHeaderPolicy::workload_backend();
     for (key, value) in req_headers {
         if header_policy.should_forward(key)
             && let Ok(value_str) = value.to_str()
@@ -935,33 +944,42 @@ pub fn rewrite_proxy_response_body(
 }
 
 /// GET/POST/PUT/DELETE/PATCH /api/v1/namespaces/{ns}/services/{name}/proxy
-pub(in crate::api) async fn service_proxy(
-    State(state): State<Arc<ApiState>>,
+pub async fn service_proxy<S>(
+    State(state): State<Arc<S>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<ProxyQuery>,
     req: Request,
-) -> Result<Response, AppError> {
+) -> Result<Response, AppError>
+where
+    S: StreamingState + 'static,
+{
     service_proxy_inner(state, &namespace, &name, "", query.port, req).await
 }
 
 /// GET/POST/PUT/DELETE/PATCH /api/v1/namespaces/{ns}/services/{name}/proxy/{*path}
-pub(in crate::api) async fn service_proxy_with_path(
-    State(state): State<Arc<ApiState>>,
+pub async fn service_proxy_with_path<S>(
+    State(state): State<Arc<S>>,
     Path((namespace, name, proxy_path)): Path<(String, String, String)>,
     Query(query): Query<ProxyQuery>,
     req: Request,
-) -> Result<Response, AppError> {
+) -> Result<Response, AppError>
+where
+    S: StreamingState + 'static,
+{
     service_proxy_inner(state, &namespace, &name, &proxy_path, query.port, req).await
 }
 
-pub(in crate::api) async fn service_proxy_inner(
-    state: Arc<ApiState>,
+pub async fn service_proxy_inner<S>(
+    state: Arc<S>,
     namespace: &str,
     name_param: &str,
     proxy_path: &str,
     port_override: Option<u16>,
     req: Request,
-) -> Result<Response, AppError> {
+) -> Result<Response, AppError>
+where
+    S: StreamingState + 'static,
+{
     if let Some(resp) = maybe_redirect_proxy_root(&req, proxy_path) {
         return Ok(resp);
     }
@@ -973,8 +991,8 @@ pub(in crate::api) async fn service_proxy_inner(
     let effective_port_override = port_override.or(parsed.port_num);
 
     // Look up the service
-    let service = crate::api::resource_query_ports::get_resource(
-        state.resource_mutation().resource_query.as_ref(),
+    let service = crate::generic_read::get_resource(
+        state.streaming_resource_query(),
         "v1",
         "Service",
         Some(namespace),
@@ -1019,8 +1037,8 @@ pub(in crate::api) async fn service_proxy_inner(
     })?;
 
     // Get Endpoints for this service
-    let endpoints = crate::api::resource_query_ports::get_resource(
-        state.resource_mutation().resource_query.as_ref(),
+    let endpoints = crate::generic_read::get_resource(
+        state.streaming_resource_query(),
         "v1",
         "Endpoints",
         Some(namespace),
@@ -1138,7 +1156,7 @@ pub(in crate::api) async fn service_proxy_inner(
         match service_proxy_request_with_readiness_retries(
             replay,
             &target_url,
-            state.operational().task_supervisor.clone(),
+            state.streaming_dependencies().task_supervisor.clone(),
         )
         .await
         {

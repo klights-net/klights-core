@@ -1,4 +1,4 @@
-//! Adapter-private Kubernetes SPDY/3.1 framing.
+//! Native-service-private Kubernetes SPDY/3.1 framing.
 //!
 //! This is the kubectl-facing server codec. Containerd's client-side streaming
 //! codec is separately private to `kubelet::containerd_streaming`; keeping the
@@ -22,7 +22,7 @@ const FLAG_FIN: u8 = 0x01;
 const SPDY_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StreamType {
+pub enum StreamType {
     Stdin,
     Stdout,
     Stderr,
@@ -32,7 +32,7 @@ pub(super) enum StreamType {
 }
 
 #[derive(Debug)]
-pub(super) enum SpdyFrame {
+pub enum SpdyFrame {
     SynStream {
         stream_id: u32,
         headers: HashMap<String, String>,
@@ -76,14 +76,14 @@ impl SpdyFrame {
     }
 }
 
-pub(super) struct SpdyConnection {
+pub struct SpdyConnection {
     pending_frames: VecDeque<SpdyFrame>,
     decompressor: flate2::Decompress,
     compressor: flate2::Compress,
 }
 
 impl SpdyConnection {
-    pub(super) fn new() -> Self {
+    pub fn new() -> Self {
         let decompressor = flate2::Decompress::new(true);
         let mut compressor = flate2::Compress::new(flate2::Compression::default(), true);
         compressor
@@ -96,7 +96,7 @@ impl SpdyConnection {
         }
     }
 
-    pub(super) async fn read_frame<S>(&mut self, stream: &mut S) -> anyhow::Result<SpdyFrame>
+    pub async fn read_frame<S>(&mut self, stream: &mut S) -> anyhow::Result<SpdyFrame>
     where
         S: AsyncRead + Unpin,
     {
@@ -224,11 +224,7 @@ impl SpdyConnection {
         Ok(compressed)
     }
 
-    pub(super) async fn write_syn_reply<S>(
-        &mut self,
-        stream: &mut S,
-        stream_id: u32,
-    ) -> anyhow::Result<()>
+    pub async fn write_syn_reply<S>(&mut self, stream: &mut S, stream_id: u32) -> anyhow::Result<()>
     where
         S: AsyncWrite + Unpin,
     {
@@ -239,7 +235,7 @@ impl SpdyConnection {
         write_control_frame(stream, SYN_REPLY, &payload).await
     }
 
-    pub(super) async fn write_data_frame<S>(
+    pub async fn write_data_frame<S>(
         &self,
         stream: &mut S,
         stream_id: u32,
@@ -266,8 +262,8 @@ impl SpdyConnection {
         write_control_frame(stream, PING, &id.to_be_bytes()).await
     }
 
-    #[cfg(test)]
-    pub(super) async fn write_syn_stream<S>(
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn write_syn_stream<S>(
         &mut self,
         stream: &mut S,
         stream_id: u32,

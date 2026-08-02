@@ -509,9 +509,9 @@ impl k8s_native_service::generic_command::GenericCommandReconcile
 pub(crate) struct ApiPodNodeSubresourceServices {
     pub(crate) services: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
     pub(crate) pod_logs: Arc<k8s_native_service::subresources::pod::logs::PodLogCapabilities>,
+    #[cfg(test)]
     pub(crate) local_node_exec: Option<Arc<dyn klights_node_api::NodeExec>>,
     pub(crate) node_metrics: Arc<dyn klights_node_api::NodeMetrics>,
-    pub(crate) node_port_forward: Arc<dyn klights_node_api::NodePortForward>,
     #[cfg(test)]
     pub(crate) pod_lifecycle_router:
         Option<Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>>,
@@ -525,9 +525,8 @@ impl ApiPodNodeSubresourceServices {
     pub(crate) fn new(
         services: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
         pod_logs: Arc<k8s_native_service::subresources::pod::logs::PodLogCapabilities>,
-        local_node_exec: Option<Arc<dyn klights_node_api::NodeExec>>,
+        #[cfg(test)] local_node_exec: Option<Arc<dyn klights_node_api::NodeExec>>,
         node_metrics: Arc<dyn klights_node_api::NodeMetrics>,
-        node_port_forward: Arc<dyn klights_node_api::NodePortForward>,
         #[cfg(test)] pod_lifecycle_router: Option<
             Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
         >,
@@ -537,9 +536,9 @@ impl ApiPodNodeSubresourceServices {
         Self {
             services,
             pod_logs,
+            #[cfg(test)]
             local_node_exec,
             node_metrics,
-            node_port_forward,
             #[cfg(test)]
             pod_lifecycle_router,
             pod_lifecycle_diagnostics,
@@ -562,6 +561,7 @@ pub(crate) enum ApiNodeRole {
 
 #[derive(Clone)]
 pub(crate) struct ApiOperationalConfig {
+    #[cfg(test)]
     pub(crate) node_name: String,
     pub(crate) anonymous_auth: bool,
     pub(crate) runtime: ApiRuntimeInputs,
@@ -632,12 +632,13 @@ impl ApiRuntimeInputs {
 
 impl ApiOperationalConfig {
     pub(crate) fn new(
-        node_name: String,
+        #[cfg(test)] node_name: String,
         anonymous_auth: bool,
         runtime: ApiRuntimeInputs,
         version_info: crate::api::version::VersionInfo,
     ) -> Self {
         Self {
+            #[cfg(test)]
             node_name,
             anonymous_auth,
             runtime,
@@ -873,6 +874,14 @@ pub(crate) fn build_router_from_root(
     };
     let replication = replication
         .map(|(exec, logs, diagnostics)| ApiRemoteNodeServices::new(exec, logs, diagnostics));
+    let streaming = k8s_native_service::StreamingDependencies::new(
+        pod_repository.clone(),
+        local_node_exec.clone(),
+        replication.as_ref().map(|services| services.exec.clone()),
+        node_port_forward.clone(),
+        Arc::<str>::from(node_name.as_str()),
+        task_supervisor.clone(),
+    );
     let state = ApiState::new(
         ApiAuthPolicy::new(
             authorizer,
@@ -915,9 +924,7 @@ pub(crate) fn build_router_from_root(
         ApiPodNodeSubresourceServices::new(
             services,
             pod_logs,
-            local_node_exec,
             node_metrics,
-            node_port_forward,
             pod_lifecycle_diagnostics,
             pod_start_retry_state,
         ),
@@ -925,7 +932,6 @@ pub(crate) fn build_router_from_root(
             role,
             replication,
             Arc::new(ApiOperationalConfig::new(
-                node_name,
                 anonymous_auth,
                 runtime_inputs,
                 version_info,
@@ -937,6 +943,7 @@ pub(crate) fn build_router_from_root(
             signing_keys,
             authority,
         ),
+        streaming,
     );
     crate::api::routes::build_router_parts(state)
 }

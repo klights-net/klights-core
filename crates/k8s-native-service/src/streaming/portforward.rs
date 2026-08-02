@@ -1,5 +1,6 @@
+//! Kubernetes Pod port-forward WebSocket adaptation.
+
 use super::*;
-use crate::api::AdmissionContextRequest;
 use klights_node_api::{
     ByteFrame, NodePortForward, NodePortForwardChannel, NodePortForwardFrame,
     NodePortForwardRequest, NodePortForwardSession, NodePortForwardTarget,
@@ -35,12 +36,15 @@ fn port_channel_from_id(channel_id: u8) -> (usize, NodePortForwardChannel) {
     )
 }
 
-pub(in crate::api) async fn pod_portforward(
-    State(state): State<Arc<ApiState>>,
+pub async fn pod_portforward<S>(
+    State(state): State<Arc<S>>,
     Path((namespace, name)): Path<(String, String)>,
     RawQuery(query): RawQuery,
     req: Request,
-) -> Result<Response, AppError> {
+) -> Result<Response, AppError>
+where
+    S: StreamingState + 'static,
+{
     // Parse ports from query string
     let query_str = query.unwrap_or_default();
     let ports = parse_ports_query(&query_str);
@@ -52,8 +56,8 @@ pub(in crate::api) async fn pod_portforward(
     }
 
     // Get pod from PodRepository to find pod IP
-    let pod = crate::api::pod_repository_ports::get_pod(
-        state.resource_mutation().pod_repository.as_ref(),
+    let pod = get_pod(
+        state.streaming_dependencies().pod_query.as_ref(),
         &namespace,
         &name,
     )
@@ -61,7 +65,7 @@ pub(in crate::api) async fn pod_portforward(
     .ok_or_else(|| AppError::NotFound(format!("Pod {}/{} not found", namespace, name)))?;
 
     let _ = run_admission_for_request(
-        state.resource_mutation().admission.as_ref(),
+        state.streaming_admission(),
         build_admission_context(AdmissionContextRequest {
             api_version: "v1",
             kind: "Pod",
@@ -89,7 +93,7 @@ pub(in crate::api) async fn pod_portforward(
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
     let node_request = NodePortForwardRequest::try_new(target, ports)
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
-    let node_port_forward = state.pod_node_subresources().node_port_forward.clone();
+    let node_port_forward = state.streaming_dependencies().node_port_forward.clone();
 
     // Check for WebSocket upgrade
     let upgrade_header = req
@@ -113,7 +117,7 @@ pub(in crate::api) async fn pod_portforward(
         // Spawn WebSocket handler
         let on_upgrade = hyper::upgrade::on(req);
 
-        let task_supervisor = state.operational().task_supervisor.clone();
+        let task_supervisor = state.streaming_dependencies().task_supervisor.clone();
         let relay_supervisor = task_supervisor.clone();
         if let Err(err) = task_supervisor
             .spawn_async(

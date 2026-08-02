@@ -1,3 +1,5 @@
+//! Kubernetes SPDY exec/attach channel adaptation.
+
 use std::collections::HashMap;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -123,7 +125,7 @@ fn spdy_stream_type_from_headers(headers: &HashMap<String, String>) -> Option<St
         })
 }
 
-pub(super) async fn collect_spdy_client_streams<S>(
+pub async fn collect_spdy_client_streams<S>(
     client_spdy: &mut SpdyConnection,
     client_stream: &mut S,
     request: SpdyExecStreamRequest,
@@ -209,7 +211,7 @@ where
     Ok(streams)
 }
 
-pub(super) async fn write_spdy_exec_channel_frame<S>(
+pub async fn write_spdy_exec_channel_frame<S>(
     client_spdy: &SpdyConnection,
     client_stream: &mut S,
     streams: &SpdyClientStreams,

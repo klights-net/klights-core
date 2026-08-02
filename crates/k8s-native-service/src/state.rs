@@ -5,6 +5,8 @@
 //! without reaching any concrete engine, store, replication, or transport
 //! implementation while later Phase 17 packets move each family in order.
 
+use crate::streaming::StreamingDependencies;
+
 /// Complete state for the current Kubernetes-native HTTP implementation.
 ///
 /// Fields remain private. The temporary family accessors expose only the exact
@@ -24,6 +26,7 @@ pub struct ApiState<
     controller_reconcile: ControllerReconcile,
     pod_node_subresources: PodNodeSubresources,
     operational: Operational,
+    streaming: StreamingDependencies,
 }
 
 impl<AuthPolicy, ResourceMutation, Discovery, ControllerReconcile, PodNodeSubresources, Operational>
@@ -43,6 +46,7 @@ impl<AuthPolicy, ResourceMutation, Discovery, ControllerReconcile, PodNodeSubres
         controller_reconcile: ControllerReconcile,
         pod_node_subresources: PodNodeSubresources,
         operational: Operational,
+        streaming: StreamingDependencies,
     ) -> Self {
         Self {
             auth_policy,
@@ -51,6 +55,7 @@ impl<AuthPolicy, ResourceMutation, Discovery, ControllerReconcile, PodNodeSubres
             controller_reconcile,
             pod_node_subresources,
             operational,
+            streaming,
         }
     }
 
@@ -78,6 +83,10 @@ impl<AuthPolicy, ResourceMutation, Discovery, ControllerReconcile, PodNodeSubres
         &self.operational
     }
 
+    pub fn streaming(&self) -> &StreamingDependencies {
+        &self.streaming
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn resource_mutation_mut(&mut self) -> &mut ResourceMutation {
         &mut self.resource_mutation
@@ -101,6 +110,11 @@ impl<AuthPolicy, ResourceMutation, Discovery, ControllerReconcile, PodNodeSubres
     #[cfg(any(test, feature = "test-support"))]
     pub fn operational_mut(&mut self) -> &mut Operational {
         &mut self.operational
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn streaming_mut(&mut self) -> &mut StreamingDependencies {
+        &mut self.streaming
     }
 }
 
@@ -146,7 +160,17 @@ mod tests {
 
     #[test]
     fn state_preserves_exact_injected_family_identity() {
-        let mut state = ApiState::new(1_u8, 2_u16, 3_u32, 4_u64, 5_u128, "operational");
+        let mut state = ApiState::new(
+            1_u8,
+            2_u16,
+            3_u32,
+            4_u64,
+            5_u128,
+            "operational",
+            crate::streaming::test_support::unavailable_dependencies(std::sync::Arc::new(
+                klights_supervisor::TaskSupervisor::new(Default::default()),
+            )),
+        );
         assert_eq!(*state.auth_policy(), 1);
         assert_eq!(*state.resource_mutation(), 2);
         assert_eq!(*state.discovery(), 3);

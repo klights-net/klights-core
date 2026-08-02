@@ -987,6 +987,17 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         )
     };
     #[cfg(test)]
+    let watcher_streaming = k8s_native_service::StreamingDependencies::new(
+        api_pod_repository.clone(),
+        None,
+        api_replication
+            .as_ref()
+            .map(|services| services.exec.clone()),
+        node_port_forward.clone(),
+        Arc::<str>::from(config.node_name.as_str()),
+        supervisor.clone(),
+    );
+    #[cfg(test)]
     let watcher_state = Arc::new(api::ApiState::new(
         crate::api::ApiAuthPolicy::new(
             std::sync::Arc::new(
@@ -1099,7 +1110,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             api_pod_logs,
             None,
             node_metrics.clone(),
-            node_port_forward,
             #[cfg(test)]
             Some(pod_lifecycle_router.clone()),
             Some(pod_lifecycle_router.clone()),
@@ -1111,7 +1121,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         ),
         crate::api::ApiOperationalServices::new(
             api_role,
-            api_replication,
+            api_replication.clone(),
             api_config,
             Arc::new(klights_auth::clock::SystemClock),
             crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(
@@ -1122,6 +1132,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             api_authority.clone(),
         ),
+        watcher_streaming,
     ));
     let kubelet_config = crate::kubelet::context::KubeletConfig::try_new(
         config.service_cidr.clone(),
@@ -1847,7 +1858,17 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     #[cfg(test)]
     let state_with_cri = {
         let mut state = (*watcher_state).clone();
-        state.pod_node_subresources_mut().local_node_exec = local_node_exec;
+        state.pod_node_subresources_mut().local_node_exec = local_node_exec.clone();
+        *state.streaming_mut() = k8s_native_service::StreamingDependencies::new(
+            api_pod_repository.clone(),
+            local_node_exec,
+            api_replication
+                .as_ref()
+                .map(|services| services.exec.clone()),
+            node_port_forward.clone(),
+            Arc::<str>::from(config.node_name.as_str()),
+            supervisor.clone(),
+        );
         state
     };
     #[cfg(test)]

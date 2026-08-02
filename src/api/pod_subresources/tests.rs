@@ -21,6 +21,9 @@ mod portforward_tests {
 }
 
 use super::*;
+use axum::http::{StatusCode, header};
+use bytes::Bytes;
+use futures::StreamExt;
 use klights_kubelet::node_api::logs::{
     LogQuery, PodLogFollowTermination, build_log_output, build_log_output_bytes,
     follow_log_file_with_initial_query, follow_log_file_with_termination_watch,
@@ -30,6 +33,26 @@ use serde_json::json;
 
 fn log_test_now() -> time::OffsetDateTime {
     time::OffsetDateTime::UNIX_EPOCH
+}
+
+fn refresh_streaming_dependencies_from_test_state(state: &mut crate::api::ApiState) {
+    let pod_query = state.resource_mutation().pod_repository.clone();
+    let local_node_exec = state.pod_node_subresources().local_node_exec.clone();
+    let remote_node_exec = state
+        .operational()
+        .replication
+        .as_ref()
+        .map(|services| services.exec.clone());
+    let local_node_name = Arc::<str>::from(state.operational().config.node_name.as_str());
+    let supervisor = state.operational().task_supervisor.clone();
+    *state.streaming_mut() = k8s_native_service::StreamingDependencies::new(
+        pod_query,
+        local_node_exec,
+        remote_node_exec,
+        klights_kubelet::node_api::port_forward::local_node_port_forward(supervisor.clone()),
+        local_node_name,
+        supervisor,
+    );
 }
 
 // --- parse_cri_log_line tests ---
@@ -319,6 +342,7 @@ async fn test_remote_websocket_exec_rejects_spdy_upgrade() {
             state.operational().task_supervisor.clone(),
         )),
     ));
+    refresh_streaming_dependencies_from_test_state(&mut state);
     state
         .resource_mutation()
         .db
@@ -380,6 +404,7 @@ async fn test_remote_websocket_exec_accepts_upgrade_instead_of_bad_request() {
             state.operational().task_supervisor.clone(),
         )),
     ));
+    refresh_streaming_dependencies_from_test_state(&mut state);
     state
         .resource_mutation()
         .db
@@ -449,6 +474,7 @@ async fn test_remote_websocket_attach_accepts_upgrade_instead_of_not_implemented
             state.operational().task_supervisor.clone(),
         )),
     ));
+    refresh_streaming_dependencies_from_test_state(&mut state);
     state
         .resource_mutation()
         .db

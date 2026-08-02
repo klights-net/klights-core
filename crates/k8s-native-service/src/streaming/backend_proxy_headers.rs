@@ -1,3 +1,5 @@
+//! Header filtering for Kubernetes workload proxy requests.
+
 use axum::http::HeaderName;
 
 #[derive(Debug, Clone, Copy, Default)]

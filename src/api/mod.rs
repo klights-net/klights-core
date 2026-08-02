@@ -16,7 +16,6 @@
 pub mod macros;
 
 pub mod apiservice_proxy;
-pub(crate) mod backend_proxy_headers;
 mod crd_conversion;
 pub(crate) mod custom_resource_ports;
 mod custom_resources;

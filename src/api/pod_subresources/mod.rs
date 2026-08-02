@@ -1,40 +1,46 @@
 use axum::{
-    Json,
-    extract::{Path, Query, RawQuery, Request, State},
-    http::{StatusCode, header},
-    response::{IntoResponse, Response},
+    extract::{Path, Query, Request, State},
+    response::Response,
 };
-use bytes::Bytes;
-#[cfg(test)]
-use futures::stream::StreamExt;
-use serde::Deserialize;
-use serde_json::Value;
 use std::sync::Arc;
 
-use crate::api::{ApiState, AppError, build_admission_context, run_admission_for_request};
+use crate::api::{ApiState, AppError};
 
 // Authorization for all pod subresources is enforced by the global
 // `authorize_request` middleware chokepoint (see src/api/auth_middleware.rs);
 // handlers no longer authorize individually.
 
-mod exec;
-mod exec_spdy;
-mod exec_ws;
-mod node_proxy;
-mod portforward;
-mod proxy;
-mod spdy_framing;
 #[cfg(test)]
 mod tests;
 
-pub(in crate::api) use self::exec::*;
-pub use self::exec_ws::*;
-pub(in crate::api) use self::node_proxy::*;
-pub(in crate::api) use self::portforward::*;
-pub use self::proxy::MAX_APISERVICE_RESPONSE_BODY_BYTES;
-pub use self::proxy::MAX_PROXY_REQUEST_BODY_BYTES;
-pub use self::proxy::MAX_PROXY_RESPONSE_BODY_BYTES;
-pub(in crate::api) use self::proxy::*;
+#[cfg(test)]
+pub use k8s_native_service::streaming::{
+    ExecTarget, ProxyQuery, RemoteExecWebSocketSyncRequest, derive_websocket_accept_key,
+    exec_exit_status, extract_container_id, format_websocket_error_payload,
+    handle_remote_exec_websocket_sync, handle_remote_exec_websocket_tungstenite,
+    negotiate_websocket_subprotocol, parse_attach_query, parse_exec_query, parse_proxy_name_port,
+    pod_proxy_inner, proxy_request, proxy_request_with_fallback, proxy_request_with_fallback_port,
+    proxy_request_with_fallback_port_and_retries, remote_exec_error_frame_is_terminal,
+    remote_pod_node_name, rewrite_proxy_response_body, send_proxy_request_https,
+    service_proxy_inner, should_allow_pod_proxy_default_port_fallback,
+    websocket_uses_structured_status_channel,
+};
+pub use k8s_native_service::streaming::{
+    MAX_APISERVICE_RESPONSE_BODY_BYTES, MAX_PROXY_REQUEST_BODY_BYTES,
+    MAX_PROXY_RESPONSE_BODY_BYTES, read_reqwest_body_limited,
+};
+pub(in crate::api) use k8s_native_service::streaming::{
+    node_proxy, node_proxy_with_path, pod_attach, pod_exec, pod_portforward, pod_proxy,
+    pod_proxy_with_path, service_proxy, service_proxy_with_path,
+};
+#[cfg(test)]
+mod exec_spdy {
+    pub(crate) use k8s_native_service::streaming::test_support::*;
+}
+#[cfg(test)]
+mod spdy_framing {
+    pub(crate) use k8s_native_service::streaming::test_support::*;
+}
 pub(in crate::api) use k8s_native_service::subresources::pod::{
     get_pod_ephemeral_containers, get_pod_status, patch_pod_ephemeral_containers,
     patch_pod_status_subresource, pod_binding, pod_eviction, update_pod_ephemeral_containers,
