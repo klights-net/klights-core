@@ -190,22 +190,22 @@ impl WebhookTargetResolver for RootWebhookTargetResolver {
                     "Service {namespace}/{name} has no ready TCP endpoint for port {requested_port}"
                 ))
             })?;
-        let endpoint_ip = selected_port.endpoints.first().copied().ok_or_else(|| {
-            AdmissionDependencyError::new(format!(
-                "Service {namespace}/{name} has no ready endpoints"
-            ))
-        })?;
-        let endpoint_port = selected_port.target_port;
         let path = service_ref
             .get("path")
             .and_then(Value::as_str)
             .unwrap_or("");
         let host = format!("{name}.{namespace}.svc");
+        // Preserve the Kubernetes Service boundary. The host-side nft output
+        // path owns ClusterIP load balancing and targetPort translation,
+        // including routing to ready endpoints on another node. Pinning the
+        // client directly to the first Pod IP bypasses those semantics and
+        // makes admission availability depend on one endpoint and route.
+        let service_port = selected_port.service_port;
         Ok(WebhookTarget {
-            base_url: format!("https://{host}:{endpoint_port}{path}"),
+            base_url: format!("https://{host}:{service_port}{path}"),
             dns_override: Some((
                 host,
-                SocketAddr::new(IpAddr::V4(endpoint_ip), endpoint_port),
+                SocketAddr::new(IpAddr::V4(service_spec.cluster_ip), service_port),
             )),
         })
     }

@@ -995,7 +995,7 @@ async fn test_resolve_webhook_target_from_service_reference() {
         target.dns_override,
         Some((
             "webhook-service.cert-manager.svc".to_string(),
-            SocketAddr::from((std::net::Ipv4Addr::new(10, 42, 1, 10), 443)),
+            SocketAddr::from((std::net::Ipv4Addr::new(10, 43, 200, 50), 443)),
         ))
     );
 }
@@ -1056,13 +1056,13 @@ async fn test_resolve_webhook_target_service_with_port_specified() {
         target.dns_override,
         Some((
             "webhook-service.default.svc".to_string(),
-            SocketAddr::from((std::net::Ipv4Addr::new(10, 42, 1, 20), 9443)),
+            SocketAddr::from((std::net::Ipv4Addr::new(10, 43, 128, 100), 9443)),
         ))
     );
 }
 
 #[tokio::test]
-async fn test_resolve_webhook_target_uses_endpoint_target_port_when_endpoints_exist() {
+async fn test_resolve_webhook_target_leaves_target_port_translation_to_service_dataplane() {
     let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
 
     let service = json!({
@@ -1113,13 +1113,89 @@ async fn test_resolve_webhook_target_uses_endpoint_target_port_when_endpoints_ex
     let target = resolve_webhook_target_for_test(db_handle, &client_config)
         .await
         .unwrap();
-    assert_eq!(target.base_url, "https://webhook-service.default.svc:9443");
+    assert_eq!(target.base_url, "https://webhook-service.default.svc:443");
     assert_eq!(
         target.dns_override,
         Some((
             "webhook-service.default.svc".to_string(),
-            SocketAddr::from((std::net::Ipv4Addr::new(10, 42, 0, 55), 9443)),
+            SocketAddr::from((std::net::Ipv4Addr::new(10, 43, 128, 100), 443)),
         ))
+    );
+}
+
+#[tokio::test]
+async fn test_resolve_webhook_target_keeps_remote_endpoint_behind_service_dataplane() {
+    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+
+    db.create_resource(
+        "v1",
+        "Service",
+        Some("webhook-7540"),
+        "e2e-test-webhook",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "name": "e2e-test-webhook",
+                "namespace": "webhook-7540"
+            },
+            "spec": {
+                "clusterIP": "10.43.128.100",
+                "ports": [{"name": "https", "port": 8443, "targetPort": 8444}]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    db.create_resource(
+        "discovery.k8s.io/v1",
+        "EndpointSlice",
+        Some("webhook-7540"),
+        "e2e-test-webhook-remote",
+        json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "e2e-test-webhook-remote",
+                "namespace": "webhook-7540",
+                "labels": {"kubernetes.io/service-name": "e2e-test-webhook"}
+            },
+            "ports": [{"name": "https", "port": 8444, "protocol": "TCP"}],
+            "endpoints": [{
+                "addresses": ["10.42.2.55"],
+                "conditions": {"ready": true},
+                "nodeName": "mn-replica"
+            }]
+        }),
+    )
+    .await
+    .unwrap();
+
+    let target = resolve_webhook_target_for_test(
+        db_handle,
+        &json!({
+            "service": {
+                "name": "e2e-test-webhook",
+                "namespace": "webhook-7540",
+                "path": "/always-allow-delay-5s",
+                "port": 8443
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        target.base_url,
+        "https://e2e-test-webhook.webhook-7540.svc:8443/always-allow-delay-5s"
+    );
+    assert_eq!(
+        target.dns_override,
+        Some((
+            "e2e-test-webhook.webhook-7540.svc".to_string(),
+            SocketAddr::from((std::net::Ipv4Addr::new(10, 43, 128, 100), 8443)),
+        )),
+        "the apiserver must enter the Service dataplane; it must not pin the first remote Pod endpoint"
     );
 }
 
