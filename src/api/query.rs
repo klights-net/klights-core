@@ -1,108 +1,18 @@
+#[cfg(test)]
 use crate::api::AppError;
+#[cfg(test)]
+pub use k8s_native_service::generic_read::{
+    CONTINUE_TOKEN_TTL_SECS, ContinueResourceVersion, ContinueTokenData, ListResourceVersionMatch,
+    encode_continue_token_at, encode_inconsistent_continue_token,
+    resolve_list_response_resource_version,
+};
+pub use k8s_native_service::generic_read::{
+    ListQuery, ListResourceVersionFuture, ListResourceVersionPort, ListSnapshotResolution,
+    ListSnapshotResult, NamespaceListFuture, NamespaceListPage, NamespaceListPort,
+    NamespaceListRequest, NamespaceListSnapshot, ResolvedListPage,
+    encode_response_continue_token_at, process_continue_token_at, resolve_list_page,
+};
 use serde::Deserialize;
-use std::future::Future;
-use std::pin::Pin;
-
-pub type ListResourceVersionFuture<'a> =
-    Pin<Box<dyn Future<Output = anyhow::Result<i64>> + Send + 'a>>;
-
-pub trait ListResourceVersionPort: Send + Sync {
-    fn advance_after(&self, minimum_resource_version: i64) -> ListResourceVersionFuture<'_>;
-}
-
-pub trait ListPageMetadata {
-    fn list_resource_version(&self) -> i64;
-}
-
-pub enum ListSnapshotResolution<Page> {
-    List(Page),
-    Current,
-    Expired,
-}
-
-pub trait ListSnapshotResult<Page> {
-    fn into_list_snapshot_resolution(self) -> ListSnapshotResolution<Page>;
-}
-
-#[derive(Clone, Debug)]
-pub struct NamespaceListRequest {
-    pub label_selector: Option<String>,
-    pub field_selector: Option<String>,
-    pub limit: Option<i64>,
-    pub continue_token: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct NamespaceListPage {
-    pub items: Vec<klights_cluster_core::Resource>,
-    pub resource_version: i64,
-    pub continue_token: Option<String>,
-    pub remaining_item_count: Option<i64>,
-}
-
-pub enum NamespaceListSnapshot {
-    List(NamespaceListPage),
-    Current,
-    Expired,
-}
-
-pub type NamespaceListFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, AppError>> + Send + 'a>>;
-
-pub trait NamespaceListPort: Send + Sync {
-    fn list_namespaces(
-        &self,
-        request: NamespaceListRequest,
-    ) -> NamespaceListFuture<'_, NamespaceListPage>;
-
-    fn snapshot_namespaces(
-        &self,
-        request: NamespaceListRequest,
-        snapshot_resource_version: i64,
-    ) -> NamespaceListFuture<'_, NamespaceListSnapshot>;
-}
-
-impl ListPageMetadata for NamespaceListPage {
-    fn list_resource_version(&self) -> i64 {
-        self.resource_version
-    }
-}
-
-impl ListSnapshotResult<NamespaceListPage> for NamespaceListSnapshot {
-    fn into_list_snapshot_resolution(self) -> ListSnapshotResolution<NamespaceListPage> {
-        match self {
-            Self::List(list) => ListSnapshotResolution::List(list),
-            Self::Current => ListSnapshotResolution::Current,
-            Self::Expired => ListSnapshotResolution::Expired,
-        }
-    }
-}
-
-impl ListPageMetadata for klights_pod_api::PodListResult {
-    fn list_resource_version(&self) -> i64 {
-        self.resource_version()
-    }
-}
-
-impl ListSnapshotResult<klights_pod_api::PodListResult>
-    for klights_pod_api::PodSnapshotListOutcome
-{
-    fn into_list_snapshot_resolution(
-        self,
-    ) -> ListSnapshotResolution<klights_pod_api::PodListResult> {
-        match self {
-            Self::List(list) => ListSnapshotResolution::List(list),
-            Self::Current => ListSnapshotResolution::Current,
-            Self::Expired => ListSnapshotResolution::Expired,
-        }
-    }
-}
-
-impl ListPageMetadata for klights_leader_api::ResourceListResult {
-    fn list_resource_version(&self) -> i64 {
-        self.resource_version()
-    }
-}
 
 impl ListSnapshotResult<klights_leader_api::ResourceListResult>
     for crate::api::custom_resource_ports::CustomResourceListSnapshot
@@ -114,146 +24,6 @@ impl ListSnapshotResult<klights_leader_api::ResourceListResult>
             Self::List(list) => ListSnapshotResolution::List(list),
             Self::Current => ListSnapshotResolution::Current,
             Self::Expired => ListSnapshotResolution::Expired,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-pub struct ListQuery {
-    #[serde(rename = "labelSelector")]
-    pub label_selector: Option<String>,
-    #[serde(rename = "fieldSelector")]
-    pub field_selector: Option<String>,
-    pub limit: Option<i64>,
-    #[serde(rename = "continue")]
-    pub continue_token: Option<String>,
-    pub watch: Option<String>,
-    #[serde(rename = "resourceVersion")]
-    pub resource_version: Option<String>,
-    #[serde(rename = "resourceVersionMatch")]
-    pub resource_version_match: Option<String>,
-    #[serde(rename = "allowWatchBookmarks")]
-    pub allow_watch_bookmarks: Option<String>,
-    #[serde(rename = "sendInitialEvents")]
-    pub send_initial_events: Option<String>,
-    #[serde(rename = "timeoutSeconds")]
-    pub timeout_seconds: Option<u64>,
-}
-
-/// How a plain (non-watch) LIST should interpret `resourceVersion`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ListResourceVersionMatch {
-    /// No `resourceVersionMatch` and no `resourceVersion` (or `rv=0`): serve the
-    /// freshest available state ("any").
-    Any,
-    /// Return state at least as fresh as the requested `resourceVersion`. This
-    /// is also the legacy meaning of a bare `resourceVersion` without a match.
-    NotOlderThan(i64),
-    /// Return state exactly at the requested `resourceVersion`.
-    Exact(i64),
-}
-
-impl ListQuery {
-    /// Parse and validate `resourceVersion` + `resourceVersionMatch` for a plain
-    /// LIST, returning the resolved semantics. Mirrors upstream apimachinery
-    /// validation (see `k8s.io/apimachinery/.../validation`):
-    ///
-    /// * `resourceVersionMatch` must be empty, `Exact`, or `NotOlderThan`.
-    /// * `resourceVersionMatch` is forbidden together with `continue`.
-    /// * `resourceVersionMatch` requires `resourceVersion` to be set.
-    /// * `resourceVersionMatch=Exact` requires a non-zero `resourceVersion`.
-    /// * `resourceVersion`, if present, must be a non-negative integer.
-    pub fn resolve_resource_version_match(
-        &self,
-        has_continue: bool,
-    ) -> Result<ListResourceVersionMatch, AppError> {
-        let rv_match = self
-            .resource_version_match
-            .as_deref()
-            .filter(|s| !s.is_empty());
-
-        let parsed_rv: Option<i64> = match self.resource_version.as_deref() {
-            None | Some("") => None,
-            Some(raw) => Some(raw.parse::<i64>().map_err(|_| {
-                AppError::BadRequest(format!(
-                    "Invalid value: \"{raw}\": resourceVersion: must be a non-negative integer"
-                ))
-            })?),
-        };
-        if let Some(rv) = parsed_rv
-            && rv < 0
-        {
-            return Err(AppError::BadRequest(format!(
-                "Invalid value: \"{rv}\": resourceVersion: must be a non-negative integer"
-            )));
-        }
-
-        let Some(rv_match) = rv_match else {
-            // Legacy: a bare resourceVersion means "not older than".
-            return Ok(match parsed_rv {
-                Some(rv) if rv > 0 => ListResourceVersionMatch::NotOlderThan(rv),
-                _ => ListResourceVersionMatch::Any,
-            });
-        };
-
-        if has_continue {
-            return Err(AppError::BadRequest(
-                "Invalid value: resourceVersionMatch is forbidden when continue is provided"
-                    .to_string(),
-            ));
-        }
-        if parsed_rv.is_none() {
-            return Err(AppError::BadRequest(
-                "Invalid value: resourceVersionMatch is forbidden unless resourceVersion is provided"
-                    .to_string(),
-            ));
-        }
-        match rv_match {
-            "NotOlderThan" => Ok(match parsed_rv {
-                Some(rv) if rv > 0 => ListResourceVersionMatch::NotOlderThan(rv),
-                _ => ListResourceVersionMatch::Any,
-            }),
-            "Exact" => match parsed_rv {
-                Some(rv) if rv > 0 => Ok(ListResourceVersionMatch::Exact(rv)),
-                _ => Err(AppError::BadRequest(
-                    "Invalid value: resourceVersionMatch \"Exact\" is forbidden unless a non-zero resourceVersion is provided"
-                        .to_string(),
-                )),
-            },
-            other => Err(AppError::BadRequest(format!(
-                "Unsupported value: \"{other}\": supported values: \"Exact\", \"NotOlderThan\""
-            ))),
-        }
-    }
-
-    pub fn validate_send_initial_events_watch(&self) -> Result<(), AppError> {
-        if self.send_initial_events.as_deref() != Some("true") {
-            return Ok(());
-        }
-
-        match self
-            .resource_version_match
-            .as_deref()
-            .filter(|s| !s.is_empty())
-        {
-            Some("NotOlderThan") => Ok(()),
-            Some(other) => Err(AppError::BadRequest(format!(
-                "Invalid value: resourceVersionMatch \"{other}\": sendInitialEvents=true requires resourceVersionMatch=NotOlderThan"
-            ))),
-            None => Err(AppError::BadRequest(
-                "Invalid value: sendInitialEvents=true requires resourceVersionMatch=NotOlderThan"
-                    .to_string(),
-            )),
-        }
-    }
-
-    pub fn normalized_limit(&self) -> Result<Option<i64>, AppError> {
-        match self.limit {
-            None | Some(0) => Ok(None),
-            Some(limit) if limit > 0 => Ok(Some(limit)),
-            Some(limit) => Err(AppError::BadRequest(format!(
-                "Invalid list limit {limit}: limit must be greater than or equal to 0"
-            ))),
         }
     }
 }
@@ -287,140 +57,6 @@ pub struct DeleteCollectionQuery {
     pub dry_run: Option<String>,
 }
 
-pub const CONTINUE_TOKEN_TTL_SECS: i64 = 60;
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct ContinueTokenData {
-    pub n: String,
-    #[serde(default)]
-    pub rv: i64,
-    pub ts: Option<i64>,
-    #[serde(default)]
-    pub session: bool,
-}
-
-impl ContinueTokenData {
-    fn is_inconsistent(&self) -> bool {
-        self.ts.is_none()
-    }
-
-    fn is_expired_at(&self, now_unix_seconds: i64) -> bool {
-        if let Some(ts) = self.ts {
-            now_unix_seconds - ts > CONTINUE_TOKEN_TTL_SECS
-        } else {
-            false
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContinueResourceVersion {
-    Current,
-    Session(i64),
-    Inconsistent { expired_rv: Option<i64> },
-    InconsistentSession(i64),
-}
-
-fn decode_continue_token_data(raw: &str) -> Option<ContinueTokenData> {
-    use base64::Engine as _;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(raw)
-        .ok()?;
-    serde_json::from_slice(&decoded).ok()
-}
-
-pub fn encode_continue_token_at(last_name: &str, session_rv: i64, now_unix_seconds: i64) -> String {
-    use base64::Engine as _;
-    let data = ContinueTokenData {
-        n: last_name.to_string(),
-        rv: session_rv,
-        ts: Some(now_unix_seconds),
-        session: false,
-    };
-    let json = serde_json::to_vec(&data).unwrap_or_default();
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
-}
-
-pub fn encode_inconsistent_continue_token(last_name: &str, expired_rv: i64) -> String {
-    use base64::Engine as _;
-    let data = ContinueTokenData {
-        n: last_name.to_string(),
-        rv: expired_rv,
-        ts: None,
-        session: false,
-    };
-    let json = serde_json::to_vec(&data).unwrap_or_default();
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
-}
-
-pub fn encode_inconsistent_session_continue_token(last_name: &str, session_rv: i64) -> String {
-    use base64::Engine as _;
-    let data = ContinueTokenData {
-        n: last_name.to_string(),
-        rv: session_rv,
-        ts: None,
-        session: true,
-    };
-    let json = serde_json::to_vec(&data).unwrap_or_default();
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
-}
-
-pub fn encode_response_continue_token_at(
-    last_name: &str,
-    response_rv: i64,
-    continue_resource_version: ContinueResourceVersion,
-    now_unix_seconds: i64,
-) -> String {
-    match continue_resource_version {
-        ContinueResourceVersion::Inconsistent { .. }
-        | ContinueResourceVersion::InconsistentSession(_) => {
-            encode_inconsistent_session_continue_token(last_name, response_rv)
-        }
-        ContinueResourceVersion::Current | ContinueResourceVersion::Session(_) => {
-            encode_continue_token_at(last_name, response_rv, now_unix_seconds)
-        }
-    }
-}
-
-pub fn process_continue_token_at(
-    raw: Option<String>,
-    now_unix_seconds: i64,
-) -> Result<(Option<String>, ContinueResourceVersion), AppError> {
-    let raw = match raw {
-        None => return Ok((None, ContinueResourceVersion::Current)),
-        Some(s) if s.is_empty() => return Ok((None, ContinueResourceVersion::Current)),
-        Some(s) => s,
-    };
-
-    if let Some(data) = decode_continue_token_data(&raw) {
-        if !data.is_inconsistent() && data.is_expired_at(now_unix_seconds) {
-            let inconsistent = encode_inconsistent_continue_token(&data.n, data.rv);
-            return Err(AppError::ResourceExpired(inconsistent));
-        }
-        if data.is_inconsistent() {
-            if data.session && data.rv > 0 {
-                return Ok((
-                    Some(data.n),
-                    ContinueResourceVersion::InconsistentSession(data.rv),
-                ));
-            }
-            let expired_rv = if data.rv > 0 { Some(data.rv) } else { None };
-            return Ok((
-                Some(data.n),
-                ContinueResourceVersion::Inconsistent { expired_rv },
-            ));
-        }
-        let resource_version = if data.rv > 0 {
-            ContinueResourceVersion::Session(data.rv)
-        } else {
-            ContinueResourceVersion::Current
-        };
-        return Ok((Some(data.n), resource_version));
-    }
-
-    Ok((Some(raw), ContinueResourceVersion::Current))
-}
-
 #[cfg(test)]
 pub fn encode_continue_token(last_name: &str, session_rv: i64) -> String {
     encode_continue_token_at(last_name, session_rv, 1_700_000_000)
@@ -448,136 +84,11 @@ pub fn process_continue_token(
 }
 
 #[cfg(test)]
-mod list_rv_match_tests {
-    use super::*;
-
-    fn q(rv: Option<&str>, rv_match: Option<&str>) -> ListQuery {
-        ListQuery {
-            label_selector: None,
-            field_selector: None,
-            limit: None,
-            continue_token: None,
-            watch: None,
-            resource_version: rv.map(str::to_string),
-            resource_version_match: rv_match.map(str::to_string),
-            allow_watch_bookmarks: None,
-            send_initial_events: None,
-            timeout_seconds: None,
-        }
-    }
-
-    #[test]
-    fn unset_is_any() {
-        assert_eq!(
-            q(None, None).resolve_resource_version_match(false).unwrap(),
-            ListResourceVersionMatch::Any
-        );
-        assert_eq!(
-            q(Some("0"), None)
-                .resolve_resource_version_match(false)
-                .unwrap(),
-            ListResourceVersionMatch::Any
-        );
-    }
-
-    #[test]
-    fn bare_rv_is_not_older_than() {
-        assert_eq!(
-            q(Some("42"), None)
-                .resolve_resource_version_match(false)
-                .unwrap(),
-            ListResourceVersionMatch::NotOlderThan(42)
-        );
-    }
-
-    #[test]
-    fn explicit_not_older_than_and_exact() {
-        assert_eq!(
-            q(Some("7"), Some("NotOlderThan"))
-                .resolve_resource_version_match(false)
-                .unwrap(),
-            ListResourceVersionMatch::NotOlderThan(7)
-        );
-        assert_eq!(
-            q(Some("7"), Some("Exact"))
-                .resolve_resource_version_match(false)
-                .unwrap(),
-            ListResourceVersionMatch::Exact(7)
-        );
-    }
-
-    #[test]
-    fn unsupported_match_value_is_400() {
-        let err = q(Some("1"), Some("Bogus"))
-            .resolve_resource_version_match(false)
-            .unwrap_err();
-        assert!(matches!(err, AppError::BadRequest(_)));
-    }
-
-    #[test]
-    fn match_requires_resource_version() {
-        assert!(matches!(
-            q(None, Some("NotOlderThan")).resolve_resource_version_match(false),
-            Err(AppError::BadRequest(_))
-        ));
-    }
-
-    #[test]
-    fn exact_forbids_zero_rv() {
-        assert!(matches!(
-            q(Some("0"), Some("Exact")).resolve_resource_version_match(false),
-            Err(AppError::BadRequest(_))
-        ));
-    }
-
-    #[test]
-    fn match_forbidden_with_continue() {
-        assert!(matches!(
-            q(Some("5"), Some("NotOlderThan")).resolve_resource_version_match(true),
-            Err(AppError::BadRequest(_))
-        ));
-    }
-
-    #[test]
-    fn invalid_rv_string_is_400() {
-        assert!(matches!(
-            q(Some("abc"), None).resolve_resource_version_match(false),
-            Err(AppError::BadRequest(_))
-        ));
-    }
-
-    #[test]
-    fn send_initial_events_requires_not_older_than_match() {
-        let mut query = q(None, None);
-        query.send_initial_events = Some("true".to_string());
-        assert!(matches!(
-            query.validate_send_initial_events_watch(),
-            Err(AppError::BadRequest(_))
-        ));
-
-        query.resource_version_match = Some("Exact".to_string());
-        assert!(matches!(
-            query.validate_send_initial_events_watch(),
-            Err(AppError::BadRequest(_))
-        ));
-
-        query.resource_version_match = Some("NotOlderThan".to_string());
-        query.validate_send_initial_events_watch().unwrap();
-    }
-
-    #[test]
-    fn send_initial_events_false_does_not_require_match() {
-        let mut query = q(None, None);
-        query.send_initial_events = Some("false".to_string());
-
-        query.validate_send_initial_events_watch().unwrap();
-    }
-}
-
-#[cfg(test)]
 mod resolve_list_page_tests {
     use super::*;
-    use crate::datastore::{ResourceList, SnapshotAtRv, sqlite::Datastore};
+    use crate::datastore::sqlite::Datastore;
+    use k8s_native_service::generic_read::GenericReadSnapshot;
+    use klights_leader_api::ResourceListResult;
 
     impl ListResourceVersionPort for Datastore {
         fn advance_after(&self, minimum_resource_version: i64) -> ListResourceVersionFuture<'_> {
@@ -588,14 +99,15 @@ mod resolve_list_page_tests {
         }
     }
 
-    fn empty_list(rv: i64, continue_token: Option<&str>) -> ResourceList {
-        ResourceList {
-            items: Vec::new(),
-            resource_version: rv,
-            watch_replay_position: None,
-            continue_token: continue_token.map(str::to_string),
-            remaining_item_count: continue_token.map(|_| 1),
-        }
+    fn empty_list(rv: i64, continue_token: Option<&str>) -> ResourceListResult {
+        ResourceListResult::try_new(
+            Vec::new(),
+            rv,
+            None,
+            continue_token.map(str::to_string),
+            continue_token.map(|_| 1),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -607,7 +119,7 @@ mod resolve_list_page_tests {
             ContinueResourceVersion::Current,
             |srv| async move {
                 assert_eq!(srv, 7);
-                Ok(SnapshotAtRv::List(empty_list(7, None)))
+                Ok(GenericReadSnapshot::List(empty_list(7, None)))
             },
             || async { panic!("live_fetch must not run when a snapshot is served") },
         )
@@ -627,7 +139,7 @@ mod resolve_list_page_tests {
             &db,
             ListResourceVersionMatch::Exact(3),
             ContinueResourceVersion::Current,
-            |_srv| async { Ok(SnapshotAtRv::Expired) },
+            |_srv| async { Ok(GenericReadSnapshot::Expired) },
             || async { panic!("live_fetch must not run") },
         )
         .await
@@ -651,7 +163,7 @@ mod resolve_list_page_tests {
             ContinueResourceVersion::Session(42),
             |srv| async move {
                 assert_eq!(srv, 42);
-                Ok(SnapshotAtRv::List(empty_list(42, Some("z"))))
+                Ok(GenericReadSnapshot::List(empty_list(42, Some("z"))))
             },
             || async { panic!("live_fetch must not run when a snapshot is served") },
         )
@@ -671,7 +183,7 @@ mod resolve_list_page_tests {
             &db,
             ListResourceVersionMatch::Any,
             ContinueResourceVersion::Session(42),
-            |_srv| async { Ok(SnapshotAtRv::Expired) },
+            |_srv| async { Ok(GenericReadSnapshot::Expired) },
             || async { Ok(empty_list(99, Some("z"))) },
         )
         .await
@@ -692,7 +204,7 @@ mod resolve_list_page_tests {
             &db,
             ListResourceVersionMatch::Exact(5),
             ContinueResourceVersion::Current,
-            |_srv| async { Ok(SnapshotAtRv::Current) },
+            |_srv| async { Ok(GenericReadSnapshot::Current) },
             || async { Ok(empty_list(5, None)) },
         )
         .await
@@ -709,7 +221,7 @@ mod resolve_list_page_tests {
             ListResourceVersionMatch::NotOlderThan(100),
             ContinueResourceVersion::Current,
             |_srv| async {
-                Err::<SnapshotAtRv, AppError>(AppError::Internal(
+                Err::<GenericReadSnapshot, AppError>(AppError::Internal(
                     "NotOlderThan unexpectedly pinned a snapshot".to_string(),
                 ))
             },
@@ -722,135 +234,4 @@ mod resolve_list_page_tests {
             "response rv must be floored to NotOlderThan"
         );
     }
-}
-
-pub async fn resolve_list_response_resource_version(
-    resource_versions: &dyn ListResourceVersionPort,
-    continue_resource_version: ContinueResourceVersion,
-    current_resource_version: i64,
-) -> Result<i64, AppError> {
-    match continue_resource_version {
-        ContinueResourceVersion::Current => Ok(current_resource_version),
-        ContinueResourceVersion::Session(rv) => Ok(rv),
-        ContinueResourceVersion::Inconsistent { expired_rv } => {
-            let min_rv = expired_rv.unwrap_or(current_resource_version);
-            resource_versions
-                .advance_after(min_rv)
-                .await
-                .map_err(|error| AppError::Internal(error.to_string()))
-        }
-        ContinueResourceVersion::InconsistentSession(rv) => Ok(rv),
-    }
-}
-
-/// The consistent page a plain (non-watch) LIST resolved to, plus the metadata
-/// every list handler needs to render its response identically.
-#[derive(Debug)]
-pub struct ResolvedListPage<Page> {
-    /// The page of resources to serve — from a pinned historical snapshot when
-    /// the read is consistent, otherwise from the live store.
-    pub list: Page,
-    /// The `metadata.resourceVersion` to report (already adjusted for
-    /// `resourceVersionMatch` and continuation-session pinning).
-    pub response_rv: i64,
-    /// The continuation mode to encode into the next page's `continue` token.
-    /// May have been downgraded to inconsistent if the snapshot window expired.
-    pub continue_resource_version: ContinueResourceVersion,
-}
-
-/// Shared consistent-snapshot selection for plain (non-watch) LISTs.
-///
-/// This centralizes the consistency logic that previously lived only in the
-/// generated list handler (`generated_handlers::inners::list_inner`). Every
-/// list handler — generated, Pods, Namespaces, and custom resources — must run
-/// pages 2+ through this so the page body and the reported `resourceVersion`
-/// come from the same consistency mode.
-///
-/// A historical snapshot is pinned when the read references an older
-/// `resourceVersion`: an explicit `resourceVersionMatch=Exact`, or a paginated
-/// continuation carrying its session rv (so every page reflects one consistent
-/// view). `NotOlderThan`/`Any` are served live (a single consistent store is
-/// always at least as fresh as any past rv).
-///
-/// When the pinned snapshot can no longer be reconstructed
-/// ([`ListSnapshotResolution::Expired`]): an explicit `Exact` answers `410 Gone`, while a
-/// still-fresh paginated continuation that merely outran the retained
-/// watch-event window continues from the last key against the live state and
-/// keeps subsequent page tokens marked inconsistent.
-///
-/// `snapshot_fetch` is invoked only when a pin is required; callers without a
-/// real reconstruction (e.g. conversion-backed CRDs) may return
-/// [`ListSnapshotResolution::Expired`] to opt into the inconsistent-continuation
-/// fallback. `live_fetch` is invoked only when no pinned snapshot is served.
-pub async fn resolve_list_page<Page, Snapshot, SFut, LFut>(
-    resource_versions: &dyn ListResourceVersionPort,
-    rv_match: ListResourceVersionMatch,
-    mut continue_resource_version: ContinueResourceVersion,
-    snapshot_fetch: impl FnOnce(i64) -> SFut,
-    live_fetch: impl FnOnce() -> LFut,
-) -> Result<ResolvedListPage<Page>, AppError>
-where
-    Page: ListPageMetadata,
-    Snapshot: ListSnapshotResult<Page>,
-    SFut: Future<Output = Result<Snapshot, AppError>>,
-    LFut: Future<Output = Result<Page, AppError>>,
-{
-    let snapshot_rv = match rv_match {
-        ListResourceVersionMatch::Exact(rv) => Some(rv),
-        _ => match continue_resource_version {
-            ContinueResourceVersion::Session(rv) => Some(rv),
-            _ => None,
-        },
-    };
-
-    let snapshot_list = if let Some(srv) = snapshot_rv {
-        match snapshot_fetch(srv).await?.into_list_snapshot_resolution() {
-            ListSnapshotResolution::List(list) => Some(list),
-            // rv is at/after current state — fall through to the live list.
-            ListSnapshotResolution::Current => None,
-            ListSnapshotResolution::Expired => match rv_match {
-                ListResourceVersionMatch::Exact(rv) => {
-                    return Err(AppError::expired(format!(
-                        "too old resource version: {rv} (the requested resourceVersion is older than the server's retained history)"
-                    )));
-                }
-                // A still-fresh paginated continuation can outlive the retained
-                // watch_events window under unrelated API churn. Continue from
-                // the last key against current state and keep subsequent page
-                // tokens marked inconsistent.
-                _ => {
-                    continue_resource_version = ContinueResourceVersion::InconsistentSession(srv);
-                    None
-                }
-            },
-        }
-    } else {
-        None
-    };
-
-    let list = match snapshot_list {
-        Some(list) => list,
-        None => live_fetch().await?,
-    };
-
-    let mut response_rv = resolve_list_response_resource_version(
-        resource_versions,
-        continue_resource_version,
-        list.list_resource_version(),
-    )
-    .await?;
-    // resourceVersionMatch handling. Exact pins the reported list rv to the
-    // requested version; NotOlderThan guarantees the response is at least that
-    // fresh (always true here — a single consistent store serves current state).
-    match rv_match {
-        ListResourceVersionMatch::Exact(rv) => response_rv = rv,
-        ListResourceVersionMatch::NotOlderThan(rv) => response_rv = response_rv.max(rv),
-        ListResourceVersionMatch::Any => {}
-    }
-
-    Ok(ResolvedListPage {
-        list,
-        response_rv,
-        continue_resource_version,
-    })
 }

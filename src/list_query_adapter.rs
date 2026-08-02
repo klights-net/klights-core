@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
 use crate::api::query::{
-    ListPageMetadata, ListResourceVersionFuture, ListResourceVersionPort, ListSnapshotResolution,
-    ListSnapshotResult, NamespaceListFuture, NamespaceListPage, NamespaceListPort,
-    NamespaceListRequest, NamespaceListSnapshot,
+    ListResourceVersionFuture, ListResourceVersionPort, NamespaceListFuture, NamespaceListPage,
+    NamespaceListPort, NamespaceListRequest, NamespaceListSnapshot,
 };
 
 pub(crate) struct DatastoreListResourceVersionPort {
@@ -23,24 +22,6 @@ impl ListResourceVersionPort for DatastoreListResourceVersionPort {
                 .advance_resource_version_after(minimum_resource_version)
                 .await
         })
-    }
-}
-
-impl ListPageMetadata for crate::datastore::ResourceList {
-    fn list_resource_version(&self) -> i64 {
-        self.resource_version
-    }
-}
-
-impl ListSnapshotResult<crate::datastore::ResourceList> for crate::datastore::SnapshotAtRv {
-    fn into_list_snapshot_resolution(
-        self,
-    ) -> ListSnapshotResolution<crate::datastore::ResourceList> {
-        match self {
-            Self::List(list) => ListSnapshotResolution::List(list),
-            Self::Current => ListSnapshotResolution::Current,
-            Self::Expired => ListSnapshotResolution::Expired,
-        }
     }
 }
 

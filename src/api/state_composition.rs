@@ -37,6 +37,216 @@ impl k8s_native_service::discovery::DiscoveryResourceQuery for ApiResourceMutati
     }
 }
 
+impl k8s_native_service::generic_read::GenericReadSnapshotPort for ApiResourceMutationServices {
+    fn snapshot_resources_at_rv(
+        &self,
+        request: k8s_native_service::generic_read::GenericReadSnapshotRequest,
+    ) -> k8s_native_service::generic_read::GenericReadFuture<
+        '_,
+        k8s_native_service::generic_read::GenericReadSnapshot,
+    > {
+        Box::pin(async move {
+            let snapshot = self
+                .custom_resource_reads
+                .snapshot_resources_at_rv(
+                    crate::api::custom_resource_ports::CustomResourceSnapshotRequest {
+                        api_version: request.api_version,
+                        kind: request.kind,
+                        namespace: request.namespace,
+                        label_selector: request.label_selector,
+                        field_selector: request.field_selector,
+                        limit: request.limit,
+                        continue_token: request.continue_token,
+                        resource_version: request.resource_version,
+                    },
+                )
+                .await?;
+            Ok(match snapshot {
+                crate::api::custom_resource_ports::CustomResourceListSnapshot::Current => {
+                    k8s_native_service::generic_read::GenericReadSnapshot::Current
+                }
+                crate::api::custom_resource_ports::CustomResourceListSnapshot::Expired => {
+                    k8s_native_service::generic_read::GenericReadSnapshot::Expired
+                }
+                crate::api::custom_resource_ports::CustomResourceListSnapshot::List(list) => {
+                    k8s_native_service::generic_read::GenericReadSnapshot::List(list)
+                }
+            })
+        })
+    }
+}
+
+impl k8s_native_service::generic_read::GenericReadResourceInputs for ApiResourceMutationServices {
+    fn resource_query(&self) -> &dyn klights_leader_api::LeaderResourceQuery {
+        self.resource_query.as_ref()
+    }
+
+    fn snapshot_port(&self) -> &dyn k8s_native_service::generic_read::GenericReadSnapshotPort {
+        self
+    }
+
+    fn resource_versions(&self) -> &dyn k8s_native_service::generic_read::ListResourceVersionPort {
+        self.list_resource_versions.as_ref()
+    }
+
+    fn prepare_resource_for_read(
+        &self,
+        api_version: &'static str,
+        kind: &'static str,
+        resource: klights_cluster_core::Resource,
+        is_get: bool,
+    ) -> k8s_native_service::generic_read::GenericReadFuture<'_, serde_json::Value> {
+        Box::pin(async move {
+            let resource = if is_get && api_version == "v1" && kind == "Secret" {
+                self.generated_lifecycle
+                    .rotate_bootstrap_token_secret(resource)
+                    .await?
+            } else {
+                resource
+            };
+            let mut value =
+                crate::api::inject_resource_version(resource.data, resource.resource_version);
+            crate::api::normalize_resource_for_read(api_version, kind, &mut value);
+            Ok(value)
+        })
+    }
+
+    fn build_watch(
+        &self,
+        request: k8s_native_service::generic_read::GenericReadWatchRequest,
+    ) -> k8s_native_service::generic_read::GenericReadFuture<'_, axum::response::Response> {
+        Box::pin(async move {
+            let query = request.query;
+            let send_initial_events = query.send_initial_events.as_deref() == Some("true");
+            let explicit_resource_version_zero = query
+                .resource_version
+                .as_deref()
+                .is_some_and(|resource_version| resource_version.trim() == "0");
+            let requested_resource_version = query
+                .resource_version
+                .as_ref()
+                .and_then(|resource_version| resource_version.parse::<i64>().ok())
+                .unwrap_or(0);
+            let send_bookmarks = query.allow_watch_bookmarks.as_deref() == Some("true");
+            let table_format = crate::api::response::wants_table_format(&request.headers)?;
+            let protobuf_supported = crate::api::watch_stream::protobuf_watch_supported_for_request(
+                request.api_version,
+                request.kind,
+                table_format,
+                query.label_selector.as_deref(),
+                query.field_selector.as_deref(),
+            );
+            let stream_format = crate::api::watch_stream::negotiate_watch_stream_format(
+                &request.headers,
+                protobuf_supported,
+            )?;
+            let body = self
+                .generated_watch
+                .build_watch_stream(crate::api::generated_handler_ports::GeneratedWatchRequest {
+                    api_version: request.api_version.to_string(),
+                    kind: request.kind.to_string(),
+                    namespace: request.namespace,
+                    requested_resource_version,
+                    send_initial_events,
+                    send_bookmarks,
+                    label_selector: query.label_selector,
+                    field_selector: query.field_selector,
+                    table_format,
+                    stream_format,
+                    timeout_seconds: query.timeout_seconds,
+                    emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,
+                    wall_clock: request.wall_clock,
+                })
+                .await;
+            Ok(axum::response::Response::builder()
+                .header("Content-Type", stream_format.content_type())
+                .header("Transfer-Encoding", "chunked")
+                .body(body)
+                .expect("static watch response headers must be valid"))
+        })
+    }
+
+    fn render_list(
+        &self,
+        response: k8s_native_service::generic_read::GenericListResponse,
+    ) -> Result<axum::response::Response, k8s_native_service::AppError> {
+        use axum::response::IntoResponse as _;
+
+        let resource_version = response.response_rv.to_string();
+        let operation_now = time::OffsetDateTime::from_unix_timestamp_nanos(
+            response.operation_unix_timestamp_nanos,
+        )
+        .map_err(|error| {
+            k8s_native_service::AppError::Internal(format!(
+                "operation time is outside the supported timestamp range: {error}"
+            ))
+        })?;
+        if crate::api::response::wants_table_format(&response.headers)? {
+            let table = match response.kind {
+                "Pod" => crate::api::response::pod_list_to_table_at(
+                    response.items,
+                    resource_version,
+                    operation_now,
+                ),
+                "Node" => crate::api::response::node_list_to_table_at(
+                    response.items,
+                    resource_version,
+                    operation_now,
+                ),
+                "ReplicaSet" => crate::api::response::replicaset_list_to_table_at(
+                    response.items,
+                    resource_version,
+                    operation_now,
+                ),
+                "Deployment" => crate::api::response::deployment_list_to_table_at(
+                    response.items,
+                    resource_version,
+                    operation_now,
+                ),
+                "StatefulSet" => crate::api::response::statefulset_list_to_table_at(
+                    response.items,
+                    resource_version,
+                    operation_now,
+                ),
+                _ => crate::api::response::generic_list_to_table_at(
+                    response.kind,
+                    response.items,
+                    resource_version,
+                    operation_now,
+                ),
+            };
+            return Ok(axum::Json(table).into_response());
+        }
+
+        let mut metadata = serde_json::json!({"resourceVersion": resource_version});
+        if let Some(token) = response.continue_token {
+            metadata["continue"] = serde_json::Value::String(token);
+        }
+        if let Some(remaining) = response.remaining_item_count {
+            metadata["remainingItemCount"] = serde_json::json!(remaining);
+        }
+        Ok(crate::api::K8sResponse::new(
+            serde_json::json!({
+                "apiVersion": response.api_version,
+                "kind": response.list_kind,
+                "metadata": metadata,
+                "items": response.items,
+            }),
+            &response.headers,
+        )
+        .into_response())
+    }
+
+    fn render_get(
+        &self,
+        value: serde_json::Value,
+        headers: axum::http::HeaderMap,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse as _;
+        crate::api::K8sResponse::new(value, &headers).into_response()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ApiAuthenticators {
     pub(crate) bootstrap_token: Arc<dyn klights_leader_api::LeaderBootstrapTokenAuthentication>,
@@ -182,6 +392,23 @@ impl ApiControllerReconcileServices {
             metrics,
             node_lease_tracker,
         }
+    }
+}
+
+impl k8s_native_service::generic_read::GenericReadControllerInputs
+    for ApiControllerReconcileServices
+{
+    fn observed_node_renew_time(
+        &self,
+        node_name: &str,
+    ) -> k8s_native_service::generic_read::GenericReadFuture<'_, Option<String>> {
+        let node_name = node_name.to_string();
+        Box::pin(async move {
+            Ok(self
+                .node_lease_tracker
+                .observed_renew_time(&node_name)
+                .await)
+        })
     }
 }
 
@@ -428,6 +655,25 @@ impl k8s_native_service::discovery::DiscoveryOperationalInputs for ApiOperationa
 
     fn task_supervisor(&self) -> &klights_supervisor::TaskSupervisor {
         self.task_supervisor.as_ref()
+    }
+}
+
+impl k8s_native_service::generic_read::GenericReadOperationalInputs for ApiOperationalServices {
+    fn operation_unix_timestamp_nanos(&self) -> i128 {
+        self.clock.now().unix_timestamp_nanos()
+    }
+
+    fn wall_clock(&self) -> Arc<dyn klights_auth::clock::Clock> {
+        self.clock.clone()
+    }
+
+    fn has_local_authority(&self) -> bool {
+        self.authority.as_ref().is_some_and(|authority| {
+            let klights_leader_api::AuthorityRoute::Local(permit) = authority.route() else {
+                return false;
+            };
+            authority.validate(&permit).is_ok()
+        })
     }
 }
 

@@ -164,13 +164,9 @@ pub use quotas::{
 pub use response::K8sResponse;
 #[cfg(test)]
 pub use response::prefers_protobuf;
-use response::{
-    deployment_list_to_table_at, node_list_to_table_at, pod_list_to_table_at,
-    replicaset_list_to_table_at, statefulset_list_to_table_at, wants_table_format,
-    watch_event_to_table_at,
-};
 #[cfg(test)]
 use response::{node_list_to_table, pod_list_to_table, watch_event_to_table};
+use response::{pod_list_to_table_at, wants_table_format, watch_event_to_table_at};
 #[cfg(test)]
 pub(crate) use routes::build_router;
 #[cfg(test)]

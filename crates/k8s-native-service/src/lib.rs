@@ -6,6 +6,7 @@
 
 pub mod discovery;
 mod error;
+pub mod generic_read;
 mod router;
 mod state;
 
