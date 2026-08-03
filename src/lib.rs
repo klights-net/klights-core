@@ -44,8 +44,6 @@ mod watch_commit_observation_adapter;
 
 #[cfg(test)]
 mod cluster_engine_composition_tests;
-#[cfg(test)]
-mod cronjob_event_driven_scheduler_tests;
 // Deployment script invariants are covered by the base-repo source guard run
 // as part of `./build.sh`.
 

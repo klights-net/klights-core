@@ -567,6 +567,8 @@ mod tests {
 
     struct MemoryCronJobStore {
         current: Mutex<Resource>,
+        jobs: Mutex<Vec<Resource>>,
+        created_jobs: AtomicUsize,
         writes: AtomicUsize,
     }
 
@@ -574,6 +576,21 @@ mod tests {
         fn new(value: Value) -> Self {
             Self {
                 current: Mutex::new(Resource::try_from_data(Arc::new(value)).unwrap()),
+                jobs: Mutex::new(Vec::new()),
+                created_jobs: AtomicUsize::new(0),
+                writes: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_jobs(value: Value, jobs: impl IntoIterator<Item = Value>) -> Self {
+            Self {
+                current: Mutex::new(Resource::try_from_data(Arc::new(value)).unwrap()),
+                jobs: Mutex::new(
+                    jobs.into_iter()
+                        .map(|job| Resource::try_from_data(Arc::new(job)).unwrap())
+                        .collect(),
+                ),
+                created_jobs: AtomicUsize::new(0),
                 writes: AtomicUsize::new(0),
             }
         }
@@ -661,13 +678,14 @@ mod tests {
             _name: &str,
             _value: Value,
         ) -> ControllerStoreResult<Resource> {
+            self.created_jobs.fetch_add(1, Ordering::Relaxed);
             Err(ControllerStoreError::unavailable(
                 "unexpected Job create in CronJob status test",
             ))
         }
 
         async fn list_jobs(&self, _namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
-            Ok(Vec::new())
+            Ok(self.jobs.lock().unwrap().clone())
         }
 
         async fn delete_job(
@@ -739,5 +757,54 @@ mod tests {
             store.resource().data["status"]["lastSuccessfulTime"],
             "2026-01-02T00:00:00Z"
         );
+    }
+
+    #[tokio::test]
+    async fn forbid_concurrent_blocks_second_job_when_active_present() {
+        let mut value = cronjob(1, "2026-01-01T00:00:00Z");
+        value["metadata"]["name"] = json!("cj-forbid");
+        value["metadata"]["uid"] = json!("u-forbid");
+        value["metadata"]["creationTimestamp"] = json!("2026-01-01T00:00:00Z");
+        value["spec"]["concurrencyPolicy"] = json!("ForbidConcurrent");
+        value["spec"]["jobTemplate"] = json!({
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{"name": "c", "image": "busybox"}],
+                        "restartPolicy": "Never"
+                    }
+                }
+            }
+        });
+        let active_job = json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": "cj-forbid-active",
+                "namespace": "default",
+                "uid": "job-uid-active",
+                "resourceVersion": "1",
+                "ownerReferences": [{
+                    "apiVersion": "batch/v1",
+                    "kind": "CronJob",
+                    "name": "cj-forbid",
+                    "uid": "u-forbid",
+                    "controller": true
+                }]
+            },
+            "spec": {"template": {"spec": {}}},
+            "status": {}
+        });
+        let store = MemoryCronJobStore::with_jobs(value.clone(), [active_job]);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:01:10Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        reconcile_cronjob_one_at(&store, None, &value, 1, now)
+            .await
+            .unwrap();
+
+        assert_eq!(store.jobs.lock().unwrap().len(), 1);
+        assert_eq!(store.created_jobs.load(Ordering::Relaxed), 0);
     }
 }

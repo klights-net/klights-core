@@ -423,14 +423,78 @@ pub fn compute_next_fire(cj: &Value, now: DateTime<Utc>) -> Result<Option<DateTi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use klights_cluster_core::Resource;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct MemorySchedulerRuntime {
+        now: DateTime<Utc>,
+        resources: Vec<Resource>,
+    }
+
+    impl MemorySchedulerRuntime {
+        fn new(resources: impl IntoIterator<Item = Value>) -> Self {
+            Self {
+                now: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:10Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                resources: resources
+                    .into_iter()
+                    .map(|value| Resource::try_from_data(Arc::new(value)).unwrap())
+                    .collect(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CronJobSchedulerRuntime for MemorySchedulerRuntime {
+        fn wall_time(&self) -> DateTime<Utc> {
+            self.now
+        }
+
+        async fn list_cronjobs(
+            &self,
+        ) -> std::result::Result<Vec<Resource>, CronJobSchedulerRuntimeError> {
+            Ok(self.resources.clone())
+        }
+
+        async fn reconcile_cronjob(
+            &self,
+            _resource: &Resource,
+        ) -> std::result::Result<(), CronJobSchedulerRuntimeError> {
+            Ok(())
+        }
+
+        async fn open_watch(&self) -> std::result::Result<CronJobWatchSession, LeaderWatchError> {
+            Ok(CronJobWatchSession {
+                initial_resources: self.resources.clone(),
+                events: WatchStream::unpositioned_test_stream(futures::stream::pending()),
+            })
+        }
+    }
+
+    fn scheduler_with_resources(
+        resources: impl IntoIterator<Item = Value>,
+    ) -> Arc<CronJobScheduler> {
+        CronJobScheduler::new(
+            Arc::new(MemorySchedulerRuntime::new(resources)),
+            Arc::new(klights_supervisor::TaskSupervisor::new(
+                klights_supervisor::TaskCategoryConfig::default(),
+            )),
+        )
+    }
 
     fn cj(uid: &str, schedule: &str) -> Value {
         json!({
             "apiVersion": "batch/v1",
             "kind": "CronJob",
-            "metadata": {"name": uid, "namespace": "default", "uid": uid},
+            "metadata": {
+                "name": uid,
+                "namespace": "default",
+                "uid": uid,
+                "resourceVersion": "1",
+                "creationTimestamp": "2026-01-01T00:00:10Z"
+            },
             "spec": {
                 "schedule": schedule,
                 "jobTemplate": {
@@ -445,6 +509,108 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[tokio::test]
+    async fn arm_and_cancel_track_per_uid_state() {
+        let scheduler = scheduler_with_resources([]);
+        let cronjob = cj("u-arm", "* * * * *");
+        Arc::clone(&scheduler).arm(&cronjob).await;
+        assert!(scheduler.is_armed("u-arm").await);
+        assert_eq!(scheduler.armed_count().await, 1);
+
+        scheduler.cancel("u-arm").await;
+        assert!(!scheduler.is_armed("u-arm").await);
+        assert_eq!(scheduler.armed_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn suspend_true_cancels_timer_suspend_false_rearms() {
+        let scheduler = scheduler_with_resources([]);
+        let mut cronjob = cj("u-susp", "* * * * *");
+        Arc::clone(&scheduler).arm(&cronjob).await;
+        assert!(scheduler.is_armed("u-susp").await);
+
+        cronjob["spec"]["suspend"] = json!(true);
+        Arc::clone(&scheduler).arm(&cronjob).await;
+        assert!(
+            !scheduler.is_armed("u-susp").await,
+            "suspend=true must clear the timer"
+        );
+
+        cronjob["spec"]["suspend"] = json!(false);
+        Arc::clone(&scheduler).arm(&cronjob).await;
+        assert!(
+            scheduler.is_armed("u-susp").await,
+            "suspend=false must re-arm the timer"
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_timestamp_blocks_arm_no_orphan_fire() {
+        let scheduler = scheduler_with_resources([]);
+        let mut cronjob = cj("u-del", "* * * * *");
+        Arc::clone(&scheduler).arm(&cronjob).await;
+        assert!(scheduler.is_armed("u-del").await);
+
+        cronjob["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:20Z");
+        Arc::clone(&scheduler).arm(&cronjob).await;
+        assert!(
+            !scheduler.is_armed("u-del").await,
+            "deletionTimestamp set must clear the timer; no orphan fire after delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_schedule_does_not_arm() {
+        let scheduler = scheduler_with_resources([]);
+        let cronjob = cj("u-inv", "not a cron expression");
+        Arc::clone(&scheduler).arm(&cronjob).await;
+        assert!(!scheduler.is_armed("u-inv").await);
+    }
+
+    #[tokio::test]
+    async fn second_arm_replaces_first() {
+        let scheduler = scheduler_with_resources([]);
+        let cronjob = cj("u-rep", "* * * * *");
+        Arc::clone(&scheduler).arm(&cronjob).await;
+        Arc::clone(&scheduler).arm(&cronjob).await;
+        assert_eq!(
+            scheduler.armed_count().await,
+            1,
+            "second arm() for same UID must displace the first timer, not stack"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_walk_arms_all_existing_cronjobs() {
+        let scheduler =
+            scheduler_with_resources([cj("u-a", "* * * * *"), cj("u-b", "*/5 * * * *")]);
+
+        scheduler.startup_walk().await.unwrap();
+
+        assert!(scheduler.is_armed("u-a").await);
+        assert!(scheduler.is_armed("u-b").await);
+        assert_eq!(scheduler.armed_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn next_fire_advances_after_status_update() {
+        use chrono::Duration;
+
+        let cronjob = cj("u-mono", "* * * * *");
+        let now = Utc::now();
+        let next1 = compute_next_fire(&cronjob, now).unwrap().unwrap();
+
+        let mut after = cronjob;
+        after["status"] = json!({"lastScheduleTime": next1.to_rfc3339()});
+        let next2 = compute_next_fire(&after, now + Duration::seconds(1))
+            .unwrap()
+            .unwrap();
+        assert!(
+            next2 >= next1,
+            "next fire after status update must not move backward; next1={next1:?}, next2={next2:?}"
+        );
     }
 
     struct ReplayExpiryRuntime {

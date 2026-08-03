@@ -83,7 +83,7 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_generator_advances_names_and_uids() {
+    fn deterministic_controller_identity_advances_names_and_uids() {
         let identity = DeterministicControllerIdentityGenerator::default();
 
         assert_eq!(identity.generate_name("pod-"), "pod-00000");
@@ -97,13 +97,16 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_generators_are_independent_and_parallel_hermetic() {
+    fn deterministic_controller_identity_graphs_are_independent() {
         let first = DeterministicControllerIdentityGenerator::default();
         let second = DeterministicControllerIdentityGenerator::default();
         assert_eq!(first.generate_name("pod-"), "pod-00000");
         assert_eq!(first.generate_name("pod-"), "pod-00001");
         assert_eq!(second.generate_name("pod-"), "pod-00000");
+    }
 
+    #[test]
+    fn deterministic_controller_identity_graphs_are_parallel_hermetic() {
         let outputs = (0..4)
             .map(|_| {
                 std::thread::spawn(|| {
@@ -119,7 +122,7 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_generator_has_valid_large_counter_uuid_and_name_shapes() {
+    fn deterministic_controller_identity_remains_valid_at_large_counter_values() {
         let identity = DeterministicControllerIdentityGenerator::with_start(u64::MAX - 1);
         let first = identity.new_uid();
         let second = identity.new_uid();
