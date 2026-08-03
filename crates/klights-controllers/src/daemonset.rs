@@ -1174,3 +1174,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "daemonset/tests.rs"]
+mod policy_tests;

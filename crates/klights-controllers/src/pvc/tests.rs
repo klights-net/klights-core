@@ -1,47 +1,388 @@
-use crate::datastore::DatastoreBackend;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
+use async_trait::async_trait;
+use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 use serde_json::{Value, json};
 
-async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Value> {
-    let file_process = crate::kubelet::file_blocking::test_file_process_executor();
-    let local_path_provisioner_root =
-        crate::paths::test_data_root_path("pvc-controller-tests").join("local-path-provisioner");
-    super::reconcile_pvc(&file_process, &local_path_provisioner_root, db, pvc).await
+use super::PvcStore;
+use crate::common::ControllerStatusStore;
+
+type ResourceKey = (String, String, Option<String>, String);
+
+static NEXT_DATA_ROOT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+struct Datastore {
+    resources: Mutex<BTreeMap<ResourceKey, Resource>>,
+    next_resource_version: AtomicU64,
+    local_path_root: PathBuf,
+}
+
+impl Default for Datastore {
+    fn default() -> Self {
+        let id = NEXT_DATA_ROOT.fetch_add(1, Ordering::Relaxed);
+        Self {
+            resources: Mutex::new(BTreeMap::new()),
+            next_resource_version: AtomicU64::new(0),
+            local_path_root: std::env::temp_dir()
+                .join("klights-controller-tests")
+                .join("pvc")
+                .join(format!("{}-{id}", std::process::id())),
+        }
+    }
+}
+
+impl Drop for Datastore {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.local_path_root)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!(
+                "failed to clean PVC test data root {}: {error}",
+                self.local_path_root.display()
+            );
+        }
+    }
+}
+
+impl Datastore {
+    fn key(api_version: &str, kind: &str, namespace: Option<&str>, name: &str) -> ResourceKey {
+        (
+            api_version.to_string(),
+            kind.to_string(),
+            namespace.map(str::to_string),
+            name.to_string(),
+        )
+    }
+
+    fn next_rv(&self) -> i64 {
+        self.next_resource_version.fetch_add(1, Ordering::Relaxed) as i64 + 1
+    }
+
+    fn normalize_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        mut data: Value,
+        resource_version: i64,
+    ) -> Resource {
+        let object = data
+            .as_object_mut()
+            .expect("test resource must be a JSON object");
+        object.insert("apiVersion".to_string(), json!(api_version));
+        object.insert("kind".to_string(), json!(kind));
+        let metadata = object
+            .entry("metadata".to_string())
+            .or_insert_with(|| json!({}));
+        let metadata = metadata
+            .as_object_mut()
+            .expect("test metadata must be an object");
+        metadata.insert("name".to_string(), json!(name));
+        match namespace {
+            Some(namespace) => {
+                metadata.insert("namespace".to_string(), json!(namespace));
+            }
+            None => {
+                metadata.remove("namespace");
+            }
+        }
+        metadata.insert(
+            "resourceVersion".to_string(),
+            json!(resource_version.to_string()),
+        );
+        let uid = metadata
+            .get("uid")
+            .and_then(Value::as_str)
+            .filter(|uid| !uid.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{resource_version:08x}-0000-4000-8000-000000000000"));
+        metadata.insert("uid".to_string(), json!(&uid));
+        Resource {
+            id: resource_version,
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            namespace: namespace.map(str::to_string),
+            name: name.to_string(),
+            uid,
+            resource_version,
+            data: Arc::new(data),
+        }
+    }
+
+    async fn create_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: Value,
+    ) -> ControllerStoreResult<Resource> {
+        let key = Self::key(api_version, kind, namespace, name);
+        let mut resources = self.resources.lock().expect("PVC test resource lock");
+        if resources.contains_key(&key) {
+            return Err(ControllerStoreError::already_exists(format!(
+                "{kind} {name} already exists"
+            )));
+        }
+        let resource =
+            self.normalize_resource(api_version, kind, namespace, name, data, self.next_rv());
+        resources.insert(key, resource.clone());
+        Ok(resource)
+    }
+
+    async fn get_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
+        Ok(self
+            .resources
+            .lock()
+            .expect("PVC test resource lock")
+            .get(&Self::key(api_version, kind, namespace, name))
+            .cloned())
+    }
+
+    async fn delete_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> ControllerStoreResult<()> {
+        self.resources
+            .lock()
+            .expect("PVC test resource lock")
+            .remove(&Self::key(api_version, kind, namespace, name));
+        Ok(())
+    }
+
+    fn update_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: Value,
+        preconditions: ResourcePreconditions,
+    ) -> ControllerStoreResult<Resource> {
+        let key = Self::key(api_version, kind, namespace, name);
+        let mut resources = self.resources.lock().expect("PVC test resource lock");
+        let current = resources
+            .get(&key)
+            .ok_or_else(|| ControllerStoreError::not_found(format!("{kind} {name}")))?;
+        if preconditions
+            .uid
+            .as_deref()
+            .is_some_and(|uid| uid != current.uid)
+            || preconditions
+                .resource_version
+                .is_some_and(|rv| rv != current.resource_version)
+        {
+            return Err(ControllerStoreError::conflict(format!(
+                "stale {kind} {name}"
+            )));
+        }
+        let updated =
+            self.normalize_resource(api_version, kind, namespace, name, data, self.next_rv());
+        resources.insert(key, updated.clone());
+        Ok(updated)
+    }
+
+    async fn update_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: Value,
+        expected_resource_version: i64,
+    ) -> ControllerStoreResult<Resource> {
+        self.update_with_preconditions(
+            api_version,
+            kind,
+            namespace,
+            name,
+            data,
+            ResourcePreconditions::resource_version(expected_resource_version),
+        )
+    }
+
+    async fn update_status_only(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        status: Value,
+        expected_resource_version: Option<i64>,
+    ) -> ControllerStoreResult<Resource> {
+        self.update_status(
+            api_version,
+            kind,
+            namespace,
+            name,
+            status,
+            ResourcePreconditions {
+                uid: None,
+                resource_version: expected_resource_version,
+            },
+        )
+        .await
+    }
+
+    fn resources_of_kind(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+    ) -> Vec<Resource> {
+        self.resources
+            .lock()
+            .expect("PVC test resource lock")
+            .values()
+            .filter(|resource| {
+                resource.api_version == api_version
+                    && resource.kind == kind
+                    && namespace
+                        .is_none_or(|expected| resource.namespace.as_deref() == Some(expected))
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn file_process_executor(&self) -> klights_supervisor::FileProcessExecutor {
+        klights_supervisor::FileProcessExecutor::new(Arc::new(
+            klights_supervisor::TaskSupervisor::new(
+                klights_supervisor::TaskCategoryConfig::default(),
+            ),
+        ))
+    }
+
+    fn local_path_root(&self) -> &Path {
+        &self.local_path_root
+    }
+}
+
+#[async_trait]
+impl ControllerStatusStore for Datastore {
+    async fn get_status_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
+        self.get_resource(api_version, kind, namespace, name).await
+    }
+
+    async fn update_status(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        status: Value,
+        preconditions: ResourcePreconditions,
+    ) -> ControllerStoreResult<Resource> {
+        let current = self
+            .get_resource(api_version, kind, namespace, name)
+            .await?
+            .ok_or_else(|| ControllerStoreError::not_found(format!("{kind} {name}")))?;
+        let mut data = (*current.data).clone();
+        data["status"] = status;
+        self.update_with_preconditions(api_version, kind, namespace, name, data, preconditions)
+    }
+
+    fn log_noop_status_write(
+        &self,
+        _operation: &'static str,
+        _resource: &Resource,
+        _reason: &'static str,
+    ) {
+    }
+}
+
+#[async_trait]
+impl PvcStore for Datastore {
+    async fn get_pvc(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
+        self.get_resource("v1", "PersistentVolumeClaim", Some(namespace), name)
+            .await
+    }
+
+    async fn list_persistent_volumes(&self) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(self.resources_of_kind("v1", "PersistentVolume", None))
+    }
+
+    async fn get_persistent_volume(&self, name: &str) -> ControllerStoreResult<Option<Resource>> {
+        self.get_resource("v1", "PersistentVolume", None, name)
+            .await
+    }
+
+    async fn create_persistent_volume(
+        &self,
+        name: &str,
+        value: Value,
+    ) -> ControllerStoreResult<Resource> {
+        self.create_resource("v1", "PersistentVolume", None, name, value)
+            .await
+    }
+
+    async fn update_persistent_volume(
+        &self,
+        name: &str,
+        value: Value,
+        preconditions: ResourcePreconditions,
+    ) -> ControllerStoreResult<Resource> {
+        self.update_with_preconditions("v1", "PersistentVolume", None, name, value, preconditions)
+    }
+}
+
+async fn reconcile_pvc(db: &Datastore, pvc: &Value) -> Result<Value> {
+    super::reconcile_pvc(&db.file_process_executor(), db.local_path_root(), db, pvc).await
 }
 
 /// Helper to fetch latest PVC from DB with resourceVersion injected
-async fn get_pvc(db: &dyn DatastoreBackend, namespace: &str, name: &str) -> Value {
+async fn get_pvc(db: &Datastore, namespace: &str, name: &str) -> Value {
     let resource = db
         .get_resource("v1", "PersistentVolumeClaim", Some(namespace), name)
         .await
         .unwrap()
         .unwrap();
 
-    let pvc: Value = crate::controller_test_support::inject_resource_version(
-        resource.data,
-        resource.resource_version,
-    );
+    let pvc: Value =
+        crate::ports::inject_resource_version(resource.data, resource.resource_version);
     pvc
 }
 
 /// Helper to fetch latest PV from DB with resourceVersion injected
-async fn get_pv(db: &dyn DatastoreBackend, name: &str) -> Value {
+async fn get_pv(db: &Datastore, name: &str) -> Value {
     let resource = db
         .get_resource("v1", "PersistentVolume", None, name)
         .await
         .unwrap()
         .unwrap();
 
-    let pv: Value = crate::controller_test_support::inject_resource_version(
-        resource.data,
-        resource.resource_version,
-    );
+    let pv: Value = crate::ports::inject_resource_version(resource.data, resource.resource_version);
     pv
 }
 
 #[tokio::test]
 async fn test_pvc_stale_snapshot_after_delete_does_not_bind_pv() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     let pv = json!({
         "apiVersion": "v1",
@@ -78,10 +419,8 @@ async fn test_pvc_stale_snapshot_after_delete_does_not_bind_pv() {
         )
         .await
         .unwrap();
-    let stale_snapshot = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let stale_snapshot =
+        crate::ports::inject_resource_version(created.data, created.resource_version);
 
     db.delete_resource("v1", "PersistentVolumeClaim", Some("default"), "stale-pvc")
         .await
@@ -103,7 +442,7 @@ async fn test_pvc_stale_snapshot_after_delete_does_not_bind_pv() {
 
 #[tokio::test]
 async fn test_pvc_binds_to_matching_pv() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     // Create a PersistentVolume
     let pv = json!({
@@ -197,7 +536,7 @@ async fn test_pvc_binds_to_matching_pv() {
 
 #[tokio::test]
 async fn test_pvc_long_exponent_quantity_selects_exact_smallest_sufficient_pv() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
     let one_long = format!("0.{}1e5000", "0".repeat(4999));
 
     for (name, capacity) in [
@@ -262,7 +601,7 @@ async fn test_pvc_long_exponent_quantity_selects_exact_smallest_sufficient_pv() 
 
 #[tokio::test]
 async fn test_pvc_bind_preserves_status_conditions() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     let pv = json!({
         "apiVersion": "v1",
@@ -329,7 +668,7 @@ async fn test_pvc_bind_preserves_status_conditions() {
 
 #[tokio::test]
 async fn test_pvc_status_writer_rejects_stale_snapshot_after_status_patch() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     let created = db
         .create_resource(
@@ -374,7 +713,7 @@ async fn test_pvc_status_writer_rejects_stale_snapshot_after_status_patch() {
     .await
     .expect("user status patch should win the race first");
 
-    let stale_write = klights_controllers::common::write_status_for_resource(
+    let stale_write = crate::common::write_status_for_resource(
         &db,
         &created,
         &json!({
@@ -387,7 +726,8 @@ async fn test_pvc_status_writer_rejects_stale_snapshot_after_status_patch() {
     .await;
     let err = stale_write.expect_err("stale PVC controller status write must not rebase");
     assert!(
-        klights_cluster_datastore::errors::is_conflict_error(&err),
+        err.downcast_ref::<ControllerStoreError>()
+            .is_some_and(ControllerStoreError::is_conflict),
         "expected stale PVC status write conflict, got {err:#}"
     );
 
@@ -402,7 +742,7 @@ async fn test_pvc_status_writer_rejects_stale_snapshot_after_status_patch() {
 
 #[tokio::test]
 async fn test_pv_bind_preserves_status_reason_and_message() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     let pv = json!({
         "apiVersion": "v1",
@@ -461,7 +801,7 @@ async fn test_pv_bind_preserves_status_reason_and_message() {
 
 #[tokio::test]
 async fn test_pvc_status_pending_when_no_matching_pv() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     // Create a PVC without any matching PV
     let pvc = json!({
@@ -502,7 +842,7 @@ async fn test_pvc_status_pending_when_no_matching_pv() {
 
 #[tokio::test]
 async fn test_pvc_pending_reconcile_is_idempotent() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     let pvc = json!({
         "apiVersion": "v1",
@@ -566,7 +906,7 @@ async fn test_pvc_pending_reconcile_is_idempotent() {
 
 #[tokio::test]
 async fn test_pvc_already_bound_no_change() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     // Create a PVC that's already bound
     let pvc = json!({
@@ -611,7 +951,7 @@ async fn test_pvc_already_bound_no_change() {
 
 #[tokio::test]
 async fn test_pvc_access_modes_must_match() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     // Create a PV with ReadWriteMany
     let pv = json!({
@@ -688,7 +1028,7 @@ async fn test_pod_can_mount_bound_pvc() {
     // 4. Create Pod with PVC volume
     // 5. Verify Pod can reference the PVC
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     // Create a PV
     let pv = json!({
@@ -789,7 +1129,7 @@ async fn test_pod_can_mount_bound_pvc() {
 
 #[tokio::test]
 async fn test_provision_pv_for_local_path_pvc() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     // Create a PVC with storageClassName "local-path"
     let pvc = json!({
@@ -849,7 +1189,7 @@ async fn test_provision_pv_for_local_path_pvc() {
 
 #[tokio::test]
 async fn test_provision_pv_binds_to_pvc() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     // Create a PVC with storageClassName "local-path"
     let pvc = json!({
@@ -918,7 +1258,7 @@ async fn test_provision_pv_binds_to_pvc() {
 
 #[tokio::test]
 async fn test_no_provision_for_unknown_storage_class() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     // Create a PVC with unknown storageClassName
     let pvc = json!({
@@ -959,21 +1299,13 @@ async fn test_no_provision_for_unknown_storage_class() {
     assert!(pvc["status"]["volumeName"].is_null());
 
     // Verify no PV was created
-    let pvs = db
-        .list_resources(
-            "v1",
-            "PersistentVolume",
-            None,
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(pvs.items.len(), 0);
+    let pvs = db.resources_of_kind("v1", "PersistentVolume", None);
+    assert_eq!(pvs.len(), 0);
 }
 
 #[tokio::test]
 async fn test_no_provision_when_matching_pv_exists() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     // Create a PV first
     let pv = json!({
@@ -1041,23 +1373,15 @@ async fn test_no_provision_when_matching_pv_exists() {
     assert_eq!(pvc["status"]["volumeName"], "existing-pv");
 
     // Verify only one PV exists (no new PV created)
-    let pvs = db
-        .list_resources(
-            "v1",
-            "PersistentVolume",
-            None,
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(pvs.items.len(), 1);
-    assert_eq!(pvs.items[0].name, "existing-pv");
+    let pvs = db.resources_of_kind("v1", "PersistentVolume", None);
+    assert_eq!(pvs.len(), 1);
+    assert_eq!(pvs[0].name, "existing-pv");
 }
 
 #[tokio::test]
 async fn test_pvc_binds_to_pv_without_status() {
     // PV with no status field should be treated as Available
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     let pv = json!({
         "apiVersion": "v1",
@@ -1106,7 +1430,7 @@ async fn test_pvc_binds_to_pv_without_status() {
 #[tokio::test]
 async fn test_pvc_capacity_mismatch_no_bind() {
     // PV with 1023Mi should NOT bind to PVC requesting 1Gi (one unit below)
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     let pv = json!({
         "apiVersion": "v1",
@@ -1154,7 +1478,7 @@ async fn test_pvc_capacity_mismatch_no_bind() {
 
 #[tokio::test]
 async fn test_pvc_binds_when_pv_capacity_exceeds_storage_request() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     let pv = json!({
         "apiVersion": "v1",
@@ -1202,7 +1526,7 @@ async fn test_pvc_binds_when_pv_capacity_exceeds_storage_request() {
 
 #[tokio::test]
 async fn test_pvc_binds_when_request_equals_larger_pv_units() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     let pv = json!({
         "apiVersion": "v1",
@@ -1250,7 +1574,7 @@ async fn test_pvc_binds_when_request_equals_larger_pv_units() {
 
 #[tokio::test]
 async fn test_pvc_does_not_bind_when_decimal_and_binary_units_do_not_match_semantics() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     let pv = json!({
         "apiVersion": "v1",
@@ -1297,7 +1621,7 @@ async fn test_pvc_does_not_bind_when_decimal_and_binary_units_do_not_match_seman
 
 #[tokio::test]
 async fn test_pvc_binding_requires_matching_storage_class_and_volume_mode_and_selector() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     let pv = json!({
         "apiVersion": "v1",
@@ -1379,7 +1703,7 @@ async fn test_pvc_binding_requires_matching_storage_class_and_volume_mode_and_se
 
 #[tokio::test]
 async fn test_pvc_binding_is_deterministic_by_pv_name() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     let pv_z = json!({
         "apiVersion": "v1",
@@ -1442,7 +1766,7 @@ async fn test_pvc_binding_is_deterministic_by_pv_name() {
 
 #[tokio::test]
 async fn test_pvc_binding_empty_storage_class_matches_omitted_pv_class() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     let pv = json!({
         "apiVersion": "v1",
@@ -1489,7 +1813,7 @@ async fn test_pvc_binding_empty_storage_class_matches_omitted_pv_class() {
 
 #[tokio::test]
 async fn test_pvc_binding_prefers_smallest_sufficient_pv_then_name() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     for (name, storage) in [
         ("a-oversized", "100Gi"),
@@ -1541,7 +1865,7 @@ async fn test_pvc_binding_prefers_smallest_sufficient_pv_then_name() {
 
 #[tokio::test]
 async fn test_pvc_binding_skips_invalid_pv_capacity_candidate() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     for (name, storage) in [("bad-pv", "not-a-quantity"), ("good-pv", "1Gi")] {
         let pv = json!({
@@ -1589,7 +1913,7 @@ async fn test_pvc_binding_skips_invalid_pv_capacity_candidate() {
 
 #[tokio::test]
 async fn test_pvc_binding_preserves_fractional_binary_quantity_ordering() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     let pv = json!({
         "apiVersion": "v1",
@@ -1636,7 +1960,7 @@ async fn test_pvc_binding_preserves_fractional_binary_quantity_ordering() {
 #[tokio::test]
 async fn test_pvc_subset_access_modes_bind() {
     // PVC requesting ReadWriteOnce should bind to PV with [ReadWriteOnce, ReadOnlyMany]
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     let pv = json!({
         "apiVersion": "v1",
@@ -1685,7 +2009,7 @@ async fn test_pvc_subset_access_modes_bind() {
 
 #[tokio::test]
 async fn test_provision_pv_without_uid_uses_namespace_name() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     // PVC without UID — should use fallback pv name: pvc-{ns}-{name}
     let pvc = json!({
@@ -1733,7 +2057,7 @@ async fn test_provision_pv_without_uid_uses_namespace_name() {
 #[tokio::test]
 async fn test_pvc_skips_bound_pv() {
     // PV already Bound should be skipped during matching
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
 
     let pv = json!({
         "apiVersion": "v1",

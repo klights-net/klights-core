@@ -502,3 +502,7 @@ pub async fn reconcile_pvc<S: PvcStore + ?Sized>(
     let pvc_status = status_with_updates(&pvc, [("phase", json!("Pending"))]);
     write_pvc_status(store, &live_pvc, pvc_status).await
 }
+
+#[cfg(test)]
+#[path = "pvc/tests.rs"]
+mod tests;

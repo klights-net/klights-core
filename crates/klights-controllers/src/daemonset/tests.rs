@@ -1,6 +1,574 @@
-use crate::datastore::Resource;
-use crate::datastore::sqlite::Datastore;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_pod_api::{
+    PodGetRequest, PodListRequest, PodListResult, PodOwnerListRequest, PodQuery,
+    PodRepositoryFuture,
+};
+use klights_reconcile_api::{
+    ControllerStoreError, ControllerStoreResult, GcNonPodFinalizationFuture,
+    GcNonPodFinalizationOutcome, GcNonPodFinalizationPort, GcNonPodFinalizationRequest,
+    GcPodDeleteError, GcPodDeleteFuture, GcPodDeleteRequest, GcPodDeleteSink,
+};
 use serde_json::{Value, json};
+
+use super::{DaemonSetPodMutation, DaemonSetStore};
+use crate::gc::GcResourceStore as _;
+
+type ResourceKey = (String, String, Option<String>, String);
+
+#[derive(Debug, Default)]
+struct Datastore {
+    resources: Mutex<BTreeMap<ResourceKey, Resource>>,
+    next_resource_version: AtomicU64,
+}
+
+#[derive(Debug)]
+struct ResourceList {
+    items: Vec<Resource>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResourceListQuery;
+
+impl ResourceListQuery {
+    const fn all() -> Self {
+        Self
+    }
+
+    const fn new(
+        _label_selector: Option<&str>,
+        _field_selector: Option<&str>,
+        _limit: Option<i64>,
+        _continue_token: Option<&str>,
+    ) -> Self {
+        Self
+    }
+}
+
+impl Datastore {
+    fn key(api_version: &str, kind: &str, namespace: Option<&str>, name: &str) -> ResourceKey {
+        (
+            api_version.to_string(),
+            kind.to_string(),
+            namespace.map(str::to_string),
+            name.to_string(),
+        )
+    }
+
+    fn next_rv(&self) -> i64 {
+        self.next_resource_version.fetch_add(1, Ordering::Relaxed) as i64 + 1
+    }
+
+    fn normalize_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        mut data: Value,
+        resource_version: i64,
+    ) -> Resource {
+        let object = data
+            .as_object_mut()
+            .expect("test resource must be a JSON object");
+        object.insert("apiVersion".to_string(), json!(api_version));
+        object.insert("kind".to_string(), json!(kind));
+        let metadata = object
+            .entry("metadata".to_string())
+            .or_insert_with(|| json!({}));
+        let metadata = metadata
+            .as_object_mut()
+            .expect("test metadata must be an object");
+        metadata.insert("name".to_string(), json!(name));
+        match namespace {
+            Some(namespace) => {
+                metadata.insert("namespace".to_string(), json!(namespace));
+            }
+            None => {
+                metadata.remove("namespace");
+            }
+        }
+        let uid = metadata
+            .get("uid")
+            .and_then(Value::as_str)
+            .filter(|uid| !uid.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("test-uid-{resource_version}"));
+        metadata.insert("uid".to_string(), json!(&uid));
+        metadata.insert(
+            "resourceVersion".to_string(),
+            json!(resource_version.to_string()),
+        );
+        Resource {
+            id: resource_version,
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            namespace: namespace.map(str::to_string),
+            name: name.to_string(),
+            uid,
+            resource_version,
+            data: Arc::new(data),
+        }
+    }
+
+    async fn create_namespace(&self, name: &str, data: Value) -> ControllerStoreResult<Resource> {
+        self.create_resource("v1", "Namespace", None, name, data)
+            .await
+    }
+
+    async fn create_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: Value,
+    ) -> ControllerStoreResult<Resource> {
+        let key = Self::key(api_version, kind, namespace, name);
+        let mut resources = self.resources.lock().expect("test resource lock");
+        if resources.contains_key(&key) {
+            return Err(ControllerStoreError::already_exists(format!(
+                "{kind} {name} already exists"
+            )));
+        }
+        let resource =
+            self.normalize_resource(api_version, kind, namespace, name, data, self.next_rv());
+        resources.insert(key, resource.clone());
+        Ok(resource)
+    }
+
+    async fn list_resources(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        _query: ResourceListQuery,
+    ) -> ControllerStoreResult<ResourceList> {
+        let mut items = self
+            .resources
+            .lock()
+            .expect("test resource lock")
+            .values()
+            .filter(|resource| {
+                resource.api_version == api_version
+                    && resource.kind == kind
+                    && namespace
+                        .is_none_or(|expected| resource.namespace.as_deref() == Some(expected))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(ResourceList { items })
+    }
+
+    async fn update_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: Value,
+        expected_resource_version: i64,
+    ) -> ControllerStoreResult<Resource> {
+        self.update_with_preconditions(
+            api_version,
+            kind,
+            namespace,
+            name,
+            data,
+            ResourcePreconditions::resource_version(expected_resource_version),
+        )
+    }
+
+    fn update_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: Value,
+        preconditions: ResourcePreconditions,
+    ) -> ControllerStoreResult<Resource> {
+        let key = Self::key(api_version, kind, namespace, name);
+        let mut resources = self.resources.lock().expect("test resource lock");
+        let current = resources
+            .get(&key)
+            .ok_or_else(|| ControllerStoreError::not_found(format!("{kind} {name}")))?;
+        if preconditions
+            .uid
+            .as_deref()
+            .is_some_and(|uid| uid != current.uid)
+            || preconditions
+                .resource_version
+                .is_some_and(|rv| rv != current.resource_version)
+        {
+            return Err(ControllerStoreError::conflict(format!(
+                "stale {kind} {name}"
+            )));
+        }
+        let updated =
+            self.normalize_resource(api_version, kind, namespace, name, data, self.next_rv());
+        resources.insert(key, updated.clone());
+        Ok(updated)
+    }
+
+    async fn delete_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> ControllerStoreResult<()> {
+        self.resources
+            .lock()
+            .expect("test resource lock")
+            .remove(&Self::key(api_version, kind, namespace, name));
+        Ok(())
+    }
+
+    fn get(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Option<Resource> {
+        self.resources
+            .lock()
+            .expect("test resource lock")
+            .get(&Self::key(api_version, kind, namespace, name))
+            .cloned()
+    }
+
+    fn resources_of_kind(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+    ) -> Vec<Resource> {
+        self.resources
+            .lock()
+            .expect("test resource lock")
+            .values()
+            .filter(|resource| {
+                resource.api_version == api_version
+                    && resource.kind == kind
+                    && namespace
+                        .is_none_or(|expected| resource.namespace.as_deref() == Some(expected))
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+#[async_trait]
+impl crate::gc::GcResourceStore for Datastore {
+    async fn list_custom_resource_definitions(&self) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
+        Ok(self.get(api_version, kind, namespace, name))
+    }
+
+    async fn update_resource_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: Value,
+        preconditions: ResourcePreconditions,
+    ) -> ControllerStoreResult<Resource> {
+        self.update_with_preconditions(api_version, kind, namespace, name, data, preconditions)
+    }
+
+    async fn update_main_resource_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: Value,
+        preconditions: ResourcePreconditions,
+    ) -> ControllerStoreResult<Resource> {
+        self.update_with_preconditions(api_version, kind, namespace, name, data, preconditions)
+    }
+
+    async fn find_owned_resources(
+        &self,
+        owner_uid: &str,
+        namespace: Option<&str>,
+    ) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(self
+            .resources
+            .lock()
+            .expect("test resource lock")
+            .values()
+            .filter(|resource| {
+                namespace.is_none_or(|expected| resource.namespace.as_deref() == Some(expected))
+                    && resource
+                        .data
+                        .pointer("/metadata/ownerReferences")
+                        .and_then(Value::as_array)
+                        .is_some_and(|owners| {
+                            owners.iter().any(|owner| {
+                                owner.get("uid").and_then(Value::as_str) == Some(owner_uid)
+                            })
+                        })
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn find_owned_by_name_kind_empty_uid(
+        &self,
+        owner_api_version: &str,
+        owner_name: &str,
+        owner_kind: &str,
+        namespace: Option<&str>,
+    ) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(self
+            .resources
+            .lock()
+            .expect("test resource lock")
+            .values()
+            .filter(|resource| {
+                namespace.is_none_or(|expected| resource.namespace.as_deref() == Some(expected))
+                    && resource
+                        .data
+                        .pointer("/metadata/ownerReferences")
+                        .and_then(Value::as_array)
+                        .is_some_and(|owners| {
+                            owners.iter().any(|owner| {
+                                owner.get("apiVersion").and_then(Value::as_str)
+                                    == Some(owner_api_version)
+                                    && owner.get("kind").and_then(Value::as_str) == Some(owner_kind)
+                                    && owner.get("name").and_then(Value::as_str) == Some(owner_name)
+                                    && owner
+                                        .get("uid")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .is_empty()
+                            })
+                        })
+            })
+            .cloned()
+            .collect())
+    }
+}
+
+#[async_trait]
+impl DaemonSetStore for Datastore {
+    async fn list_controller_revisions(
+        &self,
+        namespace: &str,
+    ) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(self.resources_of_kind("apps/v1", "ControllerRevision", Some(namespace)))
+    }
+
+    async fn create_controller_revision(
+        &self,
+        namespace: &str,
+        name: &str,
+        revision: Value,
+    ) -> ControllerStoreResult<Resource> {
+        self.create_resource(
+            "apps/v1",
+            "ControllerRevision",
+            Some(namespace),
+            name,
+            revision,
+        )
+        .await
+    }
+
+    async fn list_nodes(&self) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(self.resources_of_kind("v1", "Node", None))
+    }
+
+    async fn update_daemonset_status(
+        &self,
+        resource: &Resource,
+        status: Value,
+    ) -> ControllerStoreResult<()> {
+        let current = self
+            .get(
+                "apps/v1",
+                "DaemonSet",
+                resource.namespace.as_deref(),
+                &resource.name,
+            )
+            .ok_or_else(|| ControllerStoreError::not_found("DaemonSet missing"))?;
+        if current.uid != resource.uid || current.resource_version != resource.resource_version {
+            return Err(ControllerStoreError::conflict("stale DaemonSet status"));
+        }
+        let mut data = (*current.data).clone();
+        data["status"] = status;
+        self.update_with_preconditions(
+            "apps/v1",
+            "DaemonSet",
+            resource.namespace.as_deref(),
+            &resource.name,
+            data,
+            ResourcePreconditions::from_resource(resource),
+        )?;
+        Ok(())
+    }
+}
+
+impl PodQuery for Datastore {
+    fn get_pod(&self, request: PodGetRequest) -> PodRepositoryFuture<'_, Option<Resource>> {
+        Box::pin(async move {
+            let pod = self.get("v1", "Pod", Some(request.namespace()), request.name());
+            Ok(pod.filter(|pod| request.uid().is_none_or(|uid| pod.uid == uid)))
+        })
+    }
+
+    fn list_pods(&self, request: PodListRequest) -> PodRepositoryFuture<'_, PodListResult> {
+        Box::pin(async move {
+            let pods = self.resources_of_kind("v1", "Pod", request.namespace());
+            PodListResult::try_new(
+                pods,
+                self.next_resource_version.load(Ordering::Relaxed) as i64,
+                None,
+                None,
+            )
+        })
+    }
+
+    fn list_pods_by_owner_uid(
+        &self,
+        request: PodOwnerListRequest,
+    ) -> PodRepositoryFuture<'_, Vec<Resource>> {
+        Box::pin(async move {
+            Ok(self
+                .resources_of_kind("v1", "Pod", Some(request.namespace()))
+                .into_iter()
+                .filter(|pod| {
+                    pod.data
+                        .pointer("/metadata/ownerReferences")
+                        .and_then(Value::as_array)
+                        .is_some_and(|owners| {
+                            owners.iter().any(|owner| {
+                                owner.get("uid").and_then(Value::as_str)
+                                    == Some(request.owner_uid())
+                            })
+                        })
+                })
+                .collect())
+        })
+    }
+}
+
+#[async_trait]
+impl DaemonSetPodMutation for Datastore {
+    async fn create_daemonset_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        _node_name: &str,
+        pod: Value,
+    ) -> ControllerStoreResult<Resource> {
+        let quota_blocks_pods = self
+            .resources_of_kind("v1", "ResourceQuota", Some(namespace))
+            .iter()
+            .any(|quota| {
+                quota
+                    .data
+                    .pointer("/spec/hard/pods")
+                    .and_then(Value::as_str)
+                    == Some("0")
+            });
+        if quota_blocks_pods {
+            return Err(ControllerStoreError::unavailable(
+                "Pod creation denied by ResourceQuota",
+            ));
+        }
+        self.create_resource("v1", "Pod", Some(namespace), name, pod)
+            .await
+    }
+}
+
+impl GcPodDeleteSink for Datastore {
+    fn request_gc_pod_delete(&self, request: GcPodDeleteRequest) -> GcPodDeleteFuture<'_> {
+        Box::pin(async move {
+            let identity = request.identity();
+            let Some(current) = self.get("v1", "Pod", Some(&identity.namespace), &identity.name)
+            else {
+                return Err(GcPodDeleteError::not_found("Pod missing"));
+            };
+            if current.uid != identity.uid {
+                return Err(GcPodDeleteError::identity_changed("Pod UID changed"));
+            }
+            let mut data = (*current.data).clone();
+            data["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+            self.update_with_preconditions(
+                "v1",
+                "Pod",
+                Some(&identity.namespace),
+                &identity.name,
+                data,
+                ResourcePreconditions::from_resource(&current),
+            )
+            .map_err(|error| GcPodDeleteError::unavailable(error.to_string()))?;
+            Ok(())
+        })
+    }
+}
+
+impl GcNonPodFinalizationPort for Datastore {
+    fn finalize_non_pod(
+        &self,
+        _request: GcNonPodFinalizationRequest,
+    ) -> GcNonPodFinalizationFuture<'_> {
+        Box::pin(async { Ok(GcNonPodFinalizationOutcome::Gone) })
+    }
+}
+
+#[derive(Debug)]
+struct ScriptedControllerIdentityGenerator {
+    uids: Vec<String>,
+    next: AtomicUsize,
+}
+
+impl ScriptedControllerIdentityGenerator {
+    fn with_uids(uids: impl IntoIterator<Item = &'static str>) -> Self {
+        Self {
+            uids: uids.into_iter().map(str::to_string).collect(),
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    fn uid_calls(&self) -> usize {
+        self.next.load(Ordering::Relaxed)
+    }
+}
+
+impl crate::ControllerIdentityGenerator for ScriptedControllerIdentityGenerator {
+    fn generate_name(&self, prefix: &str) -> String {
+        format!("{prefix}00000")
+    }
+
+    fn new_uid(&self) -> String {
+        let index = self.next.fetch_add(1, Ordering::Relaxed);
+        self.uids[index].clone()
+    }
+}
+
+fn deterministic_controller_identity() -> Arc<dyn crate::ControllerIdentityGenerator> {
+    Arc::new(crate::identity::DeterministicControllerIdentityGenerator::default())
+}
 
 fn active_pods(items: &[Resource]) -> Vec<&Resource> {
     items
@@ -13,25 +581,23 @@ fn active_pods(items: &[Resource]) -> Vec<&Resource> {
 /// before the Task 18 migration. Builds a `PodRepository` over the supplied
 /// in-memory `Datastore`.
 async fn reconcile_daemonset_test(db: &Datastore, daemonset: &Value) -> anyhow::Result<()> {
-    let identity = crate::controller_test_support::deterministic_controller_identity();
+    let identity = deterministic_controller_identity();
     reconcile_daemonset_test_with_identity(db, daemonset, identity.as_ref()).await
 }
 
 async fn reconcile_daemonset_test_with_identity(
     db: &Datastore,
     daemonset: &Value,
-    identity: &dyn klights_controllers::ControllerIdentityGenerator,
+    identity: &dyn crate::ControllerIdentityGenerator,
 ) -> anyhow::Result<()> {
-    let repo = crate::controller_test_support::pod_repository_for_test(db);
-    let store = crate::controller_test_support::controller_store_for_test(db);
     super::reconcile_daemonset(
-        &store,
-        repo.as_ref(),
-        repo.as_ref(),
+        db,
+        db,
+        db,
         identity,
-        repo.as_ref(),
-        crate::controller_test_support::non_pod_finalization_port_for_test(),
-        &klights_controllers::ControllerCoordination::new(),
+        db,
+        db,
+        &crate::ControllerCoordination::new(),
         daemonset,
         chrono::Utc::now(),
     )
@@ -51,23 +617,17 @@ async fn daemonset_consumes_one_uid_per_pod_and_preserves_five_hex_name_derivati
         )
         .await
         .unwrap();
-    let identity =
-        crate::controller_test_support::ScriptedControllerIdentityGenerator::with_uids([
-            "abcde111-0000-4000-8000-000000000000",
-            "f0123222-0000-4000-8000-000000000000",
-        ]);
+    let identity = ScriptedControllerIdentityGenerator::with_uids([
+        "abcde111-0000-4000-8000-000000000000",
+        "f0123222-0000-4000-8000-000000000000",
+    ]);
 
     reconcile_daemonset_test_with_identity(&db, &created.data, &identity)
         .await
         .unwrap();
 
     let pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     let mut names = pods
@@ -81,7 +641,7 @@ async fn daemonset_consumes_one_uid_per_pod_and_preserves_five_hex_name_derivati
 }
 
 async fn setup_db_with_node(node_name: &str) -> Datastore {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
     db.create_resource(
         "v1",
         "Namespace",
@@ -104,7 +664,7 @@ async fn setup_db_with_node(node_name: &str) -> Datastore {
 }
 
 async fn setup_db_with_nodes(node_names: &[&str]) -> Datastore {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
         .unwrap();
@@ -154,12 +714,7 @@ fn daemonset_revision_status(db_ds: &Value) -> (String, String) {
 
 async fn mark_all_daemonset_pods_ready(db: &Datastore, namespace: &str) {
     let pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some(namespace), ResourceListQuery::all())
         .await
         .unwrap();
     for pod in pods.items {
@@ -205,12 +760,7 @@ async fn test_daemonset_stale_snapshot_after_delete_does_not_recreate_pods() {
         .unwrap();
 
     let pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     assert!(
@@ -223,7 +773,7 @@ async fn test_daemonset_stale_snapshot_after_delete_does_not_recreate_pods() {
             "apps/v1",
             "ControllerRevision",
             Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
+            ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -257,12 +807,7 @@ async fn test_daemonset_creates_one_pod_per_node() {
     reconcile_daemonset_test(&db, &ds_with_rv).await.unwrap();
 
     let pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     assert_eq!(
@@ -327,12 +872,7 @@ async fn test_daemonset_idempotent_no_duplicate_pods() {
     reconcile_daemonset_test(&db, &ds_with_rv2).await.unwrap();
 
     let pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     assert_eq!(
@@ -355,12 +895,7 @@ async fn test_daemonset_prunes_duplicate_active_pods_per_node() {
     reconcile_daemonset_test(&db, &created.data).await.unwrap();
 
     let pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     assert_eq!(pods.items.len(), 2);
@@ -419,12 +954,7 @@ async fn test_daemonset_prunes_duplicate_active_pods_per_node() {
     reconcile_daemonset_test(&db, &current.data).await.unwrap();
 
     let pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     let active = active_pods(&pods.items);
@@ -470,12 +1000,7 @@ async fn test_daemonset_creates_controller_revision_for_template() {
             "apps/v1",
             "ControllerRevision",
             Some("test-ns"),
-            crate::datastore::ResourceListQuery::new(
-                Some("daemonset-name=revision-ds"),
-                None,
-                None,
-                None,
-            ),
+            ResourceListQuery::new(Some("daemonset-name=revision-ds"), None, None, None),
         )
         .await
         .unwrap();
@@ -511,8 +1036,7 @@ async fn test_daemonset_creates_controller_revision_for_template() {
 #[tokio::test]
 async fn test_daemonset_rollback_reuses_revision_and_preserves_matching_pod() {
     let db = setup_db_with_nodes(&["node-1", "node-2"]).await;
-    let identity_graph = crate::controller_test_support::ControllerIdentityTestGraph::default();
-    let identity = identity_graph.identity();
+    let identity = deterministic_controller_identity();
 
     let ds_v1 = json!({
         "apiVersion": "apps/v1",
@@ -589,12 +1113,7 @@ async fn test_daemonset_rollback_reuses_revision_and_preserves_matching_pod() {
     assert_ne!(v2_update_revision, v1_update_revision);
 
     let pods_during_rollout = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     let preserved_v1_pod = pods_during_rollout
@@ -635,12 +1154,7 @@ async fn test_daemonset_rollback_reuses_revision_and_preserves_matching_pod() {
         .unwrap();
 
     let pods_after_rollback = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     assert!(
@@ -666,12 +1180,7 @@ async fn test_daemonset_rollback_reuses_revision_and_preserves_matching_pod() {
             "apps/v1",
             "ControllerRevision",
             Some("test-ns"),
-            crate::datastore::ResourceListQuery::new(
-                Some("daemonset-name=rollback-ds"),
-                None,
-                None,
-                None,
-            ),
+            ResourceListQuery::new(Some("daemonset-name=rollback-ds"), None, None, None),
         )
         .await
         .unwrap();
@@ -743,12 +1252,7 @@ async fn test_daemonset_respects_template_node_selector() {
 
     reconcile_daemonset_test(&db, &created.data).await.unwrap();
     let pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     assert_eq!(
@@ -782,12 +1286,7 @@ async fn test_daemonset_respects_template_node_selector() {
         .unwrap();
     reconcile_daemonset_test(&db, &current.data).await.unwrap();
     let pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     assert_eq!(
@@ -834,7 +1333,7 @@ async fn test_daemonset_reconcile_preserves_external_status_conditions() {
 
 #[tokio::test]
 async fn test_daemonset_no_nodes_creates_no_pods() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
     db.create_resource(
         "v1",
         "Namespace",
@@ -866,12 +1365,7 @@ async fn test_daemonset_no_nodes_creates_no_pods() {
     reconcile_daemonset_test(&db, &ds_with_rv).await.unwrap();
 
     let pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     assert_eq!(pods.items.len(), 0, "No nodes = no pods");
@@ -919,12 +1413,7 @@ async fn test_daemonset_on_delete_strategy() {
     reconcile_daemonset_test(&db, &ds_with_rv).await.unwrap();
 
     let pods_v1 = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     assert_eq!(pods_v1.items.len(), 1);
@@ -975,12 +1464,7 @@ async fn test_daemonset_on_delete_strategy() {
     reconcile_daemonset_test(&db, &ds_with_rv2).await.unwrap();
 
     let pods_after = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     assert_eq!(
@@ -1039,12 +1523,7 @@ async fn test_daemonset_rolling_update_strategy() {
     reconcile_daemonset_test(&db, &ds_with_rv).await.unwrap();
 
     let pods_v1 = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     assert_eq!(pods_v1.items.len(), 1);
@@ -1102,12 +1581,7 @@ async fn test_daemonset_rolling_update_strategy() {
     reconcile_daemonset_test(&db, &ds_with_rv2).await.unwrap();
 
     let pods_after_update = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     let active_after_update = active_pods(&pods_after_update.items);
@@ -1138,7 +1612,7 @@ async fn test_daemonset_rolling_update_strategy() {
 async fn test_daemonset_rolling_update_max_unavailable() {
     // maxUnavailable controls how many pods can be down during rolling update
     // This test verifies that with maxUnavailable=1, only 1 pod is deleted at a time
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::default();
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
         .unwrap();
@@ -1201,12 +1675,7 @@ async fn test_daemonset_rolling_update_max_unavailable() {
     mark_all_daemonset_pods_ready(&db, "test-ns").await;
 
     let pods_initial = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     assert_eq!(pods_initial.items.len(), 2, "Should have 2 pods initially");
@@ -1260,12 +1729,7 @@ async fn test_daemonset_rolling_update_max_unavailable() {
     reconcile_daemonset_test(&db, &ds_with_rv2).await.unwrap();
 
     let pods_after = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
 
@@ -1314,8 +1778,7 @@ async fn test_daemonset_rolling_update_max_unavailable() {
 #[tokio::test]
 async fn test_daemonset_rolling_update_waits_for_old_pod_final_delete_before_replacement() {
     let db = setup_db_with_nodes(&["node-1", "node-2"]).await;
-    let identity_graph = crate::controller_test_support::ControllerIdentityTestGraph::default();
-    let identity = identity_graph.identity();
+    let identity = deterministic_controller_identity();
 
     let mut ds = make_daemonset("nonsurge-ds", "ds-nonsurge-rollout");
     ds["spec"]["updateStrategy"] = json!({
@@ -1327,10 +1790,7 @@ async fn test_daemonset_rolling_update_waits_for_old_pod_final_delete_before_rep
         .create_resource("apps/v1", "DaemonSet", Some("test-ns"), "nonsurge-ds", ds)
         .await
         .unwrap();
-    let ds_with_rv = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let ds_with_rv = crate::ports::inject_resource_version(created.data, created.resource_version);
     reconcile_daemonset_test_with_identity(&db, &ds_with_rv, identity.as_ref())
         .await
         .unwrap();
@@ -1354,21 +1814,14 @@ async fn test_daemonset_rolling_update_waits_for_old_pod_final_delete_before_rep
         )
         .await
         .unwrap();
-    let updated_for_reconcile = crate::controller_test_support::inject_resource_version(
-        updated_ds.data,
-        updated_ds.resource_version,
-    );
+    let updated_for_reconcile =
+        crate::ports::inject_resource_version(updated_ds.data, updated_ds.resource_version);
     reconcile_daemonset_test_with_identity(&db, &updated_for_reconcile, identity.as_ref())
         .await
         .unwrap();
 
     let pods_after_delete = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     let terminating_old: Vec<_> = pods_after_delete
@@ -1412,21 +1865,14 @@ async fn test_daemonset_rolling_update_waits_for_old_pod_final_delete_before_rep
         .await
         .unwrap()
         .unwrap();
-    let ds_after_final_delete = crate::controller_test_support::inject_resource_version(
-        current_ds.data,
-        current_ds.resource_version,
-    );
+    let ds_after_final_delete =
+        crate::ports::inject_resource_version(current_ds.data, current_ds.resource_version);
     reconcile_daemonset_test_with_identity(&db, &ds_after_final_delete, identity.as_ref())
         .await
         .unwrap();
 
     let pods_after_final_delete = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     let active_new_after_final_delete = pods_after_final_delete
@@ -1449,8 +1895,7 @@ async fn test_daemonset_rolling_update_waits_for_old_pod_final_delete_before_rep
 #[tokio::test]
 async fn test_daemonset_rolling_update_waits_when_new_pod_unavailable() {
     let db = setup_db_with_nodes(&["node-1", "node-2"]).await;
-    let identity_graph = crate::controller_test_support::ControllerIdentityTestGraph::default();
-    let identity = identity_graph.identity();
+    let identity = deterministic_controller_identity();
 
     let mut ds = make_daemonset("blocked-rollout-ds", "ds-blocked-rollout");
     ds["spec"]["updateStrategy"] = json!({
@@ -1477,12 +1922,7 @@ async fn test_daemonset_rolling_update_waits_when_new_pod_unavailable() {
         .unwrap();
 
     let initial_pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     assert_eq!(initial_pods.items.len(), 2);
@@ -1520,12 +1960,7 @@ async fn test_daemonset_rolling_update_waits_when_new_pod_unavailable() {
         .unwrap();
 
     let pods_after_first = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     let terminating_old = pods_after_first
@@ -1581,12 +2016,7 @@ async fn test_daemonset_rolling_update_waits_when_new_pod_unavailable() {
         .unwrap();
 
     let pods_after_second = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     let old_pods = pods_after_second
@@ -1655,12 +2085,7 @@ async fn test_daemonset_template_change_detection() {
     reconcile_daemonset_test(&db, &ds_with_rv).await.unwrap();
 
     let pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     assert_eq!(pods.items.len(), 1);
@@ -1733,12 +2158,7 @@ async fn test_daemonset_status_number_ready_counts_ready_pods() {
 
     // Now simulate the pod becoming Ready by updating its status
     let pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     let pod = &pods.items[0];
@@ -1873,12 +2293,7 @@ async fn test_daemonset_skips_reconcile_when_deletion_timestamp_set() {
 
     // No pods should be created
     let pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     assert_eq!(
@@ -1891,8 +2306,7 @@ async fn test_daemonset_skips_reconcile_when_deletion_timestamp_set() {
 #[tokio::test]
 async fn test_daemonset_replaces_failed_pod() {
     let db = setup_db_with_node("node-1").await;
-    let identity_graph = crate::controller_test_support::ControllerIdentityTestGraph::default();
-    let identity = identity_graph.identity();
+    let identity = deterministic_controller_identity();
 
     let ds = make_daemonset("fail-ds", "ds-uid-fail");
     let created = db
@@ -1905,10 +2319,7 @@ async fn test_daemonset_replaces_failed_pod() {
         )
         .await
         .unwrap();
-    let ds_with_rv = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let ds_with_rv = crate::ports::inject_resource_version(created.data, created.resource_version);
 
     // First reconcile: creates 1 pod
     reconcile_daemonset_test_with_identity(&db, &ds_with_rv, identity.as_ref())
@@ -1916,12 +2327,7 @@ async fn test_daemonset_replaces_failed_pod() {
         .unwrap();
 
     let pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     assert_eq!(pods.items.len(), 1, "Should have 1 pod");
@@ -1949,21 +2355,14 @@ async fn test_daemonset_replaces_failed_pod() {
         .await
         .unwrap()
         .unwrap();
-    let ds_with_rv2 = crate::controller_test_support::inject_resource_version(
-        current_ds.data,
-        current_ds.resource_version,
-    );
+    let ds_with_rv2 =
+        crate::ports::inject_resource_version(current_ds.data, current_ds.resource_version);
     reconcile_daemonset_test_with_identity(&db, &ds_with_rv2, identity.as_ref())
         .await
         .unwrap();
 
     let pods_after = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     let active_after = active_pods(&pods_after.items);
@@ -2012,10 +2411,7 @@ async fn test_daemonset_respects_pod_resourcequota() {
         .create_resource("apps/v1", "DaemonSet", Some("test-ns"), "quota-ds", ds)
         .await
         .unwrap();
-    let ds_with_rv = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let ds_with_rv = crate::ports::inject_resource_version(created.data, created.resource_version);
 
     let result = reconcile_daemonset_test(&db, &ds_with_rv).await;
     assert!(
@@ -2024,12 +2420,7 @@ async fn test_daemonset_respects_pod_resourcequota() {
     );
 
     let pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_resources("v1", "Pod", Some("test-ns"), ResourceListQuery::all())
         .await
         .unwrap();
     assert_eq!(pods.items.len(), 0, "quota deny must prevent pod creation");

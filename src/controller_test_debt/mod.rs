@@ -17,10 +17,8 @@ async fn find_owned_pods(
         .await
 }
 
-mod daemonset;
 mod deployment;
 mod job;
-mod pvc;
 mod replicaset;
 mod replicationcontroller;
 mod statefulset;
