@@ -20,7 +20,6 @@ async fn find_owned_pods(
         .await
 }
 
-mod common;
 mod daemonset;
 mod deployment;
 mod job;

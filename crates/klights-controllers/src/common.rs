@@ -11,6 +11,9 @@ use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+#[cfg(test)]
+mod tests;
+
 pub trait OwnerRefManager: Send + Sync {
     fn build_owner_ref(&self, api_version: &str, kind: &str, name: &str, uid: &str) -> Value;
     fn is_owned_by(&self, resource_data: &Value, owner_uid: &str) -> bool;

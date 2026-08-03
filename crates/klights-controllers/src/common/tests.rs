@@ -1,13 +1,226 @@
 // Controller common tests.
 
+#[cfg(test)]
 mod cases {
     use super::super::*;
-    use crate::datastore::DatastoreBackend;
-    use crate::datastore::sqlite::Datastore;
-
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference as K8sOwnerReference;
+    use klights_cluster_core::ResourcePreconditions;
+    use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
     use serde_json::Value;
     use serde_json::json;
+
+    type ResourceKey = (String, String, Option<String>, String);
+
+    #[derive(Default)]
+    struct TestStatusState {
+        next_id: i64,
+        next_resource_version: i64,
+        resources: std::collections::HashMap<ResourceKey, Resource>,
+    }
+
+    #[derive(Default)]
+    struct TestStatusStore {
+        state: std::sync::Mutex<TestStatusState>,
+    }
+
+    impl TestStatusStore {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn key(api_version: &str, kind: &str, namespace: Option<&str>, name: &str) -> ResourceKey {
+            (
+                api_version.to_string(),
+                kind.to_string(),
+                namespace.map(str::to_string),
+                name.to_string(),
+            )
+        }
+
+        async fn create_namespace(
+            &self,
+            name: &str,
+            data: Value,
+        ) -> ControllerStoreResult<Resource> {
+            self.create_resource("v1", "Namespace", None, name, data)
+                .await
+        }
+
+        async fn create_resource(
+            &self,
+            api_version: &str,
+            kind: &str,
+            namespace: Option<&str>,
+            name: &str,
+            mut data: Value,
+        ) -> ControllerStoreResult<Resource> {
+            let mut state = self.state.lock().expect("test status store lock");
+            let key = Self::key(api_version, kind, namespace, name);
+            if state.resources.contains_key(&key) {
+                return Err(ControllerStoreError::already_exists(format!(
+                    "{kind} {name} already exists"
+                )));
+            }
+            state.next_id += 1;
+            state.next_resource_version += 1;
+            let id = state.next_id;
+            let resource_version = state.next_resource_version;
+            let metadata = data
+                .as_object_mut()
+                .expect("test resource object")
+                .entry("metadata")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .expect("test resource metadata object");
+            metadata.insert("name".to_string(), json!(name));
+            if let Some(namespace) = namespace {
+                metadata.insert("namespace".to_string(), json!(namespace));
+            }
+            let uid = metadata
+                .entry("uid")
+                .or_insert_with(|| json!(format!("test-uid-{id}")))
+                .as_str()
+                .expect("test UID string")
+                .to_string();
+            metadata.insert(
+                "resourceVersion".to_string(),
+                json!(resource_version.to_string()),
+            );
+            let resource = Resource {
+                id,
+                api_version: api_version.to_string(),
+                kind: kind.to_string(),
+                namespace: namespace.map(str::to_string),
+                name: name.to_string(),
+                uid,
+                resource_version,
+                data: std::sync::Arc::new(data),
+            };
+            state.resources.insert(key, resource.clone());
+            Ok(resource)
+        }
+
+        async fn get_resource(
+            &self,
+            api_version: &str,
+            kind: &str,
+            namespace: Option<&str>,
+            name: &str,
+        ) -> ControllerStoreResult<Option<Resource>> {
+            Ok(self
+                .state
+                .lock()
+                .expect("test status store lock")
+                .resources
+                .get(&Self::key(api_version, kind, namespace, name))
+                .cloned())
+        }
+
+        async fn delete_resource(
+            &self,
+            api_version: &str,
+            kind: &str,
+            namespace: Option<&str>,
+            name: &str,
+        ) -> ControllerStoreResult<Option<Resource>> {
+            Ok(self
+                .state
+                .lock()
+                .expect("test status store lock")
+                .resources
+                .remove(&Self::key(api_version, kind, namespace, name)))
+        }
+
+        async fn update_status_only(
+            &self,
+            api_version: &str,
+            kind: &str,
+            namespace: Option<&str>,
+            name: &str,
+            status: Value,
+            expected_resource_version: Option<i64>,
+        ) -> ControllerStoreResult<Resource> {
+            self.update_status(
+                api_version,
+                kind,
+                namespace,
+                name,
+                status,
+                ResourcePreconditions {
+                    uid: None,
+                    resource_version: expected_resource_version,
+                },
+            )
+            .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ControllerStatusStore for TestStatusStore {
+        async fn get_status_resource(
+            &self,
+            api_version: &str,
+            kind: &str,
+            namespace: Option<&str>,
+            name: &str,
+        ) -> ControllerStoreResult<Option<Resource>> {
+            self.get_resource(api_version, kind, namespace, name).await
+        }
+
+        async fn update_status(
+            &self,
+            api_version: &str,
+            kind: &str,
+            namespace: Option<&str>,
+            name: &str,
+            status: Value,
+            preconditions: ResourcePreconditions,
+        ) -> ControllerStoreResult<Resource> {
+            let mut state = self.state.lock().expect("test status store lock");
+            let key = Self::key(api_version, kind, namespace, name);
+            let live = state
+                .resources
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| ControllerStoreError::not_found(format!("{kind} {name}")))?;
+            if preconditions
+                .resource_version
+                .is_some_and(|expected| expected != live.resource_version)
+                || preconditions
+                    .uid
+                    .as_deref()
+                    .is_some_and(|expected| expected != live.uid)
+            {
+                return Err(ControllerStoreError::conflict(format!(
+                    "stale {kind} {name} status write"
+                )));
+            }
+            state.next_resource_version += 1;
+            let resource_version = state.next_resource_version;
+            let mut data = std::sync::Arc::unwrap_or_clone(live.data);
+            data.as_object_mut()
+                .expect("test resource object")
+                .insert("status".to_string(), status);
+            data.pointer_mut("/metadata/resourceVersion")
+                .expect("test resourceVersion")
+                .clone_from(&json!(resource_version.to_string()));
+            let updated = Resource {
+                resource_version,
+                data: std::sync::Arc::new(data),
+                ..live
+            };
+            state.resources.insert(key, updated.clone());
+            Ok(updated)
+        }
+
+        fn log_noop_status_write(
+            &self,
+            _operation: &'static str,
+            _resource: &Resource,
+            _reason: &'static str,
+        ) {
+        }
+    }
 
     fn is_controller_conflict(error: &anyhow::Error) -> bool {
         error
@@ -164,7 +377,7 @@ mod cases {
 
     #[tokio::test]
     async fn test_count_ready_pods_counts_only_ready_pods() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = TestStatusStore::new();
 
         // Create 3 pods: 2 ready, 1 not ready
         let ready_pod = json!({
@@ -208,7 +421,7 @@ mod cases {
 
     #[tokio::test]
     async fn test_write_status_for_resource_does_not_mutate_deleting_resource() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = TestStatusStore::new();
         db.create_namespace(
             "delete-blocking",
             json!({
@@ -259,7 +472,7 @@ mod cases {
 
     #[tokio::test]
     async fn test_write_status_for_resource_rejects_stale_uid_for_replacement_marked_deleting() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = TestStatusStore::new();
         db.create_namespace(
             "delete-stale-uid",
             json!({
@@ -644,7 +857,7 @@ mod cases {
 
     #[tokio::test]
     async fn test_write_status_for_resource_skips_unchanged_status() {
-        let db = Datastore::new_in_memory().await.unwrap();
+        let db = TestStatusStore::new();
         let created = db
             .create_resource(
                 "v1",
@@ -660,13 +873,10 @@ mod cases {
             .await
             .unwrap();
 
-        let result = write_status_for_resource(
-            &db as &dyn DatastoreBackend,
-            &created,
-            &json!({"replicas": 1, "readyReplicas": 1}),
-        )
-        .await
-        .unwrap();
+        let result =
+            write_status_for_resource(&db, &created, &json!({"replicas": 1, "readyReplicas": 1}))
+                .await
+                .unwrap();
 
         assert_eq!(
             result.resource_version, created.resource_version,
@@ -677,7 +887,7 @@ mod cases {
 
     #[tokio::test]
     async fn test_write_status_for_resource_rejects_stale_snapshot_after_status_only_overlap() {
-        let db = Datastore::new_in_memory().await.unwrap();
+        let db = TestStatusStore::new();
         let created = db
             .create_resource(
                 "apps/v1",
@@ -705,7 +915,7 @@ mod cases {
         .expect("fresh writer must win first");
 
         let stale_write = write_status_for_resource(
-            &db as &dyn DatastoreBackend,
+            &db,
             &created,
             &json!({"readyReplicas": 0, "observedGeneration": 2}),
         )
@@ -728,7 +938,7 @@ mod cases {
 
     #[tokio::test]
     async fn test_write_status_for_resource_rejects_recreated_same_name_uid() {
-        let db = Datastore::new_in_memory().await.unwrap();
+        let db = TestStatusStore::new();
         let created = db
             .create_resource(
                 "apps/v1",
@@ -771,12 +981,8 @@ mod cases {
         .await
         .unwrap();
 
-        let stale_write = write_status_for_resource(
-            &db as &dyn DatastoreBackend,
-            &created,
-            &json!({"readyReplicas": 1}),
-        )
-        .await;
+        let stale_write =
+            write_status_for_resource(&db, &created, &json!({"readyReplicas": 1})).await;
         let err = stale_write.expect_err("old UID status writer must not mutate replacement");
         assert!(
             is_controller_conflict(&err),
@@ -795,7 +1001,7 @@ mod cases {
     #[tokio::test]
     async fn test_write_status_for_resource_rejects_when_desired_matches_stale_snapshot_after_status_overlap()
      {
-        let db = Datastore::new_in_memory().await.unwrap();
+        let db = TestStatusStore::new();
         let created = db
             .create_resource(
                 "apps/v1",
@@ -822,12 +1028,8 @@ mod cases {
         .await
         .expect("concurrent status writer must advance live status");
 
-        let stale_write = write_status_for_resource(
-            &db as &dyn DatastoreBackend,
-            &created,
-            &json!({"readyReplicas": 0}),
-        )
-        .await;
+        let stale_write =
+            write_status_for_resource(&db, &created, &json!({"readyReplicas": 0})).await;
         let err = stale_write
             .expect_err("stale unchanged resource status must not overwrite live status");
         assert!(
