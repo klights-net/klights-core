@@ -23,7 +23,9 @@ use crate::resource_admission_adapter::{
 };
 
 fn deterministic_api_identity() -> Arc<dyn k8s_native_service::ApiIdentityGenerator> {
-    Arc::new(crate::resource_name::SystemIdentityGenerator)
+    Arc::new(
+        crate::bootstrap::controller_adapters::system_identity_adapter::SystemIdentityGenerator,
+    )
 }
 
 #[derive(Default)]

@@ -31,7 +31,7 @@ impl k8s_native_service::ApiIdentityGenerator for SystemIdentityGenerator {
 }
 
 /// Append the existing five-character lowercase alphanumeric suffix.
-pub fn generate(prefix: &str) -> String {
+fn generate(prefix: &str) -> String {
     use rand::distr::{Distribution, Uniform};
 
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";

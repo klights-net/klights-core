@@ -400,7 +400,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             std::sync::Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         ));
         let readiness_publisher =
-            crate::node_subnet_controller_adapter::KubeletNodeReadinessPublisher::new(
+            crate::bootstrap::controller_adapters::node_subnet_controller_adapter::KubeletNodeReadinessPublisher::new(
                 query_for_peer_watch.clone(),
                 node_status_for_peer_watch,
             );
@@ -419,7 +419,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                         peering,
                         supervisor_for_task,
                         Some(
-                            crate::node_subnet_controller_adapter::DataplaneHealthAdapter::new(
+                            crate::bootstrap::controller_adapters::node_subnet_controller_adapter::DataplaneHealthAdapter::new(
                                 health_for_peer_watch,
                             ),
                         ),

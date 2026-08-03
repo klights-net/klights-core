@@ -4,7 +4,7 @@ use klights_cluster_core::Resource;
 use klights_pod_api::{PodListRequest, PodQuery};
 use serde_json::Value;
 
-use crate::controller_store_error_adapter::map_controller_store_error;
+use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
 use crate::datastore::{DatastoreBackend, ResourceListQuery};
 use klights_controllers::resource_quota::{
     ResourceQuotaRuntime, reconcile_resource_quotas_with_runtime,
@@ -78,5 +78,5 @@ pub async fn reconcile_resource_quotas_for_namespace(
 #[cfg(test)]
 use klights_controllers::resource_quota::*;
 #[cfg(test)]
-#[path = "controller_test_debt/resource_quota/tests.rs"]
+#[path = "../../controller_test_debt/resource_quota/tests.rs"]
 mod policy_tests;

@@ -28,8 +28,10 @@ pub(crate) fn test_reconcile_context<'a>(
 
 pub(crate) fn controller_store_for_test(
     db: &crate::datastore::sqlite::Datastore,
-) -> crate::controller_runtime_adapter::RootControllerLeaderPort {
-    crate::controller_runtime_adapter::RootControllerLeaderPort::new(Arc::new(db.clone()))
+) -> crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort {
+    crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(
+        Arc::new(db.clone()),
+    )
 }
 
 pub(crate) fn runtime_dependencies_for_test(
@@ -39,13 +41,15 @@ pub(crate) fn runtime_dependencies_for_test(
     let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
     let repository = pod_repository_for_test(db);
     let leader = Arc::new(
-        crate::controller_runtime_adapter::RootControllerLeaderPort::new(db_handle.clone()),
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(db_handle.clone()),
     );
     let pods = Arc::new(
-        crate::controller_runtime_adapter::RootControllerPodPort::new_for_test(repository.clone()),
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort::new_for_test(repository.clone()),
     );
     let non_pod_finalization: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort> = Arc::new(
-        crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db_handle),
+        crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
+            db_handle,
+        ),
     );
     let services = Arc::new(crate::networking::test_support::MockServiceRouter::default());
     klights_controllers::ControllerRuntimeDependencies {
@@ -73,15 +77,15 @@ pub(crate) fn runtime_dependencies_for_test(
         replicationcontroller_pod_mutation: pods,
         pod_delete_sink: repository,
         reconcile: Arc::new(
-            crate::controller_runtime_adapter::RootControllerReconcilePort::new(
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerReconcilePort::new(
                 non_pod_finalization,
             ),
         ),
         network: Arc::new(
-            crate::controller_runtime_adapter::RootControllerNetworkPort::new(services),
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerNetworkPort::new(services),
         ),
         effects: Arc::new(
-            crate::controller_runtime_adapter::RootControllerEffectPort::new(
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerEffectPort::new(
                 crate::kubelet::file_blocking::test_file_process_executor(),
                 crate::KlightsConfig::test_default()
                     .data_root

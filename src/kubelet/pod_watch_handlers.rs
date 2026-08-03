@@ -146,7 +146,7 @@ pub async fn handle_pvc_event(
         )
         .await
     {
-        let reconcile = crate::pod_reconcile_adapter::PersistentVolumeReconcileAdapter::new(
+        let reconcile = crate::bootstrap::controller_adapters::pod_reconcile_adapter::PersistentVolumeReconcileAdapter::new(
             db,
             file_process,
             local_path_provisioner_root,
@@ -210,7 +210,7 @@ pub async fn handle_pv_event(
 
                 if phase != Some("Bound") {
                     let reconcile =
-                        crate::pod_reconcile_adapter::PersistentVolumeReconcileAdapter::new(
+                        crate::bootstrap::controller_adapters::pod_reconcile_adapter::PersistentVolumeReconcileAdapter::new(
                             db,
                             file_process,
                             local_path_provisioner_root,

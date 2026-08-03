@@ -251,7 +251,9 @@ fn build_test_server(
         local.set_controller_dispatcher(dispatcher);
     }
     local.set_non_pod_finalization(Arc::new(
-        crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db),
+        crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
+            db,
+        ),
     ));
     let projected_token = Arc::new(
         crate::control_plane::client::local::AuthenticatedProjectedTokenIssuer::new(local.clone()),
@@ -455,7 +457,9 @@ fn mount_service_full_with_passive_reads(
         local.set_controller_dispatcher(dispatcher);
     }
     local.set_non_pod_finalization(Arc::new(
-        crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db),
+        crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
+            db,
+        ),
     ));
     let projected_token = Arc::new(
         crate::control_plane::client::local::AuthenticatedProjectedTokenIssuer::new(local.clone()),

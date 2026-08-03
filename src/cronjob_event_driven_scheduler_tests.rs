@@ -32,12 +32,13 @@ async fn make_scheduler() -> (
             supervisor.clone(),
         ),
     );
-    let scheduler = crate::cronjob_scheduler_adapter::new_leader_scheduler(
-        db_handle.clone(),
-        crate::positioned_watch_adapter::for_test(&passive_reads, db_handle.clone()),
-        dispatcher.clone(),
-        supervisor.clone(),
-    );
+    let scheduler =
+        crate::bootstrap::controller_adapters::cronjob_scheduler_adapter::new_leader_scheduler(
+            db_handle.clone(),
+            crate::positioned_watch_adapter::for_test(&passive_reads, db_handle.clone()),
+            dispatcher.clone(),
+            supervisor.clone(),
+        );
     (db, db_handle, dispatcher, supervisor, scheduler)
 }
 

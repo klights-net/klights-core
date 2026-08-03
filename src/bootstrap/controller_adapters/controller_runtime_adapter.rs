@@ -1002,7 +1002,7 @@ impl klights_controllers::node_lifecycle::NodeLifecyclePodStore for RootControll
             None,
         )
         .await
-        .map_err(crate::controller_store_error_adapter::map_controller_store_error)?
+        .map_err(crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error)?
         .items)
     }
 
@@ -1022,7 +1022,7 @@ impl klights_controllers::node_lifecycle::NodeLifecyclePodStore for RootControll
             })
             .await
             .map_err(anyhow::Error::new)
-            .map_err(crate::controller_store_error_adapter::map_controller_store_error)
+            .map_err(crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error)
     }
 }
 

@@ -6,11 +6,16 @@ use crate::node_lease::{DEFAULT_NODE_LEASE_GRACE_SECONDS, NodeLeaseObservation, 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures::StreamExt as _;
 use klights_cluster_core::k8s_time::format_time as k8s_time_format;
 use klights_cluster_core::{Resource, ResourcePreconditions, StorageCommand};
-use klights_leader_api::{ResourceEvent, WatchEventType};
+use klights_leader_api::{
+    ControllerCoordination, ControllerScope, LeaderWatch, LeaderWatchError, ResourceEvent,
+    WatchEventType, WatchRequest, WatchStream,
+};
 use klights_reconcile_api::ControllerStoreResult;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 const POD_CLEANUP_REASON_NODE_LOST: &str = "NodeLost";
 
@@ -36,6 +41,259 @@ pub trait NodeLifecyclePodStore: Send + Sync {
 #[async_trait]
 pub trait NodeLostPodLifecycleSink: Send + Sync {
     async fn enqueue_node_lost_cleanup(&self, pod: Resource) -> ControllerStoreResult<()>;
+}
+
+/// Complete neutral capability bundle for the node-lifecycle event runtime.
+#[derive(Clone, Copy)]
+pub struct NodeLifecycleRuntimeDependencies<'a> {
+    store: &'a dyn NodeLifecycleStore,
+    pods: &'a dyn NodeLifecyclePodStore,
+    pod_mutations: &'a dyn klights_reconcile_api::PodMutationReconcileSink,
+    pod_lifecycle: &'a dyn NodeLostPodLifecycleSink,
+    lease_observations: &'a NodeLeaseTracker,
+    supervisor: &'a klights_supervisor::TaskSupervisor,
+    node_status: &'a dyn klights_leader_api::LeaderNodeLifecycleStatus,
+    watch: &'a dyn LeaderWatch,
+    clock: &'a dyn klights_supervisor::WallClock,
+    pod_eviction_grace: Duration,
+}
+
+impl<'a> NodeLifecycleRuntimeDependencies<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        store: &'a dyn NodeLifecycleStore,
+        pods: &'a dyn NodeLifecyclePodStore,
+        pod_mutations: &'a dyn klights_reconcile_api::PodMutationReconcileSink,
+        pod_lifecycle: &'a dyn NodeLostPodLifecycleSink,
+        lease_observations: &'a NodeLeaseTracker,
+        supervisor: &'a klights_supervisor::TaskSupervisor,
+        node_status: &'a dyn klights_leader_api::LeaderNodeLifecycleStatus,
+        watch: &'a dyn LeaderWatch,
+        clock: &'a dyn klights_supervisor::WallClock,
+        pod_eviction_grace: Duration,
+    ) -> Self {
+        Self {
+            store,
+            pods,
+            pod_mutations,
+            pod_lifecycle,
+            lease_observations,
+            supervisor,
+            node_status,
+            watch,
+            clock,
+            pod_eviction_grace,
+        }
+    }
+}
+
+pub async fn run_node_lifecycle_controller(
+    dependencies: NodeLifecycleRuntimeDependencies<'_>,
+    coordination: Arc<dyn ControllerCoordination>,
+    cancel: CancellationToken,
+) {
+    crate::run_under_lease(
+        coordination,
+        ControllerScope::Cluster,
+        cancel,
+        move |_scope, _lease, lease_cancel| {
+            run_node_lifecycle_under_lease(dependencies, lease_cancel)
+        },
+    )
+    .await;
+}
+
+async fn run_node_lifecycle_under_lease(
+    dependencies: NodeLifecycleRuntimeDependencies<'_>,
+    cancel: CancellationToken,
+) {
+    let NodeLifecycleRuntimeDependencies {
+        store,
+        pods,
+        pod_mutations,
+        pod_lifecycle,
+        lease_observations,
+        supervisor,
+        node_status,
+        watch,
+        clock,
+        pod_eviction_grace,
+    } = dependencies;
+    let mut events = match open_node_lifecycle_watches(watch).await {
+        Ok(events) => events,
+        Err(error) => {
+            tracing::warn!("node_lifecycle: failed to open positioned watches: {error:#}");
+            return;
+        }
+    };
+    if let Err(err) =
+        refresh_node_lease_tracker_from_cluster_leases(store, lease_observations).await
+    {
+        tracing::warn!(
+            "node_lifecycle: failed to seed node lease tracker from persisted leases: {err:#}"
+        );
+    }
+
+    lease_observations.reset_grace_window(clock.now_utc()).await;
+
+    let mut retry_attempt = 0u32;
+    'controller: loop {
+        let next_deadline = match reconcile_node_lifecycle_once_with_tracker(
+            store,
+            node_status,
+            pods,
+            lease_observations,
+            clock.now_utc(),
+            NodeLifecyclePodActions {
+                mutation_reconcile: Some(pod_mutations),
+                lifecycle: Some(pod_lifecycle),
+                eviction_grace: pod_eviction_grace,
+            },
+        )
+        .await
+        {
+            Ok(next_deadline) => {
+                retry_attempt = 0;
+                next_deadline
+            }
+            Err(err) => {
+                tracing::warn!("node_lifecycle reconcile failed: {err:#}");
+                let attempt = retry_attempt;
+                retry_attempt = retry_attempt.saturating_add(1);
+                if wait_for_retry(supervisor, &cancel, attempt).await {
+                    continue;
+                }
+                break;
+            }
+        };
+
+        let maybe_event = if let Some(delay) = next_deadline {
+            tokio::select! {
+                _ = cancel.cancelled() => None,
+                sleep = supervisor.sleep("node_lifecycle_lease_deadline", delay) => {
+                    if let Err(err) = sleep {
+                        tracing::warn!("node_lifecycle deadline timer failed: {err:#}");
+                    }
+                    None
+                }
+                _ = lease_observations.wait_changed() => None,
+                event = events.next() => event,
+            }
+        } else {
+            tokio::select! {
+                _ = cancel.cancelled() => None,
+                _ = lease_observations.wait_changed() => None,
+                event = events.next() => event,
+            }
+        };
+        let Some(watch_result) = maybe_event else {
+            if cancel.is_cancelled() {
+                break;
+            }
+            continue;
+        };
+
+        match watch_result {
+            Ok(event) => {
+                if let Err(err) = track_lease_from_event(&event, lease_observations).await {
+                    tracing::warn!(
+                        "node_lifecycle: failed to refresh lease from watch event: {err:#}"
+                    );
+                }
+                if event.event_type() == WatchEventType::Deleted && event.resource().kind == "Node"
+                {
+                    loop {
+                        match cleanup_pods_bound_to_deleted_node_event(
+                            store,
+                            pods,
+                            Some(pod_mutations),
+                            Some(pod_lifecycle),
+                            &event,
+                            clock.now_utc(),
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                retry_attempt = 0;
+                                continue 'controller;
+                            }
+                            Ok(false) => break,
+                            Err(err) => {
+                                tracing::warn!(
+                                    "node_lifecycle: failed to cleanup pods for deleted node event: {err:#}"
+                                );
+                                let attempt = retry_attempt;
+                                retry_attempt = retry_attempt.saturating_add(1);
+                                if !wait_for_retry(supervisor, &cancel, attempt).await {
+                                    break 'controller;
+                                }
+                            }
+                        }
+                    }
+                }
+                if node_lifecycle_event(&event) {
+                    continue;
+                }
+            }
+            Err(LeaderWatchError::ReplayExpired { .. }) => {
+                tracing::warn!(
+                    "node_lifecycle watch replay expired; refreshing lease state and reopening"
+                );
+                if let Err(error) =
+                    refresh_node_lease_tracker_from_cluster_leases(store, lease_observations).await
+                {
+                    tracing::warn!("node_lifecycle lease refresh failed: {error:#}");
+                }
+                match open_node_lifecycle_watches(watch).await {
+                    Ok(reopened) => {
+                        events = reopened;
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!("node_lifecycle positioned watch reopen failed: {error:#}");
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!("node_lifecycle watch error: {err:#?}");
+                let attempt = retry_attempt;
+                retry_attempt = retry_attempt.saturating_add(1);
+                if !wait_for_retry(supervisor, &cancel, attempt).await {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn open_node_lifecycle_watches(
+    watch: &dyn LeaderWatch,
+) -> std::result::Result<futures::stream::SelectAll<WatchStream>, LeaderWatchError> {
+    let mut sessions = Vec::with_capacity(2);
+    for (api_version, kind, namespace) in [
+        ("v1", "Node", None),
+        (
+            "coordination.k8s.io/v1",
+            "Lease",
+            Some("kube-node-lease".to_string()),
+        ),
+    ] {
+        let request = WatchRequest::try_new(api_version, kind, namespace, None, None, None, None)?;
+        sessions.push(watch.watch_resources(request).await?);
+    }
+    Ok(futures::stream::select_all(sessions))
+}
+
+async fn wait_for_retry(
+    supervisor: &klights_supervisor::TaskSupervisor,
+    cancel: &CancellationToken,
+    attempt: u32,
+) -> bool {
+    let delay = node_lifecycle_retry_delay(attempt);
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        _ = supervisor.sleep("node_lifecycle_retry", delay) => true,
+    }
 }
 
 const NODE_STATUS_UNKNOWN_REASON: &str = "NodeStatusUnknown";

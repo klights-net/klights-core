@@ -1,6 +1,6 @@
 use super::*;
+use crate::bootstrap::controller_adapters::hpa_controller_adapter::reconcile_hpa_with_metrics as reconcile_hpa_with_metrics_root;
 use crate::datastore::DatastoreBackend;
-use crate::hpa_controller_adapter::reconcile_hpa_with_metrics as reconcile_hpa_with_metrics_root;
 use klights_node_api::{
     NodeMetrics, NodeMetricsContainerSample, NodeMetricsPodSample, NodeMetricsResult,
     NodeMetricsTarget,

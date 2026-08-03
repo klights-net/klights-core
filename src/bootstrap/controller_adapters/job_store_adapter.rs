@@ -2,16 +2,16 @@ use async_trait::async_trait;
 use klights_cluster_core::Resource;
 use klights_reconcile_api::ControllerStoreResult as Result;
 
-use crate::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::{DatastoreBackend, ResourceListQuery};
+use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
+use crate::datastore::DatastoreBackend;
 use crate::kubelet::pod_repository::PodObjectWriter;
-use klights_controllers::replicationcontroller::{
-    ReplicationControllerPodMutation, ReplicationControllerStore,
-};
+use klights_controllers::job::{JobPodMutation, JobStore};
 
 #[async_trait]
-impl ReplicationControllerPodMutation for crate::controller_runtime_adapter::RootControllerPodPort {
-    async fn create_replication_controller_pod(
+impl JobPodMutation
+    for crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort
+{
+    async fn create_job_pod(
         &self,
         namespace: &str,
         name: &str,
@@ -23,7 +23,7 @@ impl ReplicationControllerPodMutation for crate::controller_runtime_adapter::Roo
             .map_err(map_controller_store_error)
     }
 
-    async fn replace_replication_controller_pod_owner_references(
+    async fn replace_job_pod_owner_references(
         &self,
         namespace: &str,
         name: &str,
@@ -36,8 +36,8 @@ impl ReplicationControllerPodMutation for crate::controller_runtime_adapter::Roo
 }
 
 #[async_trait]
-impl ReplicationControllerPodMutation for dyn PodObjectWriter + '_ {
-    async fn create_replication_controller_pod(
+impl JobPodMutation for dyn PodObjectWriter + '_ {
+    async fn create_job_pod(
         &self,
         namespace: &str,
         name: &str,
@@ -49,7 +49,7 @@ impl ReplicationControllerPodMutation for dyn PodObjectWriter + '_ {
             .map_err(map_controller_store_error)
     }
 
-    async fn replace_replication_controller_pod_owner_references(
+    async fn replace_job_pod_owner_references(
         &self,
         namespace: &str,
         name: &str,
@@ -62,8 +62,8 @@ impl ReplicationControllerPodMutation for dyn PodObjectWriter + '_ {
 }
 
 #[async_trait]
-impl ReplicationControllerPodMutation for crate::kubelet::pod_repository::PodRepository {
-    async fn create_replication_controller_pod(
+impl JobPodMutation for crate::kubelet::pod_repository::PodRepository {
+    async fn create_job_pod(
         &self,
         namespace: &str,
         name: &str,
@@ -75,7 +75,7 @@ impl ReplicationControllerPodMutation for crate::kubelet::pod_repository::PodRep
             .map_err(map_controller_store_error)
     }
 
-    async fn replace_replication_controller_pod_owner_references(
+    async fn replace_job_pod_owner_references(
         &self,
         namespace: &str,
         name: &str,
@@ -88,38 +88,20 @@ impl ReplicationControllerPodMutation for crate::kubelet::pod_repository::PodRep
 }
 
 #[async_trait]
-impl ReplicationControllerStore for dyn DatastoreBackend + '_ {
-    async fn get_replication_controller(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> Result<Option<Resource>> {
-        DatastoreBackend::get_resource(self, "v1", "ReplicationController", Some(namespace), name)
+impl JobStore for dyn DatastoreBackend + '_ {
+    async fn get_job(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
+        DatastoreBackend::get_resource(self, "batch/v1", "Job", Some(namespace), name)
             .await
             .map_err(map_controller_store_error)
     }
 
-    async fn list_resource_quotas(&self, namespace: &str) -> Result<Vec<Resource>> {
-        Ok(self
-            .list_resources(
-                "v1",
-                "ResourceQuota",
-                Some(namespace),
-                ResourceListQuery::all(),
-            )
-            .await
-            .map_err(map_controller_store_error)?
-            .items)
-    }
-
-    async fn update_replication_controller_status(
+    async fn update_job_status(
         &self,
         resource: &Resource,
         status: serde_json::Value,
-    ) -> Result<()> {
+    ) -> Result<Resource> {
         klights_controllers::common::write_status_for_resource(self, resource, &status)
             .await
-            .map(|_| ())
             .map_err(map_controller_store_error)
     }
 }

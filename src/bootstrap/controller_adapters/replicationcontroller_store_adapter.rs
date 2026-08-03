@@ -2,14 +2,18 @@ use async_trait::async_trait;
 use klights_cluster_core::Resource;
 use klights_reconcile_api::ControllerStoreResult as Result;
 
-use crate::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::DatastoreBackend;
+use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
+use crate::datastore::{DatastoreBackend, ResourceListQuery};
 use crate::kubelet::pod_repository::PodObjectWriter;
-use klights_controllers::replicaset::{ReplicaSetPodMutation, ReplicaSetStore};
+use klights_controllers::replicationcontroller::{
+    ReplicationControllerPodMutation, ReplicationControllerStore,
+};
 
 #[async_trait]
-impl ReplicaSetPodMutation for crate::controller_runtime_adapter::RootControllerPodPort {
-    async fn create_replicaset_pod(
+impl ReplicationControllerPodMutation
+    for crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort
+{
+    async fn create_replication_controller_pod(
         &self,
         namespace: &str,
         name: &str,
@@ -21,7 +25,7 @@ impl ReplicaSetPodMutation for crate::controller_runtime_adapter::RootController
             .map_err(map_controller_store_error)
     }
 
-    async fn replace_replicaset_pod_owner_references(
+    async fn replace_replication_controller_pod_owner_references(
         &self,
         namespace: &str,
         name: &str,
@@ -34,8 +38,8 @@ impl ReplicaSetPodMutation for crate::controller_runtime_adapter::RootController
 }
 
 #[async_trait]
-impl ReplicaSetPodMutation for dyn PodObjectWriter + '_ {
-    async fn create_replicaset_pod(
+impl ReplicationControllerPodMutation for dyn PodObjectWriter + '_ {
+    async fn create_replication_controller_pod(
         &self,
         namespace: &str,
         name: &str,
@@ -47,7 +51,7 @@ impl ReplicaSetPodMutation for dyn PodObjectWriter + '_ {
             .map_err(map_controller_store_error)
     }
 
-    async fn replace_replicaset_pod_owner_references(
+    async fn replace_replication_controller_pod_owner_references(
         &self,
         namespace: &str,
         name: &str,
@@ -60,8 +64,8 @@ impl ReplicaSetPodMutation for dyn PodObjectWriter + '_ {
 }
 
 #[async_trait]
-impl ReplicaSetPodMutation for crate::kubelet::pod_repository::PodRepository {
-    async fn create_replicaset_pod(
+impl ReplicationControllerPodMutation for crate::kubelet::pod_repository::PodRepository {
+    async fn create_replication_controller_pod(
         &self,
         namespace: &str,
         name: &str,
@@ -73,7 +77,7 @@ impl ReplicaSetPodMutation for crate::kubelet::pod_repository::PodRepository {
             .map_err(map_controller_store_error)
     }
 
-    async fn replace_replicaset_pod_owner_references(
+    async fn replace_replication_controller_pod_owner_references(
         &self,
         namespace: &str,
         name: &str,
@@ -86,14 +90,31 @@ impl ReplicaSetPodMutation for crate::kubelet::pod_repository::PodRepository {
 }
 
 #[async_trait]
-impl ReplicaSetStore for dyn DatastoreBackend + '_ {
-    async fn get_replicaset(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        DatastoreBackend::get_resource(self, "apps/v1", "ReplicaSet", Some(namespace), name)
+impl ReplicationControllerStore for dyn DatastoreBackend + '_ {
+    async fn get_replication_controller(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<Resource>> {
+        DatastoreBackend::get_resource(self, "v1", "ReplicationController", Some(namespace), name)
             .await
             .map_err(map_controller_store_error)
     }
 
-    async fn update_replicaset_status(
+    async fn list_resource_quotas(&self, namespace: &str) -> Result<Vec<Resource>> {
+        Ok(self
+            .list_resources(
+                "v1",
+                "ResourceQuota",
+                Some(namespace),
+                ResourceListQuery::all(),
+            )
+            .await
+            .map_err(map_controller_store_error)?
+            .items)
+    }
+
+    async fn update_replication_controller_status(
         &self,
         resource: &Resource,
         status: serde_json::Value,

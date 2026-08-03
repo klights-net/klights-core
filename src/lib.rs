@@ -4,97 +4,62 @@ mod admission_tests;
 mod allocator;
 mod api_helpers_adapter;
 mod api_state_adapter;
-mod apiservice_side_effect_adapter;
-mod applied_pod_side_effect_adapter;
 mod authority_adapter;
 pub mod cli;
 mod cluster_engine;
 pub(crate) mod cluster_store_replication_adapter;
 mod cni_socket_adapter;
 pub mod control_plane;
-mod controller_pod_adapters;
-mod controller_runtime_adapter;
-mod controller_store_adapters;
-mod controller_store_error_adapter;
 #[cfg(test)]
 mod controller_test_debt;
 #[cfg(test)]
 mod controller_test_support;
-mod coredns_bootstrap_adapter;
-pub(crate) mod crd_registry_adapter;
-pub(crate) mod cronjob_scheduler_adapter;
 mod custom_resource_read_adapter;
-mod daemonset_node_side_effect_adapter;
-mod daemonset_store_adapter;
 pub mod datastore;
-mod endpoint_mirror_side_effect_adapter;
-mod endpoint_reconcile_adapter;
 #[cfg(test)]
 mod endpoint_reconcile_integration_tests;
 pub mod gc;
-mod gc_delete_adapter;
 #[cfg(test)]
 mod gc_ownership_integration_tests;
-mod gc_resource_store_adapter;
 mod generated_handler_adapter;
 #[cfg(test)]
 mod grpc_test_support;
-mod hpa_controller_adapter;
-mod hpa_side_effect_adapter;
 #[cfg(feature = "integration-test-harness")]
 pub mod integration_test_harness;
-mod job_side_effect_adapter;
-mod job_store_adapter;
 pub mod kubelet;
 mod list_query_adapter;
 mod namespace_admission;
 pub mod networking;
 mod networking_state_adapter;
 pub mod node_admin;
-mod node_lifecycle_controller_adapter;
 mod node_log_runtime_adapter;
 mod node_metrics_adapter;
 pub(crate) mod node_routing_metadata;
-mod node_subnet_controller_adapter;
-mod node_taint_manager_side_effect_adapter;
 mod outbox_payload_codec_adapter;
 mod outbox_response_codec_adapter;
 pub mod paths;
-mod pdb_side_effect_adapter;
 pub mod pidfile;
 pub(crate) mod pod_api_service;
 mod pod_event_adapter;
 mod pod_native_adapter;
 mod pod_native_orchestration;
-pub(crate) mod pod_reconcile_adapter;
 pub(crate) mod pod_repository_composition;
 pub(crate) mod pod_subresource_service;
 mod positioned_watch_adapter;
 mod remote_informer_cache_adapter;
-mod replicaset_store_adapter;
-mod replicationcontroller_store_adapter;
 mod resource_admission_adapter;
-pub(crate) mod resource_name;
 mod resource_preconditions;
-mod resource_quota_admission_adapter;
-mod resource_quota_controller_adapter;
-mod resource_quota_side_effect_adapter;
 mod resource_write_diagnostics;
-mod service_account_defaults_side_effect_adapter;
 #[cfg(test)]
 mod service_pod_integration_tests;
-mod service_pod_side_effect_adapter;
-mod service_reconcile_adapter;
 #[cfg(test)]
 mod service_reconcile_integration_tests;
 pub mod shutdown;
 mod signing_key_state_adapter;
-mod statefulset_store_adapter;
 pub mod version;
 pub mod watch;
 mod watch_commit_observation_adapter;
 mod watch_stream_adapter;
-mod workload_pod_side_effect_adapter;
 
 #[cfg(test)]
 mod cluster_engine_composition_tests;
@@ -105,7 +70,6 @@ mod cronjob_event_driven_scheduler_tests;
 
 mod bootstrap;
 mod bound_pod_finalization_adapter;
-mod deployment_store_adapter;
 
 #[cfg(test)]
 mod datastore_codec_integration_tests;

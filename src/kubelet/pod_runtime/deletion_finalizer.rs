@@ -89,14 +89,16 @@ impl RealPodDeletionFinalizer {
             outbox.clone(),
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
-        let mutation_reconcile = Arc::new(crate::pod_reconcile_adapter::PodReconcileAdapter::new(
-            store.db().clone(),
-            side_effects.controller_dispatcher_slot(),
-            metrics.clone(),
-            side_effects,
-            store.clone(),
-            crate::controller_test_support::deterministic_controller_identity(),
-        ));
+        let mutation_reconcile = Arc::new(
+            crate::bootstrap::controller_adapters::pod_reconcile_adapter::PodReconcileAdapter::new(
+                store.db().clone(),
+                side_effects.controller_dispatcher_slot(),
+                metrics.clone(),
+                side_effects,
+                store.clone(),
+                crate::controller_test_support::deterministic_controller_identity(),
+            ),
+        );
         let inner = compose_real_pod_deletion_finalizer(RealPodDeletionFinalizerDependencies {
             pod_query: store.clone(),
             gc_pod_delete_sink,

@@ -4,10 +4,10 @@ use serde_json::json;
 
 fn controller_store(
     db: &crate::datastore::sqlite::Datastore,
-) -> crate::controller_runtime_adapter::RootControllerLeaderPort {
-    crate::controller_runtime_adapter::RootControllerLeaderPort::new(std::sync::Arc::new(
-        db.clone(),
-    ))
+) -> crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort {
+    crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(
+        std::sync::Arc::new(db.clone()),
+    )
 }
 
 async fn mirror_endpoints_to_endpointslice(

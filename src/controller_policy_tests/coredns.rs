@@ -1,5 +1,5 @@
 use super::*;
-use crate::coredns_bootstrap_adapter::bootstrap_coredns as bootstrap_coredns_root;
+use crate::bootstrap::controller_adapters::coredns_bootstrap_adapter::bootstrap_coredns as bootstrap_coredns_root;
 use klights_controllers::coredns::*;
 use klights_reconcile_api::ControllerStoreResult;
 use serde_json::json;
@@ -26,7 +26,7 @@ async fn bootstrap_coredns(
     node_name: &str,
 ) -> anyhow::Result<()> {
     let controller_pods = std::sync::Arc::new(
-        crate::controller_runtime_adapter::RootControllerPodPort::new_for_test(
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort::new_for_test(
             pod_repository.clone(),
         ),
     );
@@ -38,7 +38,7 @@ async fn bootstrap_coredns(
         crate::controller_test_support::non_pod_finalization_port_for_test(),
         &klights_controllers::ControllerCoordination::new(),
         crate::controller_test_support::deterministic_controller_identity().as_ref(),
-        crate::coredns_bootstrap_adapter::CoreDnsBootstrapConfig {
+        crate::bootstrap::controller_adapters::coredns_bootstrap_adapter::CoreDnsBootstrapConfig {
             tls_port,
             service_cidr,
             containerd_namespace,

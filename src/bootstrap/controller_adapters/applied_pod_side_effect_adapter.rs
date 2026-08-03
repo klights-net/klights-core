@@ -6,7 +6,7 @@ use klights_controllers::side_effects::applied_pod::{
 };
 use klights_reconcile_api::ControllerStoreResult;
 
-use crate::controller_store_error_adapter::map_controller_store_error;
+use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
 use crate::datastore::{DatastoreBackend, ResourceListQuery};
 
 struct BorrowedAppliedPodPdbStore<'a> {
@@ -40,10 +40,14 @@ pub(crate) async fn handle_applied_pod_side_effects(
     pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
     db: &dyn DatastoreBackend,
 ) -> Result<(), AppliedPodSideEffectError> {
-    let workload_store = crate::workload_pod_side_effect_adapter::borrowed_store(db);
-    let job_store = crate::job_side_effect_adapter::borrowed_store(db);
-    let service_store = crate::service_pod_side_effect_adapter::borrowed_store(db);
-    let gc_store = crate::gc_resource_store_adapter::borrowed_store(db);
+    let workload_store =
+        crate::bootstrap::controller_adapters::workload_pod_side_effect_adapter::borrowed_store(db);
+    let job_store =
+        crate::bootstrap::controller_adapters::job_side_effect_adapter::borrowed_store(db);
+    let service_store =
+        crate::bootstrap::controller_adapters::service_pod_side_effect_adapter::borrowed_store(db);
+    let gc_store =
+        crate::bootstrap::controller_adapters::gc_resource_store_adapter::borrowed_store(db);
     let pdb_store = BorrowedAppliedPodPdbStore { db };
     let stores = AppliedPodSideEffectStores::new(
         &service_store,

@@ -350,7 +350,7 @@ impl RootCommittedOutboxDelivery {
         } else {
             None
         };
-        crate::applied_pod_side_effect_adapter::handle_applied_pod_side_effects(
+        crate::bootstrap::controller_adapters::applied_pod_side_effect_adapter::handle_applied_pod_side_effects(
             klights_controllers::side_effects::applied_pod::AppliedPodSideEffectSinks::new(
                 Some(controller_dispatcher.as_ref()
                     as &dyn klights_reconcile_api::ControllerReconcileSink),

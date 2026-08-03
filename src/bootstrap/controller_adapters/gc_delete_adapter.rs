@@ -1,7 +1,5 @@
-use anyhow::Result;
 use klights_cluster_core::{Resource, ResourcePreconditions};
 
-use crate::datastore::DatastoreBackend;
 use crate::datastore::DatastoreHandle;
 
 pub(crate) struct GcOwnerLifecycleAdapter {
@@ -130,72 +128,45 @@ impl klights_reconcile_api::GcNonPodFinalizationPort for GcNonPodFinalizationAda
                     "GC non-Pod finalization port rejects v1/Pod",
                 ));
             }
-            complete_non_foreground_delete(
-                self.db.as_ref(),
-                &request.resource,
-                request.orphan_children,
+            let lifecycle =
+                crate::bootstrap::finalizer_lifecycle_adapter::BorrowedFinalizerLifecycleStore::new(
+                    self.db.as_ref(),
+                );
+            let delete = k8s_native_service::generic_command::NonForegroundDeleteRequest {
+                target: k8s_native_service::generic_command::ResourceDeleteTarget {
+                    api_version: &request.resource.api_version,
+                    kind: &request.resource.kind,
+                    namespace: request.resource.namespace.as_deref(),
+                    name: &request.resource.name,
+                },
+                initial_resource: request.resource.clone(),
+                delete_preconditions: ResourcePreconditions::uid(request.resource.uid.clone()),
+                orphan_children_before_completion: request.orphan_children,
+                uid_mismatch_is_conflict: false,
+                grace_seconds: 0,
+                operation_now: klights_supervisor::SystemWallClock::now_utc(),
+            };
+            match k8s_native_service::generic_command::complete_non_foreground_delete_with_live_recheck(
+                &lifecycle,
+                delete,
             )
             .await
-            .map(|outcome| match outcome {
-                GcNonPodDeleteOutcome::HardDeleted => {
-                    klights_reconcile_api::GcNonPodFinalizationOutcome::HardDeleted
+            {
+                Ok(k8s_native_service::generic_command::DeleteCompletion::HardDeleted(_)) => Ok(
+                    klights_reconcile_api::GcNonPodFinalizationOutcome::HardDeleted,
+                ),
+                Ok(k8s_native_service::generic_command::DeleteCompletion::MarkedTerminating(_)) => {
+                    Ok(klights_reconcile_api::GcNonPodFinalizationOutcome::MarkedTerminating)
                 }
-                GcNonPodDeleteOutcome::MarkedTerminating => {
-                    klights_reconcile_api::GcNonPodFinalizationOutcome::MarkedTerminating
+                Ok(k8s_native_service::generic_command::DeleteCompletion::GoneOrUidChanged)
+                | Err(k8s_native_service::AppError::NotFound(_)) => {
+                    Ok(klights_reconcile_api::GcNonPodFinalizationOutcome::Gone)
                 }
-                GcNonPodDeleteOutcome::Gone => {
-                    klights_reconcile_api::GcNonPodFinalizationOutcome::Gone
-                }
-            })
-            .map_err(|error| {
-                klights_reconcile_api::ReconcileSinkError::unavailable(error.to_string())
-            })
+                Err(error) => Err(klights_reconcile_api::ReconcileSinkError::unavailable(
+                    format!("{error:?}"),
+                )),
+            }
         })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GcNonPodDeleteOutcome {
-    HardDeleted,
-    MarkedTerminating,
-    Gone,
-}
-
-pub(crate) async fn complete_non_foreground_delete(
-    db: &dyn DatastoreBackend,
-    resource: &Resource,
-    orphan_children: bool,
-) -> Result<GcNonPodDeleteOutcome> {
-    let lifecycle =
-        crate::bootstrap::finalizer_lifecycle_adapter::BorrowedFinalizerLifecycleStore::new(db);
-    let request = k8s_native_service::generic_command::NonForegroundDeleteRequest {
-        target: k8s_native_service::generic_command::ResourceDeleteTarget {
-            api_version: &resource.api_version,
-            kind: &resource.kind,
-            namespace: resource.namespace.as_deref(),
-            name: &resource.name,
-        },
-        initial_resource: resource.clone(),
-        delete_preconditions: ResourcePreconditions::uid(resource.uid.clone()),
-        orphan_children_before_completion: orphan_children,
-        uid_mismatch_is_conflict: false,
-        grace_seconds: 0,
-        operation_now: klights_supervisor::SystemWallClock::now_utc(),
-    };
-    match k8s_native_service::generic_command::complete_non_foreground_delete_with_live_recheck(
-        &lifecycle, request,
-    )
-    .await
-    {
-        Ok(k8s_native_service::generic_command::DeleteCompletion::HardDeleted(_)) => {
-            Ok(GcNonPodDeleteOutcome::HardDeleted)
-        }
-        Ok(k8s_native_service::generic_command::DeleteCompletion::MarkedTerminating(_)) => {
-            Ok(GcNonPodDeleteOutcome::MarkedTerminating)
-        }
-        Ok(k8s_native_service::generic_command::DeleteCompletion::GoneOrUidChanged)
-        | Err(k8s_native_service::AppError::NotFound(_)) => Ok(GcNonPodDeleteOutcome::Gone),
-        Err(error) => Err(anyhow::anyhow!("{error:?}")),
     }
 }
 

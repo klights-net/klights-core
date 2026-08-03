@@ -1,6 +1,6 @@
 use super::*;
+use crate::bootstrap::controller_adapters::resource_quota_controller_adapter::reconcile_resource_quotas_for_namespace;
 use crate::datastore::DatastoreBackend;
-use crate::resource_quota_controller_adapter::reconcile_resource_quotas_for_namespace;
 
 use async_trait::async_trait;
 use serde_json::json;

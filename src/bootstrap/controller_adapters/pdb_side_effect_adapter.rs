@@ -9,7 +9,7 @@ use klights_controllers::side_effects::pdb::PdbSideEffectPort;
 use klights_pod_api::{PodListRequest, PodQuery};
 
 #[cfg(test)]
-#[path = "controller_policy_tests/pdb.rs"]
+#[path = "../../controller_policy_tests/pdb.rs"]
 mod policy_tests;
 
 struct RootPdbSideEffectPort {

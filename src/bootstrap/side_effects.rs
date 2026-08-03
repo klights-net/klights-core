@@ -24,45 +24,45 @@ pub(crate) fn default_registry(
         crate::api_state_adapter::RootNamespaceTerminationReconciler::new(namespace_store, metrics);
     let effects = DefaultSideEffects::new(
         klights_controllers::side_effects::apiservice::effect(
-            crate::apiservice_side_effect_adapter::port(db.clone()),
+            crate::bootstrap::controller_adapters::apiservice_side_effect_adapter::port(db.clone()),
             controller_slot.clone(),
         ),
         klights_controllers::side_effects::daemonset_node::effect(
-            crate::daemonset_node_side_effect_adapter::port(db.clone()),
+            crate::bootstrap::controller_adapters::daemonset_node_side_effect_adapter::port(db.clone()),
             controller_slot.clone(),
         ),
         klights_controllers::side_effects::endpoint_mirror::effect(
-            crate::endpoint_mirror_side_effect_adapter::port(db.clone(), identity.clone()),
+            crate::bootstrap::controller_adapters::endpoint_mirror_side_effect_adapter::port(db.clone(), identity.clone()),
         ),
         klights_controllers::side_effects::endpoint_slice_sync::effect(services),
         klights_controllers::side_effects::hpa::effect(
-            crate::hpa_side_effect_adapter::port(db.clone()),
+            crate::bootstrap::controller_adapters::hpa_side_effect_adapter::port(db.clone()),
             controller_slot.clone(),
         ),
         klights_controllers::side_effects::job::effect(
-            crate::job_side_effect_adapter::port(db.clone()),
+            crate::bootstrap::controller_adapters::job_side_effect_adapter::port(db.clone()),
             controller_slot.clone(),
         ),
         klights_controllers::side_effects::namespace_termination::effect(namespace_reconciliation),
         klights_controllers::side_effects::node_taint_manager::effect(
             pod_slot.clone(),
             task_supervisor,
-            Some(crate::node_taint_manager_side_effect_adapter::port(
+            Some(crate::bootstrap::controller_adapters::node_taint_manager_side_effect_adapter::port(
                 db.clone(),
             )),
         ),
-        klights_controllers::side_effects::pdb::effect(crate::pdb_side_effect_adapter::port(
+        klights_controllers::side_effects::pdb::effect(crate::bootstrap::controller_adapters::pdb_side_effect_adapter::port(
             db.clone(),
             pod_slot.clone(),
         )),
         klights_controllers::side_effects::resource_quota::effect(
-            crate::resource_quota_side_effect_adapter::port(db.clone(), pod_slot.clone()),
+            crate::bootstrap::controller_adapters::resource_quota_side_effect_adapter::port(db.clone(), pod_slot.clone()),
         ),
         klights_controllers::side_effects::service_account_defaults::effect(
-            crate::service_account_defaults_side_effect_adapter::port(db.clone(), identity),
+            crate::bootstrap::controller_adapters::service_account_defaults_side_effect_adapter::port(db.clone(), identity),
         ),
         klights_controllers::side_effects::workload_pod::effect(
-            crate::workload_pod_side_effect_adapter::port(db),
+            crate::bootstrap::controller_adapters::workload_pod_side_effect_adapter::port(db),
             controller_slot.clone(),
         ),
     );

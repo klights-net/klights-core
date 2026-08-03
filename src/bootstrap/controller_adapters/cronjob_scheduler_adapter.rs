@@ -11,7 +11,7 @@ use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest};
 use klights_supervisor::TaskSupervisor;
 
 #[cfg(test)]
-#[path = "controller_policy_tests/cronjob.rs"]
+#[path = "../../controller_policy_tests/cronjob.rs"]
 mod cronjob_policy_tests;
 
 struct LeaderCronJobSchedulerRuntime {

@@ -16,8 +16,8 @@ pub async fn run_under_lease<F, Fut>(
     shutdown: CancellationToken,
     on_leader: F,
 ) where
-    F: Fn(ControllerScope, ControllerLease, CancellationToken) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
+    F: Fn(ControllerScope, ControllerLease, CancellationToken) -> Fut + Send + Sync,
+    Fut: Future<Output = ()> + Send,
 {
     loop {
         let lease = tokio::select! {

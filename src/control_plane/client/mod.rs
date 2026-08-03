@@ -1035,7 +1035,7 @@ mod tests {
             ),
         );
         client.set_non_pod_finalization(Arc::new(
-            crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(Arc::new(db.clone())),
+            crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(Arc::new(db.clone())),
         ));
         let dispatcher = crate::controller_test_support::dispatcher_for_test(
             &db,
@@ -1138,7 +1138,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         );
         client.set_non_pod_finalization(Arc::new(
-            crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(Arc::new(db.clone())),
+            crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(Arc::new(db.clone())),
         ));
         let dispatcher = crate::controller_test_support::dispatcher_for_test(
             &db,

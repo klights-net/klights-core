@@ -2590,7 +2590,7 @@ mod tests {
     async fn namespace_termination_enqueues_uid_bound_delete_for_unscheduled_pod() {
         let (workqueue, db, _node_local) = test_workqueue().await;
         workqueue.set_namespace_termination_sink(Arc::new(
-            crate::pod_reconcile_adapter::PodReconcileAdapter::new(
+            crate::bootstrap::controller_adapters::pod_reconcile_adapter::PodReconcileAdapter::new(
                 db.clone(),
                 klights_controllers::side_effects::ControllerDispatcherSlot::new(),
                 SideEffectMetrics::new(),

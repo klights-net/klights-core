@@ -42,14 +42,16 @@ fn fixture_mutation_reconcile(
     store: Arc<PodStore>,
     side_effects: Arc<klights_controllers::side_effects::SideEffectRegistry>,
 ) -> Arc<dyn klights_reconcile_api::PodMutationReconcileSink> {
-    Arc::new(crate::pod_reconcile_adapter::PodReconcileAdapter::new(
-        store.db().clone(),
-        side_effects.controller_dispatcher_slot(),
-        klights_controllers::side_effects::SideEffectMetrics::new(),
-        side_effects,
-        store,
-        crate::controller_test_support::deterministic_controller_identity(),
-    ))
+    Arc::new(
+        crate::bootstrap::controller_adapters::pod_reconcile_adapter::PodReconcileAdapter::new(
+            store.db().clone(),
+            side_effects.controller_dispatcher_slot(),
+            klights_controllers::side_effects::SideEffectMetrics::new(),
+            side_effects,
+            store,
+            crate::controller_test_support::deterministic_controller_identity(),
+        ),
+    )
 }
 
 async fn fixture_node_local() -> std::sync::Arc<crate::datastore::node_local::NodeLocalStores> {
@@ -12650,8 +12652,8 @@ async fn emptydir_survivor_diagnosis_records_mark_workqueue_and_actor_state() {
         "ReplicationController",
         Some(ns.to_string()),
         &repo as &dyn GcPodDeleteSink,
-        &crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
-            db.clone() as crate::datastore::DatastoreHandle
+        &crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
+            db.clone() as crate::datastore::DatastoreHandle,
         ),
         &coordination,
     )

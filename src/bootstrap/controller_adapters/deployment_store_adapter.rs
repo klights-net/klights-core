@@ -2,13 +2,15 @@ use async_trait::async_trait;
 use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
 use klights_reconcile_api::ControllerStoreResult as Result;
 
-use crate::controller_store_error_adapter::map_controller_store_error;
+use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
 use crate::datastore::{DatastoreBackend, ResourceListQuery, ResourcePatchRequest};
 use crate::kubelet::pod_repository::PodObjectWriter;
 use klights_controllers::deployment::{DeploymentPodMutation, DeploymentStore};
 
 #[async_trait]
-impl DeploymentPodMutation for crate::controller_runtime_adapter::RootControllerPodPort {
+impl DeploymentPodMutation
+    for crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort
+{
     async fn merge_deployment_pod_labels(
         &self,
         namespace: &str,

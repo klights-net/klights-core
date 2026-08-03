@@ -37,7 +37,9 @@ async fn reconcile_job_test_with_identity(
 ) -> Result<Value> {
     let repo = crate::controller_test_support::pod_repository_for_test(db);
     let non_pod_finalization =
-        crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(db.clone()));
+        crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
+            std::sync::Arc::new(db.clone()),
+        );
     let store = crate::controller_test_support::controller_store_for_test(db);
     super::reconcile_job(
         &store,
@@ -218,7 +220,7 @@ impl JobPodMutation for ScaleDownDuringJobCreateWriter {
     ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
         PodObjectWriter::create_controller_pod(self, namespace, name, node_name, pod)
             .await
-            .map_err(crate::controller_store_error_adapter::map_controller_store_error)
+            .map_err(crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error)
     }
 
     async fn replace_job_pod_owner_references(
@@ -229,7 +231,7 @@ impl JobPodMutation for ScaleDownDuringJobCreateWriter {
     ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
         PodObjectWriter::update_pod_owner_references(self, namespace, name, owner_references)
             .await
-            .map_err(crate::controller_store_error_adapter::map_controller_store_error)
+            .map_err(crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error)
     }
 }
 

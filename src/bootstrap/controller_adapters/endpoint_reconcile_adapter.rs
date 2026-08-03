@@ -3,7 +3,7 @@ use klights_cluster_core::{Resource, ResourceBatchOperation, ResourcePreconditio
 use klights_reconcile_api::ControllerStoreResult as Result;
 use serde_json::Value;
 
-use crate::controller_store_error_adapter::map_controller_store_error;
+use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
 use crate::datastore::{DatastoreBackend, ResourceListQuery};
 use klights_controllers::endpoints::EndpointReconcileStore;
 

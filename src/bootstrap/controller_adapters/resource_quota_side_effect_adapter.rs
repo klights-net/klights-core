@@ -25,7 +25,7 @@ struct BoundResourceQuotaPort<'a> {
 #[async_trait]
 impl ResourceQuotaSideEffectPort for BoundResourceQuotaPort<'_> {
     async fn recount_namespace(&self, namespace: &str) -> Result<()> {
-        crate::resource_quota_controller_adapter::reconcile_resource_quotas_for_namespace(
+        crate::bootstrap::controller_adapters::resource_quota_controller_adapter::reconcile_resource_quotas_for_namespace(
             self.db,
             self.pod_query,
             namespace,

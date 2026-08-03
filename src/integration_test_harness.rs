@@ -1200,7 +1200,7 @@ impl NativeApiTestHarness {
             pod_subresource.clone(),
         );
         let controller_pod_port = Arc::new(
-            crate::controller_runtime_adapter::RootControllerPodPort::new(
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort::new(
                 pod_repository.clone(),
                 pod_api,
                 pod_subresource,
@@ -1236,10 +1236,10 @@ impl NativeApiTestHarness {
         );
         let network = crate::networking::test_support::mock_network(datastore.clone());
         let controller_leader_ports = Arc::new(
-            crate::controller_runtime_adapter::RootControllerLeaderPort::new(datastore.clone()),
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(datastore.clone()),
         );
         let non_pod_finalization = Arc::new(
-            crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(datastore.clone()),
+            crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(datastore.clone()),
         );
         let controller_dependencies = klights_controllers::ControllerRuntimeDependencies {
             wall_time: chrono::Utc::now,
@@ -1266,17 +1266,17 @@ impl NativeApiTestHarness {
             replicationcontroller_pod_mutation: controller_pod_port,
             pod_delete_sink: pod_repository.clone(),
             reconcile: Arc::new(
-                crate::controller_runtime_adapter::RootControllerReconcilePort::new(
+                crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerReconcilePort::new(
                     non_pod_finalization.clone(),
                 ),
             ),
             network: Arc::new(
-                crate::controller_runtime_adapter::RootControllerNetworkPort::new(
+                crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerNetworkPort::new(
                     network.services().clone(),
                 ),
             ),
             effects: Arc::new(
-                crate::controller_runtime_adapter::RootControllerEffectPort::new(
+                crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerEffectPort::new(
                     klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
                     config.data_root.join("local-path-provisioner"),
                 ),
@@ -1292,15 +1292,16 @@ impl NativeApiTestHarness {
                 supervisor.clone(),
             )) as Arc<dyn klights_controllers::csr_signer::CsrIssuer>
         });
-        let hpa_controller = crate::hpa_controller_adapter::controller(
-            datastore.clone(),
-            pod_repository.clone(),
-            non_pod_finalization,
-            gc_coordination.clone(),
-            Arc::from(config.node_name.as_str()),
-            node_metrics.clone(),
-            controller_identity.clone(),
-        );
+        let hpa_controller =
+            crate::bootstrap::controller_adapters::hpa_controller_adapter::controller(
+                datastore.clone(),
+                pod_repository.clone(),
+                non_pod_finalization,
+                gc_coordination.clone(),
+                Arc::from(config.node_name.as_str()),
+                node_metrics.clone(),
+                controller_identity.clone(),
+            );
         let controller_dispatcher =
             Arc::new(klights_controllers::ControllerDispatcher::new_complete(
                 service_ipam.clone(),
@@ -1421,7 +1422,7 @@ impl NativeApiTestHarness {
             mutation_effects,
             crate::list_query_adapter::DatastoreListResourceVersionPort::new(datastore.clone()),
             crate::list_query_adapter::DatastoreNamespaceListPort::new(datastore.clone()),
-            crate::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
+            crate::bootstrap::controller_adapters::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
                 datastore.clone(),
             ),
             crate::resource_admission_adapter::ResourceAdmissionAdapter::new(
@@ -1439,7 +1440,7 @@ impl NativeApiTestHarness {
             generated.clone(),
             generated,
             Arc::new(
-                crate::gc_delete_adapter::GcOwnerLifecycleAdapter::new_with_coordination(
+                crate::bootstrap::controller_adapters::gc_delete_adapter::GcOwnerLifecycleAdapter::new_with_coordination(
                     datastore.clone(),
                     pod_repository.clone(),
                     gc_coordination,

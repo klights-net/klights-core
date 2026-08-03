@@ -227,12 +227,13 @@ async fn start_leader_scoped_tasks(
         .await
         .context("reconcile kubernetes Service endpoint for active leader")?;
 
-    let scheduler = crate::cronjob_scheduler_adapter::new_leader_scheduler(
-        db_handle.clone(),
-        positioned_watch.clone(),
-        dispatcher_for_cronjobs,
-        task_supervisor.clone(),
-    );
+    let scheduler =
+        crate::bootstrap::controller_adapters::cronjob_scheduler_adapter::new_leader_scheduler(
+            db_handle.clone(),
+            positioned_watch.clone(),
+            dispatcher_for_cronjobs,
+            task_supervisor.clone(),
+        );
     if let Err(e) = scheduler.startup_walk().await {
         tracing::warn!("CronJob scheduler startup walk failed: {:#}", e);
     }

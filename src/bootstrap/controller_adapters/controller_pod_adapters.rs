@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::controller_store_error_adapter::map_controller_store_error;
+use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
 use crate::kubelet::pod_repository::{PodReader, PodRepository};
 use klights_controllers::deployment::DeploymentPodReader;
 use klights_controllers::pdb::PdbPodReader;

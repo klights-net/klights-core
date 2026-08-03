@@ -54,8 +54,8 @@ impl klights_leader_api::LeaderNodeLifecycleStatus for TestNodeLifecycleStatus<'
 
 fn test_pod_store(
     db: &crate::datastore::sqlite::Datastore,
-) -> crate::controller_runtime_adapter::RootControllerPodPort {
-    crate::controller_runtime_adapter::RootControllerPodPort::new_for_test(
+) -> crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort {
+    crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort::new_for_test(
         crate::controller_test_support::pod_repository_for_test(db),
     )
 }
@@ -76,7 +76,7 @@ async fn reconcile_node_lifecycle_once_with_tracker_for_test(
 ) -> anyhow::Result<Option<std::time::Duration>> {
     let pods = test_pod_store(db);
     reconcile_node_lifecycle_once_with_tracker(
-        db as &dyn crate::datastore::DatastoreBackend,
+        &super::borrowed_store(db),
         &TestNodeLifecycleStatus(db),
         &pods,
         tracker,
@@ -95,11 +95,7 @@ async fn reconcile_node_lifecycle_once(
     now: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<Option<std::time::Duration>> {
     let tracker = klights_controllers::node_lease::NodeLeaseTracker::new_at(now);
-    refresh_node_lease_tracker_from_cluster_leases(
-        db as &dyn crate::datastore::DatastoreBackend,
-        &tracker,
-    )
-    .await?;
+    refresh_node_lease_tracker_from_cluster_leases(&super::borrowed_store(db), &tracker).await?;
     reconcile_node_lifecycle_once_with_tracker_for_test(db, &tracker, now).await
 }
 
@@ -697,7 +693,7 @@ async fn deleted_node_event_marks_bound_pods_node_lost_and_wakes_actor() {
     let pod_repository = crate::controller_test_support::pod_repository_for_test(&db);
     let (router, recorder) = test_lifecycle_router();
     let pods =
-        crate::controller_runtime_adapter::RootControllerPodPort::new_for_test(pod_repository);
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort::new_for_test(pod_repository);
     let lifecycle = TestNodeLostSink(router);
     seed_running_pod_on_node(&db, "fake-node-pod", "fake-node-pod-uid", "e2e-fake-node").await;
     seed_running_pod_on_node(&db, "real-node-pod", "real-node-pod-uid", "real-node").await;
@@ -712,7 +708,7 @@ async fn deleted_node_event_marks_bound_pods_node_lost_and_wakes_actor() {
     );
 
     let cleaned = klights_controllers::node_lifecycle::cleanup_pods_bound_to_deleted_node_event(
-        &db as &dyn crate::datastore::DatastoreBackend,
+        &super::borrowed_store(&db),
         &pods,
         None,
         Some(&lifecycle),
@@ -904,11 +900,11 @@ async fn node_lost_cleanup_enqueues_owning_replicaset_after_node_lost_mark() {
     .await
     .unwrap();
 
-    let pods = crate::controller_runtime_adapter::RootControllerPodPort::new_for_test(
+    let pods = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort::new_for_test(
         pod_repository.clone(),
     );
     klights_controllers::node_lifecycle::reconcile_node_lifecycle_once_with_tracker(
-        &db as &dyn crate::datastore::DatastoreBackend,
+        &super::borrowed_store(&db),
         &TestNodeLifecycleStatus(&db),
         &pods,
         &tracker,
@@ -926,7 +922,7 @@ async fn node_lost_cleanup_enqueues_owning_replicaset_after_node_lost_mark() {
         let _ = dispatcher.take_reconcile_key_for_test().await;
     }
     klights_controllers::node_lifecycle::reconcile_node_lifecycle_once_with_tracker(
-        &db as &dyn crate::datastore::DatastoreBackend,
+        &super::borrowed_store(&db),
         &TestNodeLifecycleStatus(&db),
         &pods,
         &tracker,

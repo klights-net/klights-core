@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
 use serde_json::{Value, json};
 
-use crate::controller_store_error_adapter::map_controller_store_error;
+use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
 use crate::datastore::{DatastoreBackend, ResourcePatchRequest};
 use crate::kubelet::pod_repository::{PodReader, PodRepository};
 use klights_controllers::hpa::{
@@ -13,7 +13,7 @@ use klights_controllers::hpa::{
 use klights_node_api::NodeMetrics;
 
 #[cfg(test)]
-#[path = "controller_policy_tests/hpa.rs"]
+#[path = "../../controller_policy_tests/hpa.rs"]
 mod policy_tests;
 
 struct NodeApiHpaMetrics<'a> {

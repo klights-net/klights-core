@@ -192,7 +192,7 @@ impl PdbPodReader for BlockingOncePodReader {
         PodReader::list_pods(self, Some(namespace), None, None, None, None)
             .await
             .map(|listing| listing.items)
-            .map_err(crate::controller_store_error_adapter::map_controller_store_error)
+            .map_err(crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error)
     }
 }
 

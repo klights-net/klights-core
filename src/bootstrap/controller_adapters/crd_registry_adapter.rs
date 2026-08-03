@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::controller_store_error_adapter::map_controller_store_error;
+use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
 use crate::datastore::{DatastoreBackend, DatastoreHandle};
 use klights_controllers::crd::{CrdRegistryReader, CrdRegistryRuntime, CrdRegistryWatchSession};
 use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest};

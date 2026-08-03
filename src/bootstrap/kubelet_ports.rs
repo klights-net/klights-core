@@ -47,7 +47,7 @@ impl LeaderPersistentVolumeEventHandler {
     async fn reconcile_pvc(&self, resource: klights_cluster_core::Resource, event_name: &str) {
         use klights_reconcile_api::PvcReconcileSink;
 
-        let reconcile = crate::pod_reconcile_adapter::PersistentVolumeReconcileAdapter::new(
+        let reconcile = crate::bootstrap::controller_adapters::pod_reconcile_adapter::PersistentVolumeReconcileAdapter::new(
             self.db.as_ref(),
             &self.file_process,
             &self.local_path_provisioner_root,

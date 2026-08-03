@@ -31,8 +31,10 @@ where
     T: crate::datastore::DatastoreBackend + Clone + 'static,
 {
     let non_pod_finalization =
-        crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(db.clone()));
-    let store = crate::controller_runtime_adapter::RootControllerLeaderPort::new(
+        crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
+            std::sync::Arc::new(db.clone()),
+        );
+    let store = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(
         std::sync::Arc::new(db.clone()),
     );
     super::reconcile_deployment(

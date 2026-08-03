@@ -2,13 +2,15 @@ use async_trait::async_trait;
 use klights_cluster_core::Resource;
 use klights_reconcile_api::ControllerStoreResult as Result;
 
-use crate::controller_store_error_adapter::map_controller_store_error;
+use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
 use crate::datastore::{DatastoreBackend, ResourceListQuery};
 use crate::kubelet::pod_repository::PodObjectWriter;
 use klights_controllers::daemonset::{DaemonSetPodMutation, DaemonSetStore};
 
 #[async_trait]
-impl DaemonSetPodMutation for crate::controller_runtime_adapter::RootControllerPodPort {
+impl DaemonSetPodMutation
+    for crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort
+{
     async fn create_daemonset_pod(
         &self,
         namespace: &str,

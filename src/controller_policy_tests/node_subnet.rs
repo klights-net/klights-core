@@ -149,7 +149,7 @@ fn apply_peer_sync_outcome(
     health: &klights_networking::dataplane_health::DataplaneHealth,
     outcome: &klights_controllers::node_subnet::PeerSyncOutcome,
 ) {
-    let health = crate::node_subnet_controller_adapter::DataplaneHealthAdapter::new(health.clone());
+    let health = crate::bootstrap::controller_adapters::node_subnet_controller_adapter::DataplaneHealthAdapter::new(health.clone());
     klights_controllers::node_subnet::apply_peer_sync_outcome(health.as_ref(), outcome);
 }
 

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::controller_store_error_adapter::map_controller_store_error;
+use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
 use crate::datastore::DatastoreHandle;
 use klights_controllers::node_subnet::{
     NodeReadinessPublishFuture, NodeReadinessPublishResult, NodeReadinessPublisher,
@@ -8,7 +8,7 @@ use klights_controllers::node_subnet::{
 };
 
 #[cfg(test)]
-#[path = "controller_policy_tests/node_subnet.rs"]
+#[path = "../../controller_policy_tests/node_subnet.rs"]
 mod policy_tests;
 
 pub struct DatastorePeerTopologyProjection {

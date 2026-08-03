@@ -53,7 +53,7 @@ mod tests {
             __pod_repo.as_ref(),
             crate::controller_test_support::deterministic_controller_identity().as_ref(),
             __pod_repo.as_ref(),
-            &crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(
+            &crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(
                 db.clone(),
             )),
             &deployment_with_rv,

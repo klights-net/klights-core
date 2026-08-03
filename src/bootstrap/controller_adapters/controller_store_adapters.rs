@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
 use serde_json::json;
 
-use crate::controller_store_error_adapter::map_controller_store_error;
+use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
 use crate::datastore::{DatastoreBackend, ResourceListQuery, ResourcePatchRequest};
 use klights_controllers::apiservice::ApiServiceStore;
 use klights_controllers::common::ControllerStatusStore;
@@ -17,13 +17,13 @@ use klights_controllers::rbac_reconcile::RbacPolicyStore;
 use klights_reconcile_api::ControllerStoreResult;
 
 #[cfg(test)]
-#[path = "controller_policy_tests/kube_service.rs"]
+#[path = "../../controller_policy_tests/kube_service.rs"]
 mod kube_service_policy_tests;
 #[cfg(test)]
-#[path = "controller_policy_tests/namespace.rs"]
+#[path = "../../controller_policy_tests/namespace.rs"]
 mod namespace_policy_tests;
 #[cfg(test)]
-#[path = "controller_policy_tests/rbac_reconcile.rs"]
+#[path = "../../controller_policy_tests/rbac_reconcile.rs"]
 mod rbac_reconcile_policy_tests;
 
 #[async_trait]

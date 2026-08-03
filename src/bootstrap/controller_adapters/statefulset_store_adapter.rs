@@ -2,13 +2,15 @@ use async_trait::async_trait;
 use klights_cluster_core::Resource;
 use klights_reconcile_api::ControllerStoreResult as Result;
 
-use crate::controller_store_error_adapter::map_controller_store_error;
+use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
 use crate::datastore::DatastoreBackend;
 use crate::kubelet::pod_repository::PodObjectWriter;
 use klights_controllers::statefulset::{StatefulSetPodMutation, StatefulSetStore};
 
 #[async_trait]
-impl StatefulSetPodMutation for crate::controller_runtime_adapter::RootControllerPodPort {
+impl StatefulSetPodMutation
+    for crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort
+{
     async fn create_statefulset_pod(
         &self,
         namespace: &str,

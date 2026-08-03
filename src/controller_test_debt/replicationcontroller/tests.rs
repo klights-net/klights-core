@@ -404,7 +404,7 @@ macro_rules! impl_replication_controller_mutation {
             ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
                 PodObjectWriter::create_controller_pod(self, namespace, name, node_name, pod)
                     .await
-                    .map_err(crate::controller_store_error_adapter::map_controller_store_error)
+                    .map_err(crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error)
             }
 
             async fn replace_replication_controller_pod_owner_references(
@@ -420,7 +420,7 @@ macro_rules! impl_replication_controller_mutation {
                     owner_references,
                 )
                 .await
-                .map_err(crate::controller_store_error_adapter::map_controller_store_error)
+                .map_err(crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error)
             }
         }
     };

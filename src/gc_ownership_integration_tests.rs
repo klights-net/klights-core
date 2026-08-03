@@ -143,8 +143,10 @@ async fn finalize_foreground_owner_if_ready(
 
 fn non_pod_finalization(
     db: &crate::datastore::sqlite::Datastore,
-) -> crate::gc_delete_adapter::GcNonPodFinalizationAdapter {
-    crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(Arc::new(db.clone()))
+) -> crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter {
+    crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
+        Arc::new(db.clone()),
+    )
 }
 
 struct StatusChurningGcStore {

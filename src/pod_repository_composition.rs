@@ -916,7 +916,7 @@ impl RootPodRepositoryComposition {
         Arc<dyn klights_pod_api::PodScheduling>,
     ) {
         let pod_reconcile = Arc::new(
-            crate::pod_reconcile_adapter::PodReconcileAdapter::new_with_coordination(
+            crate::bootstrap::controller_adapters::pod_reconcile_adapter::PodReconcileAdapter::new_with_coordination(
                 self.db.clone(),
                 self.side_effects.controller_dispatcher_slot(),
                 self.metrics.clone(),
@@ -967,7 +967,7 @@ impl RootPodRepositoryComposition {
                 ),
                 resource_query: self.resource_query.clone(),
                 quota_runtime:
-                    crate::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
+                    crate::bootstrap::controller_adapters::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
                         self.db.clone(),
                     ),
                 supervisor: dependencies.supervisor.clone(),
@@ -1049,8 +1049,9 @@ pub(crate) fn build_pod_repository_parts(
     let gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination> =
         Arc::new(klights_controllers::ControllerCoordination::new());
     #[cfg(test)]
-    let api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator> =
-        Arc::new(crate::resource_name::SystemIdentityGenerator);
+    let api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator> = Arc::new(
+        crate::bootstrap::controller_adapters::system_identity_adapter::SystemIdentityGenerator,
+    );
     let _ = scheduling_mode;
     #[cfg(not(test))]
     let resource_query = cluster_api

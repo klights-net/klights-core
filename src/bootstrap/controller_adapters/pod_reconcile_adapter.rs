@@ -25,7 +25,8 @@ pub(crate) struct PodReconcileAdapter {
     metrics: std::sync::Arc<klights_controllers::side_effects::SideEffectMetrics>,
     side_effects: std::sync::Arc<klights_controllers::side_effects::SideEffectRegistry>,
     pod_reader: std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader>,
-    non_pod_finalization: crate::gc_delete_adapter::GcNonPodFinalizationAdapter,
+    non_pod_finalization:
+        crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter,
     coordination: std::sync::Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
     identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
 }
@@ -61,7 +62,7 @@ impl PodReconcileAdapter {
         identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Self {
         Self {
-            non_pod_finalization: crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
+            non_pod_finalization: crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
                 db.clone(),
             ),
             #[cfg(not(test))]

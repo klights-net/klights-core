@@ -17,6 +17,37 @@ pub enum CoreDnsResourceKind {
     Service,
 }
 
+impl CoreDnsResourceKind {
+    /// Return the canonical Kubernetes identity for this CoreDNS resource.
+    pub fn coordinates(
+        self,
+    ) -> (
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        &'static str,
+    ) {
+        match self {
+            Self::ServiceAccount => ("v1", "ServiceAccount", Some("kube-system"), "coredns"),
+            Self::ClusterRole => (
+                "rbac.authorization.k8s.io/v1",
+                "ClusterRole",
+                None,
+                "system:coredns",
+            ),
+            Self::ClusterRoleBinding => (
+                "rbac.authorization.k8s.io/v1",
+                "ClusterRoleBinding",
+                None,
+                "system:coredns",
+            ),
+            Self::ConfigMap => ("v1", "ConfigMap", Some("kube-system"), "coredns"),
+            Self::Deployment => ("apps/v1", "Deployment", Some("kube-system"), "coredns"),
+            Self::Service => ("v1", "Service", Some("kube-system"), "kube-dns"),
+        }
+    }
+}
+
 #[async_trait]
 pub trait CoreDnsBootstrapStore: Send + Sync {
     async fn get_coredns_resource(
@@ -474,4 +505,53 @@ async fn create_coredns_service(store: &dyn CoreDnsBootstrapStore, dns_ip: &str)
         .await?;
     tracing::info!("Created CoreDNS Service (ClusterIP: {})", dns_ip);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CoreDnsResourceKind;
+
+    #[test]
+    fn resource_kinds_map_to_exact_kubernetes_identities() {
+        let cases = [
+            (
+                CoreDnsResourceKind::ServiceAccount,
+                ("v1", "ServiceAccount", Some("kube-system"), "coredns"),
+            ),
+            (
+                CoreDnsResourceKind::ClusterRole,
+                (
+                    "rbac.authorization.k8s.io/v1",
+                    "ClusterRole",
+                    None,
+                    "system:coredns",
+                ),
+            ),
+            (
+                CoreDnsResourceKind::ClusterRoleBinding,
+                (
+                    "rbac.authorization.k8s.io/v1",
+                    "ClusterRoleBinding",
+                    None,
+                    "system:coredns",
+                ),
+            ),
+            (
+                CoreDnsResourceKind::ConfigMap,
+                ("v1", "ConfigMap", Some("kube-system"), "coredns"),
+            ),
+            (
+                CoreDnsResourceKind::Deployment,
+                ("apps/v1", "Deployment", Some("kube-system"), "coredns"),
+            ),
+            (
+                CoreDnsResourceKind::Service,
+                ("v1", "Service", Some("kube-system"), "kube-dns"),
+            ),
+        ];
+
+        for (kind, expected) in cases {
+            assert_eq!(kind.coordinates(), expected);
+        }
+    }
 }
