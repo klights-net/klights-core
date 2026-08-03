@@ -1,8 +1,6 @@
 use super::*;
-use crate::datastore::Resource;
-use crate::kubelet::pod_repository::PodResourceList as ResourceList;
-use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
-use anyhow::Result;
+use klights_cluster_core::Resource;
+use klights_reconcile_api::ControllerStoreResult;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // The "no `for _iteration in 0..20`" rollout completion loop invariant
@@ -10,12 +8,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 // run as part of `./build.sh`.
 
 struct CountingPodWriter {
-    db: crate::datastore::sqlite::Datastore,
+    db: crate::test_support::TestStore,
     creates: AtomicUsize,
 }
 
 struct ReplicaSetStatusRacingPodReader {
-    db: crate::datastore::sqlite::Datastore,
+    db: crate::test_support::TestStore,
     namespace: String,
     replica_set_name: String,
     replica_set_uid: String,
@@ -23,44 +21,36 @@ struct ReplicaSetStatusRacingPodReader {
 }
 
 #[async_trait::async_trait]
-impl PodReader for ReplicaSetStatusRacingPodReader {
-    async fn get_pod(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
-        self.db.get_resource("v1", "Pod", Some(ns), name).await
-    }
-
-    async fn get_pod_for_uid(&self, ns: &str, name: &str, uid: &str) -> Result<Option<Resource>> {
-        Ok(self
-            .db
-            .get_resource("v1", "Pod", Some(ns), name)
-            .await?
-            .filter(|pod| pod.uid == uid))
-    }
-
-    async fn list_pods(
+impl klights_pod_api::PodQuery for ReplicaSetStatusRacingPodReader {
+    fn get_pod(
         &self,
-        ns: Option<&str>,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        limit: Option<i64>,
-        continue_token: Option<&str>,
-    ) -> Result<ResourceList> {
-        self.db
-            .list_resources(
-                "v1",
-                "Pod",
-                ns,
-                crate::datastore::ResourceListQuery::new(
-                    label_selector,
-                    field_selector,
-                    limit,
-                    continue_token,
-                ),
-            )
-            .await
-            .map(Into::into)
+        request: klights_pod_api::PodGetRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Option<Resource>> {
+        klights_pod_api::PodQuery::get_pod(&self.db, request)
     }
 
-    async fn list_pods_by_owner_uid(&self, ns: &str, owner_uid: &str) -> Result<Vec<Resource>> {
+    fn list_pods(
+        &self,
+        request: klights_pod_api::PodListRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodListResult> {
+        klights_pod_api::PodQuery::list_pods(&self.db, request)
+    }
+
+    fn list_pods_by_owner_uid(
+        &self,
+        request: klights_pod_api::PodOwnerListRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Vec<Resource>> {
+        klights_pod_api::PodQuery::list_pods_by_owner_uid(&self.db, request)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::deployment::DeploymentPodReader for ReplicaSetStatusRacingPodReader {
+    async fn list_pods_by_owner_uid(
+        &self,
+        ns: &str,
+        owner_uid: &str,
+    ) -> ControllerStoreResult<Vec<Resource>> {
         if ns == self.namespace
             && owner_uid == self.replica_set_uid
             && !self.bumped.swap(true, Ordering::SeqCst)
@@ -70,7 +60,7 @@ impl PodReader for ReplicaSetStatusRacingPodReader {
                 .get_resource("apps/v1", "ReplicaSet", Some(ns), &self.replica_set_name)
                 .await?
                 .expect("racing ReplicaSet should exist");
-            klights_controllers::common::write_status_for_resource(
+            crate::common::write_status_for_resource(
                 &self.db,
                 &rs,
                 &json!({
@@ -87,7 +77,10 @@ impl PodReader for ReplicaSetStatusRacingPodReader {
                     }]
                 }),
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                klights_reconcile_api::ControllerStoreError::unavailable(error.to_string())
+            })?;
         }
 
         let pods = self
@@ -96,7 +89,7 @@ impl PodReader for ReplicaSetStatusRacingPodReader {
                 "v1",
                 "Pod",
                 Some(ns),
-                crate::datastore::ResourceListQuery::all(),
+                crate::test_support::ResourceListQuery::all(),
             )
             .await?;
         Ok(pods
@@ -114,77 +107,62 @@ impl PodReader for ReplicaSetStatusRacingPodReader {
             })
             .collect())
     }
+
+    async fn list_namespace_pods(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(self
+            .db
+            .list_resources(
+                "v1",
+                "Pod",
+                Some(namespace),
+                crate::test_support::ResourceListQuery::all(),
+            )
+            .await?
+            .items)
+    }
 }
 
 #[async_trait::async_trait]
-impl PodObjectWriter for CountingPodWriter {
-    async fn create_controller_pod(
+impl crate::replicaset::ReplicaSetPodMutation for CountingPodWriter {
+    async fn create_replicaset_pod(
         &self,
         ns: &str,
         name: &str,
         _node_name: &str,
         pod: serde_json::Value,
-    ) -> Result<Resource> {
+    ) -> ControllerStoreResult<Resource> {
         self.creates.fetch_add(1, Ordering::SeqCst);
-        self.db
-            .create_resource("v1", "Pod", Some(ns), name, pod)
-            .await
+        self.db.create_controller_pod(ns, name, pod).await
     }
 
-    async fn delete_pod(&self, ns: &str, name: &str) -> Result<()> {
-        self.db.delete_resource("v1", "Pod", Some(ns), name).await
-    }
-
-    async fn update_pod_owner_references(
+    async fn replace_replicaset_pod_owner_references(
         &self,
         ns: &str,
         name: &str,
         owner_refs: Vec<serde_json::Value>,
-    ) -> Result<Resource> {
-        let current = self
-            .db
-            .get_resource("v1", "Pod", Some(ns), name)
-            .await?
-            .expect("Pod should exist");
-        let mut pod: serde_json::Value = (*current.data).clone();
-        pod["metadata"]["ownerReferences"] = serde_json::Value::Array(owner_refs);
+    ) -> ControllerStoreResult<Resource> {
         self.db
-            .update_resource("v1", "Pod", Some(ns), name, pod, current.resource_version)
+            .replace_pod_owner_references(ns, name, owner_refs)
             .await
     }
+}
 
-    async fn merge_pod_labels(
+#[async_trait::async_trait]
+impl crate::deployment::DeploymentPodMutation for CountingPodWriter {
+    async fn merge_deployment_pod_labels(
         &self,
         ns: &str,
         name: &str,
         labels: Vec<(String, String)>,
-    ) -> Result<Resource> {
-        let current = self
-            .db
-            .get_resource("v1", "Pod", Some(ns), name)
-            .await?
-            .expect("Pod should exist");
-        let mut pod: serde_json::Value = (*current.data).clone();
-        let label_map = pod["metadata"]
-            .as_object_mut()
-            .unwrap()
-            .entry("labels".to_string())
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .unwrap();
-        for (key, value) in labels {
-            label_map.insert(key, json!(value));
-        }
-        self.db
-            .update_resource("v1", "Pod", Some(ns), name, pod, current.resource_version)
-            .await
+    ) -> ControllerStoreResult<Resource> {
+        self.db.merge_pod_labels(ns, name, labels).await
     }
 }
 
 #[tokio::test]
 async fn test_rolling_update_does_not_resurge_new_rs_after_old_rs_reaches_zero() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let pod_repo = crate::test_support::pod_repository_for_test(&db);
     let pod_writer = CountingPodWriter {
         db: db.clone(),
         creates: AtomicUsize::new(0),
@@ -355,7 +333,7 @@ async fn test_rolling_update_does_not_resurge_new_rs_after_old_rs_reaches_zero()
     .await
     .unwrap();
 
-    let deployment_with_rv = crate::controller_test_support::inject_resource_version(
+    let deployment_with_rv = crate::test_support::inject_resource_version(
         created_deploy.data,
         created_deploy.resource_version,
     );
@@ -388,7 +366,7 @@ async fn test_rolling_update_does_not_resurge_new_rs_after_old_rs_reaches_zero()
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("app=cleanup"), None, None, None),
+            crate::test_support::ResourceListQuery::new(Some("app=cleanup"), None, None, None),
         )
         .await
         .unwrap();
@@ -397,8 +375,8 @@ async fn test_rolling_update_does_not_resurge_new_rs_after_old_rs_reaches_zero()
 
 #[tokio::test]
 async fn test_rolling_update_scales_new_rs_after_simultaneous_template_update_and_scale_up() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let pod_repo = crate::test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-lifecycle-scale-up";
     let old_rs_uid = "old-rs-lifecycle-scale-up";
     let new_rs_uid = "new-rs-lifecycle-scale-up";
@@ -590,7 +568,7 @@ async fn test_rolling_update_scales_new_rs_after_simultaneous_template_update_an
             .unwrap();
     }
 
-    let deployment_with_rv = crate::controller_test_support::inject_resource_version(
+    let deployment_with_rv = crate::test_support::inject_resource_version(
         created_deploy.data,
         created_deploy.resource_version,
     );
@@ -619,8 +597,8 @@ async fn test_rolling_update_scales_new_rs_after_simultaneous_template_update_an
 
 #[tokio::test]
 async fn test_rolling_update_uses_live_new_rs_pod_readiness_for_old_rs_scale_down() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let pod_repo = crate::test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-live-new-ready";
     let first_old_rs_uid = "first-old-rs-live-new-ready";
     let second_old_rs_uid = "second-old-rs-live-new-ready";
@@ -836,7 +814,7 @@ async fn test_rolling_update_uses_live_new_rs_pod_readiness_for_old_rs_scale_dow
         .await
         .unwrap();
 
-    let deployment_with_rv = crate::controller_test_support::inject_resource_version(
+    let deployment_with_rv = crate::test_support::inject_resource_version(
         created_deploy.data,
         created_deploy.resource_version,
     );
@@ -881,8 +859,8 @@ async fn test_rolling_update_uses_live_new_rs_pod_readiness_for_old_rs_scale_dow
 
 #[tokio::test]
 async fn test_rollover_scales_unavailable_old_rs_before_available_old_rs() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let pod_repo = crate::test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-rollover-preserve-availability";
     let bad_rs_uid = "bad-rs-rollover-preserve-availability";
     let healthy_rs_uid = "healthy-rs-rollover-preserve-availability";
@@ -1132,7 +1110,7 @@ async fn test_rollover_scales_unavailable_old_rs_before_available_old_rs() {
         .await
         .unwrap();
 
-    let deployment_with_rv = crate::controller_test_support::inject_resource_version(
+    let deployment_with_rv = crate::test_support::inject_resource_version(
         created_deploy.data,
         created_deploy.resource_version,
     );
@@ -1175,258 +1153,9 @@ async fn test_rollover_scales_unavailable_old_rs_before_available_old_rs() {
 }
 
 #[tokio::test]
-async fn test_rollover_adoption_redrives_zero_replica_old_rs_pod_delete() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let pod_repo =
-        crate::controller_test_support::deferred_outbox_pod_repository_for_test(&db).await;
-    let deploy_uid = "deploy-uid-adopted-rollover";
-    let old_rs_uid = "old-rs-uid-adopted-rollover";
-
-    let deployment = json!({
-        "apiVersion": "apps/v1",
-        "kind": "Deployment",
-        "metadata": {
-            "name": "test-rolling-update-deployment",
-            "namespace": "default",
-            "uid": deploy_uid,
-            "resourceVersion": "0"
-        },
-        "spec": {
-            "replicas": 1,
-            "selector": {"matchLabels": {"name": "sample-pod"}},
-            "strategy": {
-                "type": "RollingUpdate",
-                "rollingUpdate": {
-                    "maxSurge": 1,
-                    "maxUnavailable": 0
-                }
-            },
-            "template": {
-                "metadata": {"labels": {"name": "sample-pod"}},
-                "spec": {
-                    "containers": [{
-                        "name": "agnhost",
-                        "image": "registry.k8s.io/e2e-test-images/agnhost:2.56"
-                    }]
-                }
-            }
-        }
-    });
-    let created_deploy = db
-        .create_resource(
-            "apps/v1",
-            "Deployment",
-            Some("default"),
-            "test-rolling-update-deployment",
-            deployment,
-        )
-        .await
-        .unwrap();
-
-    let old_rs = json!({
-        "apiVersion": "apps/v1",
-        "kind": "ReplicaSet",
-        "metadata": {
-            "name": "test-rolling-update-controller",
-            "namespace": "default",
-            "uid": old_rs_uid,
-            "labels": {"name": "sample-pod", "pod": "httpd"},
-            "annotations": {"deployment.kubernetes.io/revision": "1"}
-        },
-        "spec": {
-            "replicas": 1,
-            "selector": {"matchLabels": {"name": "sample-pod", "pod": "httpd"}},
-            "template": {
-                "metadata": {"labels": {"name": "sample-pod", "pod": "httpd"}},
-                "spec": {
-                    "containers": [{
-                        "name": "httpd",
-                        "image": "registry.k8s.io/e2e-test-images/httpd:2.4.38-4"
-                    }]
-                }
-            }
-        },
-        "status": {
-            "replicas": 1,
-            "readyReplicas": 1,
-            "availableReplicas": 1,
-            "observedGeneration": 1
-        }
-    });
-    db.create_resource(
-        "apps/v1",
-        "ReplicaSet",
-        Some("default"),
-        "test-rolling-update-controller",
-        old_rs,
-    )
-    .await
-    .unwrap();
-
-    let old_pod = json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": "test-rolling-update-controller-130dc",
-            "namespace": "default",
-            "uid": "old-pod-uid-adopted-rollover",
-            "labels": {"name": "sample-pod", "pod": "httpd"},
-            "ownerReferences": [{
-                "apiVersion": "apps/v1",
-                "kind": "ReplicaSet",
-                "name": "test-rolling-update-controller",
-                "uid": old_rs_uid,
-                "controller": true,
-                "blockOwnerDeletion": true
-            }]
-        },
-        "spec": {"containers": [{"name": "httpd", "image": "registry.k8s.io/e2e-test-images/httpd:2.4.38-4"}]},
-        "status": {
-            "phase": "Running",
-            "conditions": [
-                {"type": "Ready", "status": "True"},
-                {"type": "ContainersReady", "status": "True"}
-            ]
-        }
-    });
-    db.create_resource(
-        "v1",
-        "Pod",
-        Some("default"),
-        "test-rolling-update-controller-130dc",
-        old_pod,
-    )
-    .await
-    .unwrap();
-
-    let deployment_with_rv = crate::controller_test_support::inject_resource_version(
-        created_deploy.data,
-        created_deploy.resource_version,
-    );
-    reconcile_deployment(
-        &db,
-        pod_repo.as_ref(),
-        pod_repo.as_ref(),
-        pod_repo.as_ref(),
-        &deployment_with_rv,
-        "test-node",
-    )
-    .await
-    .unwrap();
-
-    let created_pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("name=sample-pod"), None, None, None),
-        )
-        .await
-        .unwrap();
-    let new_pod = created_pods
-        .items
-        .iter()
-        .find(|pod| pod.uid != "old-pod-uid-adopted-rollover")
-        .expect("first rollout reconcile must create a new ReplicaSet pod");
-    let mut ready_new_pod = (*new_pod.data).clone();
-    ready_new_pod["status"] = json!({
-        "phase": "Running",
-        "conditions": [
-            {"type": "Ready", "status": "True"},
-            {"type": "ContainersReady", "status": "True"}
-        ]
-    });
-    db.update_resource(
-        "v1",
-        "Pod",
-        Some("default"),
-        &new_pod.name,
-        ready_new_pod,
-        new_pod.resource_version,
-    )
-    .await
-    .unwrap();
-
-    let current_deployment = db
-        .get_resource(
-            "apps/v1",
-            "Deployment",
-            Some("default"),
-            "test-rolling-update-deployment",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    let current_deployment_with_rv = crate::controller_test_support::inject_resource_version(
-        current_deployment.data,
-        current_deployment.resource_version,
-    );
-    reconcile_deployment(
-        &db,
-        pod_repo.as_ref(),
-        pod_repo.as_ref(),
-        pod_repo.as_ref(),
-        &current_deployment_with_rv,
-        "test-node",
-    )
-    .await
-    .unwrap();
-
-    let live_old_rs = db
-        .get_resource(
-            "apps/v1",
-            "ReplicaSet",
-            Some("default"),
-            "test-rolling-update-controller",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        live_old_rs.data["spec"]["replicas"],
-        json!(0),
-        "Deployment must scale the adopted old ReplicaSet down during rollout"
-    );
-
-    let old_pod_after = db
-        .get_resource(
-            "v1",
-            "Pod",
-            Some("default"),
-            "test-rolling-update-controller-130dc",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        old_pod_after
-            .data
-            .pointer("/metadata/deletionTimestamp")
-            .is_some(),
-        "adopted old ReplicaSet pod must be marked terminating through the PodRepository actor-owned delete path"
-    );
-
-    let deployment_after = db
-        .get_resource(
-            "apps/v1",
-            "Deployment",
-            Some("default"),
-            "test-rolling-update-deployment",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        deployment_after.data["status"]["updatedReplicas"],
-        json!(1),
-        "rollout status must be able to reach completion after the old pod is terminating"
-    );
-}
-
-#[tokio::test]
 async fn test_rolling_update_initial_step_keeps_min_available_on_old_rs() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let __pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-partial-rollout";
 
     let deployment = json!({
@@ -1464,10 +1193,8 @@ async fn test_rolling_update_initial_step_keeps_min_available_on_old_rs() {
         .create_resource("apps/v1", "Deployment", Some("default"), "web", deployment)
         .await
         .unwrap();
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let deploy_with_rv =
+        crate::test_support::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1527,10 +1254,8 @@ async fn test_rolling_update_initial_step_keeps_min_available_on_old_rs() {
         )
         .await
         .unwrap();
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
-        updated.data,
-        updated.resource_version,
-    );
+    let deploy_with_rv =
+        crate::test_support::inject_resource_version(updated.data, updated.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1547,7 +1272,7 @@ async fn test_rolling_update_initial_step_keeps_min_available_on_old_rs() {
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1596,8 +1321,8 @@ async fn test_rolling_update_initial_step_keeps_min_available_on_old_rs() {
 
 #[tokio::test]
 async fn test_proportional_scaling_keeps_unavailable_new_rs_within_surge_budget() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let __pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-proportional-scaling";
 
     let deployment = json!({
@@ -1641,10 +1366,8 @@ async fn test_proportional_scaling_keeps_unavailable_new_rs_within_surge_budget(
         )
         .await
         .unwrap();
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let deploy_with_rv =
+        crate::test_support::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1661,7 +1384,7 @@ async fn test_proportional_scaling_keeps_unavailable_new_rs_within_surge_budget(
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1688,22 +1411,21 @@ async fn test_proportional_scaling_keeps_unavailable_new_rs_within_surge_budget(
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
     for rs in rs_after_ready.items {
-        let rs_with_rv =
-            crate::controller_test_support::inject_resource_version(rs.data, rs.resource_version);
-        klights_controllers::replicaset::reconcile_replicaset(
-            &crate::controller_test_support::controller_store_for_test(&db),
+        let rs_with_rv = crate::test_support::inject_resource_version(rs.data, rs.resource_version);
+        crate::replicaset::reconcile_replicaset(
+            &db,
             __pod_repo.as_ref(),
             __pod_repo.as_ref(),
-            crate::controller_test_support::deterministic_controller_identity().as_ref(),
+            crate::test_support::deterministic_controller_identity().as_ref(),
             __pod_repo.as_ref(),
-            crate::controller_test_support::non_pod_finalization_port_for_test(),
+            &db,
             &rs_with_rv,
-            crate::controller_test_support::test_reconcile_context(coordination(), "test-node"),
+            crate::test_support::test_reconcile_context(coordination(), "test-node"),
         )
         .await
         .unwrap();
@@ -1732,10 +1454,8 @@ async fn test_proportional_scaling_keeps_unavailable_new_rs_within_surge_budget(
         )
         .await
         .unwrap();
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
-        updated.data,
-        updated.resource_version,
-    );
+    let deploy_with_rv =
+        crate::test_support::inject_resource_version(updated.data, updated.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1757,7 +1477,7 @@ async fn test_proportional_scaling_keeps_unavailable_new_rs_within_surge_budget(
         .await
         .unwrap()
         .unwrap();
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
+    let deploy_with_rv = crate::test_support::inject_resource_version(
         current_deploy.data,
         current_deploy.resource_version,
     );
@@ -1777,7 +1497,7 @@ async fn test_proportional_scaling_keeps_unavailable_new_rs_within_surge_budget(
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1849,10 +1569,8 @@ async fn test_proportional_scaling_keeps_unavailable_new_rs_within_surge_budget(
         )
         .await
         .unwrap();
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
-        scaled.data,
-        scaled.resource_version,
-    );
+    let deploy_with_rv =
+        crate::test_support::inject_resource_version(scaled.data, scaled.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1869,7 +1587,7 @@ async fn test_proportional_scaling_keeps_unavailable_new_rs_within_surge_budget(
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1900,8 +1618,8 @@ async fn test_proportional_scaling_keeps_unavailable_new_rs_within_surge_budget(
 
 #[tokio::test]
 async fn test_proportional_scaling_is_idempotent_when_previous_attempt_partially_applied() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let __pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-proportional-partial";
     let old_rs_uid = "old-rs-uid-proportional-partial";
     let new_rs_uid = "new-rs-uid-proportional-partial";
@@ -2061,7 +1779,7 @@ async fn test_proportional_scaling_is_idempotent_when_previous_attempt_partially
     .await
     .unwrap();
 
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
+    let deploy_with_rv = crate::test_support::inject_resource_version(
         created_deploy.data,
         created_deploy.resource_version,
     );
@@ -2106,8 +1824,8 @@ async fn test_proportional_scaling_is_idempotent_when_previous_attempt_partially
 
 #[tokio::test]
 async fn test_rollout_replicasets_record_desired_and_max_replica_annotations() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let __pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-rs-scale-annotations";
 
     let deployment = json!({
@@ -2145,10 +1863,8 @@ async fn test_rollout_replicasets_record_desired_and_max_replica_annotations() {
         )
         .await
         .unwrap();
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let deploy_with_rv =
+        crate::test_support::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -2165,7 +1881,7 @@ async fn test_rollout_replicasets_record_desired_and_max_replica_annotations() {
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -2189,8 +1905,8 @@ async fn test_rollout_replicasets_record_desired_and_max_replica_annotations() {
 async fn test_rollover_with_unavailable_new_rs_keeps_old_rs_at_max_unavailable_zero() {
     // Regression: with maxUnavailable=0, a stuck new RS rollout must not
     // scale the adopted old RS below 1 while new RS pods are unavailable.
-    let db = crate::datastore::test_support::in_memory().await;
-    let __pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-rollover-maxunavail-zero";
     let old_rs_uid = "rs-uid-rollover-old";
 
@@ -2311,10 +2027,8 @@ async fn test_rollover_with_unavailable_new_rs_keeps_old_rs_at_max_unavailable_z
         .await
         .unwrap();
 
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let deploy_with_rv =
+        crate::test_support::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -2337,7 +2051,7 @@ async fn test_rollover_with_unavailable_new_rs_keeps_old_rs_at_max_unavailable_z
         .await
         .unwrap()
         .unwrap();
-    let deploy_with_rv2 = crate::controller_test_support::inject_resource_version(
+    let deploy_with_rv2 = crate::test_support::inject_resource_version(
         current_deploy.data,
         current_deploy.resource_version,
     );
@@ -2357,7 +2071,7 @@ async fn test_rollover_with_unavailable_new_rs_keeps_old_rs_at_max_unavailable_z
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -2412,7 +2126,7 @@ async fn test_rollover_with_unavailable_new_rs_keeps_old_rs_at_max_unavailable_z
         )
         .await
         .unwrap();
-    let deploy_with_rv3 = crate::controller_test_support::inject_resource_version(
+    let deploy_with_rv3 = crate::test_support::inject_resource_version(
         updated_deploy.data,
         updated_deploy.resource_version,
     );
@@ -2432,7 +2146,7 @@ async fn test_rollover_with_unavailable_new_rs_keeps_old_rs_at_max_unavailable_z
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -2508,8 +2222,8 @@ async fn test_rollover_with_unavailable_new_rs_keeps_old_rs_at_max_unavailable_z
 
 #[tokio::test]
 async fn test_rollover_redrives_zero_replica_old_rs_with_live_pods() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let pod_repo = crate::test_support::pod_repository_for_test(&db);
     let namespace = "default";
     let deploy_uid = "deploy-uid-rollover-stuck-old-pod";
     let old_rs_uid = "old-rs-uid-rollover-stuck-old-pod";
@@ -2682,7 +2396,7 @@ async fn test_rollover_redrives_zero_replica_old_rs_with_live_pods() {
             .unwrap();
     }
 
-    let deployment_with_rv = crate::controller_test_support::inject_resource_version(
+    let deployment_with_rv = crate::test_support::inject_resource_version(
         created_deployment.data,
         created_deployment.resource_version,
     );
@@ -2729,8 +2443,8 @@ async fn test_rollover_redrives_zero_replica_old_rs_with_live_pods() {
 
 #[tokio::test]
 async fn test_rolling_update_scale_down_tolerates_replicaset_status_rv_race() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let pod_repo = crate::test_support::pod_repository_for_test(&db);
     let namespace = "default";
     let deploy_uid = "deploy-uid-rs-status-race";
     let old_rs_uid = "old-rs-uid-rs-status-race";
@@ -2908,7 +2622,7 @@ async fn test_rolling_update_scale_down_tolerates_replicaset_status_rv_race() {
         replica_set_uid: old_rs_uid.to_string(),
         bumped: AtomicBool::new(false),
     };
-    let deployment_with_rv = crate::controller_test_support::inject_resource_version(
+    let deployment_with_rv = crate::test_support::inject_resource_version(
         created_deployment.data,
         created_deployment.resource_version,
     );
@@ -2940,8 +2654,8 @@ async fn test_rolling_update_scale_down_tolerates_replicaset_status_rv_race() {
 
 #[tokio::test]
 async fn test_rolling_update_creation_redrives_adopted_zero_replica_old_rs_with_live_pod() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let pod_repo = crate::test_support::pod_repository_for_test(&db);
     let namespace = "default";
     let deploy_uid = "deploy-uid-adopted-zero-old-rs";
     let old_rs_uid = "old-rs-uid-adopted-zero-old-rs";
@@ -3051,7 +2765,7 @@ async fn test_rolling_update_creation_redrives_adopted_zero_replica_old_rs_with_
         )
         .await
         .unwrap();
-    let deployment_with_rv = crate::controller_test_support::inject_resource_version(
+    let deployment_with_rv = crate::test_support::inject_resource_version(
         created_deployment.data,
         created_deployment.resource_version,
     );
@@ -3088,8 +2802,8 @@ async fn test_rolling_update_creation_redrives_adopted_zero_replica_old_rs_with_
 
 #[tokio::test]
 async fn test_adopted_replicaset_and_existing_pods_get_matching_pod_template_hash() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let pod_repo = crate::test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-adopt-hash";
     let rs_uid = "rs-uid-adopt-hash";
 
@@ -3175,10 +2889,8 @@ async fn test_adopted_replicaset_and_existing_pods_get_matching_pod_template_has
         .await
         .unwrap();
 
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let deploy_with_rv =
+        crate::test_support::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         pod_repo.as_ref(),
@@ -3240,8 +2952,8 @@ async fn test_adopted_replicaset_and_existing_pods_get_matching_pod_template_has
 
 #[tokio::test]
 async fn test_completed_rollover_deletes_multiple_previous_hash_replicasets() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let pod_repo = crate::test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-clean-prev-rs";
 
     let deployment = json!({
@@ -3381,10 +3093,8 @@ async fn test_completed_rollover_deletes_multiple_previous_hash_replicasets() {
     .await
     .unwrap();
 
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let deploy_with_rv =
+        crate::test_support::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         pod_repo.as_ref(),
@@ -3401,7 +3111,7 @@ async fn test_completed_rollover_deletes_multiple_previous_hash_replicasets() {
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -3411,8 +3121,8 @@ async fn test_completed_rollover_deletes_multiple_previous_hash_replicasets() {
 
 #[tokio::test]
 async fn test_reconcile_deployment_rolling_update_completes() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let __pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-complete";
 
     // Create initial deployment
@@ -3422,10 +3132,8 @@ async fn test_reconcile_deployment_rolling_update_completes() {
         .await
         .unwrap();
 
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let deploy_with_rv =
+        crate::test_support::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -3458,10 +3166,8 @@ async fn test_reconcile_deployment_rolling_update_completes() {
         .await
         .unwrap();
 
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
-        updated.data,
-        updated.resource_version,
-    );
+    let deploy_with_rv =
+        crate::test_support::inject_resource_version(updated.data, updated.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -3479,7 +3185,7 @@ async fn test_reconcile_deployment_rolling_update_completes() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -3506,22 +3212,21 @@ async fn test_reconcile_deployment_rolling_update_completes() {
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
     for rs in rs_after_ready.items {
-        let rs_with_rv =
-            crate::controller_test_support::inject_resource_version(rs.data, rs.resource_version);
-        klights_controllers::replicaset::reconcile_replicaset(
-            &crate::controller_test_support::controller_store_for_test(&db),
+        let rs_with_rv = crate::test_support::inject_resource_version(rs.data, rs.resource_version);
+        crate::replicaset::reconcile_replicaset(
+            &db,
             __pod_repo.as_ref(),
             __pod_repo.as_ref(),
-            crate::controller_test_support::deterministic_controller_identity().as_ref(),
+            crate::test_support::deterministic_controller_identity().as_ref(),
             __pod_repo.as_ref(),
-            crate::controller_test_support::non_pod_finalization_port_for_test(),
+            &db,
             &rs_with_rv,
-            crate::controller_test_support::test_reconcile_context(coordination(), "test-node"),
+            crate::test_support::test_reconcile_context(coordination(), "test-node"),
         )
         .await
         .unwrap();
@@ -3535,7 +3240,7 @@ async fn test_reconcile_deployment_rolling_update_completes() {
         .unwrap()
         .unwrap();
 
-    let deploy_with_rv2 = crate::controller_test_support::inject_resource_version(
+    let deploy_with_rv2 = crate::test_support::inject_resource_version(
         current_deploy2.data,
         current_deploy2.resource_version,
     );
@@ -3556,7 +3261,7 @@ async fn test_reconcile_deployment_rolling_update_completes() {
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -3658,8 +3363,8 @@ fn make_deployment_with_strategy(fixture: DeploymentStrategyFixture<'_>) -> Valu
 
 #[tokio::test]
 async fn test_reconcile_deployment_rolling_update_percentage_strategy() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let __pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-percent";
 
     // Create deployment with 10 replicas and 50% maxSurge/maxUnavailable
@@ -3678,10 +3383,8 @@ async fn test_reconcile_deployment_rolling_update_percentage_strategy() {
         .await
         .unwrap();
 
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let deploy_with_rv =
+        crate::test_support::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -3722,10 +3425,8 @@ async fn test_reconcile_deployment_rolling_update_percentage_strategy() {
         .await
         .unwrap();
 
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
-        updated.data,
-        updated.resource_version,
-    );
+    let deploy_with_rv =
+        crate::test_support::inject_resource_version(updated.data, updated.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -3742,7 +3443,7 @@ async fn test_reconcile_deployment_rolling_update_percentage_strategy() {
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -3769,8 +3470,8 @@ async fn test_reconcile_deployment_rolling_update_percentage_strategy() {
 
 #[tokio::test]
 async fn test_reconcile_deployment_tracks_revision_numbers() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let __pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-revision";
 
     // Create initial deployment with nginx:1.14
@@ -3780,10 +3481,8 @@ async fn test_reconcile_deployment_tracks_revision_numbers() {
         .await
         .unwrap();
 
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let deploy_with_rv =
+        crate::test_support::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -3801,7 +3500,7 @@ async fn test_reconcile_deployment_tracks_revision_numbers() {
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -3816,8 +3515,8 @@ async fn test_reconcile_deployment_tracks_revision_numbers() {
 
 #[tokio::test]
 async fn test_reconcile_deployment_rollback_to_previous_revision() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let __pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-rollback";
 
     // Create deployment with nginx:1.14 (revision 1)
@@ -3827,10 +3526,8 @@ async fn test_reconcile_deployment_rollback_to_previous_revision() {
         .await
         .unwrap();
 
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let deploy_with_rv =
+        crate::test_support::inject_resource_version(created.data, created.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -3862,10 +3559,8 @@ async fn test_reconcile_deployment_rollback_to_previous_revision() {
         .await
         .unwrap();
 
-    let deploy_with_rv = crate::controller_test_support::inject_resource_version(
-        updated.data,
-        updated.resource_version,
-    );
+    let deploy_with_rv =
+        crate::test_support::inject_resource_version(updated.data, updated.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -3883,7 +3578,7 @@ async fn test_reconcile_deployment_rollback_to_previous_revision() {
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -3926,10 +3621,8 @@ async fn test_reconcile_deployment_rollback_to_previous_revision() {
         .await
         .unwrap();
 
-    let deploy_with_rv2 = crate::controller_test_support::inject_resource_version(
-        updated2.data,
-        updated2.resource_version,
-    );
+    let deploy_with_rv2 =
+        crate::test_support::inject_resource_version(updated2.data, updated2.resource_version);
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),

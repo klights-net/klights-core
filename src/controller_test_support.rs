@@ -253,40 +253,6 @@ pub(crate) fn deterministic_controller_identity()
     ControllerIdentityTestGraph::default().identity()
 }
 
-pub(crate) struct ScriptedControllerIdentityGenerator {
-    uids: std::sync::Mutex<std::collections::VecDeque<String>>,
-    uid_calls: std::sync::atomic::AtomicUsize,
-}
-
-impl ScriptedControllerIdentityGenerator {
-    pub(crate) fn with_uids(uids: impl IntoIterator<Item = &'static str>) -> Self {
-        Self {
-            uids: std::sync::Mutex::new(uids.into_iter().map(str::to_string).collect()),
-            uid_calls: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    pub(crate) fn uid_calls(&self) -> usize {
-        self.uid_calls.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-impl klights_controllers::ControllerIdentityGenerator for ScriptedControllerIdentityGenerator {
-    fn generate_name(&self, _prefix: &str) -> String {
-        panic!("scripted UID identity must not generate names")
-    }
-
-    fn new_uid(&self) -> String {
-        self.uid_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.uids
-            .lock()
-            .expect("scripted identity UID lock")
-            .pop_front()
-            .expect("scripted identity exhausted")
-    }
-}
-
 pub(crate) async fn pod_repository_with_node_local_for_test(
     db: &crate::datastore::sqlite::Datastore,
 ) -> (

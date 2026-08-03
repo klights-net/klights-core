@@ -488,3 +488,7 @@ async fn create_pod(
 
 #[cfg(test)]
 mod generated_name_collision_tests;
+
+#[cfg(test)]
+#[path = "replicaset/tests/mod.rs"]
+mod policy_tests;

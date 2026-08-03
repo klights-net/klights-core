@@ -728,3 +728,11 @@ mod tests {
         assert!(!pod_matches_selector(&pod, &parsed));
     }
 }
+
+#[cfg(test)]
+#[path = "replicationcontroller/tests.rs"]
+mod policy_tests;
+
+#[cfg(test)]
+#[path = "replicationcontroller/condition_tests.rs"]
+mod condition_tests;

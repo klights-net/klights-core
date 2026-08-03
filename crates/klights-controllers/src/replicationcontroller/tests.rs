@@ -1,21 +1,38 @@
 use super::*;
 
-use crate::datastore::Resource;
-use crate::kubelet::pod_repository::PodObjectWriter;
 use anyhow::Result;
+use klights_cluster_core::Resource;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Barrier, Notify};
 
-fn coordination() -> &'static klights_controllers::ControllerCoordination {
-    static COORDINATION: std::sync::LazyLock<klights_controllers::ControllerCoordination> =
-        std::sync::LazyLock::new(klights_controllers::ControllerCoordination::new);
+#[async_trait::async_trait]
+trait RcTestPodMutation: Send + Sync {
+    async fn create_controller_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        node_name: &str,
+        pod: Value,
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource>;
+
+    async fn update_pod_owner_references(
+        &self,
+        namespace: &str,
+        name: &str,
+        owner_references: Vec<Value>,
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource>;
+}
+
+fn coordination() -> &'static crate::ControllerCoordination {
+    static COORDINATION: std::sync::LazyLock<crate::ControllerCoordination> =
+        std::sync::LazyLock::new(crate::ControllerCoordination::new);
     &COORDINATION
 }
 
 async fn reconcile_replicationcontroller(
-    db: &crate::datastore::sqlite::Datastore,
+    db: &crate::test_support::TestStore,
     pod_reader: &(impl klights_pod_api::PodQuery + ?Sized),
     pod_writer: &(impl ReplicationControllerPodMutation + ?Sized),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
@@ -23,32 +40,31 @@ async fn reconcile_replicationcontroller(
     rc: &Value,
     node_name: &str,
 ) -> Result<()> {
-    let store = crate::controller_test_support::controller_store_for_test(db);
     super::reconcile_replicationcontroller(
-        &store,
+        db,
         pod_reader,
         pod_writer,
-        crate::controller_test_support::deterministic_controller_identity().as_ref(),
+        crate::test_support::deterministic_controller_identity().as_ref(),
         pod_delete_sink,
         non_pod_finalization,
         rc,
-        crate::controller_test_support::test_reconcile_context(coordination(), node_name),
+        crate::test_support::test_reconcile_context(coordination(), node_name),
     )
     .await
 }
 
 struct SlowFirstCreateWriter {
-    db: crate::datastore::sqlite::Datastore,
+    db: crate::test_support::TestStore,
     creates: AtomicUsize,
 }
 
 struct ScaleDownDuringRcCreateWriter {
-    db: crate::datastore::sqlite::Datastore,
+    db: crate::test_support::TestStore,
     creates: AtomicUsize,
 }
 
 struct BlockingSecondCreateWriter {
-    db: crate::datastore::sqlite::Datastore,
+    db: crate::test_support::TestStore,
     creates: AtomicUsize,
     first_create_persisted: Notify,
     second_create_started: Notify,
@@ -56,7 +72,7 @@ struct BlockingSecondCreateWriter {
 }
 
 struct BlockingFirstCreateWriter {
-    db: crate::datastore::sqlite::Datastore,
+    db: crate::test_support::TestStore,
     creates: AtomicUsize,
     first_create_started: Notify,
     second_create_started: Notify,
@@ -64,7 +80,7 @@ struct BlockingFirstCreateWriter {
 }
 
 impl BlockingSecondCreateWriter {
-    fn new(db: crate::datastore::sqlite::Datastore) -> Self {
+    fn new(db: crate::test_support::TestStore) -> Self {
         Self {
             db,
             creates: AtomicUsize::new(0),
@@ -76,7 +92,7 @@ impl BlockingSecondCreateWriter {
 }
 
 impl BlockingFirstCreateWriter {
-    fn new(db: crate::datastore::sqlite::Datastore) -> Self {
+    fn new(db: crate::test_support::TestStore) -> Self {
         Self {
             db,
             creates: AtomicUsize::new(0),
@@ -88,14 +104,14 @@ impl BlockingFirstCreateWriter {
 }
 
 #[async_trait::async_trait]
-impl PodObjectWriter for SlowFirstCreateWriter {
+impl RcTestPodMutation for SlowFirstCreateWriter {
     async fn create_controller_pod(
         &self,
         ns: &str,
         name: &str,
         _node_name: &str,
         pod: serde_json::Value,
-    ) -> Result<Resource> {
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
         if self.creates.fetch_add(1, Ordering::SeqCst) == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -104,16 +120,12 @@ impl PodObjectWriter for SlowFirstCreateWriter {
             .await
     }
 
-    async fn delete_pod(&self, ns: &str, name: &str) -> Result<()> {
-        self.db.delete_resource("v1", "Pod", Some(ns), name).await
-    }
-
     async fn update_pod_owner_references(
         &self,
         ns: &str,
         name: &str,
         owner_refs: Vec<serde_json::Value>,
-    ) -> Result<Resource> {
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
         let current = self
             .db
             .get_resource("v1", "Pod", Some(ns), name)
@@ -125,44 +137,17 @@ impl PodObjectWriter for SlowFirstCreateWriter {
             .update_resource("v1", "Pod", Some(ns), name, pod, current.resource_version)
             .await
     }
-
-    async fn merge_pod_labels(
-        &self,
-        ns: &str,
-        name: &str,
-        labels: Vec<(String, String)>,
-    ) -> Result<Resource> {
-        let current = self
-            .db
-            .get_resource("v1", "Pod", Some(ns), name)
-            .await?
-            .expect("Pod should exist");
-        let mut pod: serde_json::Value = (*current.data).clone();
-        let label_map = pod["metadata"]
-            .as_object_mut()
-            .unwrap()
-            .entry("labels".to_string())
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .unwrap();
-        for (key, value) in labels {
-            label_map.insert(key, json!(value));
-        }
-        self.db
-            .update_resource("v1", "Pod", Some(ns), name, pod, current.resource_version)
-            .await
-    }
 }
 
 #[async_trait::async_trait]
-impl PodObjectWriter for ScaleDownDuringRcCreateWriter {
+impl RcTestPodMutation for ScaleDownDuringRcCreateWriter {
     async fn create_controller_pod(
         &self,
         ns: &str,
         name: &str,
         _node_name: &str,
         pod: serde_json::Value,
-    ) -> Result<Resource> {
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
         let count = self.creates.fetch_add(1, Ordering::SeqCst) + 1;
         let created = self
             .db
@@ -192,16 +177,12 @@ impl PodObjectWriter for ScaleDownDuringRcCreateWriter {
         Ok(created)
     }
 
-    async fn delete_pod(&self, ns: &str, name: &str) -> Result<()> {
-        self.db.delete_resource("v1", "Pod", Some(ns), name).await
-    }
-
     async fn update_pod_owner_references(
         &self,
         ns: &str,
         name: &str,
         owner_refs: Vec<serde_json::Value>,
-    ) -> Result<Resource> {
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
         let current = self
             .db
             .get_resource("v1", "Pod", Some(ns), name)
@@ -213,44 +194,17 @@ impl PodObjectWriter for ScaleDownDuringRcCreateWriter {
             .update_resource("v1", "Pod", Some(ns), name, pod, current.resource_version)
             .await
     }
-
-    async fn merge_pod_labels(
-        &self,
-        ns: &str,
-        name: &str,
-        labels: Vec<(String, String)>,
-    ) -> Result<Resource> {
-        let current = self
-            .db
-            .get_resource("v1", "Pod", Some(ns), name)
-            .await?
-            .expect("Pod should exist");
-        let mut pod: serde_json::Value = (*current.data).clone();
-        let label_map = pod["metadata"]
-            .as_object_mut()
-            .unwrap()
-            .entry("labels".to_string())
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .unwrap();
-        for (key, value) in labels {
-            label_map.insert(key, json!(value));
-        }
-        self.db
-            .update_resource("v1", "Pod", Some(ns), name, pod, current.resource_version)
-            .await
-    }
 }
 
 #[async_trait::async_trait]
-impl PodObjectWriter for BlockingSecondCreateWriter {
+impl RcTestPodMutation for BlockingSecondCreateWriter {
     async fn create_controller_pod(
         &self,
         ns: &str,
         name: &str,
         _node_name: &str,
         pod: serde_json::Value,
-    ) -> Result<Resource> {
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
         let create_index = self.creates.fetch_add(1, Ordering::SeqCst);
         if create_index == 1 {
             self.second_create_started.notify_one();
@@ -267,16 +221,12 @@ impl PodObjectWriter for BlockingSecondCreateWriter {
         Ok(created)
     }
 
-    async fn delete_pod(&self, ns: &str, name: &str) -> Result<()> {
-        self.db.delete_resource("v1", "Pod", Some(ns), name).await
-    }
-
     async fn update_pod_owner_references(
         &self,
         ns: &str,
         name: &str,
         owner_refs: Vec<serde_json::Value>,
-    ) -> Result<Resource> {
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
         let current = self
             .db
             .get_resource("v1", "Pod", Some(ns), name)
@@ -288,44 +238,17 @@ impl PodObjectWriter for BlockingSecondCreateWriter {
             .update_resource("v1", "Pod", Some(ns), name, pod, current.resource_version)
             .await
     }
-
-    async fn merge_pod_labels(
-        &self,
-        ns: &str,
-        name: &str,
-        labels: Vec<(String, String)>,
-    ) -> Result<Resource> {
-        let current = self
-            .db
-            .get_resource("v1", "Pod", Some(ns), name)
-            .await?
-            .expect("Pod should exist");
-        let mut pod: serde_json::Value = (*current.data).clone();
-        let label_map = pod["metadata"]
-            .as_object_mut()
-            .unwrap()
-            .entry("labels".to_string())
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .unwrap();
-        for (key, value) in labels {
-            label_map.insert(key, json!(value));
-        }
-        self.db
-            .update_resource("v1", "Pod", Some(ns), name, pod, current.resource_version)
-            .await
-    }
 }
 
 #[async_trait::async_trait]
-impl PodObjectWriter for BlockingFirstCreateWriter {
+impl RcTestPodMutation for BlockingFirstCreateWriter {
     async fn create_controller_pod(
         &self,
         ns: &str,
         name: &str,
         _node_name: &str,
         pod: serde_json::Value,
-    ) -> Result<Resource> {
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
         let create_index = self.creates.fetch_add(1, Ordering::SeqCst);
         if create_index == 0 {
             self.first_create_started.notify_one();
@@ -339,16 +262,12 @@ impl PodObjectWriter for BlockingFirstCreateWriter {
             .await
     }
 
-    async fn delete_pod(&self, ns: &str, name: &str) -> Result<()> {
-        self.db.delete_resource("v1", "Pod", Some(ns), name).await
-    }
-
     async fn update_pod_owner_references(
         &self,
         ns: &str,
         name: &str,
         owner_refs: Vec<serde_json::Value>,
-    ) -> Result<Resource> {
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
         let current = self
             .db
             .get_resource("v1", "Pod", Some(ns), name)
@@ -356,33 +275,6 @@ impl PodObjectWriter for BlockingFirstCreateWriter {
             .expect("Pod should exist");
         let mut pod: serde_json::Value = (*current.data).clone();
         pod["metadata"]["ownerReferences"] = serde_json::Value::Array(owner_refs);
-        self.db
-            .update_resource("v1", "Pod", Some(ns), name, pod, current.resource_version)
-            .await
-    }
-
-    async fn merge_pod_labels(
-        &self,
-        ns: &str,
-        name: &str,
-        labels: Vec<(String, String)>,
-    ) -> Result<Resource> {
-        let current = self
-            .db
-            .get_resource("v1", "Pod", Some(ns), name)
-            .await?
-            .expect("Pod should exist");
-        let mut pod: serde_json::Value = (*current.data).clone();
-        let label_map = pod["metadata"]
-            .as_object_mut()
-            .unwrap()
-            .entry("labels".to_string())
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .unwrap();
-        for (key, value) in labels {
-            label_map.insert(key, json!(value));
-        }
         self.db
             .update_resource("v1", "Pod", Some(ns), name, pod, current.resource_version)
             .await
@@ -402,9 +294,8 @@ macro_rules! impl_replication_controller_mutation {
                 node_name: &str,
                 pod: serde_json::Value,
             ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
-                PodObjectWriter::create_controller_pod(self, namespace, name, node_name, pod)
+                RcTestPodMutation::create_controller_pod(self, namespace, name, node_name, pod)
                     .await
-                    .map_err(crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error)
             }
 
             async fn replace_replication_controller_pod_owner_references(
@@ -413,14 +304,13 @@ macro_rules! impl_replication_controller_mutation {
                 name: &str,
                 owner_references: Vec<serde_json::Value>,
             ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
-                PodObjectWriter::update_pod_owner_references(
+                RcTestPodMutation::update_pod_owner_references(
                     self,
                     namespace,
                     name,
                     owner_references,
                 )
                 .await
-                .map_err(crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error)
             }
         }
     };
@@ -432,38 +322,37 @@ impl_replication_controller_mutation!(BlockingSecondCreateWriter);
 impl_replication_controller_mutation!(BlockingFirstCreateWriter);
 
 async fn reconcile_rc_test(
-    db: &crate::datastore::sqlite::Datastore,
+    db: &crate::test_support::TestStore,
     rc: &Value,
     node_name: &str,
 ) -> Result<()> {
-    let identity = crate::controller_test_support::deterministic_controller_identity();
+    let identity = crate::test_support::deterministic_controller_identity();
     reconcile_rc_test_with_identity(db, rc, node_name, identity.as_ref()).await
 }
 
 async fn reconcile_rc_test_with_identity(
-    db: &crate::datastore::sqlite::Datastore,
+    db: &crate::test_support::TestStore,
     rc: &Value,
     node_name: &str,
-    identity: &dyn klights_controllers::ControllerIdentityGenerator,
+    identity: &dyn crate::ControllerIdentityGenerator,
 ) -> Result<()> {
-    let repo = crate::controller_test_support::pod_repository_for_test(db);
-    let store = crate::controller_test_support::controller_store_for_test(db);
+    let repo = crate::test_support::pod_repository_for_test(db);
     super::reconcile_replicationcontroller(
-        &store,
+        db,
         repo.as_ref(),
         repo.as_ref(),
         identity,
         repo.as_ref(),
-        crate::controller_test_support::non_pod_finalization_port_for_test(),
+        db,
         rc,
-        crate::controller_test_support::test_reconcile_context(coordination(), node_name),
+        crate::test_support::test_reconcile_context(coordination(), node_name),
     )
     .await
 }
 
 #[tokio::test]
 async fn replicationcontroller_consumes_one_uid_per_pod_and_preserves_eight_hex_name_derivation() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
     let rc = json!({
         "apiVersion": "v1",
         "kind": "ReplicationController",
@@ -486,11 +375,10 @@ async fn replicationcontroller_consumes_one_uid_per_pod_and_preserves_eight_hex_
     )
     .await
     .unwrap();
-    let identity =
-        crate::controller_test_support::ScriptedControllerIdentityGenerator::with_uids([
-            "abcdef12-0000-4000-8000-000000000000",
-            "1234abcd-0000-4000-8000-000000000000",
-        ]);
+    let identity = crate::test_support::ScriptedControllerIdentityGenerator::with_uids([
+        "abcdef12-0000-4000-8000-000000000000",
+        "1234abcd-0000-4000-8000-000000000000",
+    ]);
 
     reconcile_rc_test_with_identity(&db, &rc, "test-node", &identity)
         .await
@@ -501,7 +389,7 @@ async fn replicationcontroller_consumes_one_uid_per_pod_and_preserves_eight_hex_
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -517,7 +405,7 @@ async fn replicationcontroller_consumes_one_uid_per_pod_and_preserves_eight_hex_
 
 #[tokio::test]
 async fn test_replicationcontroller_status_counts_available_ready_pods() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
     let rc = json!({
         "apiVersion": "v1",
         "kind": "ReplicationController",
@@ -591,8 +479,8 @@ async fn test_replicationcontroller_status_counts_available_ready_pods() {
 
 #[tokio::test]
 async fn test_concurrent_replicationcontroller_reconcile_creates_only_desired_pods() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let pod_reader = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let pod_reader = crate::test_support::pod_repository_for_test(&db);
     let pod_writer = Arc::new(SlowFirstCreateWriter {
         db: db.clone(),
         creates: AtomicUsize::new(0),
@@ -630,7 +518,7 @@ async fn test_concurrent_replicationcontroller_reconcile_creates_only_desired_po
         pod_reader.as_ref(),
         pod_writer.as_ref(),
         pod_reader.as_ref(),
-        crate::controller_test_support::non_pod_finalization_port_for_test(),
+        &db,
         &rc,
         "test-node",
     );
@@ -639,7 +527,7 @@ async fn test_concurrent_replicationcontroller_reconcile_creates_only_desired_po
         pod_reader.as_ref(),
         pod_writer.as_ref(),
         pod_reader.as_ref(),
-        crate::controller_test_support::non_pod_finalization_port_for_test(),
+        &db,
         &rc,
         "test-node",
     );
@@ -652,7 +540,7 @@ async fn test_concurrent_replicationcontroller_reconcile_creates_only_desired_po
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::datastore::ResourceListQuery::new(Some("app=race"), None, None, None),
+            crate::test_support::ResourceListQuery::new(Some("app=race"), None, None, None),
         )
         .await
         .unwrap();
@@ -665,7 +553,7 @@ async fn test_concurrent_replicationcontroller_reconcile_creates_only_desired_po
 
 #[tokio::test]
 async fn test_replicationcontroller_skips_reconcile_when_deletion_timestamp_set() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
     let rc = json!({
         "apiVersion": "v1",
         "kind": "ReplicationController",
@@ -702,7 +590,12 @@ async fn test_replicationcontroller_skips_reconcile_when_deletion_timestamp_set(
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("app=terminating-rc"), None, None, None),
+            crate::test_support::ResourceListQuery::new(
+                Some("app=terminating-rc"),
+                None,
+                None,
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -714,8 +607,8 @@ async fn test_replicationcontroller_skips_reconcile_when_deletion_timestamp_set(
 
 #[tokio::test]
 async fn test_replicationcontroller_stale_snapshot_after_delete_does_not_recreate_pods() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let pod_repo = crate::test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -765,7 +658,7 @@ async fn test_replicationcontroller_stale_snapshot_after_delete_does_not_recreat
         pod_repo.as_ref(),
         pod_repo.as_ref(),
         pod_repo.as_ref(),
-        crate::controller_test_support::non_pod_finalization_port_for_test(),
+        &db,
         &stale_snapshot,
         "test-node",
     )
@@ -777,7 +670,7 @@ async fn test_replicationcontroller_stale_snapshot_after_delete_does_not_recreat
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -789,8 +682,8 @@ async fn test_replicationcontroller_stale_snapshot_after_delete_does_not_recreat
 
 #[tokio::test]
 async fn test_replicationcontroller_create_loop_observes_live_scale_down() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let pod_reader = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let pod_reader = crate::test_support::pod_repository_for_test(&db);
     let pod_writer = Arc::new(ScaleDownDuringRcCreateWriter {
         db: db.clone(),
         creates: AtomicUsize::new(0),
@@ -833,17 +726,15 @@ async fn test_replicationcontroller_create_loop_observes_live_scale_down() {
         )
         .await
         .unwrap();
-    let rc_with_rv = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let rc_with_rv =
+        crate::test_support::inject_resource_version(created.data, created.resource_version);
 
     reconcile_replicationcontroller(
         &db,
         pod_reader.as_ref(),
         pod_writer.as_ref(),
         pod_reader.as_ref(),
-        crate::controller_test_support::non_pod_finalization_port_for_test(),
+        &db,
         &rc_with_rv,
         "test-node",
     )
@@ -855,7 +746,12 @@ async fn test_replicationcontroller_create_loop_observes_live_scale_down() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::new(Some("app=scale-down-rc"), None, None, None),
+            crate::test_support::ResourceListQuery::new(
+                Some("app=scale-down-rc"),
+                None,
+                None,
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -896,7 +792,7 @@ async fn test_replicationcontroller_create_loop_observes_live_scale_down() {
 async fn test_rc_status_replicas_reflects_newly_created_pods() {
     // Regression test: RC controller was updating status with pre-creation owned_pods
     // (always empty on first reconcile), so status.replicas stayed 0 forever.
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -955,8 +851,8 @@ async fn test_rc_status_advances_while_large_scale_up_is_still_creating_pods() {
     // Conformance waits only two minutes for a 100-replica RC to report the
     // desired status. Status must advance as Pods are created instead of
     // staying at zero until the whole create loop finishes.
-    let db = crate::datastore::test_support::in_memory().await;
-    let pod_reader = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let pod_reader = crate::test_support::pod_repository_for_test(&db);
     let pod_writer = Arc::new(BlockingSecondCreateWriter::new(db.clone()));
 
     db.create_resource(
@@ -1003,7 +899,7 @@ async fn test_rc_status_advances_while_large_scale_up_is_still_creating_pods() {
             reader_for_task.as_ref(),
             writer_for_task.as_ref(),
             reader_for_task.as_ref(),
-            crate::controller_test_support::non_pod_finalization_port_for_test(),
+            &db_for_task,
             &rc_for_task,
             "test-node",
         )
@@ -1057,8 +953,8 @@ async fn test_rc_status_advances_while_large_scale_up_is_still_creating_pods() {
 
 #[tokio::test]
 async fn test_rc_large_scale_up_starts_next_create_while_prior_create_is_in_flight() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let pod_reader = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let pod_reader = crate::test_support::pod_repository_for_test(&db);
     let pod_writer = Arc::new(BlockingFirstCreateWriter::new(db.clone()));
 
     db.create_resource(
@@ -1105,7 +1001,7 @@ async fn test_rc_large_scale_up_starts_next_create_while_prior_create_is_in_flig
             reader_for_task.as_ref(),
             writer_for_task.as_ref(),
             reader_for_task.as_ref(),
-            crate::controller_test_support::non_pod_finalization_port_for_test(),
+            &db,
             &rc_for_task,
             "test-node",
         )
@@ -1139,7 +1035,7 @@ async fn test_rc_large_scale_up_starts_next_create_while_prior_create_is_in_flig
 
 #[tokio::test]
 async fn test_rc_large_scale_up_does_not_write_status_after_every_child_create() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -1177,35 +1073,11 @@ async fn test_rc_large_scale_up_does_not_write_status_after_every_child_create()
 
     reconcile_rc_test(&db, &rc, "node1").await.unwrap();
 
-    let rc_events = db
-        .list_watch_events_since(
-            &[crate::datastore::WatchTarget::namespaced_in_namespace(
-                "v1",
-                "ReplicationController",
-                "default",
-            )],
-            0,
-        )
-        .await
-        .unwrap();
-    let modified_replicas = rc_events
-        .iter()
-        .filter(|event| event.event_type.as_ref() == "MODIFIED")
-        .filter(|event| event.resource.name == "large-rc")
-        .map(|event| {
-            event
-                .resource
-                .data
-                .pointer("/status/replicas")
-                .and_then(|value| value.as_u64())
-        })
-        .collect::<Vec<_>>();
+    let status_writes = db.status_write_count();
 
     assert!(
-        modified_replicas.len() <= 4,
-        "large RC scale-up must not write RC status after every child Pod create; wrote {} updates with replicas {:?}",
-        modified_replicas.len(),
-        modified_replicas
+        status_writes <= 4,
+        "large RC scale-up must not write RC status after every child Pod create; wrote {status_writes} updates"
     );
 
     let updated = db
@@ -1218,7 +1090,7 @@ async fn test_rc_large_scale_up_does_not_write_status_after_every_child_create()
 
 #[tokio::test]
 async fn test_rc_ignores_ownerref_pods_that_do_not_match_selector() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -1308,7 +1180,7 @@ async fn test_rc_ignores_ownerref_pods_that_do_not_match_selector() {
 
 #[tokio::test]
 async fn test_rc_create_pod_has_apiversion_kind_status_and_labels() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -1352,7 +1224,7 @@ async fn test_rc_create_pod_has_apiversion_kind_status_and_labels() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1404,8 +1276,8 @@ async fn test_rc_create_pod_has_apiversion_kind_status_and_labels() {
 
 #[tokio::test]
 async fn test_rc_releases_pod_when_selector_changes() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let identity_graph = crate::controller_test_support::ControllerIdentityTestGraph::default();
+    let db = crate::test_support::in_memory().await;
+    let identity_graph = crate::test_support::ControllerIdentityTestGraph::default();
     let identity = identity_graph.identity();
 
     db.create_resource(
@@ -1451,7 +1323,7 @@ async fn test_rc_releases_pod_when_selector_changes() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1510,134 +1382,8 @@ async fn test_rc_releases_pod_when_selector_changes() {
 }
 
 #[tokio::test]
-async fn test_rc_adopts_and_releases_through_leader_repository_with_worker_outbox() {
-    let db = crate::datastore::test_support::in_memory().await;
-    db.create_resource(
-        "v1",
-        "Namespace",
-        None,
-        "default",
-        json!({"metadata": {"name": "default"}}),
-    )
-    .await
-    .unwrap();
-    db.create_resource(
-        "v1",
-        "Pod",
-        Some("default"),
-        "orphan",
-        json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {
-                "name": "orphan",
-                "namespace": "default",
-                "uid": "orphan-uid",
-                "labels": {"app": "rc"}
-            },
-            "spec": {
-                "nodeName": "worker-b",
-                "containers": [{"name": "app", "image": "nginx"}]
-            },
-            "status": {"phase": "Running"}
-        }),
-    )
-    .await
-    .unwrap();
-    let rc = json!({
-        "apiVersion": "v1",
-        "kind": "ReplicationController",
-        "metadata": {"name": "rc", "namespace": "default", "uid": "rc-uid"},
-        "spec": {
-            "replicas": 1,
-            "selector": {"app": "rc"},
-            "template": {
-                "metadata": {"labels": {"app": "rc"}},
-                "spec": {"containers": [{"name": "app", "image": "nginx"}]}
-            }
-        }
-    });
-    db.create_resource(
-        "v1",
-        "ReplicationController",
-        Some("default"),
-        "rc",
-        rc.clone(),
-    )
-    .await
-    .unwrap();
-    let repository =
-        crate::controller_test_support::deferred_outbox_pod_repository_for_test(&db).await;
-    let delete_sink = crate::gc_ownership_integration_tests::NoOpGcPodDeleteSink;
-
-    reconcile_replicationcontroller(
-        &db,
-        repository.as_ref(),
-        repository.as_ref(),
-        &delete_sink,
-        crate::controller_test_support::non_pod_finalization_port_for_test(),
-        &rc,
-        "leader",
-    )
-    .await
-    .expect("adopt orphan Pod");
-
-    let adopted = db
-        .get_resource("v1", "Pod", Some("default"), "orphan")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        adopted
-            .data
-            .pointer("/metadata/ownerReferences/0/uid")
-            .and_then(serde_json::Value::as_str),
-        Some("rc-uid"),
-        "RC adoption must be visible in leader storage"
-    );
-
-    let mut relabeled = (*adopted.data).clone();
-    relabeled["metadata"]["labels"]["app"] = json!("other");
-    db.update_resource(
-        "v1",
-        "Pod",
-        Some("default"),
-        "orphan",
-        relabeled,
-        adopted.resource_version,
-    )
-    .await
-    .unwrap();
-    reconcile_replicationcontroller(
-        &db,
-        repository.as_ref(),
-        repository.as_ref(),
-        &delete_sink,
-        crate::controller_test_support::non_pod_finalization_port_for_test(),
-        &rc,
-        "leader",
-    )
-    .await
-    .expect("release non-matching Pod");
-
-    let released = db
-        .get_resource("v1", "Pod", Some("default"), "orphan")
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        released
-            .data
-            .pointer("/metadata/ownerReferences")
-            .and_then(serde_json::Value::as_array)
-            .is_none_or(Vec::is_empty),
-        "RC release must be visible in leader storage"
-    );
-}
-
-#[tokio::test]
 async fn test_rc_does_not_adopt_pod_with_foreign_controller_owner() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -1764,106 +1510,5 @@ fn rc_selector_with_non_string_value_returns_error() {
     assert!(
         result.is_err(),
         "non-string selector value must be rejected"
-    );
-}
-
-/// Regression: a pod created by an RC reconcile must remain selector-visible
-/// after a metadata annotation patch is applied directly through the datastore.
-/// This pins the selector-index refresh on the datastore patch path so a
-/// metadata-only patch does not drop the pod's labels out of the label index.
-#[tokio::test]
-async fn rc_reconcile_created_pod_remains_selector_visible_after_annotation_patch() {
-    let db = crate::datastore::test_support::in_memory().await;
-
-    db.create_resource(
-        "v1",
-        "Namespace",
-        None,
-        "kubectl-rc",
-        json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"kubectl-rc"}}),
-    )
-    .await
-    .unwrap();
-
-    let rc = json!({
-        "apiVersion": "v1",
-        "kind": "ReplicationController",
-        "metadata": {"name": "agnhost-primary", "namespace": "kubectl-rc", "uid": "agnhost-rc-uid"},
-        "spec": {
-            "replicas": 1,
-            "selector": {"name": "agnhost-primary"},
-            "template": {
-                "metadata": {"labels": {"name": "agnhost-primary"}},
-                "spec": {"containers": [{"name": "agnhost", "image": "registry.k8s.io/e2e-test-images/agnhost:2.56"}]}
-            }
-        }
-    });
-    db.create_resource(
-        "v1",
-        "ReplicationController",
-        Some("kubectl-rc"),
-        "agnhost-primary",
-        rc.clone(),
-    )
-    .await
-    .unwrap();
-
-    reconcile_rc_test(&db, &rc, "worker-a").await.unwrap();
-
-    let pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("kubectl-rc"),
-            crate::datastore::ResourceListQuery::new(
-                Some("name=agnhost-primary"),
-                None,
-                None,
-                None,
-            ),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        pods.items.len(),
-        1,
-        "RC reconcile must create one matching pod"
-    );
-    let pod_name = pods.items[0].name.clone();
-
-    db.patch_resource_latest(
-        "v1",
-        "Pod",
-        Some("kubectl-rc"),
-        &pod_name,
-        crate::datastore::PatchKind::Merge,
-        json!({"metadata": {"annotations": {"patched": "true"}}}),
-    )
-    .await
-    .unwrap();
-
-    let patched = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("kubectl-rc"),
-            crate::datastore::ResourceListQuery::new(
-                Some("name=agnhost-primary"),
-                None,
-                None,
-                None,
-            ),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        patched.items.len(),
-        1,
-        "patched RC-owned pod must remain selector-visible"
-    );
-    assert_eq!(
-        patched.items[0].data.pointer("/metadata/labels/name"),
-        Some(&json!("agnhost-primary")),
-        "metadata annotation patch must preserve selector label"
     );
 }

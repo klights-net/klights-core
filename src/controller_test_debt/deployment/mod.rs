@@ -1,3 +1,3 @@
 use klights_controllers::deployment::*;
 
-mod tests;
+mod cross_adapter_tests;

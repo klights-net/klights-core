@@ -13,39 +13,33 @@ fn compute_pod_template_hash(template: &Value) -> String {
         .to_string()
 }
 
-fn coordination() -> &'static klights_controllers::ControllerCoordination {
-    static COORDINATION: std::sync::LazyLock<klights_controllers::ControllerCoordination> =
-        std::sync::LazyLock::new(klights_controllers::ControllerCoordination::new);
+fn coordination() -> &'static crate::ControllerCoordination {
+    static COORDINATION: std::sync::LazyLock<crate::ControllerCoordination> =
+        std::sync::LazyLock::new(crate::ControllerCoordination::new);
     &COORDINATION
 }
 
-async fn reconcile_deployment<T>(
-    db: &T,
-    pod_reader: &dyn crate::kubelet::pod_repository::PodReader,
-    pod_writer: &dyn crate::kubelet::pod_repository::PodObjectWriter,
+async fn reconcile_deployment(
+    db: &crate::test_support::TestStore,
+    pod_reader: &(impl crate::deployment::DeploymentPodReader + klights_pod_api::PodQuery + ?Sized),
+    pod_writer: &(
+         impl crate::deployment::DeploymentPodMutation
+         + crate::replicaset::ReplicaSetPodMutation
+         + ?Sized
+     ),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     deployment: &Value,
     node_name: &str,
-) -> anyhow::Result<()>
-where
-    T: crate::datastore::DatastoreBackend + Clone + 'static,
-{
-    let non_pod_finalization =
-        crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
-            std::sync::Arc::new(db.clone()),
-        );
-    let store = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(
-        std::sync::Arc::new(db.clone()),
-    );
+) -> anyhow::Result<()> {
     super::reconcile_deployment(
-        &store,
+        db,
         pod_reader,
         pod_writer,
-        crate::controller_test_support::deterministic_controller_identity().as_ref(),
+        crate::test_support::deterministic_controller_identity().as_ref(),
         pod_delete_sink,
-        &non_pod_finalization,
+        db,
         deployment,
-        crate::controller_test_support::test_reconcile_context(coordination(), node_name),
+        crate::test_support::test_reconcile_context(coordination(), node_name),
     )
     .await
 }

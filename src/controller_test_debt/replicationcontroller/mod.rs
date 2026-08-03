@@ -1,4 +1,3 @@
 use klights_controllers::replicationcontroller::*;
 
-mod condition_tests;
-mod tests;
+mod cross_adapter_tests;

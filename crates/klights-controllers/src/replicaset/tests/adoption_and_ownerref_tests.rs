@@ -4,8 +4,8 @@ use super::*;
 /// not be hardcoded to 0. Sonobuoy: RS scaled to 3 but ReadyReplicas stays 0.
 #[tokio::test]
 async fn test_replicaset_status_ready_replicas_reflects_pod_conditions() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let __pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -72,7 +72,7 @@ async fn test_replicaset_status_ready_replicas_reflects_pod_conditions() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -147,8 +147,8 @@ async fn test_replicaset_status_ready_replicas_reflects_pod_conditions() {
 
 #[tokio::test]
 async fn test_replicaset_deletes_itself_when_controller_deployment_missing() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let __pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -189,10 +189,8 @@ async fn test_replicaset_deletes_itself_when_controller_deployment_missing() {
         .await
         .unwrap();
 
-    let rs_with_rv = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let rs_with_rv =
+        crate::test_support::inject_resource_version(created.data, created.resource_version);
     reconcile_replicaset(
         &db,
         __pod_repo.as_ref(),
@@ -216,8 +214,8 @@ async fn test_replicaset_deletes_itself_when_controller_deployment_missing() {
 
 #[tokio::test]
 async fn test_replicaset_skips_reconcile_when_deletion_timestamp_set() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let __pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -279,7 +277,7 @@ async fn test_replicaset_skips_reconcile_when_deletion_timestamp_set() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -292,8 +290,8 @@ async fn test_replicaset_skips_reconcile_when_deletion_timestamp_set() {
 
 #[tokio::test]
 async fn test_replicaset_stale_snapshot_after_delete_does_not_recreate_pods() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let __pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let db = crate::test_support::in_memory().await;
+    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -349,7 +347,7 @@ async fn test_replicaset_stale_snapshot_after_delete_does_not_recreate_pods() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -357,119 +355,6 @@ async fn test_replicaset_stale_snapshot_after_delete_does_not_recreate_pods() {
         pods.items.len(),
         0,
         "stale ReplicaSet reconcile after delete must not recreate pods"
-    );
-}
-
-#[tokio::test]
-async fn test_replicaset_created_pod_gets_api_pipeline_defaults() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let __pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
-
-    db.create_resource(
-        "v1",
-        "Namespace",
-        None,
-        "test-ns",
-        json!({"metadata": {"name": "test-ns"}}),
-    )
-    .await
-    .unwrap();
-
-    let rs = json!({
-        "apiVersion": "apps/v1",
-        "kind": "ReplicaSet",
-        "metadata": {
-            "name": "defaults-rs",
-            "namespace": "test-ns",
-            "uid": "rs-uid-defaults"
-        },
-        "spec": {
-            "replicas": 1,
-            "selector": {"matchLabels": {"app": "demo"}},
-            "template": {
-                "metadata": {"labels": {"app": "demo"}},
-                "spec": {
-                    "containers": [{
-                        "name": "app",
-                        "image": "busybox",
-                        "terminationMessagePath": "",
-                        "terminationMessagePolicy": "",
-                        "livenessProbe": {"httpGet": {"port": 8080, "path": "", "scheme": ""}}
-                    }]
-                }
-            }
-        }
-    });
-
-    let created = db
-        .create_resource("apps/v1", "ReplicaSet", Some("test-ns"), "defaults-rs", rs)
-        .await
-        .unwrap();
-    let mut rs_with_rv: serde_json::Value = (*created.data).clone();
-    if let Some(meta) = rs_with_rv
-        .get_mut("metadata")
-        .and_then(|m| m.as_object_mut())
-    {
-        meta.insert(
-            "resourceVersion".to_string(),
-            json!(created.resource_version.to_string()),
-        );
-    }
-
-    reconcile_replicaset(
-        &db,
-        __pod_repo.as_ref(),
-        __pod_repo.as_ref(),
-        __pod_repo.as_ref(),
-        &rs_with_rv,
-        "test-node",
-    )
-    .await
-    .unwrap();
-
-    let pods = db
-        .list_resources(
-            "v1",
-            "Pod",
-            Some("test-ns"),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(pods.items.len(), 1);
-    let pod = &pods.items[0].data;
-    assert_eq!(
-        pod.pointer("/status/phase").and_then(|v| v.as_str()),
-        Some("Pending")
-    );
-    assert_eq!(
-        pod.pointer("/status/qosClass").and_then(|v| v.as_str()),
-        Some("BestEffort")
-    );
-    assert!(
-        pod.pointer("/status/conditions")
-            .and_then(|v| v.as_array())
-            .is_some_and(|c| !c.is_empty())
-    );
-    assert_eq!(
-        pod.pointer("/spec/containers/0/terminationMessagePath")
-            .and_then(|v| v.as_str()),
-        Some("/dev/termination-log")
-    );
-    assert_eq!(
-        pod.pointer("/spec/containers/0/terminationMessagePolicy")
-            .and_then(|v| v.as_str()),
-        Some("File")
-    );
-    assert_eq!(
-        pod.pointer("/spec/containers/0/livenessProbe/httpGet/path")
-            .and_then(|v| v.as_str()),
-        Some("/")
-    );
-    assert_eq!(
-        pod.pointer("/spec/containers/0/livenessProbe/httpGet/scheme")
-            .and_then(|v| v.as_str()),
-        Some("HTTP")
     );
 }
 
@@ -491,11 +376,7 @@ async fn test_replicaset_created_pod_gets_api_pipeline_defaults() {
 async fn test_replicaset_status_write_never_clobbers_user_scale_under_race() {
     use std::sync::Arc;
 
-    let db: Arc<crate::datastore::sqlite::Datastore> = Arc::new(
-        crate::datastore::sqlite::Datastore::new_in_memory()
-            .await
-            .unwrap(),
-    );
+    let db = Arc::new(crate::test_support::in_memory().await);
 
     for iteration in 0..25 {
         let name = format!("rs-race-{iteration}");
@@ -530,12 +411,11 @@ async fn test_replicaset_status_write_never_clobbers_user_scale_under_race() {
             // explicit resourceVersion CAS so it cannot 409 against the
             // controller's status write).
             user_db
-                .patch_resource_latest(
+                .patch_resource_merge_latest(
                     "apps/v1",
                     "ReplicaSet",
                     Some("default"),
                     &user_name,
-                    crate::datastore::PatchKind::Merge,
                     json!({"spec": {"replicas": 7}}),
                 )
                 .await
@@ -553,7 +433,7 @@ async fn test_replicaset_status_write_never_clobbers_user_scale_under_race() {
                 "fullyLabeledReplicas": 3,
                 "observedGeneration": 1
             });
-            klights_controllers::common::ControllerStatusStore::update_status(
+            crate::common::ControllerStatusStore::update_status(
                 ctl_db.as_ref(),
                 "apps/v1",
                 "ReplicaSet",

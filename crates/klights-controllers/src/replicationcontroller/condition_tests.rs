@@ -1,26 +1,24 @@
-use crate::datastore::sqlite::Datastore;
+use crate::test_support::TestStore;
 use serde_json::{Value, json};
 
 /// Test-only shim wrapping `reconcile_replicationcontroller` with the
 /// repository-backed argument list, mirroring the pre-Task-18 signature.
-async fn reconcile_rc_test(db: &Datastore, rc: &Value, node_name: &str) -> anyhow::Result<()> {
-    let repo = crate::controller_test_support::pod_repository_for_test(db);
-    let coordination = klights_controllers::ControllerCoordination::new();
-    let store = crate::controller_test_support::controller_store_for_test(db);
+async fn reconcile_rc_test(db: &TestStore, rc: &Value, node_name: &str) -> anyhow::Result<()> {
+    let coordination = crate::ControllerCoordination::new();
     super::reconcile_replicationcontroller(
-        &store,
-        repo.as_ref(),
-        repo.as_ref(),
-        crate::controller_test_support::deterministic_controller_identity().as_ref(),
-        repo.as_ref(),
-        crate::controller_test_support::non_pod_finalization_port_for_test(),
+        db,
+        db,
+        db,
+        crate::test_support::deterministic_controller_identity().as_ref(),
+        db,
+        db,
         rc,
-        crate::controller_test_support::test_reconcile_context(&coordination, node_name),
+        crate::test_support::test_reconcile_context(&coordination, node_name),
     )
     .await
 }
 
-async fn setup_db_with_rc(db: &Datastore, rc_name: &str) {
+async fn setup_db_with_rc(db: &TestStore, rc_name: &str) {
     db.create_resource(
         "v1",
         "Namespace",
@@ -44,7 +42,7 @@ async fn setup_db_with_rc(db: &Datastore, rc_name: &str) {
 
 #[tokio::test]
 async fn test_rc_publishes_replica_failure_condition_on_create_failure() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
     setup_db_with_rc(&db, "test-rc").await;
     db.create_resource(
         "v1",
@@ -90,7 +88,7 @@ async fn test_rc_publishes_replica_failure_condition_on_create_failure() {
 
 #[tokio::test]
 async fn test_rc_clears_replica_failure_condition_when_healthy() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
     setup_db_with_rc(&db, "test-rc-ok").await;
     let rc = db
         .get_resource("v1", "ReplicationController", Some("default"), "test-rc-ok")
@@ -118,7 +116,7 @@ async fn test_rc_clears_replica_failure_condition_when_healthy() {
 
 #[tokio::test]
 async fn test_rc_returns_error_when_quota_blocks_pod_create() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
     setup_db_with_rc(&db, "test-rc-quota").await;
 
     db.create_resource(
@@ -176,7 +174,7 @@ async fn test_rc_returns_error_when_quota_blocks_pod_create() {
             "v1",
             "Pod",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            crate::test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();

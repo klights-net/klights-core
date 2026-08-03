@@ -23,6 +23,7 @@ type ResourceKey = (String, String, Option<String>, String);
 struct Inner {
     resources: Mutex<BTreeMap<ResourceKey, Resource>>,
     next_resource_version: AtomicU64,
+    status_write_count: AtomicUsize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -220,6 +221,29 @@ impl TestStore {
         )
     }
 
+    pub(crate) async fn patch_resource_merge_latest(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        patch: Value,
+    ) -> ControllerStoreResult<Resource> {
+        let current = self
+            .get(api_version, kind, namespace, name)
+            .ok_or_else(|| ControllerStoreError::not_found(format!("{kind} {name}")))?;
+        let mut data = (*current.data).clone();
+        merge_json(&mut data, patch);
+        self.update_with_preconditions(
+            api_version,
+            kind,
+            namespace,
+            name,
+            data,
+            ResourcePreconditions::from_resource(&current),
+        )
+    }
+
     pub(crate) async fn update_status_only_with_preconditions(
         &self,
         api_version: &str,
@@ -232,9 +256,35 @@ impl TestStore {
         let current = self
             .get(api_version, kind, namespace, name)
             .ok_or_else(|| ControllerStoreError::not_found(format!("{kind} {name}")))?;
+        if current.data.get("status") == Some(&status) {
+            if preconditions
+                .uid
+                .as_deref()
+                .is_some_and(|uid| uid != current.uid)
+                || preconditions
+                    .resource_version
+                    .is_some_and(|rv| rv != current.resource_version)
+            {
+                return Err(ControllerStoreError::conflict(format!(
+                    "stale {kind} {name}"
+                )));
+            }
+            return Ok(current);
+        }
         let mut data = (*current.data).clone();
         data["status"] = status;
-        self.update_with_preconditions(api_version, kind, namespace, name, data, preconditions)
+        let result =
+            self.update_with_preconditions(api_version, kind, namespace, name, data, preconditions);
+        if result.is_ok() {
+            self.inner
+                .status_write_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    pub(crate) fn status_write_count(&self) -> usize {
+        self.inner.status_write_count.load(Ordering::Relaxed)
     }
 
     pub(crate) async fn replace_status_from_api(
@@ -253,6 +303,66 @@ impl TestStore {
             ResourcePreconditions::resource_version(expected_resource_version),
         )
         .await
+    }
+
+    pub(crate) async fn create_controller_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        pod: Value,
+    ) -> ControllerStoreResult<Resource> {
+        create_controller_pod(self, namespace, name, pod).await
+    }
+
+    pub(crate) async fn replace_pod_owner_references(
+        &self,
+        namespace: &str,
+        name: &str,
+        owner_references: Vec<Value>,
+    ) -> ControllerStoreResult<Resource> {
+        let current = self
+            .get("v1", "Pod", Some(namespace), name)
+            .ok_or_else(|| ControllerStoreError::not_found("Pod missing"))?;
+        let mut pod = (*current.data).clone();
+        pod["metadata"]["ownerReferences"] = Value::Array(owner_references);
+        self.update_with_preconditions(
+            "v1",
+            "Pod",
+            Some(namespace),
+            name,
+            pod,
+            ResourcePreconditions::from_resource(&current),
+        )
+    }
+
+    pub(crate) async fn merge_pod_labels(
+        &self,
+        namespace: &str,
+        name: &str,
+        labels: Vec<(String, String)>,
+    ) -> ControllerStoreResult<Resource> {
+        let current = self
+            .get("v1", "Pod", Some(namespace), name)
+            .ok_or_else(|| ControllerStoreError::not_found("Pod missing"))?;
+        let mut pod = (*current.data).clone();
+        let label_map = pod["metadata"]
+            .as_object_mut()
+            .expect("Pod metadata object")
+            .entry("labels")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .expect("Pod labels object");
+        for (key, value) in labels {
+            label_map.insert(key, json!(value));
+        }
+        self.update_with_preconditions(
+            "v1",
+            "Pod",
+            Some(namespace),
+            name,
+            pod,
+            ResourcePreconditions::from_resource(&current),
+        )
     }
 
     pub(crate) async fn delete_resource(
@@ -348,6 +458,21 @@ fn owned_by(resource: &Resource, owner_uid: &str) -> bool {
                 .iter()
                 .any(|owner| owner.get("uid").and_then(Value::as_str) == Some(owner_uid))
         })
+}
+
+fn merge_json(target: &mut Value, patch: Value) {
+    match (target, patch) {
+        (Value::Object(target), Value::Object(patch)) => {
+            for (key, value) in patch {
+                if value.is_null() {
+                    target.remove(&key);
+                } else {
+                    merge_json(target.entry(key).or_insert(Value::Null), value);
+                }
+            }
+        }
+        (target, patch) => *target = patch,
+    }
 }
 
 fn matches_query(resource: &Resource, query: ResourceListQuery<'_>) -> bool {
@@ -553,17 +678,19 @@ async fn create_controller_pod(
     name: &str,
     mut pod: Value,
 ) -> ControllerStoreResult<Resource> {
-    if store
+    let current_pods = store.resources_of_kind("v1", "Pod", Some(namespace)).len();
+    let quota_exhausted = store
         .resources_of_kind("v1", "ResourceQuota", Some(namespace))
         .iter()
-        .any(|quota| {
+        .filter_map(|quota| {
             quota
                 .data
                 .pointer("/spec/hard/pods")
                 .and_then(Value::as_str)
-                == Some("0")
+                .and_then(|hard| hard.parse::<usize>().ok())
         })
-    {
+        .any(|hard| current_pods >= hard);
+    if quota_exhausted {
         return Err(ControllerStoreError::unavailable(
             "Pod creation denied by ResourceQuota",
         ));
@@ -673,6 +800,266 @@ impl crate::statefulset::StatefulSetPodMutation for TestStore {
         pod: Value,
     ) -> ControllerStoreResult<Resource> {
         create_controller_pod(self, namespace, name, pod).await
+    }
+}
+
+#[async_trait]
+impl crate::deployment::DeploymentStore for TestStore {
+    async fn list_replicasets(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(self.resources_of_kind("apps/v1", "ReplicaSet", Some(namespace)))
+    }
+
+    async fn create_replicaset(
+        &self,
+        namespace: &str,
+        name: &str,
+        replicaset: Value,
+    ) -> ControllerStoreResult<Resource> {
+        self.create_resource("apps/v1", "ReplicaSet", Some(namespace), name, replicaset)
+            .await
+    }
+
+    async fn patch_replicaset_scale(
+        &self,
+        namespace: &str,
+        name: &str,
+        patch: Value,
+        expected_uid: String,
+    ) -> ControllerStoreResult<Option<Resource>> {
+        let Some(current) = self.get("apps/v1", "ReplicaSet", Some(namespace), name) else {
+            return Ok(None);
+        };
+        if current.uid != expected_uid {
+            return Ok(None);
+        }
+        let mut data = (*current.data).clone();
+        if let Some(replicas) = patch.pointer("/spec/replicas").cloned() {
+            if data.pointer("/spec/replicas") == Some(&replicas) {
+                return Ok(Some(current));
+            }
+            data["spec"]["replicas"] = replicas;
+        }
+        self.update_with_preconditions(
+            "apps/v1",
+            "ReplicaSet",
+            Some(namespace),
+            name,
+            data,
+            ResourcePreconditions::from_resource(&current),
+        )
+        .map(Some)
+    }
+
+    async fn update_deployment_status(
+        &self,
+        resource: &Resource,
+        status: Value,
+    ) -> ControllerStoreResult<()> {
+        self.update_status_only_with_preconditions(
+            "apps/v1",
+            "Deployment",
+            resource.namespace.as_deref(),
+            &resource.name,
+            status,
+            ResourcePreconditions::from_resource(resource),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::deployment::DeploymentFinalizeStore for TestStore {
+    async fn get_deployment(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
+        Ok(self.get("apps/v1", "Deployment", Some(namespace), name))
+    }
+
+    async fn patch_deployment_revision(
+        &self,
+        namespace: &str,
+        name: &str,
+        revision: String,
+        expected_uid: String,
+    ) -> ControllerStoreResult<()> {
+        let current = self
+            .get("apps/v1", "Deployment", Some(namespace), name)
+            .ok_or_else(|| ControllerStoreError::not_found("Deployment missing"))?;
+        if current.uid != expected_uid {
+            return Err(ControllerStoreError::conflict("Deployment UID changed"));
+        }
+        if current
+            .data
+            .pointer("/metadata/annotations/deployment.kubernetes.io~1revision")
+            .and_then(Value::as_str)
+            == Some(revision.as_str())
+        {
+            return Ok(());
+        }
+        let mut data = (*current.data).clone();
+        data["metadata"]["annotations"]["deployment.kubernetes.io/revision"] = json!(revision);
+        self.update_with_preconditions(
+            "apps/v1",
+            "Deployment",
+            Some(namespace),
+            name,
+            data,
+            ResourcePreconditions::from_resource(&current),
+        )?;
+        Ok(())
+    }
+
+    async fn delete_replicaset(
+        &self,
+        namespace: &str,
+        name: &str,
+        expected_uid: String,
+    ) -> ControllerStoreResult<()> {
+        let Some(current) = self.get("apps/v1", "ReplicaSet", Some(namespace), name) else {
+            return Ok(());
+        };
+        if current.uid != expected_uid {
+            return Err(ControllerStoreError::conflict("ReplicaSet UID changed"));
+        }
+        self.delete_resource("apps/v1", "ReplicaSet", Some(namespace), name)
+            .await
+    }
+}
+
+#[async_trait]
+impl crate::deployment::DeploymentPodReader for TestStore {
+    async fn list_pods_by_owner_uid(
+        &self,
+        namespace: &str,
+        owner_uid: &str,
+    ) -> ControllerStoreResult<Vec<Resource>> {
+        self.list_resources_by_owner_uid("v1", "Pod", Some(namespace), owner_uid)
+            .await
+    }
+
+    async fn list_namespace_pods(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(self.resources_of_kind("v1", "Pod", Some(namespace)))
+    }
+}
+
+#[async_trait]
+impl crate::deployment::DeploymentPodMutation for TestStore {
+    async fn merge_deployment_pod_labels(
+        &self,
+        namespace: &str,
+        name: &str,
+        labels: Vec<(String, String)>,
+    ) -> ControllerStoreResult<Resource> {
+        self.merge_pod_labels(namespace, name, labels).await
+    }
+}
+
+#[async_trait]
+impl crate::replicaset::ReplicaSetStore for TestStore {
+    async fn get_replicaset(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
+        Ok(self.get("apps/v1", "ReplicaSet", Some(namespace), name))
+    }
+
+    async fn update_replicaset_status(
+        &self,
+        resource: &Resource,
+        status: Value,
+    ) -> ControllerStoreResult<()> {
+        self.update_status_only_with_preconditions(
+            "apps/v1",
+            "ReplicaSet",
+            resource.namespace.as_deref(),
+            &resource.name,
+            status,
+            ResourcePreconditions::from_resource(resource),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::replicaset::ReplicaSetPodMutation for TestStore {
+    async fn create_replicaset_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        _node_name: &str,
+        pod: Value,
+    ) -> ControllerStoreResult<Resource> {
+        self.create_controller_pod(namespace, name, pod).await
+    }
+
+    async fn replace_replicaset_pod_owner_references(
+        &self,
+        namespace: &str,
+        name: &str,
+        owner_references: Vec<Value>,
+    ) -> ControllerStoreResult<Resource> {
+        self.replace_pod_owner_references(namespace, name, owner_references)
+            .await
+    }
+}
+
+#[async_trait]
+impl crate::replicationcontroller::ReplicationControllerStore for TestStore {
+    async fn get_replication_controller(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
+        Ok(self.get("v1", "ReplicationController", Some(namespace), name))
+    }
+
+    async fn list_resource_quotas(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(self.resources_of_kind("v1", "ResourceQuota", Some(namespace)))
+    }
+
+    async fn update_replication_controller_status(
+        &self,
+        resource: &Resource,
+        status: Value,
+    ) -> ControllerStoreResult<()> {
+        self.update_status_only_with_preconditions(
+            "v1",
+            "ReplicationController",
+            resource.namespace.as_deref(),
+            &resource.name,
+            status,
+            ResourcePreconditions::from_resource(resource),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::replicationcontroller::ReplicationControllerPodMutation for TestStore {
+    async fn create_replication_controller_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        _node_name: &str,
+        pod: Value,
+    ) -> ControllerStoreResult<Resource> {
+        self.create_controller_pod(namespace, name, pod).await
+    }
+
+    async fn replace_replication_controller_pod_owner_references(
+        &self,
+        namespace: &str,
+        name: &str,
+        owner_references: Vec<Value>,
+    ) -> ControllerStoreResult<Resource> {
+        self.replace_pod_owner_references(namespace, name, owner_references)
+            .await
     }
 }
 
