@@ -49,6 +49,7 @@ pub mod runtime_observations;
 pub mod runtime_paths;
 pub mod runtime_reconcile_hint;
 pub mod runtime_types;
+pub mod sandbox_gc;
 pub mod unscheduled_deletion;
 pub mod volume_registry;
 pub mod volume_sources;

@@ -18,7 +18,6 @@ mod custom_resource_read_adapter;
 pub mod datastore;
 #[cfg(test)]
 mod endpoint_reconcile_integration_tests;
-pub mod gc;
 #[cfg(test)]
 mod gc_ownership_integration_tests;
 mod generated_handler_adapter;

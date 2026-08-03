@@ -221,7 +221,6 @@ async fn start_leader_scoped_tasks(
     } = context;
 
     tracing::info!("Acquired leader lease");
-    use crate::gc;
 
     reconcile_kubernetes_service_for_leader(config.as_ref(), &db_handle, datapath.as_ref())
         .await
@@ -310,38 +309,46 @@ async fn start_leader_scoped_tasks(
     }
     tracing::info!("Scheduler controller started");
 
-    let mut sched = gc::GcScheduler::new(config.gc_interval);
-    if let Some(cri_arc) = cri_for_shutdown {
-        sched.register(Arc::new(gc::sandbox_gc::SandboxGc::new(
+    let sandbox_maintenance = if let Some(cri_arc) = cri_for_shutdown {
+        let pod_query: Arc<dyn klights_pod_api::PodQuery> = pod_repository.clone();
+        Some(Arc::new(klights_kubelet::sandbox_gc::SandboxGc::new(
             pod_network_cache,
             pod_runtime_store,
             cri_arc.clone(),
-            pod_repository.clone(),
+            pod_query,
             config.containerd_namespace.clone(),
             pod_repository.sandbox_gc_dirty_counter(),
             klights_supervisor::FileProcessExecutor::from_supervisor(task_supervisor.as_ref()),
-        )));
-    }
-    sched.register(Arc::new(gc::watch_events_gc::WatchEventsGc::new(
+        )))
+    } else {
+        None
+    };
+    let maintenance = crate::bootstrap::maintenance::MaintenanceRunner::new(
         db_handle.clone(),
+        sandbox_maintenance,
+        task_supervisor.clone(),
+        config.gc_interval,
         config.max_watch_events,
-    )?));
+    )?;
 
     let cancel = lease_cancel.child_token();
-    let ts = task_supervisor.clone();
-    let gc_coordination = coordination;
-    let gc_lease = lease;
+    let maintenance_coordination = coordination;
+    let maintenance_lease = lease;
     if let Err(e) = task_supervisor
         .spawn_async(
             klights_supervisor::TaskCategory::Background,
-            "runtime_gc_scheduler",
-            klights_leader_api::scope_controller_lease(gc_coordination, gc_lease, async move {
-                sched.run(ts, cancel).await;
-            }),
+            "runtime_root_maintenance",
+            klights_leader_api::scope_controller_lease(
+                maintenance_coordination,
+                maintenance_lease,
+                async move {
+                    maintenance.run(cancel).await;
+                },
+            ),
         )
         .await
     {
-        tracing::warn!("Failed to spawn GC scheduler: {}", e);
+        tracing::warn!("Failed to spawn root maintenance: {}", e);
     }
 
     Ok(())

@@ -16,12 +16,11 @@
 //!   * Second pass: `pod_sandboxes` rows whose sandbox_id is not in the CRI
 //!     list get dropped, along with their matching `pod_networks` rows.
 
-use crate::kubelet::pod_repository::PodReader;
+use crate::cgroup_cleanup::cleanup_pod_cgroup;
+use crate::cri::CriClient;
 use anyhow::Result;
-use async_trait::async_trait;
-use klights_kubelet::cgroup_cleanup::cleanup_pod_cgroup;
-use klights_kubelet::cri::CriClient;
 use klights_node_store::{CacheNetworkError, PodNetworkCache, SandboxKey};
+use klights_pod_api::{PodGetRequest, PodQuery};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -35,7 +34,7 @@ pub struct SandboxGc {
     pod_network_cache: Arc<dyn PodNetworkCache>,
     pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
     cri: Arc<Mutex<CriClient>>,
-    pod_reader: Arc<dyn PodReader>,
+    pod_query: Arc<dyn PodQuery>,
     containerd_ns: String,
     /// Shared counter: incremented by PodStore on create/update/delete.
     /// Zero when the cluster has been quiescent — no sweep needed.
@@ -48,7 +47,7 @@ impl SandboxGc {
         pod_network_cache: Arc<dyn PodNetworkCache>,
         pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
         cri: Arc<Mutex<CriClient>>,
-        pod_reader: Arc<dyn PodReader>,
+        pod_query: Arc<dyn PodQuery>,
         containerd_ns: impl Into<String>,
         dirty: Arc<AtomicUsize>,
         file_process: klights_supervisor::FileProcessExecutor,
@@ -57,7 +56,7 @@ impl SandboxGc {
             pod_network_cache,
             pod_runtime_store,
             cri,
-            pod_reader,
+            pod_query,
             containerd_ns: containerd_ns.into(),
             dirty,
             file_process,
@@ -114,7 +113,20 @@ impl SandboxGc {
                 continue;
             }
 
-            let live_pod = match self.pod_reader.get_pod(&meta.namespace, &meta.name).await {
+            let request = match PodGetRequest::try_by_name(&meta.namespace, &meta.name) {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::debug!(
+                        sandbox_id = %sandbox.id,
+                        ns = %meta.namespace,
+                        name = %meta.name,
+                        error = %error,
+                        "sandbox_gc: invalid Pod identity, skipping this tick"
+                    );
+                    continue;
+                }
+            };
+            let live_pod = match self.pod_query.get_pod(request).await {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::debug!(
@@ -379,12 +391,8 @@ fn pod_network_cleanup_candidates(
         .collect()
 }
 
-#[async_trait]
-impl super::GcTask for SandboxGc {
-    fn name(&self) -> &'static str {
-        "sandbox_gc"
-    }
-    async fn run(&self) -> Result<()> {
+impl SandboxGc {
+    pub async fn run_if_dirty(&self) -> Result<()> {
         // Event-driven: skip the CRI list if no pod lifecycle events have occurred
         // since the last successful sweep.
         let pending = self.dirty.swap(0, Ordering::Acquire);
@@ -404,9 +412,7 @@ impl super::GcTask for SandboxGc {
 #[cfg(test)]
 mod tests {
     use super::{pod_network_cleanup_candidates, pod_network_cleanup_live_ids};
-    use crate::gc::GcTask;
     use anyhow::{Result, anyhow};
-    use async_trait::async_trait;
     use std::collections::HashSet;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -454,12 +460,8 @@ mod tests {
         sweep_count: AtomicUsize,
     }
 
-    #[async_trait]
-    impl GcTask for CountingSweepGc {
-        fn name(&self) -> &'static str {
-            "counting_sweep"
-        }
-        async fn run(&self) -> Result<()> {
+    impl CountingSweepGc {
+        async fn run_if_dirty(&self) -> Result<()> {
             let pending = self.dirty.swap(0, Ordering::Acquire);
             if pending == 0 {
                 return Ok(());
@@ -477,11 +479,11 @@ mod tests {
             sweep_count: AtomicUsize::new(0),
         };
         // First tick: dirty=1 → runs sweep
-        gc.run().await.unwrap();
+        gc.run_if_dirty().await.unwrap();
         assert_eq!(gc.sweep_count.load(Ordering::Relaxed), 1);
 
         // Second tick: dirty=0 → skipped
-        gc.run().await.unwrap();
+        gc.run_if_dirty().await.unwrap();
         assert_eq!(
             gc.sweep_count.load(Ordering::Relaxed),
             1,
@@ -497,16 +499,16 @@ mod tests {
             sweep_count: AtomicUsize::new(0),
         };
         // First tick: runs
-        gc.run().await.unwrap();
+        gc.run_if_dirty().await.unwrap();
         assert_eq!(gc.sweep_count.load(Ordering::Relaxed), 1);
 
         // Second tick: skipped (clean)
-        gc.run().await.unwrap();
+        gc.run_if_dirty().await.unwrap();
         assert_eq!(gc.sweep_count.load(Ordering::Relaxed), 1);
 
         // Mark dirty → next tick runs
         dirty.fetch_add(1, Ordering::Release);
-        gc.run().await.unwrap();
+        gc.run_if_dirty().await.unwrap();
         assert_eq!(gc.sweep_count.load(Ordering::Relaxed), 2);
     }
 
@@ -518,13 +520,13 @@ mod tests {
             sweep_count: AtomicUsize::new(0),
         };
         // Tick while clean: skipped
-        gc.run().await.unwrap();
+        gc.run_if_dirty().await.unwrap();
         assert_eq!(gc.sweep_count.load(Ordering::Relaxed), 0);
 
         // Mark dirty twice (two pod creates), then tick: one sweep
         dirty.fetch_add(1, Ordering::Release);
         dirty.fetch_add(1, Ordering::Release);
-        gc.run().await.unwrap();
+        gc.run_if_dirty().await.unwrap();
         assert_eq!(gc.sweep_count.load(Ordering::Relaxed), 1);
     }
 }

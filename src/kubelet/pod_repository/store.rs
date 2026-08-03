@@ -7,7 +7,7 @@
 //!
 //! `pod_network` and `sandbox` table access is intentionally NOT routed
 //! through this hub — those are network-runtime / GC concerns owned by
-//! `src/networking/cni.rs`, `src/gc/sandbox_gc.rs`, `src/shutdown.rs`,
+//! `src/networking/cni.rs`, `crates/klights-kubelet/src/sandbox_gc.rs`, `src/shutdown.rs`,
 //! `src/kubelet/pod_sandbox.rs`, and `src/datastore/sqlite/crud/sandbox_network.rs`.
 
 use anyhow::Result;

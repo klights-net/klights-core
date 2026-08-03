@@ -14,6 +14,7 @@ pub mod init;
 pub mod kubelet_ports;
 pub mod leader_reconnect;
 pub mod logging;
+pub(crate) mod maintenance;
 pub(crate) mod network_adapters;
 pub mod node_mode;
 pub(crate) mod node_registration_adapter;

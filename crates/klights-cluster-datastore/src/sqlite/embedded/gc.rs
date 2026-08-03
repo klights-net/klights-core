@@ -518,6 +518,34 @@ fn focused_replay_floor_to_legacy(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn gc_watch_respects_batch_cap() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        for i in 0..200 {
+            db.create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                &format!("batch-cap-{i}"),
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"namespace": "default", "name": format!("batch-cap-{i}")},
+                    "data": {"key": "value"}
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let removed = db.gc_watch_events(50, 30).await.unwrap();
+
+        assert_eq!(
+            removed, 30,
+            "one retention mutation must honor its batch cap"
+        );
+    }
+
     #[test]
     fn watch_events_scope_floor_shrinks_when_scope_count_would_exceed_global_cap() {
         assert_eq!(
