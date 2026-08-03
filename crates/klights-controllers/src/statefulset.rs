@@ -718,3 +718,7 @@ pub async fn reconcile_statefulset(
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "statefulset/tests/mod.rs"]
+mod policy_tests;

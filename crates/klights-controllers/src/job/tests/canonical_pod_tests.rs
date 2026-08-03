@@ -7,7 +7,7 @@ use super::*;
 /// and template label inheritance for both modes.
 #[tokio::test]
 async fn test_job_create_pod_uses_canonical_template() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
 
     // ---- Non-indexed path ----
     let std_job = json!({
@@ -30,7 +30,7 @@ async fn test_job_create_pod_uses_canonical_template() {
     let job = get_job(&db, "default", "std-job").await;
     reconcile_job_test(&db, &job, "test-node").await.unwrap();
 
-    let pods = crate::controller_test_debt::find_owned_pods(&db, "default", "std-uid")
+    let pods = crate::test_support::find_owned_pods(&db, "default", "std-uid")
         .await
         .unwrap();
     assert_eq!(pods.len(), 1, "non-indexed Job should produce 1 pod");
@@ -85,7 +85,7 @@ async fn test_job_create_pod_uses_canonical_template() {
     let job = get_job(&db, "default", "idx-job").await;
     reconcile_job_test(&db, &job, "test-node").await.unwrap();
 
-    let pods = crate::controller_test_debt::find_owned_pods(&db, "default", "idx-uid")
+    let pods = crate::test_support::find_owned_pods(&db, "default", "idx-uid")
         .await
         .unwrap();
     assert_eq!(pods.len(), 2, "indexed Job should produce 2 pods");

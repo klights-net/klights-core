@@ -6,19 +6,6 @@
 //! explicit and test-only preserves coverage without resurrecting a root
 //! production controller owner.
 
-#[cfg(test)]
-async fn find_owned_pods(
-    datastore: &dyn crate::datastore::DatastoreBackend,
-    namespace: &str,
-    owner_uid: &str,
-) -> anyhow::Result<Vec<klights_cluster_core::Resource>> {
-    datastore
-        .list_resources_by_owner_uid("v1", "Pod", Some(namespace), owner_uid)
-        .await
-}
-
 mod deployment;
-mod job;
 mod replicaset;
 mod replicationcontroller;
-mod statefulset;

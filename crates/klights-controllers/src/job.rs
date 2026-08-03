@@ -1423,6 +1423,10 @@ pub async fn reconcile_job(
     Ok(std::sync::Arc::unwrap_or_clone(updated_resource.data))
 }
 
+#[cfg(test)]
+#[path = "job/tests/mod.rs"]
+mod policy_tests;
+
 fn job_pod_selector(spec: &Value, template: &Value) -> Option<Value> {
     if let Some(selector) = spec.get("selector") {
         return Some(selector.clone());

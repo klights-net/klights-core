@@ -165,29 +165,6 @@ pub fn non_pod_finalization_port_for_test()
     &PORT
 }
 
-/// Store a resource in the DB and return it with resourceVersion injected,
-/// matching how the API server passes resources to reconcile.
-pub async fn store_and_prepare(
-    db: &crate::datastore::sqlite::Datastore,
-    api_version: &str,
-    kind: &str,
-    namespace: Option<&str>,
-    name: &str,
-    data: serde_json::Value,
-) -> serde_json::Value {
-    let created = db
-        .create_resource(
-            api_version,
-            kind,
-            namespace.map(String::from).as_deref(),
-            name,
-            data,
-        )
-        .await
-        .unwrap();
-    crate::controller_test_support::inject_resource_version(created.data, created.resource_version)
-}
-
 /// Build a `PodRepository` over the supplied in-memory `Datastore` for use
 /// in controller unit tests that exercise `reconcile_deployment` /
 /// `reconcile_replicaset` without going through the full dispatcher.

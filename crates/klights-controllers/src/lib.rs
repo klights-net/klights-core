@@ -50,6 +50,9 @@ mod service_controller;
 pub mod side_effects;
 pub mod statefulset;
 mod statefulset_controller;
+#[cfg(test)]
+#[path = "tests/support.rs"]
+mod test_support;
 pub mod workqueue;
 
 pub use coordination::{
