@@ -44,10 +44,6 @@ pub async fn patch_pod_status_subresource<S: GenericCommandState + 'static>(
         .map_err(|e| AppError::BadRequest(format!("Invalid patch body: {}", e)))?;
     let requested_rv = metadata_resource_version(&patch_value);
 
-    let pod = get_pod(state.as_ref(), &namespace, &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("Pod {}/{} not found", namespace, name)))?;
-
     let updated = state
         .command_store()
         .pod_subresource_mutation()
@@ -56,7 +52,7 @@ pub async fn patch_pod_status_subresource<S: GenericCommandState + 'static>(
             name: name.clone(),
             patch: patch_value,
             patch_kind: patch_type,
-            expected_resource_version: requested_rv.unwrap_or(pod.resource_version),
+            expected_resource_version: requested_rv,
         })
         .await
         .map_err(|e| AppError::from(e).with_resource_context("v1", "Pod", &name))?;

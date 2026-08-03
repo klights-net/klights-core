@@ -118,49 +118,66 @@ impl PodSubresourceService {
         name: &str,
         patch: Value,
         patch_type: PodStatusPatchKind,
-        expected_rv: i64,
+        expected_rv: Option<i64>,
     ) -> Result<Resource> {
-        let current = self
-            .pod_query
-            .get_pod(PodGetRequest::try_by_name(
-                ns.to_string(),
-                name.to_string(),
-            )?)
-            .await?
-            .ok_or_else(|| anyhow!("Pod not found"))?;
-        if current.resource_version != expected_rv {
-            return Err(anyhow!(PodRepositoryError::conflict(
-                "the Pod resourceVersion does not match the current object",
-            )));
+        for attempt in 0..super::POD_MUTATION_CONFLICT_MAX_ATTEMPTS {
+            let current = self
+                .pod_query
+                .get_pod(PodGetRequest::try_by_name(
+                    ns.to_string(),
+                    name.to_string(),
+                )?)
+                .await?
+                .ok_or_else(|| anyhow!("Pod not found"))?;
+            if expected_rv.is_some_and(|expected| current.resource_version != expected) {
+                return Err(anyhow!(PodRepositoryError::conflict(
+                    "the Pod resourceVersion does not match the current object",
+                )));
+            }
+            let observed_rv = current.resource_version;
+            let patched = apply_patch(
+                &current.data,
+                &patch,
+                Some(patch_type_to_content_type(patch_type)),
+            )
+            .map_err(|e| anyhow!("apply_patch failed: {e:?}"))?;
+            let mut next_status = patched.get("status").cloned().unwrap_or(Value::Null);
+            klights_cluster_core::merge_status_for_apply(
+                "v1",
+                "Pod",
+                current.data.as_ref(),
+                &mut next_status,
+                klights_cluster_core::StatusApplyFreshness::Fresh,
+                klights_cluster_core::StatusApplyOrigin::ApiSubresource,
+            );
+            let previous = std::sync::Arc::unwrap_or_clone(current.data);
+            match self
+                .status_persistence
+                .write_pod_status(PodStatusWriteRequest {
+                    namespace: ns.to_string(),
+                    name: name.to_string(),
+                    status: next_status,
+                    expected_resource_version: Some(observed_rv),
+                })
+                .await
+            {
+                Ok(updated) => {
+                    self.reconcile_status_change(previous, &updated, "patch")
+                        .await;
+                    return Ok(updated);
+                }
+                Err(PodRepositoryError::Conflict { .. })
+                    if expected_rv.is_none()
+                        && attempt + 1 < super::POD_MUTATION_CONFLICT_MAX_ATTEMPTS =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(anyhow!(error)),
+            }
         }
-        let patched = apply_patch(
-            &current.data,
-            &patch,
-            Some(patch_type_to_content_type(patch_type)),
-        )
-        .map_err(|e| anyhow!("apply_patch failed: {e:?}"))?;
-        let mut next_status = patched.get("status").cloned().unwrap_or(Value::Null);
-        klights_cluster_core::merge_status_for_apply(
-            "v1",
-            "Pod",
-            current.data.as_ref(),
-            &mut next_status,
-            klights_cluster_core::StatusApplyFreshness::Fresh,
-            klights_cluster_core::StatusApplyOrigin::ApiSubresource,
-        );
-        let previous = std::sync::Arc::unwrap_or_clone(current.data);
-        let updated = self
-            .status_persistence
-            .write_pod_status(PodStatusWriteRequest {
-                namespace: ns.to_string(),
-                name: name.to_string(),
-                status: next_status,
-                expected_resource_version: Some(expected_rv),
-            })
-            .await?;
-        self.reconcile_status_change(previous, &updated, "patch")
-            .await;
-        Ok(updated)
+        Err(anyhow!(PodRepositoryError::conflict(
+            "the Pod status patch conflicted too many times",
+        )))
     }
 
     /// PATCH `/api/v1/.../pods/{name}/ephemeralcontainers` — replace the
@@ -321,6 +338,7 @@ fn bump_metadata_generation(obj: &mut Value) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use klights_reconcile_api::{
@@ -338,6 +356,8 @@ mod tests {
 
     struct TestPodStore {
         current: Mutex<klights_cluster_core::Resource>,
+        advance_status_before_next_write: AtomicBool,
+        status_write_attempts: AtomicUsize,
     }
 
     impl TestPodStore {
@@ -346,7 +366,14 @@ mod tests {
                 current: Mutex::new(
                     klights_cluster_core::Resource::try_from_data(Arc::new(body)).unwrap(),
                 ),
+                advance_status_before_next_write: AtomicBool::new(false),
+                status_write_attempts: AtomicUsize::new(0),
             }
+        }
+
+        fn advance_status_before_next_write(&self) {
+            self.advance_status_before_next_write
+                .store(true, Ordering::SeqCst);
         }
 
         fn current(&self) -> klights_cluster_core::Resource {
@@ -434,6 +461,17 @@ mod tests {
             request: PodStatusWriteRequest,
         ) -> PodRepositoryFuture<'_, klights_cluster_core::Resource> {
             Box::pin(async move {
+                self.status_write_attempts.fetch_add(1, Ordering::SeqCst);
+                if self
+                    .advance_status_before_next_write
+                    .swap(false, Ordering::SeqCst)
+                {
+                    let current = self.current();
+                    let mut raced = Arc::unwrap_or_clone(current.data);
+                    raced["status"]["internalHeartbeat"] = json!("new");
+                    self.replace(raced, current.resource_version)
+                        .expect("coordinated internal status writer advances the Pod RV");
+                }
                 let current = self.current();
                 let mut body = Arc::unwrap_or_clone(current.data);
                 body.as_object_mut()
@@ -447,6 +485,96 @@ mod tests {
                 )
             })
         }
+    }
+
+    /// Kubernetes PATCH without `metadata.resourceVersion` is an unconditional
+    /// read-modify-write. An internal status writer may advance the Pod between
+    /// this request's read and CAS; the API patch must re-read, re-apply, and
+    /// succeed instead of exposing that internal race as a client conflict.
+    #[tokio::test]
+    async fn status_patch_without_client_rv_retries_coordinated_internal_status_race() {
+        let store = Arc::new(TestPodStore::new(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "status-race",
+                "namespace": "default",
+                "uid": "pod-status-race",
+                "resourceVersion": "7"
+            },
+            "spec": {"containers": [{"name": "app", "image": "busybox"}]},
+            "status": {"phase": "Running"}
+        })));
+        let service = PodSubresourceService::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            Arc::new(RecordingMutationReconcile::default()),
+        );
+        store.advance_status_before_next_write();
+
+        let updated = service
+            .patch_status_from_api(
+                "default",
+                "status-race",
+                json!({"status": {"phase": "Failed"}}),
+                PodStatusPatchKind::MergePatch,
+                None,
+            )
+            .await
+            .expect("an internal status RV advance must be retried");
+
+        assert_eq!(updated.data["status"]["phase"], "Failed");
+        assert_eq!(updated.data["status"]["internalHeartbeat"], "new");
+        assert_eq!(
+            store.status_write_attempts.load(Ordering::SeqCst),
+            2,
+            "the coordinated race must cause exactly one retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_patch_with_explicit_client_rv_does_not_retry_coordinated_conflict() {
+        let store = Arc::new(TestPodStore::new(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "strict-status-race",
+                "namespace": "default",
+                "uid": "pod-strict-status-race",
+                "resourceVersion": "7"
+            },
+            "spec": {"containers": [{"name": "app", "image": "busybox"}]},
+            "status": {"phase": "Running"}
+        })));
+        let service = PodSubresourceService::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            Arc::new(RecordingMutationReconcile::default()),
+        );
+        store.advance_status_before_next_write();
+
+        let error = PodSubresourceMutation::patch_status(
+            &service,
+            klights_pod_api::PodStatusPatchRequest {
+                namespace: "default".to_string(),
+                name: "strict-status-race".to_string(),
+                patch: json!({"status": {"phase": "Failed"}}),
+                patch_kind: PodStatusPatchKind::MergePatch,
+                expected_resource_version: Some(7),
+            },
+        )
+        .await
+        .expect_err("an explicit stale client resourceVersion must remain a conflict");
+
+        assert!(matches!(error, PodRepositoryError::Conflict { .. }));
+        assert_eq!(
+            store.status_write_attempts.load(Ordering::SeqCst),
+            1,
+            "an explicit client precondition must never be silently refreshed"
+        );
+        assert_eq!(store.current().data["status"]["phase"], "Running");
     }
 
     #[derive(Default)]
@@ -520,7 +648,7 @@ mod tests {
                             "node-agent",
                             json!({"status": {"phase": "Failed"}}),
                             PodStatusPatchKind::MergePatch,
-                            created.resource_version,
+                            Some(created.resource_version),
                         )
                         .await
                         .unwrap();

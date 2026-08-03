@@ -963,7 +963,7 @@ impl crate::kubelet::pod_repository::PodSubresourceWriter for RootControllerPodP
                 name: name.to_string(),
                 patch,
                 patch_kind: patch_type,
-                expected_resource_version,
+                expected_resource_version: Some(expected_resource_version),
             })
             .await
             .map_err(anyhow::Error::new)

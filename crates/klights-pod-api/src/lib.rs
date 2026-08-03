@@ -669,7 +669,10 @@ pub struct PodStatusPatchRequest {
     pub name: String,
     pub patch: serde_json::Value,
     pub patch_kind: PodStatusPatchKind,
-    pub expected_resource_version: i64,
+    /// Client-supplied `metadata.resourceVersion`, when present. `None` is an
+    /// unconditional Kubernetes PATCH and must not turn an internal status
+    /// writer's resourceVersion advance into a client-visible conflict.
+    pub expected_resource_version: Option<i64>,
 }
 
 #[derive(Clone, Debug)]

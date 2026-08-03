@@ -634,7 +634,7 @@ impl PodNativeOrchestration {
             }
         }
 
-        let max_retries = 20u32;
+        let max_retries = super::POD_MUTATION_CONFLICT_MAX_ATTEMPTS;
         for attempt in 0..max_retries {
             let current = self
                 .pod_query

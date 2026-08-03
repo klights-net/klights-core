@@ -6648,6 +6648,34 @@ async fn patch_status_from_api_merge_patch_updates_only_named_keys() {
 }
 
 #[tokio::test]
+async fn test_only_repository_subresource_port_delegates_unconditional_status_patch() {
+    let repo = build_repo().await;
+    repo.store
+        .create(
+            "default",
+            "p-neutral-unconditional",
+            pending_pod("p-neutral-unconditional"),
+        )
+        .await
+        .unwrap();
+
+    let updated = klights_pod_api::PodSubresourceMutation::patch_status(
+        &repo,
+        klights_pod_api::PodStatusPatchRequest {
+            namespace: "default".to_string(),
+            name: "p-neutral-unconditional".to_string(),
+            patch: json!({"status": {"phase": "Running"}}),
+            patch_kind: klights_pod_api::PodStatusPatchKind::MergePatch,
+            expected_resource_version: None,
+        },
+    )
+    .await
+    .expect("the cfg(test) compatibility port must delegate None to canonical policy");
+
+    assert_eq!(updated.data["status"]["phase"], json!("Running"));
+}
+
+#[tokio::test]
 async fn patch_status_from_api_ignores_non_status_fields() {
     use super::PodSubresourceWriter;
     let repo = build_repo().await;

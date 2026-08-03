@@ -58,6 +58,12 @@ pub mod state_ports;
 pub mod status;
 mod status_command_ports;
 mod validation;
+
+/// Shared optimistic-concurrency bound for request-scoped Pod PATCH
+/// read-modify-write operations. These are finite mutation retries, not
+/// background reconciliation or polling.
+const POD_MUTATION_CONFLICT_MAX_ATTEMPTS: usize = 20;
+
 pub mod watch_event {
     pub use crate::watch::{EventType, WatchEvent};
 }

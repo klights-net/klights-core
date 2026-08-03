@@ -1882,7 +1882,7 @@ impl PodSubresourceWriter for PodRepository {
                         klights_pod_api::PodStatusPatchKind::ApplyPatch
                     }
                 },
-                expected_resource_version: expected_rv,
+                expected_resource_version: Some(expected_rv),
             })
             .await?;
         let _ = self
@@ -1963,32 +1963,24 @@ impl klights_pod_api::PodSubresourceMutation for PodRepository {
         &self,
         request: klights_pod_api::PodStatusPatchRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
-        let klights_pod_api::PodStatusPatchRequest {
-            namespace,
-            name,
-            patch,
-            patch_kind,
-            expected_resource_version,
-        } = request;
-        let patch_type = match patch_kind {
-            klights_pod_api::PodStatusPatchKind::JsonPatch => PodStatusPatchType::JsonPatch,
-            klights_pod_api::PodStatusPatchKind::MergePatch => PodStatusPatchType::MergePatch,
-            klights_pod_api::PodStatusPatchKind::StrategicMerge => {
-                PodStatusPatchType::StrategicMerge
-            }
-            klights_pod_api::PodStatusPatchKind::ApplyPatch => PodStatusPatchType::ApplyPatch,
-        };
         Box::pin(async move {
-            PodSubresourceWriter::patch_status_from_api(
-                self,
-                &namespace,
-                &name,
-                patch,
-                patch_type,
-                expected_resource_version,
-            )
-            .await
-            .map_err(|error| ordinary_access::map_repository_error(error, &namespace, &name))
+            let updated = self
+                .test_subresource
+                .as_deref()
+                .expect("test status patch requires the canonical Pod subresource port")
+                .patch_status(request)
+                .await?;
+            let _ = self
+                .mutation_reconcile
+                .reconcile_pod_mutation(
+                    klights_reconcile_api::PodMutationReconcileRequest::RunHooks {
+                        pod: updated.clone(),
+                        named_hook: None,
+                        context: "pod_status_subresource_patch",
+                    },
+                )
+                .await;
+            Ok(updated)
         })
     }
 
