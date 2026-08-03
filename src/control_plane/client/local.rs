@@ -29,6 +29,9 @@ use crate::control_plane::client::{
 };
 use crate::datastore::{DatastoreHandle, Resource};
 use crate::kubelet::pod_repository::store::PodStore;
+use klights_auth::projected_service_account_token::{
+    authorize_projected_service_account_token, sign_authorized_projected_service_account_token,
+};
 use klights_cluster_core::LogApplyPodCleanupIntentRow as StoredPodCleanupIntent;
 use klights_cluster_core::command::StorageCommand;
 use klights_controllers::ControllerDispatcher;
@@ -500,13 +503,11 @@ impl LocalApiClient {
             });
             leadership.ensure_unchanged()?;
             let signing_key_pem = signing_key_pem?;
-            let claims =
-                crate::control_plane::service_account_tokens::authorize_projected_service_account_token(
+            let resources = crate::bootstrap::composition_adapters::projected_token_resource_adapter::ProjectedTokenResourceAdapter::new(
                 self.db.as_ref(),
                 self.pod_store.as_ref(),
-                &request,
-            )
-            .await;
+            );
+            let claims = authorize_projected_service_account_token(&resources, &request).await;
             leadership.ensure_unchanged()?;
             let claims = claims?;
             #[cfg(test)]
@@ -518,11 +519,11 @@ impl LocalApiClient {
             let crypto: &klights_supervisor::CryptoExecutor = &self.crypto;
             let token = crypto
                 .run_blocking("sign-projected-service-account-token", move || {
-                    crate::control_plane::service_account_tokens::sign_authorized_projected_service_account_token(
-                    &signing_key_pem,
-                    claims,
-                    &klights_auth::clock::SystemClock,
-                )
+                    sign_authorized_projected_service_account_token(
+                        &signing_key_pem,
+                        claims,
+                        &klights_auth::clock::SystemClock,
+                    )
                 })
                 .await
                 .map_err(|error| {

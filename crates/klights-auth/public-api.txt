@@ -1,4 +1,4 @@
 # Exact compiler-derived normal public API for klights-auth.
 # Update only after reviewing the complete rustdoc symbol delta.
-count=237
-sha256=88811ffeff4df7f97b35fc6470585efb0eae8dcf350b6ca4b96e784e455d8042
+count=247
+sha256=f32d0448a39f2066b27f758c3e1c6894872632ee5e2951b71c53673e1abac52c

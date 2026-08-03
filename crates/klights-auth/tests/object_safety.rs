@@ -12,6 +12,9 @@ fn every_substitutable_auth_port_is_object_safe() {
     assert_object_safe::<dyn klights_auth::NodePolicyStore>();
     assert_object_safe::<dyn klights_auth::OidcDiscovery>();
     assert_object_safe::<dyn klights_auth::OidcValidator>();
+    assert_object_safe::<
+        dyn klights_auth::projected_service_account_token::ProjectedTokenResourceReader,
+    >();
     assert_object_safe::<dyn klights_auth::RbacPolicyStore>();
     assert_object_safe::<dyn klights_auth::RbacResourceReader>();
     assert_object_safe::<dyn klights_auth::WebhookAuthenticator>();

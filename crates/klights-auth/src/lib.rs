@@ -16,6 +16,7 @@ pub mod kubelet_client_cert;
 pub mod node_authorizer;
 pub mod node_policy_store;
 pub mod oidc;
+pub mod projected_service_account_token;
 pub mod rbac_authorizer;
 pub mod rbac_policy_store;
 pub mod rbac_rule_evaluator;

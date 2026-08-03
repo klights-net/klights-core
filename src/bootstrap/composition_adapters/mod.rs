@@ -8,5 +8,6 @@ pub(crate) mod networking_state_adapter;
 pub(crate) mod node_log_runtime_adapter;
 pub(crate) mod node_metrics_adapter;
 pub(crate) mod positioned_watch_adapter;
+pub(crate) mod projected_token_resource_adapter;
 pub(crate) mod signing_key_state_adapter;
 pub(crate) mod watch_stream_adapter;
