@@ -139,7 +139,10 @@ impl LocalApiPersistencePorts {
         _watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     ) -> Self {
         let positioned_watch =
-            crate::positioned_watch_adapter::for_test(&passive_reads, db.clone());
+            crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
+                &passive_reads,
+                db.clone(),
+            );
         Self {
             db,
             positioned_watch,

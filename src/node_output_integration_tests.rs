@@ -1695,7 +1695,10 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let watch_source = std::sync::Arc::new(
             crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(std::sync::Arc::new(
-                crate::positioned_watch_adapter::for_test(&passive_reads, db_handle),
+                crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
+                    &passive_reads,
+                    db_handle,
+                ),
             )),
         );
         let handle = tokio::spawn(run_heartbeat_with_interval(

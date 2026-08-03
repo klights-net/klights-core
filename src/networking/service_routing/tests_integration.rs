@@ -46,7 +46,7 @@ mod integration_tests {
         let rt = NftServiceRouter::boot(NftServiceRouterBoot::new(
             NftServiceRouterStores::new(
                 std::sync::Arc::new(
-                    crate::networking_state_adapter::LeaderRoutingStateAdapter::new(resource_query),
+                    crate::bootstrap::composition_adapters::networking_state_adapter::LeaderRoutingStateAdapter::new(resource_query),
                 ),
                 watch,
                 endpoint_source,

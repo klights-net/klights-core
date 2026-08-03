@@ -2023,7 +2023,10 @@ mod cases {
             crate::datastore::test_support::sqlite_passive_read_ports(&concrete_pod_event_db);
         let pod_event_db: crate::datastore::DatastoreHandle = Arc::new(concrete_pod_event_db);
         let positioned_watch =
-            crate::positioned_watch_adapter::for_test(&passive_reads, pod_event_db.clone());
+            crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
+                &passive_reads,
+                pod_event_db.clone(),
+            );
         pod_event_db.seed_namespace_for_test("sonobuoy").await;
         pod_event_db
             .create_resource(

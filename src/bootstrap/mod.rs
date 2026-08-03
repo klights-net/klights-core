@@ -2,6 +2,7 @@ pub(crate) mod auth_adapters;
 pub mod bootstrap_token;
 pub(crate) mod certificate_bootstrap;
 pub mod cluster_meta;
+pub(crate) mod composition_adapters;
 pub mod config;
 pub(crate) mod controller_adapters;
 pub mod controlplane_discovery;

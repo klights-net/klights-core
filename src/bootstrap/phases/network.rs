@@ -164,7 +164,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
             klights_networking::service_routing::NftServiceRouterDefaultBoot::new(
                 klights_networking::service_routing::NftServiceRouterStores::new(
                     Arc::new(
-                        crate::networking_state_adapter::LeaderRoutingStateAdapter::new(
+                        crate::bootstrap::composition_adapters::networking_state_adapter::LeaderRoutingStateAdapter::new(
                             resource_query,
                         ),
                     ),
@@ -214,7 +214,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
                     .to_string_lossy()
                     .into_owned(),
             )?,
-            socket_filesystem: crate::cni_socket_adapter::RootCniSocketFilesystem::shared(
+            socket_filesystem: crate::bootstrap::composition_adapters::cni_socket_adapter::RootCniSocketFilesystem::shared(
                 klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
             ),
             datapath: cni_datapath,

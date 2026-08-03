@@ -1029,8 +1029,8 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         );
         client.set_namespace_termination(
-            crate::api_state_adapter::RootNamespaceTerminationReconciler::new(
-                crate::api_state_adapter::RootNamespaceTerminationStore::new(Arc::new(db.clone())),
+            crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationReconciler::new(
+                crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(Arc::new(db.clone())),
                 klights_controllers::side_effects::SideEffectMetrics::new(),
             ),
         );

@@ -23,7 +23,7 @@ async fn reconcile_hpa(
         &klights_controllers::ControllerCoordination::new(),
         hpa,
         node_name,
-        &crate::node_metrics_adapter::UnavailableNodeMetrics,
+        &crate::bootstrap::composition_adapters::node_metrics_adapter::UnavailableNodeMetrics,
         crate::controller_test_support::deterministic_controller_identity().as_ref(),
         chrono::Utc::now(),
     )

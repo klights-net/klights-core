@@ -268,7 +268,9 @@ async fn start_cleanup_cni_rpc_server(
             .into_owned(),
     )?;
     let socket_filesystem =
-        crate::cni_socket_adapter::RootCniSocketFilesystem::shared(file_process.clone());
+        crate::bootstrap::composition_adapters::cni_socket_adapter::RootCniSocketFilesystem::shared(
+            file_process.clone(),
+        );
     let server = cni_plugin::bind_cleanup_rpc_server(
         socket_path,
         socket_filesystem,

@@ -139,10 +139,11 @@ mod tests {
             ),
         );
         let runtime = LeaderCronJobSchedulerRuntime {
-            positioned_watch: crate::positioned_watch_adapter::for_test(
-                &passive_reads,
-                db_handle.clone(),
-            ),
+            positioned_watch:
+                crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
+                    &passive_reads,
+                    db_handle.clone(),
+                ),
             db: db_handle,
             dispatcher,
         };

@@ -61,7 +61,10 @@ impl ClusterControlplaneJoinRegistration {
             is_learner: request.as_learner,
         };
         let role_projection =
-            crate::authority_adapter::project_raft_shape(&node_role, &joiner_shape);
+            crate::bootstrap::composition_adapters::authority_adapter::project_raft_shape(
+                &node_role,
+                &joiner_shape,
+            );
         let registration_addresses = NodeRegistrationAddresses::new(
             request
                 .node_internal_ip

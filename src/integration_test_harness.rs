@@ -189,7 +189,7 @@ pub async fn reconcile_namespace_termination_for_integration(
     db: IntegrationDatastoreHandle,
     namespace: &str,
 ) -> Result<(), k8s_native_service::AppError> {
-    let store = crate::api_state_adapter::RootNamespaceTerminationStore::new(db);
+    let store = crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(db);
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     k8s_native_service::reconcile_namespace_termination_at(
         store.as_ref(),
@@ -205,7 +205,7 @@ pub async fn reconcile_namespace_termination_for_uid_for_integration(
     namespace: &str,
     expected_uid: &str,
 ) -> Result<k8s_native_service::NamespaceTerminationOutcome, k8s_native_service::AppError> {
-    let store = crate::api_state_adapter::RootNamespaceTerminationStore::new(db);
+    let store = crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(db);
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     k8s_native_service::reconcile_namespace_termination_for_uid_with_outcome_at(
         store.as_ref(),
@@ -670,7 +670,7 @@ impl NativeApiTestHarness {
         Self::assemble(
             authorizer,
             None,
-            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
+            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             None,
             None,
             None,
@@ -689,7 +689,7 @@ impl NativeApiTestHarness {
         Self::assemble(
             authorizer,
             None,
-            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
+            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             None,
             None,
             None,
@@ -709,7 +709,7 @@ impl NativeApiTestHarness {
         Self::assemble(
             authorizer,
             None,
-            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
+            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             None,
             None,
             None,
@@ -728,7 +728,7 @@ impl NativeApiTestHarness {
         Self::assemble(
             Arc::new(AllowAllAuthorizer),
             Some(diagnostics),
-            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
+            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             None,
             None,
             None,
@@ -767,7 +767,7 @@ impl NativeApiTestHarness {
         webhook: Option<Arc<dyn klights_auth::webhook_auth::WebhookAuthenticator>>,
     ) -> anyhow::Result<Self> {
         Self::with_authentication_dependencies(
-            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
+            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             oidc,
             webhook,
         )
@@ -782,7 +782,7 @@ impl NativeApiTestHarness {
         Self::assemble_with_options(
             Arc::new(AllowAllAuthorizer),
             None,
-            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
+            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             None,
             None,
             None,
@@ -801,7 +801,7 @@ impl NativeApiTestHarness {
 
     pub async fn with_signing_key_pem(signing_key_pem: String) -> anyhow::Result<Self> {
         Self::with_authentication_dependencies(
-            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::from_pem(
+            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::from_pem(
                 signing_key_pem,
             ),
             None,
@@ -816,7 +816,7 @@ impl NativeApiTestHarness {
         Self::assemble_with_options(
             Arc::new(AllowAllAuthorizer),
             None,
-            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
+            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             None,
             None,
             None,
@@ -839,7 +839,7 @@ impl NativeApiTestHarness {
         Self::assemble_with_options(
             Arc::new(AllowAllAuthorizer),
             None,
-            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
+            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             None,
             None,
             None,
@@ -862,7 +862,7 @@ impl NativeApiTestHarness {
         let harness = Self::assemble(
             Arc::new(AllowAllAuthorizer),
             None,
-            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
+            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             None,
             None,
             Some(fail.clone()),
@@ -887,7 +887,7 @@ impl NativeApiTestHarness {
         Self::assemble(
             Arc::new(AllowAllAuthorizer),
             None,
-            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
+            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             None,
             None,
             None,
@@ -906,7 +906,7 @@ impl NativeApiTestHarness {
         let harness = Self::assemble(
             Arc::new(AllowAllAuthorizer),
             None,
-            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
+            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             None,
             None,
             None,
@@ -929,7 +929,7 @@ impl NativeApiTestHarness {
         let harness = Self::assemble(
             Arc::new(AllowAllAuthorizer),
             None,
-            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
+            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             None,
             None,
             None,
@@ -954,7 +954,7 @@ impl NativeApiTestHarness {
         let harness = Self::assemble_with_options(
             Arc::new(AllowAllAuthorizer),
             None,
-            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
+            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             None,
             None,
             None,
@@ -980,7 +980,7 @@ impl NativeApiTestHarness {
         let harness = Self::assemble_with_options(
             Arc::new(AllowAllAuthorizer),
             None,
-            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
+            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             None,
             None,
             None,
@@ -1194,11 +1194,12 @@ impl NativeApiTestHarness {
         let pod_api = root_pod_parts.api;
         let pod_subresource = root_pod_parts.subresource;
         let pod_repository = Arc::new(root_pod_parts.repository_parts.repository);
-        let api_pod_repository = crate::api_state_adapter::RootApiPodRepository::new(
-            pod_repository.clone(),
-            pod_api.clone(),
-            pod_subresource.clone(),
-        );
+        let api_pod_repository =
+            crate::bootstrap::composition_adapters::api_state_adapter::RootApiPodRepository::new(
+                pod_repository.clone(),
+                pod_api.clone(),
+                pod_subresource.clone(),
+            );
         let controller_pod_port = Arc::new(
             crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort::new(
                 pod_repository.clone(),
@@ -1223,9 +1224,12 @@ impl NativeApiTestHarness {
             metrics.clone(),
         );
         let positioned_watch =
-            crate::positioned_watch_adapter::for_test(&passive_reads, datastore.clone());
+            crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
+                &passive_reads,
+                datastore.clone(),
+            );
         let watch_signals = crate::watch_commit_observation_adapter::test_signal_source(&datastore);
-        let generated = crate::generated_handler_adapter::GeneratedHandlerAdapter::new(
+        let generated = crate::bootstrap::composition_adapters::generated_handler_adapter::GeneratedHandlerAdapter::new(
             datastore.clone(),
             watch_signals.clone(),
             positioned_watch.clone(),
@@ -1325,7 +1329,7 @@ impl NativeApiTestHarness {
         let pod_logs_root = config.data_root.join("logs/pods");
         let wall_clock: Arc<dyn klights_supervisor::WallClock> =
             Arc::new(klights_supervisor::SystemWallClock);
-        let pod_logs = crate::node_log_runtime_adapter::pod_log_capabilities(
+        let pod_logs = crate::bootstrap::composition_adapters::node_log_runtime_adapter::pod_log_capabilities(
             Arc::new(
                 klights_kubelet::node_api::logs::LocalNodeLogRuntime::new_with_pod_event_store(
                     pod_logs_root.clone(),
@@ -1409,19 +1413,19 @@ impl NativeApiTestHarness {
             webhook,
             None,
             Arc::new(
-                crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
+                crate::bootstrap::composition_adapters::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
                     datastore.clone(),
                     watch_signals,
                     positioned_watch.clone(),
                 ),
             ),
-            crate::api_state_adapter::RootNamespaceTerminationStore::new(datastore.clone()),
+            crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(datastore.clone()),
             resource_query,
             resource_command,
             finalizer_lifecycle,
             mutation_effects,
-            crate::list_query_adapter::DatastoreListResourceVersionPort::new(datastore.clone()),
-            crate::list_query_adapter::DatastoreNamespaceListPort::new(datastore.clone()),
+            crate::bootstrap::composition_adapters::list_query_adapter::DatastoreListResourceVersionPort::new(datastore.clone()),
+            crate::bootstrap::composition_adapters::list_query_adapter::DatastoreNamespaceListPort::new(datastore.clone()),
             crate::bootstrap::controller_adapters::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
                 datastore.clone(),
             ),
@@ -1429,7 +1433,7 @@ impl NativeApiTestHarness {
                 identity,
                 datastore.clone(),
             ),
-            crate::custom_resource_read_adapter::CustomResourceReadAdapter::new(
+            crate::bootstrap::composition_adapters::custom_resource_read_adapter::CustomResourceReadAdapter::new(
                 datastore.clone(),
                 crate::watch_commit_observation_adapter::test_signal_source(&datastore),
                 positioned_watch,
@@ -1455,8 +1459,8 @@ impl NativeApiTestHarness {
                 controller_identity,
             ),
             controller_dispatcher.clone(),
-            crate::api_state_adapter::RootApiFailureMetrics::new(metrics),
-            crate::api_state_adapter::RootApiNodeLeaseObservations::new(node_lease_tracker.clone()),
+            crate::bootstrap::composition_adapters::api_state_adapter::RootApiFailureMetrics::new(metrics),
+            crate::bootstrap::composition_adapters::api_state_adapter::RootApiNodeLeaseObservations::new(node_lease_tracker.clone()),
             service_routing.clone(),
             pod_logs,
             None,

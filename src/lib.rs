@@ -3,35 +3,26 @@
 mod admission_tests;
 mod allocator;
 mod api_helpers_adapter;
-mod api_state_adapter;
-mod authority_adapter;
 pub mod cli;
 mod cluster_engine;
 pub(crate) mod cluster_store_replication_adapter;
-mod cni_socket_adapter;
 pub mod control_plane;
 #[cfg(test)]
 mod controller_test_debt;
 #[cfg(test)]
 mod controller_test_support;
-mod custom_resource_read_adapter;
 pub mod datastore;
 #[cfg(test)]
 mod endpoint_reconcile_integration_tests;
 #[cfg(test)]
 mod gc_ownership_integration_tests;
-mod generated_handler_adapter;
 #[cfg(test)]
 mod grpc_test_support;
 #[cfg(feature = "integration-test-harness")]
 pub mod integration_test_harness;
 pub mod kubelet;
-mod list_query_adapter;
 pub mod networking;
-mod networking_state_adapter;
 pub mod node_admin;
-mod node_log_runtime_adapter;
-mod node_metrics_adapter;
 pub(crate) mod node_routing_metadata;
 mod outbox_payload_codec_adapter;
 mod outbox_response_codec_adapter;
@@ -40,7 +31,6 @@ pub mod pidfile;
 mod pod_event_adapter;
 mod pod_native_adapter;
 pub(crate) mod pod_repository_composition;
-mod positioned_watch_adapter;
 mod remote_informer_cache_adapter;
 mod resource_admission_adapter;
 #[cfg(test)]
@@ -48,11 +38,9 @@ mod service_pod_integration_tests;
 #[cfg(test)]
 mod service_reconcile_integration_tests;
 pub mod shutdown;
-mod signing_key_state_adapter;
 pub mod version;
 pub mod watch;
 mod watch_commit_observation_adapter;
-mod watch_stream_adapter;
 
 #[cfg(test)]
 mod cluster_engine_composition_tests;

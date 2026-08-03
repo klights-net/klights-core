@@ -168,7 +168,10 @@ mod tests {
         let watcher = tokio::spawn(run_crd_registry_watch_with_components(
             new_runtime(
                 handle.clone(),
-                crate::positioned_watch_adapter::for_test(&passive_reads, handle),
+                crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
+                    &passive_reads,
+                    handle,
+                ),
             ),
             registry.clone(),
             cancel.clone(),

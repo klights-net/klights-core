@@ -220,7 +220,7 @@ impl GrpcReplicationServerTestExt for GrpcReplicationServer {
     }
 
     fn with_leader_gate(self, is_leader_rx: tokio::sync::watch::Receiver<bool>) -> Self {
-        self.with_authority(crate::authority_adapter::TestBooleanWatchAuthority::new(
+        self.with_authority(crate::bootstrap::composition_adapters::authority_adapter::TestBooleanWatchAuthority::new(
             is_leader_rx,
         ))
     }
@@ -468,7 +468,9 @@ fn mount_service_full_with_passive_reads(
         klights_leader_rpc::server::ReplicationServerPorts::from_shared(local, projected_token);
     let supervisor = service.task_supervisor();
     let etc = PathBuf::from(data_root).join("etc");
-    let authority = is_leader_rx.map(crate::authority_adapter::TestBooleanWatchAuthority::new);
+    let authority = is_leader_rx.map(
+        crate::bootstrap::composition_adapters::authority_adapter::TestBooleanWatchAuthority::new,
+    );
 
     klights_leader_rpc::server::mount_service_full_production(
         app,

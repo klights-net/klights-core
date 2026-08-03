@@ -489,8 +489,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             supervisor.clone(),
         )) as Arc<dyn klights_node_api::NodeMetricsSampler>
     });
-    let node_metrics: Arc<dyn klights_node_api::NodeMetrics> =
-        Arc::new(crate::node_metrics_adapter::RootNodeMetrics::new(
+    let node_metrics: Arc<dyn klights_node_api::NodeMetrics> = Arc::new(
+        crate::bootstrap::composition_adapters::node_metrics_adapter::RootNodeMetrics::new(
             config.node_name.clone(),
             local_node_metrics,
             replication_service_for_router.clone().map(|service| {
@@ -498,13 +498,14 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     as Arc<dyn klights_node_api::NodeMetrics>
             }),
             supervisor.clone(),
-        ));
+        ),
+    );
 
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let namespace_lifecycle_store =
-        crate::api_state_adapter::RootNamespaceTerminationStore::new(db_handle.clone());
+        crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(db_handle.clone());
     local_api_client.set_namespace_termination(
-        crate::api_state_adapter::RootNamespaceTerminationReconciler::new(
+        crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationReconciler::new(
             namespace_lifecycle_store.clone(),
             metrics.clone(),
         ),
@@ -833,9 +834,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let initial_is_leader = initial_raft_shape.as_ref().is_none_or(|s| s.is_leader);
     let initial_declared_role =
         crate::bootstrap::node_registration_profile::build(node_mode, &cli.role).role();
-    let initial_role_projection = initial_raft_shape
-        .as_ref()
-        .map(|shape| crate::authority_adapter::project_raft_shape(&initial_declared_role, shape));
+    let initial_role_projection = initial_raft_shape.as_ref().map(|shape| {
+        crate::bootstrap::composition_adapters::authority_adapter::project_raft_shape(
+            &initial_declared_role,
+            shape,
+        )
+    });
     publish_leadership_if_changed(&is_leader_tx, initial_is_leader);
     let initial_leader_addr = raft_node
         .as_ref()
@@ -918,14 +922,14 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         metrics.clone(),
     );
     let list_resource_versions =
-        crate::list_query_adapter::DatastoreListResourceVersionPort::new(db_handle.clone());
+        crate::bootstrap::composition_adapters::list_query_adapter::DatastoreListResourceVersionPort::new(db_handle.clone());
     let gc_owner_lifecycle =
         crate::bootstrap::controller_adapters::gc_delete_adapter::GcOwnerLifecycleAdapter::new_with_coordination(
             db_handle.clone(),
             api_pod_repository.clone(),
             controller_coordination.clone(),
         );
-    let generated_handler_adapter = crate::generated_handler_adapter::GeneratedHandlerAdapter::new(
+    let generated_handler_adapter = crate::bootstrap::composition_adapters::generated_handler_adapter::GeneratedHandlerAdapter::new(
         db_handle.clone(),
         watch_signals.clone(),
         positioned_watch.clone(),
@@ -1177,7 +1181,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                             &node_name,
                             &registration_profile_task,
                             registration_addresses,
-                            Some(crate::authority_adapter::project_raft_shape(
+                            Some(crate::bootstrap::composition_adapters::authority_adapter::project_raft_shape(
                                 &registration_profile_task.role(),
                                 &shape,
                             )),
@@ -1540,7 +1544,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 clock,
             ),
         );
-        crate::node_log_runtime_adapter::pod_log_capabilities(
+        crate::bootstrap::composition_adapters::node_log_runtime_adapter::pod_log_capabilities(
             local_http,
             local_websocket,
             supervisor.clone(),
@@ -1549,7 +1553,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     };
     #[cfg(not(test))]
     let api_signing_keys =
-        crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::load(
+        crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::load(
             &service_account_signing_key_path,
             supervisor.as_ref(),
         )
@@ -1557,7 +1561,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .context("load root-owned ServiceAccount signing state")?;
     #[cfg(test)]
     let api_signing_keys =
-        crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test();
+        crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test();
     let (api_router, api_outer_layers) = k8s_native_service::build_current_router(
         api_identity.clone(),
         Arc::new(
@@ -1576,7 +1580,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         webhook_authenticator,
         cluster_ca_pem.map(Arc::new),
         Arc::new(
-            crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
+            crate::bootstrap::composition_adapters::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
                 db_handle.clone(),
                 watch_signals.clone(),
                 positioned_watch.clone(),
@@ -1588,7 +1592,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         finalizer_lifecycle,
         mutation_effects,
         list_resource_versions,
-        crate::list_query_adapter::DatastoreNamespaceListPort::new(db_handle.clone()),
+        crate::bootstrap::composition_adapters::list_query_adapter::DatastoreNamespaceListPort::new(db_handle.clone()),
         crate::bootstrap::controller_adapters::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
             db_handle.clone(),
         ),
@@ -1596,7 +1600,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             api_identity,
             db_handle.clone(),
         ),
-        crate::custom_resource_read_adapter::CustomResourceReadAdapter::new(
+        crate::bootstrap::composition_adapters::custom_resource_read_adapter::CustomResourceReadAdapter::new(
             db_handle.clone(),
             watch_signals.clone(),
             positioned_watch,
@@ -1607,7 +1611,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         generated_handler_adapter.clone(),
         generated_handler_adapter,
         Arc::new(gc_owner_lifecycle),
-        crate::api_state_adapter::RootApiPodRepository::new(
+        crate::bootstrap::composition_adapters::api_state_adapter::RootApiPodRepository::new(
             api_pod_repository.clone(),
             pod_api_service.clone(),
             pod_subresource_service.clone(),
@@ -1620,8 +1624,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             controller_identity.clone(),
         ),
         controller_dispatcher.clone(),
-        crate::api_state_adapter::RootApiFailureMetrics::new(metrics.clone()),
-        crate::api_state_adapter::RootApiNodeLeaseObservations::new(node_lease_tracker.clone()),
+        crate::bootstrap::composition_adapters::api_state_adapter::RootApiFailureMetrics::new(metrics.clone()),
+        crate::bootstrap::composition_adapters::api_state_adapter::RootApiNodeLeaseObservations::new(node_lease_tracker.clone()),
         Arc::new(
             crate::bootstrap::network_adapters::ApiServiceRoutingSyncAdapter::new(services.clone()),
         ),

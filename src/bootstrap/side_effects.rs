@@ -19,9 +19,9 @@ pub(crate) fn default_registry(
     let db = db.expect("default side-effect registry requires a datastore handle");
     let pod_slot = PodSideEffectPortsSlot::new();
     let controller_slot = ControllerDispatcherSlot::new();
-    let namespace_store = crate::api_state_adapter::RootNamespaceTerminationStore::new(db.clone());
+    let namespace_store = crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(db.clone());
     let namespace_reconciliation =
-        crate::api_state_adapter::RootNamespaceTerminationReconciler::new(namespace_store, metrics);
+        crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationReconciler::new(namespace_store, metrics);
     let effects = DefaultSideEffects::new(
         klights_controllers::side_effects::apiservice::effect(
             crate::bootstrap::controller_adapters::apiservice_side_effect_adapter::port(db.clone()),

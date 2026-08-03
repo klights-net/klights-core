@@ -428,7 +428,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 ),
             );
             let positioned_watch =
-                crate::positioned_watch_adapter::datastore_positioned_watch_service(
+                crate::bootstrap::composition_adapters::positioned_watch_adapter::datastore_positioned_watch_service(
                     &passive_read_ports,
                     db_handle.clone(),
                     watch_commit_wiring.signals.clone(),

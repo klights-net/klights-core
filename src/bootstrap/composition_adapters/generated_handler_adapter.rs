@@ -13,7 +13,7 @@ use k8s_native_service::ports::{GeneratedWatchPort, GeneratedWatchRequest};
 
 pub(crate) struct GeneratedHandlerAdapter {
     db: DatastoreHandle,
-    watch_source: Arc<crate::watch_stream_adapter::DatastoreWatchStreamAdapter>,
+    watch_source: Arc<super::watch_stream_adapter::DatastoreWatchStreamAdapter>,
     file_process: klights_supervisor::FileProcessExecutor,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ca_cert_path: std::path::PathBuf,
@@ -32,7 +32,7 @@ impl GeneratedHandlerAdapter {
     ) -> Arc<Self> {
         Arc::new(Self {
             watch_source: Arc::new(
-                crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
+                super::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
                     db.clone(),
                     watch_signals,
                     positioned_watch,

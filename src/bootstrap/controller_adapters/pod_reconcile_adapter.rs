@@ -66,11 +66,11 @@ impl PodReconcileAdapter {
                 db.clone(),
             ),
             #[cfg(not(test))]
-            namespace_lifecycle: crate::api_state_adapter::RootNamespaceTerminationStore::new(
+            namespace_lifecycle: crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(
                 db.clone(),
             ),
             #[cfg(test)]
-            namespace_lifecycle: crate::api_state_adapter::RootNamespaceTerminationStore::new(
+            namespace_lifecycle: crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(
                 db.clone(),
             ),
             db,
