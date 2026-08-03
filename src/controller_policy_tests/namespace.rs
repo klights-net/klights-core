@@ -12,7 +12,7 @@ async fn create_default_service_account(
         store,
         namespace,
         chrono::Utc::now(),
-        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+        crate::controller_test_support::deterministic_controller_identity().as_ref(),
     )
     .await
 }
@@ -25,7 +25,7 @@ async fn reconcile_default_service_account(
         store,
         namespace,
         chrono::Utc::now(),
-        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+        crate::controller_test_support::deterministic_controller_identity().as_ref(),
     )
     .await
 }
@@ -40,7 +40,7 @@ async fn create_kube_root_ca_configmap(
         namespace,
         ca_cert_pem,
         chrono::Utc::now(),
-        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+        crate::controller_test_support::deterministic_controller_identity().as_ref(),
     )
     .await
 }
@@ -53,7 +53,7 @@ async fn create_extension_apiserver_authentication_configmap(
         store,
         ca_cert_pem,
         chrono::Utc::now(),
-        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+        crate::controller_test_support::deterministic_controller_identity().as_ref(),
     )
     .await
 }
@@ -117,7 +117,7 @@ impl NamespaceRuntimeFixture {
             db,
             &self.ca_cert_path,
             "2026-01-01T00:00:00Z".parse().expect("fixed test time"),
-            crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+            crate::controller_test_support::deterministic_controller_identity().as_ref(),
         )
         .await
     }
@@ -134,7 +134,7 @@ impl NamespaceRuntimeFixture {
             namespace,
             &self.ca_cert_path,
             "2026-01-01T00:00:00Z".parse().expect("fixed test time"),
-            crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+            crate::controller_test_support::deterministic_controller_identity().as_ref(),
         )
         .await
     }
@@ -151,7 +151,7 @@ async fn init_default_namespaces(db: &dyn DatastoreBackend) -> Result<()> {
         db,
         &crate::paths::ca_cert_path(&crate::paths::runtime_namespace()),
         chrono::Utc::now(),
-        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+        crate::controller_test_support::deterministic_controller_identity().as_ref(),
     )
     .await
 }
@@ -164,7 +164,7 @@ async fn reconcile_kube_root_ca(db: &dyn DatastoreBackend, namespace: &str) -> R
         namespace,
         &crate::paths::ca_cert_path(&crate::paths::runtime_namespace()),
         chrono::Utc::now(),
-        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+        crate::controller_test_support::deterministic_controller_identity().as_ref(),
     )
     .await
 }
@@ -251,7 +251,7 @@ async fn test_init_default_namespaces_creates_default_service_accounts() {
 async fn namespace_service_account_consumes_injected_uid_exactly_once() {
     let db = crate::datastore::test_support::in_memory().await;
     let identity =
-        crate::controllers::test_utils::ScriptedControllerIdentityGenerator::with_uids([
+        crate::controller_test_support::ScriptedControllerIdentityGenerator::with_uids([
             "abcdef12-3456-4000-8000-000000000000",
         ]);
 

@@ -127,14 +127,14 @@ async fn grpc_test_server(
 
 async fn grpc_test_server_with_dispatcher(
     db: DatastoreHandle,
-    controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
+    controller_dispatcher: Option<Arc<klights_controllers::ControllerDispatcher>>,
 ) -> (String, Arc<ReplicationService>, tokio::task::JoinHandle<()>) {
     grpc_test_server_full(db, controller_dispatcher, None).await
 }
 
 async fn grpc_test_server_full(
     db: DatastoreHandle,
-    controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
+    controller_dispatcher: Option<Arc<klights_controllers::ControllerDispatcher>>,
     controlplane_join_handler: Option<Arc<dyn ControlplaneJoinHandler>>,
 ) -> (String, Arc<ReplicationService>, tokio::task::JoinHandle<()>) {
     let (endpoint, service, _progress, handle) = grpc_test_server_full_with_node_cert(
@@ -158,7 +158,7 @@ async fn grpc_test_server_with_node_cert(
 
 async fn grpc_test_server_full_with_node_cert(
     db: DatastoreHandle,
-    controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
+    controller_dispatcher: Option<Arc<klights_controllers::ControllerDispatcher>>,
     controlplane_join_handler: Option<Arc<dyn ControlplaneJoinHandler>>,
     injected_node_cert: Option<String>,
 ) -> (
@@ -179,7 +179,7 @@ async fn grpc_test_server_full_with_node_cert(
 
 async fn grpc_test_server_full_with_node_cert_and_current_rv(
     db: DatastoreHandle,
-    controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
+    controller_dispatcher: Option<Arc<klights_controllers::ControllerDispatcher>>,
     controlplane_join_handler: Option<Arc<dyn ControlplaneJoinHandler>>,
     injected_node_cert: Option<String>,
     current_rv: i64,
@@ -3748,9 +3748,8 @@ async fn apply_outbox_pod_status_enqueues_matching_service() {
     )
     .await
     .unwrap();
-    let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(Arc::new(
-        klights_controllers::service::ServiceIpam::new("10.43.128.0/17"),
-    )));
+    let dispatcher =
+        Arc::new(crate::controller_test_support::default_queue_only_dispatcher_for_test());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(crate::grpc_test_support::replication_service(
         db.clone(),
@@ -3880,7 +3879,7 @@ async fn channel_snapshot_sink_forwards_typed_restore_operations() {
         &db,
         &crate::paths::ca_cert_path(&crate::paths::runtime_namespace()),
         chrono::DateTime::UNIX_EPOCH,
-        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+        crate::controller_test_support::deterministic_controller_identity().as_ref(),
     )
     .await
     .unwrap();

@@ -98,7 +98,7 @@ mod tests {
                 outbox: None,
                 cluster_api: None,
                 controller_identity:
-                    crate::controllers::test_utils::deterministic_controller_identity(),
+                    crate::controller_test_support::deterministic_controller_identity(),
                 scheduler_bind_gate: None,
             },
         );

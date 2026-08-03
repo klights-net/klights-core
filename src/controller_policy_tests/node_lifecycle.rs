@@ -5,6 +5,7 @@
 use chrono::{TimeZone, Utc};
 use klights_controllers::node_lifecycle::*;
 use klights_leader_api::{ResourceEvent, WatchEventType};
+use klights_reconcile_api::ControllerDispatcherPort as _;
 use serde_json::json;
 
 struct TestNodeLifecycleStatus<'a>(&'a dyn crate::datastore::DatastoreBackend);
@@ -55,7 +56,7 @@ fn test_pod_store(
     db: &crate::datastore::sqlite::Datastore,
 ) -> crate::controller_runtime_adapter::RootControllerPodPort {
     crate::controller_runtime_adapter::RootControllerPodPort::new_for_test(
-        crate::controllers::test_utils::pod_repository_for_test(db),
+        crate::controller_test_support::pod_repository_for_test(db),
     )
 }
 
@@ -693,7 +694,7 @@ async fn stale_node_lease_marks_unknown_bound_pods_node_lost_after_grace() {
 #[tokio::test]
 async fn deleted_node_event_marks_bound_pods_node_lost_and_wakes_actor() {
     let db = crate::datastore::test_support::in_memory().await;
-    let pod_repository = crate::controllers::test_utils::pod_repository_for_test(&db);
+    let pod_repository = crate::controller_test_support::pod_repository_for_test(&db);
     let (router, recorder) = test_lifecycle_router();
     let pods =
         crate::controller_runtime_adapter::RootControllerPodPort::new_for_test(pod_repository);
@@ -771,17 +772,15 @@ async fn node_lost_cleanup_enqueues_owning_replicaset_after_node_lost_mark() {
         klights_supervisor::TaskCategoryConfig::default(),
     ));
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-    let dispatcher = std::sync::Arc::new(crate::controllers::ControllerDispatcher::new(
-        std::sync::Arc::new(klights_controllers::service::ServiceIpam::new(
-            "10.43.128.0/17",
-        )),
-    ));
+    let dispatcher = std::sync::Arc::new(
+        crate::controller_test_support::default_queue_only_dispatcher_for_test(),
+    );
     let side_effects = std::sync::Arc::new(crate::bootstrap::side_effects::default_registry(
         metrics.clone(),
         None,
         Some(supervisor.clone()),
         Some(db_handle.clone()),
-        crate::controllers::test_utils::deterministic_controller_identity(),
+        crate::controller_test_support::deterministic_controller_identity(),
     ));
     side_effects.set_controller_dispatcher(dispatcher.clone());
     let pod_repository = std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(

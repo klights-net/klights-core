@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::controllers::ControllerDispatcher;
 use crate::datastore::DatastoreHandle;
+use klights_controllers::ControllerDispatcher;
 use klights_controllers::cronjob_scheduler::{
     CronJobScheduler, CronJobSchedulerRuntime, CronJobSchedulerRuntimeError, CronJobWatchSession,
 };
@@ -131,7 +131,7 @@ mod tests {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let dispatcher = Arc::new(
-            crate::controllers::ControllerDispatcher::with_task_supervisor(
+            klights_controllers::ControllerDispatcher::with_task_supervisor(
                 Arc::new(klights_controllers::service::ServiceIpam::new(
                     "10.43.128.0/17",
                 )),

@@ -78,5 +78,5 @@ pub async fn reconcile_resource_quotas_for_namespace(
 #[cfg(test)]
 use klights_controllers::resource_quota::*;
 #[cfg(test)]
-#[path = "controllers/resource_quota/tests.rs"]
+#[path = "controller_test_debt/resource_quota/tests.rs"]
 mod policy_tests;

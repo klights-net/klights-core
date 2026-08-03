@@ -95,7 +95,7 @@ impl RealPodDeletionFinalizer {
             metrics.clone(),
             side_effects,
             store.clone(),
-            crate::controllers::test_utils::deterministic_controller_identity(),
+            crate::controller_test_support::deterministic_controller_identity(),
         ));
         let inner = compose_real_pod_deletion_finalizer(RealPodDeletionFinalizerDependencies {
             pod_query: store.clone(),

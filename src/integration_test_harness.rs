@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use crate::datastore::DatastoreHandle;
+use klights_reconcile_api::ControllerDispatcherPort as _;
 
 /// Opaque root datastore capability for base-repository integration fixtures.
 ///
@@ -647,7 +648,7 @@ pub struct NativeApiTestHarness {
     pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
     _node_local: Arc<crate::datastore::node_local::NodeLocalStores>,
     outbox_dispatcher: Arc<klights_kubelet::node_outbox::OutboxDispatcher>,
-    controller_dispatcher: Arc<crate::controllers::ControllerDispatcher>,
+    controller_dispatcher: Arc<klights_controllers::ControllerDispatcher>,
     crd_registry: klights_controllers::crd::CrdRegistry,
     service_routing: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
     node_metrics: Arc<IntegrationNodeMetrics>,
@@ -1240,7 +1241,7 @@ impl NativeApiTestHarness {
         let non_pod_finalization = Arc::new(
             crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(datastore.clone()),
         );
-        let controller_dependencies = crate::controllers::ControllerRuntimeDependencies {
+        let controller_dependencies = klights_controllers::ControllerRuntimeDependencies {
             wall_time: chrono::Utc::now,
             resource_query: controller_leader_ports.clone(),
             deployment_store: controller_leader_ports.clone(),
@@ -1291,7 +1292,7 @@ impl NativeApiTestHarness {
                 supervisor.clone(),
             )) as Arc<dyn klights_controllers::csr_signer::CsrIssuer>
         });
-        let hpa_controller = Arc::new(crate::hpa_controller_adapter::HpaController::new(
+        let hpa_controller = crate::hpa_controller_adapter::controller(
             datastore.clone(),
             pod_repository.clone(),
             non_pod_finalization,
@@ -1299,9 +1300,9 @@ impl NativeApiTestHarness {
             Arc::from(config.node_name.as_str()),
             node_metrics.clone(),
             controller_identity.clone(),
-        ));
+        );
         let controller_dispatcher =
-            Arc::new(crate::controllers::ControllerDispatcher::new_complete(
+            Arc::new(klights_controllers::ControllerDispatcher::new_complete(
                 service_ipam.clone(),
                 nodeport_alloc.clone(),
                 supervisor.clone(),
@@ -1607,7 +1608,7 @@ impl NativeApiTestHarness {
             }
             drained.push(
                 self.controller_dispatcher
-                    .dispatch_next_key_for_test(&self.datastore, &self.node_name)
+                    .dispatch_next_key_for_test()
                     .await,
             );
         }
@@ -1616,7 +1617,7 @@ impl NativeApiTestHarness {
 
     pub async fn dispatch_next_controller_reconcile(&self) -> klights_reconcile_api::ReconcileKey {
         self.controller_dispatcher
-            .dispatch_next_key_for_test(&self.datastore, &self.node_name)
+            .dispatch_next_key_for_test()
             .await
     }
 

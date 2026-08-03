@@ -26,7 +26,7 @@ async fn reconcile_owner_references(
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<OwnerReferenceReconcile> {
-    let store = crate::controllers::test_utils::controller_store_for_test(db);
+    let store = crate::controller_test_support::controller_store_for_test(db);
     klights_controllers::gc::reconcile_owner_references(
         &store,
         resource,
@@ -51,7 +51,7 @@ async fn cascade_delete_with_uid(
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<()> {
-    let store = crate::controllers::test_utils::controller_store_for_test(db);
+    let store = crate::controller_test_support::controller_store_for_test(db);
     klights_controllers::gc::cascade_delete_with_uid(
         &store,
         owner_uid,
@@ -80,7 +80,7 @@ async fn owner_cascade_sweep_once(
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<bool> {
-    let store = crate::controllers::test_utils::controller_store_for_test(db);
+    let store = crate::controller_test_support::controller_store_for_test(db);
     klights_controllers::gc::owner_cascade_sweep_once(
         &store,
         owner_uid,
@@ -109,7 +109,7 @@ async fn check_foreground_deletion_ready(
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<bool> {
-    let store = crate::controllers::test_utils::controller_store_for_test(db);
+    let store = crate::controller_test_support::controller_store_for_test(db);
     klights_controllers::gc::check_foreground_deletion_ready(
         &store,
         owner_uid,
@@ -130,7 +130,7 @@ async fn finalize_foreground_owner_if_ready(
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<bool> {
-    let store = crate::controllers::test_utils::controller_store_for_test(db);
+    let store = crate::controller_test_support::controller_store_for_test(db);
     klights_controllers::gc::finalize_foreground_owner_if_ready(
         &store,
         owner,
@@ -1384,7 +1384,7 @@ async fn test_orphan_children_removes_owner_references() {
 
     // Orphan children
     orphan_children(
-        &crate::controllers::test_utils::controller_store_for_test(&db),
+        &crate::controller_test_support::controller_store_for_test(&db),
         owner_uid,
         "apps/v1",
         "owner",
@@ -1453,7 +1453,7 @@ async fn test_orphan_children_removes_empty_uid_ownerrefs_by_name_kind() {
     .unwrap();
 
     orphan_children(
-        &crate::controllers::test_utils::controller_store_for_test(&db),
+        &crate::controller_test_support::controller_store_for_test(&db),
         "",
         "apps/v1",
         "owner-empty-uid",
@@ -2266,7 +2266,7 @@ async fn assert_foreground_delete_reservation_released_after(
 
     let coordination = klights_controllers::ControllerCoordination::new();
     let sink = FailOrLoseFirstGcPodDeleteSink::new(first_result);
-    let store = crate::controllers::test_utils::controller_store_for_test(&db);
+    let store = crate::controller_test_support::controller_store_for_test(&db);
     for _ in 0..2 {
         let ready = klights_controllers::gc::check_foreground_deletion_ready(
             &store,
@@ -3126,7 +3126,7 @@ async fn owner_cascade_sweep_marks_all_children_and_self_extinguishes() {
     }
 
     // The real PodRepository sink marks terminating + enqueues per child.
-    let repo = crate::controllers::test_utils::pod_repository_for_test(&db);
+    let repo = crate::controller_test_support::pod_repository_for_test(&db);
     let needs_more = owner_cascade_sweep_once(
         &db,
         rc_uid,
@@ -3197,7 +3197,7 @@ async fn rc_background_delete_drives_all_running_children_to_finalization() {
     }
 
     let (repo, node_local) =
-        crate::controllers::test_utils::pod_repository_with_node_local_for_test(&db).await;
+        crate::controller_test_support::pod_repository_with_node_local_for_test(&db).await;
     let needs_more = owner_cascade_sweep_once(
         &db,
         rc_uid,
@@ -3309,7 +3309,7 @@ async fn burst_delete_of_many_rcs_leaves_no_orphan_pods() {
     db.create_namespace("ed-burst", json!({"metadata": {"name": "ed-burst"}}))
         .await
         .unwrap();
-    let repo = crate::controllers::test_utils::pod_repository_for_test(&db);
+    let repo = crate::controller_test_support::pod_repository_for_test(&db);
 
     for rc in 0..3 {
         let rc_name = format!("rc-{rc}");

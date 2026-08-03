@@ -533,7 +533,7 @@ async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_matc
             scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
-            controller_identity: crate::controllers::test_utils::deterministic_controller_identity(
+            controller_identity: crate::controller_test_support::deterministic_controller_identity(
             ),
             scheduler_bind_gate: None,
         },
@@ -1133,7 +1133,7 @@ async fn fixture_pod_repository() -> std::sync::Arc<crate::kubelet::pod_reposito
             scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
-            controller_identity: crate::controllers::test_utils::deterministic_controller_identity(
+            controller_identity: crate::controller_test_support::deterministic_controller_identity(
             ),
             scheduler_bind_gate: None,
         },
@@ -10450,7 +10450,7 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
             scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
-            controller_identity: crate::controllers::test_utils::deterministic_controller_identity(
+            controller_identity: crate::controller_test_support::deterministic_controller_identity(
             ),
             scheduler_bind_gate: None,
         },

@@ -18,7 +18,7 @@ async fn mirror_endpoints_to_endpointslice(
         db,
         endpoints,
         chrono::Utc::now(),
-        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+        crate::controller_test_support::deterministic_controller_identity().as_ref(),
     )
     .await
 }

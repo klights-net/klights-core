@@ -245,7 +245,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let repo = crate::controllers::test_utils::pod_repository_for_test(&db);
+        let repo = crate::controller_test_support::pod_repository_for_test(&db);
         let recreated = json!({
             "metadata": {"name": "ss-0", "namespace": "test-ns", "uid": "new-uid"},
             "spec": {
@@ -278,7 +278,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let repo = crate::controllers::test_utils::pod_repository_for_test(&db);
+        let repo = crate::controller_test_support::pod_repository_for_test(&db);
         let claimant = json!({
             "metadata": {"name": "claimant", "namespace": "test-ns", "uid": "claimant-uid"},
             "spec": {

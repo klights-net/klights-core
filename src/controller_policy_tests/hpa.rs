@@ -19,12 +19,12 @@ async fn reconcile_hpa(
     reconcile_hpa_with_metrics_root(
         db,
         pod_repository,
-        crate::controllers::test_utils::non_pod_finalization_port_for_test(),
+        crate::controller_test_support::non_pod_finalization_port_for_test(),
         &klights_controllers::ControllerCoordination::new(),
         hpa,
         node_name,
         &crate::node_metrics_adapter::UnavailableNodeMetrics,
-        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+        crate::controller_test_support::deterministic_controller_identity().as_ref(),
         chrono::Utc::now(),
     )
     .await
@@ -40,12 +40,12 @@ async fn reconcile_hpa_with_metrics(
     reconcile_hpa_with_metrics_root(
         db,
         pod_repository,
-        crate::controllers::test_utils::non_pod_finalization_port_for_test(),
+        crate::controller_test_support::non_pod_finalization_port_for_test(),
         &klights_controllers::ControllerCoordination::new(),
         hpa,
         node_name,
         node_metrics,
-        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+        crate::controller_test_support::deterministic_controller_identity().as_ref(),
         chrono::Utc::now(),
     )
     .await
@@ -269,9 +269,9 @@ fn runtime_metrics_for_pods<'a>(
 #[tokio::test]
 async fn hpa_v2_resource_metric_scales_deployment_from_resource_usage() {
     let db = crate::datastore::test_support::in_memory().await;
-    let pod_repository = crate::controllers::test_utils::pod_repository_for_test(&db);
+    let pod_repository = crate::controller_test_support::pod_repository_for_test(&db);
 
-    let _deployment = crate::controllers::test_utils::store_and_prepare(
+    let _deployment = crate::controller_test_support::store_and_prepare(
         &db,
         "apps/v1",
         "Deployment",
@@ -304,7 +304,7 @@ async fn hpa_v2_resource_metric_scales_deployment_from_resource_usage() {
         .await;
     }
 
-    let hpa = crate::controllers::test_utils::store_and_prepare(
+    let hpa = crate::controller_test_support::store_and_prepare(
         &db,
         "autoscaling/v2",
         "HorizontalPodAutoscaler",
@@ -383,9 +383,9 @@ async fn hpa_v2_resource_metric_scales_deployment_from_resource_usage() {
 #[tokio::test]
 async fn hpa_v1_cpu_metric_scales_replicationcontroller_from_resource_usage() {
     let db = crate::datastore::test_support::in_memory().await;
-    let pod_repository = crate::controllers::test_utils::pod_repository_for_test(&db);
+    let pod_repository = crate::controller_test_support::pod_repository_for_test(&db);
 
-    let _rc = crate::controllers::test_utils::store_and_prepare(
+    let _rc = crate::controller_test_support::store_and_prepare(
         &db,
         "v1",
         "ReplicationController",
@@ -418,7 +418,7 @@ async fn hpa_v1_cpu_metric_scales_replicationcontroller_from_resource_usage() {
         .await;
     }
 
-    let hpa = crate::controllers::test_utils::store_and_prepare(
+    let hpa = crate::controller_test_support::store_and_prepare(
             &db,
             "autoscaling/v1",
             "HorizontalPodAutoscaler",
@@ -480,9 +480,9 @@ async fn hpa_v1_cpu_metric_scales_replicationcontroller_from_resource_usage() {
 #[tokio::test]
 async fn hpa_does_not_scale_when_runtime_metrics_are_unavailable() {
     let db = crate::datastore::test_support::in_memory().await;
-    let pod_repository = crate::controllers::test_utils::pod_repository_for_test(&db);
+    let pod_repository = crate::controller_test_support::pod_repository_for_test(&db);
 
-    let _deployment = crate::controllers::test_utils::store_and_prepare(
+    let _deployment = crate::controller_test_support::store_and_prepare(
         &db,
         "apps/v1",
         "Deployment",
@@ -515,7 +515,7 @@ async fn hpa_does_not_scale_when_runtime_metrics_are_unavailable() {
         .await;
     }
 
-    let hpa = crate::controllers::test_utils::store_and_prepare(
+    let hpa = crate::controller_test_support::store_and_prepare(
         &db,
         "autoscaling/v2",
         "HorizontalPodAutoscaler",

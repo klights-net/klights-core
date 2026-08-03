@@ -4,11 +4,11 @@ use async_trait::async_trait;
 use klights_cluster_core::{Resource, ResourceBatchOperation, ResourcePreconditions};
 use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult as Result};
 
-use crate::controllers::{
-    ControllerEffectPort, ControllerNetworkPort, ControllerReconcilePort, ControllerResourceQuery,
-};
 use crate::datastore::DatastoreHandle;
 use crate::kubelet::pod_repository::PodRepository;
+use klights_controllers::{
+    ControllerEffectPort, ControllerNetworkPort, ControllerReconcilePort, ControllerResourceQuery,
+};
 
 fn validate_controller_effect() -> Result<()> {
     klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {

@@ -1889,7 +1889,7 @@ async fn test_apply_pod_phase_update_reconciles_pdb_on_ready_transition() {
 
     klights_controllers::pdb::reconcile_pdb_at(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         &pdb,
         chrono::Utc::now(),
     )
@@ -2103,7 +2103,7 @@ async fn test_apply_pod_phase_update_repairs_scalar_pod_ips_from_arrays() {
 #[tokio::test]
 async fn test_enqueue_job_reconcile_no_owner_is_noop() {
     let db = crate::datastore::test_support::in_memory().await;
-    let pod_repo = crate::controllers::test_utils::pod_repository_for_test(&db);
+    let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
     let pod = serde_json::json!({
         "metadata": {"name": "pod", "namespace": "default"},
         "spec": {"nodeName": "node"},
@@ -2116,7 +2116,7 @@ async fn test_enqueue_job_reconcile_no_owner_is_noop() {
 #[tokio::test]
 async fn test_enqueue_job_reconcile_non_job_owner_is_noop() {
     let db = crate::datastore::test_support::in_memory().await;
-    let pod_repo = crate::controllers::test_utils::pod_repository_for_test(&db);
+    let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
     let pod = serde_json::json!({
         "metadata": {
             "name": "pod",
@@ -2136,8 +2136,9 @@ async fn test_enqueue_job_reconcile_enqueues_job_key_via_dispatcher() {
     let service_ipam = std::sync::Arc::new(klights_controllers::service::ServiceIpam::new(
         "10.43.128.0/17",
     ));
-    let dispatcher =
-        std::sync::Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
+    let dispatcher = std::sync::Arc::new(
+        crate::controller_test_support::queue_only_dispatcher_for_test(service_ipam),
+    );
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
@@ -2195,14 +2196,16 @@ async fn test_enqueue_job_reconcile_enqueues_job_key_via_dispatcher() {
         .await
         .unwrap();
 
-    dispatcher
-        .enqueue_reconcile_key(klights_reconcile_api::ReconcileKey::namespaced(
+    klights_reconcile_api::ControllerDispatcherPort::enqueue_reconcile(
+        dispatcher.as_ref(),
+        klights_reconcile_api::ReconcileKey::namespaced(
             "apps/v1",
             "Deployment",
             "default",
             "normal-backlog",
-        ))
-        .await;
+        ),
+    )
+    .await;
     pod_repo.enqueue_job_reconcile_for_pod(&pod).await;
 
     let keys = dispatcher.queued_reconcile_keys_for_test().await;
@@ -2229,8 +2232,9 @@ async fn test_terminal_watch_modified_pod_enqueues_job_reconcile() {
     let service_ipam = std::sync::Arc::new(klights_controllers::service::ServiceIpam::new(
         "10.43.128.0/17",
     ));
-    let dispatcher =
-        std::sync::Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
+    let dispatcher = std::sync::Arc::new(
+        crate::controller_test_support::queue_only_dispatcher_for_test(service_ipam),
+    );
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
@@ -2286,14 +2290,16 @@ async fn test_terminal_watch_modified_pod_enqueues_job_reconcile() {
         "status": {"phase": "Succeeded"}
     });
 
-    dispatcher
-        .enqueue_reconcile_key(klights_reconcile_api::ReconcileKey::namespaced(
+    klights_reconcile_api::ControllerDispatcherPort::enqueue_reconcile(
+        dispatcher.as_ref(),
+        klights_reconcile_api::ReconcileKey::namespaced(
             "apps/v1",
             "Deployment",
             "default",
             "normal-backlog",
-        ))
-        .await;
+        ),
+    )
+    .await;
     event_handlers::enqueue_job_reconcile_for_terminal_watch_pod(&pod_repo, &terminal_watch_pod)
         .await;
 
@@ -2321,7 +2327,7 @@ async fn test_terminal_watch_modified_pod_enqueues_job_reconcile() {
 #[tokio::test]
 async fn test_enqueue_job_reconcile_skips_when_dispatcher_not_bound() {
     let db = crate::datastore::test_support::in_memory().await;
-    let pod_repo = crate::controllers::test_utils::pod_repository_for_test(&db);
+    let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
     let pod = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",

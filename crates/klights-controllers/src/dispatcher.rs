@@ -1,218 +1,409 @@
-//! Generic event-driven controller dispatch coordination.
+//! Focused-port controller registry and event-driven dispatcher.
 
-use std::collections::{HashMap, HashSet};
-use std::future::Future;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use tokio::sync::{Mutex, Notify};
-use tokio_util::sync::CancellationToken;
+use anyhow::{Context as _, Result};
+use klights_reconcile_api::{
+    ControllerReconcileSink, ReconcileKey, ReconcileSinkFuture, ServiceReconcileKey,
+    ServiceReconcileSink,
+};
+use serde_json::Value;
 
-use crate::workqueue::{Key, MAX_RETRY_ATTEMPTS, WorkQueue, backoff_for};
+use crate::workqueue::{Key, controller_kind_static};
+use crate::{
+    Context, Controller, ControllerRuntimeDependencies, DispatcherRuntime,
+    apiservice_controller::APIServiceController, daemonset_controller::DaemonSetController,
+    deployment_controller::DeploymentController, job_controller::JobController,
+    pdb_controller::PDBController, pvc_controller::PVCController,
+    replicaset_controller::ReplicaSetController,
+    replication_controller_runner::ReplicationControllerController,
+    service_controller::ServiceController, statefulset_controller::StatefulSetController,
+};
 
-#[derive(Default)]
-struct ActiveReconciles {
-    in_flight: HashSet<Key>,
-    pending_followup: HashSet<Key>,
+pub struct ControllerDispatcher {
+    controllers: HashMap<(&'static str, &'static str), Arc<dyn Controller>>,
+    runtime: Arc<DispatcherRuntime>,
+    dependencies: Option<ControllerRuntimeDependencies>,
+    coordination: Arc<crate::ControllerCoordination>,
 }
 
-/// Queue, retry, cancellation, and same-key serialization shared by all
-/// resource-specific controller dispatch adapters.
-pub struct DispatcherRuntime {
-    queue: WorkQueue,
-    retry_count: Mutex<HashMap<Key, u32>>,
-    worker_running: AtomicBool,
-    active_reconciles: Mutex<ActiveReconciles>,
-    active_reconciles_changed: Notify,
-}
-
-impl DispatcherRuntime {
-    pub fn new(task_supervisor: Arc<klights_supervisor::TaskSupervisor>) -> Self {
+impl ControllerDispatcher {
+    /// Transitional queue-only constructor for root real-adapter tests.
+    ///
+    /// P2g removes this public test-support debt after those suites migrate to
+    /// the base integration surface. The caller must inject its test-owned
+    /// supervisor; production composition uses [`Self::new_complete`].
+    #[doc(hidden)]
+    pub fn with_task_supervisor(
+        _service_ipam: Arc<crate::service::ServiceIpam>,
+        task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    ) -> Self {
         Self {
-            queue: WorkQueue::with_task_supervisor(task_supervisor),
-            retry_count: Mutex::new(HashMap::new()),
-            worker_running: AtomicBool::new(false),
-            active_reconciles: Mutex::new(ActiveReconciles::default()),
-            active_reconciles_changed: Notify::new(),
+            controllers: HashMap::new(),
+            runtime: Arc::new(DispatcherRuntime::new(task_supervisor)),
+            dependencies: None,
+            coordination: Arc::new(crate::ControllerCoordination::new()),
         }
     }
 
-    pub fn worker_running(&self) -> bool {
-        self.worker_running.load(Ordering::Acquire)
-    }
-
-    pub async fn enqueue(&self, key: Key) {
-        self.queue.add(key).await;
-    }
-
-    pub async fn enqueue_batch(&self, keys: Vec<Key>) {
-        self.queue.add_batch(keys).await;
-    }
-
-    pub async fn enqueue_after(&self, key: Key, delay: std::time::Duration) {
-        if delay.is_zero() {
-            self.queue.add(key).await;
-        } else {
-            self.queue.add_after(key, delay).await;
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_complete(
+        service_ipam: Arc<crate::service::ServiceIpam>,
+        nodeport_alloc: Arc<crate::service::NodePortAllocator>,
+        task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
+        csr_issuer: Option<Arc<dyn crate::csr_signer::CsrIssuer>>,
+        hpa_controller: Arc<crate::hpa::HpaController>,
+        dependencies: ControllerRuntimeDependencies,
+        identity: Arc<dyn crate::ControllerIdentityGenerator>,
+    ) -> Self {
+        let controllers = Self::controller_registry(
+            service_ipam,
+            nodeport_alloc,
+            csr_issuer,
+            hpa_controller,
+            identity,
+        );
+        let coordination = dependencies.coordination.clone();
+        Self {
+            controllers,
+            runtime: Arc::new(DispatcherRuntime::new(task_supervisor)),
+            dependencies: Some(dependencies),
+            coordination,
         }
     }
 
-    pub async fn pending_keys(&self) -> Vec<Key> {
-        self.queue.ready_keys_snapshot().await
-    }
-
-    /// Take the next ready key. Intended for deterministic, externally-driven
-    /// dispatchers; production worker pools call the same queue operation.
-    pub async fn take_next(&self) -> Key {
-        self.queue.take().await
-    }
-
-    pub async fn record_success(&self, key: &Key) {
-        self.retry_count.lock().await.remove(key);
-    }
-
-    pub async fn requeue_with_backoff(&self, key: Key) {
-        let mut counts = self.retry_count.lock().await;
-        let attempt = counts.entry(key.clone()).or_insert(0);
-        if *attempt >= MAX_RETRY_ATTEMPTS {
-            tracing::error!(
-                workqueue_key = %key,
-                attempts = *attempt,
-                "workqueue: dropping key after MAX_RETRY_ATTEMPTS — will only retry on next mutation or watch event"
+    fn controller_registry(
+        service_ipam: Arc<crate::service::ServiceIpam>,
+        nodeport_alloc: Arc<crate::service::NodePortAllocator>,
+        csr_issuer: Option<Arc<dyn crate::csr_signer::CsrIssuer>>,
+        hpa_controller: Arc<crate::hpa::HpaController>,
+        identity: Arc<dyn crate::ControllerIdentityGenerator>,
+    ) -> HashMap<(&'static str, &'static str), Arc<dyn Controller>> {
+        let mut controllers: HashMap<(&'static str, &'static str), Arc<dyn Controller>> =
+            HashMap::new();
+        controllers.insert(
+            ("apps/v1", "Deployment"),
+            Arc::new(DeploymentController::new(identity.clone())),
+        );
+        controllers.insert(
+            ("apps/v1", "ReplicaSet"),
+            Arc::new(ReplicaSetController::new(identity.clone())),
+        );
+        controllers.insert(
+            ("apps/v1", "StatefulSet"),
+            Arc::new(StatefulSetController::new(identity.clone())),
+        );
+        controllers.insert(
+            ("apps/v1", "DaemonSet"),
+            Arc::new(DaemonSetController::new(identity.clone())),
+        );
+        controllers.insert(
+            ("batch/v1", "Job"),
+            Arc::new(JobController::new(identity.clone())),
+        );
+        controllers.insert(
+            ("v1", "Service"),
+            Arc::new(ServiceController {
+                service_ipam,
+                nodeport_alloc,
+                identity: identity.clone(),
+            }),
+        );
+        controllers.insert(("v1", "PersistentVolumeClaim"), Arc::new(PVCController));
+        controllers.insert(
+            ("v1", "ReplicationController"),
+            Arc::new(ReplicationControllerController::new(identity)),
+        );
+        controllers.insert(
+            ("policy/v1", "PodDisruptionBudget"),
+            Arc::new(PDBController),
+        );
+        controllers.insert(
+            ("autoscaling/v1", "HorizontalPodAutoscaler"),
+            hpa_controller.clone(),
+        );
+        controllers.insert(
+            ("autoscaling/v2", "HorizontalPodAutoscaler"),
+            hpa_controller,
+        );
+        controllers.insert(
+            ("apiregistration.k8s.io/v1", "APIService"),
+            Arc::new(APIServiceController),
+        );
+        if let Some(issuer) = csr_issuer {
+            controllers.insert(
+                ("certificates.k8s.io/v1", "CertificateSigningRequest"),
+                Arc::new(crate::csr_signer_controller::CsrSignerController::new(
+                    issuer,
+                )),
             );
-            counts.remove(&key);
-            return;
         }
-        let backoff = backoff_for(*attempt);
-        *attempt += 1;
-        drop(counts);
-        self.queue.add_after(key, backoff).await;
+        controllers
     }
 
-    /// Run an event-driven worker pool through a deterministic dispatch seam.
-    pub async fn run_worker_pool<F, Fut>(
+    pub fn gc_coordination(&self) -> &dyn klights_reconcile_api::GcForegroundDeleteCoordination {
+        self.coordination.as_ref()
+    }
+
+    pub fn pod_delete_sink(&self) -> &dyn klights_reconcile_api::GcPodDeleteSink {
+        self.dependencies().pod_delete_sink.as_ref()
+    }
+
+    async fn enqueue(&self, resource: &Value) {
+        if let Some(key) = key_for_value(resource) {
+            self.runtime.enqueue(key).await;
+        }
+    }
+
+    async fn enqueue_reconcile_key(&self, key: ReconcileKey) {
+        self.runtime.enqueue(key).await;
+    }
+
+    async fn enqueue_reconcile_batch(&self, keys: Vec<ReconcileKey>) {
+        self.runtime.enqueue_batch(keys).await;
+    }
+
+    #[doc(hidden)]
+    pub async fn queued_reconcile_keys_for_test(&self) -> Vec<ReconcileKey> {
+        self.runtime.pending_keys().await
+    }
+
+    #[doc(hidden)]
+    pub async fn take_reconcile_key_for_test(&self) -> ReconcileKey {
+        self.runtime.take_next().await
+    }
+
+    #[doc(hidden)]
+    pub async fn dispatch_next_key_for_test(&self) -> ReconcileKey {
+        let key = self.runtime.take_next().await;
+        self.runtime.wait_for_key_dispatch_slot(&key).await;
+        self.dispatch_key(&key).await;
+        self.runtime.finish_key_dispatch(key.clone()).await;
+        key
+    }
+
+    pub async fn run_worker_pool(
         self: Arc<Self>,
         worker_count: usize,
-        cancel: CancellationToken,
-        dispatch: F,
-    ) where
-        F: Fn(Key) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        self.worker_running.store(true, Ordering::Release);
-        let dispatch = Arc::new(dispatch);
-        let workers = (0..worker_count.max(1)).map(|worker_id| {
-            let runtime = self.clone();
-            let cancel = cancel.clone();
-            let dispatch = dispatch.clone();
-            async move {
-                runtime.run_worker_loop(worker_id, cancel, dispatch).await;
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        let runtime = self.runtime.clone();
+        runtime
+            .run_worker_pool(worker_count, cancel, move |key| {
+                let dispatcher = self.clone();
+                async move { dispatcher.dispatch_key(&key).await }
+            })
+            .await;
+    }
+
+    async fn dispatch_key(&self, key: &Key) {
+        let resource = match self
+            .dependencies()
+            .resource_query
+            .get_reconcile_resource(key.api_version(), key.kind(), key.namespace(), key.name())
+            .await
+        {
+            Ok(Some(resource)) => resource,
+            Ok(None) => {
+                self.runtime.record_success(key).await;
+                return;
             }
-        });
-        futures::future::join_all(workers).await;
-        self.worker_running.store(false, Ordering::Release);
-    }
-
-    async fn run_worker_loop<F, Fut>(
-        self: Arc<Self>,
-        worker_id: usize,
-        cancel: CancellationToken,
-        dispatch: Arc<F>,
-    ) where
-        F: Fn(Key) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    tracing::info!(worker_id, "controller workqueue worker shutting down");
-                    return;
-                }
-                key = self.queue.take() => {
-                    if !self.begin_key_dispatch(&key).await {
-                        continue;
-                    }
-                    dispatch(key.clone()).await;
-                    self.finish_key_dispatch(key).await;
-                }
+            Err(error) => {
+                tracing::warn!(workqueue_key = %key, %error, "workqueue resource read failed");
+                self.runtime.requeue_with_backoff(key.clone()).await;
+                return;
             }
-        }
-    }
-
-    pub async fn begin_key_dispatch(&self, key: &Key) -> bool {
-        let mut active = self.active_reconciles.lock().await;
-        if active.in_flight.contains(key) {
-            active.pending_followup.insert(key.clone());
-            return false;
-        }
-        active.in_flight.insert(key.clone());
-        true
-    }
-
-    pub async fn wait_for_key_dispatch_slot(&self, key: &Key) {
-        loop {
-            let notified = self.active_reconciles_changed.notified();
-            {
-                let mut active = self.active_reconciles.lock().await;
-                if !active.in_flight.contains(key) {
-                    active.in_flight.insert(key.clone());
-                    return;
-                }
-            }
-            notified.await;
-        }
-    }
-
-    pub async fn finish_key_dispatch(&self, key: Key) {
-        let should_requeue = {
-            let mut active = self.active_reconciles.lock().await;
-            active.in_flight.remove(&key);
-            active.pending_followup.remove(&key)
         };
-        self.active_reconciles_changed.notify_waiters();
-        if should_requeue {
-            self.queue.add(key).await;
+        let value = crate::ports::inject_resource_version(
+            Arc::unwrap_or_clone(resource.data),
+            resource.resource_version,
+        );
+        match self.reconcile_unlocked(&value).await {
+            Ok(()) => {
+                self.runtime.record_success(key).await;
+                if let Err(error) = self.schedule_finished_job_ttl_requeue_if_needed(key).await {
+                    tracing::warn!(workqueue_key = %key, %error, "job TTL requeue failed");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(workqueue_key = %key, %error, "controller reconcile failed");
+                self.runtime.requeue_with_backoff(key.clone()).await;
+            }
         }
+    }
+
+    async fn schedule_finished_job_ttl_requeue_if_needed(&self, key: &Key) -> Result<()> {
+        if key.api_version() != "batch/v1" || key.kind() != "Job" {
+            return Ok(());
+        }
+        let Some(resource) = self
+            .dependencies()
+            .resource_query
+            .get_reconcile_resource(key.api_version(), key.kind(), key.namespace(), key.name())
+            .await?
+        else {
+            return Ok(());
+        };
+        if resource
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .is_some()
+        {
+            return Ok(());
+        }
+        let Some(delay) = crate::job::job_ttl_cleanup_delay_at(
+            &resource.data,
+            (self.dependencies().wall_time)(),
+        )?
+        else {
+            return Ok(());
+        };
+        self.runtime.enqueue_after(key.clone(), delay).await;
+        Ok(())
+    }
+
+    async fn reconcile_unlocked(&self, resource: &Value) -> Result<()> {
+        let api_version = resource
+            .get("apiVersion")
+            .and_then(Value::as_str)
+            .context("Missing apiVersion in resource")?;
+        let kind = resource
+            .get("kind")
+            .and_then(Value::as_str)
+            .context("Missing kind in resource")?;
+        if let Some(namespace) = resource
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .filter(|namespace| !namespace.is_empty())
+            && self
+                .dependencies()
+                .resource_query
+                .namespace_is_terminating(namespace)
+                .await?
+        {
+            return Ok(());
+        }
+        if let Some(controller) = self.controllers.get(&(api_version, kind)) {
+            controller
+                .reconcile(
+                    resource.clone(),
+                    Context::new(
+                        self.dependencies().clone(),
+                        (self.dependencies().wall_time)(),
+                    ),
+                )
+                .await
+                .with_context(|| format!("{} controller reconcile failed", controller.name()))?;
+        }
+        Ok(())
+    }
+
+    fn dependencies(&self) -> &ControllerRuntimeDependencies {
+        self.dependencies
+            .as_ref()
+            .expect("queue-only ControllerDispatcher cannot execute reconciliation")
+    }
+}
+
+impl klights_reconcile_api::ControllerDispatcherPort for ControllerDispatcher {
+    fn enqueue<'a>(
+        &'a self,
+        resource: &'a Value,
+    ) -> klights_reconcile_api::ControllerDispatchFuture<'a, ()> {
+        Box::pin(async move { self.enqueue(resource).await })
+    }
+
+    fn enqueue_reconcile(
+        &self,
+        key: ReconcileKey,
+    ) -> klights_reconcile_api::ControllerDispatchFuture<'_, ()> {
+        Box::pin(async move { self.enqueue_reconcile_key(key).await })
+    }
+
+    fn pending_reconcile_keys(
+        &self,
+    ) -> klights_reconcile_api::ControllerDispatchFuture<'_, Vec<ReconcileKey>> {
+        Box::pin(async move { self.runtime.pending_keys().await })
+    }
+}
+
+fn key_for_value(resource: &Value) -> Option<Key> {
+    let api_version = resource.get("apiVersion").and_then(Value::as_str)?;
+    let kind = resource.get("kind").and_then(Value::as_str)?;
+    let (api_version, kind) = controller_kind_static(api_version, kind)?;
+    let name = resource.pointer("/metadata/name").and_then(Value::as_str)?;
+    let namespace = resource
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str);
+    Some(match namespace {
+        Some(namespace) if !namespace.is_empty() => {
+            Key::namespaced(api_version, kind, namespace, name)
+        }
+        _ => Key::cluster(api_version, kind, name),
+    })
+}
+
+impl ControllerReconcileSink for ControllerDispatcher {
+    fn enqueue_reconcile_batch(&self, keys: Vec<ReconcileKey>) -> ReconcileSinkFuture<'_> {
+        Box::pin(async move {
+            if keys
+                .iter()
+                .any(|key| key.api_version() == "v1" && key.kind() == "Service")
+            {
+                return Err(klights_reconcile_api::ReconcileSinkError::unsupported_key(
+                    "Service reconcile keys must use ServiceReconcileSink",
+                ));
+            }
+            ControllerDispatcher::enqueue_reconcile_batch(self, keys).await;
+            Ok(())
+        })
+    }
+}
+
+impl ServiceReconcileSink for ControllerDispatcher {
+    fn enqueue_service_reconcile_batch(
+        &self,
+        keys: Vec<ServiceReconcileKey>,
+    ) -> ReconcileSinkFuture<'_> {
+        Box::pin(async move {
+            ControllerDispatcher::enqueue_reconcile_batch(
+                self,
+                keys.into_iter()
+                    .map(ServiceReconcileKey::into_reconcile_key)
+                    .collect(),
+            )
+            .await;
+            Ok(())
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workqueue::key_for_test;
-    use std::sync::atomic::AtomicUsize;
+    use serde_json::json;
 
-    #[tokio::test]
-    async fn same_key_is_serialized_and_gets_one_followup() {
-        let runtime = DispatcherRuntime::new(Arc::new(klights_supervisor::TaskSupervisor::new(
-            klights_supervisor::TaskCategoryConfig::default(),
-        )));
-        let key = key_for_test("apps/v1", "Deployment", "default", "web");
-        assert!(runtime.begin_key_dispatch(&key).await);
-        assert!(!runtime.begin_key_dispatch(&key).await);
-        runtime.finish_key_dispatch(key.clone()).await;
-        assert_eq!(runtime.take_next().await, key);
-    }
-
-    #[tokio::test]
-    async fn worker_pool_stops_on_cancellation_without_polling() {
-        let runtime = Arc::new(DispatcherRuntime::new(Arc::new(
-            klights_supervisor::TaskSupervisor::new(
-                klights_supervisor::TaskCategoryConfig::default(),
-            ),
-        )));
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        let calls = Arc::new(AtomicUsize::new(0));
-        runtime
-            .run_worker_pool(2, cancel, {
-                let calls = calls.clone();
-                move |_| {
-                    calls.fetch_add(1, Ordering::Relaxed);
-                    std::future::ready(())
-                }
-            })
-            .await;
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    #[test]
+    fn key_projection_rejects_unregistered_and_incomplete_resources() {
+        assert!(key_for_value(&json!({})).is_none());
+        assert!(
+            key_for_value(&json!({
+                "apiVersion": "v1",
+                "kind": "Endpoints",
+                "metadata": {"name": "legacy", "namespace": "default"}
+            }))
+            .is_none()
+        );
+        assert_eq!(
+            key_for_value(&json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "web", "namespace": "default"}
+            }))
+            .expect("registered controller key")
+            .to_string(),
+            "apps/v1/Deployment default/web"
+        );
     }
 }

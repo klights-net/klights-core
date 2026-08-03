@@ -27,11 +27,11 @@ use tokio::sync::watch;
 use crate::control_plane::client::{
     focused_dataplane, focused_node_subnet, query_error, query_list_result,
 };
-use crate::controllers::ControllerDispatcher;
 use crate::datastore::{DatastoreHandle, Resource};
 use crate::kubelet::pod_repository::store::PodStore;
 use klights_cluster_core::LogApplyPodCleanupIntentRow as StoredPodCleanupIntent;
 use klights_cluster_core::command::StorageCommand;
+use klights_controllers::ControllerDispatcher;
 #[cfg(test)]
 use klights_kubelet::node_outbox::payload::OutboxOperationExt as _;
 
@@ -340,7 +340,6 @@ impl RootCommittedOutboxDelivery {
                         "controller dispatcher is not ready for committed Pod side effects",
                     )
                 })?;
-        #[cfg(not(test))]
         let gc_pod_delete_sink = if matches!(
             command,
             StorageCommand::DeleteResource { api_version, kind, .. }
@@ -351,30 +350,16 @@ impl RootCommittedOutboxDelivery {
         } else {
             None
         };
-        #[cfg(test)]
-        let gc_pod_delete_sink = if matches!(
-            command,
-            StorageCommand::DeleteResource { api_version, kind, .. }
-                if api_version == "v1" && kind == "Pod"
-        ) || matches!(command, StorageCommand::FinalizeBoundPod { .. })
-        {
-            controller_dispatcher
-                .current_pod_repository()
-                .await
-                .map(|repository| repository as Arc<dyn klights_reconcile_api::GcPodDeleteSink>)
-        } else {
-            None
-        };
         crate::applied_pod_side_effect_adapter::handle_applied_pod_side_effects(
             klights_controllers::side_effects::applied_pod::AppliedPodSideEffectSinks::new(
                 Some(controller_dispatcher.as_ref()
                     as &dyn klights_reconcile_api::ControllerReconcileSink),
                 Some(controller_dispatcher.as_ref()
                     as &dyn klights_reconcile_api::ServiceReconcileSink),
+                #[cfg(test)]
+                gc_pod_delete_sink,
                 #[cfg(not(test))]
                 gc_pod_delete_sink,
-                #[cfg(test)]
-                gc_pod_delete_sink.as_deref(),
                 self.side_effects
                     .non_pod_finalization
                     .get()
@@ -1371,7 +1356,8 @@ mod inner_gate_tests {
             "worker-1".to_string(),
             crate::control_plane::client::local::always_leader_watch(),
         );
-        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::default());
+        let dispatcher =
+            Arc::new(crate::controller_test_support::default_queue_only_dispatcher_for_test());
         client.set_controller_dispatcher(dispatcher.clone());
         let command = StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
@@ -2277,7 +2263,9 @@ mod inner_gate_tests {
         make_pod(&db).await;
         let (tx, rx) = watch::channel(false);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
-        client.set_controller_dispatcher(Arc::new(ControllerDispatcher::default()));
+        client.set_controller_dispatcher(Arc::new(
+            crate::controller_test_support::default_queue_only_dispatcher_for_test(),
+        ));
 
         // Pre-promotion: write refused.
         let pre = client
@@ -2321,7 +2309,9 @@ mod inner_gate_tests {
         make_pod(&db).await;
         let (tx, rx) = watch::channel(true);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
-        client.set_controller_dispatcher(Arc::new(ControllerDispatcher::default()));
+        client.set_controller_dispatcher(Arc::new(
+            crate::controller_test_support::default_queue_only_dispatcher_for_test(),
+        ));
 
         // Pre-demotion: write succeeds.
         let pre = client

@@ -10,7 +10,7 @@ mod tests {
     #[tokio::test]
     async fn test_deployment_replicaset_creation_failure_sets_condition() {
         let db = crate::datastore::test_support::in_memory().await;
-        let __pod_repo = crate::controllers::test_utils::pod_repository_for_test(&db);
+        let __pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
 
         // Create a Deployment with missing spec fields (will fail reconcile)
         let deployment = json!({
@@ -40,22 +40,24 @@ mod tests {
             .await
             .unwrap();
 
-        let deployment_with_rv =
-            crate::controllers::inject_resource_version(created.data, created.resource_version);
+        let deployment_with_rv = crate::controller_test_support::inject_resource_version(
+            created.data,
+            created.resource_version,
+        );
 
         // Reconcile should succeed (not return error) and set failure condition
         let coordination = klights_controllers::ControllerCoordination::new();
         let result = klights_controllers::deployment::reconcile_deployment(
-            &crate::controllers::test_utils::controller_store_for_test(&db),
+            &crate::controller_test_support::controller_store_for_test(&db),
             __pod_repo.as_ref(),
             __pod_repo.as_ref(),
-            crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+            crate::controller_test_support::deterministic_controller_identity().as_ref(),
             __pod_repo.as_ref(),
             &crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(
                 db.clone(),
             )),
             &deployment_with_rv,
-            crate::controllers::test_reconcile_context(&coordination, "test-node"),
+            crate::controller_test_support::test_reconcile_context(&coordination, "test-node"),
         )
         .await;
 

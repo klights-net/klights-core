@@ -803,7 +803,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         );
         client.set_controller_dispatcher(Arc::new(
-            crate::controllers::ControllerDispatcher::default(),
+            crate::controller_test_support::default_queue_only_dispatcher_for_test(),
         ));
 
         let first = client
@@ -923,7 +923,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         );
         client.set_controller_dispatcher(Arc::new(
-            crate::controllers::ControllerDispatcher::default(),
+            crate::controller_test_support::default_queue_only_dispatcher_for_test(),
         ));
 
         let applied = client
@@ -1037,12 +1037,12 @@ mod tests {
         client.set_non_pod_finalization(Arc::new(
             crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(Arc::new(db.clone())),
         ));
-        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(Arc::new(
-            klights_controllers::service::ServiceIpam::new("10.43.128.0/17"),
-        )));
-        dispatcher
-            .set_pod_repository(crate::controllers::test_utils::pod_repository_for_test(&db))
-            .await;
+        let dispatcher = crate::controller_test_support::dispatcher_for_test(
+            &db,
+            Arc::new(klights_controllers::service::ServiceIpam::new(
+                "10.43.128.0/17",
+            )),
+        );
         client.set_controller_dispatcher(dispatcher);
         let applied = client
             .deliver_test_outbox(
@@ -1140,12 +1140,12 @@ mod tests {
         client.set_non_pod_finalization(Arc::new(
             crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(Arc::new(db.clone())),
         ));
-        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(Arc::new(
-            klights_controllers::service::ServiceIpam::new("10.43.128.0/17"),
-        )));
-        dispatcher
-            .set_pod_repository(crate::controllers::test_utils::pod_repository_for_test(&db))
-            .await;
+        let dispatcher = crate::controller_test_support::dispatcher_for_test(
+            &db,
+            Arc::new(klights_controllers::service::ServiceIpam::new(
+                "10.43.128.0/17",
+            )),
+        );
         client.set_controller_dispatcher(dispatcher);
 
         let applied = client

@@ -16,7 +16,10 @@ mod controller_pod_adapters;
 mod controller_runtime_adapter;
 mod controller_store_adapters;
 mod controller_store_error_adapter;
-pub mod controllers;
+#[cfg(test)]
+mod controller_test_debt;
+#[cfg(test)]
+mod controller_test_support;
 mod coredns_bootstrap_adapter;
 pub(crate) mod crd_registry_adapter;
 pub(crate) mod cronjob_scheduler_adapter;

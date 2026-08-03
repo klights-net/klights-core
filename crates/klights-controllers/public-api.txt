@@ -1,4 +1,4 @@
 # Exact normalized compiler-derived normal public API for klights-controllers.
 # Update only after reviewing the complete rustdoc signature/impl/type delta.
-count=4390
-sha256=3b937e8cd0080de44935dc36541788a7c118481fc3ca55e5142a4554cc4eca24
+count=4513
+sha256=ecf0a31686c257d2b6397ea53ba29cbaf58e2a526cf77b50fd83f3ef434d6f67

@@ -84,13 +84,14 @@ mod tests {
         let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
-        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
+        let dispatcher =
+            Arc::new(crate::controller_test_support::queue_only_dispatcher_for_test(service_ipam));
         let registry = default_registry(
             SideEffectMetrics::new(),
             None,
             Some(task_supervisor),
             Some(db_handle),
-            crate::controllers::test_utils::deterministic_controller_identity(),
+            crate::controller_test_support::deterministic_controller_identity(),
         );
         registry.set_controller_dispatcher(dispatcher.clone());
 
@@ -171,12 +172,13 @@ mod tests {
             None,
             None,
             Some(db_handle.clone()),
-            crate::controllers::test_utils::deterministic_controller_identity(),
+            crate::controller_test_support::deterministic_controller_identity(),
         );
         let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
-        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
+        let dispatcher =
+            Arc::new(crate::controller_test_support::queue_only_dispatcher_for_test(service_ipam));
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(
@@ -288,12 +290,13 @@ mod tests {
             None,
             None,
             Some(db_handle.clone()),
-            crate::controllers::test_utils::deterministic_controller_identity(),
+            crate::controller_test_support::deterministic_controller_identity(),
         );
         let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
-        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
+        let dispatcher =
+            Arc::new(crate::controller_test_support::queue_only_dispatcher_for_test(service_ipam));
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(
@@ -374,12 +377,13 @@ mod tests {
             None,
             None,
             Some(db_handle.clone()),
-            crate::controllers::test_utils::deterministic_controller_identity(),
+            crate::controller_test_support::deterministic_controller_identity(),
         );
         let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
-        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
+        let dispatcher =
+            Arc::new(crate::controller_test_support::queue_only_dispatcher_for_test(service_ipam));
         registry.set_controller_dispatcher(dispatcher.clone());
 
         let endpoints = json!({
@@ -417,12 +421,13 @@ mod tests {
             None,
             None,
             Some(db_handle.clone()),
-            crate::controllers::test_utils::deterministic_controller_identity(),
+            crate::controller_test_support::deterministic_controller_identity(),
         );
         let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
-        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
+        let dispatcher =
+            Arc::new(crate::controller_test_support::queue_only_dispatcher_for_test(service_ipam));
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(
@@ -537,12 +542,13 @@ mod tests {
             None,
             None,
             Some(db_handle.clone()),
-            crate::controllers::test_utils::deterministic_controller_identity(),
+            crate::controller_test_support::deterministic_controller_identity(),
         );
         let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
-        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
+        let dispatcher =
+            Arc::new(crate::controller_test_support::queue_only_dispatcher_for_test(service_ipam));
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(
@@ -626,12 +632,13 @@ mod tests {
             None,
             None,
             Some(db_handle.clone()),
-            crate::controllers::test_utils::deterministic_controller_identity(),
+            crate::controller_test_support::deterministic_controller_identity(),
         );
         let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
-        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
+        let dispatcher =
+            Arc::new(crate::controller_test_support::queue_only_dispatcher_for_test(service_ipam));
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(
@@ -745,12 +752,13 @@ mod tests {
             None,
             None,
             Some(db_handle.clone()),
-            crate::controllers::test_utils::deterministic_controller_identity(),
+            crate::controller_test_support::deterministic_controller_identity(),
         );
         let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
-        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
+        let dispatcher =
+            Arc::new(crate::controller_test_support::queue_only_dispatcher_for_test(service_ipam));
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(

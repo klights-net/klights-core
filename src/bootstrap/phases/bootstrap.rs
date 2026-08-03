@@ -40,7 +40,7 @@ pub struct BootstrapPhase {
     pub node_subnet_watch_handle: SupervisedJoinHandle<()>,
     pub node_lifecycle_handle: Option<SupervisedJoinHandle<()>>,
     pub scheduler_controller_handle: Option<SupervisedJoinHandle<()>>,
-    pub dispatcher_for_worker: Arc<crate::controllers::ControllerDispatcher>,
+    pub dispatcher_for_worker: Arc<klights_controllers::ControllerDispatcher>,
     pub app: axum::Router,
 }
 
@@ -746,7 +746,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let controller_leader_ports = Arc::new(
         crate::controller_runtime_adapter::RootControllerLeaderPort::new(db_handle.clone()),
     );
-    let controller_dependencies = crate::controllers::ControllerRuntimeDependencies {
+    let controller_dependencies = klights_controllers::ControllerRuntimeDependencies {
         wall_time: chrono::Utc::now,
         resource_query: controller_leader_ports.clone(),
         deployment_store: controller_leader_ports.clone(),
@@ -787,7 +787,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         coordination: controller_coordination.clone(),
         node_name: Arc::from(config.node_name.as_str()),
     };
-    let hpa_controller = Arc::new(crate::hpa_controller_adapter::HpaController::new(
+    let hpa_controller = crate::hpa_controller_adapter::controller(
         db_handle.clone(),
         api_pod_repository.clone(),
         non_pod_finalization,
@@ -795,8 +795,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         Arc::from(config.node_name.as_str()),
         node_metrics.clone(),
         controller_identity.clone(),
-    ));
-    let controller_dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new_complete(
+    );
+    let controller_dispatcher = Arc::new(klights_controllers::ControllerDispatcher::new_complete(
         service_ipam.clone(),
         nodeport_alloc.clone(),
         supervisor.clone(),

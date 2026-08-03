@@ -29,8 +29,8 @@ pub struct LeaderStart<'a> {
     pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
     pub pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
     pub task_supervisor: &'a Arc<TaskSupervisor>,
-    pub dispatcher_for_worker: &'a Arc<crate::controllers::ControllerDispatcher>,
-    pub dispatcher_for_cronjobs: &'a Arc<crate::controllers::ControllerDispatcher>,
+    pub dispatcher_for_worker: &'a Arc<klights_controllers::ControllerDispatcher>,
+    pub dispatcher_for_cronjobs: &'a Arc<klights_controllers::ControllerDispatcher>,
     pub pod_repository: &'a Arc<crate::kubelet::pod_repository::PodRepository>,
     pub pod_scheduling: &'a Arc<dyn klights_pod_api::PodScheduling>,
     pub cri_for_shutdown: &'a Option<Arc<tokio::sync::Mutex<klights_kubelet::cri::CriClient>>>,
@@ -46,8 +46,8 @@ struct LeaderScopedTaskContext {
     pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
     pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
     task_supervisor: Arc<TaskSupervisor>,
-    dispatcher_for_worker: Arc<crate::controllers::ControllerDispatcher>,
-    dispatcher_for_cronjobs: Arc<crate::controllers::ControllerDispatcher>,
+    dispatcher_for_worker: Arc<klights_controllers::ControllerDispatcher>,
+    dispatcher_for_cronjobs: Arc<klights_controllers::ControllerDispatcher>,
     pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
     pod_scheduling: Arc<dyn klights_pod_api::PodScheduling>,
     cri_for_shutdown: Option<Arc<tokio::sync::Mutex<klights_kubelet::cri::CriClient>>>,
@@ -155,7 +155,7 @@ mod tests {
             &db,
             &crate::paths::ca_cert_path(&crate::paths::runtime_namespace()),
             chrono::DateTime::UNIX_EPOCH,
-            crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+            crate::controller_test_support::deterministic_controller_identity().as_ref(),
         )
         .await
         .expect("default namespaces");
@@ -254,10 +254,6 @@ async fn start_leader_scoped_tasks(
     }
 
     let d = dispatcher_for_worker;
-    #[cfg(test)]
-    let dhw = db_handle.clone();
-    #[cfg(test)]
-    let nn = config.node_name.clone();
     let c = lease_cancel.child_token();
     let worker_coordination = coordination.clone();
     let worker_lease = lease.clone();
@@ -269,10 +265,6 @@ async fn start_leader_scoped_tasks(
                 worker_coordination,
                 worker_lease,
                 async move {
-                    #[cfg(test)]
-                    d.run_worker_pool(CONTROLLER_WORKQUEUE_WORKERS, dhw, nn, c)
-                        .await;
-                    #[cfg(not(test))]
                     d.run_worker_pool(CONTROLLER_WORKQUEUE_WORKERS, c).await;
                 },
             ),

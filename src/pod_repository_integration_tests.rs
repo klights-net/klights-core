@@ -25,6 +25,7 @@ use super::state_only_writer::StateOnlyWriter;
 use super::store::{BoundPodDeleteOutcome, PodStore};
 use super::{PodReader, PodRepository, PodRepositoryBuildConfig};
 use klights_pod_api::{UnscheduledPodDeletionOutcome, UnscheduledPodDeletionRequest};
+use klights_reconcile_api::ControllerDispatcherPort as _;
 use klights_types::PodIdentity;
 
 fn fixture_supervisor() -> Arc<klights_supervisor::TaskSupervisor> {
@@ -47,7 +48,7 @@ fn fixture_mutation_reconcile(
         klights_controllers::side_effects::SideEffectMetrics::new(),
         side_effects,
         store,
-        crate::controllers::test_utils::deterministic_controller_identity(),
+        crate::controller_test_support::deterministic_controller_identity(),
     ))
 }
 
@@ -103,7 +104,7 @@ async fn fixture_repository_with_node_local(
         scheduling_mode: super::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
-        controller_identity: crate::controllers::test_utils::deterministic_controller_identity(),
+        controller_identity: crate::controller_test_support::deterministic_controller_identity(),
         scheduler_bind_gate: None,
     })
     .repository;
@@ -408,7 +409,7 @@ async fn pod_repository_build_parts_exposes_repository_and_background_without_st
         scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
-        controller_identity: crate::controllers::test_utils::deterministic_controller_identity(),
+        controller_identity: crate::controller_test_support::deterministic_controller_identity(),
         scheduler_bind_gate: None,
     });
 
@@ -440,7 +441,7 @@ async fn pod_repository_build_parts_does_not_start_workqueue_until_background_st
         scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
-        controller_identity: crate::controllers::test_utils::deterministic_controller_identity(),
+        controller_identity: crate::controller_test_support::deterministic_controller_identity(),
         scheduler_bind_gate: None,
     });
 
@@ -482,7 +483,7 @@ async fn pod_workqueue_runner_start_calls_workqueue_start_once() {
         scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
-        controller_identity: crate::controllers::test_utils::deterministic_controller_identity(),
+        controller_identity: crate::controller_test_support::deterministic_controller_identity(),
         scheduler_bind_gate: None,
     });
 
@@ -2569,7 +2570,7 @@ async fn build_repo_with_bound_side_effects() -> Arc<super::PodRepository> {
         None,
         Some(supervisor.clone()),
         Some(db.clone()),
-        crate::controllers::test_utils::deterministic_controller_identity(),
+        crate::controller_test_support::deterministic_controller_identity(),
     ));
     let repo = Arc::new(super::PodRepository::new(
         db,
@@ -2796,7 +2797,7 @@ async fn build_repo_with_scheduling_mode_and_gate(
         scheduling_mode,
         outbox: None,
         cluster_api: None,
-        controller_identity: crate::controllers::test_utils::deterministic_controller_identity(),
+        controller_identity: crate::controller_test_support::deterministic_controller_identity(),
         scheduler_bind_gate: Some(gate),
     })
     .repository
@@ -2805,7 +2806,7 @@ async fn build_repo_with_scheduling_mode_and_gate(
 async fn build_repo_with_dispatcher() -> (
     super::PodRepository,
     crate::datastore::DatastoreHandle,
-    Arc<crate::controllers::ControllerDispatcher>,
+    Arc<klights_controllers::ControllerDispatcher>,
 ) {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
@@ -2815,10 +2816,10 @@ async fn build_repo_with_dispatcher() -> (
         None,
         Some(supervisor.clone()),
         Some(db.clone()),
-        crate::controllers::test_utils::deterministic_controller_identity(),
+        crate::controller_test_support::deterministic_controller_identity(),
     ));
     let dispatcher = Arc::new(
-        crate::controllers::ControllerDispatcher::with_task_supervisor(
+        klights_controllers::ControllerDispatcher::with_task_supervisor(
             Arc::new(klights_controllers::service::ServiceIpam::new(
                 "10.43.128.0/17",
             )),
@@ -4954,9 +4955,11 @@ async fn apply_runtime_reconcile_status_enqueues_deployment_rollout_on_readiness
     let created = repo.store.create("default", "web-pod", seed).await.unwrap();
     let deployment_key =
         klights_reconcile_api::ReconcileKey::namespaced("apps/v1", "Deployment", "default", "web");
-    dispatcher
-        .enqueue_reconcile_key(deployment_key.clone())
-        .await;
+    klights_reconcile_api::ControllerDispatcherPort::enqueue_reconcile(
+        dispatcher.as_ref(),
+        deployment_key.clone(),
+    )
+    .await;
 
     repo.apply_runtime_reconcile_status(
         "default",

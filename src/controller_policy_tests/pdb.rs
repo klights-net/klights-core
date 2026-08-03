@@ -239,7 +239,7 @@ async fn test_pdb_reconcile_does_not_overwrite_fresher_status_after_stale_pod_li
     )
     .await;
 
-    let repo = crate::controllers::test_utils::pod_repository_for_test(&db);
+    let repo = crate::controller_test_support::pod_repository_for_test(&db);
     let listed = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let stale_reader = Arc::new(BlockingOncePodReader {
@@ -316,7 +316,7 @@ async fn test_pdb_reconcile_preserves_disrupted_pods_for_existing_pods() {
 
     reconcile_pdb(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         &pdb,
     )
     .await
@@ -377,7 +377,7 @@ async fn test_pdb_reconcile_preserves_disrupted_pods_for_terminating_pods() {
 
     reconcile_pdb(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         &pdb,
     )
     .await
@@ -446,7 +446,7 @@ async fn test_pdb_reconcile_preserves_condition_transition_time_when_status_unch
 
     reconcile_pdb(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         &pdb,
     )
     .await
@@ -511,7 +511,7 @@ async fn test_pdb_reconcile_sets_status_fields() {
 
     reconcile_pdb(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         &pdb,
     )
     .await
@@ -570,7 +570,7 @@ async fn test_pdb_reconcile_zero_disruptions_when_below_min_available() {
 
     reconcile_pdb(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         &pdb,
     )
     .await
@@ -617,7 +617,7 @@ async fn test_pdb_reconcile_max_unavailable() {
 
     reconcile_pdb(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         &pdb,
     )
     .await
@@ -683,7 +683,7 @@ async fn test_pdb_reconcile_selector_match_expressions_in_operator() {
 
     reconcile_pdb(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         &pdb,
     )
     .await
@@ -739,7 +739,7 @@ async fn test_pdb_reconcile_selector_match_expressions_exists_operator() {
 
     reconcile_pdb(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         &pdb,
     )
     .await
@@ -793,7 +793,7 @@ async fn test_pdb_reconcile_selector_match_expressions_does_not_exist_operator()
 
     reconcile_pdb(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         &pdb,
     )
     .await
@@ -856,7 +856,7 @@ async fn test_pdb_reconcile_selector_match_expressions_not_in_operator() {
 
     reconcile_pdb(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         &pdb,
     )
     .await
@@ -907,7 +907,7 @@ async fn test_pdb_reconcile_selector_filters_unrelated_pods() {
 
     reconcile_pdb(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         &pdb,
     )
     .await
@@ -947,7 +947,7 @@ async fn eviction_admission_atomically_records_live_disruption_but_not_dry_run()
         true,
     )
     .await;
-    let pods = crate::controllers::test_utils::pod_repository_for_test(&db);
+    let pods = crate::controller_test_support::pod_repository_for_test(&db);
     reconcile_pdb(&db, pods.as_ref(), &pdb).await.unwrap();
     let pod = db
         .get_resource("v1", "Pod", Some("default"), "victim")
@@ -1014,7 +1014,7 @@ async fn unhealthy_pod_policy_allows_only_spec_permitted_budget_safe_evictions()
             false,
         )
         .await;
-        let pods = crate::controllers::test_utils::pod_repository_for_test(&db);
+        let pods = crate::controller_test_support::pod_repository_for_test(&db);
         reconcile_pdb(&db, pods.as_ref(), &pdb).await.unwrap();
         let pod = db
             .get_resource("v1", "Pod", Some("default"), "victim")

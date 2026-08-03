@@ -149,7 +149,7 @@ pub(crate) trait GrpcReplicationServerTestExt: Sized {
     fn new_with_controller_dispatcher(
         service: Arc<ReplicationService>,
         db: DatastoreHandle,
-        controller_dispatcher: Arc<crate::controllers::ControllerDispatcher>,
+        controller_dispatcher: Arc<klights_controllers::ControllerDispatcher>,
     ) -> Self;
 
     fn new_with_node_lease_tracker(
@@ -185,7 +185,7 @@ impl GrpcReplicationServerTestExt for GrpcReplicationServer {
     fn new_with_controller_dispatcher(
         service: Arc<ReplicationService>,
         db: DatastoreHandle,
-        controller_dispatcher: Arc<crate::controllers::ControllerDispatcher>,
+        controller_dispatcher: Arc<klights_controllers::ControllerDispatcher>,
     ) -> Self {
         build_test_server(
             service,
@@ -230,7 +230,7 @@ fn build_test_server(
     service: Arc<ReplicationService>,
     db: DatastoreHandle,
     passive_reads: crate::datastore::selector::PassiveReadPorts,
-    controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
+    controller_dispatcher: Option<Arc<klights_controllers::ControllerDispatcher>>,
     node_lease_tracker: Option<Arc<klights_controllers::node_lease::NodeLeaseTracker>>,
 ) -> GrpcReplicationServer {
     let node_lease_tracker = node_lease_tracker.unwrap_or_else(|| {
@@ -284,7 +284,7 @@ pub(crate) fn mount_service_full(
     app: axum::Router,
     service: Arc<ReplicationService>,
     db: DatastoreHandle,
-    controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
+    controller_dispatcher: Option<Arc<klights_controllers::ControllerDispatcher>>,
     node_lease_tracker: Option<Arc<klights_controllers::node_lease::NodeLeaseTracker>>,
     raft_rpc_router: Option<Arc<dyn klights_leader_rpc::raft_rpc::RaftRpcRouter>>,
     controlplane_join_handler: Option<Arc<dyn klights_leader_api::ControlplaneJoinHandler>>,
@@ -397,7 +397,7 @@ pub(crate) fn mount_service_with_controller_dispatcher(
     app: axum::Router,
     service: Arc<ReplicationService>,
     db: DatastoreHandle,
-    controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
+    controller_dispatcher: Option<Arc<klights_controllers::ControllerDispatcher>>,
     node_lease_tracker: Option<Arc<klights_controllers::node_lease::NodeLeaseTracker>>,
     transport_policy: Arc<klights_leader_rpc::transport_policy::GrpcTransportPolicy>,
 ) -> axum::Router {
@@ -425,7 +425,7 @@ fn mount_service_full_with_passive_reads(
     service: Arc<ReplicationService>,
     db: DatastoreHandle,
     passive_reads: crate::datastore::selector::PassiveReadPorts,
-    controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
+    controller_dispatcher: Option<Arc<klights_controllers::ControllerDispatcher>>,
     node_lease_tracker: Option<Arc<klights_controllers::node_lease::NodeLeaseTracker>>,
     raft_rpc_router: Option<Arc<dyn klights_leader_rpc::raft_rpc::RaftRpcRouter>>,
     controlplane_join_handler: Option<Arc<dyn klights_leader_api::ControlplaneJoinHandler>>,

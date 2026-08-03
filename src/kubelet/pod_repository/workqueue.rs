@@ -2596,7 +2596,7 @@ mod tests {
                 SideEffectMetrics::new(),
                 Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
                 workqueue.store.clone(),
-                crate::controllers::test_utils::deterministic_controller_identity(),
+                crate::controller_test_support::deterministic_controller_identity(),
             ),
         ));
         db.create_namespace(

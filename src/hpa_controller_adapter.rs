@@ -4,7 +4,6 @@ use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
 use serde_json::{Value, json};
 
 use crate::controller_store_error_adapter::map_controller_store_error;
-use crate::controllers::{Context, Controller};
 use crate::datastore::{DatastoreBackend, ResourcePatchRequest};
 use crate::kubelet::pod_repository::{PodReader, PodRepository};
 use klights_controllers::hpa::{
@@ -90,28 +89,7 @@ impl HpaMetrics for NodeApiHpaMetrics<'_> {
     }
 }
 
-#[cfg(test)]
-pub struct HpaController {
-    pub(crate) identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
-}
-
-#[cfg(test)]
-impl HpaController {
-    pub(crate) fn new(
-        _db: crate::datastore::DatastoreHandle,
-        _pod_repository: std::sync::Arc<PodRepository>,
-        _non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
-        _coordination: std::sync::Arc<klights_controllers::ControllerCoordination>,
-        _node_name: std::sync::Arc<str>,
-        _node_metrics: std::sync::Arc<dyn NodeMetrics>,
-        identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
-    ) -> Self {
-        Self { identity }
-    }
-}
-
-#[cfg(not(test))]
-pub struct HpaController {
+struct RootHpaReconcileAdapter {
     db: crate::datastore::DatastoreHandle,
     pod_repository: std::sync::Arc<PodRepository>,
     non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
@@ -121,18 +99,17 @@ pub struct HpaController {
     identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
 }
 
-#[cfg(not(test))]
-impl HpaController {
-    pub(crate) fn new(
-        db: crate::datastore::DatastoreHandle,
-        pod_repository: std::sync::Arc<PodRepository>,
-        non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
-        coordination: std::sync::Arc<klights_controllers::ControllerCoordination>,
-        node_name: std::sync::Arc<str>,
-        node_metrics: std::sync::Arc<dyn NodeMetrics>,
-        identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
-    ) -> Self {
-        Self {
+pub(crate) fn controller(
+    db: crate::datastore::DatastoreHandle,
+    pod_repository: std::sync::Arc<PodRepository>,
+    non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
+    coordination: std::sync::Arc<klights_controllers::ControllerCoordination>,
+    node_name: std::sync::Arc<str>,
+    node_metrics: std::sync::Arc<dyn NodeMetrics>,
+    identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
+) -> std::sync::Arc<klights_controllers::hpa::HpaController> {
+    std::sync::Arc::new(klights_controllers::hpa::HpaController::new(
+        std::sync::Arc::new(RootHpaReconcileAdapter {
             db,
             pod_repository,
             non_pod_finalization,
@@ -140,79 +117,29 @@ impl HpaController {
             node_name,
             node_metrics,
             identity,
-        }
-    }
+        }),
+    ))
 }
 
 #[async_trait]
-impl Controller for HpaController {
-    fn name(&self) -> &'static str {
-        "horizontalpodautoscaler"
-    }
-
-    async fn reconcile(&self, resource: Value, ctx: Context) -> Result<()> {
-        #[cfg(not(test))]
-        {
-            return reconcile_hpa_with_metrics(
-                self.db.as_ref(),
-                self.pod_repository.as_ref(),
-                self.non_pod_finalization.as_ref(),
-                self.coordination.as_ref(),
-                &resource,
-                &self.node_name,
-                self.node_metrics.as_ref(),
-                self.identity.as_ref(),
-                ctx.reconcile_time(),
-            )
-            .await;
-        }
-        #[cfg(test)]
-        {
-            let pod_repository = ctx.pod_repository().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "horizontalpodautoscaler requires pod_repository in Context — wire it via \
-                 ControllerDispatcher::set_pod_repository or Context::with_pod_repository"
-                )
-            })?;
-            let fallback_metrics;
-            let node_metrics = match ctx.node_metrics() {
-                Some(provider) => provider.as_ref(),
-                None => {
-                    fallback_metrics = crate::node_metrics_adapter::UnavailableNodeMetrics;
-                    &fallback_metrics as &dyn NodeMetrics
-                }
-            };
-            let non_pod_finalization = ctx.non_pod_finalization().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "horizontalpodautoscaler requires non-Pod GC finalization in Context"
-                )
-            })?;
-            reconcile_hpa_with_metrics(
-                ctx.db_handle().as_ref(),
-                pod_repository.as_ref(),
-                non_pod_finalization.as_ref(),
-                ctx.coordination(),
-                &resource,
-                ctx.node_name(),
-                node_metrics,
-                self.identity.as_ref(),
-                ctx.reconcile_time(),
-            )
-            .await
-        }
-    }
-}
-
-#[cfg(test)]
-mod dispatch_tests {
-    use super::*;
-
-    #[test]
-    fn controller_name_is_stable() {
-        let controller = HpaController {
-            identity: crate::controllers::test_utils::deterministic_controller_identity(),
-        };
-        assert_eq!(controller.name(), "horizontalpodautoscaler");
+impl klights_controllers::hpa::HpaReconcilePort for RootHpaReconcileAdapter {
+    async fn reconcile(
+        &self,
+        resource: &Value,
+        reconcile_time: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        reconcile_hpa_with_metrics(
+            self.db.as_ref(),
+            self.pod_repository.as_ref(),
+            self.non_pod_finalization.as_ref(),
+            self.coordination.as_ref(),
+            resource,
+            &self.node_name,
+            self.node_metrics.as_ref(),
+            self.identity.as_ref(),
+            reconcile_time,
+        )
+        .await
     }
 }
 

@@ -488,7 +488,7 @@ async fn test_update_pod_status_triggers_endpoint_reconciliation() {
     // Simulate pod transitioning to Running with an IP (what update_pod_status does)
     update_pod_status(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         "web-1",
         "default",
         PodStatusUpdate {
@@ -553,7 +553,7 @@ async fn test_update_pod_status_running_without_container_statuses_sets_ready_co
 
     update_pod_status(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         "ready-empty-statuses",
         "default",
         PodStatusUpdate {
@@ -621,7 +621,7 @@ async fn test_update_pod_status_preserves_restart_count_and_last_state() {
 
     update_pod_status(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         "preserve-restart",
         "default",
         PodStatusUpdate {
@@ -715,7 +715,7 @@ async fn test_endpoints_populated_on_pod_modified_event() {
     // Reconcile with pod that has no IP — endpoints should remain empty
     reconcile_endpoints_for_pod(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         &pod_no_ip,
         None,
     )
@@ -766,7 +766,7 @@ async fn test_endpoints_populated_on_pod_modified_event() {
     // Reconcile with updated pod — endpoints should now be populated
     reconcile_endpoints_for_pod(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         &pod_with_ip,
         None,
     )

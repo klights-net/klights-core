@@ -24,8 +24,10 @@ async fn test_mirror_endpoints_sets_owner_reference() {
         .create_resource("v1", "Endpoints", Some("default"), "my-svc", endpoints)
         .await
         .unwrap();
-    let endpoints =
-        crate::controllers::inject_resource_version(created.data, created.resource_version);
+    let endpoints = crate::controller_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
 
     mirror_endpoints_to_endpointslice(&controller_store(&db), &endpoints)
         .await
@@ -76,8 +78,10 @@ async fn test_mirror_endpoints_stale_snapshot_after_delete_does_not_recreate_sli
         .create_resource("v1", "Endpoints", Some("default"), "gone-svc", endpoints)
         .await
         .unwrap();
-    let stale_snapshot =
-        crate::controllers::inject_resource_version(created.data, created.resource_version);
+    let stale_snapshot = crate::controller_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
 
     db.delete_resource("v1", "Endpoints", Some("default"), "gone-svc")
         .await
@@ -141,7 +145,7 @@ async fn test_reconcile_endpointslice_named_target_port_resolves_to_container_po
 
     reconcile_endpointslice(
         &controller_store(&db),
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         "nginx-service",
         "test-service-uid",
         "test",
@@ -215,7 +219,7 @@ async fn test_reconcile_endpointslice_splits_named_target_ports_per_resolved_por
 
     reconcile_endpointslice(
         &controller_store(&db),
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         "example-named-port",
         "svc-uid",
         "test",
@@ -304,7 +308,7 @@ async fn test_reconcile_endpointslice_create_conflict_recovers_to_desired_state(
 
     reconcile_endpointslice(
         &controller_store(&db),
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         service_name,
         "svc-uid",
         "test",
@@ -355,7 +359,7 @@ async fn test_reconcile_endpointslice_create_conflict_recovers_to_desired_state(
 
     reconcile_endpointslice(
         &controller_store(&db),
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         service_name,
         "svc-uid",
         "test",
@@ -430,7 +434,7 @@ async fn test_reconcile_endpointslice_numeric_string_target_port_and_skip_unreso
 
     reconcile_endpointslice(
         &controller_store(&db),
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         "multi-endpoint-test",
         "svc-uid-3",
         "test",
@@ -503,7 +507,7 @@ async fn test_reconcile_endpoints_named_target_port_resolves_to_container_port()
 
     reconcile_endpoints(
         &controller_store(&db),
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         "nginx-service",
         "test",
         Some(&selector),
@@ -567,7 +571,7 @@ async fn test_reconcile_endpoints_numeric_string_target_port_and_skip_unresolved
 
     reconcile_endpoints(
         &controller_store(&db),
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         "multi-endpoint-test",
         "test",
         Some(&selector),
@@ -637,7 +641,7 @@ async fn test_reconcile_endpoints_preserves_service_port_name() {
 
     reconcile_endpoints(
         &controller_store(&db),
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         "svc",
         "test",
         Some(&selector),
@@ -713,7 +717,7 @@ async fn test_endpointslice_deleted_when_service_deleted_via_cascade() {
     let ports = json!([{"port": 80, "targetPort": 8080}]);
     reconcile_endpointslice(
         &controller_store(&db),
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         "test-service",
         "test-service-uid-123",
         "test",
@@ -798,7 +802,7 @@ async fn test_endpointslice_ports_match_service_targetport() {
 
     reconcile_endpointslice(
         &controller_store(&db),
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         "web-svc",
         "svc-uid-1",
         "test",
@@ -852,7 +856,7 @@ async fn test_endpointslice_ports_use_service_port_when_no_targetport() {
 
     reconcile_endpointslice(
         &controller_store(&db),
-        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
         "web-svc",
         "svc-uid-2",
         "test",
@@ -918,7 +922,7 @@ async fn test_endpointslice_ports_not_zero() {
         let slice_name = format!("{}-klights", svc_name);
         reconcile_endpointslice(
             &controller_store(&db),
-            crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+            crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
             &svc_name,
             &format!("uid-{}", test_case),
             "test",

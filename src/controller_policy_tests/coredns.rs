@@ -11,7 +11,7 @@ async fn init_default_namespaces(db: &dyn crate::datastore::DatastoreBackend) {
         db,
         &crate::paths::ca_cert_path(&crate::paths::runtime_namespace()),
         chrono::DateTime::UNIX_EPOCH,
-        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+        crate::controller_test_support::deterministic_controller_identity().as_ref(),
     )
     .await
     .unwrap();
@@ -35,9 +35,9 @@ async fn bootstrap_coredns(
         pod_repository.clone(),
         controller_pods,
         pod_repository,
-        crate::controllers::test_utils::non_pod_finalization_port_for_test(),
+        crate::controller_test_support::non_pod_finalization_port_for_test(),
         &klights_controllers::ControllerCoordination::new(),
-        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+        crate::controller_test_support::deterministic_controller_identity().as_ref(),
         crate::coredns_bootstrap_adapter::CoreDnsBootstrapConfig {
             tls_port,
             service_cidr,
@@ -122,7 +122,7 @@ async fn test_bootstrap_coredns_creates_all_resources() {
 
     bootstrap_coredns(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db),
+        crate::controller_test_support::pod_repository_for_test(&db),
         7443,
         "10.43.128.0/17",
         "klights",
@@ -178,7 +178,7 @@ async fn test_bootstrap_coredns_creates_serviceaccount_and_rbac() {
 
     bootstrap_coredns(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db),
+        crate::controller_test_support::pod_repository_for_test(&db),
         7679,
         "10.43.128.0/17",
         "klights",
@@ -292,7 +292,7 @@ async fn test_bootstrap_coredns_idempotent() {
 
     bootstrap_coredns(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db),
+        crate::controller_test_support::pod_repository_for_test(&db),
         7443,
         "10.43.128.0/17",
         "klights",
@@ -302,7 +302,7 @@ async fn test_bootstrap_coredns_idempotent() {
     .unwrap();
     let result = bootstrap_coredns(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db),
+        crate::controller_test_support::pod_repository_for_test(&db),
         7443,
         "10.43.128.0/17",
         "klights",
@@ -396,7 +396,7 @@ async fn test_bootstrap_coredns_repairs_legacy_node_local_kubeconfig_resources()
 
     bootstrap_coredns(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db),
+        crate::controller_test_support::pod_repository_for_test(&db),
         7679,
         "10.43.128.0/17",
         "klights",
@@ -476,7 +476,7 @@ async fn test_coredns_service_uses_derived_ip_from_custom_cidr() {
 
     bootstrap_coredns(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db),
+        crate::controller_test_support::pod_repository_for_test(&db),
         7443,
         custom_service_cidr,
         "klights",
@@ -504,7 +504,7 @@ async fn test_coredns_deployment_has_dns_policy_default() {
 
     bootstrap_coredns(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db),
+        crate::controller_test_support::pod_repository_for_test(&db),
         7443,
         "10.43.128.0/17",
         "klights",
@@ -537,7 +537,7 @@ async fn test_coredns_deployment_template_is_not_pinned_to_bootstrap_node() {
 
     bootstrap_coredns(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db),
+        crate::controller_test_support::pod_repository_for_test(&db),
         7443,
         "10.43.128.0/17",
         "klights",
@@ -568,7 +568,7 @@ async fn test_coredns_deployment_volume_mounts() {
 
     bootstrap_coredns(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db),
+        crate::controller_test_support::pod_repository_for_test(&db),
         7443,
         "10.43.128.0/17",
         "klights",
@@ -618,7 +618,7 @@ async fn test_coredns_deployment_labels() {
 
     bootstrap_coredns(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db),
+        crate::controller_test_support::pod_repository_for_test(&db),
         7443,
         "10.43.128.0/17",
         "klights",
@@ -656,7 +656,7 @@ async fn test_coredns_service_cluster_ips_array() {
 
     bootstrap_coredns(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db),
+        crate::controller_test_support::pod_repository_for_test(&db),
         7443,
         "10.43.128.0/17",
         "klights",
@@ -689,7 +689,7 @@ async fn test_coredns_service_ports() {
 
     bootstrap_coredns(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db),
+        crate::controller_test_support::pod_repository_for_test(&db),
         7443,
         "10.43.128.0/17",
         "klights",
@@ -724,7 +724,7 @@ async fn test_coredns_configmap_namespace_in_corefile() {
     // Use a custom containerd namespace
     bootstrap_coredns(
         &db,
-        crate::controllers::test_utils::pod_repository_for_test(&db),
+        crate::controller_test_support::pod_repository_for_test(&db),
         7443,
         "10.43.128.0/17",
         "klights-architect",

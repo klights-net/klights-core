@@ -7,7 +7,7 @@ async fn init_default_namespaces(db: &dyn crate::datastore::DatastoreBackend) {
         db,
         &crate::paths::ca_cert_path(&crate::paths::runtime_namespace()),
         chrono::DateTime::UNIX_EPOCH,
-        crate::controllers::test_utils::deterministic_controller_identity().as_ref(),
+        crate::controller_test_support::deterministic_controller_identity().as_ref(),
     )
     .await
     .unwrap();

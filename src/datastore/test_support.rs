@@ -283,15 +283,3 @@ mod tests {
 pub async fn ensure_namespace(db: &dyn DatastoreBackend, name: &str) {
     db.seed_namespace_for_test(name).await;
 }
-
-/// Construct the focused controller test context used by the thin controller
-/// runner fixtures. This helper is test-only and does not add a production
-/// datastore-to-controller compatibility seam.
-#[cfg(test)]
-pub(crate) fn test_context(db: &Datastore) -> crate::controllers::Context {
-    let db_handle = Arc::new(db.clone()) as DatastoreHandle;
-    crate::controllers::Context::new(db_handle.clone(), "test-node".to_string())
-        .with_non_pod_finalization(Arc::new(
-            crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db_handle),
-        ))
-}

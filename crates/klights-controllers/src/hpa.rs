@@ -6,6 +6,7 @@ use klights_cluster_core::Resource;
 use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 const MAX_RETRIES: u32 = 5;
 
@@ -124,6 +125,40 @@ pub trait HpaRuntime: Send + Sync {
     ) -> ControllerStoreResult<()>;
     fn is_conflict(&self, error: &ControllerStoreError) -> bool {
         error.is_conflict()
+    }
+}
+
+#[async_trait]
+pub trait HpaReconcilePort: Send + Sync {
+    async fn reconcile(
+        &self,
+        resource: &Value,
+        reconcile_time: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()>;
+}
+
+/// Generic HPA dispatcher wrapper. Concrete datastore and node-metrics
+/// adapters are supplied by root composition through focused ports.
+pub struct HpaController {
+    port: Arc<dyn HpaReconcilePort>,
+}
+
+impl HpaController {
+    pub fn new(port: Arc<dyn HpaReconcilePort>) -> Self {
+        Self { port }
+    }
+}
+
+#[async_trait]
+impl crate::Controller for HpaController {
+    fn name(&self) -> &'static str {
+        "horizontalpodautoscaler"
+    }
+
+    async fn reconcile(&self, resource: Value, context: crate::Context) -> Result<()> {
+        self.port
+            .reconcile(&resource, context.reconcile_time())
+            .await
     }
 }
 

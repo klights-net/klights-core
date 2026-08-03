@@ -457,17 +457,12 @@ async fn test_cronjob_created_job_is_reconciled_into_pod() {
     .await
     .unwrap();
 
-    let dispatcher = std::sync::Arc::new(crate::controllers::ControllerDispatcher::new(
+    let dispatcher = crate::controller_test_support::dispatcher_for_test(
+        &db,
         std::sync::Arc::new(klights_controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         )),
-    ));
-    dispatcher
-        .set_sync_context(std::sync::Arc::new(db.clone()), "test-node".to_string())
-        .await;
-    dispatcher
-        .set_pod_repository(crate::controllers::test_utils::pod_repository_for_test(&db))
-        .await;
+    );
     let old_creation = klights_cluster_core::k8s_time::format_time(
         chrono::Utc::now() - chrono::Duration::minutes(2),
     );
@@ -516,6 +511,7 @@ async fn test_cronjob_created_job_is_reconciled_into_pod() {
     )
     .await
     .unwrap();
+    dispatcher.dispatch_next_key_for_test().await;
 
     let pods = db
         .list_resources(
