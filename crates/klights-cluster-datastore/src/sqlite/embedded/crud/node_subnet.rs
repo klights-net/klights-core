@@ -256,6 +256,124 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn test_allocate_node_subnet_first_node_gets_first_24() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        let subnet = db
+            .allocate_node_subnet("node-a", "10.42.0.0/16", "192.168.1.1")
+            .await
+            .unwrap();
+        assert_eq!(subnet.subnet.to_string(), "10.42.0.0/24");
+        assert_eq!(subnet.gateway_ip.to_string(), "10.42.0.0");
+        assert_eq!(subnet.node_ip.to_string(), "192.168.1.1");
+        assert_eq!(subnet.node_name.as_str(), "node-a");
+    }
+
+    #[tokio::test]
+    async fn test_allocate_node_subnet_second_node_gets_next_24() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        db.allocate_node_subnet("node-a", "10.42.0.0/16", "192.168.1.1")
+            .await
+            .unwrap();
+        let subnet = db
+            .allocate_node_subnet("node-b", "10.42.0.0/16", "192.168.1.2")
+            .await
+            .unwrap();
+        assert_eq!(subnet.subnet.to_string(), "10.42.1.0/24");
+        assert_eq!(subnet.gateway_ip.to_string(), "10.42.1.0");
+    }
+
+    #[tokio::test]
+    async fn test_allocate_node_subnet_idempotent_for_existing_node() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        let first = db
+            .allocate_node_subnet("node-a", "10.42.0.0/16", "192.168.1.1")
+            .await
+            .unwrap();
+        let second = db
+            .allocate_node_subnet("node-a", "10.42.0.0/16", "192.168.1.1")
+            .await
+            .unwrap();
+        assert_eq!(first.subnet, second.subnet);
+    }
+
+    #[tokio::test]
+    async fn test_get_node_subnet_returns_none_when_absent() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        assert!(db.get_node_subnet("nonexistent").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_node_subnet_returns_record_after_allocation() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        db.allocate_node_subnet("node-a", "10.42.0.0/16", "10.0.0.1")
+            .await
+            .unwrap();
+        let record = db.get_node_subnet("node-a").await.unwrap().unwrap();
+        assert_eq!(record.node_ip.to_string(), "10.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn test_list_peer_subnets_excludes_self_and_includes_peer_rows() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        db.allocate_node_subnet("node-a", "10.42.0.0/16", "10.0.0.1")
+            .await
+            .unwrap();
+        db.allocate_node_subnet("node-b", "10.42.0.0/16", "10.0.0.2")
+            .await
+            .unwrap();
+        let peers = db
+            .list_peer_subnets(
+                klights_cluster_store::PeerTopologyRequest::excluding("node-a").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].node_name.as_str(), "node-b");
+        assert_eq!(
+            db.list_peer_subnets(klights_cluster_store::PeerTopologyRequest::all())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_node_subnet_removes_record() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        db.allocate_node_subnet("node-a", "10.42.0.0/16", "10.0.0.1")
+            .await
+            .unwrap();
+        db.delete_node_subnet("node-a").await.unwrap();
+        assert!(db.get_node_subnet("node-a").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn list_peer_subnets_includes_rootless_peers() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        db.allocate_node_subnet("node-a", "10.42.0.0/16", "10.0.0.1")
+            .await
+            .unwrap();
+        db.allocate_node_subnet("rootless-d", "10.42.0.0/16", "10.0.0.4")
+            .await
+            .unwrap();
+        db.update_node_peer_attributes("rootless-d", klights_types::NodePeerMode::Rootless, None)
+            .await
+            .unwrap();
+        let peers = db
+            .list_peer_subnets(
+                klights_cluster_store::PeerTopologyRequest::excluding("node-a").unwrap(),
+            )
+            .await
+            .unwrap();
+        let peer = peers
+            .iter()
+            .find(|peer| peer.node_name.as_str() == "rootless-d")
+            .expect("rootless peer remains visible to route projection");
+        assert_eq!(peer.mode, klights_types::NodePeerMode::Rootless);
+    }
+
+    #[tokio::test]
     async fn all_peer_subnets_ignores_the_empty_snapshot_sentinel_row() {
         let db = Datastore::new_in_memory().await.unwrap();
         db.allocate_node_subnet("healthy-a", "10.42.0.0/16", "192.0.2.10")

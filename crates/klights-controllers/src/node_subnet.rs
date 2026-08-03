@@ -690,3 +690,7 @@ pub fn project_node_peer_attributes(
     let hostport_range = range_str.and_then(|s| HostPortRange::parse(s).ok());
     (mode, hostport_range)
 }
+
+#[cfg(test)]
+#[path = "node_subnet/tests.rs"]
+mod tests;

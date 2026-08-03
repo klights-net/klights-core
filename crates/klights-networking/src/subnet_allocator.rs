@@ -309,6 +309,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_rootless_allocates_local_subnet_without_peer_router() {
+        let row = NodeSubnet::try_new(
+            "rootless-node-a",
+            "10.50.1.0/24",
+            u32::from(Ipv4Addr::new(10, 50, 1, 0)),
+            Ipv4Addr::new(10, 50, 1, 0),
+            Ipv4Addr::new(192, 0, 2, 10),
+            NetworkNodeMode::Root,
+            None,
+        )
+        .unwrap();
+        let client = FakeAllocationClient::new(vec![Outcome::Ok(row)]);
+        let allocator = test_allocator(client.clone());
+
+        let subnet = allocator
+            .allocate("rootless-node-a", "10.50.0.0/16", "192.0.2.10")
+            .await
+            .expect("rootless allocation must use only the focused allocation port");
+
+        assert_eq!(subnet.to_string(), "10.50.1.0/24");
+        assert_eq!(client.calls(), 1);
+    }
+
+    #[tokio::test]
     async fn retries_retryable_deadline_and_returns_success() {
         let client = FakeAllocationClient::new(vec![
             Outcome::Err(NodeSubnetAllocationError::Timeout),

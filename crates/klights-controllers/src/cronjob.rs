@@ -568,6 +568,7 @@ mod tests {
     struct MemoryCronJobStore {
         current: Mutex<Resource>,
         jobs: Mutex<Vec<Resource>>,
+        deleted: std::sync::atomic::AtomicBool,
         created_jobs: AtomicUsize,
         writes: AtomicUsize,
     }
@@ -577,6 +578,7 @@ mod tests {
             Self {
                 current: Mutex::new(Resource::try_from_data(Arc::new(value)).unwrap()),
                 jobs: Mutex::new(Vec::new()),
+                deleted: std::sync::atomic::AtomicBool::new(false),
                 created_jobs: AtomicUsize::new(0),
                 writes: AtomicUsize::new(0),
             }
@@ -590,6 +592,7 @@ mod tests {
                         .map(|job| Resource::try_from_data(Arc::new(job)).unwrap())
                         .collect(),
                 ),
+                deleted: std::sync::atomic::AtomicBool::new(false),
                 created_jobs: AtomicUsize::new(0),
                 writes: AtomicUsize::new(0),
             }
@@ -597,6 +600,14 @@ mod tests {
 
         fn resource(&self) -> Resource {
             self.current.lock().unwrap().clone()
+        }
+
+        fn replace(&self, value: Value) {
+            *self.current.lock().unwrap() = Resource::try_from_data(Arc::new(value)).unwrap();
+        }
+
+        fn delete_current(&self) {
+            self.deleted.store(true, Ordering::SeqCst);
         }
     }
 
@@ -609,7 +620,7 @@ mod tests {
             _namespace: Option<&str>,
             _name: &str,
         ) -> ControllerStoreResult<Option<Resource>> {
-            Ok(Some(self.resource()))
+            Ok((!self.deleted.load(Ordering::SeqCst)).then(|| self.resource()))
         }
 
         async fn update_status(
@@ -657,6 +668,9 @@ mod tests {
             namespace: &str,
             name: &str,
         ) -> ControllerStoreResult<Option<Resource>> {
+            if self.deleted.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
             let current = self.resource();
             Ok(
                 (current.namespace.as_deref() == Some(namespace) && current.name == name)
@@ -666,22 +680,32 @@ mod tests {
 
         async fn get_job(
             &self,
-            _namespace: &str,
-            _name: &str,
+            namespace: &str,
+            name: &str,
         ) -> ControllerStoreResult<Option<Resource>> {
-            Ok(None)
+            Ok(self
+                .jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|job| job.namespace.as_deref() == Some(namespace) && job.name == name)
+                .cloned())
         }
 
         async fn create_job(
             &self,
-            _namespace: &str,
-            _name: &str,
-            _value: Value,
+            namespace: &str,
+            name: &str,
+            mut value: Value,
         ) -> ControllerStoreResult<Resource> {
             self.created_jobs.fetch_add(1, Ordering::Relaxed);
-            Err(ControllerStoreError::unavailable(
-                "unexpected Job create in CronJob status test",
-            ))
+            value["metadata"]["namespace"] = json!(namespace);
+            value["metadata"]["name"] = json!(name);
+            value["metadata"]["uid"] = json!(format!("uid-{name}"));
+            value["metadata"]["resourceVersion"] = json!("1");
+            let resource = Resource::try_from_data(Arc::new(value)).unwrap();
+            self.jobs.lock().unwrap().push(resource.clone());
+            Ok(resource)
         }
 
         async fn list_jobs(&self, _namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
@@ -690,10 +714,13 @@ mod tests {
 
         async fn delete_job(
             &self,
-            _namespace: &str,
-            _name: &str,
-            _uid: String,
+            namespace: &str,
+            name: &str,
+            uid: String,
         ) -> ControllerStoreResult<()> {
+            self.jobs.lock().unwrap().retain(|job| {
+                !(job.namespace.as_deref() == Some(namespace) && job.name == name && job.uid == uid)
+            });
             Ok(())
         }
     }
@@ -806,5 +833,297 @@ mod tests {
 
         assert_eq!(store.jobs.lock().unwrap().len(), 1);
         assert_eq!(store.created_jobs.load(Ordering::Relaxed), 0);
+    }
+
+    fn instant(value: &str) -> DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn scheduled_cronjob(name: &str, creation: &str) -> Value {
+        json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {
+                "name": name,
+                "namespace": "default",
+                "uid": format!("uid-{name}"),
+                "resourceVersion": "1",
+                "generation": 1,
+                "creationTimestamp": creation
+            },
+            "spec": {
+                "schedule": "* * * * *",
+                "concurrencyPolicy": "Allow",
+                "jobTemplate": {"spec": {"template": {"spec": {
+                    "containers": [{"name": "c", "image": "nginx"}],
+                    "restartPolicy": "Never"
+                }}}}
+            },
+            "status": {}
+        })
+    }
+
+    fn finished_job(name: &str, owner_uid: &str, timestamp: &str, condition: &str) -> Value {
+        json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": name,
+                "namespace": "default",
+                "uid": format!("uid-{name}"),
+                "resourceVersion": "1",
+                "creationTimestamp": timestamp,
+                "ownerReferences": [{
+                    "apiVersion": "batch/v1",
+                    "kind": "CronJob",
+                    "name": "owner",
+                    "uid": owner_uid,
+                    "controller": true
+                }]
+            },
+            "spec": {"template": {"spec": {}}},
+            "status": {"conditions": [{"type": condition, "status": "True"}]}
+        })
+    }
+
+    async fn reconcile_at(store: &MemoryCronJobStore, value: &Value, now: &str) -> Result<()> {
+        reconcile_cronjob_one_at(store, None, value, 1, instant(now)).await
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_creates_job_when_due() {
+        let value = scheduled_cronjob("due", "2026-01-01T00:00:00Z");
+        let store = MemoryCronJobStore::new(value.clone());
+
+        reconcile_at(&store, &value, "2026-01-01T00:02:10Z")
+            .await
+            .unwrap();
+
+        assert_eq!(store.jobs.lock().unwrap().len(), 1);
+        assert_eq!(store.created_jobs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_reconcile_persists_last_schedule_time_status() {
+        let value = scheduled_cronjob("status", "2026-01-01T00:00:00Z");
+        let store = MemoryCronJobStore::new(value.clone());
+
+        reconcile_at(&store, &value, "2026-01-01T00:02:10Z")
+            .await
+            .unwrap();
+
+        let current = store.resource();
+        assert!(
+            current
+                .data
+                .pointer("/status/lastScheduleTime")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(
+            current.data.pointer("/spec/schedule"),
+            Some(&json!("* * * * *"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_stale_snapshot_after_delete_does_not_create_job() {
+        let value = scheduled_cronjob("deleted", "2026-01-01T00:00:00Z");
+        let store = MemoryCronJobStore::new(value.clone());
+        store.delete_current();
+
+        reconcile_at(&store, &value, "2026-01-01T00:02:10Z")
+            .await
+            .unwrap();
+
+        assert!(store.jobs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_reconcile_uses_live_suspend_state() {
+        let stale = scheduled_cronjob("suspended", "2026-01-01T00:00:00Z");
+        let store = MemoryCronJobStore::new(stale.clone());
+        let mut live = stale.clone();
+        live["metadata"]["resourceVersion"] = json!("2");
+        live["spec"]["suspend"] = json!(true);
+        store.replace(live);
+
+        reconcile_at(&store, &stale, "2026-01-01T00:02:10Z")
+            .await
+            .unwrap();
+
+        assert!(store.jobs.lock().unwrap().is_empty());
+    }
+
+    #[derive(Default)]
+    struct PodHandoffDispatcher {
+        reconciled_jobs: AtomicUsize,
+    }
+
+    impl klights_reconcile_api::ServiceReconcileSink for PodHandoffDispatcher {
+        fn enqueue_service_reconcile_batch(
+            &self,
+            _keys: Vec<klights_reconcile_api::ServiceReconcileKey>,
+        ) -> klights_reconcile_api::ReconcileSinkFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl klights_reconcile_api::ControllerDispatcherPort for PodHandoffDispatcher {
+        fn enqueue<'a>(
+            &'a self,
+            resource: &'a Value,
+        ) -> klights_reconcile_api::ControllerDispatchFuture<'a, ()> {
+            Box::pin(async move {
+                if resource.get("kind").and_then(Value::as_str) == Some("Job") {
+                    self.reconciled_jobs.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        }
+
+        fn enqueue_reconcile(
+            &self,
+            _key: klights_reconcile_api::ReconcileKey,
+        ) -> klights_reconcile_api::ControllerDispatchFuture<'_, ()> {
+            Box::pin(async {})
+        }
+
+        fn pending_reconcile_keys(
+            &self,
+        ) -> klights_reconcile_api::ControllerDispatchFuture<
+            '_,
+            Vec<klights_reconcile_api::ReconcileKey>,
+        > {
+            Box::pin(async { Vec::new() })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_created_job_is_reconciled_into_pod() {
+        let value = scheduled_cronjob("handoff", "2026-01-01T00:00:00Z");
+        let store = MemoryCronJobStore::new(value.clone());
+        let dispatcher = PodHandoffDispatcher::default();
+
+        reconcile_cronjob_one_at(
+            &store,
+            Some(&dispatcher),
+            &value,
+            1,
+            instant("2026-01-01T00:02:10Z"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dispatcher.reconciled_jobs.load(Ordering::SeqCst), 1);
+        assert_eq!(store.jobs.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_reconcile_uses_live_resource_for_status_after_stale_input_rv() {
+        let value = scheduled_cronjob("live-rv", "2026-01-01T00:00:00Z");
+        let store = MemoryCronJobStore::new(value.clone());
+
+        reconcile_cronjob_one_at(
+            &store,
+            None,
+            &value,
+            999_999,
+            instant("2026-01-01T00:02:10Z"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.resource().data.pointer("/status/observedGeneration"),
+            Some(&json!(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_forbid_concurrent_skips_when_active_job() {
+        let mut value = scheduled_cronjob("forbid", "2026-01-01T00:00:00Z");
+        value["spec"]["concurrencyPolicy"] = json!("ForbidConcurrent");
+        let active = json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {
+                "name": "active", "namespace": "default", "uid": "uid-active",
+                "resourceVersion": "1",
+                "ownerReferences": [{"uid": "uid-forbid", "controller": true}]
+            },
+            "spec": {"template": {"spec": {}}}, "status": {}
+        });
+        let store = MemoryCronJobStore::with_jobs(value.clone(), [active]);
+
+        reconcile_at(&store, &value, "2026-01-01T00:02:10Z")
+            .await
+            .unwrap();
+
+        assert_eq!(store.jobs.lock().unwrap().len(), 1);
+        assert_eq!(store.created_jobs.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_does_not_schedule_before_creation_timestamp() {
+        let value = scheduled_cronjob("new", "2026-01-01T00:00:30Z");
+        let store = MemoryCronJobStore::new(value.clone());
+
+        reconcile_at(&store, &value, "2026-01-01T00:00:40Z")
+            .await
+            .unwrap();
+
+        assert!(store.jobs.lock().unwrap().is_empty());
+    }
+
+    async fn assert_history_limits(successful_limit: usize, failed_limit: usize) {
+        let mut value = scheduled_cronjob("history", "2026-01-01T00:00:00Z");
+        value["spec"]["suspend"] = json!(true);
+        value["spec"]["successfulJobsHistoryLimit"] = json!(successful_limit);
+        value["spec"]["failedJobsHistoryLimit"] = json!(failed_limit);
+        let owner_uid = "uid-history";
+        value["metadata"]["uid"] = json!(owner_uid);
+        let successful = (0..successful_limit + 2).map(|index| {
+            finished_job(
+                &format!("success-{index}"),
+                owner_uid,
+                &format!("2025-01-{:02}T00:00:00Z", index + 1),
+                "Complete",
+            )
+        });
+        let failed = (0..failed_limit + 2).map(|index| {
+            finished_job(
+                &format!("failed-{index}"),
+                owner_uid,
+                &format!("2025-02-{:02}T00:00:00Z", index + 1),
+                "Failed",
+            )
+        });
+        let store = MemoryCronJobStore::with_jobs(value.clone(), successful.chain(failed));
+
+        reconcile_at(&store, &value, "2026-01-01T00:02:10Z")
+            .await
+            .unwrap();
+
+        let jobs = store.jobs.lock().unwrap();
+        assert_eq!(jobs.len(), successful_limit + failed_limit);
+        for index in 0..2 {
+            assert!(
+                !jobs
+                    .iter()
+                    .any(|job| job.name == format!("success-{index}"))
+            );
+            assert!(!jobs.iter().any(|job| job.name == format!("failed-{index}")));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_history_limits_cleanup_old_completed_jobs() {
+        assert_history_limits(1, 1).await;
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_history_limits_keep_five_successful_and_two_failed_jobs() {
+        assert_history_limits(5, 2).await;
     }
 }

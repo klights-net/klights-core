@@ -7,10 +7,6 @@ use klights_controllers::node_subnet::{
     PeerDataplaneHealth, PeerSyncOutcome, PeerTopologyProjection, PeerTopologyProjectionFuture,
 };
 
-#[cfg(test)]
-#[path = "../../controller_policy_tests/node_subnet.rs"]
-mod policy_tests;
-
 pub struct DatastorePeerTopologyProjection {
     db: DatastoreHandle,
     my_node_name: String,
