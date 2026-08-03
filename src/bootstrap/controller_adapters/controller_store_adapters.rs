@@ -17,16 +17,6 @@ use klights_controllers::pvc::PvcStore;
 use klights_controllers::rbac_reconcile::RbacPolicyStore;
 use klights_reconcile_api::ControllerStoreResult;
 
-#[cfg(test)]
-#[path = "../../controller_policy_tests/kube_service.rs"]
-mod kube_service_policy_tests;
-#[cfg(test)]
-#[path = "../../controller_policy_tests/namespace.rs"]
-mod namespace_policy_tests;
-#[cfg(test)]
-#[path = "../../controller_policy_tests/rbac_reconcile.rs"]
-mod rbac_reconcile_policy_tests;
-
 #[async_trait]
 impl ApiServiceStore for dyn DatastoreBackend + '_ {
     async fn get_apiservice(&self, name: &str) -> ControllerStoreResult<Option<Resource>> {

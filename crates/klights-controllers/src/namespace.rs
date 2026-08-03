@@ -410,7 +410,11 @@ fn extension_apiserver_authentication_configmap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     struct FixedIdentity;
 
@@ -425,43 +429,94 @@ mod tests {
     }
 
     struct MockNamespaceStore {
-        namespace: Resource,
+        namespaces: Mutex<BTreeMap<String, Resource>>,
         service_accounts: Mutex<Vec<serde_json::Value>>,
+        configmaps: Mutex<BTreeMap<(String, String), Resource>>,
     }
 
     impl MockNamespaceStore {
         fn new(terminating: bool) -> Self {
             let deletion = terminating.then_some("2026-01-01T00:00:00Z");
+            let namespace = Resource::from_data_lossy(Arc::new(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "team-a", "deletionTimestamp": deletion}
+            })));
             Self {
-                namespace: Resource::from_data_lossy(Arc::new(serde_json::json!({
-                    "apiVersion": "v1",
-                    "kind": "Namespace",
-                    "metadata": {"name": "team-a", "deletionTimestamp": deletion}
-                }))),
+                namespaces: Mutex::new(BTreeMap::from([("team-a".to_string(), namespace)])),
                 service_accounts: Mutex::new(Vec::new()),
+                configmaps: Mutex::new(BTreeMap::new()),
             }
+        }
+
+        fn empty() -> Self {
+            Self {
+                namespaces: Mutex::new(BTreeMap::new()),
+                service_accounts: Mutex::new(Vec::new()),
+                configmaps: Mutex::new(BTreeMap::new()),
+            }
+        }
+
+        fn namespace(&self, name: &str) -> Option<Resource> {
+            self.namespaces.lock().unwrap().get(name).cloned()
+        }
+
+        fn service_account(&self, namespace: &str) -> Option<serde_json::Value> {
+            self.service_accounts
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|value| {
+                    value
+                        .pointer("/metadata/namespace")
+                        .and_then(|v| v.as_str())
+                        == Some(namespace)
+                })
+                .cloned()
+        }
+
+        fn configmap(&self, namespace: &str, name: &str) -> Option<Resource> {
+            self.configmaps
+                .lock()
+                .unwrap()
+                .get(&(namespace.to_string(), name.to_string()))
+                .cloned()
+        }
+
+        fn remove_configmap(&self, namespace: &str, name: &str) {
+            self.configmaps
+                .lock()
+                .unwrap()
+                .remove(&(namespace.to_string(), name.to_string()));
         }
     }
 
     #[async_trait]
     impl NamespaceBootstrapStore for MockNamespaceStore {
-        async fn get_namespace(&self, _name: &str) -> ControllerStoreResult<Option<Resource>> {
-            Ok(Some(self.namespace.clone()))
+        async fn get_namespace(&self, name: &str) -> ControllerStoreResult<Option<Resource>> {
+            Ok(self.namespace(name))
         }
 
         async fn create_namespace(
             &self,
-            _name: &str,
-            _value: serde_json::Value,
+            name: &str,
+            value: serde_json::Value,
         ) -> ControllerStoreResult<Resource> {
-            unreachable!("namespace already exists")
+            let resource = Resource::from_data_lossy(Arc::new(value));
+            self.namespaces
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), resource.clone());
+            Ok(resource)
         }
 
         async fn get_default_service_account(
             &self,
-            _namespace: &str,
+            namespace: &str,
         ) -> ControllerStoreResult<Option<Resource>> {
-            Ok(None)
+            Ok(self
+                .service_account(namespace)
+                .map(|value| Resource::from_data_lossy(Arc::new(value))))
         }
 
         async fn create_default_service_account(
@@ -475,30 +530,128 @@ mod tests {
 
         async fn get_configmap(
             &self,
-            _namespace: &str,
-            _name: &str,
+            namespace: &str,
+            name: &str,
         ) -> ControllerStoreResult<Option<Resource>> {
-            Ok(None)
+            Ok(self.configmap(namespace, name))
         }
 
         async fn create_configmap(
             &self,
-            _namespace: &str,
-            _name: &str,
+            namespace: &str,
+            name: &str,
             value: serde_json::Value,
         ) -> ControllerStoreResult<Resource> {
-            Ok(Resource::from_data_lossy(Arc::new(value)))
+            let resource = Resource::from_data_lossy(Arc::new(value));
+            self.configmaps
+                .lock()
+                .unwrap()
+                .insert((namespace.to_string(), name.to_string()), resource.clone());
+            Ok(resource)
         }
 
         async fn update_configmap(
             &self,
-            _namespace: &str,
-            _name: &str,
+            namespace: &str,
+            name: &str,
             value: serde_json::Value,
             _expected_resource_version: i64,
         ) -> ControllerStoreResult<Resource> {
-            Ok(Resource::from_data_lossy(Arc::new(value)))
+            let resource = Resource::from_data_lossy(Arc::new(value));
+            self.configmaps
+                .lock()
+                .unwrap()
+                .insert((namespace.to_string(), name.to_string()), resource.clone());
+            Ok(resource)
         }
+    }
+
+    struct CountingIdentity {
+        calls: AtomicUsize,
+    }
+
+    impl CountingIdentity {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl crate::ControllerIdentityGenerator for CountingIdentity {
+        fn generate_name(&self, prefix: &str) -> String {
+            format!("{prefix}fixed")
+        }
+
+        fn new_uid(&self) -> String {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            "abcdef12-3456-4000-8000-000000000000".to_string()
+        }
+    }
+
+    struct TestDirectory(std::path::PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).expect("remove namespace controller test directory");
+        }
+    }
+
+    struct CaFixture {
+        _temp: TestDirectory,
+        path: std::path::PathBuf,
+        pem: &'static str,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
+        file_process: klights_supervisor::FileProcessExecutor,
+    }
+
+    impl CaFixture {
+        fn new() -> Self {
+            static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "klights-controller-namespace-{}-{}",
+                std::process::id(),
+                NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&root).expect("create namespace controller test directory");
+            let temp = TestDirectory(root);
+            let path = temp.0.join("ca.crt");
+            let pem = "-----BEGIN CERTIFICATE-----\nfocused-ca\n-----END CERTIFICATE-----";
+            std::fs::write(&path, pem).expect("write namespace controller test CA");
+            let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+                klights_supervisor::TaskCategoryConfig::default(),
+            ));
+            let file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
+            Self {
+                _temp: temp,
+                path,
+                pem,
+                supervisor,
+                file_process,
+            }
+        }
+
+        async fn shutdown(&self) {
+            let _ = self.supervisor.shutdown(Duration::from_secs(1)).await;
+        }
+    }
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        "2026-01-02T03:04:05Z"
+            .parse()
+            .expect("fixed controller test time")
+    }
+
+    async fn init(store: &dyn NamespaceBootstrapStore, fixture: &CaFixture) {
+        init_default_namespaces_with_ca_path(
+            &fixture.file_process,
+            store,
+            &fixture.path,
+            now(),
+            &FixedIdentity,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -528,5 +681,292 @@ mod tests {
             .await
             .unwrap();
         assert!(store.service_accounts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_init_default_namespaces_creates_four_namespaces() {
+        let store = MockNamespaceStore::empty();
+        let fixture = CaFixture::new();
+        init(&store, &fixture).await;
+
+        for name in DEFAULT_NAMESPACES {
+            let namespace = store.namespace(name).expect("default namespace");
+            assert_eq!(namespace.data.pointer("/metadata/name"), Some(&json!(name)));
+            assert_eq!(
+                namespace.data.pointer("/status/phase"),
+                Some(&json!("Active"))
+            );
+        }
+        assert_eq!(store.namespaces.lock().unwrap().len(), 4);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_init_default_namespaces_creates_default_service_accounts() {
+        let store = MockNamespaceStore::empty();
+        let fixture = CaFixture::new();
+        init(&store, &fixture).await;
+
+        for namespace in DEFAULT_NAMESPACES {
+            let account = store
+                .service_account(namespace)
+                .expect("default ServiceAccount");
+            assert_eq!(account.pointer("/metadata/name"), Some(&json!("default")));
+            assert_eq!(
+                account.pointer("/metadata/namespace"),
+                Some(&json!(namespace))
+            );
+        }
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn namespace_service_account_consumes_injected_uid_exactly_once() {
+        let store = MockNamespaceStore::empty();
+        let identity = CountingIdentity::new();
+        create_default_service_account_at(&store, "identity-spy", now(), &identity)
+            .await
+            .unwrap();
+
+        let account = store
+            .service_account("identity-spy")
+            .expect("default ServiceAccount");
+        assert_eq!(
+            account.pointer("/metadata/uid").and_then(Value::as_str),
+            Some("abcdef12-3456-4000-8000-000000000000")
+        );
+        assert_eq!(identity.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_init_default_namespaces_creates_kube_root_ca_configmaps() {
+        let store = MockNamespaceStore::empty();
+        let fixture = CaFixture::new();
+        init(&store, &fixture).await;
+
+        for namespace in DEFAULT_NAMESPACES {
+            let configmap = store
+                .configmap(namespace, "kube-root-ca.crt")
+                .expect("root CA ConfigMap");
+            assert_eq!(
+                configmap
+                    .data
+                    .pointer("/data/ca.crt")
+                    .and_then(Value::as_str),
+                Some(fixture.pem)
+            );
+        }
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_create_kube_root_ca_configmap() {
+        let store = MockNamespaceStore::empty();
+        create_kube_root_ca_configmap_at(&store, "default", "fake-ca-data", now(), &FixedIdentity)
+            .await
+            .unwrap();
+        let configmap = store
+            .configmap("default", "kube-root-ca.crt")
+            .expect("root CA ConfigMap");
+        assert_eq!(
+            configmap.data.pointer("/data/ca.crt"),
+            Some(&json!("fake-ca-data"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_kube_root_ca_recreates_after_deletion() {
+        let store = MockNamespaceStore::new(false);
+        let fixture = CaFixture::new();
+        reconcile_kube_root_ca_with_path(
+            &fixture.file_process,
+            &store,
+            "team-a",
+            &fixture.path,
+            now(),
+            &FixedIdentity,
+        )
+        .await
+        .unwrap();
+        assert!(store.configmap("team-a", "kube-root-ca.crt").is_some());
+        store.remove_configmap("team-a", "kube-root-ca.crt");
+        reconcile_kube_root_ca_with_path(
+            &fixture.file_process,
+            &store,
+            "team-a",
+            &fixture.path,
+            now(),
+            &FixedIdentity,
+        )
+        .await
+        .unwrap();
+        assert!(store.configmap("team-a", "kube-root-ca.crt").is_some());
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_kube_root_ca_skips_when_namespace_terminating() {
+        let store = MockNamespaceStore::new(true);
+        let fixture = CaFixture::new();
+        reconcile_kube_root_ca_with_path(
+            &fixture.file_process,
+            &store,
+            "team-a",
+            &fixture.path,
+            now(),
+            &FixedIdentity,
+        )
+        .await
+        .unwrap();
+        assert!(store.configmap("team-a", "kube-root-ca.crt").is_none());
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_kube_root_ca_skips_when_namespace_is_missing() {
+        let store = MockNamespaceStore::empty();
+        let fixture = CaFixture::new();
+        reconcile_kube_root_ca_with_path(
+            &fixture.file_process,
+            &store,
+            "missing",
+            &fixture.path,
+            now(),
+            &FixedIdentity,
+        )
+        .await
+        .unwrap();
+        assert!(store.configmap("missing", "kube-root-ca.crt").is_none());
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_default_service_account_skips_when_namespace_terminating() {
+        let store = MockNamespaceStore::new(true);
+        reconcile_default_service_account_at(&store, "team-a", now(), &FixedIdentity)
+            .await
+            .unwrap();
+        assert!(store.service_account("team-a").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_create_default_service_account_standalone() {
+        let store = MockNamespaceStore::empty();
+        create_default_service_account_at(&store, "test-ns", now(), &FixedIdentity)
+            .await
+            .unwrap();
+        let account = store
+            .service_account("test-ns")
+            .expect("default ServiceAccount");
+        assert_eq!(account.pointer("/metadata/name"), Some(&json!("default")));
+        assert_eq!(
+            account.pointer("/metadata/namespace"),
+            Some(&json!("test-ns"))
+        );
+        assert!(
+            account
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .is_some()
+        );
+        assert!(
+            account
+                .pointer("/metadata/creationTimestamp")
+                .and_then(Value::as_str)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_init_default_namespaces_creates_extension_apiserver_authentication_configmap() {
+        let store = MockNamespaceStore::empty();
+        let fixture = CaFixture::new();
+        init(&store, &fixture).await;
+        let configmap = store
+            .configmap("kube-system", "extension-apiserver-authentication")
+            .expect("extension API authentication ConfigMap");
+        assert_eq!(
+            configmap.data.pointer("/data/client-ca-file"),
+            Some(&json!(fixture.pem))
+        );
+        assert_eq!(
+            configmap.data.pointer("/data/requestheader-client-ca-file"),
+            Some(&json!(fixture.pem))
+        );
+        assert_eq!(
+            configmap.data.pointer("/data/requestheader-allowed-names"),
+            Some(&json!(format!(
+                "[\"{}\"]",
+                klights_types::APISERVICE_PROXY_COMMON_NAME
+            )))
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_init_default_namespaces_updates_legacy_extension_auth_allowed_names() {
+        let store = MockNamespaceStore::empty();
+        let fixture = CaFixture::new();
+        store
+            .create_configmap(
+                "kube-system",
+                "extension-apiserver-authentication",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "extension-apiserver-authentication", "namespace": "kube-system"},
+                    "data": {"requestheader-allowed-names": "[]"}
+                }),
+            )
+            .await
+            .unwrap();
+        init(&store, &fixture).await;
+        let configmap = store
+            .configmap("kube-system", "extension-apiserver-authentication")
+            .expect("extension API authentication ConfigMap");
+        assert_eq!(
+            configmap.data.pointer("/data/requestheader-allowed-names"),
+            Some(&json!(format!(
+                "[\"{}\"]",
+                klights_types::APISERVICE_PROXY_COMMON_NAME
+            )))
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_init_default_namespaces_idempotent() {
+        let store = MockNamespaceStore::empty();
+        let fixture = CaFixture::new();
+        init(&store, &fixture).await;
+        init(&store, &fixture).await;
+        assert_eq!(store.namespaces.lock().unwrap().len(), 4);
+        assert_eq!(store.service_accounts.lock().unwrap().len(), 4);
+        assert_eq!(store.configmaps.lock().unwrap().len(), 5);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_init_default_namespaces_runs_through_trait_object() {
+        let concrete = MockNamespaceStore::empty();
+        let store: &dyn NamespaceBootstrapStore = &concrete;
+        let fixture = CaFixture::new();
+        init(store, &fixture).await;
+        create_default_service_account_at(store, "extra-ns", now(), &FixedIdentity)
+            .await
+            .unwrap();
+        create_kube_root_ca_configmap_at(store, "extra-ns", "fake-ca", now(), &FixedIdentity)
+            .await
+            .unwrap();
+        create_extension_apiserver_authentication_configmap_at(
+            store,
+            "fake-ca",
+            now(),
+            &FixedIdentity,
+        )
+        .await
+        .unwrap();
+        assert!(concrete.service_account("extra-ns").is_some());
+        fixture.shutdown().await;
     }
 }

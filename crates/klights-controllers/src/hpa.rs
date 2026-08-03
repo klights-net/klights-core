@@ -850,3 +850,360 @@ fn existing_transition_time(
             })
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn resource(value: Value) -> Resource {
+        Resource::try_from_data(Arc::new(value)).expect("valid controller test resource")
+    }
+
+    fn hpa(api_version: &str, name: &str, target_kind: &str, target_name: &str) -> Value {
+        let mut value = json!({
+            "apiVersion": api_version,
+            "kind": "HorizontalPodAutoscaler",
+            "metadata": {
+                "name": name,
+                "namespace": "default",
+                "uid": format!("hpa-{name}"),
+                "generation": 1
+            },
+            "spec": {
+                "scaleTargetRef": {
+                    "apiVersion": if target_kind == "ReplicationController" { "v1" } else { "apps/v1" },
+                    "kind": target_kind,
+                    "name": target_name
+                }
+            }
+        });
+        if api_version == "autoscaling/v1" {
+            value["spec"]["minReplicas"] = json!(1);
+            value["spec"]["maxReplicas"] = json!(5);
+            value["spec"]["targetCPUUtilizationPercentage"] = json!(60);
+        } else {
+            value["spec"]["minReplicas"] = json!(2);
+            value["spec"]["maxReplicas"] = json!(8);
+            value["spec"]["metrics"] = json!([{
+                "type": "Resource",
+                "resource": {
+                    "name": "cpu",
+                    "target": {"type": "Utilization", "averageUtilization": 50}
+                }
+            }]);
+        }
+        value
+    }
+
+    fn scale_target(kind: &str, name: &str, replicas: i64) -> Resource {
+        let selector = if kind == "ReplicationController" {
+            json!({"app": name})
+        } else {
+            json!({"matchLabels": {"app": name}})
+        };
+        resource(json!({
+            "apiVersion": if kind == "ReplicationController" { "v1" } else { "apps/v1" },
+            "kind": kind,
+            "metadata": {"name": name, "namespace": "default", "uid": format!("target-{name}")},
+            "spec": {"replicas": replicas, "selector": selector},
+            "status": {"replicas": replicas, "readyReplicas": replicas}
+        }))
+    }
+
+    fn ready_pods(name: &str, count: usize) -> Vec<Resource> {
+        (0..count)
+            .map(|index| {
+                resource(json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": format!("{name}-{index}"),
+                        "namespace": "default",
+                        "uid": format!("pod-{name}-{index}"),
+                        "labels": {"app": name}
+                    },
+                    "spec": {
+                        "nodeName": "node-a",
+                        "containers": [{
+                            "name": "app",
+                            "image": "example.invalid/app",
+                            "resources": {"requests": {"cpu": "100m"}}
+                        }]
+                    },
+                    "status": {
+                        "phase": "Running",
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                        "containerStatuses": [{"name": "app", "ready": true}]
+                    }
+                }))
+            })
+            .collect()
+    }
+
+    struct MemoryHpaRuntime {
+        current: Mutex<Resource>,
+        target: Mutex<Option<Resource>>,
+        pods: Vec<Resource>,
+        conflict_updates_remaining: AtomicUsize,
+        successful_updates: AtomicUsize,
+        scale_updates: AtomicUsize,
+    }
+
+    impl MemoryHpaRuntime {
+        fn new(hpa: Value, target: Option<Resource>, pods: Vec<Resource>) -> Self {
+            Self {
+                current: Mutex::new(resource(hpa)),
+                target: Mutex::new(target),
+                pods,
+                conflict_updates_remaining: AtomicUsize::new(0),
+                successful_updates: AtomicUsize::new(0),
+                scale_updates: AtomicUsize::new(0),
+            }
+        }
+
+        fn hpa_data(&self) -> Value {
+            (*self.current.lock().unwrap().data).clone()
+        }
+
+        fn target_data(&self) -> Value {
+            let target = self.target.lock().unwrap();
+            (*target.as_ref().expect("scale target").data).clone()
+        }
+    }
+
+    #[async_trait]
+    impl HpaRuntime for MemoryHpaRuntime {
+        async fn get_hpa(
+            &self,
+            _api_version: &str,
+            _namespace: &str,
+            _name: &str,
+        ) -> ControllerStoreResult<Option<Resource>> {
+            Ok(Some(self.current.lock().unwrap().clone()))
+        }
+
+        async fn get_scale_target(
+            &self,
+            _api_version: &str,
+            _kind: &str,
+            _namespace: &str,
+            _name: &str,
+        ) -> ControllerStoreResult<Option<Resource>> {
+            Ok(self.target.lock().unwrap().clone())
+        }
+
+        async fn list_pods(&self, _namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
+            Ok(self.pods.clone())
+        }
+
+        async fn patch_scale_target(
+            &self,
+            _target: &ScaleTarget,
+            replicas: i64,
+        ) -> ControllerStoreResult<Resource> {
+            let mut target = self.target.lock().unwrap();
+            let current = target.as_mut().expect("scale target");
+            Arc::make_mut(&mut current.data)["spec"]["replicas"] = json!(replicas);
+            self.scale_updates.fetch_add(1, Ordering::Relaxed);
+            Ok(current.clone())
+        }
+
+        async fn reconcile_scaled_target(
+            &self,
+            _target: &ScaleTarget,
+            _resource: &Value,
+            _node_name: &str,
+        ) -> ControllerStoreResult<()> {
+            Ok(())
+        }
+
+        async fn update_hpa_status(
+            &self,
+            _current: &Resource,
+            status: Value,
+        ) -> ControllerStoreResult<()> {
+            if self
+                .conflict_updates_remaining
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(ControllerStoreError::conflict("synthetic HPA conflict"));
+            }
+            let mut current = self.current.lock().unwrap();
+            Arc::make_mut(&mut current.data)["status"] = status;
+            self.successful_updates.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FixedMetrics(HpaMetricsSnapshot);
+
+    #[async_trait]
+    impl HpaMetrics for FixedMetrics {
+        async fn snapshot(&self, _pods: &[Resource]) -> HpaMetricsSnapshot {
+            self.0.clone()
+        }
+    }
+
+    fn metrics_for(pods: &[Resource]) -> FixedMetrics {
+        let mut snapshot = HpaMetricsSnapshot::default();
+        for pod in pods {
+            snapshot.insert_container(
+                pod.uid.as_str(),
+                "default",
+                pod.name.as_str(),
+                "app",
+                HpaMetricUsage::new(100_000_000, 64 * 1024 * 1024),
+            );
+        }
+        FixedMetrics(snapshot)
+    }
+
+    #[tokio::test]
+    async fn missing_target_retries_status_conflict_and_then_stabilizes_as_noop() {
+        let runtime = MemoryHpaRuntime::new(
+            hpa("autoscaling/v2", "missing", "Deployment", "missing"),
+            None,
+            Vec::new(),
+        );
+        runtime
+            .conflict_updates_remaining
+            .store(1, Ordering::Relaxed);
+        let initial = runtime.hpa_data();
+        reconcile_hpa_with_runtime(
+            &runtime,
+            &initial,
+            "node-a",
+            &FixedMetrics::default(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(runtime.successful_updates.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            runtime
+                .hpa_data()
+                .pointer("/status/conditions/0/reason")
+                .and_then(Value::as_str),
+            Some("FailedGetScale")
+        );
+
+        let current = runtime.hpa_data();
+        reconcile_hpa_with_runtime(
+            &runtime,
+            &current,
+            "node-a",
+            &FixedMetrics::default(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(runtime.successful_updates.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn hpa_v2_resource_metric_scales_deployment_from_resource_usage() {
+        let pods = ready_pods("web", 4);
+        let metrics = metrics_for(&pods);
+        let initial = hpa("autoscaling/v2", "web", "Deployment", "web");
+        let runtime = MemoryHpaRuntime::new(
+            initial.clone(),
+            Some(scale_target("Deployment", "web", 4)),
+            pods,
+        );
+        reconcile_hpa_with_runtime(&runtime, &initial, "node-a", &metrics, chrono::Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime.target_data().pointer("/spec/replicas"),
+            Some(&json!(8))
+        );
+        let current = runtime.hpa_data();
+        assert_eq!(current.pointer("/status/currentReplicas"), Some(&json!(4)));
+        assert_eq!(current.pointer("/status/desiredReplicas"), Some(&json!(8)));
+        assert_eq!(
+            current.pointer("/status/currentMetrics/0/resource/current/averageUtilization"),
+            Some(&json!(100))
+        );
+        assert_eq!(
+            current.pointer("/status/conditions/0/type"),
+            Some(&json!("AbleToScale"))
+        );
+        assert_eq!(
+            current.pointer("/status/conditions/0/status"),
+            Some(&json!("True"))
+        );
+    }
+
+    #[tokio::test]
+    async fn hpa_v1_cpu_metric_scales_replicationcontroller_from_resource_usage() {
+        let pods = ready_pods("legacy", 3);
+        let metrics = metrics_for(&pods);
+        let initial = hpa(
+            "autoscaling/v1",
+            "legacy",
+            "ReplicationController",
+            "legacy",
+        );
+        let runtime = MemoryHpaRuntime::new(
+            initial.clone(),
+            Some(scale_target("ReplicationController", "legacy", 3)),
+            pods,
+        );
+        reconcile_hpa_with_runtime(&runtime, &initial, "node-a", &metrics, chrono::Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime.target_data().pointer("/spec/replicas"),
+            Some(&json!(5))
+        );
+        let current = runtime.hpa_data();
+        assert_eq!(current.pointer("/status/currentReplicas"), Some(&json!(3)));
+        assert_eq!(current.pointer("/status/desiredReplicas"), Some(&json!(5)));
+        assert_eq!(
+            current.pointer("/status/currentCPUUtilizationPercentage"),
+            Some(&json!(100))
+        );
+    }
+
+    #[tokio::test]
+    async fn hpa_does_not_scale_when_runtime_metrics_are_unavailable() {
+        let pods = ready_pods("web", 4);
+        let initial = hpa("autoscaling/v2", "web", "Deployment", "web");
+        let runtime = MemoryHpaRuntime::new(
+            initial.clone(),
+            Some(scale_target("Deployment", "web", 4)),
+            pods,
+        );
+        reconcile_hpa_with_runtime(
+            &runtime,
+            &initial,
+            "node-a",
+            &FixedMetrics::default(),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            runtime.target_data().pointer("/spec/replicas"),
+            Some(&json!(4))
+        );
+        assert_eq!(runtime.scale_updates.load(Ordering::Relaxed), 0);
+        let current = runtime.hpa_data();
+        assert_eq!(current.pointer("/status/currentReplicas"), Some(&json!(4)));
+        assert_eq!(current.pointer("/status/desiredReplicas"), Some(&json!(4)));
+        assert_eq!(
+            current.pointer("/status/conditions/1/reason"),
+            Some(&json!("FailedGetResourceMetric"))
+        );
+        assert!(current.pointer("/status/currentMetrics").is_none());
+    }
+}

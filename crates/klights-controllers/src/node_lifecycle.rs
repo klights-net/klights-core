@@ -1297,3 +1297,7 @@ mod tests {
         assert!(!mark_node_ready_unknown(&mut node, now));
     }
 }
+
+#[cfg(test)]
+#[path = "node_lifecycle_policy_tests.rs"]
+mod policy_tests;

@@ -493,3 +493,7 @@ fn parse_int_or_percent(value: &Value, total: i64) -> i64 {
     }
     0
 }
+
+#[cfg(test)]
+#[path = "pdb_tests.rs"]
+mod tests;

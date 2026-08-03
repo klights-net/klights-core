@@ -509,7 +509,114 @@ async fn create_coredns_service(store: &dyn CoreDnsBootstrapStore, dns_ip: &str)
 
 #[cfg(test)]
 mod tests {
-    use super::CoreDnsResourceKind;
+    use super::*;
+    use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct MemoryCoreDnsStore {
+        resources: Mutex<Vec<(CoreDnsResourceKind, Resource)>>,
+        created: Mutex<Vec<CoreDnsResourceKind>>,
+        reconciled_deployments: Mutex<usize>,
+    }
+
+    impl MemoryCoreDnsStore {
+        fn resource(&self, kind: CoreDnsResourceKind) -> Option<Resource> {
+            self.resources
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|(candidate, resource)| (*candidate == kind).then(|| resource.clone()))
+        }
+
+        fn seed(&self, kind: CoreDnsResourceKind, value: Value) {
+            let resource = resource_with_version(value, 1);
+            self.resources.lock().unwrap().push((kind, resource));
+        }
+    }
+
+    fn resource_with_version(mut value: Value, resource_version: i64) -> Resource {
+        let metadata = value
+            .get_mut("metadata")
+            .and_then(Value::as_object_mut)
+            .expect("CoreDNS test resource metadata");
+        metadata
+            .entry("uid".to_string())
+            .or_insert_with(|| json!(format!("test-{resource_version}")));
+        metadata.insert(
+            "resourceVersion".to_string(),
+            json!(resource_version.to_string()),
+        );
+        Resource::try_from_data(Arc::new(value)).expect("CoreDNS test resource identity")
+    }
+
+    #[async_trait]
+    impl CoreDnsBootstrapStore for MemoryCoreDnsStore {
+        async fn get_coredns_resource(
+            &self,
+            kind: CoreDnsResourceKind,
+        ) -> ControllerStoreResult<Option<Resource>> {
+            Ok(self.resource(kind))
+        }
+
+        async fn create_coredns_resource(
+            &self,
+            kind: CoreDnsResourceKind,
+            value: Value,
+        ) -> ControllerStoreResult<Resource> {
+            if self.resource(kind).is_some() {
+                return Err(ControllerStoreError::conflict("duplicate CoreDNS resource"));
+            }
+            let resource_version = self.resources.lock().unwrap().len() as i64 + 1;
+            let resource = resource_with_version(value, resource_version);
+            self.resources
+                .lock()
+                .unwrap()
+                .push((kind, resource.clone()));
+            self.created.lock().unwrap().push(kind);
+            Ok(resource)
+        }
+
+        async fn update_coredns_resource(
+            &self,
+            kind: CoreDnsResourceKind,
+            value: Value,
+            expected_resource_version: i64,
+        ) -> ControllerStoreResult<Resource> {
+            let mut resources = self.resources.lock().unwrap();
+            let Some((_, current)) = resources
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == kind)
+            else {
+                return Err(ControllerStoreError::not_found("CoreDNS resource missing"));
+            };
+            if current.resource_version != expected_resource_version {
+                return Err(ControllerStoreError::conflict("stale CoreDNS resource"));
+            }
+            let updated = resource_with_version(value, expected_resource_version + 1);
+            *current = updated.clone();
+            Ok(updated)
+        }
+
+        async fn reconcile_coredns_deployment(
+            &self,
+            _deployment: Resource,
+            _node_name: &str,
+        ) -> ControllerStoreResult<()> {
+            *self.reconciled_deployments.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    async fn bootstrap(store: &MemoryCoreDnsStore, service_cidr: &str, node_name: &str) {
+        bootstrap_coredns_with_store(store, 7443, service_cidr, "klights", node_name)
+            .await
+            .unwrap();
+    }
+
+    fn data(store: &MemoryCoreDnsStore, kind: CoreDnsResourceKind) -> Arc<Value> {
+        store.resource(kind).expect("CoreDNS resource").data
+    }
 
     #[test]
     fn resource_kinds_map_to_exact_kubernetes_identities() {
@@ -553,5 +660,314 @@ mod tests {
         for (kind, expected) in cases {
             assert_eq!(kind.coordinates(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn focused_store_bootstrap_creates_exact_resource_family_once() {
+        let store = MemoryCoreDnsStore::default();
+        bootstrap(&store, "10.43.128.0/17", "node-a").await;
+        assert_eq!(
+            *store.created.lock().unwrap(),
+            vec![
+                CoreDnsResourceKind::ServiceAccount,
+                CoreDnsResourceKind::ClusterRole,
+                CoreDnsResourceKind::ClusterRoleBinding,
+                CoreDnsResourceKind::ConfigMap,
+                CoreDnsResourceKind::Deployment,
+                CoreDnsResourceKind::Service,
+            ]
+        );
+        assert_eq!(*store.reconciled_deployments.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_coredns_creates_all_resources() {
+        let store = MemoryCoreDnsStore::default();
+        bootstrap(&store, "10.43.128.0/17", "test-node").await;
+
+        let configmap = data(&store, CoreDnsResourceKind::ConfigMap);
+        let corefile = configmap["data"]["Corefile"].as_str().unwrap();
+        assert!(corefile.contains("kubernetes cluster.local"));
+        assert!(!corefile.contains("kubeconfig "));
+
+        let deployment = data(&store, CoreDnsResourceKind::Deployment);
+        assert_eq!(deployment["spec"]["replicas"], 1);
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["containers"][0]["image"],
+            "coredns/coredns:1.11.1"
+        );
+
+        let service = data(&store, CoreDnsResourceKind::Service);
+        assert_eq!(service["spec"]["clusterIP"], "10.43.128.10");
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_coredns_creates_serviceaccount_and_rbac() {
+        let store = MemoryCoreDnsStore::default();
+        bootstrap(&store, "10.43.128.0/17", "test-node").await;
+
+        assert!(
+            store
+                .resource(CoreDnsResourceKind::ServiceAccount)
+                .is_some()
+        );
+        let role = data(&store, CoreDnsResourceKind::ClusterRole);
+        let rules = role["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|rule| {
+            rule["apiGroups"]
+                .as_array()
+                .is_some_and(|groups| groups.iter().any(|group| group.as_str() == Some("")))
+                && rule["resources"].as_array().is_some_and(|resources| {
+                    ["endpoints", "namespaces", "pods", "services"]
+                        .iter()
+                        .all(|expected| {
+                            resources.iter().any(|item| item.as_str() == Some(expected))
+                        })
+                })
+                && rule["verbs"].as_array().is_some_and(|verbs| {
+                    ["list", "watch"]
+                        .iter()
+                        .all(|expected| verbs.iter().any(|item| item.as_str() == Some(expected)))
+                })
+        }));
+        assert!(rules.iter().any(|rule| {
+            rule["apiGroups"].as_array().is_some_and(|groups| {
+                groups
+                    .iter()
+                    .any(|group| group.as_str() == Some("discovery.k8s.io"))
+            }) && rule["resources"].as_array().is_some_and(|resources| {
+                resources
+                    .iter()
+                    .any(|item| item.as_str() == Some("endpointslices"))
+            })
+        }));
+
+        let binding = data(&store, CoreDnsResourceKind::ClusterRoleBinding);
+        assert_eq!(
+            binding.pointer("/roleRef/name").and_then(Value::as_str),
+            Some("system:coredns")
+        );
+        assert!(binding["subjects"].as_array().is_some_and(|subjects| {
+            subjects.iter().any(|subject| {
+                subject["kind"] == "ServiceAccount"
+                    && subject["name"] == "coredns"
+                    && subject["namespace"] == "kube-system"
+            })
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_coredns_idempotent() {
+        let store = MemoryCoreDnsStore::default();
+        bootstrap(&store, "10.43.128.0/17", "test-node").await;
+        bootstrap(&store, "10.43.128.0/17", "test-node").await;
+
+        assert_eq!(store.created.lock().unwrap().len(), 6);
+        assert_eq!(
+            store
+                .resources
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(kind, _)| *kind == CoreDnsResourceKind::ConfigMap)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_coredns_repairs_legacy_node_local_kubeconfig_resources() {
+        let store = MemoryCoreDnsStore::default();
+        store.seed(
+            CoreDnsResourceKind::ConfigMap,
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "coredns", "namespace": "kube-system"},
+                "data": {"Corefile": ".:53 {\n kubernetes cluster.local {\n  kubeconfig /etc/coredns/kubeconfig.yaml old\n }\n}\n"}
+            }),
+        );
+        store.seed(
+            CoreDnsResourceKind::Deployment,
+            json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "coredns", "namespace": "kube-system"},
+                "spec": {
+                    "replicas": 1,
+                    "selector": {"matchLabels": {"k8s-app": "kube-dns"}},
+                    "template": {
+                        "metadata": {"labels": {"k8s-app": "kube-dns"}},
+                        "spec": {
+                            "nodeName": "old-node",
+                            "containers": [{
+                                "name": "coredns",
+                                "image": "coredns/coredns:1.11.1",
+                                "volumeMounts": [
+                                    {"name": "config-volume", "mountPath": "/etc/coredns/Corefile"},
+                                    {"name": "kubeconfig", "mountPath": "/etc/coredns/kubeconfig.yaml"}
+                                ]
+                            }],
+                            "volumes": [
+                                {"name": "config-volume", "configMap": {"name": "coredns"}},
+                                {"name": "kubeconfig", "hostPath": {"path": "/old/kubeconfig.yaml"}}
+                            ]
+                        }
+                    }
+                }
+            }),
+        );
+
+        bootstrap(&store, "10.43.128.0/17", "test-node").await;
+
+        let configmap = data(&store, CoreDnsResourceKind::ConfigMap);
+        assert!(
+            !configmap["data"]["Corefile"]
+                .as_str()
+                .unwrap()
+                .contains("kubeconfig ")
+        );
+        let deployment = data(&store, CoreDnsResourceKind::Deployment);
+        assert!(deployment.pointer("/spec/template/spec/nodeName").is_none());
+        assert!(
+            deployment["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|mount| mount["name"] != "kubeconfig")
+        );
+        assert!(
+            deployment["spec"]["template"]["spec"]["volumes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|volume| volume["name"] != "kubeconfig")
+        );
+    }
+
+    #[test]
+    fn test_derive_dns_service_ip_from_service_cidr() {
+        for (cidr, expected) in [
+            ("10.43.128.0/17", "10.43.128.10"),
+            ("10.50.128.0/17", "10.50.128.10"),
+            ("192.168.0.0/24", "192.168.0.10"),
+            ("172.16.0.0/16", "172.16.0.10"),
+        ] {
+            assert_eq!(derive_dns_service_ip(cidr), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_coredns_service_uses_derived_ip_from_custom_cidr() {
+        let store = MemoryCoreDnsStore::default();
+        bootstrap(&store, "10.50.128.0/17", "test-node").await;
+        assert_eq!(
+            data(&store, CoreDnsResourceKind::Service)["spec"]["clusterIP"],
+            "10.50.128.10"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_coredns_deployment_has_dns_policy_default() {
+        let store = MemoryCoreDnsStore::default();
+        bootstrap(&store, "10.43.128.0/17", "test-node").await;
+        assert_eq!(
+            data(&store, CoreDnsResourceKind::Deployment)
+                .pointer("/spec/template/spec/dnsPolicy")
+                .and_then(Value::as_str),
+            Some("Default")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_coredns_deployment_template_is_not_pinned_to_bootstrap_node() {
+        let store = MemoryCoreDnsStore::default();
+        bootstrap(&store, "10.43.128.0/17", "bootstrap-node").await;
+        assert!(
+            data(&store, CoreDnsResourceKind::Deployment)
+                .pointer("/spec/template/spec/nodeName")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_coredns_deployment_volume_mounts() {
+        let store = MemoryCoreDnsStore::default();
+        bootstrap(&store, "10.43.128.0/17", "test-node").await;
+        let deployment = data(&store, CoreDnsResourceKind::Deployment);
+        let mounts = deployment["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .unwrap();
+        let corefile = mounts
+            .iter()
+            .find(|mount| mount["mountPath"] == "/etc/coredns/Corefile")
+            .expect("Corefile mount");
+        assert_eq!(corefile["subPath"], "Corefile");
+        assert!(
+            mounts
+                .iter()
+                .all(|mount| mount["mountPath"] != "/etc/coredns/kubeconfig.yaml")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_coredns_deployment_labels() {
+        let store = MemoryCoreDnsStore::default();
+        bootstrap(&store, "10.43.128.0/17", "test-node").await;
+        let deployment = data(&store, CoreDnsResourceKind::Deployment);
+        assert_eq!(deployment["metadata"]["labels"]["k8s-app"], "kube-dns");
+        assert_eq!(
+            deployment["spec"]["selector"]["matchLabels"],
+            deployment["spec"]["template"]["metadata"]["labels"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_coredns_service_cluster_ips_array() {
+        let store = MemoryCoreDnsStore::default();
+        bootstrap(&store, "10.43.128.0/17", "test-node").await;
+        let service = data(&store, CoreDnsResourceKind::Service);
+        assert_eq!(service["spec"]["clusterIPs"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            service["spec"]["clusterIPs"][0],
+            service["spec"]["clusterIP"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_coredns_service_ports() {
+        let store = MemoryCoreDnsStore::default();
+        bootstrap(&store, "10.43.128.0/17", "test-node").await;
+        let service = data(&store, CoreDnsResourceKind::Service);
+        let ports = service["spec"]["ports"].as_array().unwrap();
+        assert_eq!(ports.len(), 2);
+        for protocol in ["UDP", "TCP"] {
+            let port = ports
+                .iter()
+                .find(|port| port["protocol"] == protocol)
+                .expect("DNS service protocol");
+            assert_eq!(port["port"], 53);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_coredns_configmap_namespace_in_corefile() {
+        let store = MemoryCoreDnsStore::default();
+        bootstrap_coredns_with_store(
+            &store,
+            7443,
+            "10.43.128.0/17",
+            "klights-architect",
+            "test-node",
+        )
+        .await
+        .unwrap();
+        let configmap = data(&store, CoreDnsResourceKind::ConfigMap);
+        assert!(
+            !configmap["data"]["Corefile"]
+                .as_str()
+                .unwrap()
+                .contains("kubeconfig ")
+        );
     }
 }

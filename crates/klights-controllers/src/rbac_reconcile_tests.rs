@@ -1,13 +1,14 @@
-use crate::datastore::backend::DatastoreHandle;
-use crate::datastore::sqlite::Datastore;
-use klights_auth::rbac_rule_evaluator::{PolicyRule, RuleMatchRequest, rule_matches};
-use klights_controllers::default_rbac_policy::{
+use crate::default_rbac_policy::{
     AUTOUPDATE_ANNOTATION, RBAC_API_VERSION, default_cluster_role_rules, default_rbac_fixtures,
 };
-use klights_controllers::rbac_reconcile::*;
+use crate::rbac_reconcile::*;
+use async_trait::async_trait;
+use klights_cluster_core::Resource;
+use klights_reconcile_api::ControllerStoreResult;
 use serde_json::Value;
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RuleShape {
@@ -39,8 +40,128 @@ impl RuleShape {
     }
 }
 
-fn as_handle(db: &Datastore) -> DatastoreHandle {
-    Arc::new(db.clone()) as DatastoreHandle
+type ObjectKey = (String, Option<String>, String);
+
+#[derive(Default)]
+struct MemoryRbacStore {
+    objects: Mutex<BTreeMap<ObjectKey, Resource>>,
+    next_resource_version: AtomicI64,
+}
+
+impl MemoryRbacStore {
+    fn key(kind: &str, namespace: Option<&str>, name: &str) -> ObjectKey {
+        (
+            kind.to_string(),
+            namespace.map(str::to_string),
+            name.to_string(),
+        )
+    }
+
+    fn store(&self, kind: &str, namespace: Option<&str>, name: &str, mut value: Value) -> Resource {
+        let resource_version = self.next_resource_version.fetch_add(1, Ordering::Relaxed) + 1;
+        value["metadata"]["resourceVersion"] = Value::String(resource_version.to_string());
+        let resource = Resource::try_from_data(Arc::new(value)).expect("valid RBAC resource");
+        self.objects
+            .lock()
+            .unwrap()
+            .insert(Self::key(kind, namespace, name), resource.clone());
+        resource
+    }
+
+    async fn get_resource(
+        &self,
+        _api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
+        self.get_rbac_object(kind, namespace, name).await
+    }
+
+    async fn create_resource(
+        &self,
+        _api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: Value,
+    ) -> ControllerStoreResult<Resource> {
+        self.create_rbac_object(kind, namespace, name, value).await
+    }
+
+    async fn update_resource(
+        &self,
+        _api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: Value,
+        expected_resource_version: i64,
+    ) -> ControllerStoreResult<Resource> {
+        self.update_rbac_object(kind, namespace, name, value, expected_resource_version)
+            .await
+    }
+}
+
+#[async_trait]
+impl RbacPolicyStore for MemoryRbacStore {
+    async fn get_rbac_object(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
+        Ok(self
+            .objects
+            .lock()
+            .unwrap()
+            .get(&Self::key(kind, namespace, name))
+            .cloned())
+    }
+
+    async fn create_rbac_object(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: Value,
+    ) -> ControllerStoreResult<Resource> {
+        Ok(self.store(kind, namespace, name, value))
+    }
+
+    async fn update_rbac_object(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: Value,
+        expected_resource_version: i64,
+    ) -> ControllerStoreResult<Resource> {
+        let current = self
+            .objects
+            .lock()
+            .unwrap()
+            .get(&Self::key(kind, namespace, name))
+            .cloned()
+            .expect("RBAC update target");
+        assert_eq!(current.resource_version, expected_resource_version);
+        Ok(self.store(kind, namespace, name, value))
+    }
+
+    async fn list_cluster_roles(&self) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(self
+            .objects
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((kind, namespace, _), _)| kind == "ClusterRole" && namespace.is_none())
+            .map(|(_, resource)| resource.clone())
+            .collect())
+    }
+}
+
+fn as_handle(db: &Arc<MemoryRbacStore>) -> Arc<MemoryRbacStore> {
+    db.clone()
 }
 
 fn has_rule(rules: &[Value], expected: &Value) -> bool {
@@ -56,53 +177,24 @@ fn cluster_admin_fixture_authorizes_resource_and_non_resource_requests() {
         .into_iter()
         .find(|object| object.kind == "ClusterRole" && object.name == "cluster-admin")
         .expect("cluster-admin fixture exists");
-    let rules: Vec<PolicyRule> = fixture
-        .rules
-        .expect("cluster-admin rules")
-        .into_iter()
-        .map(|rule| PolicyRule {
-            verbs: rule.verbs.into_iter().map(str::to_string).collect(),
-            api_groups: rule.api_groups.into_iter().map(str::to_string).collect(),
-            resources: rule.resources.into_iter().map(str::to_string).collect(),
-            resource_names: rule
-                .resource_names
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            non_resource_urls: rule
-                .non_resource_urls
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-        })
-        .collect();
-
-    let resource = RuleMatchRequest {
-        verb: "list",
-        api_group: Some(""),
-        resource: Some("limitranges"),
-        subresource: None,
-        resource_name: None,
-        non_resource_url: None,
-        field_selector: None,
-    };
-    assert!(rules.iter().any(|rule| rule_matches(rule, resource)));
-
-    let non_resource = RuleMatchRequest {
-        verb: "get",
-        api_group: None,
-        resource: None,
-        subresource: None,
-        resource_name: None,
-        non_resource_url: Some("/healthz"),
-        field_selector: None,
-    };
-    assert!(rules.iter().any(|rule| rule_matches(rule, non_resource)));
+    let rules = fixture.rules.expect("cluster-admin rules");
+    assert!(rules.iter().any(|rule| {
+        rule.verbs == vec!["*"]
+            && rule.api_groups == vec!["*"]
+            && rule.resources == vec!["*"]
+            && rule.non_resource_urls.is_empty()
+    }));
+    assert!(rules.iter().any(|rule| {
+        rule.verbs == vec!["*"]
+            && rule.api_groups.is_empty()
+            && rule.resources.is_empty()
+            && rule.non_resource_urls == vec!["*"]
+    }));
 }
 
 #[tokio::test]
 async fn reconcile_default_rbac_objects_creates_missing_objects() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Arc::new(MemoryRbacStore::default());
     let handle = as_handle(&db);
 
     reconcile_default_rbac_objects(handle.as_ref())
@@ -132,7 +224,7 @@ async fn reconcile_default_rbac_objects_creates_missing_objects() {
 
 #[tokio::test]
 async fn reconcile_repairs_missing_cluster_role_rule_when_autoupdate_enabled() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Arc::new(MemoryRbacStore::default());
     let handle = as_handle(&db);
     reconcile_default_rbac_objects(handle.as_ref())
         .await
@@ -199,7 +291,7 @@ async fn reconcile_repairs_missing_cluster_role_rule_when_autoupdate_enabled() {
 
 #[tokio::test]
 async fn reconcile_preserves_user_edits_when_autoupdate_false() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Arc::new(MemoryRbacStore::default());
     let handle = as_handle(&db);
     reconcile_default_rbac_objects(handle.as_ref())
         .await
@@ -281,7 +373,7 @@ async fn reconcile_preserves_user_edits_when_autoupdate_false() {
 
 #[tokio::test]
 async fn reconcile_repairs_missing_namespaced_role_rule_when_autoupdate_enabled() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Arc::new(MemoryRbacStore::default());
     let handle = as_handle(&db);
     reconcile_default_rbac_objects(handle.as_ref())
         .await
@@ -357,7 +449,7 @@ async fn reconcile_repairs_missing_namespaced_role_rule_when_autoupdate_enabled(
 
 #[tokio::test]
 async fn reconcile_aggregates_labeled_cluster_role_rules_into_user_facing_roles() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Arc::new(MemoryRbacStore::default());
     let handle = as_handle(&db);
     reconcile_default_rbac_objects(handle.as_ref())
         .await
@@ -426,7 +518,7 @@ async fn reconcile_aggregates_labeled_cluster_role_rules_into_user_facing_roles(
 
 #[tokio::test]
 async fn default_admin_edit_view_carry_aggregation_rule() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Arc::new(MemoryRbacStore::default());
     let handle = as_handle(&db);
     reconcile_default_rbac_objects(handle.as_ref())
         .await
@@ -463,7 +555,7 @@ async fn default_admin_edit_view_carry_aggregation_rule() {
 
 #[tokio::test]
 async fn reconcile_revokes_aggregated_rules_when_source_label_removed() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Arc::new(MemoryRbacStore::default());
     let handle = as_handle(&db);
     reconcile_default_rbac_objects(handle.as_ref())
         .await
@@ -575,7 +667,7 @@ async fn reconcile_revokes_aggregated_rules_when_source_label_removed() {
 
 #[tokio::test]
 async fn reconcile_honors_user_defined_aggregation_rule_selectors() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Arc::new(MemoryRbacStore::default());
     let handle = as_handle(&db);
     reconcile_default_rbac_objects(handle.as_ref())
         .await

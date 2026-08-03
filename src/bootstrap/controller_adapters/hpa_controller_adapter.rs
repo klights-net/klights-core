@@ -12,10 +12,6 @@ use klights_controllers::hpa::{
 };
 use klights_node_api::NodeMetrics;
 
-#[cfg(test)]
-#[path = "../../controller_policy_tests/hpa.rs"]
-mod policy_tests;
-
 struct NodeApiHpaMetrics<'a> {
     node_metrics: &'a dyn NodeMetrics,
 }

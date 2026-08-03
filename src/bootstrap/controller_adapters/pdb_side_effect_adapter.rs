@@ -8,10 +8,6 @@ use klights_controllers::side_effects::PodSideEffectPortsSlot;
 use klights_controllers::side_effects::pdb::PdbSideEffectPort;
 use klights_pod_api::{PodListRequest, PodQuery};
 
-#[cfg(test)]
-#[path = "../../controller_policy_tests/pdb.rs"]
-mod policy_tests;
-
 struct RootPdbSideEffectPort {
     db: DatastoreHandle,
     pod_repository: PodSideEffectPortsSlot,

@@ -11,10 +11,6 @@ use klights_controllers::coredns::{
     CoreDnsBootstrapStore, CoreDnsResourceKind, bootstrap_coredns_with_store,
 };
 
-#[cfg(test)]
-#[path = "../../controller_policy_tests/coredns.rs"]
-mod policy_tests;
-
 struct CoreDnsBootstrapAdapter<'a> {
     db: &'a dyn DatastoreBackend,
     pod_reader: Arc<dyn klights_controllers::DeploymentControllerPodReader>,

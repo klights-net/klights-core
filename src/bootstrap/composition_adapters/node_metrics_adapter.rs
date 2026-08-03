@@ -156,23 +156,6 @@ impl NodeMetrics for RootNodeMetrics {
 }
 
 #[cfg(test)]
-pub(crate) struct UnavailableNodeMetrics;
-
-#[cfg(test)]
-impl NodeMetrics for UnavailableNodeMetrics {
-    fn collect_metrics(
-        &self,
-        _request: NodeMetricsRequest,
-    ) -> NodeMetricsFuture<'_, NodeMetricsResult> {
-        Box::pin(async {
-            Err(NodeMetricsError::unavailable(
-                "node metrics are not configured for this test",
-            ))
-        })
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

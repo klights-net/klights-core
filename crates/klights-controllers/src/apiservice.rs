@@ -249,3 +249,187 @@ fn existing_available_transition_time(apiservice: &Value, status: &str) -> Optio
         .and_then(|v| v.as_str())
         .map(ToOwned::to_owned)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct MemoryApiServiceStore {
+        current: Mutex<Resource>,
+        endpoint_slices: Vec<Resource>,
+    }
+
+    impl MemoryApiServiceStore {
+        fn new(apiservice: Value, endpoint_slices: impl IntoIterator<Item = Value>) -> Self {
+            Self {
+                current: Mutex::new(resource_with_identity(apiservice, "apiservice-uid")),
+                endpoint_slices: endpoint_slices
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, slice)| {
+                        resource_with_identity(slice, &format!("endpointslice-{index}"))
+                    })
+                    .collect(),
+            }
+        }
+
+        fn resource(&self) -> Resource {
+            self.current.lock().unwrap().clone()
+        }
+
+        fn status(&self) -> Value {
+            self.resource()
+                .data
+                .get("status")
+                .cloned()
+                .unwrap_or(Value::Null)
+        }
+    }
+
+    fn resource_with_identity(mut value: Value, uid: &str) -> Resource {
+        let metadata = value
+            .get_mut("metadata")
+            .and_then(Value::as_object_mut)
+            .expect("controller test resource metadata");
+        metadata
+            .entry("uid".to_string())
+            .or_insert_with(|| json!(uid));
+        metadata
+            .entry("resourceVersion".to_string())
+            .or_insert_with(|| json!("1"));
+        Resource::try_from_data(Arc::new(value)).expect("controller test resource identity")
+    }
+
+    #[async_trait]
+    impl ApiServiceStore for MemoryApiServiceStore {
+        async fn get_apiservice(&self, name: &str) -> ControllerStoreResult<Option<Resource>> {
+            let current = self.resource();
+            Ok((current.name == name).then_some(current))
+        }
+
+        async fn service_exists(
+            &self,
+            _namespace: &str,
+            _name: &str,
+        ) -> ControllerStoreResult<bool> {
+            Ok(true)
+        }
+
+        async fn list_endpoint_slices(
+            &self,
+            _namespace: &str,
+            _service_name: &str,
+        ) -> ControllerStoreResult<Vec<Resource>> {
+            Ok(self.endpoint_slices.clone())
+        }
+
+        async fn get_endpoints(
+            &self,
+            _namespace: &str,
+            _name: &str,
+        ) -> ControllerStoreResult<Option<Resource>> {
+            Ok(None)
+        }
+
+        async fn update_apiservice_status(
+            &self,
+            observed: &Resource,
+            status: Value,
+        ) -> ControllerStoreResult<()> {
+            let mut current = self.current.lock().unwrap();
+            if current.uid != observed.uid || current.resource_version != observed.resource_version
+            {
+                return Err(ControllerStoreError::conflict(
+                    "stale APIService status observation",
+                ));
+            }
+            let mut value = Arc::unwrap_or_clone(current.data.clone());
+            value["status"] = status;
+            value["metadata"]["resourceVersion"] =
+                json!((current.resource_version + 1).to_string());
+            *current =
+                Resource::try_from_data(Arc::new(value)).expect("updated APIService test resource");
+            Ok(())
+        }
+    }
+
+    fn apiservice() -> Value {
+        json!({
+            "apiVersion": "apiregistration.k8s.io/v1",
+            "kind": "APIService",
+            "metadata": {"name": "v1alpha1.wardle.example.com"},
+            "spec": {
+                "group": "wardle.example.com",
+                "version": "v1alpha1",
+                "service": {"namespace": "default", "name": "wardle-service"}
+            }
+        })
+    }
+
+    fn endpoint_slice(name: &str, ready: bool) -> Value {
+        json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": name,
+                "namespace": "default",
+                "labels": {"kubernetes.io/service-name": "wardle-service"}
+            },
+            "addressType": "IPv4",
+            "ports": [{"name": "https", "port": 8443, "protocol": "TCP"}],
+            "endpoints": [{
+                "addresses": ["10.42.0.25"],
+                "conditions": {"ready": ready}
+            }]
+        })
+    }
+
+    async fn evaluate_status(store: &MemoryApiServiceStore, value: &Value) -> Value {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        reconcile_apiservice(store, value, now).await.unwrap();
+        store.status()
+    }
+
+    fn available_condition<'a>(status: &'a Value, field: &str) -> Option<&'a str> {
+        status
+            .pointer("/conditions")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|condition| {
+                condition.pointer("/type").and_then(Value::as_str) == Some("Available")
+            })
+            .and_then(|condition| condition.get(field))
+            .and_then(Value::as_str)
+    }
+
+    #[tokio::test]
+    async fn apiservice_available_when_ready_endpointslice_exists_without_legacy_endpoints() {
+        let value = apiservice();
+        let store =
+            MemoryApiServiceStore::new(value.clone(), [endpoint_slice("wardle-service-abc", true)]);
+
+        let status = evaluate_status(&store, &value).await;
+
+        assert_eq!(available_condition(&status, "status"), Some("True"));
+    }
+
+    #[tokio::test]
+    async fn apiservice_unavailable_when_endpointslice_has_no_ready_addresses() {
+        let value = apiservice();
+        let store = MemoryApiServiceStore::new(
+            value.clone(),
+            [endpoint_slice("wardle-service-empty", false)],
+        );
+
+        let status = evaluate_status(&store, &value).await;
+
+        assert_eq!(available_condition(&status, "status"), Some("False"));
+        assert_eq!(
+            available_condition(&status, "reason"),
+            Some("MissingEndpoints")
+        );
+    }
+}

@@ -1,16 +1,196 @@
-use klights_controllers::pdb::*;
-
-use crate::datastore::DatastoreBackend;
-use crate::kubelet::pod_repository::PodReader;
+use crate::common::ControllerStatusStore;
+use crate::pdb::*;
 use anyhow::Result;
 use async_trait::async_trait;
-use klights_reconcile_api::PodEvictionAdmissionOutcome;
+use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_reconcile_api::{
+    ControllerStoreError, ControllerStoreResult, PodEvictionAdmissionOutcome,
+};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::Notify;
+
+type ResourceKey = (String, String, Option<String>, String);
+
+#[derive(Clone, Default)]
+struct MemoryPdbRuntime {
+    resources: Arc<Mutex<BTreeMap<ResourceKey, Resource>>>,
+    next_resource_version: Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl MemoryPdbRuntime {
+    fn key(api_version: &str, kind: &str, namespace: Option<&str>, name: &str) -> ResourceKey {
+        (
+            api_version.to_string(),
+            kind.to_string(),
+            namespace.map(str::to_string),
+            name.to_string(),
+        )
+    }
+
+    fn store(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        mut value: Value,
+    ) -> Resource {
+        let resource_version = self.next_resource_version.fetch_add(1, Ordering::Relaxed) + 1;
+        value["metadata"]["resourceVersion"] = Value::String(resource_version.to_string());
+        let resource = Resource::try_from_data(Arc::new(value)).expect("valid PDB test resource");
+        self.resources.lock().unwrap().insert(
+            Self::key(api_version, kind, namespace, name),
+            resource.clone(),
+        );
+        resource
+    }
+
+    async fn create_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: Value,
+    ) -> ControllerStoreResult<Resource> {
+        Ok(self.store(api_version, kind, namespace, name, value))
+    }
+
+    async fn get_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
+        Ok(self
+            .resources
+            .lock()
+            .unwrap()
+            .get(&Self::key(api_version, kind, namespace, name))
+            .cloned())
+    }
+
+    async fn update_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: Value,
+        expected_resource_version: i64,
+    ) -> ControllerStoreResult<Resource> {
+        let current = self
+            .get_resource(api_version, kind, namespace, name)
+            .await?
+            .expect("PDB test update target");
+        if current.resource_version != expected_resource_version {
+            return Err(ControllerStoreError::conflict("stale PDB test resource"));
+        }
+        Ok(self.store(api_version, kind, namespace, name, value))
+    }
+
+    async fn update_status_only(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        status: Value,
+        _preconditions: Option<ResourcePreconditions>,
+    ) -> ControllerStoreResult<Resource> {
+        let current = self
+            .get_resource(api_version, kind, namespace, name)
+            .await?
+            .expect("PDB test status target");
+        let mut value = (*current.data).clone();
+        value["status"] = status;
+        Ok(self.store(api_version, kind, namespace, name, value))
+    }
+}
+
+#[async_trait]
+impl ControllerStatusStore for MemoryPdbRuntime {
+    async fn get_status_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
+        self.get_resource(api_version, kind, namespace, name).await
+    }
+
+    async fn update_status(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        status: Value,
+        preconditions: ResourcePreconditions,
+    ) -> ControllerStoreResult<Resource> {
+        let current = self
+            .get_resource(api_version, kind, namespace, name)
+            .await?
+            .expect("PDB status target");
+        if preconditions.resource_version != Some(current.resource_version)
+            || preconditions.uid.as_deref() != Some(current.uid.as_str())
+        {
+            return Err(ControllerStoreError::conflict("stale PDB status update"));
+        }
+        let mut value = (*current.data).clone();
+        value["status"] = status;
+        Ok(self.store(api_version, kind, namespace, name, value))
+    }
+
+    fn log_noop_status_write(
+        &self,
+        _operation: &'static str,
+        _resource: &Resource,
+        _reason: &'static str,
+    ) {
+    }
+}
+
+#[async_trait]
+impl PdbStore for MemoryPdbRuntime {
+    async fn list_pdbs(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(self
+            .resources
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((api_version, kind, ns, _), _)| {
+                api_version == "policy/v1"
+                    && kind == "PodDisruptionBudget"
+                    && ns.as_deref() == Some(namespace)
+            })
+            .map(|(_, resource)| resource.clone())
+            .collect())
+    }
+}
+
+#[async_trait]
+impl PdbPodReader for MemoryPdbRuntime {
+    async fn list_namespace_pods(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(self
+            .resources
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((api_version, kind, ns, _), _)| {
+                api_version == "v1" && kind == "Pod" && ns.as_deref() == Some(namespace)
+            })
+            .map(|(_, resource)| resource.clone())
+            .collect())
+    }
+}
 
 async fn reconcile_pdb(
     store: &(impl PdbStore + ?Sized),
@@ -28,7 +208,7 @@ async fn admit_pod_eviction(
     admit_pod_eviction_at(store, pod, dry_run, chrono::Utc::now()).await
 }
 
-async fn create_pdb(db: &dyn DatastoreBackend, name: &str, namespace: &str, spec: Value) -> Value {
+async fn create_pdb(db: &MemoryPdbRuntime, name: &str, namespace: &str, spec: Value) -> Value {
     let pdb = json!({
         "apiVersion": "policy/v1",
         "kind": "PodDisruptionBudget",
@@ -48,7 +228,7 @@ async fn create_pdb(db: &dyn DatastoreBackend, name: &str, namespace: &str, spec
 }
 
 async fn create_pod(
-    db: &dyn DatastoreBackend,
+    db: &MemoryPdbRuntime,
     name: &str,
     namespace: &str,
     labels: Value,
@@ -72,7 +252,7 @@ async fn create_pod(
         .unwrap();
 }
 
-async fn set_pod_ready(db: &dyn DatastoreBackend, namespace: &str, name: &str) {
+async fn set_pod_ready(db: &MemoryPdbRuntime, namespace: &str, name: &str) {
     let current = db
         .get_resource("v1", "Pod", Some(namespace), name)
         .await
@@ -95,7 +275,7 @@ async fn set_pod_ready(db: &dyn DatastoreBackend, namespace: &str, name: &str) {
     .unwrap();
 }
 
-async fn set_pod_terminating(db: &dyn DatastoreBackend, namespace: &str, name: &str) {
+async fn set_pod_terminating(db: &MemoryPdbRuntime, namespace: &str, name: &str) {
     let current = db
         .get_resource("v1", "Pod", Some(namespace), name)
         .await
@@ -115,7 +295,7 @@ async fn set_pod_terminating(db: &dyn DatastoreBackend, namespace: &str, name: &
     .unwrap();
 }
 
-async fn get_pdb_status(db: &dyn DatastoreBackend, namespace: &str, name: &str) -> Value {
+async fn get_pdb_status(db: &MemoryPdbRuntime, namespace: &str, name: &str) -> Value {
     let r = db
         .get_resource("policy/v1", "PodDisruptionBudget", Some(namespace), name)
         .await
@@ -125,80 +305,27 @@ async fn get_pdb_status(db: &dyn DatastoreBackend, namespace: &str, name: &str) 
 }
 
 struct BlockingOncePodReader {
-    inner: Arc<crate::kubelet::pod_repository::PodRepository>,
+    inner: Arc<MemoryPdbRuntime>,
     listed: Arc<Notify>,
     release: Arc<Notify>,
     block_next_list: AtomicBool,
 }
 
 #[async_trait]
-impl PodReader for BlockingOncePodReader {
-    async fn get_pod(
-        &self,
-        ns: &str,
-        name: &str,
-    ) -> Result<Option<klights_cluster_core::Resource>> {
-        PodReader::get_pod(self.inner.as_ref(), ns, name).await
-    }
-
-    async fn get_pod_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-    ) -> Result<Option<klights_cluster_core::Resource>> {
-        PodReader::get_pod_for_uid(self.inner.as_ref(), ns, name, uid).await
-    }
-
-    async fn list_pods(
-        &self,
-        ns: Option<&str>,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        limit: Option<i64>,
-        continue_token: Option<&str>,
-    ) -> Result<crate::kubelet::pod_repository::PodResourceList> {
-        let pods = PodReader::list_pods(
-            self.inner.as_ref(),
-            ns,
-            label_selector,
-            field_selector,
-            limit,
-            continue_token,
-        )
-        .await?;
+impl PdbPodReader for BlockingOncePodReader {
+    async fn list_namespace_pods(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
+        let pods = self.inner.list_namespace_pods(namespace).await?;
         if self.block_next_list.swap(false, Ordering::SeqCst) {
             self.listed.notify_one();
             self.release.notified().await;
         }
         Ok(pods)
     }
-
-    async fn list_pods_by_owner_uid(
-        &self,
-        ns: &str,
-        owner_uid: &str,
-    ) -> Result<Vec<klights_cluster_core::Resource>> {
-        PodReader::list_pods_by_owner_uid(self.inner.as_ref(), ns, owner_uid).await
-    }
-}
-
-#[async_trait]
-impl PdbPodReader for BlockingOncePodReader {
-    async fn list_namespace_pods(
-        &self,
-        namespace: &str,
-    ) -> klights_reconcile_api::ControllerStoreResult<Vec<klights_cluster_core::Resource>> {
-        PodReader::list_pods(self, Some(namespace), None, None, None, None)
-            .await
-            .map(|listing| listing.items)
-            .map_err(crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error)
-    }
 }
 
 #[tokio::test]
 async fn test_pdb_reconcile_does_not_overwrite_fresher_status_after_stale_pod_list() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryPdbRuntime::default();
 
     let pdb = create_pdb(
         &db,
@@ -239,7 +366,7 @@ async fn test_pdb_reconcile_does_not_overwrite_fresher_status_after_stale_pod_li
     )
     .await;
 
-    let repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let repo = Arc::new(db.clone());
     let listed = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let stale_reader = Arc::new(BlockingOncePodReader {
@@ -251,10 +378,16 @@ async fn test_pdb_reconcile_does_not_overwrite_fresher_status_after_stale_pod_li
 
     let stale_db = db.clone();
     let stale_pdb = pdb.clone();
-    let stale_task =
-        tokio::spawn(
+    let supervisor =
+        klights_supervisor::TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default());
+    let stale_task = supervisor
+        .spawn_async(
+            klights_supervisor::TaskCategory::Others,
+            "pdb_stale_snapshot_race",
             async move { reconcile_pdb(&stale_db, stale_reader.as_ref(), &stale_pdb).await },
-        );
+        )
+        .await
+        .unwrap();
 
     listed.notified().await;
 
@@ -266,7 +399,8 @@ async fn test_pdb_reconcile_does_not_overwrite_fresher_status_after_stale_pod_li
     assert_eq!(fresh_status["currentHealthy"], 3);
 
     release.notify_one();
-    stale_task.await.unwrap().unwrap();
+    stale_task.join().await.unwrap().unwrap();
+    let _ = supervisor.shutdown(std::time::Duration::from_secs(1)).await;
 
     let final_status = get_pdb_status(&db, "default", "race-pdb").await;
     assert_eq!(
@@ -277,7 +411,7 @@ async fn test_pdb_reconcile_does_not_overwrite_fresher_status_after_stale_pod_li
 
 #[tokio::test]
 async fn test_pdb_reconcile_preserves_disrupted_pods_for_existing_pods() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryPdbRuntime::default();
 
     let pdb = create_pdb(
         &db,
@@ -314,13 +448,7 @@ async fn test_pdb_reconcile_preserves_disrupted_pods_for_existing_pods() {
     .await
     .unwrap();
 
-    reconcile_pdb(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        &pdb,
-    )
-    .await
-    .unwrap();
+    reconcile_pdb(&db, &db, &pdb).await.unwrap();
 
     let status = get_pdb_status(&db, "default", "disrupted-pdb").await;
     assert_eq!(
@@ -337,7 +465,7 @@ async fn test_pdb_reconcile_preserves_disrupted_pods_for_existing_pods() {
 
 #[tokio::test]
 async fn test_pdb_reconcile_preserves_disrupted_pods_for_terminating_pods() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryPdbRuntime::default();
 
     let pdb = create_pdb(
         &db,
@@ -375,13 +503,7 @@ async fn test_pdb_reconcile_preserves_disrupted_pods_for_terminating_pods() {
     .await
     .unwrap();
 
-    reconcile_pdb(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        &pdb,
-    )
-    .await
-    .unwrap();
+    reconcile_pdb(&db, &db, &pdb).await.unwrap();
 
     let status = get_pdb_status(&db, "default", "terminating-disrupted-pdb").await;
     assert_eq!(
@@ -398,7 +520,7 @@ async fn test_pdb_reconcile_preserves_disrupted_pods_for_terminating_pods() {
 
 #[tokio::test]
 async fn test_pdb_reconcile_preserves_condition_transition_time_when_status_unchanged() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryPdbRuntime::default();
 
     let pdb = create_pdb(
         &db,
@@ -444,13 +566,7 @@ async fn test_pdb_reconcile_preserves_condition_transition_time_when_status_unch
     .await
     .unwrap();
 
-    reconcile_pdb(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        &pdb,
-    )
-    .await
-    .unwrap();
+    reconcile_pdb(&db, &db, &pdb).await.unwrap();
 
     let status = get_pdb_status(&db, "default", "stable-condition-pdb").await;
     assert_eq!(
@@ -468,7 +584,7 @@ async fn test_pdb_reconcile_preserves_condition_transition_time_when_status_unch
 async fn test_pdb_reconcile_sets_status_fields() {
     // PDB with minAvailable=1, 3 matching pods (2 healthy, 1 not ready)
     // Expected: expectedPods=3, currentHealthy=2, desiredHealthy=1, disruptionsAllowed=1
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryPdbRuntime::default();
 
     let pdb = create_pdb(
         &db,
@@ -509,13 +625,7 @@ async fn test_pdb_reconcile_sets_status_fields() {
     )
     .await;
 
-    reconcile_pdb(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        &pdb,
-    )
-    .await
-    .unwrap();
+    reconcile_pdb(&db, &db, &pdb).await.unwrap();
 
     let status = get_pdb_status(&db, "default", "test-pdb").await;
     assert_eq!(status["expectedPods"], 3, "expectedPods should be 3");
@@ -536,7 +646,7 @@ async fn test_pdb_reconcile_sets_status_fields() {
 #[tokio::test]
 async fn test_pdb_reconcile_zero_disruptions_when_below_min_available() {
     // PDB with minAvailable=3, only 2 healthy pods → disruptionsAllowed=0
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryPdbRuntime::default();
 
     let pdb = create_pdb(
         &db,
@@ -568,13 +678,7 @@ async fn test_pdb_reconcile_zero_disruptions_when_below_min_available() {
     )
     .await;
 
-    reconcile_pdb(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        &pdb,
-    )
-    .await
-    .unwrap();
+    reconcile_pdb(&db, &db, &pdb).await.unwrap();
 
     let status = get_pdb_status(&db, "default", "strict-pdb").await;
     assert_eq!(status["expectedPods"], 2);
@@ -590,7 +694,7 @@ async fn test_pdb_reconcile_zero_disruptions_when_below_min_available() {
 async fn test_pdb_reconcile_max_unavailable() {
     // PDB with maxUnavailable=1, 4 pods all healthy
     // desiredHealthy = 4 - 1 = 3, disruptionsAllowed = 4 - 3 = 1
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryPdbRuntime::default();
 
     let pdb = create_pdb(
         &db,
@@ -615,13 +719,7 @@ async fn test_pdb_reconcile_max_unavailable() {
         .await;
     }
 
-    reconcile_pdb(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        &pdb,
-    )
-    .await
-    .unwrap();
+    reconcile_pdb(&db, &db, &pdb).await.unwrap();
 
     let status = get_pdb_status(&db, "default", "max-unavail-pdb").await;
     assert_eq!(status["expectedPods"], 4);
@@ -635,7 +733,7 @@ async fn test_pdb_reconcile_selector_match_expressions_in_operator() {
     // PDB with matchExpressions In — must match pods with tier in {fe, be}.
     // Without LabelSelector::from_k8s_selector, the controller silently
     // matches no pods (matchLabels is missing) and disruptionsAllowed is wrong.
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryPdbRuntime::default();
 
     let pdb = create_pdb(
         &db,
@@ -681,13 +779,7 @@ async fn test_pdb_reconcile_selector_match_expressions_in_operator() {
     )
     .await;
 
-    reconcile_pdb(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        &pdb,
-    )
-    .await
-    .unwrap();
+    reconcile_pdb(&db, &db, &pdb).await.unwrap();
 
     let status = get_pdb_status(&db, "default", "expr-pdb").await;
     assert_eq!(
@@ -701,7 +793,7 @@ async fn test_pdb_reconcile_selector_match_expressions_in_operator() {
 #[tokio::test]
 async fn test_pdb_reconcile_selector_match_expressions_exists_operator() {
     // PDB with Exists operator — must match all pods that have the key set.
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryPdbRuntime::default();
 
     let pdb = create_pdb(
         &db,
@@ -737,13 +829,7 @@ async fn test_pdb_reconcile_selector_match_expressions_exists_operator() {
     )
     .await;
 
-    reconcile_pdb(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        &pdb,
-    )
-    .await
-    .unwrap();
+    reconcile_pdb(&db, &db, &pdb).await.unwrap();
 
     let status = get_pdb_status(&db, "default", "exists-pdb").await;
     assert_eq!(
@@ -755,7 +841,7 @@ async fn test_pdb_reconcile_selector_match_expressions_exists_operator() {
 #[tokio::test]
 async fn test_pdb_reconcile_selector_match_expressions_does_not_exist_operator() {
     // PDB with DoesNotExist operator — must match all pods missing the key.
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryPdbRuntime::default();
 
     let pdb = create_pdb(
         &db,
@@ -791,13 +877,7 @@ async fn test_pdb_reconcile_selector_match_expressions_does_not_exist_operator()
     )
     .await;
 
-    reconcile_pdb(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        &pdb,
-    )
-    .await
-    .unwrap();
+    reconcile_pdb(&db, &db, &pdb).await.unwrap();
 
     let status = get_pdb_status(&db, "default", "dne-pdb").await;
     assert_eq!(
@@ -808,7 +888,7 @@ async fn test_pdb_reconcile_selector_match_expressions_does_not_exist_operator()
 
 #[tokio::test]
 async fn test_pdb_reconcile_selector_match_expressions_not_in_operator() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryPdbRuntime::default();
 
     let pdb = create_pdb(
         &db,
@@ -854,13 +934,7 @@ async fn test_pdb_reconcile_selector_match_expressions_not_in_operator() {
     )
     .await;
 
-    reconcile_pdb(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        &pdb,
-    )
-    .await
-    .unwrap();
+    reconcile_pdb(&db, &db, &pdb).await.unwrap();
 
     let status = get_pdb_status(&db, "default", "notin-pdb").await;
     assert_eq!(
@@ -872,7 +946,7 @@ async fn test_pdb_reconcile_selector_match_expressions_not_in_operator() {
 #[tokio::test]
 async fn test_pdb_reconcile_selector_filters_unrelated_pods() {
     // PDB selector only matches "app=myapp" — unrelated pods should not count
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryPdbRuntime::default();
 
     let pdb = create_pdb(
         &db,
@@ -905,13 +979,7 @@ async fn test_pdb_reconcile_selector_filters_unrelated_pods() {
     )
     .await;
 
-    reconcile_pdb(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        &pdb,
-    )
-    .await
-    .unwrap();
+    reconcile_pdb(&db, &db, &pdb).await.unwrap();
 
     let status = get_pdb_status(&db, "default", "select-pdb").await;
     assert_eq!(
@@ -927,7 +995,7 @@ async fn test_pdb_reconcile_selector_filters_unrelated_pods() {
 
 #[tokio::test]
 async fn eviction_admission_atomically_records_live_disruption_but_not_dry_run() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryPdbRuntime::default();
     let pdb = create_pdb(
         &db,
         "admission-pdb",
@@ -947,8 +1015,8 @@ async fn eviction_admission_atomically_records_live_disruption_but_not_dry_run()
         true,
     )
     .await;
-    let pods = crate::controller_test_support::pod_repository_for_test(&db);
-    reconcile_pdb(&db, pods.as_ref(), &pdb).await.unwrap();
+    let pods = &db;
+    reconcile_pdb(&db, pods, &pdb).await.unwrap();
     let pod = db
         .get_resource("v1", "Pod", Some("default"), "victim")
         .await
@@ -985,7 +1053,7 @@ async fn unhealthy_pod_policy_allows_only_spec_permitted_budget_safe_evictions()
         ("if-unhealthy", None, 1, false),
         ("always", Some("AlwaysAllow"), 1, true),
     ] {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = MemoryPdbRuntime::default();
         let mut spec = json!({
             "minAvailable": 2,
             "selector": {"matchLabels": {"app": name}}
@@ -1014,8 +1082,8 @@ async fn unhealthy_pod_policy_allows_only_spec_permitted_budget_safe_evictions()
             false,
         )
         .await;
-        let pods = crate::controller_test_support::pod_repository_for_test(&db);
-        reconcile_pdb(&db, pods.as_ref(), &pdb).await.unwrap();
+        let pods = &db;
+        reconcile_pdb(&db, pods, &pdb).await.unwrap();
         let pod = db
             .get_resource("v1", "Pod", Some("default"), "victim")
             .await

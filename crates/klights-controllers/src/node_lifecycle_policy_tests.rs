@@ -1,14 +1,184 @@
-// These tests hold TEST_ENV_LOCK across awaits on purpose: the guard
-// serializes env-var mutation for the whole test body, so dropping it
-// before the awaited reconcile would reintroduce the cross-test env race.
-#![allow(clippy::await_holding_lock)]
+use crate::node_lease::{DEFAULT_NODE_LEASE_GRACE_SECONDS, NodeLeaseTracker};
+use crate::node_lifecycle::*;
 use chrono::{TimeZone, Utc};
-use klights_controllers::node_lifecycle::*;
+use klights_cluster_core::{Resource, ResourcePreconditions, StorageCommand};
 use klights_leader_api::{ResourceEvent, WatchEventType};
-use klights_reconcile_api::ControllerDispatcherPort as _;
+use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 use serde_json::json;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 
-struct TestNodeLifecycleStatus<'a>(&'a dyn crate::datastore::DatastoreBackend);
+type ResourceKey = (String, String, Option<String>, String);
+
+#[derive(Clone, Default)]
+struct MemoryNodeLifecycleRuntime {
+    resources: Arc<Mutex<BTreeMap<ResourceKey, Resource>>>,
+    next_resource_version: Arc<AtomicI64>,
+}
+
+impl MemoryNodeLifecycleRuntime {
+    fn key(api_version: &str, kind: &str, namespace: Option<&str>, name: &str) -> ResourceKey {
+        (
+            api_version.to_string(),
+            kind.to_string(),
+            namespace.map(str::to_string),
+            name.to_string(),
+        )
+    }
+
+    fn store(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        mut value: serde_json::Value,
+    ) -> Resource {
+        let resource_version = self.next_resource_version.fetch_add(1, Ordering::Relaxed) + 1;
+        if value
+            .pointer("/metadata/uid")
+            .and_then(|value| value.as_str())
+            .is_none_or(str::is_empty)
+        {
+            value["metadata"]["uid"] = json!(format!("{kind}-{name}-uid"));
+        }
+        value["metadata"]["resourceVersion"] = json!(resource_version.to_string());
+        let resource = Resource::try_from_data(Arc::new(value)).expect("valid lifecycle resource");
+        self.resources.lock().unwrap().insert(
+            Self::key(api_version, kind, namespace, name),
+            resource.clone(),
+        );
+        resource
+    }
+
+    async fn create_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: serde_json::Value,
+    ) -> ControllerStoreResult<Resource> {
+        Ok(self.store(api_version, kind, namespace, name, value))
+    }
+
+    async fn get_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
+        Ok(self
+            .resources
+            .lock()
+            .unwrap()
+            .get(&Self::key(api_version, kind, namespace, name))
+            .cloned())
+    }
+
+    async fn get_current_resource_version(&self) -> ControllerStoreResult<i64> {
+        Ok(self.next_resource_version.load(Ordering::Relaxed))
+    }
+
+    async fn update_status_only_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        status: serde_json::Value,
+        preconditions: ResourcePreconditions,
+    ) -> ControllerStoreResult<Resource> {
+        let current = self
+            .get_resource(api_version, kind, namespace, name)
+            .await?
+            .expect("lifecycle status target");
+        if preconditions.resource_version != Some(current.resource_version)
+            || preconditions.uid.as_deref() != Some(current.uid.as_str())
+        {
+            return Err(ControllerStoreError::conflict("stale lifecycle status"));
+        }
+        let mut value = (*current.data).clone();
+        value["status"] = status;
+        Ok(self.store(api_version, kind, namespace, name, value))
+    }
+}
+
+#[async_trait::async_trait]
+impl NodeLifecycleStore for MemoryNodeLifecycleRuntime {
+    async fn list_nodes(&self) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(self
+            .resources
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((api_version, kind, namespace, _), _)| {
+                api_version == "v1" && kind == "Node" && namespace.is_none()
+            })
+            .map(|(_, resource)| resource.clone())
+            .collect())
+    }
+
+    async fn list_node_leases(&self) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(self
+            .resources
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((api_version, kind, namespace, _), _)| {
+                api_version == "coordination.k8s.io/v1"
+                    && kind == "Lease"
+                    && namespace.as_deref() == Some("kube-node-lease")
+            })
+            .map(|(_, resource)| resource.clone())
+            .collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl NodeLifecyclePodStore for MemoryNodeLifecycleRuntime {
+    async fn list_pods_bound_to_node(
+        &self,
+        node_name: &str,
+    ) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(self
+            .resources
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((api_version, kind, _, _), resource)| {
+                api_version == "v1"
+                    && kind == "Pod"
+                    && resource
+                        .data
+                        .pointer("/spec/nodeName")
+                        .and_then(|v| v.as_str())
+                        == Some(node_name)
+            })
+            .map(|(_, resource)| resource.clone())
+            .collect())
+    }
+
+    async fn replace_pod_status_for_uid(
+        &self,
+        pod: &Resource,
+        status: serde_json::Value,
+    ) -> ControllerStoreResult<Resource> {
+        self.update_status_only_with_preconditions(
+            "v1",
+            "Pod",
+            pod.namespace.as_deref(),
+            &pod.name,
+            status,
+            ResourcePreconditions::from_resource(pod),
+        )
+        .await
+    }
+}
+
+struct TestNodeLifecycleStatus<'a>(&'a MemoryNodeLifecycleRuntime);
 
 impl klights_leader_api::LeaderNodeLifecycleStatus for TestNodeLifecycleStatus<'_> {
     fn submit_node_lifecycle_status(
@@ -19,7 +189,7 @@ impl klights_leader_api::LeaderNodeLifecycleStatus for TestNodeLifecycleStatus<'
         klights_leader_api::NodeLifecycleStatusResult,
     > {
         Box::pin(async move {
-            let klights_cluster_core::StorageCommand::UpdateStatus {
+            let StorageCommand::UpdateStatus {
                 api_version,
                 kind,
                 namespace,
@@ -52,159 +222,103 @@ impl klights_leader_api::LeaderNodeLifecycleStatus for TestNodeLifecycleStatus<'
     }
 }
 
-fn test_pod_store(
-    db: &crate::datastore::sqlite::Datastore,
-) -> crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort {
-    crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort::new_for_test(
-        crate::controller_test_support::pod_repository_for_test(db),
-    )
-}
-
-fn eviction_grace() -> std::time::Duration {
-    let seconds = std::env::var("KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|value| *value >= 0)
-        .unwrap_or(0);
-    std::time::Duration::from_secs(seconds as u64)
-}
-
-async fn reconcile_node_lifecycle_once_with_tracker_for_test(
-    db: &crate::datastore::sqlite::Datastore,
-    tracker: &klights_controllers::node_lease::NodeLeaseTracker,
+async fn reconcile_node_lifecycle_once_with_tracker_and_grace(
+    db: &MemoryNodeLifecycleRuntime,
+    tracker: &NodeLeaseTracker,
     now: chrono::DateTime<chrono::Utc>,
+    eviction_grace: std::time::Duration,
 ) -> anyhow::Result<Option<std::time::Duration>> {
-    let pods = test_pod_store(db);
     reconcile_node_lifecycle_once_with_tracker(
-        &super::borrowed_store(db),
+        db,
         &TestNodeLifecycleStatus(db),
-        &pods,
+        db,
         tracker,
         now,
         NodeLifecyclePodActions {
             mutation_reconcile: None,
             lifecycle: None,
-            eviction_grace: eviction_grace(),
+            eviction_grace,
         },
     )
     .await
 }
 
-async fn reconcile_node_lifecycle_once(
-    db: &crate::datastore::sqlite::Datastore,
+async fn reconcile_node_lifecycle_once_with_tracker_for_test(
+    db: &MemoryNodeLifecycleRuntime,
+    tracker: &NodeLeaseTracker,
     now: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<Option<std::time::Duration>> {
-    let tracker = klights_controllers::node_lease::NodeLeaseTracker::new_at(now);
-    refresh_node_lease_tracker_from_cluster_leases(&super::borrowed_store(db), &tracker).await?;
-    reconcile_node_lifecycle_once_with_tracker_for_test(db, &tracker, now).await
-}
-
-async fn reconcile_node_lifecycle_once_after_startup(
-    db: &crate::datastore::sqlite::Datastore,
-    now: chrono::DateTime<chrono::Utc>,
-    _startup_resource_version: i64,
-) -> anyhow::Result<Option<std::time::Duration>> {
-    reconcile_node_lifecycle_once_with_tracker_for_test(
+    reconcile_node_lifecycle_once_with_tracker_and_grace(
         db,
-        &klights_controllers::node_lease::NodeLeaseTracker::new_at(now),
+        tracker,
         now,
+        std::time::Duration::ZERO,
     )
     .await
 }
 
+async fn reconcile_node_lifecycle_once_with_grace(
+    db: &MemoryNodeLifecycleRuntime,
+    now: chrono::DateTime<chrono::Utc>,
+    eviction_grace: std::time::Duration,
+) -> anyhow::Result<Option<std::time::Duration>> {
+    let tracker = NodeLeaseTracker::new_at(now);
+    refresh_node_lease_tracker_from_cluster_leases(db, &tracker).await?;
+    reconcile_node_lifecycle_once_with_tracker_and_grace(db, &tracker, now, eviction_grace).await
+}
+
+async fn reconcile_node_lifecycle_once(
+    db: &MemoryNodeLifecycleRuntime,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<Option<std::time::Duration>> {
+    reconcile_node_lifecycle_once_with_grace(db, now, std::time::Duration::ZERO).await
+}
+
+async fn reconcile_node_lifecycle_once_after_startup(
+    db: &MemoryNodeLifecycleRuntime,
+    now: chrono::DateTime<chrono::Utc>,
+    _startup_resource_version: i64,
+) -> anyhow::Result<Option<std::time::Duration>> {
+    reconcile_node_lifecycle_once_with_tracker_for_test(db, &NodeLeaseTracker::new_at(now), now)
+        .await
+}
+
 fn resource_event(event_type: WatchEventType, value: serde_json::Value) -> ResourceEvent {
-    let resource =
-        klights_cluster_core::Resource::try_from_data(std::sync::Arc::new(value)).unwrap();
+    let resource = Resource::try_from_data(Arc::new(value)).unwrap();
     ResourceEvent::try_new(event_type, resource, None).unwrap()
 }
 
-/// Test-only env var guard: sets a var for the test's duration and
-/// restores the prior value on drop. Use under `crate::TEST_ENV_LOCK`.
-struct EnvVarGuard {
-    name: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-impl EnvVarGuard {
-    fn set(name: &'static str, value: &str) -> Self {
-        let previous = std::env::var_os(name);
-        unsafe { std::env::set_var(name, value) };
-        Self { name, previous }
-    }
-    fn remove(name: &'static str) -> Self {
-        let previous = std::env::var_os(name);
-        unsafe { std::env::remove_var(name) };
-        Self { name, previous }
-    }
-}
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(v) => unsafe { std::env::set_var(self.name, v) },
-            None => unsafe { std::env::remove_var(self.name) },
-        }
-    }
-}
-
-fn test_lifecycle_router() -> (
-    std::sync::Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
-    std::sync::Arc<crate::kubelet::pod_lifecycle_router::executor::RecordingExecutor>,
-) {
-    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
-        klights_supervisor::TaskCategoryConfig::default(),
-    ));
-    let recorder = crate::kubelet::pod_lifecycle_router::executor::RecordingExecutor::new();
-    let executor: std::sync::Arc<
-        dyn crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor,
-    > = recorder.clone();
-    let registry = std::sync::Arc::new(
-            crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry::new(
-                supervisor,
-                crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
-                std::sync::Arc::new(std::sync::Mutex::new(executor)),
-            ),
-        );
-    (
-        std::sync::Arc::new(
-            crate::kubelet::pod_lifecycle_router::PodLifecycleRouter::new_actor_with_executor(
-                registry,
-                recorder.clone(),
-            ),
-        ),
-        recorder,
-    )
-}
-
-struct TestNodeLostSink(std::sync::Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>);
+#[derive(Default)]
+struct RecordingNodeLostSink(Mutex<Vec<(String, String, String)>>);
 
 #[async_trait::async_trait]
-impl klights_controllers::node_lifecycle::NodeLostPodLifecycleSink for TestNodeLostSink {
-    async fn enqueue_node_lost_cleanup(
-        &self,
-        pod: klights_cluster_core::Resource,
-    ) -> klights_reconcile_api::ControllerStoreResult<()> {
-        use crate::kubelet::pod_lifecycle_router::{OrphanReason, enqueue_orphan_finalize};
+impl NodeLostPodLifecycleSink for RecordingNodeLostSink {
+    async fn enqueue_node_lost_cleanup(&self, pod: Resource) -> ControllerStoreResult<()> {
+        self.0.lock().unwrap().push((
+            pod.namespace.as_deref().unwrap_or("default").to_string(),
+            pod.name.clone(),
+            pod.uid.clone(),
+        ));
+        Ok(())
+    }
+}
 
-        enqueue_orphan_finalize(
-            self.0.as_ref(),
-            crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey::new(
-                pod.namespace.as_deref().unwrap_or("default"),
-                &pod.name,
-                &pod.uid,
-            ),
-            OrphanReason::NodeLost,
-        )
-        .await
-        .map_err(|error| {
-            klights_reconcile_api::ControllerStoreError::unavailable(error.to_string())
-        })
+#[derive(Default)]
+struct RecordingPodMutationSink(Mutex<Vec<klights_reconcile_api::PodMutationReconcileRequest>>);
+
+impl klights_reconcile_api::PodMutationReconcileSink for RecordingPodMutationSink {
+    fn reconcile_pod_mutation(
+        &self,
+        request: klights_reconcile_api::PodMutationReconcileRequest,
+    ) -> klights_reconcile_api::ReconcileSinkFuture<'_> {
+        self.0.lock().unwrap().push(request);
+        Box::pin(async { Ok(()) })
     }
 }
 
 #[tokio::test]
 async fn track_lease_from_event_updates_tracker() {
-    let tracker = klights_controllers::node_lease::NodeLeaseTracker::new_at(
-        Utc.with_ymd_and_hms(2026, 5, 13, 6, 30, 0).unwrap(),
-    );
+    let tracker = NodeLeaseTracker::new_at(Utc.with_ymd_and_hms(2026, 5, 13, 6, 30, 0).unwrap());
     let event = resource_event(
         WatchEventType::Added,
         json!({
@@ -223,7 +337,7 @@ async fn track_lease_from_event_updates_tracker() {
         }),
     );
 
-    klights_controllers::node_lifecycle::track_lease_from_event(&event, &tracker)
+    track_lease_from_event(&event, &tracker)
         .await
         .expect("event should refresh local lease tracker");
 
@@ -237,9 +351,7 @@ async fn track_lease_from_event_updates_tracker() {
 
 #[tokio::test]
 async fn track_lease_from_event_ignores_deleted_lease() {
-    let tracker = klights_controllers::node_lease::NodeLeaseTracker::new_at(
-        Utc.with_ymd_and_hms(2026, 5, 13, 6, 30, 0).unwrap(),
-    );
+    let tracker = NodeLeaseTracker::new_at(Utc.with_ymd_and_hms(2026, 5, 13, 6, 30, 0).unwrap());
     let event = resource_event(
         WatchEventType::Deleted,
         json!({
@@ -257,7 +369,7 @@ async fn track_lease_from_event_ignores_deleted_lease() {
         }),
     );
 
-    klights_controllers::node_lifecycle::track_lease_from_event(&event, &tracker)
+    track_lease_from_event(&event, &tracker)
         .await
         .expect("deleted events should be ignored");
     assert!(
@@ -271,7 +383,7 @@ async fn track_lease_from_event_ignores_deleted_lease() {
 
 #[tokio::test]
 async fn stale_node_lease_marks_ready_unknown() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryNodeLifecycleRuntime::default();
     db.create_resource(
         "v1",
         "Node",
@@ -362,9 +474,7 @@ async fn stale_node_lease_marks_bound_pods_unknown() {
     // This test verifies the Unknown projection in the window before
     // cleanup, so it pins a non-zero eviction grace (the default is now 0
     // = immediate cleanup; see default_zero_grace_cleans_stale_node_pod).
-    let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
-    let _grace = EnvVarGuard::set("KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS", "30");
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryNodeLifecycleRuntime::default();
     db.create_resource(
         "v1",
         "Node",
@@ -409,9 +519,13 @@ async fn stale_node_lease_marks_bound_pods_unknown() {
     seed_running_pod_on_node(&db, "worker-pod", "worker-pod-uid", "worker-a").await;
     seed_running_pod_on_node(&db, "other-pod", "other-pod-uid", "worker-b").await;
 
-    reconcile_node_lifecycle_once(&db, Utc.with_ymd_and_hms(2026, 5, 13, 6, 34, 56).unwrap())
-        .await
-        .unwrap();
+    reconcile_node_lifecycle_once_with_grace(
+        &db,
+        Utc.with_ymd_and_hms(2026, 5, 13, 6, 34, 56).unwrap(),
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
 
     let worker_pod = db
         .get_resource("v1", "Pod", Some("default"), "worker-pod")
@@ -458,9 +572,7 @@ async fn stale_node_lease_marks_bound_pods_unknown() {
 
 #[tokio::test]
 async fn fresh_node_status_heartbeat_prevents_stale_lease_pod_cleanup() {
-    let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
-    let _grace = EnvVarGuard::remove("KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS");
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryNodeLifecycleRuntime::default();
     db.create_resource(
         "v1",
         "Node",
@@ -541,9 +653,7 @@ async fn default_zero_grace_marks_stale_node_pod_node_lost_immediately() {
     // With the default eviction grace (0), a pod on a confirmed-stale node
     // is marked NodeLost in the same reconcile pass. Actor finalization owns
     // the eventual API row removal.
-    let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
-    let _grace = EnvVarGuard::remove("KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS");
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryNodeLifecycleRuntime::default();
     db.create_resource(
         "v1",
         "Node",
@@ -604,9 +714,7 @@ async fn default_zero_grace_marks_stale_node_pod_node_lost_immediately() {
 async fn stale_node_lease_marks_unknown_bound_pods_node_lost_after_grace() {
     // Exercises the within-grace -> after-grace staging, so it pins a
     // non-zero eviction grace (the default is now 0 = immediate cleanup).
-    let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
-    let _grace = EnvVarGuard::set("KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS", "30");
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryNodeLifecycleRuntime::default();
     db.create_resource(
         "v1",
         "Node",
@@ -650,9 +758,13 @@ async fn stale_node_lease_marks_unknown_bound_pods_node_lost_after_grace() {
     .unwrap();
     seed_running_pod_on_node(&db, "worker-pod", "worker-pod-uid", "worker-a").await;
 
-    reconcile_node_lifecycle_once(&db, Utc.with_ymd_and_hms(2026, 5, 13, 6, 34, 56).unwrap())
-        .await
-        .unwrap();
+    reconcile_node_lifecycle_once_with_grace(
+        &db,
+        Utc.with_ymd_and_hms(2026, 5, 13, 6, 34, 56).unwrap(),
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
     let within_grace = db
         .get_resource("v1", "Pod", Some("default"), "worker-pod")
         .await
@@ -666,9 +778,13 @@ async fn stale_node_lease_marks_unknown_bound_pods_node_lost_after_grace() {
         "pod should not terminate before the stale-node eviction grace period"
     );
 
-    reconcile_node_lifecycle_once(&db, Utc.with_ymd_and_hms(2026, 5, 13, 6, 35, 26).unwrap())
-        .await
-        .unwrap();
+    reconcile_node_lifecycle_once_with_grace(
+        &db,
+        Utc.with_ymd_and_hms(2026, 5, 13, 6, 35, 26).unwrap(),
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
     let after_grace = db
         .get_resource("v1", "Pod", Some("default"), "worker-pod")
         .await
@@ -689,12 +805,8 @@ async fn stale_node_lease_marks_unknown_bound_pods_node_lost_after_grace() {
 
 #[tokio::test]
 async fn deleted_node_event_marks_bound_pods_node_lost_and_wakes_actor() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let pod_repository = crate::controller_test_support::pod_repository_for_test(&db);
-    let (router, recorder) = test_lifecycle_router();
-    let pods =
-        crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort::new_for_test(pod_repository);
-    let lifecycle = TestNodeLostSink(router);
+    let db = MemoryNodeLifecycleRuntime::default();
+    let lifecycle = RecordingNodeLostSink::default();
     seed_running_pod_on_node(&db, "fake-node-pod", "fake-node-pod-uid", "e2e-fake-node").await;
     seed_running_pod_on_node(&db, "real-node-pod", "real-node-pod-uid", "real-node").await;
 
@@ -707,9 +819,9 @@ async fn deleted_node_event_marks_bound_pods_node_lost_and_wakes_actor() {
         }),
     );
 
-    let cleaned = klights_controllers::node_lifecycle::cleanup_pods_bound_to_deleted_node_event(
-        &super::borrowed_store(&db),
-        &pods,
+    let cleaned = cleanup_pods_bound_to_deleted_node_event(
+        &db,
+        &db,
         None,
         Some(&lifecycle),
         &event,
@@ -734,26 +846,14 @@ async fn deleted_node_event_marks_bound_pods_node_lost_and_wakes_actor() {
         "cleanup must be scoped to the deleted Node name"
     );
 
-    for _ in 0..1000 {
-        if recorder.action_count() > 0 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    let actions = recorder.take_actions();
     assert!(
-        actions.iter().any(|action| {
-            matches!(
-                action,
-                crate::kubelet::pod_lifecycle_core::action::PodAction::StopPod {
-                    key,
-                    ..
-                } if key.namespace == "default"
-                    && key.name == "fake-node-pod"
-                    && key.uid == "fake-node-pod-uid"
-            )
-        }),
-        "deleted-node cleanup must wake the UID-bound lifecycle actor: {actions:?}"
+        lifecycle.0.lock().unwrap().iter().any(|key| key
+            == &(
+                "default".to_string(),
+                "fake-node-pod".to_string(),
+                "fake-node-pod-uid".to_string(),
+            )),
+        "deleted-node cleanup must wake the UID-bound lifecycle actor"
     );
 }
 
@@ -761,34 +861,9 @@ async fn deleted_node_event_marks_bound_pods_node_lost_and_wakes_actor() {
 async fn node_lost_cleanup_enqueues_owning_replicaset_after_node_lost_mark() {
     // Uses the staged within-grace -> after-grace timing, so it pins a
     // non-zero eviction grace (the default is now 0 = immediate cleanup).
-    let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
-    let _grace = EnvVarGuard::set("KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS", "30");
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
-        klights_supervisor::TaskCategoryConfig::default(),
-    ));
-    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-    let dispatcher = std::sync::Arc::new(
-        crate::controller_test_support::default_queue_only_dispatcher_for_test(),
-    );
-    let side_effects = std::sync::Arc::new(crate::bootstrap::side_effects::default_registry(
-        metrics.clone(),
-        None,
-        Some(supervisor.clone()),
-        Some(db_handle.clone()),
-        crate::controller_test_support::deterministic_controller_identity(),
-    ));
-    side_effects.set_controller_dispatcher(dispatcher.clone());
-    let pod_repository = std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(
-        db_handle,
-        supervisor,
-        side_effects.clone(),
-        metrics,
-    ));
-    side_effects.set_pod_ports(pod_repository.clone(), pod_repository.clone());
-    let tracker = klights_controllers::node_lease::NodeLeaseTracker::new_at(
-        Utc.with_ymd_and_hms(2026, 5, 13, 6, 34, 14).unwrap(),
-    );
+    let db = MemoryNodeLifecycleRuntime::default();
+    let mutation_reconcile = RecordingPodMutationSink::default();
+    let tracker = NodeLeaseTracker::new_at(Utc.with_ymd_and_hms(2026, 5, 13, 6, 34, 14).unwrap());
 
     db.create_resource(
         "v1",
@@ -900,35 +975,14 @@ async fn node_lost_cleanup_enqueues_owning_replicaset_after_node_lost_mark() {
     .await
     .unwrap();
 
-    let pods = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort::new_for_test(
-        pod_repository.clone(),
-    );
-    klights_controllers::node_lifecycle::reconcile_node_lifecycle_once_with_tracker(
-        &super::borrowed_store(&db),
+    reconcile_node_lifecycle_once_with_tracker(
+        &db,
         &TestNodeLifecycleStatus(&db),
-        &pods,
+        &db,
         &tracker,
         Utc.with_ymd_and_hms(2026, 5, 13, 6, 34, 56).unwrap(),
-        klights_controllers::node_lifecycle::NodeLifecyclePodActions {
-            mutation_reconcile: Some(pod_repository.mutation_reconcile_port().as_ref()),
-            lifecycle: None,
-            eviction_grace: std::time::Duration::ZERO,
-        },
-    )
-    .await
-    .unwrap();
-    let pre_cleanup_keys = dispatcher.pending_reconcile_keys().await;
-    for _ in 0..pre_cleanup_keys.len() {
-        let _ = dispatcher.take_reconcile_key_for_test().await;
-    }
-    klights_controllers::node_lifecycle::reconcile_node_lifecycle_once_with_tracker(
-        &super::borrowed_store(&db),
-        &TestNodeLifecycleStatus(&db),
-        &pods,
-        &tracker,
-        Utc.with_ymd_and_hms(2026, 5, 13, 6, 35, 26).unwrap(),
-        klights_controllers::node_lifecycle::NodeLifecyclePodActions {
-            mutation_reconcile: Some(pod_repository.mutation_reconcile_port().as_ref()),
+        NodeLifecyclePodActions {
+            mutation_reconcile: Some(&mutation_reconcile),
             lifecycle: None,
             eviction_grace: std::time::Duration::ZERO,
         },
@@ -943,13 +997,17 @@ async fn node_lost_cleanup_enqueues_owning_replicaset_after_node_lost_mark() {
         .expect("controller must preserve the Pod row for actor-owned finalization");
     assert_eq!(lost_pod.data["status"]["phase"], "Failed");
     assert_eq!(lost_pod.data["status"]["reason"], "NodeLost");
-    let keys = dispatcher.pending_reconcile_keys().await;
+    let requests = mutation_reconcile.0.lock().unwrap();
     assert!(
-        keys.iter().any(|key| {
-            key.api_version() == "apps/v1"
-                && key.kind() == "ReplicaSet"
-                && key.namespace() == Some("default")
-                && key.name() == "owned-rs"
+        requests.iter().any(|request| {
+            let klights_reconcile_api::PodMutationReconcileRequest::RunHooks { pod, .. } = request
+            else {
+                return false;
+            };
+            pod.data
+                .pointer("/metadata/ownerReferences/0/name")
+                .and_then(|value| value.as_str())
+                == Some("owned-rs")
         }),
         "NodeLost cleanup must enqueue the owning ReplicaSet so it can reschedule"
     );
@@ -975,7 +1033,7 @@ fn node_lifecycle_retry_delay_increases_linearly_and_caps_at_sixty_seconds() {
     ];
     for (attempt, seconds) in expected {
         assert_eq!(
-            klights_controllers::node_lifecycle::node_lifecycle_retry_delay(attempt),
+            node_lifecycle_retry_delay(attempt),
             std::time::Duration::from_secs(seconds),
             "attempt {attempt}"
         );
@@ -983,7 +1041,7 @@ fn node_lifecycle_retry_delay_increases_linearly_and_caps_at_sixty_seconds() {
 }
 
 async fn seed_running_pod_on_node(
-    db: &crate::datastore::sqlite::Datastore,
+    db: &MemoryNodeLifecycleRuntime,
     name: &str,
     uid: &str,
     node_name: &str,
@@ -1057,7 +1115,7 @@ fn pod_condition<'a>(pod: &'a serde_json::Value, condition_type: &str) -> &'a se
 
 #[tokio::test]
 async fn memory_lease_tracker_writes_node_status_only_after_deadline_expires() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryNodeLifecycleRuntime::default();
     db.create_resource(
         "v1",
         "Node",
@@ -1081,9 +1139,7 @@ async fn memory_lease_tracker_writes_node_status_only_after_deadline_expires() {
     )
     .await
     .unwrap();
-    let tracker = klights_controllers::node_lease::NodeLeaseTracker::new_at(
-        Utc.with_ymd_and_hms(2026, 5, 13, 6, 35, 0).unwrap(),
-    );
+    let tracker = NodeLeaseTracker::new_at(Utc.with_ymd_and_hms(2026, 5, 13, 6, 35, 0).unwrap());
     tracker
         .record_from_lease_object(
             "worker-a",
@@ -1147,7 +1203,7 @@ async fn newly_promoted_leader_grace_reset_prevents_mass_eviction() {
     // in-memory tracker and an old startup_time. Without the promotion
     // grace-reset (T8) every unobserved node would look stale and be
     // evicted. With it, they get a fresh window and stay Ready.
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryNodeLifecycleRuntime::default();
     db.create_resource(
         "v1",
         "Node",
@@ -1174,7 +1230,7 @@ async fn newly_promoted_leader_grace_reset_prevents_mass_eviction() {
     seed_running_pod_on_node(&db, "worker-pod", "worker-pod-uid", "worker-a").await;
 
     let old_start = Utc.with_ymd_and_hms(2026, 5, 13, 6, 0, 0).unwrap();
-    let tracker = klights_controllers::node_lease::NodeLeaseTracker::new_at(old_start);
+    let tracker = NodeLeaseTracker::new_at(old_start);
     let now = Utc.with_ymd_and_hms(2026, 5, 13, 7, 0, 0).unwrap();
 
     // Precondition: without a reset the unobserved node already looks stale.
@@ -1215,7 +1271,7 @@ async fn newly_promoted_leader_grace_reset_prevents_mass_eviction() {
 
 #[tokio::test]
 async fn fresh_lease_promotes_startup_unknown_node_ready() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryNodeLifecycleRuntime::default();
     db.create_resource(
         "v1",
         "Node",
@@ -1284,14 +1340,14 @@ async fn fresh_lease_promotes_startup_unknown_node_ready() {
     assert_eq!(
         next,
         Some(std::time::Duration::from_secs(
-            (klights_controllers::node_lease::DEFAULT_NODE_LEASE_GRACE_SECONDS - 1) as u64
+            (DEFAULT_NODE_LEASE_GRACE_SECONDS - 1) as u64
         ))
     );
 }
 
 #[tokio::test]
 async fn node_status_transitions_do_not_store_last_heartbeat_time() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryNodeLifecycleRuntime::default();
     db.create_resource(
         "v1",
         "Node",
@@ -1314,9 +1370,7 @@ async fn node_status_transitions_do_not_store_last_heartbeat_time() {
     )
     .await
     .unwrap();
-    let tracker = klights_controllers::node_lease::NodeLeaseTracker::new_at(
-        Utc.with_ymd_and_hms(2026, 5, 13, 6, 34, 0).unwrap(),
-    );
+    let tracker = NodeLeaseTracker::new_at(Utc.with_ymd_and_hms(2026, 5, 13, 6, 34, 0).unwrap());
     tracker
         .record_from_lease_object(
             "worker-a",
@@ -1397,7 +1451,7 @@ async fn node_status_transitions_do_not_store_last_heartbeat_time() {
 
 #[tokio::test]
 async fn fresh_lease_reconciles_unknown_bound_pods_from_cluster_status_after_worker_replay() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryNodeLifecycleRuntime::default();
     db.create_resource(
         "v1",
         "Node",
@@ -1536,7 +1590,7 @@ async fn fresh_lease_reconciles_unknown_bound_pods_from_cluster_status_after_wor
 
 #[tokio::test]
 async fn fresh_lease_reconciles_unknown_pods_when_node_status_refresh_already_marked_ready() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryNodeLifecycleRuntime::default();
     db.create_resource(
         "v1",
         "Node",
@@ -1634,7 +1688,7 @@ async fn fresh_lease_reconciles_unknown_pods_when_node_status_refresh_already_ma
 
 #[tokio::test]
 async fn leader_startup_ignores_preexisting_fresh_lease_until_renewed() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = MemoryNodeLifecycleRuntime::default();
     db.create_resource(
         "v1",
         "Node",

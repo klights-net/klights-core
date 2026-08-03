@@ -14,10 +14,6 @@ use klights_controllers::node_lifecycle::{
     NodeLifecyclePodStore, NodeLifecycleStore, NodeLostPodLifecycleSink,
 };
 
-#[cfg(test)]
-#[path = "../../controller_policy_tests/node_lifecycle.rs"]
-mod policy_tests;
-
 trait DatastoreNodeLifecycleAccess {
     fn datastore(&self) -> &dyn DatastoreBackend;
 }
@@ -75,11 +71,6 @@ where
             .map_err(map_controller_store_error)?
             .items)
     }
-}
-
-#[cfg(test)]
-fn borrowed_store(db: &dyn DatastoreBackend) -> DatastoreNodeLifecycleStore<&dyn DatastoreBackend> {
-    DatastoreNodeLifecycleStore::new(db)
 }
 
 struct NodeLostPodLifecycleAdapter {

@@ -376,3 +376,7 @@ fn strings_set(value: Option<&Value>) -> BTreeSet<String> {
         })
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+#[path = "rbac_reconcile_tests.rs"]
+mod tests;
