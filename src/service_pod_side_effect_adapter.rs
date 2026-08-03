@@ -4,6 +4,21 @@ use async_trait::async_trait;
 use crate::datastore::{DatastoreBackend, ResourceListQuery};
 use klights_controllers::side_effects::service_pod::{ServiceEndpointState, ServicePodStore};
 
+struct BorrowedServicePodStore<'a> {
+    db: &'a dyn DatastoreBackend,
+}
+
+pub(crate) fn borrowed_store(db: &dyn DatastoreBackend) -> impl ServicePodStore + '_ {
+    BorrowedServicePodStore { db }
+}
+
+#[async_trait]
+impl ServicePodStore for BorrowedServicePodStore<'_> {
+    async fn load_service_endpoint_state(&self, namespace: &str) -> Result<ServiceEndpointState> {
+        ServicePodStore::load_service_endpoint_state(self.db, namespace).await
+    }
+}
+
 #[async_trait]
 impl ServicePodStore for dyn DatastoreBackend + '_ {
     async fn load_service_endpoint_state(&self, namespace: &str) -> Result<ServiceEndpointState> {

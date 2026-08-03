@@ -286,7 +286,7 @@ impl RootCommittedOutboxDelivery {
             .as_ref()
             .ok()
             .filter(|command| {
-                crate::control_plane::client::pod_status_side_effects::needs_committed_pod_side_effects(
+                klights_controllers::side_effects::applied_pod::needs_committed_pod_side_effects(
                     command,
                 )
             })
@@ -365,35 +365,33 @@ impl RootCommittedOutboxDelivery {
         } else {
             None
         };
-        crate::control_plane::client::pod_status_side_effects::handle_applied_pod_side_effects(
-            crate::control_plane::client::pod_status_side_effects::PodSideEffectSinks {
-                controller: Some(controller_dispatcher.as_ref()
+        crate::applied_pod_side_effect_adapter::handle_applied_pod_side_effects(
+            klights_controllers::side_effects::applied_pod::AppliedPodSideEffectSinks::new(
+                Some(controller_dispatcher.as_ref()
                     as &dyn klights_reconcile_api::ControllerReconcileSink),
-                service: Some(controller_dispatcher.as_ref()
+                Some(controller_dispatcher.as_ref()
                     as &dyn klights_reconcile_api::ServiceReconcileSink),
                 #[cfg(not(test))]
-                pod_delete: gc_pod_delete_sink,
+                gc_pod_delete_sink,
                 #[cfg(test)]
-                pod_delete: gc_pod_delete_sink.as_deref(),
-                non_pod_finalization: self
-                    .side_effects
+                gc_pod_delete_sink.as_deref(),
+                self.side_effects
                     .non_pod_finalization
                     .get()
                     .map(Arc::as_ref),
-                namespace_termination: self
-                    .side_effects
+                self.side_effects
                     .namespace_termination
                     .get()
                     .map(Arc::as_ref),
-                gc_coordination: controller_dispatcher.gc_coordination(),
-            },
+                controller_dispatcher.gc_coordination(),
+            ),
             command,
             resource,
             pod_endpoint_effect,
             self.side_effects.db.as_ref(),
         )
         .await
-        .map_err(klights_leader_api::OutboxDeliveryError::unavailable)
+        .map_err(|error| klights_leader_api::OutboxDeliveryError::unavailable(error.to_string()))
     }
 }
 

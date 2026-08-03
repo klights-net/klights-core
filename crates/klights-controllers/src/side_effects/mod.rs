@@ -1,6 +1,7 @@
 //! Neutral side-effect policies, metrics, and registry runtime.
 
 pub mod apiservice;
+pub mod applied_pod;
 pub mod daemonset_node;
 pub mod hpa;
 pub mod job;

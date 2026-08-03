@@ -4,7 +4,6 @@ pub mod informer;
 pub mod leader_proxy;
 pub mod local;
 pub mod membership;
-pub mod pod_status_side_effects;
 pub mod remote;
 pub mod worker_store;
 

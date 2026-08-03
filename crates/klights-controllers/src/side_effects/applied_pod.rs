@@ -1,4 +1,4 @@
-//! Pod-status side-effect dispatch shared by every outbox apply path.
+//! Applied-Pod side-effect policy shared by every committed outbox path.
 //!
 //! Every successful Pod status update or actor-owned finalization must
 //! enqueue workload-owner, Job, and Service reconcile keys through focused
@@ -15,28 +15,102 @@
 //!  * `replication::grpc::server::Replication::apply_outbox` — remote worker
 //!    writes forwarded over gRPC.
 //!
-//! Both paths converge on the same leader-side apply result, so the
-//! side-effect dispatch logic is the same; sharing it here keeps the two paths
-//! from drifting.
+//! Both paths converge on the same leader-side apply result. Root supplies
+//! concrete adapters for the focused stores below; controller policy never
+//! receives or names the cluster datastore implementation.
 
-use crate::datastore::DatastoreBackend;
+use async_trait::async_trait;
 use klights_cluster_core::{Resource, command::StorageCommand};
 use klights_reconcile_api::{
-    ControllerReconcileSink, GcForegroundDeleteCoordination, GcNonPodFinalizationPort,
-    GcPodDeleteSink, ReconcileKey, ServiceReconcileKey, ServiceReconcileSink,
+    ControllerReconcileSink, ControllerStoreResult, GcForegroundDeleteCoordination,
+    GcNonPodFinalizationPort, GcPodDeleteSink, NamespaceTerminationRequest,
+    NamespaceTerminationSink, ReconcileKey, ServiceReconcileKey, ServiceReconcileSink,
 };
-use klights_reconcile_api::{NamespaceTerminationRequest, NamespaceTerminationSink};
+use thiserror::Error;
 
-pub struct PodSideEffectSinks<'a> {
-    pub controller: Option<&'a dyn ControllerReconcileSink>,
-    pub service: Option<&'a dyn ServiceReconcileSink>,
-    pub pod_delete: Option<&'a dyn GcPodDeleteSink>,
-    pub non_pod_finalization: Option<&'a dyn GcNonPodFinalizationPort>,
-    pub namespace_termination: Option<&'a dyn NamespaceTerminationSink>,
-    pub gc_coordination: &'a dyn GcForegroundDeleteCoordination,
+use super::job::JobSideEffectStore;
+use super::service_pod::ServicePodStore;
+use super::workload_pod::WorkloadPodStore;
+use crate::gc::GcResourceStore;
+
+#[async_trait]
+pub trait AppliedPodPdbStore: Send + Sync {
+    async fn list_pod_disruption_budgets(
+        &self,
+        namespace: &str,
+    ) -> ControllerStoreResult<Vec<Resource>>;
 }
 
-pub(crate) fn needs_committed_pod_side_effects(command: &StorageCommand) -> bool {
+pub struct AppliedPodSideEffectStores<'a> {
+    service_pods: &'a dyn ServicePodStore,
+    workload_pods: &'a dyn WorkloadPodStore,
+    jobs: &'a dyn JobSideEffectStore,
+    pdbs: &'a dyn AppliedPodPdbStore,
+    gc: &'a dyn GcResourceStore,
+}
+
+impl<'a> AppliedPodSideEffectStores<'a> {
+    pub const fn new(
+        service_pods: &'a dyn ServicePodStore,
+        workload_pods: &'a dyn WorkloadPodStore,
+        jobs: &'a dyn JobSideEffectStore,
+        pdbs: &'a dyn AppliedPodPdbStore,
+        gc: &'a dyn GcResourceStore,
+    ) -> Self {
+        Self {
+            service_pods,
+            workload_pods,
+            jobs,
+            pdbs,
+            gc,
+        }
+    }
+}
+
+pub struct AppliedPodSideEffectSinks<'a> {
+    controller: Option<&'a dyn ControllerReconcileSink>,
+    service: Option<&'a dyn ServiceReconcileSink>,
+    pod_delete: Option<&'a dyn GcPodDeleteSink>,
+    non_pod_finalization: Option<&'a dyn GcNonPodFinalizationPort>,
+    namespace_termination: Option<&'a dyn NamespaceTerminationSink>,
+    gc_coordination: &'a dyn GcForegroundDeleteCoordination,
+}
+
+impl<'a> AppliedPodSideEffectSinks<'a> {
+    pub const fn new(
+        controller: Option<&'a dyn ControllerReconcileSink>,
+        service: Option<&'a dyn ServiceReconcileSink>,
+        pod_delete: Option<&'a dyn GcPodDeleteSink>,
+        non_pod_finalization: Option<&'a dyn GcNonPodFinalizationPort>,
+        namespace_termination: Option<&'a dyn NamespaceTerminationSink>,
+        gc_coordination: &'a dyn GcForegroundDeleteCoordination,
+    ) -> Self {
+        Self {
+            controller,
+            service,
+            pod_delete,
+            non_pod_finalization,
+            namespace_termination,
+            gc_coordination,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct AppliedPodSideEffectError {
+    message: String,
+}
+
+impl AppliedPodSideEffectError {
+    fn required_cascade(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+pub fn needs_committed_pod_side_effects(command: &StorageCommand) -> bool {
     matches!(
         command,
         StorageCommand::UpdateStatus {
@@ -52,12 +126,12 @@ pub(crate) fn needs_committed_pod_side_effects(command: &StorageCommand) -> bool
 }
 
 pub async fn handle_applied_pod_side_effects(
-    sinks: PodSideEffectSinks<'_>,
+    stores: AppliedPodSideEffectStores<'_>,
+    sinks: AppliedPodSideEffectSinks<'_>,
     command: &StorageCommand,
     resource: Option<&Resource>,
     pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
-    db: &dyn DatastoreBackend,
-) -> Result<(), String> {
+) -> Result<(), AppliedPodSideEffectError> {
     // The actor delete is already committed at this point. Its dependent
     // cascade is the one mandatory delivery in this group: absence or a
     // transient failure must keep the worker's durable outbox item pending so
@@ -68,7 +142,7 @@ pub async fn handle_applied_pod_side_effects(
         sinks.gc_coordination,
         command,
         resource,
-        db,
+        stores.gc,
     )
     .await?;
     enqueue_pod_status_side_effects_with_endpoint_change(
@@ -77,7 +151,7 @@ pub async fn handle_applied_pod_side_effects(
         command,
         resource,
         pod_endpoint_effect,
-        db,
+        &stores,
     )
     .await;
     finalize_foreground_owners_after_pod_delete(
@@ -86,7 +160,7 @@ pub async fn handle_applied_pod_side_effects(
         sinks.gc_coordination,
         command,
         resource,
-        db,
+        stores.gc,
     )
     .await;
     reconcile_namespace_after_pod_delete(command, resource, sinks.namespace_termination).await;
@@ -99,7 +173,7 @@ async fn enqueue_pod_status_side_effects_with_endpoint_change(
     command: &StorageCommand,
     resource: Option<&Resource>,
     pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
-    db: &dyn DatastoreBackend,
+    stores: &AppliedPodSideEffectStores<'_>,
 ) {
     if controller_sink.is_none() && service_sink.is_none() {
         return;
@@ -157,9 +231,9 @@ async fn enqueue_pod_status_side_effects_with_endpoint_change(
                 command,
                 StorageCommand::DeleteResource { .. } | StorageCommand::FinalizeBoundPod { .. }
             )) {
-        match klights_controllers::side_effects::service_pod::service_reconcile_keys_for_pod(
+        match super::service_pod::service_reconcile_keys_for_pod(
             &resource.data,
-            db,
+            stores.service_pods,
             namespace,
         )
         .await
@@ -185,29 +259,26 @@ async fn enqueue_pod_status_side_effects_with_endpoint_change(
         enqueue_service_keys(service_sink, service_keys).await;
         return;
     };
-    let workload_store = crate::workload_pod_side_effect_adapter::borrowed_store(db);
-    let workload_keys =
-        match klights_controllers::side_effects::workload_pod::workload_reconcile_keys_for_pod(
-            &resource.data,
-            &workload_store,
-            namespace,
-        )
-        .await
-        {
-            Ok(keys) => keys,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    namespace,
-                    "failed to derive workload owner keys for pod status side effects"
-                );
-                Vec::new()
-            }
-        };
-    let job_store = crate::job_side_effect_adapter::borrowed_store(db);
-    let job_keys = match klights_controllers::side_effects::job::job_reconcile_keys_for_pod(
+    let workload_keys = match super::workload_pod::workload_reconcile_keys_for_pod(
         &resource.data,
-        &job_store,
+        stores.workload_pods,
+        namespace,
+    )
+    .await
+    {
+        Ok(keys) => keys,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                namespace,
+                "failed to derive workload owner keys for pod status side effects"
+            );
+            Vec::new()
+        }
+    };
+    let job_keys = match super::job::job_reconcile_keys_for_pod(
+        &resource.data,
+        stores.jobs,
         namespace,
     )
     .await
@@ -222,7 +293,7 @@ async fn enqueue_pod_status_side_effects_with_endpoint_change(
             Vec::new()
         }
     };
-    let pdb_keys = pdb_reconcile_keys_for_namespace(db, namespace).await;
+    let pdb_keys = pdb_reconcile_keys_for_namespace(stores.pdbs, namespace).await;
     let mut controller_keys = workload_keys;
     controller_keys.extend(job_keys);
     controller_keys.extend(pdb_keys);
@@ -253,7 +324,7 @@ async fn finalize_foreground_owners_after_pod_delete(
     coordination: &dyn GcForegroundDeleteCoordination,
     command: &StorageCommand,
     resource: Option<&Resource>,
-    db: &dyn DatastoreBackend,
+    gc_store: &dyn GcResourceStore,
 ) {
     let is_pod_delete = matches!(
         command,
@@ -274,8 +345,8 @@ async fn finalize_foreground_owners_after_pod_delete(
         return;
     };
     let deleted_resource = resource.clone();
-    if let Err(err) = klights_controllers::gc::finalize_foreground_owners_after_dependent_delete(
-        db,
+    if let Err(err) = crate::gc::finalize_foreground_owners_after_dependent_delete(
+        gc_store,
         &deleted_resource,
         gc_pod_delete_sink,
         non_pod_finalization,
@@ -299,19 +370,25 @@ async fn cascade_dependents_after_actor_pod_delete(
     coordination: &dyn GcForegroundDeleteCoordination,
     command: &StorageCommand,
     resource: Option<&Resource>,
-    db: &dyn DatastoreBackend,
-) -> Result<(), String> {
+    gc_store: &dyn GcResourceStore,
+) -> Result<(), AppliedPodSideEffectError> {
     if !matches!(command, StorageCommand::FinalizeBoundPod { .. }) {
         return Ok(());
     }
     let resource = resource.ok_or_else(|| {
-        "committed bound Pod finalization is missing its durable delete receipt".to_string()
+        AppliedPodSideEffectError::required_cascade(
+            "committed bound Pod finalization is missing its durable delete receipt",
+        )
     })?;
     let gc_pod_delete_sink = gc_pod_delete_sink.ok_or_else(|| {
-        "committed bound Pod finalization has no dependent-cascade sink".to_string()
+        AppliedPodSideEffectError::required_cascade(
+            "committed bound Pod finalization has no dependent-cascade sink",
+        )
     })?;
     let non_pod_finalization = non_pod_finalization.ok_or_else(|| {
-        "committed bound Pod finalization has no non-Pod finalization port".to_string()
+        AppliedPodSideEffectError::required_cascade(
+            "committed bound Pod finalization has no non-Pod finalization port",
+        )
     })?;
     let namespace = resource.namespace.clone().or_else(|| {
         resource
@@ -326,10 +403,12 @@ async fn cascade_dependents_after_actor_pod_delete(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     if uid.is_empty() {
-        return Err("committed bound Pod finalization receipt has no metadata.uid".to_string());
+        return Err(AppliedPodSideEffectError::required_cascade(
+            "committed bound Pod finalization receipt has no metadata.uid",
+        ));
     }
-    klights_controllers::gc::cascade_delete_with_uid(
-        db,
+    crate::gc::cascade_delete_with_uid(
+        gc_store,
         uid,
         &resource.api_version,
         &resource.name,
@@ -341,12 +420,12 @@ async fn cascade_dependents_after_actor_pod_delete(
     )
     .await
     .map_err(|error| {
-        format!(
+        AppliedPodSideEffectError::required_cascade(format!(
             "leader committed Pod delete dependent cascade failed for {}/{} uid {}: {error}",
             resource.namespace.as_deref().unwrap_or(""),
             resource.name,
             uid
-        )
+        ))
     })
 }
 
@@ -394,18 +473,10 @@ async fn reconcile_namespace_after_pod_delete(
 }
 
 async fn pdb_reconcile_keys_for_namespace(
-    db: &dyn DatastoreBackend,
+    store: &dyn AppliedPodPdbStore,
     namespace: &str,
 ) -> Vec<ReconcileKey> {
-    let pdbs = match db
-        .list_resources(
-            "policy/v1",
-            "PodDisruptionBudget",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await
-    {
+    let pdbs = match store.list_pod_disruption_budgets(namespace).await {
         Ok(pdbs) => pdbs,
         Err(err) => {
             tracing::warn!(
@@ -417,8 +488,7 @@ async fn pdb_reconcile_keys_for_namespace(
         }
     };
 
-    pdbs.items
-        .into_iter()
+    pdbs.into_iter()
         .filter_map(|pdb| {
             pdb.data
                 .pointer("/metadata/name")
@@ -433,17 +503,19 @@ async fn pdb_reconcile_keys_for_namespace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use klights_cluster_core::{PatchKind, ResourcePreconditions};
+    use klights_reconcile_api::{ControllerStoreError, ReconcileSinkFuture};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    fn gc_coordination() -> &'static klights_controllers::ControllerCoordination {
-        static COORDINATION: std::sync::LazyLock<klights_controllers::ControllerCoordination> =
-            std::sync::LazyLock::new(klights_controllers::ControllerCoordination::new);
+    fn gc_coordination() -> &'static crate::ControllerCoordination {
+        static COORDINATION: std::sync::LazyLock<crate::ControllerCoordination> =
+            std::sync::LazyLock::new(crate::ControllerCoordination::new);
         &COORDINATION
     }
 
-    use crate::controllers::ControllerDispatcher;
-    use crate::datastore::ResourcePreconditions;
     use klights_cluster_core::command::StorageCommand;
     use klights_types::PodIdentity;
     use serde_json::json;
@@ -469,6 +541,311 @@ mod tests {
                 data,
             }
         }};
+    }
+
+    #[derive(Default)]
+    struct FakeAppliedPodStore {
+        resources: Mutex<Vec<Resource>>,
+    }
+
+    impl FakeAppliedPodStore {
+        fn insert(
+            &self,
+            api_version: &str,
+            kind: &str,
+            namespace: Option<&str>,
+            name: &str,
+            data: serde_json::Value,
+        ) {
+            let data = Arc::new(data);
+            self.resources.lock().unwrap().push(Resource {
+                id: 0,
+                api_version: api_version.to_string(),
+                kind: kind.to_string(),
+                namespace: namespace.map(str::to_string),
+                name: name.to_string(),
+                uid: Resource::uid_from_data(&data),
+                resource_version: 1,
+                data,
+            });
+        }
+
+        fn list(&self, api_version: &str, kind: &str, namespace: &str) -> Vec<Resource> {
+            self.resources
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|resource| {
+                    resource.api_version == api_version
+                        && resource.kind == kind
+                        && resource.namespace.as_deref() == Some(namespace)
+                })
+                .cloned()
+                .collect()
+        }
+
+        fn replace_resource(
+            &self,
+            api_version: &str,
+            kind: &str,
+            namespace: Option<&str>,
+            name: &str,
+            data: serde_json::Value,
+        ) -> ControllerStoreResult<Resource> {
+            let mut resources = self.resources.lock().unwrap();
+            let resource = resources
+                .iter_mut()
+                .find(|resource| {
+                    resource.api_version == api_version
+                        && resource.kind == kind
+                        && resource.namespace.as_deref() == namespace
+                        && resource.name == name
+                })
+                .ok_or_else(|| ControllerStoreError::not_found("test resource not found"))?;
+            resource.data = Arc::new(data);
+            resource.uid = Resource::uid_from_data(&resource.data);
+            resource.resource_version += 1;
+            Ok(resource.clone())
+        }
+    }
+
+    #[async_trait]
+    impl super::super::service_pod::ServicePodStore for FakeAppliedPodStore {
+        async fn load_service_endpoint_state(
+            &self,
+            namespace: &str,
+        ) -> Result<super::super::service_pod::ServiceEndpointState> {
+            Ok(super::super::service_pod::ServiceEndpointState {
+                services: self.list("v1", "Service", namespace),
+                endpoints: self.list("v1", "Endpoints", namespace),
+                endpoint_slices: self.list("discovery.k8s.io/v1", "EndpointSlice", namespace),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl super::super::workload_pod::WorkloadPodStore for FakeAppliedPodStore {
+        async fn get_replica_set(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
+            Ok(self
+                .list("apps/v1", "ReplicaSet", namespace)
+                .into_iter()
+                .find(|resource| resource.name == name))
+        }
+
+        async fn list_replica_sets(&self, namespace: &str) -> Result<Vec<Resource>> {
+            Ok(self.list("apps/v1", "ReplicaSet", namespace))
+        }
+
+        async fn list_replication_controllers(&self, namespace: &str) -> Result<Vec<Resource>> {
+            Ok(self.list("v1", "ReplicationController", namespace))
+        }
+    }
+
+    #[async_trait]
+    impl super::super::job::JobSideEffectStore for FakeAppliedPodStore {
+        async fn list_jobs(&self, namespace: &str) -> Result<Vec<Resource>> {
+            Ok(self.list("batch/v1", "Job", namespace))
+        }
+    }
+
+    #[async_trait]
+    impl AppliedPodPdbStore for FakeAppliedPodStore {
+        async fn list_pod_disruption_budgets(
+            &self,
+            namespace: &str,
+        ) -> ControllerStoreResult<Vec<Resource>> {
+            Ok(self.list("policy/v1", "PodDisruptionBudget", namespace))
+        }
+    }
+
+    #[async_trait]
+    impl GcResourceStore for FakeAppliedPodStore {
+        async fn list_custom_resource_definitions(&self) -> ControllerStoreResult<Vec<Resource>> {
+            Ok(self.list("apiextensions.k8s.io/v1", "CustomResourceDefinition", ""))
+        }
+
+        async fn get_resource(
+            &self,
+            api_version: &str,
+            kind: &str,
+            namespace: Option<&str>,
+            name: &str,
+        ) -> ControllerStoreResult<Option<Resource>> {
+            Ok(self
+                .resources
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|resource| {
+                    resource.api_version == api_version
+                        && resource.kind == kind
+                        && resource.namespace.as_deref() == namespace
+                        && resource.name == name
+                })
+                .cloned())
+        }
+
+        async fn update_resource_with_preconditions(
+            &self,
+            api_version: &str,
+            kind: &str,
+            namespace: Option<&str>,
+            name: &str,
+            data: serde_json::Value,
+            _preconditions: ResourcePreconditions,
+        ) -> ControllerStoreResult<Resource> {
+            self.replace_resource(api_version, kind, namespace, name, data)
+        }
+
+        async fn update_main_resource_with_preconditions(
+            &self,
+            api_version: &str,
+            kind: &str,
+            namespace: Option<&str>,
+            name: &str,
+            data: serde_json::Value,
+            _preconditions: ResourcePreconditions,
+        ) -> ControllerStoreResult<Resource> {
+            self.replace_resource(api_version, kind, namespace, name, data)
+        }
+
+        async fn find_owned_resources(
+            &self,
+            owner_uid: &str,
+            namespace: Option<&str>,
+        ) -> ControllerStoreResult<Vec<Resource>> {
+            Ok(self
+                .resources
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|resource| {
+                    resource.namespace.as_deref() == namespace
+                        && resource
+                            .data
+                            .pointer("/metadata/ownerReferences")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|owners| {
+                                owners.iter().any(|owner| {
+                                    owner.get("uid").and_then(serde_json::Value::as_str)
+                                        == Some(owner_uid)
+                                })
+                            })
+                })
+                .cloned()
+                .collect())
+        }
+
+        async fn find_owned_by_name_kind_empty_uid(
+            &self,
+            owner_api_version: &str,
+            owner_name: &str,
+            owner_kind: &str,
+            namespace: Option<&str>,
+        ) -> ControllerStoreResult<Vec<Resource>> {
+            Ok(self
+                .resources
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|resource| {
+                    resource.namespace.as_deref() == namespace
+                        && resource
+                            .data
+                            .pointer("/metadata/ownerReferences")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|owners| {
+                                owners.iter().any(|owner| {
+                                    owner.get("apiVersion").and_then(serde_json::Value::as_str)
+                                        == Some(owner_api_version)
+                                        && owner.get("kind").and_then(serde_json::Value::as_str)
+                                            == Some(owner_kind)
+                                        && owner.get("name").and_then(serde_json::Value::as_str)
+                                            == Some(owner_name)
+                                        && owner
+                                            .get("uid")
+                                            .and_then(serde_json::Value::as_str)
+                                            .is_none_or(str::is_empty)
+                                })
+                            })
+                })
+                .cloned()
+                .collect())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingReconcileSink {
+        keys: Mutex<Vec<ReconcileKey>>,
+    }
+
+    impl RecordingReconcileSink {
+        fn enqueue(&self, key: ReconcileKey) {
+            let mut keys = self.keys.lock().unwrap();
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+
+        fn queued(&self) -> Vec<ReconcileKey> {
+            self.keys.lock().unwrap().clone()
+        }
+    }
+
+    impl ControllerReconcileSink for RecordingReconcileSink {
+        fn enqueue_reconcile_batch(&self, keys: Vec<ReconcileKey>) -> ReconcileSinkFuture<'_> {
+            Box::pin(async move {
+                for key in keys {
+                    self.enqueue(key);
+                }
+                Ok(())
+            })
+        }
+    }
+
+    impl ServiceReconcileSink for RecordingReconcileSink {
+        fn enqueue_service_reconcile_batch(
+            &self,
+            keys: Vec<ServiceReconcileKey>,
+        ) -> ReconcileSinkFuture<'_> {
+            Box::pin(async move {
+                for key in keys {
+                    self.enqueue(key.into_reconcile_key());
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct NoopNonPodFinalization;
+
+    impl GcNonPodFinalizationPort for NoopNonPodFinalization {
+        fn finalize_non_pod(
+            &self,
+            _request: klights_reconcile_api::GcNonPodFinalizationRequest,
+        ) -> klights_reconcile_api::GcNonPodFinalizationFuture<'_> {
+            Box::pin(async { Ok(klights_reconcile_api::GcNonPodFinalizationOutcome::Gone) })
+        }
+    }
+
+    fn stores(store: &FakeAppliedPodStore) -> AppliedPodSideEffectStores<'_> {
+        AppliedPodSideEffectStores::new(store, store, store, store, store)
+    }
+
+    fn sinks<'a>(
+        reconcile: Option<&'a RecordingReconcileSink>,
+        pod_delete: Option<&'a dyn GcPodDeleteSink>,
+        non_pod: Option<&'a dyn GcNonPodFinalizationPort>,
+    ) -> AppliedPodSideEffectSinks<'a> {
+        AppliedPodSideEffectSinks::new(
+            reconcile.map(|sink| sink as &dyn ControllerReconcileSink),
+            reconcile.map(|sink| sink as &dyn ServiceReconcileSink),
+            pod_delete,
+            non_pod,
+            None,
+            gc_coordination(),
+        )
     }
 
     #[derive(Default)]
@@ -518,8 +895,8 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_pod_status_enqueues_pdb_reconcile_for_namespace() {
-        let db = crate::datastore::test_support::in_memory().await;
-        db.create_resource(
+        let store = FakeAppliedPodStore::default();
+        store.insert(
             "policy/v1",
             "PodDisruptionBudget",
             Some("default"),
@@ -533,11 +910,9 @@ mod tests {
                     "selector": {"matchLabels": {"app": "x"}}
                 }
             }),
-        )
-        .await
-        .expect("create pdb");
+        );
 
-        let dispatcher = Arc::new(ControllerDispatcher::default());
+        let dispatcher = RecordingReconcileSink::default();
         let command = StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -572,16 +947,16 @@ mod tests {
         };
 
         enqueue_pod_status_side_effects_with_endpoint_change(
-            Some(dispatcher.as_ref()),
-            Some(dispatcher.as_ref()),
+            Some(&dispatcher),
+            Some(&dispatcher),
             &command,
             Some(&resource),
             klights_cluster_core::PodEndpointEffect::Unchanged,
-            &db,
+            &stores(&store),
         )
         .await;
 
-        let keys = dispatcher.queued_reconcile_keys_for_test().await;
+        let keys = dispatcher.queued();
         assert!(
             keys.iter().any(|key| {
                 key.api_version() == "policy/v1"
@@ -595,8 +970,8 @@ mod tests {
 
     #[tokio::test]
     async fn committed_actor_delete_receipt_cascades_pod_dependents_exactly_once() {
-        let db = crate::datastore::test_support::in_memory().await;
-        db.create_resource(
+        let store = FakeAppliedPodStore::default();
+        store.insert(
             "v1",
             "Pod",
             Some("default"),
@@ -617,9 +992,7 @@ mod tests {
                 },
                 "spec": {"nodeName": "worker-b"}
             }),
-        )
-        .await
-        .unwrap();
+        );
         let command = StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "owner".to_string(),
@@ -645,64 +1018,46 @@ mod tests {
             }),
         };
         let sink = RecordingPodDeleteSink::default();
+        let non_pod = NoopNonPodFinalization;
 
         let missing_sink = handle_applied_pod_side_effects(
-            PodSideEffectSinks {
-                controller: None,
-                service: None,
-                pod_delete: None,
-                non_pod_finalization: Some(
-                    crate::controllers::test_utils::non_pod_finalization_port_for_test(),
-                ),
-                namespace_termination: None,
-                gc_coordination: gc_coordination(),
-            },
+            stores(&store),
+            sinks(None, None, Some(&non_pod)),
             &command,
             Some(&receipt),
             klights_cluster_core::PodEndpointEffect::NotApplicable,
-            &db,
         )
         .await
         .expect_err("a committed finalize command must have a cascade sink");
-        assert!(missing_sink.contains("no dependent-cascade sink"));
+        assert!(
+            missing_sink
+                .to_string()
+                .contains("no dependent-cascade sink")
+        );
 
         handle_applied_pod_side_effects(
-            PodSideEffectSinks {
-                controller: None,
-                service: None,
-                pod_delete: Some(&sink),
-                non_pod_finalization: Some(
-                    crate::controllers::test_utils::non_pod_finalization_port_for_test(),
-                ),
-                namespace_termination: None,
-                gc_coordination: gc_coordination(),
-            },
+            stores(&store),
+            sinks(None, Some(&sink), Some(&non_pod)),
             &command,
             Some(&receipt),
             klights_cluster_core::PodEndpointEffect::NotApplicable,
-            &db,
         )
         .await
         .unwrap();
         let missing_receipt = handle_applied_pod_side_effects(
-            PodSideEffectSinks {
-                controller: None,
-                service: None,
-                pod_delete: Some(&sink),
-                non_pod_finalization: Some(
-                    crate::controllers::test_utils::non_pod_finalization_port_for_test(),
-                ),
-                namespace_termination: None,
-                gc_coordination: gc_coordination(),
-            },
+            stores(&store),
+            sinks(None, Some(&sink), Some(&non_pod)),
             &command,
             None,
             klights_cluster_core::PodEndpointEffect::NotApplicable,
-            &db,
         )
         .await
         .expect_err("a surfaced committed finalize command must retain its receipt");
-        assert!(missing_receipt.contains("durable delete receipt"));
+        assert!(
+            missing_receipt
+                .to_string()
+                .contains("durable delete receipt")
+        );
 
         let requests = sink.requests.lock().unwrap();
         assert_eq!(
@@ -713,8 +1068,8 @@ mod tests {
 
     #[tokio::test]
     async fn committed_actor_delete_cascade_retries_after_transient_sink_failure() {
-        let db = crate::datastore::test_support::in_memory().await;
-        db.create_resource(
+        let store = FakeAppliedPodStore::default();
+        store.insert(
             "v1",
             "Pod",
             Some("default"),
@@ -735,9 +1090,7 @@ mod tests {
                 },
                 "spec": {"nodeName": "worker-b"}
             }),
-        )
-        .await
-        .unwrap();
+        );
         let command = StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "owner".to_string(),
@@ -763,42 +1116,29 @@ mod tests {
             }),
         };
         let sink = FailOncePodDeleteSink::default();
+        let non_pod = NoopNonPodFinalization;
 
         let first = handle_applied_pod_side_effects(
-            PodSideEffectSinks {
-                controller: None,
-                service: None,
-                pod_delete: Some(&sink),
-                non_pod_finalization: Some(
-                    crate::controllers::test_utils::non_pod_finalization_port_for_test(),
-                ),
-                namespace_termination: None,
-                gc_coordination: gc_coordination(),
-            },
+            stores(&store),
+            sinks(None, Some(&sink), Some(&non_pod)),
             &command,
             Some(&receipt),
             klights_cluster_core::PodEndpointEffect::NotApplicable,
-            &db,
         )
         .await
         .expect_err("transient cascade failure must keep the durable outbox pending");
-        assert!(first.contains("transient leader-side delete failure"));
+        assert!(
+            first
+                .to_string()
+                .contains("transient leader-side delete failure")
+        );
 
         handle_applied_pod_side_effects(
-            PodSideEffectSinks {
-                controller: None,
-                service: None,
-                pod_delete: Some(&sink),
-                non_pod_finalization: Some(
-                    crate::controllers::test_utils::non_pod_finalization_port_for_test(),
-                ),
-                namespace_termination: None,
-                gc_coordination: gc_coordination(),
-            },
+            stores(&store),
+            sinks(None, Some(&sink), Some(&non_pod)),
             &command,
             Some(&receipt),
             klights_cluster_core::PodEndpointEffect::NotApplicable,
-            &db,
         )
         .await
         .expect("replayed committed receipt should complete the cascade");
@@ -812,8 +1152,8 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_pod_status_enqueues_job_reconcile_for_owner_reference() {
-        let db = crate::datastore::test_support::in_memory().await;
-        let dispatcher = Arc::new(ControllerDispatcher::default());
+        let store = FakeAppliedPodStore::default();
+        let dispatcher = RecordingReconcileSink::default();
         let command = StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -857,16 +1197,16 @@ mod tests {
         };
 
         enqueue_pod_status_side_effects_with_endpoint_change(
-            Some(dispatcher.as_ref()),
-            Some(dispatcher.as_ref()),
+            Some(&dispatcher),
+            Some(&dispatcher),
             &command,
             Some(&resource),
             klights_cluster_core::PodEndpointEffect::Changed,
-            &db,
+            &stores(&store),
         )
         .await;
 
-        let keys = dispatcher.queued_reconcile_keys_for_test().await;
+        let keys = dispatcher.queued();
         assert!(
             keys.iter().any(|key| {
                 key.api_version() == "batch/v1"
@@ -880,8 +1220,8 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_ready_pod_status_keeps_deployment_rollout_reconcile_queued() {
-        let db = crate::datastore::test_support::in_memory().await;
-        db.create_resource(
+        let store = FakeAppliedPodStore::default();
+        store.insert(
             "apps/v1",
             "Deployment",
             Some("default"),
@@ -903,10 +1243,8 @@ mod tests {
                     }
                 }
             }),
-        )
-        .await
-        .expect("create deployment");
-        db.create_resource(
+        );
+        store.insert(
             "apps/v1",
             "ReplicaSet",
             Some("default"),
@@ -929,14 +1267,10 @@ mod tests {
                 "spec": {"replicas": 1},
                 "status": {"replicas": 1, "readyReplicas": 0, "availableReplicas": 0}
             }),
-        )
-        .await
-        .expect("create replicaset");
-        let dispatcher = Arc::new(ControllerDispatcher::default());
+        );
+        let dispatcher = RecordingReconcileSink::default();
         let deployment_key = ReconcileKey::namespaced("apps/v1", "Deployment", "default", "web");
-        dispatcher
-            .enqueue_reconcile_key(deployment_key.clone())
-            .await;
+        dispatcher.enqueue(deployment_key.clone());
 
         let command = StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
@@ -983,16 +1317,16 @@ mod tests {
         };
 
         enqueue_pod_status_side_effects_with_endpoint_change(
-            Some(dispatcher.as_ref()),
-            Some(dispatcher.as_ref()),
+            Some(&dispatcher),
+            Some(&dispatcher),
             &command,
             Some(&resource),
             klights_cluster_core::PodEndpointEffect::Changed,
-            &db,
+            &stores(&store),
         )
         .await;
 
-        let keys = dispatcher.queued_reconcile_keys_for_test().await;
+        let keys = dispatcher.queued();
         assert_eq!(
             keys.iter().filter(|key| *key == &deployment_key).count(),
             1,
@@ -1002,8 +1336,8 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_pod_status_and_actor_finalization_keep_service_reconcile_queued() {
-        let db = crate::datastore::test_support::in_memory().await;
-        db.create_resource(
+        let store = FakeAppliedPodStore::default();
+        store.insert(
             "v1",
             "Service",
             Some("default"),
@@ -1021,9 +1355,7 @@ mod tests {
                     "ports": [{"name": "http", "port": 80, "targetPort": 9376, "protocol": "TCP"}]
                 }
             }),
-        )
-        .await
-        .expect("create service");
+        );
         let service_key = ReconcileKey::namespaced("v1", "Service", "default", "web");
         let resource = test_resource! {
             api_version: "v1".to_string(),
@@ -1088,21 +1420,20 @@ mod tests {
         ];
 
         for (case, command, endpoint_effect) in cases {
-            let dispatcher = Arc::new(ControllerDispatcher::default());
+            let dispatcher = RecordingReconcileSink::default();
             enqueue_pod_status_side_effects_with_endpoint_change(
-                Some(dispatcher.as_ref()),
-                Some(dispatcher.as_ref()),
+                Some(&dispatcher),
+                Some(&dispatcher),
                 &command,
                 Some(&resource),
                 endpoint_effect,
-                &db,
+                &stores(&store),
             )
             .await;
 
             assert_eq!(
                 dispatcher
-                    .queued_reconcile_keys_for_test()
-                    .await
+                    .queued()
                     .iter()
                     .filter(|key| *key == &service_key)
                     .count(),
@@ -1114,9 +1445,9 @@ mod tests {
 
     #[tokio::test]
     async fn pod_label_patch_enqueues_matching_and_stale_targetref_services_only() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let store = FakeAppliedPodStore::default();
         for (name, selector) in [("matching", "new"), ("stale", "old")] {
-            db.create_resource(
+            store.insert(
                 "v1",
                 "Service",
                 Some("default"),
@@ -1127,11 +1458,9 @@ mod tests {
                     "metadata": {"namespace": "default", "name": name},
                     "spec": {"selector": {"app": selector}, "ports": [{"port": 80}]}
                 }),
-            )
-            .await
-            .unwrap();
+            );
         }
-        db.create_resource(
+        store.insert(
             "v1",
             "Endpoints",
             Some("default"),
@@ -1145,16 +1474,14 @@ mod tests {
                     "targetRef": {"kind": "Pod", "namespace": "default", "name": "web", "uid": "pod-uid"}
                 }]}]
             }),
-        )
-        .await
-        .unwrap();
-        let dispatcher = Arc::new(ControllerDispatcher::default());
+        );
+        let dispatcher = RecordingReconcileSink::default();
         let command = StorageCommand::PatchResource {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some("default".to_string()),
             name: "web".to_string(),
-            patch_kind: crate::datastore::PatchKind::Merge,
+            patch_kind: PatchKind::Merge,
             patch: json!({"metadata": {"labels": {"app": "new"}}}),
             preconditions: ResourcePreconditions {
                 uid: Some("pod-uid".to_string()),
@@ -1177,15 +1504,15 @@ mod tests {
         };
 
         enqueue_pod_status_side_effects_with_endpoint_change(
-            Some(dispatcher.as_ref()),
-            Some(dispatcher.as_ref()),
+            Some(&dispatcher),
+            Some(&dispatcher),
             &command,
             Some(&resource),
             klights_cluster_core::PodEndpointEffect::NotApplicable,
-            &db,
+            &stores(&store),
         )
         .await;
-        let keys = dispatcher.queued_reconcile_keys_for_test().await;
+        let keys = dispatcher.queued();
         assert!(
             keys.iter()
                 .any(|key| key.kind() == "Service" && key.name() == "matching")
@@ -1199,8 +1526,8 @@ mod tests {
 
     #[tokio::test]
     async fn unrelated_pod_status_fields_do_not_enqueue_service_reconcile() {
-        let db = crate::datastore::test_support::in_memory().await;
-        db.create_resource(
+        let store = FakeAppliedPodStore::default();
+        store.insert(
             "v1",
             "Service",
             Some("default"),
@@ -1211,10 +1538,8 @@ mod tests {
                 "metadata": {"namespace": "default", "name": "web"},
                 "spec": {"selector": {"app": "web"}}
             }),
-        )
-        .await
-        .unwrap();
-        let dispatcher = Arc::new(ControllerDispatcher::default());
+        );
+        let dispatcher = RecordingReconcileSink::default();
         let command = StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -1256,12 +1581,12 @@ mod tests {
         };
 
         enqueue_pod_status_side_effects_with_endpoint_change(
-            Some(dispatcher.as_ref()),
-            Some(dispatcher.as_ref()),
+            Some(&dispatcher),
+            Some(&dispatcher),
             &command,
             Some(&resource),
             klights_cluster_core::PodEndpointEffect::Unchanged,
-            &db,
+            &stores(&store),
         )
         .await;
 
@@ -1279,19 +1604,18 @@ mod tests {
             observed_status_stamp: None,
         };
         enqueue_pod_status_side_effects_with_endpoint_change(
-            Some(dispatcher.as_ref()),
-            Some(dispatcher.as_ref()),
+            Some(&dispatcher),
+            Some(&dispatcher),
             &repeated_full_status,
             Some(&resource),
             klights_cluster_core::PodEndpointEffect::Unchanged,
-            &db,
+            &stores(&store),
         )
         .await;
 
         assert!(
             dispatcher
-                .queued_reconcile_keys_for_test()
-                .await
+                .queued()
                 .iter()
                 .all(|key| key.kind() != "Service"),
             "unrelated or repeated unchanged status is not endpoint-relevant Service work"

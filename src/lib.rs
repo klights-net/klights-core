@@ -5,6 +5,7 @@ mod allocator;
 mod api_helpers_adapter;
 mod api_state_adapter;
 mod apiservice_side_effect_adapter;
+mod applied_pod_side_effect_adapter;
 mod authority_adapter;
 pub mod cli;
 mod cluster_engine;
