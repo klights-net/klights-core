@@ -598,3 +598,7 @@ pub async fn reconcile_resource_quotas_with_runtime(
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "resource_quota/tests.rs"]
+mod policy_tests;

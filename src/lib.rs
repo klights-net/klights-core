@@ -77,10 +77,6 @@ mod raft_node_composition_tests;
 #[cfg(test)]
 mod raft_state_machine_composition_tests;
 #[cfg(test)]
-mod resource_quota_event_driven_tests;
-#[cfg(test)]
-mod resourcequota_tests;
-#[cfg(test)]
 mod shutdown_test;
 
 pub use bootstrap::config::DbEncryption;

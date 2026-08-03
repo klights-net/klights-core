@@ -1,9 +1,12 @@
+#![cfg(test)]
+
+use super::*;
 use serde_json::json;
 
 #[tokio::test]
 async fn test_resourcequota_create_and_get() {
     // Setup
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
 
     // Create a ResourceQuota
     let quota = json!({
@@ -59,7 +62,7 @@ async fn test_resourcequota_create_and_get() {
 #[tokio::test]
 async fn test_resourcequota_list() {
     // Setup
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
 
     // Create multiple ResourceQuotas
     for i in 1..=3 {
@@ -94,7 +97,7 @@ async fn test_resourcequota_list() {
             "v1",
             "ResourceQuota",
             Some("default"),
-            crate::datastore::ResourceListQuery::all(),
+            ResourceListOptions::new(None, None, None, None),
         )
         .await
         .unwrap();
@@ -108,7 +111,7 @@ async fn test_resourcequota_list() {
 #[tokio::test]
 async fn test_resourcequota_delete() {
     // Setup
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
 
     // Create a ResourceQuota
     let quota = json!({
@@ -146,7 +149,7 @@ async fn test_resourcequota_delete() {
 #[tokio::test]
 async fn test_resourcequota_update() {
     // Setup
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = Datastore::new_in_memory().await.unwrap();
 
     // Create a ResourceQuota
     let quota = json!({

@@ -36,6 +36,7 @@ mod live_apply_coordinator_tests;
 mod namespace_and_watch_tests;
 mod owner_reference_query_tests;
 mod pod_status_stamp_tests;
+mod resource_quota_crud_tests;
 mod selector_index_tests;
 mod selectors_and_filter_tests;
 mod status_subresource_tests;

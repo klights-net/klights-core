@@ -930,6 +930,39 @@ impl crate::deployment::DeploymentFinalizeStore for TestStore {
 }
 
 #[async_trait]
+impl crate::resource_quota::ResourceQuotaRuntime for TestStore {
+    async fn list_quota_resources(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: &str,
+    ) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(self.resources_of_kind(api_version, kind, Some(namespace)))
+    }
+
+    async fn list_namespace_pods(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
+        Ok(self.resources_of_kind("v1", "Pod", Some(namespace)))
+    }
+
+    async fn write_resource_quota_status(
+        &self,
+        resource: &Resource,
+        status: &Value,
+    ) -> ControllerStoreResult<()> {
+        self.update_status_only_with_preconditions(
+            "v1",
+            "ResourceQuota",
+            resource.namespace.as_deref(),
+            &resource.name,
+            status.clone(),
+            ResourcePreconditions::from_resource(resource),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl crate::deployment::DeploymentPodReader for TestStore {
     async fn list_pods_by_owner_uid(
         &self,

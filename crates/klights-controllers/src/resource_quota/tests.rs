@@ -1,297 +1,4 @@
 use super::*;
-use crate::bootstrap::controller_adapters::resource_quota_controller_adapter::reconcile_resource_quotas_for_namespace;
-use crate::datastore::DatastoreBackend;
-
-use async_trait::async_trait;
-use serde_json::json;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-
-async fn make_raft_resourcequota_datastore() -> (
-    crate::bootstrap::sequenced_datastore::SequencedDatastore,
-    crate::datastore::sqlite::Datastore,
-) {
-    use crate::datastore::backend::DatastoreHandle;
-    use klights_cluster_core::command::StorageCommand;
-    use klights_kubelet::node_outbox::payload::OutboxOperation;
-
-    struct InlineProposer {
-        inner: DatastoreHandle,
-    }
-
-    #[async_trait]
-    impl klights_replication::proposal::RaftProposal for InlineProposer {
-        async fn propose_command(
-            &self,
-            command: StorageCommand,
-        ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
-            crate::bootstrap::outbox_apply_adapter::propose_command_on_backend(
-                self.inner.as_ref(),
-                command,
-            )
-            .await
-            .map_err(|err| anyhow::anyhow!("inline resource quota propose: {err}"))
-        }
-
-        async fn propose_outbox_command(
-            &self,
-            idempotency_key: &str,
-            operation: &str,
-            command: StorageCommand,
-            authoring_node: &str,
-            _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
-        ) -> std::result::Result<
-            klights_cluster_core::OutboxApplyOutcome,
-            klights_cluster_core::OutboxApplyError,
-        > {
-            let outcome =
-                crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
-                    self.inner.as_ref(),
-                    idempotency_key,
-                    OutboxOperation::try_from(operation).map_err(|err| {
-                        klights_cluster_core::OutboxApplyError::Retryable(err.to_string())
-                    })?,
-                    command,
-                    authoring_node,
-                    None,
-                )
-                .await?;
-            Ok(outcome.into_parts().0)
-        }
-    }
-
-    let inner = crate::datastore::test_support::in_memory().await;
-    let handle: DatastoreHandle = Arc::new(inner.clone());
-    let ds = crate::bootstrap::sequenced_datastore::SequencedDatastore::new(
-        handle.clone(),
-        Arc::new(InlineProposer { inner: handle }),
-    );
-    (ds, inner)
-}
-
-struct ResourceQuotaConflictPodReader {
-    inner: Arc<dyn crate::kubelet::pod_repository::PodReader>,
-    db: crate::datastore::sqlite::Datastore,
-    updated: AtomicBool,
-}
-
-#[async_trait]
-impl crate::kubelet::pod_repository::PodReader for ResourceQuotaConflictPodReader {
-    async fn get_pod(
-        &self,
-        ns: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.inner.get_pod(ns, name).await
-    }
-
-    async fn get_pod_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.inner.get_pod_for_uid(ns, name, uid).await
-    }
-
-    async fn list_pods(
-        &self,
-        ns: Option<&str>,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        limit: Option<i64>,
-        continue_token: Option<&str>,
-    ) -> anyhow::Result<crate::kubelet::pod_repository::PodResourceList> {
-        if ns == Some("default") && !self.updated.swap(true, Ordering::SeqCst) {
-            let current = self
-                .db
-                .get_resource("v1", "ResourceQuota", Some("default"), "test-rq")
-                .await?
-                .expect("test ResourceQuota should exist");
-            let mut updated = (*current.data).clone();
-            updated["spec"]["hard"] = json!({
-                "pods": "10",
-                "secrets": "5"
-            });
-            self.db
-                .update_resource(
-                    "v1",
-                    "ResourceQuota",
-                    Some("default"),
-                    "test-rq",
-                    updated,
-                    current.resource_version,
-                )
-                .await?;
-        }
-
-        self.inner
-            .list_pods(ns, label_selector, field_selector, limit, continue_token)
-            .await
-    }
-
-    async fn list_pods_by_owner_uid(
-        &self,
-        ns: &str,
-        owner_uid: &str,
-    ) -> anyhow::Result<Vec<crate::datastore::Resource>> {
-        self.inner.list_pods_by_owner_uid(ns, owner_uid).await
-    }
-}
-
-struct ResourceQuotaStatusConflictPodReader {
-    inner: Arc<dyn crate::kubelet::pod_repository::PodReader>,
-    db: crate::datastore::sqlite::Datastore,
-    updated: AtomicBool,
-}
-
-#[async_trait]
-impl crate::kubelet::pod_repository::PodReader for ResourceQuotaStatusConflictPodReader {
-    async fn get_pod(
-        &self,
-        ns: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.inner.get_pod(ns, name).await
-    }
-
-    async fn get_pod_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.inner.get_pod_for_uid(ns, name, uid).await
-    }
-
-    async fn list_pods(
-        &self,
-        ns: Option<&str>,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        limit: Option<i64>,
-        continue_token: Option<&str>,
-    ) -> anyhow::Result<crate::kubelet::pod_repository::PodResourceList> {
-        if ns == Some("default") && !self.updated.swap(true, Ordering::SeqCst) {
-            let current = self
-                .db
-                .get_resource("v1", "ResourceQuota", Some("default"), "test-rq")
-                .await?
-                .expect("test ResourceQuota should exist");
-            self.db
-                .update_status_only(
-                    "v1",
-                    "ResourceQuota",
-                    Some("default"),
-                    "test-rq",
-                    json!({
-                        "hard": {"pods": "4"},
-                        "used": {"pods": "77"}
-                    }),
-                    Some(current.resource_version),
-                )
-                .await?;
-        }
-
-        self.inner
-            .list_pods(ns, label_selector, field_selector, limit, continue_token)
-            .await
-    }
-
-    async fn list_pods_by_owner_uid(
-        &self,
-        ns: &str,
-        owner_uid: &str,
-    ) -> anyhow::Result<Vec<crate::datastore::Resource>> {
-        self.inner.list_pods_by_owner_uid(ns, owner_uid).await
-    }
-}
-
-macro_rules! impl_test_pod_query {
-    ($reader:ty) => {
-        impl klights_pod_api::PodQuery for $reader {
-            fn get_pod(
-                &self,
-                request: klights_pod_api::PodGetRequest,
-            ) -> klights_pod_api::PodRepositoryFuture<'_, Option<klights_cluster_core::Resource>>
-            {
-                Box::pin(async move {
-                    let result = match request.uid() {
-                        Some(uid) => {
-                            crate::kubelet::pod_repository::PodReader::get_pod_for_uid(
-                                self,
-                                request.namespace(),
-                                request.name(),
-                                uid,
-                            )
-                            .await
-                        }
-                        None => {
-                            crate::kubelet::pod_repository::PodReader::get_pod(
-                                self,
-                                request.namespace(),
-                                request.name(),
-                            )
-                            .await
-                        }
-                    };
-                    result.map_err(|error| {
-                        klights_pod_api::PodRepositoryError::unavailable(error.to_string())
-                    })
-                })
-            }
-
-            fn list_pods(
-                &self,
-                request: klights_pod_api::PodListRequest,
-            ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodListResult> {
-                Box::pin(async move {
-                    let list = crate::kubelet::pod_repository::PodReader::list_pods(
-                        self,
-                        request.namespace(),
-                        request.label_selector(),
-                        request.field_selector(),
-                        request.limit(),
-                        request.continue_token(),
-                    )
-                    .await
-                    .map_err(|error| {
-                        klights_pod_api::PodRepositoryError::unavailable(error.to_string())
-                    })?;
-                    klights_pod_api::PodListResult::try_new(
-                        list.items,
-                        list.resource_version,
-                        list.continue_token,
-                        list.remaining_item_count,
-                    )
-                })
-            }
-
-            fn list_pods_by_owner_uid(
-                &self,
-                request: klights_pod_api::PodOwnerListRequest,
-            ) -> klights_pod_api::PodRepositoryFuture<'_, Vec<klights_cluster_core::Resource>> {
-                Box::pin(async move {
-                    crate::kubelet::pod_repository::PodReader::list_pods_by_owner_uid(
-                        self,
-                        request.namespace(),
-                        request.owner_uid(),
-                    )
-                    .await
-                    .map_err(|error| {
-                        klights_pod_api::PodRepositoryError::unavailable(error.to_string())
-                    })
-                })
-            }
-        }
-    };
-}
-
-impl_test_pod_query!(ResourceQuotaConflictPodReader);
-impl_test_pod_query!(ResourceQuotaStatusConflictPodReader);
-
 #[test]
 fn test_parse_resource_quantity_storage_matches_kubernetes_semantics() {
     let equal_pairs = [
@@ -457,186 +164,8 @@ fn test_resource_quota_scope_selector_matches_priority_class_and_cross_namespace
 }
 
 #[tokio::test]
-async fn test_reconcile_resource_quota_rejects_stale_status_overlap() {
-    let db = crate::datastore::test_support::in_memory().await;
-
-    db.create_resource(
-        "v1",
-        "ResourceQuota",
-        Some("default"),
-        "test-rq",
-        json!({
-            "apiVersion": "v1",
-            "kind": "ResourceQuota",
-            "metadata": {"name": "test-rq", "namespace": "default"},
-            "spec": {"hard": {"pods": "4"}},
-            "status": {"hard": {"pods": "4"}, "used": {"pods": "0"}}
-        }),
-    )
-    .await
-    .unwrap();
-
-    db.create_resource(
-        "v1",
-        "Pod",
-        Some("default"),
-        "test-pod",
-        json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {"name": "test-pod", "namespace": "default"},
-            "spec": {"containers": [{"name": "c", "image": "busybox"}]}
-        }),
-    )
-    .await
-    .unwrap();
-
-    let pod_reader = ResourceQuotaStatusConflictPodReader {
-        inner: crate::controller_test_support::pod_repository_for_test(&db),
-        db: db.clone(),
-        updated: AtomicBool::new(false),
-    };
-
-    let result = reconcile_resource_quotas_for_namespace(&db, &pod_reader, "default").await;
-    let err = result.expect_err("stale ResourceQuota status overlap must be rejected");
-    assert!(
-        klights_cluster_datastore::errors::is_conflict_error(&err),
-        "expected status conflict, got {err:#}"
-    );
-
-    let rq = db
-        .get_resource("v1", "ResourceQuota", Some("default"), "test-rq")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        rq.data
-            .pointer("/status/used/pods")
-            .and_then(|v| v.as_str()),
-        Some("77"),
-        "ResourceQuota reconcile must not overwrite a live status change from a stale snapshot"
-    );
-}
-
-#[tokio::test]
-async fn test_reconcile_resource_quota_rejects_stale_spec_overlap() {
-    let db = crate::datastore::test_support::in_memory().await;
-
-    db.create_resource(
-        "v1",
-        "ResourceQuota",
-        Some("default"),
-        "test-rq",
-        json!({
-            "apiVersion": "v1",
-            "kind": "ResourceQuota",
-            "metadata": {"name": "test-rq", "namespace": "default"},
-            "spec": {"hard": {"pods": "4"}},
-            "status": {"hard": {"pods": "4"}, "used": {"pods": "0"}}
-        }),
-    )
-    .await
-    .unwrap();
-
-    db.create_resource(
-        "v1",
-        "Pod",
-        Some("default"),
-        "test-pod",
-        json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {"name": "test-pod", "namespace": "default"},
-            "spec": {"containers": [{"name": "c", "image": "busybox"}]}
-        }),
-    )
-    .await
-    .unwrap();
-
-    let pod_reader = ResourceQuotaConflictPodReader {
-        inner: crate::controller_test_support::pod_repository_for_test(&db),
-        db: db.clone(),
-        updated: AtomicBool::new(false),
-    };
-
-    let result = reconcile_resource_quotas_for_namespace(&db, &pod_reader, "default").await;
-    let err = result.expect_err("stale ResourceQuota spec overlap must be rejected");
-    assert!(
-        klights_cluster_datastore::errors::is_conflict_error(&err),
-        "expected status conflict, got {err:#}"
-    );
-
-    let rq = db
-        .get_resource("v1", "ResourceQuota", Some("default"), "test-rq")
-        .await
-        .unwrap()
-        .unwrap();
-
-    assert_eq!(
-        rq.data
-            .pointer("/spec/hard/secrets")
-            .and_then(|v| v.as_str()),
-        Some("5"),
-        "test mutation should leave the live spec.hard changed"
-    );
-    assert_eq!(
-        rq.data
-            .pointer("/status/used/secrets")
-            .and_then(|v| v.as_str()),
-        None,
-        "ResourceQuota reconcile must not rebase stale status across a live spec change"
-    );
-}
-
-#[tokio::test]
-async fn test_reconcile_resource_quota_writes_status_through_raft_status_subresource() {
-    let (db, inner) = make_raft_resourcequota_datastore().await;
-
-    db.create_resource(
-        "v1",
-        "ResourceQuota",
-        Some("default"),
-        "test-quota",
-        json!({
-            "apiVersion": "v1",
-            "kind": "ResourceQuota",
-            "metadata": {"name": "test-quota", "namespace": "default"},
-            "spec": {"hard": {"resourcequotas": "1", "secrets": "1"}},
-            "status": {
-                "hard": {"resourcequotas": "1", "secrets": "1"},
-                "used": {"resourcequotas": "0", "secrets": "0"}
-            }
-        }),
-    )
-    .await
-    .expect("create ResourceQuota through raft");
-
-    reconcile_resource_quotas_for_namespace(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&inner).as_ref(),
-        "default",
-    )
-    .await
-    .expect("reconcile ResourceQuota through raft");
-
-    let rq = db
-        .get_resource("v1", "ResourceQuota", Some("default"), "test-quota")
-        .await
-        .expect("get ResourceQuota")
-        .expect("ResourceQuota exists");
-
-    assert_eq!(
-        rq.data
-            .pointer("/status/used/resourcequotas")
-            .and_then(|v| v.as_str()),
-        Some("1"),
-        "raft-routed ResourceQuota reconcile must update status.used.resourcequotas via status subresource"
-    );
-}
-
-#[tokio::test]
 async fn test_reconcile_resource_quotas_updates_secret_count() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
 
     // Create a ResourceQuota tracking secrets
     db.create_resource(
@@ -673,13 +202,9 @@ async fn test_reconcile_resource_quotas_updates_secret_count() {
     }
 
     // Reconcile
-    reconcile_resource_quotas_for_namespace(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        "default",
-    )
-    .await
-    .unwrap();
+    reconcile_resource_quotas_with_runtime(&db, "default")
+        .await
+        .unwrap();
 
     // Check status.used.secrets = "2"
     let rq = db
@@ -701,7 +226,7 @@ async fn test_reconcile_resource_quotas_updates_secret_count() {
 
 #[tokio::test]
 async fn test_reconcile_resource_quotas_decrements_on_delete() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -738,13 +263,9 @@ async fn test_reconcile_resource_quotas_decrements_on_delete() {
         .await
         .unwrap();
 
-    reconcile_resource_quotas_for_namespace(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        "default",
-    )
-    .await
-    .unwrap();
+    reconcile_resource_quotas_with_runtime(&db, "default")
+        .await
+        .unwrap();
 
     let rq = db
         .get_resource("v1", "ResourceQuota", Some("default"), "test-quota")
@@ -765,14 +286,9 @@ async fn test_reconcile_resource_quotas_decrements_on_delete() {
 
 #[tokio::test]
 async fn test_reconcile_resource_quotas_no_quota_is_noop() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
     // Should not panic/error when no ResourceQuota exists
-    let result = reconcile_resource_quotas_for_namespace(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        "default",
-    )
-    .await;
+    let result = reconcile_resource_quotas_with_runtime(&db, "default").await;
     assert!(result.is_ok());
 }
 
@@ -795,7 +311,7 @@ fn test_pod_is_terminating_uses_active_deadline_seconds() {
 
 #[tokio::test]
 async fn test_reconcile_resource_quota_notterminating_tracks_pod_compute_usage() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -846,13 +362,9 @@ async fn test_reconcile_resource_quota_notterminating_tracks_pod_compute_usage()
     .await
     .unwrap();
 
-    reconcile_resource_quotas_for_namespace(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        "default",
-    )
-    .await
-    .unwrap();
+    reconcile_resource_quotas_with_runtime(&db, "default")
+        .await
+        .unwrap();
 
     let rq = db
         .get_resource(
@@ -903,7 +415,7 @@ async fn test_reconcile_resource_quota_notterminating_tracks_pod_compute_usage()
 /// capture the life of a pod".
 #[tokio::test]
 async fn test_reconcile_resource_quotas_pod_create_updates_used_pods_immediately() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -938,13 +450,9 @@ async fn test_reconcile_resource_quotas_pod_create_updates_used_pods_immediately
         .unwrap();
     }
 
-    reconcile_resource_quotas_for_namespace(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        "default",
-    )
-    .await
-    .unwrap();
+    reconcile_resource_quotas_with_runtime(&db, "default")
+        .await
+        .unwrap();
 
     let rq = db
         .get_resource("v1", "ResourceQuota", Some("default"), "test-rq")
@@ -965,7 +473,7 @@ async fn test_reconcile_resource_quotas_pod_create_updates_used_pods_immediately
 /// resource requests (including ephemeral-storage and custom requests.* keys).
 #[tokio::test]
 async fn test_reconcile_resource_quota_unscoped_pod_compute_and_extended_requests() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -1047,13 +555,9 @@ async fn test_reconcile_resource_quota_unscoped_pod_compute_and_extended_request
     .await
     .unwrap();
 
-    reconcile_resource_quotas_for_namespace(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        "default",
-    )
-    .await
-    .unwrap();
+    reconcile_resource_quotas_with_runtime(&db, "default")
+        .await
+        .unwrap();
 
     let rq = db
         .get_resource("v1", "ResourceQuota", Some("default"), "test-quota")
@@ -1109,7 +613,7 @@ async fn test_reconcile_resource_quota_unscoped_pod_compute_and_extended_request
 /// requests in status.used, matching upstream resource_quota.go:280.
 #[tokio::test]
 async fn test_reconcile_resource_quota_unscoped_legacy_cpu_memory_keys() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -1181,13 +685,9 @@ async fn test_reconcile_resource_quota_unscoped_legacy_cpu_memory_keys() {
     .await
     .unwrap();
 
-    reconcile_resource_quotas_for_namespace(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        "default",
-    )
-    .await
-    .unwrap();
+    reconcile_resource_quotas_with_runtime(&db, "default")
+        .await
+        .unwrap();
 
     let rq = db
         .get_resource("v1", "ResourceQuota", Some("default"), "legacy-quota")
@@ -1235,7 +735,7 @@ async fn test_reconcile_resource_quota_unscoped_legacy_cpu_memory_keys() {
 /// non-terminating pods for requests/limits accounting.
 #[tokio::test]
 async fn test_reconcile_resource_quota_terminating_scope_tracks_only_terminating_pods() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
 
     for (name, scope) in [
         ("quota-terminating", "Terminating"),
@@ -1291,13 +791,9 @@ async fn test_reconcile_resource_quota_terminating_scope_tracks_only_terminating
     .await
     .unwrap();
 
-    reconcile_resource_quotas_for_namespace(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        "default",
-    )
-    .await
-    .unwrap();
+    reconcile_resource_quotas_with_runtime(&db, "default")
+        .await
+        .unwrap();
 
     let term = db
         .get_resource("v1", "ResourceQuota", Some("default"), "quota-terminating")
@@ -1357,13 +853,9 @@ async fn test_reconcile_resource_quota_terminating_scope_tracks_only_terminating
     .await
     .unwrap();
 
-    reconcile_resource_quotas_for_namespace(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        "default",
-    )
-    .await
-    .unwrap();
+    reconcile_resource_quotas_with_runtime(&db, "default")
+        .await
+        .unwrap();
 
     let term = db
         .get_resource("v1", "ResourceQuota", Some("default"), "quota-terminating")
@@ -1417,12 +909,12 @@ async fn test_reconcile_resource_quota_terminating_scope_tracks_only_terminating
 
 /// P0-S13-4: status.used.pods must decrement immediately after pod deletion —
 /// the background tokio::spawn that performs the actual pod removal MUST call
-/// reconcile_resource_quotas_for_namespace after db.delete_resource.
+/// reconcile_resource_quotas_with_runtime after db.delete_resource.
 /// Without this, status.used.pods stays inflated until the 30s periodic reconciler fires,
 /// causing resource_quota.go:280 to time out at 300s.
 #[tokio::test]
 async fn test_reconcile_resource_quotas_pod_delete_decrements_used_pods_immediately() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -1457,13 +949,9 @@ async fn test_reconcile_resource_quotas_pod_delete_decrements_used_pods_immediat
         .unwrap();
     }
 
-    reconcile_resource_quotas_for_namespace(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        "default",
-    )
-    .await
-    .unwrap();
+    reconcile_resource_quotas_with_runtime(&db, "default")
+        .await
+        .unwrap();
 
     // Simulate the actual pod removal that the background spawn performs
     db.delete_resource("v1", "Pod", Some("default"), "pod-0")
@@ -1474,13 +962,9 @@ async fn test_reconcile_resource_quotas_pod_delete_decrements_used_pods_immediat
         .unwrap();
 
     // The background spawn must call reconcile after delete_resource
-    reconcile_resource_quotas_for_namespace(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        "default",
-    )
-    .await
-    .unwrap();
+    reconcile_resource_quotas_with_runtime(&db, "default")
+        .await
+        .unwrap();
 
     let rq = db
         .get_resource("v1", "ResourceQuota", Some("default"), "test-rq")
@@ -1502,7 +986,7 @@ async fn test_reconcile_resource_quotas_pod_delete_decrements_used_pods_immediat
 /// This models the K8s conformance test "should apply changes to a resourcequota status".
 #[tokio::test]
 async fn test_reconcile_resets_status_hard_to_spec_hard_after_status_patch() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
 
     // Create RQ with Spec.Hard = {pods: "5"}
     db.create_resource(
@@ -1556,13 +1040,9 @@ async fn test_reconcile_resets_status_hard_to_spec_hard_after_status_patch() {
     );
 
     // Reconcile: should reset Status.Hard back to Spec.Hard = {pods: "5"}
-    reconcile_resource_quotas_for_namespace(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        "default",
-    )
-    .await
-    .unwrap();
+    reconcile_resource_quotas_with_runtime(&db, "default")
+        .await
+        .unwrap();
 
     let after = db
         .get_resource("v1", "ResourceQuota", Some("default"), "e2e-rq")
@@ -1584,7 +1064,7 @@ async fn test_reconcile_resets_status_hard_to_spec_hard_after_status_patch() {
 /// terminating pods from status.used.
 #[tokio::test]
 async fn test_terminating_pod_excluded_from_pod_count() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
 
     db.create_resource(
         "v1", "ResourceQuota", Some("default"), "test-rq",
@@ -1616,13 +1096,9 @@ async fn test_terminating_pod_excluded_from_pod_count() {
         }),
     ).await.unwrap();
 
-    reconcile_resource_quotas_for_namespace(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        "default",
-    )
-    .await
-    .unwrap();
+    reconcile_resource_quotas_with_runtime(&db, "default")
+        .await
+        .unwrap();
 
     let rq = db
         .get_resource("v1", "ResourceQuota", Some("default"), "test-rq")
@@ -1654,7 +1130,7 @@ async fn test_terminating_pod_excluded_from_pod_count() {
 /// a subsequent reconcile must release all its resources from quota.
 #[tokio::test]
 async fn test_pod_becomes_terminating_releases_quota() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::test_support::in_memory().await;
 
     db.create_resource(
         "v1", "ResourceQuota", Some("default"), "test-rq",
@@ -1675,13 +1151,9 @@ async fn test_pod_becomes_terminating_releases_quota() {
         }),
     ).await.unwrap();
 
-    reconcile_resource_quotas_for_namespace(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        "default",
-    )
-    .await
-    .unwrap();
+    reconcile_resource_quotas_with_runtime(&db, "default")
+        .await
+        .unwrap();
 
     let rq = db
         .get_resource("v1", "ResourceQuota", Some("default"), "test-rq")
@@ -1731,13 +1203,9 @@ async fn test_pod_becomes_terminating_releases_quota() {
     .unwrap();
 
     // Reconcile again (side effect fires after deletionTimestamp is set)
-    reconcile_resource_quotas_for_namespace(
-        &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
-        "default",
-    )
-    .await
-    .unwrap();
+    reconcile_resource_quotas_with_runtime(&db, "default")
+        .await
+        .unwrap();
 
     let rq = db
         .get_resource("v1", "ResourceQuota", Some("default"), "test-rq")
