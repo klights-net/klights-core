@@ -31,7 +31,7 @@ fn publish_leadership_if_changed(
 pub struct BootstrapPhase {
     pub _node_lifecycle_start_resource_version: i64,
     pub pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
-    pub pod_api_service: Arc<crate::pod_api_service::PodApiService>,
+    pub pod_api_service: Arc<k8s_native_service::PodApiService>,
     pub pod_scheduling: Arc<dyn klights_pod_api::PodScheduling>,
     pub crd_registry_watch_handle: SupervisedJoinHandle<()>,
     pub leader_peer_endpoint_observer_handle: Option<SupervisedJoinHandle<()>>,

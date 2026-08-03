@@ -37,8 +37,10 @@ impl klights_cluster_store::PodUidPreconditionRead for dyn crate::datastore::Dat
         })
     }
 }
-use crate::pod_api_service::{PodApiService, PodApiServiceDependencies};
-use crate::pod_native_orchestration::{PodNativeOrchestration, PodNativeOrchestrationDependencies};
+use k8s_native_service::{
+    PodApiService, PodApiServiceDependencies, PodNativeOrchestration,
+    PodNativeOrchestrationDependencies, PodSubresourceService,
+};
 use klights_controllers::side_effects::SideEffectMetrics;
 use klights_controllers::side_effects::SideEffectRegistry;
 use klights_leader_api::LeaderResourceQuery;
@@ -100,7 +102,7 @@ struct RootPodRepositoryComposition {
 pub(crate) struct RootPodRepositoryParts {
     pub repository_parts: crate::kubelet::pod_repository::facade::PodRepositoryParts,
     pub api: Arc<PodApiService>,
-    pub subresource: Arc<crate::pod_subresource_service::PodSubresourceService>,
+    pub subresource: Arc<PodSubresourceService>,
     pub scheduling: Arc<dyn klights_pod_api::PodScheduling>,
 }
 
@@ -912,7 +914,7 @@ impl RootPodRepositoryComposition {
     ) -> (
         PodRepositoryAdapters,
         Arc<PodApiService>,
-        Arc<crate::pod_subresource_service::PodSubresourceService>,
+        Arc<PodSubresourceService>,
         Arc<dyn klights_pod_api::PodScheduling>,
     ) {
         let pod_reconcile = Arc::new(
@@ -947,7 +949,7 @@ impl RootPodRepositoryComposition {
                 self.side_effects.clone(),
                 self.metrics.clone(),
             );
-        let subresource = Arc::new(crate::pod_subresource_service::PodSubresourceService::new(
+        let subresource = Arc::new(PodSubresourceService::new(
             pod_query.clone(),
             persistence.clone(),
             status_persistence.clone(),

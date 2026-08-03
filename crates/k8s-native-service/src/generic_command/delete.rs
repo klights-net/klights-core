@@ -190,14 +190,15 @@ mod tests {
         .unwrap();
         assert!(matches!(
             ensure_delete_preconditions_match(&resource, &ResourcePreconditions::uid("other")),
-            Err(AppError::Conflict(_))
+            Err(AppError::Conflict(message)) if message == "UID precondition failed"
         ));
         assert!(matches!(
             ensure_delete_preconditions_match(
                 &resource,
                 &ResourcePreconditions::resource_version(8)
             ),
-            Err(AppError::Conflict(_))
+            Err(AppError::Conflict(message))
+                if message == "resourceVersion precondition failed: expected 8 got 7"
         ));
     }
 }

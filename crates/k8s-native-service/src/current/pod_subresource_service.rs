@@ -10,14 +10,14 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
-use k8s_native_service::apply_patch;
+use super::helpers::apply_patch;
 use klights_cluster_core::Resource;
 use klights_pod_api::{
     PodGetRequest, PodPersistence, PodPersistenceReplaceRequest, PodQuery, PodRepositoryError,
     PodStatusPatchKind, PodStatusPersistence, PodStatusWriteRequest,
 };
 
-pub(crate) struct PodSubresourceService {
+pub struct PodSubresourceService {
     pod_query: Arc<dyn PodQuery>,
     persistence: Arc<dyn PodPersistence>,
     status_persistence: Arc<dyn PodStatusPersistence>,
@@ -25,7 +25,7 @@ pub(crate) struct PodSubresourceService {
 }
 
 impl PodSubresourceService {
-    pub(crate) fn new(
+    pub fn new(
         pod_query: Arc<dyn PodQuery>,
         persistence: Arc<dyn PodPersistence>,
         status_persistence: Arc<dyn PodStatusPersistence>,
@@ -329,29 +329,87 @@ mod tests {
     use serde_json::json;
 
     use super::PodSubresourceService;
-    use crate::kubelet::pod_repository::state_only_writer::StatusOnlyWriterService;
-    use crate::kubelet::pod_repository::store::PodStore;
     use klights_pod_api::{
-        PodPersistence, PodPersistenceCreateRequest, PodPersistenceReplaceRequest,
-        PodRepositoryError, PodRepositoryFuture, PodStatusPatchKind, PodStatusPersistence,
-        PodStatusWriteRequest, PodSubresourceMutation,
+        PodGetRequest, PodListRequest, PodListResult, PodOwnerListRequest, PodPersistence,
+        PodPersistenceCreateRequest, PodPersistenceReplaceRequest, PodQuery, PodRepositoryError,
+        PodRepositoryFuture, PodStatusPatchKind, PodStatusPersistence, PodStatusWriteRequest,
+        PodSubresourceMutation,
     };
 
-    struct TestPodWrites {
-        store: Arc<PodStore>,
-        status: Arc<StatusOnlyWriterService>,
+    struct TestPodStore {
+        current: Mutex<klights_cluster_core::Resource>,
     }
 
-    impl PodPersistence for TestPodWrites {
+    impl TestPodStore {
+        fn new(body: serde_json::Value) -> Self {
+            Self {
+                current: Mutex::new(
+                    klights_cluster_core::Resource::try_from_data(Arc::new(body)).unwrap(),
+                ),
+            }
+        }
+
+        fn current(&self) -> klights_cluster_core::Resource {
+            self.current.lock().unwrap().clone()
+        }
+
+        fn replace(
+            &self,
+            mut body: serde_json::Value,
+            expected_resource_version: i64,
+        ) -> Result<klights_cluster_core::Resource, PodRepositoryError> {
+            let mut current = self.current.lock().unwrap();
+            if current.resource_version != expected_resource_version {
+                return Err(PodRepositoryError::conflict(
+                    "the Pod resourceVersion does not match the current object",
+                ));
+            }
+            body.pointer_mut("/metadata/resourceVersion")
+                .expect("test Pod has metadata.resourceVersion")
+                .clone_from(&json!((expected_resource_version + 1).to_string()));
+            let updated = klights_cluster_core::Resource::try_from_data(Arc::new(body)).unwrap();
+            *current = updated.clone();
+            Ok(updated)
+        }
+    }
+
+    impl PodQuery for TestPodStore {
+        fn get_pod(
+            &self,
+            request: PodGetRequest,
+        ) -> PodRepositoryFuture<'_, Option<klights_cluster_core::Resource>> {
+            Box::pin(async move {
+                let current = self.current();
+                let matches = current.namespace.as_deref() == Some(request.namespace())
+                    && current.name == request.name()
+                    && request.uid().is_none_or(|uid| uid == current.uid);
+                Ok(matches.then_some(current))
+            })
+        }
+
+        fn list_pods(&self, _request: PodListRequest) -> PodRepositoryFuture<'_, PodListResult> {
+            Box::pin(async move {
+                let current = self.current();
+                PodListResult::try_new(vec![current.clone()], current.resource_version, None, None)
+            })
+        }
+
+        fn list_pods_by_owner_uid(
+            &self,
+            _request: PodOwnerListRequest,
+        ) -> PodRepositoryFuture<'_, Vec<klights_cluster_core::Resource>> {
+            Box::pin(async move { Ok(vec![self.current()]) })
+        }
+    }
+
+    impl PodPersistence for TestPodStore {
         fn create_pod(
             &self,
             request: PodPersistenceCreateRequest,
         ) -> PodRepositoryFuture<'_, klights_cluster_core::Resource> {
             Box::pin(async move {
-                self.store
-                    .create(&request.namespace, &request.name, request.body)
-                    .await
-                    .map_err(|error| PodRepositoryError::internal(error.to_string()))
+                let expected = self.current().resource_version;
+                self.replace(request.body, expected)
             })
         }
 
@@ -359,52 +417,34 @@ mod tests {
             &self,
             request: PodPersistenceReplaceRequest,
         ) -> PodRepositoryFuture<'_, klights_cluster_core::Resource> {
-            Box::pin(async move {
-                self.store
-                    .update(
-                        &request.namespace,
-                        &request.name,
-                        request.body,
-                        request.expected_resource_version,
-                    )
-                    .await
-                    .map_err(|error| PodRepositoryError::internal(error.to_string()))
-            })
+            Box::pin(async move { self.replace(request.body, request.expected_resource_version) })
         }
 
         fn replace_pod_including_status(
             &self,
             request: PodPersistenceReplaceRequest,
         ) -> PodRepositoryFuture<'_, klights_cluster_core::Resource> {
-            Box::pin(async move {
-                self.store
-                    .update_including_status_for_scheduler(
-                        &request.namespace,
-                        &request.name,
-                        request.body,
-                        request.expected_resource_version,
-                    )
-                    .await
-                    .map_err(|error| PodRepositoryError::internal(error.to_string()))
-            })
+            Box::pin(async move { self.replace(request.body, request.expected_resource_version) })
         }
     }
 
-    impl PodStatusPersistence for TestPodWrites {
+    impl PodStatusPersistence for TestPodStore {
         fn write_pod_status(
             &self,
             request: PodStatusWriteRequest,
         ) -> PodRepositoryFuture<'_, klights_cluster_core::Resource> {
             Box::pin(async move {
-                crate::kubelet::pod_repository::state_only_writer::StateOnlyWriter::write_status(
-                    self.status.as_ref(),
-                    &request.namespace,
-                    &request.name,
-                    request.status,
-                    request.expected_resource_version,
+                let current = self.current();
+                let mut body = Arc::unwrap_or_clone(current.data);
+                body.as_object_mut()
+                    .expect("test Pod is an object")
+                    .insert("status".to_string(), request.status);
+                self.replace(
+                    body,
+                    request
+                        .expected_resource_version
+                        .unwrap_or(current.resource_version),
                 )
-                .await
-                .map_err(|error| PodRepositoryError::internal(error.to_string()))
             })
         }
     }
@@ -429,48 +469,36 @@ mod tests {
     #[tokio::test]
     async fn api_status_replace_and_patch_emit_focused_status_changed_reconcile() {
         for operation in ["replace", "patch"] {
-            let (_datastore, db) = crate::datastore::test_support::in_memory_with_handle().await;
-            let store = Arc::new(PodStore::new(db.clone()));
-            let status_only = Arc::new(StatusOnlyWriterService::new(store.clone()));
-            let writes = Arc::new(TestPodWrites {
-                store: store.clone(),
-                status: status_only,
-            });
+            let store = Arc::new(TestPodStore::new(json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "node-agent",
+                    "namespace": "default",
+                    "uid": "pod-node-agent",
+                    "resourceVersion": "7",
+                    "ownerReferences": [{
+                        "apiVersion": "apps/v1",
+                        "kind": "DaemonSet",
+                        "name": "node-agent",
+                        "uid": "ds-node-agent",
+                        "controller": true
+                    }]
+                },
+                "spec": {
+                    "nodeName": "node-a",
+                    "containers": [{"name": "agent", "image": "busybox"}]
+                },
+                "status": {"phase": "Running"}
+            })));
             let reconcile = Arc::new(RecordingMutationReconcile::default());
             let service = PodSubresourceService::new(
                 store.clone(),
-                writes.clone(),
-                writes,
+                store.clone(),
+                store.clone(),
                 reconcile.clone(),
             );
-            let created = store
-                .create(
-                    "default",
-                    "node-agent",
-                    json!({
-                        "apiVersion": "v1",
-                        "kind": "Pod",
-                        "metadata": {
-                            "name": "node-agent",
-                            "namespace": "default",
-                            "uid": "pod-node-agent",
-                            "ownerReferences": [{
-                                "apiVersion": "apps/v1",
-                                "kind": "DaemonSet",
-                                "name": "node-agent",
-                                "uid": "ds-node-agent",
-                                "controller": true
-                            }]
-                        },
-                        "spec": {
-                            "nodeName": "node-a",
-                            "containers": [{"name": "agent", "image": "busybox"}]
-                        },
-                        "status": {"phase": "Running"}
-                    }),
-                )
-                .await
-                .unwrap();
+            let created = store.current();
 
             match operation {
                 "replace" => {
@@ -521,38 +549,26 @@ mod tests {
 
     #[tokio::test]
     async fn stale_ephemeral_container_write_preserves_typed_conflict() {
-        let (_datastore, db) = crate::datastore::test_support::in_memory_with_handle().await;
-        let store = Arc::new(PodStore::new(db));
-        let status_only = Arc::new(StatusOnlyWriterService::new(store.clone()));
-        let writes = Arc::new(TestPodWrites {
-            store: store.clone(),
-            status: status_only,
-        });
+        let store = Arc::new(TestPodStore::new(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "debuggable",
+                "namespace": "default",
+                "uid": "pod-debuggable",
+                "resourceVersion": "9"
+            },
+            "spec": {
+                "containers": [{"name": "main", "image": "busybox"}]
+            }
+        })));
         let service = PodSubresourceService::new(
             store.clone(),
-            writes.clone(),
-            writes,
+            store.clone(),
+            store.clone(),
             Arc::new(RecordingMutationReconcile::default()),
         );
-        let created = store
-            .create(
-                "default",
-                "debuggable",
-                json!({
-                    "apiVersion": "v1",
-                    "kind": "Pod",
-                    "metadata": {
-                        "name": "debuggable",
-                        "namespace": "default",
-                        "uid": "pod-debuggable"
-                    },
-                    "spec": {
-                        "containers": [{"name": "main", "image": "busybox"}]
-                    }
-                }),
-            )
-            .await
-            .unwrap();
+        let created = store.current();
 
         let error = PodSubresourceMutation::update_ephemeral_containers(
             &service,

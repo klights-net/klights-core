@@ -28,11 +28,13 @@ pub mod watch;
 
 pub use current::{
     AdmissionContextRequest, AdmissionResourceStore, ApiRuntimeInputs, ApiRuntimePaths,
-    DeleteOptions, DeletePreconditions, NamespaceTerminationOutcome, NativeApiOuterLayers,
-    NativeApiRemoteNodeServices, apply_default_storage_class_admission,
-    apply_limitrange_defaults_to_pod, apply_patch, apply_pod_runtimeclass_admission,
-    apply_pod_service_account_defaults, apply_pod_spec_create_defaults, build_admission_context,
-    build_current_router, check_resource_quota_for_creation, check_resource_quota_for_pod_update,
+    DeleteOptions, DeletePreconditions, NamespaceCreateEligibility, NamespaceTerminationOutcome,
+    NativeApiOuterLayers, NativeApiRemoteNodeServices, PodApiService, PodApiServiceDependencies,
+    PodNativeOrchestration, PodNativeOrchestrationDependencies, PodSubresourceService,
+    apply_default_storage_class_admission, apply_limitrange_defaults_to_pod, apply_patch,
+    apply_pod_runtimeclass_admission, apply_pod_service_account_defaults,
+    apply_pod_spec_create_defaults, build_admission_context, build_current_router,
+    check_resource_quota_for_creation, check_resource_quota_for_pod_update, classify_namespace,
     compute_qos_class, enforce_limitrange_constraints_for_pod,
     enforce_limitrange_constraints_for_pvc, enforce_pod_security_admission,
     normalize_resource_for_storage, parse_delete_options_body, parse_delete_options_protobuf,

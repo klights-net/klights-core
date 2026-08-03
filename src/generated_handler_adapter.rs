@@ -53,15 +53,15 @@ impl BuiltinAdmissionDefaultsPort for GeneratedHandlerAdapter {
             let resource =
                 crate::datastore::DatastoreBackend::get_namespace(self.db.as_ref(), &namespace)
                     .await?;
-            match crate::namespace_admission::classify_namespace(
+            match k8s_native_service::classify_namespace(
                 &namespace,
                 resource.as_ref().map(|resource| resource.data.as_ref()),
             ) {
-                crate::namespace_admission::NamespaceCreateEligibility::Allowed => Ok(()),
-                crate::namespace_admission::NamespaceCreateEligibility::Missing => Err(
+                k8s_native_service::NamespaceCreateEligibility::Allowed => Ok(()),
+                k8s_native_service::NamespaceCreateEligibility::Missing => Err(
                     AppError::Forbidden(format!("namespace {namespace} not found")),
                 ),
-                crate::namespace_admission::NamespaceCreateEligibility::Terminating => Err(
+                k8s_native_service::NamespaceCreateEligibility::Terminating => Err(
                     AppError::Forbidden(format!("namespace {namespace} is being terminated")),
                 ),
             }

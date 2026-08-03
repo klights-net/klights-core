@@ -1,17 +1,17 @@
 //! Framework-neutral Namespace lifecycle admission facts.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum NamespaceCreateEligibility {
+pub enum NamespaceCreateEligibility {
     Allowed,
     Missing,
     Terminating,
 }
 
-pub(crate) fn is_protected(name: &str) -> bool {
+fn is_protected(name: &str) -> bool {
     ["default", "kube-system", "kube-public", "kube-node-lease"].contains(&name)
 }
 
-pub(crate) fn classify_namespace(
+pub fn classify_namespace(
     namespace: &str,
     resource: Option<&serde_json::Value>,
 ) -> NamespaceCreateEligibility {

@@ -1,22 +1,17 @@
 //! Neutral Pod API and scheduling orchestration shared by focused services.
-//! pipeline (today the body of `src/pod_create.rs::create_pod_through_pipeline`
-//! and the Pod-specific arms of `namespaced_resource_handlers!`).
 //!
 //! Persistence, deletion, admission reads, placement, event emission, and
 //! reconciliation arrive through focused neutral capabilities. Concrete
 //! kubelet repositories, datastores, scheduler engines, and event writers
-//! remain behind root-owned adapters. The orchestration owner never schedules
+//! remain behind composition-owned adapters. The orchestration owner never schedules
 //! an unsupervised task or reaches those implementations directly.
-//!
-//! Implementations land in Tasks 11 (create), 12 (update/patch), and 13
-//! (delete + delete-collection).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use k8s_native_service::{
+use crate::{
     AdmissionContextRequest, AdmissionResourceStore, apply_limitrange_defaults_to_pod, apply_patch,
     apply_pod_runtimeclass_admission, apply_pod_service_account_defaults,
     apply_pod_spec_create_defaults, build_admission_context, check_resource_quota_for_creation,
@@ -25,7 +20,7 @@ use k8s_native_service::{
     run_admission_for_request, validate_builtin_resource_spec, validate_dns_subdomain,
     validate_pod_resource_requirements_immutable, validate_pod_sysctls,
 };
-use k8s_native_service::{AppError, DeleteOptions};
+use crate::{AppError, DeleteOptions};
 use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_pod_api::{
     PodActorFinalizeRequest, PodApiCreateResult, PodApiDeleteOutcome, PodApiWriteOutcome,
@@ -56,8 +51,7 @@ fn ensure_resource_preconditions_match(
     resource: &Resource,
     preconditions: &ResourcePreconditions,
 ) -> Result<(), AppError> {
-    crate::resource_preconditions::ensure_delete_preconditions_match(resource, preconditions)
-        .map_err(|error| AppError::Conflict(error.to_string()))
+    crate::generic_command::ensure_delete_preconditions_match(resource, preconditions)
 }
 
 fn pod_get_request(namespace: &str, name: &str) -> Result<PodGetRequest, AppError> {
@@ -139,13 +133,13 @@ struct InitialPodSchedulingState {
 }
 
 pub struct PodNativeOrchestration {
-    identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
+    identity: Arc<dyn crate::ApiIdentityGenerator>,
     pod_query: Arc<dyn PodQuery>,
     persistence: Arc<dyn PodPersistence>,
     deletion: Arc<dyn PodDeleteOrchestration>,
     admission_resources: Arc<dyn AdmissionResourceStore>,
     spec_validation: Arc<dyn PodSpecValidation>,
-    admission: Arc<dyn k8s_native_service::generic_command::ResourceAdmissionPort>,
+    admission: Arc<dyn crate::generic_command::ResourceAdmissionPort>,
     resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     quota_runtime: Arc<dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime>,
     supervisor: Arc<TaskSupervisor>,
@@ -156,13 +150,13 @@ pub struct PodNativeOrchestration {
 }
 
 pub struct PodNativeOrchestrationDependencies {
-    pub identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
+    pub identity: Arc<dyn crate::ApiIdentityGenerator>,
     pub pod_query: Arc<dyn PodQuery>,
     pub persistence: Arc<dyn PodPersistence>,
     pub deletion: Arc<dyn PodDeleteOrchestration>,
     pub admission_resources: Arc<dyn AdmissionResourceStore>,
     pub spec_validation: Arc<dyn PodSpecValidation>,
-    pub admission: Arc<dyn k8s_native_service::generic_command::ResourceAdmissionPort>,
+    pub admission: Arc<dyn crate::generic_command::ResourceAdmissionPort>,
     pub resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     pub quota_runtime: Arc<dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime>,
     pub supervisor: Arc<TaskSupervisor>,
@@ -208,11 +202,8 @@ impl PodNativeOrchestration {
         }
     }
 
-    /// Body of `src/pod_create.rs::create_pod_through_pipeline`, moved
-    /// into the repository. The single `("v1","Pod",...)` DB call is the
-    /// final `store.create(...)` — every other DB touch is admission,
-    /// quota, or limit-range helpers against other kinds, which legitimately
-    /// flow through `self.db`.
+    /// Run Pod creation validation, admission, defaults, quota checks, and
+    /// persistence through focused native-service capabilities.
     async fn api_create_pod(
         &self,
         request: PodApiCreateRequest,
@@ -233,19 +224,19 @@ impl PodNativeOrchestration {
             .admission_resources
             .get_admission_resource("v1", "Namespace", None, &namespace)
             .await?;
-        match crate::namespace_admission::classify_namespace(
+        match super::namespace_admission::classify_namespace(
             &namespace,
             namespace_resource
                 .as_ref()
                 .map(|resource| resource.data.as_ref()),
         ) {
-            crate::namespace_admission::NamespaceCreateEligibility::Allowed => {}
-            crate::namespace_admission::NamespaceCreateEligibility::Missing => {
+            super::namespace_admission::NamespaceCreateEligibility::Allowed => {}
+            super::namespace_admission::NamespaceCreateEligibility::Missing => {
                 return Err(AppError::Forbidden(format!(
                     "namespace {namespace} not found"
                 )));
             }
-            crate::namespace_admission::NamespaceCreateEligibility::Terminating => {
+            super::namespace_admission::NamespaceCreateEligibility::Terminating => {
                 return Err(AppError::Forbidden(format!(
                     "namespace {namespace} is being terminated"
                 )));
@@ -527,12 +518,8 @@ impl PodNativeOrchestration {
         Ok(())
     }
 
-    /// Body of the macro's Pod-update branch (today inlined into
-    /// `pod_handlers::update_pod`). Runs Pod-specific validation,
-    /// admission, immutability + quota checks, normalization, then
-    /// persists via `store.update(...)` with CAS. The handler keeps the
-    /// post-update side-effect calls (`maybe_hard_delete_pod_after_finalizers_drained`,
-    /// `reconcile_owner_refs_after_mutation`, `state.controller_reconcile().side_effects.run_hooks`).
+    /// Run Pod-specific update validation, admission, immutability and quota
+    /// checks, normalization, CAS persistence, and post-write reconciliation.
     pub async fn api_update_pod(
         &self,
         ns: &str,
@@ -609,9 +596,8 @@ impl PodNativeOrchestration {
         Ok(PodApiUpdateOutcome::Persisted(resource))
     }
 
-    /// Body of the macro's Pod-patch branch. Handles SSA-create when
-    /// `patch_type == ApplyPatch` against a missing pod (matches today's
-    /// generic handler). Other patch types against a missing pod return
+    /// Handle SSA-create when `patch_type == ApplyPatch` targets a missing
+    /// Pod. Other patch types against a missing Pod return
     /// 404. Includes the existing 20-attempt retry-on-409 loop with
     /// capped exponential backoff via `TaskSupervisor::sleep`.
     pub async fn api_patch_pod(
@@ -938,10 +924,8 @@ impl PodNativeOrchestration {
         Ok(PodApiDeleteOutcome::GracefulSet(updated))
     }
 
-    /// List all matching pods and call `api_delete_pod` for each. Mirrors
-    /// today's `delete_collection_*` macro arm semantics — best-effort
-    /// (errors logged, loop continues) and returns a Status:Success
-    /// response at the handler.
+    /// List all matching Pods and mark each for actor-owned deletion.
+    /// Individual failures are logged while the remaining Pods continue.
     pub async fn api_delete_collection_pods(
         &self,
         ns: &str,
@@ -1471,23 +1455,15 @@ impl klights_pod_api::PodApiMutation for PodNativeOrchestration {
     }
 }
 
-impl klights_kubelet::pod_repository::PodTerminationPort for PodNativeOrchestration {
-    fn mark_terminating(
-        &self,
-        target: klights_pod_api::PodMutationTarget,
-    ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
-        Box::pin(async move { self.mark_pod_terminating_for_repository(&target).await })
-    }
-}
-
 impl klights_pod_api::PodMarkTerminating for PodNativeOrchestration {
     fn mark_pod_terminating(
         &self,
         request: klights_pod_api::PodMarkTerminatingRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
-        klights_kubelet::pod_repository::PodRepositoryService::mark_pod_terminating_from(
-            self, request,
-        )
+        Box::pin(async move {
+            self.mark_pod_terminating_for_repository(request.target())
+                .await
+        })
     }
 }
 
@@ -1495,7 +1471,7 @@ impl GcPodDeleteSink for PodNativeOrchestration {
     fn request_gc_pod_delete(&self, request: GcPodDeleteRequest) -> GcPodDeleteFuture<'_> {
         Box::pin(async move {
             let identity = request.into_identity();
-            let options = k8s_native_service::DeleteOptions::with_uid_precondition(&identity.uid);
+            let options = DeleteOptions::with_uid_precondition(&identity.uid);
             match self
                 .api_delete_pod_for_gc(&identity.namespace, &identity.name, options, false)
                 .await
@@ -1559,5 +1535,156 @@ pub(crate) async fn classify_gc_pod_delete_error(
             )),
         },
         other => GcPodDeleteError::unavailable(format!("{other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::response::IntoResponse;
+    use serde_json::json;
+
+    use super::{classify_gc_pod_delete_error, map_api_error_to_pod_repository};
+    use crate::AppError;
+    use klights_cluster_core::Resource;
+    use klights_pod_api::{
+        PodGetRequest, PodListRequest, PodListResult, PodOwnerListRequest, PodQuery,
+        PodRepositoryFuture,
+    };
+    use klights_reconcile_api::GcPodDeleteError;
+    use klights_types::PodIdentity;
+
+    struct FakePodQuery {
+        pod: Option<Resource>,
+    }
+
+    impl PodQuery for FakePodQuery {
+        fn get_pod(&self, request: PodGetRequest) -> PodRepositoryFuture<'_, Option<Resource>> {
+            Box::pin(async move {
+                Ok(self.pod.clone().filter(|pod| {
+                    pod.namespace.as_deref() == Some(request.namespace())
+                        && pod.name == request.name()
+                        && request.uid().is_none_or(|uid| uid == pod.uid)
+                }))
+            })
+        }
+
+        fn list_pods(&self, _request: PodListRequest) -> PodRepositoryFuture<'_, PodListResult> {
+            Box::pin(async move { PodListResult::try_new(Vec::new(), 0, None, None) })
+        }
+
+        fn list_pods_by_owner_uid(
+            &self,
+            _request: PodOwnerListRequest,
+        ) -> PodRepositoryFuture<'_, Vec<Resource>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+    }
+
+    fn current_pod(uid: &str) -> Resource {
+        Resource::try_from_data(Arc::new(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": "current",
+                "uid": uid,
+                "resourceVersion": "7"
+            },
+            "spec": {"containers": [{"name": "c", "image": "pause"}]}
+        })))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn gc_delete_conflict_with_current_uid_is_retryable() {
+        let query = FakePodQuery {
+            pod: Some(current_pod("uid-current")),
+        };
+        for conflict in [
+            AppError::Conflict("resourceVersion conflict".to_string()),
+            AppError::Status {
+                code: axum::http::StatusCode::CONFLICT,
+                reason: "Conflict",
+                message: "admission conflict".to_string(),
+                details: json!({}),
+            },
+            AppError::Conflict("retry budget exhausted".to_string()),
+        ] {
+            let error = classify_gc_pod_delete_error(
+                &query,
+                &PodIdentity::new("default", "current", "uid-current"),
+                conflict,
+            )
+            .await;
+            assert!(matches!(error, GcPodDeleteError::Unavailable { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn gc_delete_conflict_with_replacement_uid_is_terminal() {
+        let error = classify_gc_pod_delete_error(
+            &FakePodQuery {
+                pod: Some(current_pod("uid-current")),
+            },
+            &PodIdentity::new("default", "current", "uid-old"),
+            AppError::Conflict("UID precondition conflict".to_string()),
+        )
+        .await;
+        assert!(matches!(error, GcPodDeleteError::IdentityChanged { .. }));
+    }
+
+    #[tokio::test]
+    async fn gc_delete_conflict_after_disappearance_is_terminal() {
+        let error = classify_gc_pod_delete_error(
+            &FakePodQuery { pod: None },
+            &PodIdentity::new("default", "absent", "uid-old"),
+            AppError::Conflict("delete conflict".to_string()),
+        )
+        .await;
+        assert!(matches!(error, GcPodDeleteError::NotFound { .. }));
+    }
+
+    #[test]
+    fn pod_repository_error_round_trips_kubernetes_http_categories() {
+        let cases = [
+            (AppError::BadRequest("bad".into()), 400),
+            (AppError::Forbidden("denied".into()), 403),
+            (AppError::NotFound("missing".into()), 404),
+            (AppError::Conflict("stale".into()), 409),
+            (AppError::UnprocessableEntity("invalid".into()), 422),
+            (AppError::InternalError("queue".into()), 500),
+            (AppError::ServiceUnavailable("leader".into()), 503),
+        ];
+        for (source, expected) in cases {
+            let leaf = map_api_error_to_pod_repository(source, "default", "web");
+            assert_eq!(
+                AppError::from(leaf).into_response().status().as_u16(),
+                expected
+            );
+        }
+
+        for code in [
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::http::StatusCode::FORBIDDEN,
+            axum::http::StatusCode::NOT_FOUND,
+            axum::http::StatusCode::CONFLICT,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let leaf = map_api_error_to_pod_repository(
+                AppError::Status {
+                    code,
+                    reason: "TestReason",
+                    message: format!("status {}", code.as_u16()),
+                    details: serde_json::Value::Null,
+                },
+                "default",
+                "web",
+            );
+            assert_eq!(AppError::from(leaf).into_response().status(), code);
+        }
     }
 }

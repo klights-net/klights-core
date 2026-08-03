@@ -33,12 +33,16 @@ mod handlers;
 pub mod helpers;
 pub(crate) mod metrics;
 mod namespace;
+mod namespace_admission;
 mod patch;
 #[cfg(test)]
 mod patch_tests;
+mod pod_api_service;
 mod pod_handlers;
+mod pod_native_orchestration;
 pub mod pod_repository_ports;
 mod pod_security;
+mod pod_subresource_service;
 pub mod pod_subresources;
 mod policy_input_adapters;
 pub mod query;
@@ -119,11 +123,15 @@ pub(in crate::current) use namespace::{
     create_namespace, delete_namespace, finalize_namespace, get_namespace, list_namespaces,
     patch_namespace, update_namespace,
 };
+pub use namespace_admission::{NamespaceCreateEligibility, classify_namespace};
+pub use pod_api_service::{PodApiService, PodApiServiceDependencies};
 pub(in crate::current) use pod_handlers::{
     create_pod, delete_collection_pods, delete_pod, get_pod, list_all_pods, list_pods, patch_pod,
     update_pod,
 };
+pub use pod_native_orchestration::{PodNativeOrchestration, PodNativeOrchestrationDependencies};
 pub use pod_security::enforce_pod_security_admission;
+pub use pod_subresource_service::PodSubresourceService;
 use query::{CreateUpdateQuery, DeleteCollectionQuery, ListQuery, process_continue_token_at};
 pub use quotas::{
     check_resource_quota_for_creation, check_resource_quota_for_pod_update,

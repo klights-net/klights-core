@@ -18,7 +18,7 @@ impl klights_kubelet::pod_events::PodEventQuery for DatastorePodEventAdapter<'_>
     ) -> anyhow::Result<klights_kubelet::pod_events::PodEventNamespaceEligibility> {
         let resource = self.db.get_namespace(namespace).await?;
         Ok(map_namespace_eligibility(
-            crate::namespace_admission::classify_namespace(
+            k8s_native_service::classify_namespace(
                 namespace,
                 resource.as_ref().map(|resource| resource.data.as_ref()),
             ),
@@ -82,7 +82,7 @@ impl klights_kubelet::pod_events::PodEventQuery for LeaderPodEventQuery<'_> {
             .await
             .map_err(anyhow::Error::new)?;
         Ok(map_namespace_eligibility(
-            crate::namespace_admission::classify_namespace(
+            k8s_native_service::classify_namespace(
                 namespace,
                 resource.as_ref().map(|resource| resource.data.as_ref()),
             ),
@@ -111,9 +111,9 @@ impl klights_kubelet::pod_events::PodEventQuery for LeaderPodEventQuery<'_> {
 }
 
 fn map_namespace_eligibility(
-    eligibility: crate::namespace_admission::NamespaceCreateEligibility,
+    eligibility: k8s_native_service::NamespaceCreateEligibility,
 ) -> klights_kubelet::pod_events::PodEventNamespaceEligibility {
-    use crate::namespace_admission::NamespaceCreateEligibility;
+    use k8s_native_service::NamespaceCreateEligibility;
     use klights_kubelet::pod_events::PodEventNamespaceEligibility;
 
     match eligibility {
