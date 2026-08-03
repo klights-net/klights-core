@@ -1,379 +1,79 @@
 //! Root composition for post-mutation side effects.
 
-use klights_controllers::side_effects::{ErrorPolicy, SideEffectMetrics, SideEffectRegistry};
+use std::sync::Arc;
 
-/// Run all registered hooks for `resource`, logging and counting any failure.
-///
-/// The HTTP handler must already have returned a success response — this
-/// function never propagates the error to the caller; it only makes failures
-/// observable via structured logs and the `metrics` counters.
-pub async fn run_hooks_logged(
-    registry: &SideEffectRegistry,
-    resource: &serde_json::Value,
-    metrics: &SideEffectMetrics,
-    context: &'static str,
-) {
-    let api_version = resource
-        .get("apiVersion")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let kind = resource
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let namespace = resource
-        .pointer("/metadata/namespace")
-        .and_then(|v| v.as_str())
-        .map(|value| value.to_string());
-    let name = resource
-        .pointer("/metadata/name")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+use klights_controllers::side_effects::{
+    ControllerDispatcherSlot, DefaultSideEffects, PodSideEffectPortsSlot, SideEffectMetrics,
+    SideEffectRegistry,
+};
 
-    let (failures, failed) = registry.run_hooks_collect_failures(resource).await;
-
-    for failure in &failures {
-        metrics.record_recent_failure(klights_controllers::side_effects::SideEffectFailureEntry {
-            api_version: api_version.clone(),
-            kind: kind.clone(),
-            namespace: namespace.clone(),
-            name: name.clone(),
-            hook: failure.hook.to_string(),
-            context: context.to_string(),
-            error: failure.error.clone(),
-        });
-    }
-
-    if failed {
-        metrics
-            .side_effect_failures_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(error) = failures.first() {
-            tracing::error!(
-                context,
-                hook = %error.hook,
-                error = %error.error,
-                "side-effect hooks failed"
-            );
-        } else {
-            tracing::error!(context, "side-effect hooks failed");
-        }
-        return;
-    }
-
-    if !failures.is_empty() {
-        tracing::warn!(
-            context,
-            side_effect_failures = failures.len(),
-            "side-effect hooks failed with non-fatal policy"
-        );
-    }
-}
-
-/// Run all registered delete hooks for `resource`, logging and counting any
-/// failure without propagating it back to the already-successful mutation.
-pub async fn run_delete_hooks_logged(
-    registry: &SideEffectRegistry,
-    resource: &serde_json::Value,
-    metrics: &SideEffectMetrics,
-    context: &'static str,
-) {
-    let api_version = resource
-        .get("apiVersion")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let kind = resource
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let namespace = resource
-        .pointer("/metadata/namespace")
-        .and_then(|v| v.as_str())
-        .map(|value| value.to_string());
-    let name = resource
-        .pointer("/metadata/name")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-
-    let (failures, failed) = registry.run_delete_hooks_collect_failures(resource).await;
-
-    for failure in &failures {
-        metrics.record_recent_failure(klights_controllers::side_effects::SideEffectFailureEntry {
-            api_version: api_version.clone(),
-            kind: kind.clone(),
-            namespace: namespace.clone(),
-            name: name.clone(),
-            hook: failure.hook.to_string(),
-            context: context.to_string(),
-            error: failure.error.clone(),
-        });
-    }
-
-    if failed {
-        metrics
-            .side_effect_failures_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(error) = failures.first() {
-            tracing::error!(
-                context,
-                hook = %error.hook,
-                error = %error.error,
-                "delete side-effect hooks failed"
-            );
-        } else {
-            tracing::error!(context, "delete side-effect hooks failed");
-        }
-        return;
-    }
-
-    if !failures.is_empty() {
-        tracing::warn!(
-            context,
-            side_effect_failures = failures.len(),
-            "delete side-effect hooks failed with non-fatal policy"
-        );
-    }
-}
-
-/// Run one registered hook by name for `resource`, logging and counting any
-/// failure with the same policy as `run_hooks_logged`.
-pub async fn run_named_hook_logged(
-    registry: &SideEffectRegistry,
-    resource: &serde_json::Value,
-    metrics: &SideEffectMetrics,
-    hook_name: &'static str,
-    context: &'static str,
-) {
-    let api_version = resource
-        .get("apiVersion")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let kind = resource
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let namespace = resource
-        .pointer("/metadata/namespace")
-        .and_then(|v| v.as_str())
-        .map(|value| value.to_string());
-    let name = resource
-        .pointer("/metadata/name")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-
-    let (failures, failed) = registry
-        .run_named_hook_collect_failures(resource, hook_name)
-        .await;
-
-    for failure in &failures {
-        metrics.record_recent_failure(klights_controllers::side_effects::SideEffectFailureEntry {
-            api_version: api_version.clone(),
-            kind: kind.clone(),
-            namespace: namespace.clone(),
-            name: name.clone(),
-            hook: failure.hook.to_string(),
-            context: context.to_string(),
-            error: failure.error.clone(),
-        });
-    }
-
-    if failed {
-        metrics
-            .side_effect_failures_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(error) = failures.first() {
-            tracing::error!(
-                context,
-                hook = %error.hook,
-                error = %error.error,
-                "side-effect hook failed"
-            );
-        } else {
-            tracing::error!(context, hook = hook_name, "side-effect hook failed");
-        }
-        return;
-    }
-
-    if !failures.is_empty() {
-        tracing::warn!(
-            context,
-            hook = hook_name,
-            side_effect_failures = failures.len(),
-            "side-effect hook failed with non-fatal policy"
-        );
-    }
-}
-
-/// Build the default side-effect registry used by both the production
-/// bootstrap and integration test fixtures.  Keeping the registration set
-/// in one place is what guarantees `cargo test` exercises the same hook
-/// fan-out the running server does.
-///
-/// `metrics` is wired into hooks (currently `namespace_termination`) that
-/// need to increment per-failure-mode counters from inside their `apply`
-/// path. Test fixtures pass a fresh `SideEffectMetrics::new()`; production
-/// passes the same `Arc<SideEffectMetrics>` that lives on `ApiState`.
-pub fn default_registry(
-    metrics: std::sync::Arc<SideEffectMetrics>,
-    services: Option<std::sync::Arc<dyn klights_network_api::ServiceRouter>>,
-    task_supervisor: Option<std::sync::Arc<klights_supervisor::TaskSupervisor>>,
+/// Construct the root-selected focused ports and hand the complete immutable
+/// effect bundle to the controller-owned registration policy.
+pub(crate) fn default_registry(
+    metrics: Arc<SideEffectMetrics>,
+    services: Option<Arc<dyn klights_network_api::ServiceRouter>>,
+    task_supervisor: Option<Arc<klights_supervisor::TaskSupervisor>>,
     db: Option<crate::datastore::DatastoreHandle>,
-    identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
+    identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
 ) -> SideEffectRegistry {
     let db = db.expect("default side-effect registry requires a datastore handle");
-    let mut registry = SideEffectRegistry::new();
-    let pod_slot = registry.pod_ports_slot();
-    let controller_slot = registry.controller_dispatcher_slot();
-    registry.register(
-        "v1",
-        "Endpoints",
-        crate::endpoint_mirror_side_effect_adapter::effect(db.clone(), identity.clone()),
-        ErrorPolicy::Warn,
-    );
-    registry.register(
-        "discovery.k8s.io/v1",
-        "EndpointSlice",
-        crate::endpoint_slice_sync_side_effect_adapter::effect(services),
-        ErrorPolicy::Warn,
-    );
-    let rq_effect = crate::resource_quota_side_effect_adapter::effect(db.clone(), pod_slot.clone());
-    for (api_version, kind) in [
-        ("v1", "Pod"),
-        ("v1", "ConfigMap"),
-        ("v1", "Secret"),
-        ("v1", "PersistentVolumeClaim"),
-        ("v1", "ServiceAccount"),
-        ("v1", "Service"),
-        ("v1", "ResourceQuota"),
-        ("v1", "LimitRange"),
-        ("v1", "ReplicationController"),
-        ("apps/v1", "Deployment"),
-        ("apps/v1", "ReplicaSet"),
-        ("apps/v1", "StatefulSet"),
-        ("apps/v1", "DaemonSet"),
-        ("batch/v1", "Job"),
-        ("batch/v1", "CronJob"),
-        ("policy/v1", "PodDisruptionBudget"),
-    ] {
-        registry.register(api_version, kind, rq_effect.clone(), ErrorPolicy::Warn);
-    }
-    registry.register(
-        "v1",
-        "ServiceAccount",
-        crate::service_account_defaults_side_effect_adapter::effect(db.clone(), identity),
-        ErrorPolicy::Warn,
-    );
-    registry.register(
-        "v1",
-        "Pod",
-        crate::workload_pod_side_effect_adapter::effect(db.clone(), controller_slot.clone()),
-        ErrorPolicy::Warn,
-    );
-    registry.register(
-        "v1",
-        "Pod",
-        crate::job_side_effect_adapter::effect(db.clone(), controller_slot.clone()),
-        ErrorPolicy::Warn,
-    );
-    registry.register(
-        "v1",
-        "Pod",
-        crate::pdb_side_effect_adapter::effect(db.clone(), pod_slot.clone()),
-        ErrorPolicy::Warn,
-    );
-    registry.register(
-        "v1",
-        "Pod",
-        crate::namespace_termination_adapter::effect(db.clone(), metrics),
-        ErrorPolicy::Warn,
-    );
-    let hpa_effect = crate::hpa_side_effect_adapter::effect(db.clone(), controller_slot.clone());
-    for (api_version, kind) in [
-        ("v1", "Pod"),
-        ("v1", "ReplicationController"),
-        ("apps/v1", "Deployment"),
-        ("apps/v1", "ReplicaSet"),
-        ("apps/v1", "StatefulSet"),
-    ] {
-        registry.register(api_version, kind, hpa_effect.clone(), ErrorPolicy::Warn);
-    }
-    registry.register(
-        "v1",
-        "Node",
-        crate::daemonset_node_side_effect_adapter::effect(db.clone(), controller_slot),
-        ErrorPolicy::Warn,
-    );
-    let apiservice_effect = crate::apiservice_side_effect_adapter::effect(
-        db.clone(),
-        registry.controller_dispatcher_slot(),
-    );
-    registry.register(
-        "apiregistration.k8s.io/v1",
-        "APIService",
-        apiservice_effect.clone(),
-        ErrorPolicy::Warn,
-    );
-    registry.register(
-        "v1",
-        "Service",
-        apiservice_effect.clone(),
-        ErrorPolicy::Warn,
-    );
-    registry.register(
-        "v1",
-        "Endpoints",
-        apiservice_effect.clone(),
-        ErrorPolicy::Warn,
-    );
-    registry.register(
-        "discovery.k8s.io/v1",
-        "EndpointSlice",
-        apiservice_effect,
-        ErrorPolicy::Warn,
-    );
-    registry.register(
-        "v1",
-        "Node",
-        crate::node_taint_manager_side_effect_adapter::node_taint_manager(
-            pod_slot,
-            task_supervisor,
-            Some(db),
+    let pod_slot = PodSideEffectPortsSlot::new();
+    let controller_slot = ControllerDispatcherSlot::new();
+    let namespace_store = crate::api_state_adapter::RootNamespaceTerminationStore::new(db.clone());
+    let namespace_reconciliation =
+        crate::api_state_adapter::RootNamespaceTerminationReconciler::new(namespace_store, metrics);
+    let effects = DefaultSideEffects::new(
+        klights_controllers::side_effects::apiservice::effect(
+            crate::apiservice_side_effect_adapter::port(db.clone()),
+            controller_slot.clone(),
         ),
-        ErrorPolicy::Warn,
+        klights_controllers::side_effects::daemonset_node::effect(
+            crate::daemonset_node_side_effect_adapter::port(db.clone()),
+            controller_slot.clone(),
+        ),
+        klights_controllers::side_effects::endpoint_mirror::effect(
+            crate::endpoint_mirror_side_effect_adapter::port(db.clone(), identity.clone()),
+        ),
+        klights_controllers::side_effects::endpoint_slice_sync::effect(services),
+        klights_controllers::side_effects::hpa::effect(
+            crate::hpa_side_effect_adapter::port(db.clone()),
+            controller_slot.clone(),
+        ),
+        klights_controllers::side_effects::job::effect(
+            crate::job_side_effect_adapter::port(db.clone()),
+            controller_slot.clone(),
+        ),
+        klights_controllers::side_effects::namespace_termination::effect(namespace_reconciliation),
+        klights_controllers::side_effects::node_taint_manager::effect(
+            pod_slot.clone(),
+            task_supervisor,
+            Some(crate::node_taint_manager_side_effect_adapter::port(
+                db.clone(),
+            )),
+        ),
+        klights_controllers::side_effects::pdb::effect(crate::pdb_side_effect_adapter::port(
+            db.clone(),
+            pod_slot.clone(),
+        )),
+        klights_controllers::side_effects::resource_quota::effect(
+            crate::resource_quota_side_effect_adapter::port(db.clone(), pod_slot.clone()),
+        ),
+        klights_controllers::side_effects::service_account_defaults::effect(
+            crate::service_account_defaults_side_effect_adapter::port(db.clone(), identity),
+        ),
+        klights_controllers::side_effects::workload_pod::effect(
+            crate::workload_pod_side_effect_adapter::port(db),
+            controller_slot.clone(),
+        ),
     );
-    registry
+    klights_controllers::side_effects::default_registry(effects, pod_slot, controller_slot)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use klights_controllers::side_effects::SideEffect;
     use serde_json::json;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
-
-    struct FailingHook;
-
-    #[async_trait]
-    impl SideEffect for FailingHook {
-        fn name(&self) -> &'static str {
-            "failing_hook"
-        }
-
-        async fn apply(&self, _resource: &serde_json::Value) -> anyhow::Result<()> {
-            anyhow::bail!("intentional failure")
-        }
-    }
 
     #[tokio::test]
     async fn node_side_effect_enqueues_daemonset_key_without_inline_reconcile() {
@@ -459,60 +159,6 @@ mod tests {
             .items
             .is_empty(),
             "node side effect must not run DaemonSet reconciliation inline"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_run_hooks_logged_increments_counter_on_failure() {
-        let mut registry = SideEffectRegistry::new();
-        registry.register(
-            "v1",
-            "Test",
-            Arc::new(FailingHook) as Arc<dyn SideEffect>,
-            ErrorPolicy::Fail,
-        );
-
-        let metrics = SideEffectMetrics::new();
-        let resource = json!({"apiVersion": "v1", "kind": "Test"});
-
-        run_hooks_logged(&registry, &resource, &metrics, "test").await;
-
-        assert_eq!(
-            metrics.side_effect_failures_total.load(Ordering::Relaxed),
-            1,
-            "counter must increment on hook failure"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_run_hooks_logged_does_not_panic_on_failure() {
-        let mut registry = SideEffectRegistry::new();
-        registry.register(
-            "v1",
-            "Test",
-            Arc::new(FailingHook) as Arc<dyn SideEffect>,
-            ErrorPolicy::Fail,
-        );
-
-        let metrics = SideEffectMetrics::new();
-        let resource = json!({"apiVersion": "v1", "kind": "Test"});
-
-        // Must complete without panicking even when the hook fails.
-        run_hooks_logged(&registry, &resource, &metrics, "test").await;
-    }
-
-    #[tokio::test]
-    async fn test_run_hooks_logged_no_increment_on_success() {
-        let registry = SideEffectRegistry::new(); // no hooks registered
-        let metrics = SideEffectMetrics::new();
-        let resource = json!({"apiVersion": "v1", "kind": "Test"});
-
-        run_hooks_logged(&registry, &resource, &metrics, "test").await;
-
-        assert_eq!(
-            metrics.side_effect_failures_total.load(Ordering::Relaxed),
-            0,
-            "counter must stay zero when no hooks fail"
         );
     }
 

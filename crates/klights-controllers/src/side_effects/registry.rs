@@ -154,6 +154,17 @@ impl SideEffectRegistry {
         }
     }
 
+    pub(super) fn with_slots(
+        pod_ports: PodSideEffectPortsSlot,
+        controller_dispatcher: ControllerDispatcherSlot,
+    ) -> Self {
+        Self {
+            hooks: HashMap::new(),
+            pod_ports,
+            controller_dispatcher,
+        }
+    }
+
     /// Borrow the potentially-empty focused Pod capability slot.
     pub fn pod_ports_slot(&self) -> PodSideEffectPortsSlot {
         self.pod_ports.clone()

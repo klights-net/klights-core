@@ -7,12 +7,60 @@ use klights_cluster_core::Resource;
 use klights_reconcile_api::ReconcileKey;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::Arc;
+
+use super::{ControllerDispatcherSlot, SideEffect};
 
 #[async_trait]
 pub trait WorkloadPodStore: Send + Sync {
     async fn get_replica_set(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
     async fn list_replica_sets(&self, namespace: &str) -> Result<Vec<Resource>>;
     async fn list_replication_controllers(&self, namespace: &str) -> Result<Vec<Resource>>;
+}
+
+struct WorkloadPodReconcileEffect {
+    store: Arc<dyn WorkloadPodStore>,
+    controller_dispatcher: ControllerDispatcherSlot,
+}
+
+#[async_trait]
+impl SideEffect for WorkloadPodReconcileEffect {
+    fn name(&self) -> &'static str {
+        "workload_pod_reconcile"
+    }
+
+    async fn apply(&self, resource: &Value) -> Result<()> {
+        let namespace = resource
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if namespace.is_empty() {
+            return Ok(());
+        }
+        let Some(dispatcher) = self.controller_dispatcher.get() else {
+            tracing::debug!(
+                "WorkloadPodReconcileEffect skipped for {}: controller dispatcher not yet bound",
+                namespace
+            );
+            return Ok(());
+        };
+        dispatcher
+            .enqueue_reconcile_batch(
+                workload_reconcile_keys_for_pod(resource, self.store.as_ref(), namespace).await?,
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+pub fn effect(
+    store: Arc<dyn WorkloadPodStore>,
+    controller_dispatcher: ControllerDispatcherSlot,
+) -> Arc<dyn SideEffect> {
+    Arc::new(WorkloadPodReconcileEffect {
+        store,
+        controller_dispatcher,
+    })
 }
 
 pub async fn workload_reconcile_keys_for_pod<Store: WorkloadPodStore + ?Sized>(

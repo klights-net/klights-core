@@ -543,6 +543,95 @@ mod tests {
     use super::*;
     use klights_leader_api::{AuthorityRoute, LeaderAuthority};
     use serde_json::json;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn root_namespace_termination_reconciler_is_the_controller_effect_port() {
+        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
+        let store = RootNamespaceTerminationStore::new(db_handle);
+        let reconciler = RootNamespaceTerminationReconciler::new(store, metrics);
+        let effect = klights_controllers::side_effects::namespace_termination::effect(reconciler);
+        assert_eq!(effect.name(), "namespace_termination");
+    }
+
+    #[tokio::test]
+    async fn root_namespace_termination_reconciler_shares_metrics_arc() {
+        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
+        let store = RootNamespaceTerminationStore::new(db_handle);
+        let _reconciler = RootNamespaceTerminationReconciler::new(store, metrics.clone());
+
+        metrics
+            .namespace_delete_failures_total
+            .fetch_add(7, Ordering::Relaxed);
+        assert_eq!(
+            metrics
+                .namespace_delete_failures_total
+                .load(Ordering::Relaxed),
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_namespace_termination_already_deleted_is_ok() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
+
+        k8s_native_service::reconcile_namespace_termination_at(
+            &db,
+            "ghost-ns",
+            metrics.as_ref(),
+            chrono::DateTime::UNIX_EPOCH,
+        )
+        .await
+        .expect("reconcile against missing namespace must be ok");
+
+        assert_eq!(
+            metrics
+                .namespace_delete_failures_total
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_namespace_termination_success_does_not_increment_counter() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
+        let ns_name = "term-test-ns";
+        db.create_namespace(
+            ns_name,
+            json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": ns_name,
+                    "deletionTimestamp": "2026-01-01T00:00:00.000000000Z"
+                },
+                "spec": {"finalizers": []},
+                "status": {"phase": "Terminating"}
+            }),
+        )
+        .await
+        .expect("create ns");
+
+        k8s_native_service::reconcile_namespace_termination_at(
+            &db,
+            ns_name,
+            metrics.as_ref(),
+            chrono::DateTime::UNIX_EPOCH,
+        )
+        .await
+        .expect("reconcile ok");
+
+        assert_eq!(
+            metrics
+                .namespace_delete_failures_total
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
 
     #[tokio::test]
     async fn stale_http_authority_scope_rejects_write_after_demote_promote_aba() {

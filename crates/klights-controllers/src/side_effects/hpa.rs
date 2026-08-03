@@ -6,10 +6,48 @@ use klights_cluster_core::Resource;
 use klights_reconcile_api::ReconcileKey;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::Arc;
+
+use super::{ControllerDispatcherSlot, SideEffect};
 
 #[async_trait]
 pub trait HpaSideEffectStore: Send + Sync {
     async fn list_hpas(&self, api_version: &'static str, namespace: &str) -> Result<Vec<Resource>>;
+}
+
+struct HpaReconcileEffect {
+    store: Arc<dyn HpaSideEffectStore>,
+    controller_dispatcher: ControllerDispatcherSlot,
+}
+
+#[async_trait]
+impl SideEffect for HpaReconcileEffect {
+    fn name(&self) -> &'static str {
+        "hpa_reconcile"
+    }
+
+    async fn apply(&self, resource: &Value) -> Result<()> {
+        let Some(dispatcher) = self.controller_dispatcher.get() else {
+            tracing::debug!("HpaReconcileEffect skipped: controller dispatcher not yet bound");
+            return Ok(());
+        };
+        dispatcher
+            .enqueue_reconcile_batch(
+                hpa_reconcile_keys_for_resource(resource, self.store.as_ref()).await?,
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+pub fn effect(
+    store: Arc<dyn HpaSideEffectStore>,
+    controller_dispatcher: ControllerDispatcherSlot,
+) -> Arc<dyn SideEffect> {
+    Arc::new(HpaReconcileEffect {
+        store,
+        controller_dispatcher,
+    })
 }
 
 pub async fn hpa_reconcile_keys_for_resource<Store: HpaSideEffectStore + ?Sized>(

@@ -507,7 +507,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             metrics.clone(),
         ),
     );
-    let side_effects = Arc::new(crate::side_effect_registry_composition::default_registry(
+    let side_effects = Arc::new(crate::bootstrap::side_effects::default_registry(
         metrics.clone(),
         Some(services.clone()),
         Some(supervisor.clone()),
@@ -909,11 +909,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             metrics.clone(),
             controller_coordination.clone(),
         );
-    let mutation_effects =
-        crate::resource_mutation_effects_adapter::ResourceMutationEffectsAdapter::new(
-            side_effects.clone(),
-            metrics.clone(),
-        );
+    let mutation_effects = klights_controllers::side_effects::ResourceMutationEffects::new(
+        side_effects.clone(),
+        metrics.clone(),
+    );
     let list_resource_versions =
         crate::list_query_adapter::DatastoreListResourceVersionPort::new(db_handle.clone());
     let gc_owner_lifecycle =

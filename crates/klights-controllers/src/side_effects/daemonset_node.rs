@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -7,9 +7,48 @@ use klights_cluster_core::Resource;
 use klights_reconcile_api::ReconcileKey;
 use serde_json::Value;
 
+use super::{ControllerDispatcherSlot, SideEffect};
+
 #[async_trait]
 pub trait DaemonSetNodeSideEffectStore: Send + Sync {
     async fn list_daemonsets(&self) -> Result<Vec<Resource>>;
+}
+
+struct DaemonSetNodeReconcile {
+    store: Arc<dyn DaemonSetNodeSideEffectStore>,
+    controller_dispatcher: ControllerDispatcherSlot,
+    last_fingerprint: Mutex<HashMap<String, NodeSchedulingFingerprint>>,
+}
+
+#[async_trait]
+impl SideEffect for DaemonSetNodeReconcile {
+    fn name(&self) -> &'static str {
+        "daemonset_node_reconcile"
+    }
+
+    async fn apply(&self, node: &Value) -> Result<()> {
+        let Some(dispatcher) = self.controller_dispatcher.get() else {
+            tracing::debug!("daemonset_node_reconcile: controller dispatcher is not bound yet");
+            return Ok(());
+        };
+        dispatcher
+            .enqueue_reconcile_batch(
+                reconcile_keys_for_node(node, self.store.as_ref(), &self.last_fingerprint).await?,
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+pub fn effect(
+    store: Arc<dyn DaemonSetNodeSideEffectStore>,
+    controller_dispatcher: ControllerDispatcherSlot,
+) -> Arc<dyn SideEffect> {
+    Arc::new(DaemonSetNodeReconcile {
+        store,
+        controller_dispatcher,
+        last_fingerprint: Mutex::new(HashMap::new()),
+    })
 }
 
 /// Cached fingerprint of scheduling-relevant node fields. When these don't

@@ -2,20 +2,17 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::Value;
 
 use crate::datastore::{DatastoreBackend, DatastoreHandle};
-use klights_controllers::side_effects::resource_quota::{
-    ResourceQuotaSideEffectPort, apply_resource_quota_event,
-};
-use klights_controllers::side_effects::{PodSideEffectPortsSlot, SideEffect};
+use klights_controllers::side_effects::PodSideEffectPortsSlot;
+use klights_controllers::side_effects::resource_quota::ResourceQuotaSideEffectPort;
 use klights_pod_api::PodQuery;
 
 /// Recounts ResourceQuota status.used after any namespaced resource mutation.
 ///
 /// The late-bound repository is resolved for every event so construction
 /// order remains independent and pod-scoped counts always use `PodReader`.
-struct ResourceQuotaEffect {
+struct RootResourceQuotaSideEffectPort {
     db: DatastoreHandle,
     pod_repository: PodSideEffectPortsSlot,
 }
@@ -38,41 +35,29 @@ impl ResourceQuotaSideEffectPort for BoundResourceQuotaPort<'_> {
 }
 
 #[async_trait]
-impl SideEffect for ResourceQuotaEffect {
-    fn name(&self) -> &'static str {
-        "resource_quota_recount"
-    }
-
-    async fn apply(&self, resource: &Value) -> Result<()> {
+impl ResourceQuotaSideEffectPort for RootResourceQuotaSideEffectPort {
+    async fn recount_namespace(&self, namespace: &str) -> Result<()> {
         let Some(pod_query) = self.pod_repository.query() else {
-            let namespace = resource
-                .pointer("/metadata/namespace")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if !namespace.is_empty() {
-                tracing::debug!(
-                    "ResourceQuotaEffect skipped for {}: PodRepository not yet bound",
-                    namespace
-                );
-            }
+            tracing::debug!(
+                "ResourceQuotaEffect skipped for {}: PodRepository not yet bound",
+                namespace
+            );
             return Ok(());
         };
-        apply_resource_quota_event(
-            resource,
-            &BoundResourceQuotaPort {
-                db: self.db.as_ref(),
-                pod_query: pod_query.as_ref(),
-            },
-        )
+        BoundResourceQuotaPort {
+            db: self.db.as_ref(),
+            pod_query: pod_query.as_ref(),
+        }
+        .recount_namespace(namespace)
         .await
     }
 }
 
-pub(crate) fn effect(
+pub(crate) fn port(
     db: DatastoreHandle,
     pod_repository: PodSideEffectPortsSlot,
-) -> Arc<dyn SideEffect> {
-    Arc::new(ResourceQuotaEffect { db, pod_repository })
+) -> Arc<dyn ResourceQuotaSideEffectPort> {
+    Arc::new(RootResourceQuotaSideEffectPort { db, pod_repository })
 }
 
 #[cfg(test)]
@@ -80,10 +65,10 @@ mod adapter_tests {
     #[tokio::test]
     async fn test_resource_quota_recount_name() {
         let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-        let effect = super::effect(
+        let effect = klights_controllers::side_effects::resource_quota::effect(super::port(
             db_handle,
             klights_controllers::side_effects::PodSideEffectPortsSlot::new(),
-        );
+        ));
         assert_eq!(effect.name(), "resource_quota_recount");
     }
 }

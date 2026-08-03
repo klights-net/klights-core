@@ -2564,7 +2564,7 @@ async fn build_repo_with_bound_side_effects() -> Arc<super::PodRepository> {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-    let side_effects = Arc::new(crate::side_effect_registry_composition::default_registry(
+    let side_effects = Arc::new(crate::bootstrap::side_effects::default_registry(
         metrics.clone(),
         None,
         Some(supervisor.clone()),
@@ -2810,7 +2810,7 @@ async fn build_repo_with_dispatcher() -> (
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-    let side_effects = Arc::new(crate::side_effect_registry_composition::default_registry(
+    let side_effects = Arc::new(crate::bootstrap::side_effects::default_registry(
         metrics.clone(),
         None,
         Some(supervisor.clone()),

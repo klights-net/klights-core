@@ -1,27 +1,18 @@
 use std::sync::Arc;
 
+use crate::datastore::{DatastoreBackend, DatastoreHandle};
 use anyhow::Result;
 use async_trait::async_trait;
-use klights_pod_api::{PodListRequest, PodQuery};
-use serde_json::Value;
-
-use crate::datastore::{DatastoreBackend, DatastoreHandle};
 use klights_controllers::pdb;
-use klights_controllers::side_effects::pdb::{
-    PdbSideEffectPort, apply_pdb_event, pdb_event_namespace,
-};
-use klights_controllers::side_effects::{PodSideEffectPortsSlot, SideEffect};
+use klights_controllers::side_effects::PodSideEffectPortsSlot;
+use klights_controllers::side_effects::pdb::PdbSideEffectPort;
+use klights_pod_api::{PodListRequest, PodQuery};
 
 #[cfg(test)]
 #[path = "controller_policy_tests/pdb.rs"]
 mod policy_tests;
 
-/// Updates PodDisruptionBudget status after Pod create/update/delete.
-///
-/// Registered only for `(v1, Pod)` — the registry handles the kind dispatch.
-/// The repository remains late-bound because the registry is constructed
-/// before the repository in bootstrap.
-struct PdbReconcileEffect {
+struct RootPdbSideEffectPort {
     db: DatastoreHandle,
     pod_repository: PodSideEffectPortsSlot,
 }
@@ -64,15 +55,8 @@ impl PdbSideEffectPort for BoundPdbPort<'_> {
 }
 
 #[async_trait]
-impl SideEffect for PdbReconcileEffect {
-    fn name(&self) -> &'static str {
-        "pdb_reconcile"
-    }
-
-    async fn apply(&self, resource: &Value) -> Result<()> {
-        let Some(namespace) = pdb_event_namespace(resource) else {
-            return Ok(());
-        };
+impl PdbSideEffectPort for RootPdbSideEffectPort {
+    async fn reconcile_namespace(&self, namespace: &str) -> Result<()> {
         let Some(pod_query) = self.pod_repository.query() else {
             tracing::debug!(
                 "PDBReconcileEffect skipped for {}: PodRepository not yet bound",
@@ -80,22 +64,20 @@ impl SideEffect for PdbReconcileEffect {
             );
             return Ok(());
         };
-        apply_pdb_event(
-            resource,
-            &BoundPdbPort {
-                db: self.db.as_ref(),
-                pod_query: pod_query.as_ref(),
-            },
-        )
+        BoundPdbPort {
+            db: self.db.as_ref(),
+            pod_query: pod_query.as_ref(),
+        }
+        .reconcile_namespace(namespace)
         .await
     }
 }
 
-pub(crate) fn effect(
+pub(crate) fn port(
     db: DatastoreHandle,
     pod_repository: PodSideEffectPortsSlot,
-) -> Arc<dyn SideEffect> {
-    Arc::new(PdbReconcileEffect { db, pod_repository })
+) -> Arc<dyn PdbSideEffectPort> {
+    Arc::new(RootPdbSideEffectPort { db, pod_repository })
 }
 
 #[cfg(test)]
@@ -103,10 +85,10 @@ mod adapter_tests {
     #[tokio::test]
     async fn test_pdb_reconcile_name() {
         let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-        let effect = super::effect(
+        let effect = klights_controllers::side_effects::pdb::effect(super::port(
             db_handle,
             klights_controllers::side_effects::PodSideEffectPortsSlot::new(),
-        );
+        ));
         assert_eq!(effect.name(), "pdb_reconcile");
     }
 }

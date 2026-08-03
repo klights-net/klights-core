@@ -5,33 +5,16 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::datastore::DatastoreHandle;
-use crate::side_effects::endpoint_mirror::EndpointMirrorStore;
 use klights_controllers::endpoints;
-use klights_controllers::side_effects::SideEffect;
+use klights_controllers::side_effects::endpoint_mirror::EndpointMirrorStore;
 
-/// Mirrors manually-created/updated Endpoints to EndpointSlices.
-struct EndpointMirrorEffect {
+struct RootEndpointMirrorStore {
     db: DatastoreHandle,
     identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
 }
 
 #[async_trait]
-impl SideEffect for EndpointMirrorEffect {
-    fn name(&self) -> &'static str {
-        "endpoint_mirror"
-    }
-
-    async fn apply(&self, resource: &Value) -> Result<()> {
-        self.mirror_endpoints(resource).await
-    }
-
-    async fn apply_delete(&self, resource: &Value) -> Result<()> {
-        self.delete_mirrored_endpointslice(resource).await
-    }
-}
-
-#[async_trait]
-impl EndpointMirrorStore for EndpointMirrorEffect {
+impl EndpointMirrorStore for RootEndpointMirrorStore {
     async fn mirror_endpoints(&self, resource: &Value) -> Result<()> {
         endpoints::mirror_endpoints_to_endpointslice_at(
             self.db.as_ref(),
@@ -47,9 +30,67 @@ impl EndpointMirrorStore for EndpointMirrorEffect {
     }
 }
 
-pub(crate) fn effect(
+pub(crate) fn port(
     db: DatastoreHandle,
     identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
-) -> Arc<dyn SideEffect> {
-    Arc::new(EndpointMirrorEffect { db, identity })
+) -> Arc<dyn EndpointMirrorStore> {
+    Arc::new(RootEndpointMirrorStore { db, identity })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn endpoint_mirror_delete_hook_removes_mirrored_slice() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
+        db.create_resource(
+            "discovery.k8s.io/v1",
+            "EndpointSlice",
+            Some("default"),
+            "manual-mirror",
+            serde_json::json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSlice",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "manual-mirror",
+                    "labels": {
+                        "endpointslice.kubernetes.io/managed-by": "endpointslicemirroring-controller.k8s.io"
+                    }
+                },
+                "addressType": "IPv4",
+                "endpoints": [],
+                "ports": []
+            }),
+        )
+        .await
+        .expect("create mirror slice");
+        let endpoints = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Endpoints",
+            "metadata": {"namespace": "default", "name": "manual"}
+        });
+
+        klights_controllers::side_effects::endpoint_mirror::effect(port(
+            db_handle,
+            crate::controllers::test_utils::deterministic_controller_identity(),
+        ))
+        .apply_delete(&endpoints)
+        .await
+        .expect("delete hook");
+
+        assert!(
+            db.get_resource(
+                "discovery.k8s.io/v1",
+                "EndpointSlice",
+                Some("default"),
+                "manual-mirror",
+            )
+            .await
+            .expect("get mirror")
+            .is_none()
+        );
+    }
 }

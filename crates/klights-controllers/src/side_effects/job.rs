@@ -1,14 +1,63 @@
 //! Side effect to reconcile Jobs after Pod mutations.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
 use klights_reconcile_api::ReconcileKey;
 use serde_json::Value;
 
+use super::{ControllerDispatcherSlot, SideEffect};
+
 #[async_trait]
 pub trait JobSideEffectStore: Send + Sync {
     async fn list_jobs(&self, namespace: &str) -> Result<Vec<Resource>>;
+}
+
+struct JobReconcileEffect {
+    store: Arc<dyn JobSideEffectStore>,
+    controller_dispatcher: ControllerDispatcherSlot,
+}
+
+#[async_trait]
+impl SideEffect for JobReconcileEffect {
+    fn name(&self) -> &'static str {
+        "job_reconcile"
+    }
+
+    async fn apply(&self, resource: &Value) -> Result<()> {
+        let namespace = resource
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if namespace.is_empty() {
+            return Ok(());
+        }
+        let Some(dispatcher) = self.controller_dispatcher.get() else {
+            tracing::debug!(
+                "JobReconcileEffect skipped for {}: controller dispatcher not yet bound",
+                namespace
+            );
+            return Ok(());
+        };
+        dispatcher
+            .enqueue_reconcile_batch(
+                job_reconcile_keys_for_pod(resource, self.store.as_ref(), namespace).await?,
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+pub fn effect(
+    store: Arc<dyn JobSideEffectStore>,
+    controller_dispatcher: ControllerDispatcherSlot,
+) -> Arc<dyn SideEffect> {
+    Arc::new(JobReconcileEffect {
+        store,
+        controller_dispatcher,
+    })
 }
 
 pub async fn job_reconcile_keys_for_pod<Store: JobSideEffectStore + ?Sized>(

@@ -776,14 +776,13 @@ async fn node_lost_cleanup_enqueues_owning_replicaset_after_node_lost_mark() {
             "10.43.128.0/17",
         )),
     ));
-    let side_effects =
-        std::sync::Arc::new(crate::side_effect_registry_composition::default_registry(
-            metrics.clone(),
-            None,
-            Some(supervisor.clone()),
-            Some(db_handle.clone()),
-            crate::controllers::test_utils::deterministic_controller_identity(),
-        ));
+    let side_effects = std::sync::Arc::new(crate::bootstrap::side_effects::default_registry(
+        metrics.clone(),
+        None,
+        Some(supervisor.clone()),
+        Some(db_handle.clone()),
+        crate::controllers::test_utils::deterministic_controller_identity(),
+    ));
     side_effects.set_controller_dispatcher(dispatcher.clone());
     let pod_repository = std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(
         db_handle,

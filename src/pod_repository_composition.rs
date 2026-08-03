@@ -943,7 +943,7 @@ impl RootPodRepositoryComposition {
         let placement: Arc<dyn klights_pod_api::PodPlacement> =
             Arc::new(klights_controllers::scheduler::SchedulerPlacement::new());
         let mutation_effects: Arc<dyn klights_reconcile_api::ResourceMutationEffectsPort> =
-            crate::resource_mutation_effects_adapter::ResourceMutationEffectsAdapter::new(
+            klights_controllers::side_effects::ResourceMutationEffects::new(
                 self.side_effects.clone(),
                 self.metrics.clone(),
             );

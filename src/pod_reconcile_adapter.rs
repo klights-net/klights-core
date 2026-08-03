@@ -96,7 +96,7 @@ impl PodMutationReconcileSink for PodReconcileAdapter {
                     context,
                 } => {
                     if let Some(hook_name) = named_hook {
-                        crate::side_effect_registry_composition::run_named_hook_logged(
+                        klights_controllers::side_effects::run_named_hook_logged(
                             &self.side_effects,
                             &pod.data,
                             &self.metrics,
@@ -105,7 +105,7 @@ impl PodMutationReconcileSink for PodReconcileAdapter {
                         )
                         .await;
                     } else {
-                        crate::side_effect_registry_composition::run_hooks_logged(
+                        klights_controllers::side_effects::run_hooks_logged(
                             &self.side_effects,
                             &pod.data,
                             &self.metrics,

@@ -2,37 +2,18 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::Value;
 
 use crate::datastore::DatastoreHandle;
 use klights_controllers::namespace;
-use klights_controllers::side_effects::SideEffect;
-use klights_controllers::side_effects::service_account_defaults::{
-    DefaultServiceAccountPort, apply_default_service_account_delete,
-};
+use klights_controllers::side_effects::service_account_defaults::DefaultServiceAccountPort;
 
-struct DefaultServiceAccountEffect {
+struct RootDefaultServiceAccountPort {
     db: DatastoreHandle,
     identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
 }
 
 #[async_trait]
-impl SideEffect for DefaultServiceAccountEffect {
-    fn name(&self) -> &'static str {
-        "default_serviceaccount"
-    }
-
-    async fn apply(&self, _resource: &Value) -> Result<()> {
-        Ok(())
-    }
-
-    async fn apply_delete(&self, resource: &Value) -> Result<()> {
-        apply_default_service_account_delete(resource, self).await
-    }
-}
-
-#[async_trait]
-impl DefaultServiceAccountPort for DefaultServiceAccountEffect {
+impl DefaultServiceAccountPort for RootDefaultServiceAccountPort {
     async fn ensure_default_service_account(&self, namespace: &str) -> Result<()> {
         namespace::reconcile_default_service_account_at(
             self.db.as_ref(),
@@ -44,9 +25,9 @@ impl DefaultServiceAccountPort for DefaultServiceAccountEffect {
     }
 }
 
-pub(crate) fn effect(
+pub(crate) fn port(
     db: DatastoreHandle,
     identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
-) -> Arc<dyn SideEffect> {
-    Arc::new(DefaultServiceAccountEffect { db, identity })
+) -> Arc<dyn DefaultServiceAccountPort> {
+    Arc::new(RootDefaultServiceAccountPort { db, identity })
 }

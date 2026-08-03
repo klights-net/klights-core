@@ -1,12 +1,35 @@
 //! Side effect to update PDB status after Pod mutations.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
+use super::SideEffect;
+
 #[async_trait]
 pub trait PdbSideEffectPort: Send + Sync {
     async fn reconcile_namespace(&self, namespace: &str) -> Result<()>;
+}
+
+struct PdbReconcileEffect {
+    port: Arc<dyn PdbSideEffectPort>,
+}
+
+#[async_trait]
+impl SideEffect for PdbReconcileEffect {
+    fn name(&self) -> &'static str {
+        "pdb_reconcile"
+    }
+
+    async fn apply(&self, resource: &Value) -> Result<()> {
+        apply_pdb_event(resource, self.port.as_ref()).await
+    }
+}
+
+pub fn effect(port: Arc<dyn PdbSideEffectPort>) -> Arc<dyn SideEffect> {
+    Arc::new(PdbReconcileEffect { port })
 }
 
 pub fn pdb_event_namespace(resource: &Value) -> Option<&str> {

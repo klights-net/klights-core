@@ -1,12 +1,39 @@
 //! Event-driven maintenance for namespace default ServiceAccounts.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
+use super::SideEffect;
+
 #[async_trait]
 pub trait DefaultServiceAccountPort: Send + Sync {
     async fn ensure_default_service_account(&self, namespace: &str) -> Result<()>;
+}
+
+struct DefaultServiceAccountEffect {
+    port: Arc<dyn DefaultServiceAccountPort>,
+}
+
+#[async_trait]
+impl SideEffect for DefaultServiceAccountEffect {
+    fn name(&self) -> &'static str {
+        "default_serviceaccount"
+    }
+
+    async fn apply(&self, _resource: &Value) -> Result<()> {
+        Ok(())
+    }
+
+    async fn apply_delete(&self, resource: &Value) -> Result<()> {
+        apply_default_service_account_delete(resource, self.port.as_ref()).await
+    }
+}
+
+pub fn effect(port: Arc<dyn DefaultServiceAccountPort>) -> Arc<dyn SideEffect> {
+    Arc::new(DefaultServiceAccountEffect { port })
 }
 
 pub async fn apply_default_service_account_delete<Port: DefaultServiceAccountPort + ?Sized>(

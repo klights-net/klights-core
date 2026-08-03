@@ -1,14 +1,55 @@
 //! Side effect to enqueue APIService availability reconciliation.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
 use klights_reconcile_api::ReconcileKey;
 use serde_json::Value;
 
+use super::{ControllerDispatcherSlot, SideEffect};
+
 #[async_trait]
 pub trait ApiServiceSideEffectStore: Send + Sync {
     async fn list_apiservices(&self) -> Result<Vec<Resource>>;
+}
+
+struct ApiServiceReconcileEffect {
+    store: Arc<dyn ApiServiceSideEffectStore>,
+    controller_dispatcher: ControllerDispatcherSlot,
+}
+
+#[async_trait]
+impl SideEffect for ApiServiceReconcileEffect {
+    fn name(&self) -> &'static str {
+        "apiservice_reconcile"
+    }
+
+    async fn apply(&self, resource: &Value) -> Result<()> {
+        let Some(dispatcher) = self.controller_dispatcher.get() else {
+            tracing::debug!(
+                "ApiServiceReconcileEffect skipped: controller dispatcher not yet bound"
+            );
+            return Ok(());
+        };
+        dispatcher
+            .enqueue_reconcile_batch(
+                apiservice_reconcile_keys_for_resource(resource, self.store.as_ref()).await?,
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+pub fn effect(
+    store: Arc<dyn ApiServiceSideEffectStore>,
+    controller_dispatcher: ControllerDispatcherSlot,
+) -> Arc<dyn SideEffect> {
+    Arc::new(ApiServiceReconcileEffect {
+        store,
+        controller_dispatcher,
+    })
 }
 
 pub async fn apiservice_reconcile_keys_for_resource<Store: ApiServiceSideEffectStore + ?Sized>(

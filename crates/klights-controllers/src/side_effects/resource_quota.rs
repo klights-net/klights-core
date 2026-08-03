@@ -1,12 +1,35 @@
 //! Side effect to recount ResourceQuota after namespaced resource mutations.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
+use super::SideEffect;
+
 #[async_trait]
 pub trait ResourceQuotaSideEffectPort: Send + Sync {
     async fn recount_namespace(&self, namespace: &str) -> Result<()>;
+}
+
+struct ResourceQuotaEffect {
+    port: Arc<dyn ResourceQuotaSideEffectPort>,
+}
+
+#[async_trait]
+impl SideEffect for ResourceQuotaEffect {
+    fn name(&self) -> &'static str {
+        "resource_quota_recount"
+    }
+
+    async fn apply(&self, resource: &Value) -> Result<()> {
+        apply_resource_quota_event(resource, self.port.as_ref()).await
+    }
+}
+
+pub fn effect(port: Arc<dyn ResourceQuotaSideEffectPort>) -> Arc<dyn SideEffect> {
+    Arc::new(ResourceQuotaEffect { port })
 }
 
 pub async fn apply_resource_quota_event<Port: ResourceQuotaSideEffectPort + ?Sized>(

@@ -16,14 +16,13 @@ pub(super) fn fixture_pod_repository(
     ));
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
-    let side_effects =
-        std::sync::Arc::new(crate::side_effect_registry_composition::default_registry(
-            metrics.clone(),
-            None,
-            Some(supervisor.clone()),
-            Some(db_handle.clone()),
-            crate::controllers::test_utils::deterministic_controller_identity(),
-        ));
+    let side_effects = std::sync::Arc::new(crate::bootstrap::side_effects::default_registry(
+        metrics.clone(),
+        None,
+        Some(supervisor.clone()),
+        Some(db_handle.clone()),
+        crate::controllers::test_utils::deterministic_controller_identity(),
+    ));
     let repo = std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(
         db_handle,
         supervisor,

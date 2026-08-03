@@ -28,7 +28,6 @@ mod endpoint_mirror_side_effect_adapter;
 mod endpoint_reconcile_adapter;
 #[cfg(test)]
 mod endpoint_reconcile_integration_tests;
-mod endpoint_slice_sync_side_effect_adapter;
 pub mod gc;
 mod gc_delete_adapter;
 #[cfg(test)]
@@ -46,7 +45,6 @@ mod job_store_adapter;
 pub mod kubelet;
 mod list_query_adapter;
 mod namespace_admission;
-mod namespace_termination_adapter;
 pub mod networking;
 mod networking_state_adapter;
 pub mod node_admin;
@@ -73,7 +71,6 @@ mod remote_informer_cache_adapter;
 mod replicaset_store_adapter;
 mod replicationcontroller_store_adapter;
 mod resource_admission_adapter;
-mod resource_mutation_effects_adapter;
 pub(crate) mod resource_name;
 mod resource_preconditions;
 mod resource_quota_admission_adapter;
@@ -88,8 +85,6 @@ mod service_reconcile_adapter;
 #[cfg(test)]
 mod service_reconcile_integration_tests;
 pub mod shutdown;
-mod side_effect_registry_composition;
-pub mod side_effects;
 mod signing_key_state_adapter;
 mod statefulset_store_adapter;
 pub mod version;

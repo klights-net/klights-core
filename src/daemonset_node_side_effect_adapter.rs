@@ -1,45 +1,18 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
-use serde_json::Value;
 
 use crate::datastore::{DatastoreHandle, ResourceListQuery};
-use klights_controllers::side_effects::daemonset_node::{
-    DaemonSetNodeSideEffectStore, NodeSchedulingFingerprint, reconcile_keys_for_node,
-};
-use klights_controllers::side_effects::{ControllerDispatcherSlot, SideEffect};
+use klights_controllers::side_effects::daemonset_node::DaemonSetNodeSideEffectStore;
 
-struct DaemonSetNodeReconcile {
+struct RootDaemonSetNodeSideEffectStore {
     db: DatastoreHandle,
-    controller_dispatcher: ControllerDispatcherSlot,
-    last_fingerprint: Mutex<HashMap<String, NodeSchedulingFingerprint>>,
 }
 
 #[async_trait]
-impl SideEffect for DaemonSetNodeReconcile {
-    fn name(&self) -> &'static str {
-        "daemonset_node_reconcile"
-    }
-
-    async fn apply(&self, node: &Value) -> Result<()> {
-        let Some(dispatcher) = self.controller_dispatcher.get() else {
-            tracing::debug!("daemonset_node_reconcile: controller dispatcher is not bound yet");
-            return Ok(());
-        };
-        dispatcher
-            .enqueue_reconcile_batch(
-                reconcile_keys_for_node(node, self, &self.last_fingerprint).await?,
-            )
-            .await?;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl DaemonSetNodeSideEffectStore for DaemonSetNodeReconcile {
+impl DaemonSetNodeSideEffectStore for RootDaemonSetNodeSideEffectStore {
     async fn list_daemonsets(&self) -> Result<Vec<Resource>> {
         self.db
             .list_resources("apps/v1", "DaemonSet", None, ResourceListQuery::all())
@@ -48,15 +21,8 @@ impl DaemonSetNodeSideEffectStore for DaemonSetNodeReconcile {
     }
 }
 
-pub(crate) fn effect(
-    db: DatastoreHandle,
-    controller_dispatcher: ControllerDispatcherSlot,
-) -> Arc<dyn SideEffect> {
-    Arc::new(DaemonSetNodeReconcile {
-        db,
-        controller_dispatcher,
-        last_fingerprint: Mutex::new(HashMap::new()),
-    })
+pub(crate) fn port(db: DatastoreHandle) -> Arc<dyn DaemonSetNodeSideEffectStore> {
+    Arc::new(RootDaemonSetNodeSideEffectStore { db })
 }
 
 #[cfg(test)]
@@ -72,7 +38,7 @@ mod tests {
             "10.43.128.0/17",
         ));
         let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
-        let slot = ControllerDispatcherSlot::new();
+        let slot = klights_controllers::side_effects::ControllerDispatcherSlot::new();
         slot.set(dispatcher.clone());
 
         let node = db
@@ -109,7 +75,10 @@ mod tests {
         .await
         .unwrap();
 
-        let effect = effect(db_handle.clone(), slot);
+        let effect = klights_controllers::side_effects::daemonset_node::effect(
+            port(db_handle.clone()),
+            slot,
+        );
         effect.apply(&node.data).await.unwrap();
         assert_eq!(
             dispatcher.queued_reconcile_keys_for_test().await,

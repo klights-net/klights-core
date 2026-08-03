@@ -28,6 +28,7 @@ pub(crate) mod runtime_inputs;
 pub(crate) mod scheduler_adapter;
 pub(crate) mod sequenced_datastore;
 pub(crate) mod service_adapters;
+pub(crate) mod side_effects;
 pub mod worker_identity;
 pub mod worker_runtime;
 pub mod worker_store_adapter;

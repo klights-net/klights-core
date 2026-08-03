@@ -1,3 +1,5 @@
+//! Adapter from mutation facts to the controller-owned side-effect runtime.
+
 use std::sync::Arc;
 
 use klights_reconcile_api::{
@@ -5,21 +7,20 @@ use klights_reconcile_api::{
     ResourceMutationEffectsRequest,
 };
 
-pub(crate) struct ResourceMutationEffectsAdapter {
-    registry: Arc<klights_controllers::side_effects::SideEffectRegistry>,
-    metrics: Arc<klights_controllers::side_effects::SideEffectMetrics>,
+use super::{SideEffectMetrics, SideEffectRegistry, run_delete_hooks_logged, run_hooks_logged};
+
+pub struct ResourceMutationEffects {
+    registry: Arc<SideEffectRegistry>,
+    metrics: Arc<SideEffectMetrics>,
 }
 
-impl ResourceMutationEffectsAdapter {
-    pub(crate) fn new(
-        registry: Arc<klights_controllers::side_effects::SideEffectRegistry>,
-        metrics: Arc<klights_controllers::side_effects::SideEffectMetrics>,
-    ) -> Arc<Self> {
+impl ResourceMutationEffects {
+    pub fn new(registry: Arc<SideEffectRegistry>, metrics: Arc<SideEffectMetrics>) -> Arc<Self> {
         Arc::new(Self { registry, metrics })
     }
 }
 
-impl ResourceMutationEffectsPort for ResourceMutationEffectsAdapter {
+impl ResourceMutationEffectsPort for ResourceMutationEffects {
     fn dispatch_resource_mutation_effects<'a>(
         &'a self,
         request: ResourceMutationEffectsRequest<'a>,
@@ -28,7 +29,7 @@ impl ResourceMutationEffectsPort for ResourceMutationEffectsAdapter {
             let _ = request.old_resource();
             match request.change() {
                 ResourceChange::Deleted => {
-                    crate::side_effect_registry_composition::run_delete_hooks_logged(
+                    run_delete_hooks_logged(
                         &self.registry,
                         request.resource(),
                         &self.metrics,
@@ -37,7 +38,7 @@ impl ResourceMutationEffectsPort for ResourceMutationEffectsAdapter {
                     .await;
                 }
                 ResourceChange::Created | ResourceChange::Updated => {
-                    crate::side_effect_registry_composition::run_hooks_logged(
+                    run_hooks_logged(
                         &self.registry,
                         request.resource(),
                         &self.metrics,

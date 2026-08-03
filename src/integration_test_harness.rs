@@ -1163,7 +1163,7 @@ impl NativeApiTestHarness {
             outbox_notify,
             Arc::new(klights_supervisor::SystemWallClock),
         ));
-        let side_effects = Arc::new(crate::side_effect_registry_composition::default_registry(
+        let side_effects = Arc::new(crate::bootstrap::side_effects::default_registry(
             metrics.clone(),
             None,
             Some(supervisor.clone()),
@@ -1217,11 +1217,10 @@ impl NativeApiTestHarness {
         let mutation_side_effects = mutation_side_effects_factory
             .map(|factory| factory(datastore.clone()))
             .unwrap_or_else(|| side_effects.clone());
-        let mutation_effects =
-            crate::resource_mutation_effects_adapter::ResourceMutationEffectsAdapter::new(
-                mutation_side_effects,
-                metrics.clone(),
-            );
+        let mutation_effects = klights_controllers::side_effects::ResourceMutationEffects::new(
+            mutation_side_effects,
+            metrics.clone(),
+        );
         let positioned_watch =
             crate::positioned_watch_adapter::for_test(&passive_reads, datastore.clone());
         let watch_signals = crate::watch_commit_observation_adapter::test_signal_source(&datastore);

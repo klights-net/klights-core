@@ -12,7 +12,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::side_effect_registry_composition::default_registry;
+use crate::bootstrap::side_effects::default_registry;
 use klights_controllers::side_effects::SideEffectMetrics;
 use klights_controllers::side_effects::SideEffectRegistry;
 
