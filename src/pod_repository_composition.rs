@@ -41,6 +41,7 @@ use k8s_native_service::{
     PodApiService, PodApiServiceDependencies, PodNativeOrchestration,
     PodNativeOrchestrationDependencies, PodSubresourceService,
 };
+use klights_cluster_datastore::diagnostics::{NoopResourceWrite, log_noop_resource_write};
 use klights_controllers::side_effects::SideEffectMetrics;
 use klights_controllers::side_effects::SideEffectRegistry;
 use klights_leader_api::LeaderResourceQuery;
@@ -661,18 +662,16 @@ impl crate::kubelet::pod_repository::store::PodPersistence for RootPodPersistenc
         name: &str,
         resource: &klights_cluster_core::Resource,
     ) {
-        crate::resource_write_diagnostics::log_noop_resource_write(
-            crate::resource_write_diagnostics::NoopResourceWrite {
-                operation: "pod_store_update_status",
-                api_version: "v1",
-                kind: "Pod",
-                namespace: Some(namespace),
-                name,
-                uid: &resource.uid,
-                resource_version: resource.resource_version,
-                reason: "pod status unchanged",
-            },
-        );
+        log_noop_resource_write(NoopResourceWrite {
+            operation: "pod_store_update_status",
+            api_version: "v1",
+            kind: "Pod",
+            namespace: Some(namespace),
+            name,
+            uid: &resource.uid,
+            resource_version: resource.resource_version,
+            reason: "pod status unchanged",
+        });
     }
 
     #[cfg(test)]

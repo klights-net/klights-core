@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
+use klights_cluster_datastore::diagnostics::{NoopResourceWrite, log_noop_resource_write};
 use serde_json::json;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
@@ -274,18 +275,16 @@ impl ControllerStatusStore for dyn DatastoreBackend + '_ {
         resource: &Resource,
         reason: &'static str,
     ) {
-        crate::resource_write_diagnostics::log_noop_resource_write(
-            crate::resource_write_diagnostics::NoopResourceWrite {
-                operation,
-                api_version: &resource.api_version,
-                kind: &resource.kind,
-                namespace: resource.namespace.as_deref(),
-                name: &resource.name,
-                uid: &resource.uid,
-                resource_version: resource.resource_version,
-                reason,
-            },
-        );
+        log_noop_resource_write(NoopResourceWrite {
+            operation,
+            api_version: &resource.api_version,
+            kind: &resource.kind,
+            namespace: resource.namespace.as_deref(),
+            name: &resource.name,
+            uid: &resource.uid,
+            resource_version: resource.resource_version,
+            reason,
+        });
     }
 }
 

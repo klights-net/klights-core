@@ -43,7 +43,6 @@ pub(crate) mod pod_repository_composition;
 mod positioned_watch_adapter;
 mod remote_informer_cache_adapter;
 mod resource_admission_adapter;
-mod resource_write_diagnostics;
 #[cfg(test)]
 mod service_pod_integration_tests;
 #[cfg(test)]
