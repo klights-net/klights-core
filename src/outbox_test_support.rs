@@ -69,7 +69,7 @@ pub fn outbox_with_notify(node_db: impl NodeLocalStoresRef, notify: Arc<Notify>)
     let node_db = node_db.node_local_stores();
     Outbox::compose(
         outbox_stores(node_db),
-        crate::outbox_payload_codec_adapter::new_codec(),
+        crate::bootstrap::composition_adapters::outbox_payload_codec_adapter::new_codec(),
         notify,
         Arc::new(klights_supervisor::SystemWallClock),
     )
@@ -90,7 +90,7 @@ pub fn dispatcher_with_notify(
     let node_db = node_db.node_local_stores();
     OutboxDispatcher::new(
         outbox_stores(node_db),
-        crate::outbox_payload_codec_adapter::new_codec(),
+        crate::bootstrap::composition_adapters::outbox_payload_codec_adapter::new_codec(),
         client,
         notify,
         Arc::new(klights_supervisor::SystemWallClock),
@@ -105,7 +105,7 @@ pub fn dispatcher_with_rtt_estimator(
     let node_db = node_db.node_local_stores();
     OutboxDispatcher::compose_with_rtt_estimator_for_test(
         outbox_stores(node_db),
-        crate::outbox_payload_codec_adapter::new_codec(),
+        crate::bootstrap::composition_adapters::outbox_payload_codec_adapter::new_codec(),
         client,
         Arc::new(Notify::new()),
         rtt,

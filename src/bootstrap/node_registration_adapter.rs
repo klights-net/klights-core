@@ -14,7 +14,10 @@ impl NodeRegistrationStore for DatastoreNodeRegistrationStore<'_> {
         node_name: &str,
         node: &mut serde_json::Value,
     ) -> Result<bool> {
-        crate::node_routing_metadata::stamp_from_store(self.db, node_name, node).await
+        crate::bootstrap::composition_adapters::node_routing_metadata::stamp_from_store(
+            self.db, node_name, node,
+        )
+        .await
     }
 
     async fn update_node(
@@ -57,7 +60,10 @@ impl NodeRegistrationStore for WorkerNodeRegistrationStore<'_> {
         node_name: &str,
         node: &mut serde_json::Value,
     ) -> Result<bool> {
-        crate::node_routing_metadata::stamp_from_network_metadata(self.store, node_name, node).await
+        crate::bootstrap::composition_adapters::node_routing_metadata::stamp_from_network_metadata(
+            self.store, node_name, node,
+        )
+        .await
     }
 
     async fn update_node(

@@ -391,7 +391,7 @@ mod tests {
     }
 
     fn raft_store_ports(backend: Arc<crate::datastore::sqlite::Datastore>) -> RaftStorePorts {
-        crate::cluster_store_replication_adapter::raft_store_ports_for_test(backend)
+        crate::bootstrap::composition_adapters::cluster_store_replication_adapter::raft_store_ports_for_test(backend)
     }
 
     fn storage_attestation(
@@ -551,7 +551,7 @@ mod tests {
             "activation proof must be Raft-committed cluster state"
         );
         let materializer =
-            crate::cluster_store_replication_adapter::DatastoreRaftCommitMaterializer::new(
+            crate::bootstrap::composition_adapters::cluster_store_replication_adapter::DatastoreRaftCommitMaterializer::new(
                 backend.clone(),
             );
         let restored_activation = CommandCodecV3Activation::load(&materializer)

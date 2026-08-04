@@ -1,5 +1,6 @@
 pub(crate) mod api_state_adapter;
 pub(crate) mod authority_adapter;
+pub(crate) mod cluster_store_replication_adapter;
 pub(crate) mod cni_socket_adapter;
 pub(crate) mod custom_resource_read_adapter;
 pub(crate) mod generated_handler_adapter;
@@ -8,6 +9,9 @@ pub(crate) mod networking_state_adapter;
 pub(crate) mod node_admin_adapter;
 pub(crate) mod node_log_runtime_adapter;
 pub(crate) mod node_metrics_adapter;
+pub(crate) mod node_routing_metadata;
+pub(crate) mod outbox_payload_codec_adapter;
+pub(crate) mod outbox_response_codec_adapter;
 pub(crate) mod positioned_watch_adapter;
 pub(crate) mod projected_token_resource_adapter;
 pub(crate) mod signing_key_state_adapter;

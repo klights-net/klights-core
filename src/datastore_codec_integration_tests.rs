@@ -26,7 +26,7 @@ async fn passive_sqlite_store(
     klights_cluster_datastore::sqlite::embedded::Datastore::new_in_memory_with_watch_and_executor_with_sink(
         executor,
         Arc::new(PassiveCommitSink),
-        crate::outbox_response_codec_adapter::new_codec(),
+        crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
         Arc::new(klights_supervisor::SystemWallClock),
     )
     .await

@@ -66,7 +66,7 @@ impl Datastore {
             key_file,
             #[cfg(any(test, feature = "integration-test-harness"))]
             crate::bootstrap::watch_commit_wiring::new_sink(),
-            crate::outbox_response_codec_adapter::new_codec(),
+            crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),
         )
         .await
@@ -143,7 +143,7 @@ impl Datastore {
         Self::new_in_memory_with_watch_and_executor_with_sink(
             executor,
             crate::bootstrap::watch_commit_wiring::new_sink(),
-            crate::outbox_response_codec_adapter::new_codec(),
+            crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),
         )
         .await
@@ -160,7 +160,7 @@ impl Datastore {
             supervisor,
             key_file,
             crate::bootstrap::watch_commit_wiring::new_sink(),
-            crate::outbox_response_codec_adapter::new_codec(),
+            crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),
         )
         .await
@@ -173,7 +173,7 @@ impl Datastore {
         Self::new_in_memory_with_watch_and_executor_with_sink(
             executor,
             crate::bootstrap::watch_commit_wiring::new_sink(),
-            crate::outbox_response_codec_adapter::new_codec(),
+            crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),
         )
         .await
@@ -529,7 +529,11 @@ impl DatastoreBackend for Datastore {
         commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<klights_cluster_store::StorageCommandResult> {
         let receipt = PassiveDatastore::apply_raft_log_apply_commit_receipt(self, commit).await?;
-        Ok(crate::cluster_store_replication_adapter::storage_command_result_from_receipt(&receipt))
+        Ok(
+            crate::bootstrap::composition_adapters::cluster_store_replication_adapter::storage_command_result_from_receipt(
+                &receipt,
+            ),
+        )
     }
 
     async fn apply_raft_log_apply_commit_receipt(

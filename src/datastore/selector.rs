@@ -210,7 +210,7 @@ pub(crate) async fn open(
         request,
         supervisor,
         crate::bootstrap::watch_commit_wiring::new_sink(),
-        crate::outbox_response_codec_adapter::new_codec(),
+        crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
     )
     .await
     .map(|opened| opened.backend)
@@ -259,7 +259,7 @@ mod tests {
             request,
             supervisor(),
             crate::bootstrap::watch_commit_wiring::new_sink(),
-            crate::outbox_response_codec_adapter::new_codec(),
+            crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
         )
         .await
         .expect("open selected passive store")

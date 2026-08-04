@@ -180,7 +180,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         supervisor.clone(),
         #[cfg(any(test, feature = "integration-test-harness"))]
         watch_commit_wiring.sink,
-        crate::outbox_response_codec_adapter::new_codec(),
+        crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
     )
     .await
     .context("Failed to open datastore")?;
@@ -360,9 +360,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             let raft_network =
                 klights_replication::grpc_network::GrpcRaftNetwork::new(raft_factory);
             let materializer = Arc::new(
-                crate::cluster_store_replication_adapter::DatastoreRaftCommitMaterializer::new(
-                    passive_backend.clone(),
-                ),
+                crate::bootstrap::composition_adapters::cluster_store_replication_adapter::DatastoreRaftCommitMaterializer::new(passive_backend.clone()),
             );
             let allocator = passive_read_ports.allocator_reads();
             let lifecycle = Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(
@@ -468,7 +466,8 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 crate::control_plane::client::local::RootCommittedOutboxDelivery::new(
                     embedded_outbox_delivery,
                     local_api_client.outbox_side_effect_state(),
-                    crate::outbox_payload_codec_adapter::new_codec(),
+                    crate::bootstrap::composition_adapters::outbox_payload_codec_adapter::new_codec(
+                    ),
                     config.node_name.clone(),
                 ),
             );
@@ -942,7 +941,8 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             node_local.runtime_observation_checkpoints(),
             node_local.outbox_status_stamps(),
         );
-        let outbox_codec = crate::outbox_payload_codec_adapter::new_codec();
+        let outbox_codec =
+            crate::bootstrap::composition_adapters::outbox_payload_codec_adapter::new_codec();
         let outbox_wall_clock: Arc<dyn klights_supervisor::WallClock> =
             Arc::new(klights_supervisor::SystemWallClock);
         let ob = Arc::new(klights_kubelet::node_outbox::Outbox::compose(

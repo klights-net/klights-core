@@ -114,7 +114,9 @@ pub(crate) async fn propose_command_on_backend(
     let commit = backend
         .build_log_apply_commit_for_command(command, operation.as_str(), "test-proposer")
         .await
-        .map_err(crate::cluster_store_replication_adapter::map_storage_mutation_error_for_test)?;
+        .map_err(
+            crate::bootstrap::composition_adapters::cluster_store_replication_adapter::map_storage_mutation_error_for_test,
+        )?;
     let receipt = backend
         .apply_raft_log_apply_commit_receipt(commit)
         .await

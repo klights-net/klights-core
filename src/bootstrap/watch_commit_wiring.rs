@@ -291,7 +291,7 @@ mod tests {
             crate::datastore::sqlite::Datastore::new_in_memory_with_watch_and_executor_with_sink(
                 executor,
                 sink.clone(),
-                crate::outbox_response_codec_adapter::new_codec(),
+                crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
                 std::sync::Arc::new(klights_supervisor::SystemWallClock),
             )
             .await

@@ -729,7 +729,7 @@ impl LocalApiClient {
             let committed_outbox = Arc::new(RootCommittedOutboxDelivery::new(
                 embedded_outbox,
                 outbox_side_effects.clone(),
-                crate::outbox_payload_codec_adapter::new_codec(),
+                crate::bootstrap::composition_adapters::outbox_payload_codec_adapter::new_codec(),
                 authoring_node.clone(),
             ));
             LocalApiTestServices {
@@ -1233,7 +1233,7 @@ impl LeaderNetworkTopologyCommand for LocalApiClient {
                 return Ok(());
             };
             let mut data = (*resource.data).clone();
-            if !crate::node_routing_metadata::stamp_from_store(
+            if !crate::bootstrap::composition_adapters::node_routing_metadata::stamp_from_store(
                 self.db.as_ref(),
                 &metadata.node_name,
                 &mut data,

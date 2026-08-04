@@ -1139,7 +1139,8 @@ impl NativeApiTestHarness {
             node_local.runtime_observation_checkpoints(),
             node_local.outbox_status_stamps(),
         );
-        let outbox_codec = crate::outbox_payload_codec_adapter::new_codec();
+        let outbox_codec =
+            crate::bootstrap::composition_adapters::outbox_payload_codec_adapter::new_codec();
         let outbox = Arc::new(klights_kubelet::node_outbox::Outbox::compose(
             outbox_stores.clone(),
             outbox_codec.clone(),

@@ -5,7 +5,6 @@ mod allocator;
 mod api_helpers_adapter;
 pub mod cli;
 mod cluster_engine;
-pub(crate) mod cluster_store_replication_adapter;
 pub mod control_plane;
 #[cfg(test)]
 mod controller_test_support;
@@ -20,9 +19,6 @@ mod grpc_test_support;
 pub mod integration_test_harness;
 pub mod kubelet;
 pub mod networking;
-pub(crate) mod node_routing_metadata;
-mod outbox_payload_codec_adapter;
-mod outbox_response_codec_adapter;
 pub mod paths;
 pub mod pidfile;
 mod pod_event_adapter;

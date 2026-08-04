@@ -213,7 +213,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         node_local.runtime_observation_checkpoints(),
         node_local.outbox_status_stamps(),
     );
-    let outbox_codec = crate::outbox_payload_codec_adapter::new_codec();
+    let outbox_codec =
+        crate::bootstrap::composition_adapters::outbox_payload_codec_adapter::new_codec();
     let outbox_wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock> =
         std::sync::Arc::new(klights_supervisor::SystemWallClock);
     let outbox = std::sync::Arc::new(klights_kubelet::node_outbox::Outbox::compose(
