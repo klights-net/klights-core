@@ -811,6 +811,39 @@ pub fn normalize_resource_for_storage(api_version: &str, kind: &str, body: &mut 
 pub fn normalize_resource_for_read(api_version: &str, kind: &str, body: &mut Value) {
     if api_version == "v1" && kind == "Event" {
         normalize_events_v1_to_core_event_shape(body);
+    } else if api_version == "events.k8s.io/v1" && kind == "Event" {
+        normalize_core_v1_to_events_v1_event_shape(body);
+    }
+}
+
+fn move_event_field(obj: &mut serde_json::Map<String, Value>, source: &str, target: &str) {
+    if let Some(value) = obj.remove(source) {
+        obj.entry(target.to_string()).or_insert(value);
+    }
+}
+
+pub fn normalize_core_v1_to_events_v1_event_shape(body: &mut Value) {
+    if body.get("apiVersion").and_then(|v| v.as_str()) != Some("v1") {
+        return;
+    }
+
+    if let Some(obj) = body.as_object_mut() {
+        // Match Kubernetes' core.Event -> events.v1.Event conversion. Shared
+        // fields (eventTime, series, action, reason, related,
+        // reportingInstance and type) retain their existing representation.
+        move_event_field(obj, "involvedObject", "regarding");
+        move_event_field(obj, "message", "note");
+        move_event_field(obj, "source", "deprecatedSource");
+        move_event_field(obj, "firstTimestamp", "deprecatedFirstTimestamp");
+        move_event_field(obj, "lastTimestamp", "deprecatedLastTimestamp");
+        move_event_field(obj, "count", "deprecatedCount");
+        move_event_field(obj, "reportingComponent", "reportingController");
+
+        obj.insert(
+            "apiVersion".to_string(),
+            Value::String("events.k8s.io/v1".to_string()),
+        );
+        obj.insert("kind".to_string(), Value::String("Event".to_string()));
     }
 }
 
@@ -824,44 +857,35 @@ pub fn normalize_events_v1_to_core_event_shape(body: &mut Value) {
     }
 
     if let Some(obj) = body.as_object_mut() {
-        // Core/v1 event list/get paths expect involvedObject/source fields.
-        if obj.get("involvedObject").is_none()
-            && let Some(regarding) = obj.get("regarding").cloned()
-        {
-            obj.insert("involvedObject".to_string(), regarding);
-        }
+        // Match Kubernetes' events.v1.Event -> core.Event conversion while
+        // retaining the source fallback needed by legacy Event producers.
+        move_event_field(obj, "regarding", "involvedObject");
+        move_event_field(obj, "note", "message");
+        move_event_field(obj, "deprecatedSource", "source");
+        move_event_field(obj, "deprecatedFirstTimestamp", "firstTimestamp");
+        move_event_field(obj, "deprecatedLastTimestamp", "lastTimestamp");
+        move_event_field(obj, "deprecatedCount", "count");
 
-        if obj.get("source").is_none() {
-            let mut source = serde_json::Map::new();
-            if let Some(component) =
-                non_empty_str(obj.get("deprecatedSource").and_then(|v| v.get("component")))
-                    .or_else(|| non_empty_str(obj.get("reportingController")))
-            {
-                source.insert(
-                    "component".to_string(),
-                    Value::String(component.to_string()),
-                );
-            }
-            if let Some(host) =
-                non_empty_str(obj.get("deprecatedSource").and_then(|v| v.get("host")))
-                    .or_else(|| non_empty_str(obj.get("reportingInstance")))
-            {
-                source.insert("host".to_string(), Value::String(host.to_string()));
-            }
-            if !source.is_empty() {
-                obj.insert("source".to_string(), Value::Object(source));
-            }
-        }
+        let reporting_controller = non_empty_str(obj.get("reportingController")).map(str::to_owned);
+        let reporting_instance = non_empty_str(obj.get("reportingInstance")).map(str::to_owned);
+        move_event_field(obj, "reportingController", "reportingComponent");
 
-        if obj.get("firstTimestamp").is_none()
-            && let Some(v) = obj.get("deprecatedFirstTimestamp").cloned()
-        {
-            obj.insert("firstTimestamp".to_string(), v);
-        }
-        if obj.get("lastTimestamp").is_none()
-            && let Some(v) = obj.get("deprecatedLastTimestamp").cloned()
-        {
-            obj.insert("lastTimestamp".to_string(), v);
+        if reporting_controller.is_some() || reporting_instance.is_some() {
+            let source = obj
+                .entry("source".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(source) = source.as_object_mut() {
+                if non_empty_str(source.get("component")).is_none()
+                    && let Some(component) = reporting_controller
+                {
+                    source.insert("component".to_string(), Value::String(component));
+                }
+                if non_empty_str(source.get("host")).is_none()
+                    && let Some(host) = reporting_instance
+                {
+                    source.insert("host".to_string(), Value::String(host));
+                }
+            }
         }
 
         obj.insert("apiVersion".to_string(), Value::String("v1".to_string()));

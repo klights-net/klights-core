@@ -439,6 +439,44 @@ pub fn test_events_k8s_io_v1_event_protobuf_decode_preserves_fields() {
 }
 
 #[test]
+pub fn test_event_legacy_timestamps_decode_as_rfc3339_in_both_versions() {
+    use k8s_pb::apimachinery::pkg::apis::meta::v1::Time;
+
+    let first = Time {
+        seconds: Some(1_505_828_950),
+        nanos: Some(0),
+    };
+    let last = Time {
+        seconds: Some(1_505_828_951),
+        nanos: Some(0),
+    };
+    let core_event = k8s_pb::api::core::v1::Event {
+        first_timestamp: Some(first.clone()),
+        last_timestamp: Some(last.clone()),
+        ..Default::default()
+    };
+    let events_v1_event = k8s_pb::api::events::v1::Event {
+        deprecated_first_timestamp: Some(first),
+        deprecated_last_timestamp: Some(last),
+        ..Default::default()
+    };
+
+    let core_json = pb_event_to_json(&core_event).unwrap();
+    let events_v1_json = pb_events_v1_event_to_json(&events_v1_event).unwrap();
+
+    assert_eq!(core_json["firstTimestamp"], "2017-09-19T13:49:10Z");
+    assert_eq!(core_json["lastTimestamp"], "2017-09-19T13:49:11Z");
+    assert_eq!(
+        events_v1_json["deprecatedFirstTimestamp"],
+        "2017-09-19T13:49:10Z"
+    );
+    assert_eq!(
+        events_v1_json["deprecatedLastTimestamp"],
+        "2017-09-19T13:49:11Z"
+    );
+}
+
+#[test]
 pub fn test_decode_protobuf_resource_dispatches_events_k8s_io_v1() {
     use k8s_pb::api::events::v1::Event;
     use k8s_pb::apimachinery::pkg::apis::meta::v1::ObjectMeta;

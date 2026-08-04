@@ -261,15 +261,11 @@ pb_decode!(
         if let Some(instance) = &event.reporting_instance {
             obj["reportingInstance"] = json!(instance);
         }
-        if let Some(first_timestamp) = &event.first_timestamp
-            && let Some(seconds) = first_timestamp.seconds
-        {
-            obj["firstTimestamp"] = json!(seconds);
+        if let Some(first_timestamp) = &event.first_timestamp {
+            obj["firstTimestamp"] = pb_time_to_json(first_timestamp);
         }
-        if let Some(last_timestamp) = &event.last_timestamp
-            && let Some(seconds) = last_timestamp.seconds
-        {
-            obj["lastTimestamp"] = json!(seconds);
+        if let Some(last_timestamp) = &event.last_timestamp {
+            obj["lastTimestamp"] = pb_time_to_json(last_timestamp);
         }
     }
 );
@@ -381,15 +377,11 @@ pb_decode!(
             }
             obj["deprecatedSource"] = source_obj;
         }
-        if let Some(first_timestamp) = &event.deprecated_first_timestamp
-            && let Some(seconds) = first_timestamp.seconds
-        {
-            obj["deprecatedFirstTimestamp"] = json!(seconds);
+        if let Some(first_timestamp) = &event.deprecated_first_timestamp {
+            obj["deprecatedFirstTimestamp"] = pb_time_to_json(first_timestamp);
         }
-        if let Some(last_timestamp) = &event.deprecated_last_timestamp
-            && let Some(seconds) = last_timestamp.seconds
-        {
-            obj["deprecatedLastTimestamp"] = json!(seconds);
+        if let Some(last_timestamp) = &event.deprecated_last_timestamp {
+            obj["deprecatedLastTimestamp"] = pb_time_to_json(last_timestamp);
         }
         if let Some(count) = event.deprecated_count {
             obj["deprecatedCount"] = json!(count);

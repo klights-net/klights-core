@@ -509,3 +509,86 @@ fn test_normalize_events_v1_to_core_event_shape_ignores_empty_deprecated_source(
     assert_eq!(event["source"]["component"], "test-controller");
     assert_eq!(event["source"]["host"], "test-host");
 }
+
+#[test]
+fn test_normalize_event_shapes_round_trip_core_and_events_v1_fields() {
+    let original = json!({
+        "apiVersion": "v1",
+        "kind": "Event",
+        "metadata": {"name": "evt", "namespace": "default"},
+        "involvedObject": {"kind": "Pod", "name": "p1", "namespace": "default"},
+        "message": "pulled image",
+        "source": {"component": "kubelet", "host": "node-1"},
+        "firstTimestamp": "2026-01-01T00:00:00Z",
+        "lastTimestamp": "2026-01-01T00:00:01Z",
+        "count": 2,
+        "eventTime": "2026-01-01T00:00:00.000001Z",
+        "series": {"count": 2, "lastObservedTime": "2026-01-01T00:00:01.000001Z"},
+        "action": "Pulling",
+        "reason": "Pulled",
+        "related": {"kind": "Node", "name": "node-1"},
+        "reportingComponent": "kubelet",
+        "reportingInstance": "node-1",
+        "type": "Normal"
+    });
+    let mut event = original.clone();
+
+    normalize_resource_for_read("events.k8s.io/v1", "Event", &mut event);
+
+    assert_eq!(event["apiVersion"], "events.k8s.io/v1");
+    assert_eq!(event["regarding"], original["involvedObject"]);
+    assert_eq!(event["note"], original["message"]);
+    assert_eq!(event["deprecatedSource"], original["source"]);
+    assert_eq!(
+        event["deprecatedFirstTimestamp"],
+        original["firstTimestamp"]
+    );
+    assert_eq!(event["deprecatedLastTimestamp"], original["lastTimestamp"]);
+    assert_eq!(event["deprecatedCount"], original["count"]);
+    assert_eq!(event["reportingController"], original["reportingComponent"]);
+    for legacy_key in [
+        "involvedObject",
+        "message",
+        "source",
+        "firstTimestamp",
+        "lastTimestamp",
+        "count",
+        "reportingComponent",
+    ] {
+        assert!(event.get(legacy_key).is_none(), "legacy key {legacy_key}");
+    }
+
+    normalize_resource_for_read("v1", "Event", &mut event);
+    assert_eq!(event, original);
+}
+
+#[test]
+fn test_normalize_core_event_to_events_v1_does_not_fabricate_missing_fields() {
+    let mut event = json!({
+        "apiVersion": "v1",
+        "kind": "Event",
+        "metadata": {"name": "evt", "namespace": "default"},
+        "reason": "Pulled",
+        "type": "Normal"
+    });
+
+    normalize_resource_for_read("events.k8s.io/v1", "Event", &mut event);
+
+    assert_eq!(event["apiVersion"], "events.k8s.io/v1");
+    assert_eq!(event["kind"], "Event");
+    for absent in [
+        "eventTime",
+        "series",
+        "action",
+        "regarding",
+        "note",
+        "deprecatedSource",
+        "deprecatedFirstTimestamp",
+        "deprecatedLastTimestamp",
+        "deprecatedCount",
+        "reportingController",
+        "reportingInstance",
+    ] {
+        assert!(event.get(absent).is_none(), "fabricated field {absent}");
+    }
+}
