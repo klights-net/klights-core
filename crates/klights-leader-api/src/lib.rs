@@ -3,6 +3,7 @@
 mod crd_registry;
 pub use crd_registry::{CrdRegistry, CrdResourceInfo, resource_infos_from_value};
 mod controlplane_join;
+mod peer_endpoint;
 pub mod replication;
 pub use controlplane_join::{
     ControlplaneJoinAdmission, ControlplaneJoinAdmissionFuture, ControlplaneJoinAdmissionOutcome,
@@ -13,6 +14,7 @@ pub use controlplane_join::{
     ControlplaneMemberQuery, ControlplaneMemberQueryFuture, RaftStorageAttestation,
     RaftStorageLogAttestation, RemoteNodeHostFacts, RemoteNodeMode, RemoteNodeRegistrationSnapshot,
 };
+pub use peer_endpoint::{PeerEndpoint, node_external_ip, peer_endpoint_from_node};
 pub use replication::{
     JoinRequest, JoinResponse, JoinRole, MetadataRequest, MetadataResponse,
     require_exact_command_codec,

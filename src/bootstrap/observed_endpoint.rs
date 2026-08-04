@@ -7,16 +7,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bootstrap::NodeMode;
 use crate::datastore::{DatastoreHandle, ResourceListQuery};
-use klights_controllers::annotations::GRPC_PORT_ANNOTATION;
-use klights_leader_api::JoinRole;
+use klights_leader_api::{JoinRole, PeerEndpoint, node_external_ip, peer_endpoint_from_node};
 use klights_leader_rpc::client::{GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient};
+use klights_network_api::GRPC_PORT_ANNOTATION;
 use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PeerEndpoint {
-    node_name: String,
-    endpoint: String,
-}
 
 pub(crate) struct LeaderPeerEndpointObserverDeps {
     query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
@@ -169,9 +163,12 @@ async fn observe_from_existing_nodes(
         .list_resources("v1", "Node", None, ResourceListQuery::all())
         .await?;
     for node in nodes.items {
-        let Some(peer) =
-            peer_endpoint_from_node(&node.data, &deps.config.node_name, deps.config.tls_port)
-        else {
+        let Some(peer) = peer_endpoint_from_node(
+            &node.data,
+            &deps.config.node_name,
+            GRPC_PORT_ANNOTATION,
+            deps.config.tls_port,
+        ) else {
             continue;
         };
         if observe_from_peer(
@@ -200,7 +197,7 @@ async fn observe_from_peer(
 ) -> Result<bool> {
     let client = ReplicationGrpcClient::new(
         GrpcClientConfig {
-            leader_endpoint: peer.endpoint.clone(),
+            leader_endpoint: peer.endpoint().to_owned(),
             token: String::new(),
             node_name: deps.config.node_name.clone(),
             role: JoinRole::Worker,
@@ -218,7 +215,7 @@ async fn observe_from_peer(
     if let Some(endpoint) = client
         .observe_peer_endpoint_rpc(&deps.config.node_name)
         .await
-        .with_context(|| format!("observe peer endpoint from {}", peer.node_name))?
+        .with_context(|| format!("observe peer endpoint from {}", peer.node_name()))?
     {
         let endpoint_ip = endpoint
             .parse::<std::net::IpAddr>()
@@ -307,55 +304,6 @@ fn placeholder_dataplane(node_mode: &NodeMode) -> JoinDataplaneMetadata {
     }
 }
 
-fn peer_endpoint_from_node(
-    node: &serde_json::Value,
-    local_node_name: &str,
-    default_port: u16,
-) -> Option<PeerEndpoint> {
-    if node.get("kind").and_then(|value| value.as_str()) != Some("Node") {
-        return None;
-    }
-    let node_name = node
-        .pointer("/metadata/name")
-        .and_then(|value| value.as_str())?;
-    if node_name == local_node_name {
-        return None;
-    }
-    let external_ip = node_external_ip(node)?;
-    let external_ip = external_ip.parse::<std::net::IpAddr>().ok()?;
-    let port = node
-        .pointer("/metadata/annotations")
-        .and_then(|value| value.get(GRPC_PORT_ANNOTATION))
-        .and_then(|value| value.as_str())
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(default_port);
-    Some(PeerEndpoint {
-        node_name: node_name.to_string(),
-        endpoint: format!("https://{}:{port}", uri_host_for_ip(external_ip)),
-    })
-}
-
-fn node_external_ip(node: &serde_json::Value) -> Option<&str> {
-    node.pointer("/status/addresses")
-        .and_then(|value| value.as_array())
-        .and_then(|addresses| {
-            addresses.iter().find_map(|address| {
-                if address.get("type").and_then(|value| value.as_str()) == Some("ExternalIP") {
-                    address.get("address").and_then(|value| value.as_str())
-                } else {
-                    None
-                }
-            })
-        })
-}
-
-fn uri_host_for_ip(ip: std::net::IpAddr) -> String {
-    match ip {
-        std::net::IpAddr::V4(ip) => ip.to_string(),
-        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
-    }
-}
-
 #[derive(Clone)]
 struct ClientIdentity {
     client_cert_pem: String,
@@ -392,45 +340,6 @@ async fn load_local_node_client_identity(
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn peer_endpoint_from_node_uses_external_ip_only() {
-        let node = json!({
-            "apiVersion": "v1",
-            "kind": "Node",
-            "metadata": {"name": "worker-a"},
-            "status": {
-                "addresses": [
-                    {"type": "InternalIP", "address": "172.31.11.2"},
-                    {"type": "ExternalIP", "address": "10.99.0.11"}
-                ]
-            }
-        });
-
-        assert_eq!(
-            peer_endpoint_from_node(&node, "leader-a", 7679),
-            Some(PeerEndpoint {
-                node_name: "worker-a".to_string(),
-                endpoint: "https://10.99.0.11:7679".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn peer_endpoint_from_node_ignores_internal_ip_only_peer() {
-        let node = json!({
-            "apiVersion": "v1",
-            "kind": "Node",
-            "metadata": {"name": "worker-a"},
-            "status": {
-                "addresses": [
-                    {"type": "InternalIP", "address": "172.31.11.2"}
-                ]
-            }
-        });
-
-        assert_eq!(peer_endpoint_from_node(&node, "leader-a", 7679), None);
-    }
 
     #[tokio::test]
     async fn ensure_published_self_heals_when_local_node_has_external_ip() {
@@ -513,21 +422,5 @@ mod tests {
             db.get_node_dataplane("leader-a").await.unwrap().is_none(),
             "no dataplane row should be published without an external endpoint"
         );
-    }
-
-    #[test]
-    fn peer_endpoint_from_node_ignores_local_node() {
-        let node = json!({
-            "apiVersion": "v1",
-            "kind": "Node",
-            "metadata": {"name": "leader-a"},
-            "status": {
-                "addresses": [
-                    {"type": "ExternalIP", "address": "10.99.0.10"}
-                ]
-            }
-        });
-
-        assert_eq!(peer_endpoint_from_node(&node, "leader-a", 7679), None);
     }
 }
