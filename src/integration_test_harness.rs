@@ -13,7 +13,7 @@ use klights_reconcile_api::ControllerDispatcherPort as _;
 /// This alias is compiled only with `integration-test-harness`; production and
 /// native-service APIs do not expose a datastore surface.
 pub type IntegrationDatastoreHandle = DatastoreHandle;
-pub type IntegrationWatchEvent = crate::watch::WatchEvent;
+pub type IntegrationWatchEvent = klights_watch::WatchEvent;
 pub use klights_cluster_datastore::sqlite::embedded::{
     ResourceMutationPause as IntegrationResourceMutationPause,
     ResourceMutationPauseOperation as IntegrationResourceMutationPauseOperation,
@@ -180,7 +180,7 @@ pub fn broadcast_watch_event_for_integration(
     db: &IntegrationDatastoreHandle,
     object: serde_json::Value,
 ) {
-    let event = crate::watch::WatchEvent::added(object);
+    let event = klights_watch::WatchEvent::added(object);
     let pending = crate::datastore::staged_post_commit_from_event(event);
     db.commit_observation_sink().observe(&[pending]);
 }
@@ -1228,7 +1228,7 @@ impl NativeApiTestHarness {
                 &passive_reads,
                 datastore.clone(),
             );
-        let watch_signals = crate::watch_commit_observation_adapter::test_signal_source(&datastore);
+        let watch_signals = crate::bootstrap::watch_commit_wiring::test_signal_source(&datastore);
         let generated = crate::bootstrap::composition_adapters::generated_handler_adapter::GeneratedHandlerAdapter::new(
             datastore.clone(),
             watch_signals.clone(),
@@ -1435,7 +1435,7 @@ impl NativeApiTestHarness {
             ),
             crate::bootstrap::composition_adapters::custom_resource_read_adapter::CustomResourceReadAdapter::new(
                 datastore.clone(),
-                crate::watch_commit_observation_adapter::test_signal_source(&datastore),
+                crate::bootstrap::watch_commit_wiring::test_signal_source(&datastore),
                 positioned_watch,
                 supervisor.clone(),
             ),
@@ -1751,8 +1751,8 @@ impl NativeApiTestHarness {
         &self,
         api_version: &str,
         kind: &str,
-    ) -> tokio::sync::broadcast::Receiver<crate::watch::WatchEvent> {
-        crate::watch_commit_observation_adapter::subscribe_test_events(
+    ) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
+        crate::bootstrap::watch_commit_wiring::subscribe_test_events(
             self.datastore.commit_observation_sink().as_ref(),
             klights_watch::WatchTopic::new(api_version, kind),
         )

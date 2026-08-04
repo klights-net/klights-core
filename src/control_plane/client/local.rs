@@ -124,7 +124,7 @@ use klights_leader_api::{ResourceQueryConsistency, pod_get_request};
 fn test_watch_signals(db: &DatastoreHandle) -> Arc<dyn klights_watch::WatchSignalSubscribe> {
     let sink = db.commit_observation_sink();
     sink.as_any()
-        .downcast_ref::<crate::watch_commit_observation_adapter::WatchCommitObservationSink>()
+        .downcast_ref::<crate::bootstrap::watch_commit_wiring::WatchCommitObservationSink>()
         .expect("test datastore watch sink")
         .signal_source()
 }

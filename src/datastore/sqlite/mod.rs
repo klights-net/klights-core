@@ -65,7 +65,7 @@ impl Datastore {
             supervisor,
             key_file,
             #[cfg(any(test, feature = "integration-test-harness"))]
-            crate::watch_commit_observation_adapter::new_sink(),
+            crate::bootstrap::watch_commit_wiring::new_sink(),
             crate::outbox_response_codec_adapter::new_codec(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),
         )
@@ -142,7 +142,7 @@ impl Datastore {
         .await?;
         Self::new_in_memory_with_watch_and_executor_with_sink(
             executor,
-            crate::watch_commit_observation_adapter::new_sink(),
+            crate::bootstrap::watch_commit_wiring::new_sink(),
             crate::outbox_response_codec_adapter::new_codec(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),
         )
@@ -159,7 +159,7 @@ impl Datastore {
             &db_root.join("sqlite").join("cluster.db"),
             supervisor,
             key_file,
-            crate::watch_commit_observation_adapter::new_sink(),
+            crate::bootstrap::watch_commit_wiring::new_sink(),
             crate::outbox_response_codec_adapter::new_codec(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),
         )
@@ -172,7 +172,7 @@ impl Datastore {
     ) -> Result<Self> {
         Self::new_in_memory_with_watch_and_executor_with_sink(
             executor,
-            crate::watch_commit_observation_adapter::new_sink(),
+            crate::bootstrap::watch_commit_wiring::new_sink(),
             crate::outbox_response_codec_adapter::new_codec(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),
         )
@@ -183,7 +183,7 @@ impl Datastore {
     pub fn subscribe_watch(
         &self,
         topic: klights_watch::WatchTopic,
-    ) -> broadcast::Receiver<crate::watch::WatchEvent> {
+    ) -> broadcast::Receiver<klights_watch::WatchEvent> {
         DatastoreBackend::subscribe_watch(self, topic)
     }
 
@@ -191,7 +191,7 @@ impl Datastore {
     pub fn subscribe_watch_many(
         &self,
         topics: Vec<klights_watch::WatchTopic>,
-    ) -> crate::watch::WatchReceiver {
+    ) -> klights_watch::WatchReceiver {
         DatastoreBackend::subscribe_watch_many(self, topics)
     }
 
@@ -333,9 +333,9 @@ pub fn create_staged_post_commit(
 }
 
 #[cfg(any(test, feature = "integration-test-harness"))]
-pub fn staged_test_event(pending: &StagedPostCommit) -> Option<crate::watch::WatchEvent> {
+pub fn staged_test_event(pending: &StagedPostCommit) -> Option<klights_watch::WatchEvent> {
     let staged = pending.test_event()?;
-    let mut event = crate::watch::WatchEvent::from_type(
+    let mut event = klights_watch::WatchEvent::from_type(
         staged.event_type(),
         staged.resource().data.as_ref().clone(),
     );
@@ -343,21 +343,21 @@ pub fn staged_test_event(pending: &StagedPostCommit) -> Option<crate::watch::Wat
         staged
             .encoded_json()
             .cloned()
-            .map(|bytes| crate::watch::events::EncodedWatchPayload {
-                content_type: crate::watch::WatchContentType::Json,
+            .map(|bytes| klights_watch::EncodedWatchPayload {
+                content_type: klights_watch::WatchContentType::Json,
                 bytes,
             });
     Some(event)
 }
 
 #[cfg(any(test, feature = "integration-test-harness"))]
-pub fn staged_post_commit_from_event(event: crate::watch::WatchEvent) -> StagedPostCommit {
+pub fn staged_post_commit_from_event(event: klights_watch::WatchEvent) -> StagedPostCommit {
     let resource = Resource::try_from_data(event.object.clone())
         .expect("test watch event must carry canonical resource identity");
     let encoded_json = event
         .encoded_payload
         .as_ref()
-        .filter(|payload| payload.content_type == crate::watch::WatchContentType::Json)
+        .filter(|payload| payload.content_type == klights_watch::WatchContentType::Json)
         .map(|payload| payload.bytes.clone());
     StagedPostCommit::new(
         &resource.api_version,
@@ -448,8 +448,8 @@ impl DatastoreBackend for Datastore {
     }
 
     #[cfg(test)]
-    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<crate::watch::WatchEvent> {
-        crate::watch_commit_observation_adapter::subscribe_test_events(
+    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<klights_watch::WatchEvent> {
+        crate::bootstrap::watch_commit_wiring::subscribe_test_events(
             PassiveDatastore::commit_observation_sink(self)
                 .expect("test datastore must install a commit observation sink")
                 .as_ref(),
@@ -458,8 +458,8 @@ impl DatastoreBackend for Datastore {
     }
 
     #[cfg(test)]
-    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> crate::watch::WatchReceiver {
-        crate::watch_commit_observation_adapter::subscribe_test_events_many(
+    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> klights_watch::WatchReceiver {
+        crate::bootstrap::watch_commit_wiring::subscribe_test_events_many(
             PassiveDatastore::commit_observation_sink(self)
                 .expect("test datastore must install a commit observation sink")
                 .as_ref(),

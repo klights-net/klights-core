@@ -116,7 +116,7 @@ async fn run_leader_peer_endpoint_observer(
         );
     }
 
-    let mut signal_rx = crate::watch_commit_observation_adapter::subscribe(
+    let mut signal_rx = crate::bootstrap::watch_commit_wiring::subscribe(
         watch_signals.as_ref(),
         klights_watch::WatchTopic::new("v1", "Node"),
     );

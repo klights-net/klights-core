@@ -285,6 +285,7 @@ klights-cluster-datastore = { workspace = true, features = ["test-support"] }
 klights-cluster-store = { workspace = true, features = ["test-support"] }
 klights-kubelet = { workspace = true, features = ["test-support"] }
 klights-networking = { workspace = true, features = ["test-support"] }
+klights-watch = { workspace = true, features = ["integration-test-harness"] }
 openraft = { workspace = true }
 rtnetlink = { workspace = true }
 tempfile = { workspace = true }
@@ -307,6 +308,7 @@ integration-test-harness = [
     "klights-cluster-store/test-support",
     "klights-kubelet/test-support",
     "klights-networking/test-support",
+    "klights-watch/integration-test-harness",
 ]
 sqlcipher = [
     "sqlite",

@@ -6264,7 +6264,7 @@ async fn reconcile_runtime_duplicate_status_does_not_emit_second_watch_event() {
         .await
         .expect("first reconcile must emit one status watch event")
         .expect("pod watch channel must remain open");
-    assert_eq!(first_event.event_type, crate::watch::EventType::Modified);
+    assert_eq!(first_event.event_type, klights_watch::EventType::Modified);
     assert_eq!(
         first_event
             .object

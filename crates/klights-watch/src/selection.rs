@@ -1,4 +1,4 @@
-use super::WatchEvent;
+use crate::WatchEvent;
 
 #[derive(Clone, Copy, Debug)]
 pub struct WatchEventSelection<'a> {

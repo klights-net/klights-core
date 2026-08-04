@@ -97,12 +97,12 @@ impl DatastoreBackend for SequencedDatastore {
     }
 
     #[cfg(test)]
-    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<crate::watch::WatchEvent> {
+    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<klights_watch::WatchEvent> {
         self.passive.subscribe_watch(topic)
     }
 
     #[cfg(test)]
-    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> crate::watch::WatchReceiver {
+    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> klights_watch::WatchReceiver {
         self.passive.subscribe_watch_many(topics)
     }
 
@@ -1878,7 +1878,7 @@ impl klights_cluster_store::BackendLifecycleStore for SequencedDatastore {
 
 #[cfg(test)]
 impl crate::datastore::TestWatchStore for SequencedDatastore {
-    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> crate::watch::WatchReceiver {
+    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> klights_watch::WatchReceiver {
         crate::datastore::DatastoreBackend::subscribe_watch_many(self, topics)
     }
 

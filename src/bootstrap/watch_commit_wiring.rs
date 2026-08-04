@@ -1,12 +1,11 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 #[cfg(any(test, feature = "integration-test-harness"))]
 use crate::datastore::CommitObservationSink;
 #[cfg(any(test, feature = "integration-test-harness"))]
-use crate::watch::WatchBus;
-#[cfg(any(test, feature = "integration-test-harness"))]
 use klights_cluster_store::StagedPostCommit;
+#[cfg(any(test, feature = "integration-test-harness"))]
+use klights_watch::WatchBus;
 
 pub(crate) struct WatchCommitWiring {
     #[cfg(any(test, feature = "integration-test-harness"))]
@@ -19,7 +18,7 @@ pub(crate) struct WatchCommitWiring {
 pub(crate) fn new_wiring() -> WatchCommitWiring {
     let hub = Arc::new(klights_watch::WatchSignalHub::new(1024));
     let watch_wakeups: Arc<dyn klights_leader_api::PostCommitWakeup> =
-        Arc::new(WatchPostCommitWakeup::new(hub.clone()));
+        Arc::new(klights_watch::PostCommitWatchWakeup::new(hub.clone()));
     let follower_progress = Arc::new(klights_replication::FollowerProgressHub::new(0));
     let wakeups: Arc<dyn klights_leader_api::PostCommitWakeup> = Arc::new(ActivePostCommitWakeup {
         watch: watch_wakeups,
@@ -41,7 +40,7 @@ pub(crate) fn new_wiring() -> WatchCommitWiring {
 pub(crate) fn new_sink() -> Arc<WatchCommitObservationSink> {
     let hub = Arc::new(klights_watch::WatchSignalHub::new(1024));
     Arc::new(WatchCommitObservationSink::new(
-        Arc::new(WatchPostCommitWakeup::new(hub.clone())),
+        Arc::new(klights_watch::PostCommitWatchWakeup::new(hub.clone())),
         hub,
     ))
 }
@@ -124,72 +123,6 @@ impl CommitObservationSink for WatchCommitObservationSink {
     }
 }
 
-pub(crate) struct WatchPostCommitWakeup {
-    publisher: Arc<klights_watch::WatchSignalHub>,
-}
-
-impl WatchPostCommitWakeup {
-    fn new(publisher: Arc<klights_watch::WatchSignalHub>) -> Self {
-        Self { publisher }
-    }
-}
-
-impl klights_leader_api::PostCommitWakeup for WatchPostCommitWakeup {
-    fn wake(&self, observations: &[klights_leader_api::PostCommitAdvance]) {
-        let mut grouped: HashMap<klights_watch::WatchTopic, HashMap<Option<String>, (i64, i64)>> =
-            HashMap::new();
-        for observation in observations {
-            if observation.resource_version() <= 0 {
-                continue;
-            }
-            let topic =
-                klights_watch::WatchTopic::new(observation.api_version(), observation.kind());
-            let entry = grouped
-                .entry(topic)
-                .or_default()
-                .entry(observation.namespace().map(str::to_string))
-                .or_insert((
-                    observation.resource_version(),
-                    observation.resource_version(),
-                ));
-            entry.0 = entry.0.min(observation.resource_version());
-            entry.1 = entry.1.max(observation.resource_version());
-        }
-        let mut signals = Vec::new();
-        for (topic, namespace_rvs) in grouped {
-            let mut advances = namespace_rvs
-                .into_iter()
-                .map(
-                    |(namespace, (low_rv, high_rv))| klights_watch::WatchAdvance {
-                        namespace,
-                        low_rv,
-                        high_rv,
-                    },
-                )
-                .collect::<Vec<_>>();
-            advances.sort_by(|left, right| left.namespace.cmp(&right.namespace));
-            for chunk in advances.chunks(klights_watch::DEFAULT_WATCH_ADVANCE_GROUP_LIMIT) {
-                signals.push(klights_watch::WatchSignal {
-                    topic: topic.clone(),
-                    advances: chunk.to_vec(),
-                });
-            }
-        }
-        signals.sort_by(|left, right| {
-            (left.topic.api_version(), left.topic.kind())
-                .cmp(&(right.topic.api_version(), right.topic.kind()))
-        });
-        for signal in signals {
-            self.publisher.publish(signal);
-        }
-    }
-
-    fn wake_namespace_contents(&self, namespace: &str, resource_version: i64) {
-        self.publisher
-            .publish_namespace_advance(namespace, resource_version);
-    }
-}
-
 struct ActivePostCommitWakeup {
     watch: Arc<dyn klights_leader_api::PostCommitWakeup>,
     follower_progress: Arc<klights_replication::FollowerProgressHub>,
@@ -217,7 +150,7 @@ impl klights_leader_api::PostCommitWakeup for ActivePostCommitWakeup {
 #[cfg(test)]
 pub(crate) fn publish_test_events(
     sink: &dyn CommitObservationSink,
-    events: Vec<crate::watch::WatchEvent>,
+    events: Vec<klights_watch::WatchEvent>,
 ) {
     if let Some(sink) = sink.as_any().downcast_ref::<WatchCommitObservationSink>() {
         for event in events {
@@ -230,7 +163,7 @@ pub(crate) fn publish_test_events(
 pub(crate) fn subscribe_test_events(
     sink: &dyn CommitObservationSink,
     topic: klights_watch::WatchTopic,
-) -> tokio::sync::broadcast::Receiver<crate::watch::WatchEvent> {
+) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
     sink.as_any()
         .downcast_ref::<WatchCommitObservationSink>()
         .expect("test datastore watch sink")
@@ -242,7 +175,7 @@ pub(crate) fn subscribe_test_events(
 pub(crate) fn subscribe_test_events_many(
     sink: &dyn CommitObservationSink,
     topics: Vec<klights_watch::WatchTopic>,
-) -> crate::watch::WatchReceiver {
+) -> klights_watch::WatchReceiver {
     sink.as_any()
         .downcast_ref::<WatchCommitObservationSink>()
         .expect("test datastore watch sink")
@@ -378,90 +311,5 @@ mod tests {
         .await
         .unwrap();
         assert_success_only(&store, sink.as_ref()).await;
-    }
-
-    #[tokio::test]
-    async fn distinct_external_engine_endpoint_wakes_local_watch_over_transport() {
-        enum TransportWakeup {
-            Advances(Vec<klights_leader_api::PostCommitAdvance>),
-            NamespaceContents(String, i64),
-        }
-        struct RemoteWakeupEndpoint {
-            sender: tokio::sync::mpsc::UnboundedSender<TransportWakeup>,
-        }
-        impl klights_leader_api::PostCommitWakeup for RemoteWakeupEndpoint {
-            fn wake(&self, advances: &[klights_leader_api::PostCommitAdvance]) {
-                self.sender
-                    .send(TransportWakeup::Advances(advances.to_vec()))
-                    .expect("local transport endpoint must remain connected");
-            }
-
-            fn wake_namespace_contents(&self, namespace: &str, resource_version: i64) {
-                self.sender
-                    .send(TransportWakeup::NamespaceContents(
-                        namespace.to_string(),
-                        resource_version,
-                    ))
-                    .expect("local transport endpoint must remain connected");
-            }
-        }
-        struct SimulatedExternalEngine {
-            wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>,
-        }
-        impl SimulatedExternalEngine {
-            fn commit_config_map(&self) {
-                self.wakeups
-                    .wake(&[klights_leader_api::PostCommitAdvance::new(
-                        "v1",
-                        "ConfigMap",
-                        Some("default".to_string()),
-                        41,
-                    )]);
-            }
-        }
-
-        let hub = Arc::new(klights_watch::WatchSignalHub::new(4));
-        let local_wakeup = WatchPostCommitWakeup::new(hub.clone());
-        let topic = klights_watch::WatchTopic::new("v1", "ConfigMap");
-        let mut local_watch = hub.subscribe(topic.clone());
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let external_engine = SimulatedExternalEngine {
-            wakeups: Arc::new(RemoteWakeupEndpoint { sender }),
-        };
-
-        let bridge = async {
-            let wakeup = receiver
-                .recv()
-                .await
-                .expect("external endpoint must deliver one commit");
-            match wakeup {
-                TransportWakeup::Advances(advances) => {
-                    klights_leader_api::PostCommitWakeup::wake(&local_wakeup, &advances);
-                }
-                TransportWakeup::NamespaceContents(namespace, resource_version) => {
-                    klights_leader_api::PostCommitWakeup::wake_namespace_contents(
-                        &local_wakeup,
-                        &namespace,
-                        resource_version,
-                    );
-                }
-            }
-        };
-        let remote_commit = async {
-            external_engine.commit_config_map();
-        };
-        tokio::join!(bridge, remote_commit);
-
-        assert_eq!(
-            local_watch.recv().await,
-            Ok(klights_watch::WatchSignal {
-                topic,
-                advances: vec![klights_watch::WatchAdvance {
-                    namespace: Some("default".to_string()),
-                    low_rv: 41,
-                    high_rv: 41,
-                }],
-            })
-        );
     }
 }

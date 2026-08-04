@@ -1,4 +1,4 @@
-use super::*;
+use crate::*;
 
 #[test]
 fn watch_event_constructors_preserve_wire_type_and_object() {

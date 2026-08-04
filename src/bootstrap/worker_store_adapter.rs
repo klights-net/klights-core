@@ -85,8 +85,8 @@ pub(crate) async fn start_worker_store_adapter(
                         let mut next_discovered: HashMap<String, String> = HashMap::new();
                         let mut leader_endpoint = None;
                         for node in nodes.items {
-                            let event = crate::watch::WatchEvent {
-                                event_type: crate::watch::EventType::Added,
+                            let event = klights_watch::WatchEvent {
+                                event_type: klights_watch::EventType::Added,
                                 object: node.data.clone(),
                                 encoded_payload: None,
                             };

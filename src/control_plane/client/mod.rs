@@ -17,7 +17,7 @@ use klights_leader_api::{
 use std::sync::Arc;
 
 use crate::datastore::{Resource, ResourceList};
-use crate::watch::WatchEvent;
+use klights_watch::WatchEvent;
 
 pub type Pod = Resource;
 pub type ConfigMap = Resource;
@@ -176,11 +176,11 @@ pub(crate) fn legacy_list_response(result: ResourceListResult) -> ResourceList {
 pub(crate) fn legacy_watch_event(event: &ResourceEvent) -> WatchEvent {
     WatchEvent {
         event_type: match event.event_type() {
-            WatchEventType::Added => crate::watch::EventType::Added,
-            WatchEventType::Modified => crate::watch::EventType::Modified,
-            WatchEventType::Deleted => crate::watch::EventType::Deleted,
-            WatchEventType::Bookmark => crate::watch::EventType::Bookmark,
-            WatchEventType::Error => crate::watch::EventType::Error,
+            WatchEventType::Added => klights_watch::EventType::Added,
+            WatchEventType::Modified => klights_watch::EventType::Modified,
+            WatchEventType::Deleted => klights_watch::EventType::Deleted,
+            WatchEventType::Bookmark => klights_watch::EventType::Bookmark,
+            WatchEventType::Error => klights_watch::EventType::Error,
         },
         object: event.resource().data.clone(),
         encoded_payload: None,
@@ -192,11 +192,11 @@ pub(crate) fn focused_watch_event(
     resume_position: Option<crate::datastore::WatchReplayPosition>,
 ) -> std::result::Result<ResourceEvent, LeaderWatchError> {
     let event_type = match event.event_type {
-        crate::watch::EventType::Added => WatchEventType::Added,
-        crate::watch::EventType::Modified => WatchEventType::Modified,
-        crate::watch::EventType::Deleted => WatchEventType::Deleted,
-        crate::watch::EventType::Bookmark => WatchEventType::Bookmark,
-        crate::watch::EventType::Error => WatchEventType::Error,
+        klights_watch::EventType::Added => WatchEventType::Added,
+        klights_watch::EventType::Modified => WatchEventType::Modified,
+        klights_watch::EventType::Deleted => WatchEventType::Deleted,
+        klights_watch::EventType::Bookmark => WatchEventType::Bookmark,
+        klights_watch::EventType::Error => WatchEventType::Error,
     };
     ResourceEvent::try_new(
         event_type,

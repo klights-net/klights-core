@@ -8,7 +8,7 @@ use serde_json::json;
 
 #[test]
 fn watch_event_filter_matches_hydrated_labels() {
-    let event = crate::watch::WatchEvent::added(json!({
+    let event = klights_watch::WatchEvent::added(json!({
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": {
@@ -159,7 +159,7 @@ async fn apply_log_apply_commit_broadcasts_explicit_watch_event() {
     let event = watch_rx
         .try_recv()
         .expect("explicit watch-history apply must wake local watchers");
-    assert_eq!(event.event_type, crate::watch::EventType::Modified);
+    assert_eq!(event.event_type, klights_watch::EventType::Modified);
     assert_eq!(event.resource_version(), Some(applied_rv));
     assert_eq!(
         event

@@ -19,7 +19,6 @@ use crate::datastore::{
 };
 use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
-use crate::watch::{EventType, WatchBus, WatchEvent};
 use klights_cluster_core::LogApplyPodCleanupIntentRow;
 #[cfg(test)]
 use klights_cluster_core::command::{CommandMeta, StorageCommand};
@@ -31,6 +30,7 @@ use klights_leader_api::{
     WatchResumeCursor,
 };
 use klights_types::ResourceKey;
+use klights_watch::{EventType, WatchBus, WatchEvent};
 use klights_watch::{WatchSignal, WatchTopic};
 
 const WORKER_WATCH_EVENT_HISTORY_CAPACITY: usize = 32_768;
@@ -1027,7 +1027,7 @@ impl crate::datastore::CurrentResourceVersionStore for WorkerStoreAdapter {
 #[async_trait]
 impl WatchStore for WorkerStoreAdapter {
     #[cfg(test)]
-    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<crate::watch::WatchEvent> {
+    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<klights_watch::WatchEvent> {
         self.watch_events.subscribe(topic)
     }
 
@@ -3200,7 +3200,7 @@ mod tests {
             let _ = handle.join().await;
         }
 
-        assert_eq!(event.event_type, crate::watch::EventType::Added);
+        assert_eq!(event.event_type, klights_watch::EventType::Added);
         assert_eq!(
             event
                 .object
@@ -3279,7 +3279,7 @@ mod tests {
             let _ = handle.join().await;
         }
 
-        assert_eq!(event.event_type, crate::watch::EventType::Added);
+        assert_eq!(event.event_type, klights_watch::EventType::Added);
         assert_eq!(
             event
                 .object
@@ -3835,7 +3835,7 @@ mod tests {
 
         assert_eq!(
             event.event_type,
-            crate::watch::EventType::Added,
+            klights_watch::EventType::Added,
             "a Pod entering the worker's nodeName selector after LIST must be ADDED"
         );
         assert_eq!(

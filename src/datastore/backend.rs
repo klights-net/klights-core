@@ -68,11 +68,11 @@ where
 #[cfg(test)]
 use tokio::sync::broadcast;
 
-#[cfg(test)]
-use crate::watch::{WatchEvent, WatchReceiver};
 use klights_cluster_core::command::StorageCommand;
 #[cfg(test)]
 use klights_watch::WatchTopic;
+#[cfg(test)]
+use klights_watch::{WatchEvent, WatchReceiver};
 
 use super::types::{
     CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation, ListPageRequest,

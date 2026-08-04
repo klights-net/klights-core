@@ -24,8 +24,6 @@ use tokio::sync::broadcast;
 use crate::datastore::DatastoreHandle;
 use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
 use crate::kubelet::pod_runtime::service::PodDeletionFinalizeResult;
-#[cfg(test)]
-use crate::watch::WatchEvent;
 use klights_cluster_core::Resource;
 #[cfg(test)]
 use klights_controllers::side_effects::SideEffectMetrics;
@@ -37,6 +35,8 @@ use klights_pod_api::{PodDeleteOptions, PodRepositoryError};
 use klights_reconcile_api::{GcPodDeleteRequest, GcPodDeleteSink};
 use klights_supervisor::TaskSupervisor;
 use klights_types::{PodIdentity, ResourceKey};
+#[cfg(test)]
+use klights_watch::WatchEvent;
 
 #[derive(Clone, Debug)]
 pub struct PodResourceList {

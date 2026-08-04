@@ -68,7 +68,7 @@ impl RedbDatastore {
     pub async fn new_in_memory() -> Result<Self> {
         Self::new_in_memory_with_supervisor_and_sink(
             Arc::new(TaskSupervisor::new(Default::default())),
-            crate::watch_commit_observation_adapter::new_sink(),
+            crate::bootstrap::watch_commit_wiring::new_sink(),
             Arc::new(klights_supervisor::SystemWallClock),
         )
         .await

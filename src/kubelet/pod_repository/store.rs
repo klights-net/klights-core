@@ -20,11 +20,11 @@ use tokio::sync::broadcast;
 use super::PodResourceList;
 #[cfg(test)]
 use crate::datastore::DatastoreHandle;
-#[cfg(test)]
-use crate::watch::WatchEvent;
 use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
 use klights_kubelet::unscheduled_deletion::EligibleUnscheduledPodDeletion;
 use klights_pod_api::PodRepositoryError;
+#[cfg(test)]
+use klights_watch::WatchEvent;
 
 /// Result of the root-private, actor-owned bound-Pod finalization primitive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

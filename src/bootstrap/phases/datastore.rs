@@ -174,7 +174,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     // sufficient because followers must be able to install and advance.
     validate_raft_backend_capability(config.datastore_backend)?;
 
-    let watch_commit_wiring = crate::watch_commit_observation_adapter::new_wiring();
+    let watch_commit_wiring = crate::bootstrap::watch_commit_wiring::new_wiring();
     let opened_passive = crate::datastore::selector::open_with_sink(
         passive_store_open_request(config),
         supervisor.clone(),

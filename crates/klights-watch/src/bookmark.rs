@@ -1,4 +1,4 @@
-//! Bookmark payload constructors used by watch events.
+//! Bookmark payload constructors used by canonical watch events.
 
 use serde_json::{Value, json};
 

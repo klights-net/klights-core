@@ -209,7 +209,7 @@ pub(crate) async fn open(
     open_with_sink(
         request,
         supervisor,
-        crate::watch_commit_observation_adapter::new_sink(),
+        crate::bootstrap::watch_commit_wiring::new_sink(),
         crate::outbox_response_codec_adapter::new_codec(),
     )
     .await
@@ -258,7 +258,7 @@ mod tests {
         open_with_sink(
             request,
             supervisor(),
-            crate::watch_commit_observation_adapter::new_sink(),
+            crate::bootstrap::watch_commit_wiring::new_sink(),
             crate::outbox_response_codec_adapter::new_codec(),
         )
         .await

@@ -91,7 +91,7 @@ async fn wait_until_fresh(
     if target_rv <= 0 {
         return;
     }
-    let mut fresh_rx = crate::watch_commit_observation_adapter::subscribe(signals, topic);
+    let mut fresh_rx = crate::bootstrap::watch_commit_wiring::subscribe(signals, topic);
     if db.get_current_resource_version().await.unwrap_or(0) >= target_rv {
         return;
     }

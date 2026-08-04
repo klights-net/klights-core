@@ -631,7 +631,7 @@ async fn watch_stream_replays_lower_matching_pod_on_nonmatching_high_rv_signal()
         .into_inner();
 
     db.broadcast_watch_event(crate::datastore::staged_post_commit_from_event(
-        crate::watch::WatchEvent::modified(serde_json::json!({
+        klights_watch::WatchEvent::modified(serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {

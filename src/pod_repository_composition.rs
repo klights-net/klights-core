@@ -675,7 +675,7 @@ impl crate::kubelet::pod_repository::store::PodPersistence for RootPodPersistenc
     }
 
     #[cfg(test)]
-    fn subscribe_watch(&self) -> tokio::sync::broadcast::Receiver<crate::watch::WatchEvent> {
+    fn subscribe_watch(&self) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
         self.db
             .subscribe_watch(klights_watch::WatchTopic::new("v1", "Pod"))
     }

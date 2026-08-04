@@ -37,8 +37,6 @@ mod service_pod_integration_tests;
 mod service_reconcile_integration_tests;
 pub mod shutdown;
 pub mod version;
-pub mod watch;
-mod watch_commit_observation_adapter;
 
 #[cfg(test)]
 mod cluster_engine_composition_tests;

@@ -27,7 +27,7 @@ pub(crate) fn for_test(
     datastore_positioned_watch_service(
         passive_reads,
         db.clone(),
-        crate::watch_commit_observation_adapter::test_signal_source(&db),
+        crate::bootstrap::watch_commit_wiring::test_signal_source(&db),
     )
 }
 

@@ -361,8 +361,55 @@ impl WatchSignalPublish for WatchSignalHub {
     }
 }
 
+impl WatchSignalEvent for klights_leader_api::PostCommitAdvance {
+    fn watch_api_version(&self) -> Option<&str> {
+        Some(self.api_version())
+    }
+
+    fn watch_kind(&self) -> Option<&str> {
+        Some(self.kind())
+    }
+
+    fn watch_namespace(&self) -> Option<&str> {
+        self.namespace()
+    }
+
+    fn watch_resource_version(&self) -> Option<i64> {
+        Some(self.resource_version())
+    }
+}
+
+/// Converts backend-neutral committed advances into bounded active-watch hints.
+/// Durable history remains authoritative; this adapter only wakes subscribers.
+pub struct PostCommitWatchWakeup {
+    publisher: Arc<WatchSignalHub>,
+}
+
+impl PostCommitWatchWakeup {
+    pub fn new(publisher: Arc<WatchSignalHub>) -> Self {
+        Self { publisher }
+    }
+}
+
+impl klights_leader_api::PostCommitWakeup for PostCommitWatchWakeup {
+    fn wake(&self, observations: &[klights_leader_api::PostCommitAdvance]) {
+        for signal in WatchSignal::from_events(observations) {
+            self.publisher.publish(signal);
+        }
+    }
+
+    fn wake_namespace_contents(&self, namespace: &str, resource_version: i64) {
+        self.publisher
+            .publish_namespace_advance(namespace, resource_version);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use klights_leader_api::PostCommitWakeup;
+
     use super::*;
 
     #[tokio::test]
@@ -402,5 +449,41 @@ mod tests {
             }],
         });
         assert!(hub.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn distinct_external_engine_endpoint_wakes_local_watch_over_transport() {
+        let hub = Arc::new(WatchSignalHub::new(4));
+        let local_wakeup = PostCommitWatchWakeup::new(hub.clone());
+        let topic = WatchTopic::new("v1", "ConfigMap");
+        let mut local_watch = hub.subscribe(topic.clone());
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        sender
+            .send(vec![klights_leader_api::PostCommitAdvance::new(
+                "v1",
+                "ConfigMap",
+                Some("default".to_string()),
+                41,
+            )])
+            .expect("simulated external transport remains connected");
+        local_wakeup.wake(
+            &receiver
+                .recv()
+                .await
+                .expect("external endpoint delivers one commit"),
+        );
+
+        assert_eq!(
+            local_watch.recv().await,
+            Ok(WatchSignal {
+                topic,
+                advances: vec![WatchAdvance {
+                    namespace: Some("default".to_string()),
+                    low_rv: 41,
+                    high_rv: 41,
+                }],
+            })
+        );
     }
 }

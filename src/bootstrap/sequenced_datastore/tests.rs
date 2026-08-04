@@ -1132,7 +1132,7 @@ mod cases {
         );
 
         let event = watch.recv().await.unwrap();
-        assert_eq!(event.event_type, crate::watch::EventType::Deleted);
+        assert_eq!(event.event_type, klights_watch::EventType::Deleted);
         assert_eq!(
             event
                 .object
@@ -1149,7 +1149,7 @@ mod cases {
         );
 
         let event = watch.recv().await.unwrap();
-        assert_eq!(event.event_type, crate::watch::EventType::Added);
+        assert_eq!(event.event_type, klights_watch::EventType::Added);
         assert_eq!(
             event
                 .object

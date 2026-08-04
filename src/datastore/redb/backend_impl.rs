@@ -156,8 +156,8 @@ impl DatastoreBackend for RedbDatastore {
     }
 
     #[cfg(test)]
-    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<crate::watch::WatchEvent> {
-        crate::watch_commit_observation_adapter::subscribe_test_events(
+    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<klights_watch::WatchEvent> {
+        crate::bootstrap::watch_commit_wiring::subscribe_test_events(
             klights_cluster_datastore::redb::embedded::RedbDatastore::commit_observation_sink(self)
                 .expect("test datastore must install a commit observation sink")
                 .as_ref(),
@@ -166,8 +166,8 @@ impl DatastoreBackend for RedbDatastore {
     }
 
     #[cfg(test)]
-    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> crate::watch::WatchReceiver {
-        crate::watch_commit_observation_adapter::subscribe_test_events_many(
+    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> klights_watch::WatchReceiver {
+        crate::bootstrap::watch_commit_wiring::subscribe_test_events_many(
             klights_cluster_datastore::redb::embedded::RedbDatastore::commit_observation_sink(self)
                 .expect("test datastore must install a commit observation sink")
                 .as_ref(),
@@ -179,7 +179,7 @@ impl DatastoreBackend for RedbDatastore {
     fn broadcast_watch_event(&self, pending: StagedPostCommit) {
         let event = crate::datastore::staged_test_event(&pending).expect("staged test watch event");
         let _ = WatchSignal::from_event(&event);
-        crate::watch_commit_observation_adapter::publish_test_events(
+        crate::bootstrap::watch_commit_wiring::publish_test_events(
             klights_cluster_datastore::redb::embedded::RedbDatastore::commit_observation_sink(self)
                 .expect("test datastore must install a commit observation sink")
                 .as_ref(),
@@ -1657,7 +1657,7 @@ impl klights_cluster_store::BackendLifecycleStore for RedbDatastore {
 
 #[cfg(test)]
 impl crate::datastore::TestWatchStore for RedbDatastore {
-    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> crate::watch::WatchReceiver {
+    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> klights_watch::WatchReceiver {
         crate::datastore::DatastoreBackend::subscribe_watch_many(self, topics)
     }
 

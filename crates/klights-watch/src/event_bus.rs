@@ -1,4 +1,4 @@
-//! bug-grpc Task D: per-topic watch fan-out (`WatchBus`).
+//! Per-topic watch fan-out (`WatchBus`).
 //!
 //! Today every watch subscriber — each HTTP watch, each gRPC server stream,
 //! the scheduler, node_subnet, node_lifecycle, crd, cronjob_scheduler, and the
@@ -25,19 +25,18 @@ use std::collections::HashMap;
 #[cfg(any(test, feature = "integration-test-harness"))]
 use std::sync::Mutex;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use futures::future::select_all;
 #[cfg(any(test, feature = "integration-test-harness"))]
 use tokio::sync::broadcast;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use tokio::sync::broadcast::error::RecvError;
 
-use super::events::WatchEvent;
 #[cfg(test)]
-use klights_watch::{DEFAULT_WATCH_ADVANCE_GROUP_LIMIT, WatchAdvance, WatchSignalTryReceiveError};
-use klights_watch::{WatchSignal, WatchSignalReceiver, WatchTopic};
+use crate::{DEFAULT_WATCH_ADVANCE_GROUP_LIMIT, WatchAdvance, WatchSignalTryReceiveError};
+use crate::{WatchEvent, WatchSignal, WatchSignalReceiver, WatchTopic};
 
-impl klights_watch::WatchSignalEvent for WatchEvent {
+impl crate::WatchSignalEvent for WatchEvent {
     fn watch_api_version(&self) -> Option<&str> {
         self.object
             .get("apiVersion")
@@ -72,7 +71,7 @@ fn event_topic(event: &WatchEvent) -> Option<WatchTopic> {
 pub struct WatchBus {
     #[cfg(any(test, feature = "integration-test-harness"))]
     topics: Mutex<HashMap<WatchTopic, broadcast::Sender<WatchEvent>>>,
-    signal_hub: klights_watch::WatchSignalHub,
+    signal_hub: crate::WatchSignalHub,
     /// Per-topic buffer capacity. Far smaller than the old global 8192/kind is
     /// viable because a topic only carries its own kind's events; the durable
     /// `watch_events` replay still backstops a lagging receiver.
@@ -85,17 +84,17 @@ impl WatchBus {
         Self {
             #[cfg(any(test, feature = "integration-test-harness"))]
             topics: Mutex::new(HashMap::new()),
-            signal_hub: klights_watch::WatchSignalHub::new(capacity),
+            signal_hub: crate::WatchSignalHub::new(capacity),
             #[cfg(any(test, feature = "integration-test-harness"))]
             capacity: capacity.max(1),
         }
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
     /// Subscribe to exactly one topic. The topic sender is created lazily on
     /// first subscribe. The returned receiver only ever observes events for
     /// `topic`; drop it to release the slot (the topic self-collects on the
     /// next publish once its receiver count reaches zero).
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub fn subscribe(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
         let mut topics = self.lock();
         topics
@@ -104,7 +103,7 @@ impl WatchBus {
             .subscribe()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub fn subscribe_many(&self, topics: impl IntoIterator<Item = WatchTopic>) -> WatchReceiver {
         WatchReceiver::new(
             topics
@@ -143,7 +142,7 @@ impl WatchBus {
     }
 
     /// Test/observability seam: number of live topics currently held.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub fn topic_count(&self) -> usize {
         self.lock().len()
     }
@@ -158,12 +157,12 @@ impl WatchBus {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub struct WatchReceiver {
     receivers: Vec<broadcast::Receiver<WatchEvent>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 impl WatchReceiver {
     pub fn new(receivers: Vec<broadcast::Receiver<WatchEvent>>) -> Self {
         Self { receivers }
@@ -192,7 +191,7 @@ impl WatchReceiver {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 impl From<broadcast::Receiver<WatchEvent>> for WatchReceiver {
     fn from(receiver: broadcast::Receiver<WatchEvent>) -> Self {
         Self::from_receiver(receiver)

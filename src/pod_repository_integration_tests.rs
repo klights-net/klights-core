@@ -2985,7 +2985,7 @@ async fn pod_watch_source_receives_added_on_create() {
         .await
         .expect("watch event must arrive within 2s")
         .expect("watch channel must not lag/close");
-    assert_eq!(evt.event_type, crate::watch::EventType::Added);
+    assert_eq!(evt.event_type, klights_watch::EventType::Added);
     let object = evt.object.as_ref();
     assert_eq!(object["kind"], serde_json::json!("Pod"));
     assert_eq!(object["metadata"]["name"], serde_json::json!("watched"));

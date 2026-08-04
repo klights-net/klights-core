@@ -2533,11 +2533,13 @@ name = "klights-watch"
 version = "0.0.0"
 dependencies = [
  "async-stream",
+ "bytes",
  "futures",
  "klights-cluster-core",
  "klights-cluster-store",
  "klights-leader-api",
  "klights-types",
+ "serde",
  "serde_json",
  "tokio",
 ]
