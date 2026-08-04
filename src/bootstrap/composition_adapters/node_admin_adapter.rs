@@ -126,7 +126,7 @@ impl NodeDeadLetterAdmin for RootNodeAdmin {
     }
 }
 
-pub async fn start_node_admin(
+pub(crate) async fn start_node_admin(
     dead_letters: Arc<dyn DeadLetterStore>,
     outbox_notify: Arc<Notify>,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,

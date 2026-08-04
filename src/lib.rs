@@ -20,7 +20,6 @@ mod grpc_test_support;
 pub mod integration_test_harness;
 pub mod kubelet;
 pub mod networking;
-pub mod node_admin;
 pub(crate) mod node_routing_metadata;
 mod outbox_payload_codec_adapter;
 mod outbox_response_codec_adapter;

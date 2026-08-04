@@ -965,7 +965,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     };
     let (local_api_client, positioned_watch, authenticated_outbox_delivery) = local_services;
 
-    match crate::node_admin::start_node_admin(
+    match crate::bootstrap::composition_adapters::node_admin_adapter::start_node_admin(
         node_local.dead_letters(),
         outbox.notify_handle(),
         supervisor.clone(),
