@@ -82,7 +82,7 @@ pub struct BootstrapRunArgs<'a> {
     pub outbox_runtime: Arc<klights_kubelet::node_outbox::Outbox>,
     pub node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
     pub node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
-    pub network: Arc<crate::networking::Network>,
+    pub network: Arc<crate::bootstrap::networking::Network>,
     pub services: Arc<dyn klights_network_api::ServiceRouter>,
     pub local_api_client: Arc<crate::control_plane::client::local::LocalApiClient>,
     pub authenticated_outbox_delivery:

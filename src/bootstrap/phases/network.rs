@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::KlightsConfig;
 use crate::bootstrap::NodeMode;
-use crate::networking::{self, NetworkCleanup};
+use crate::bootstrap::networking::{self, NetworkCleanup};
 use klights_supervisor::{SupervisedJoinHandle, TaskSupervisor};
 
 pub struct NetworkPhase {

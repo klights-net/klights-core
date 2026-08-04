@@ -425,9 +425,9 @@ impl Default for MockServiceRouter {
 /// fixture stays one line.
 pub fn mock_network(
     _db: crate::datastore::DatastoreHandle,
-) -> std::sync::Arc<crate::networking::Network> {
+) -> std::sync::Arc<crate::bootstrap::networking::Network> {
     let provider = Arc::new(MockNetworkProvider::new());
-    std::sync::Arc::new(crate::networking::Network::new(
+    std::sync::Arc::new(crate::bootstrap::networking::Network::new(
         provider.clone(),
         provider,
         Arc::new(MockServiceRouter::new()),
@@ -502,7 +502,7 @@ mod peer_endpoint_tests {
         assert_impl::<MockNetworkProvider>();
         // NetworkPlane impls Datapath via the same trait surface — verify
         // by erasing through `dyn`.
-        let _erase = |p: std::sync::Arc<crate::networking::plane::NetworkPlane>| {
+        let _erase = |p: std::sync::Arc<crate::bootstrap::networking::plane::NetworkPlane>| {
             let _: std::sync::Arc<dyn klights_network_api::Datapath> = p;
         };
     }

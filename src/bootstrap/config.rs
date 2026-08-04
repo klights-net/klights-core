@@ -144,7 +144,7 @@ impl KlightsConfig {
     pub fn from_env_with_namespace_override(
         namespace_override: Option<&str>,
     ) -> anyhow::Result<Self> {
-        use crate::networking::BridgeName;
+        use crate::bootstrap::networking::BridgeName;
         use anyhow::anyhow;
         use klights_types::{ClusterCidr, NodeName};
 

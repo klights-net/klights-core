@@ -616,10 +616,10 @@ mod tests {
         let mut config = fixture_config(db);
         config.cri = Some(klights_kubelet::cri::SharedCriClient::new(cri));
         config.datapath = Some(Arc::new(
-            crate::networking::test_support::MockNetworkProvider::new(),
+            crate::bootstrap::networking::test_support::MockNetworkProvider::new(),
         ));
         config.service_router = Some(Arc::new(
-            crate::networking::test_support::MockServiceRouter::new(),
+            crate::bootstrap::networking::test_support::MockServiceRouter::new(),
         ));
         config.runtime_service = None;
         let subsystem = PodSubsystem::new(config).expect("construction must succeed");

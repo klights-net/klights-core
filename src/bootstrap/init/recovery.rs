@@ -3,7 +3,8 @@
 use anyhow::Context;
 
 use crate::bootstrap::NodeMode;
-use crate::{KlightsConfig, networking, paths, shutdown};
+use crate::bootstrap::networking;
+use crate::{KlightsConfig, paths, shutdown};
 
 use super::cleanup::stop_namespace_containerd_after_cleanup;
 

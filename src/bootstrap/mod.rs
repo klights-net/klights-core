@@ -15,6 +15,7 @@ pub mod kubelet_ports;
 pub mod logging;
 pub(crate) mod maintenance;
 pub(crate) mod network_adapters;
+pub(crate) mod networking;
 pub mod node_mode;
 pub(crate) mod node_registration_adapter;
 pub(crate) mod node_registration_profile;

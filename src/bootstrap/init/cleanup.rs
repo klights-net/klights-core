@@ -2,8 +2,9 @@
 
 use anyhow::Context;
 
+use crate::bootstrap::networking;
 use crate::bootstrap::{CliFlags, NodeMode};
-use crate::{KlightsConfig, networking, paths, pidfile, shutdown};
+use crate::{KlightsConfig, paths, pidfile, shutdown};
 use klights_networking::cni_plugin;
 
 /// Full teardown with the same immutable mode detection used by startup. This

@@ -5,6 +5,8 @@ use klights_types::{NodeName, PodSubnet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
+use super::boot::NetworkBootStores;
+
 /// Concrete root-mode networking implementation used by klights runtime.
 pub struct NetworkPlane {
     root: RootDatapath,
@@ -25,12 +27,12 @@ impl NetworkPlane {
     /// cross-node dataplane. WireGuard is the default encrypted dataplane;
     /// explicit direct-route mode installs only kernel routes.
     pub(crate) async fn boot(
-        cfg: &crate::networking::NetworkBootConfig,
-        stores: crate::networking::boot::NetworkBootStores,
+        cfg: &super::NetworkBootConfig,
+        stores: super::boot::NetworkBootStores,
         cancel: tokio_util::sync::CancellationToken,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Result<Arc<Self>> {
-        let crate::networking::boot::NetworkBootStores {
+        let NetworkBootStores {
             subnet_allocation,
             topology,
             pod_network_cache,
@@ -63,9 +65,9 @@ impl NetworkPlane {
         let root = RootDatapath::boot(
             cfg.bridge().clone(),
             local_subnet,
-            klights_networking::PodLinkMtu::try_new(
-                crate::networking::pod_link_mtu_for_encryption(cfg.encryption()),
-            )
+            klights_networking::PodLinkMtu::try_new(super::pod_link_mtu_for_encryption(
+                cfg.encryption(),
+            ))
             .map_err(anyhow::Error::msg)?,
             cancel.clone(),
             task_supervisor.clone(),

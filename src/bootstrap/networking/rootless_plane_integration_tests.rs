@@ -3,7 +3,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::bootstrap::config::KlightsConfig;
-    use crate::networking::NetworkBootConfig;
+    use crate::bootstrap::networking::NetworkBootConfig;
     use klights_networking::rootless::RootlessNetworkPlane;
 
     fn rootless_test_config(node_name: &str) -> KlightsConfig {
@@ -94,7 +94,7 @@ mod tests {
 
     fn focused_test_config(cfg: &KlightsConfig, node_ip: &str) -> NetworkBootConfig {
         NetworkBootConfig::try_new(
-            crate::networking::NetworkMode::Rootless,
+            crate::bootstrap::networking::NetworkMode::Rootless,
             &cfg.bridge_name,
             &cfg.node_name,
             &cfg.cluster_cidr,
@@ -124,9 +124,9 @@ mod tests {
             cluster_api.clone();
         let topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> = cluster_api;
         let focused = focused_test_config(&cfg, "192.168.1.5");
-        let plane = crate::networking::boot::boot_rootless(
+        let plane = crate::bootstrap::networking::boot::boot_rootless(
             &focused,
-            crate::networking::boot::NetworkBootStores::new(
+            crate::bootstrap::networking::boot::NetworkBootStores::new(
                 subnet_allocation,
                 topology,
                 node_network.clone(),
@@ -169,9 +169,9 @@ mod tests {
             cluster_api.clone();
         let topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> = cluster_api;
         let focused = focused_test_config(&cfg, "192.168.77.9");
-        let plane = crate::networking::boot::boot_rootless(
+        let plane = crate::bootstrap::networking::boot::boot_rootless(
             &focused,
-            crate::networking::boot::NetworkBootStores::new(
+            crate::bootstrap::networking::boot::NetworkBootStores::new(
                 subnet_allocation,
                 topology,
                 node_network.clone(),
@@ -234,9 +234,9 @@ mod tests {
             cluster_api.clone();
         let topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> = cluster_api;
         let focused = focused_test_config(&cfg, "192.168.1.5");
-        let plane = crate::networking::boot::boot_rootless(
+        let plane = crate::bootstrap::networking::boot::boot_rootless(
             &focused,
-            crate::networking::boot::NetworkBootStores::new(
+            crate::bootstrap::networking::boot::NetworkBootStores::new(
                 subnet_allocation,
                 topology,
                 node_network.clone(),

@@ -25,18 +25,22 @@ impl klights_reconcile_api::ServiceRoutingSync for ApiServiceRoutingSyncAdapter 
     }
 }
 
-pub(crate) fn network_mode(mode: &crate::bootstrap::NodeMode) -> crate::networking::NetworkMode {
+pub(crate) fn network_mode(
+    mode: &crate::bootstrap::NodeMode,
+) -> crate::bootstrap::networking::NetworkMode {
     match mode {
-        crate::bootstrap::NodeMode::Root => crate::networking::NetworkMode::Root,
-        crate::bootstrap::NodeMode::Rootless { .. } => crate::networking::NetworkMode::Rootless,
+        crate::bootstrap::NodeMode::Root => crate::bootstrap::networking::NetworkMode::Root,
+        crate::bootstrap::NodeMode::Rootless { .. } => {
+            crate::bootstrap::networking::NetworkMode::Rootless
+        }
     }
 }
 
 pub(crate) fn cleanup_config(
     mode: &crate::bootstrap::NodeMode,
     config: &crate::KlightsConfig,
-) -> anyhow::Result<crate::networking::NetworkCleanupConfig> {
-    crate::networking::NetworkCleanupConfig::try_new(
+) -> anyhow::Result<crate::bootstrap::networking::NetworkCleanupConfig> {
+    crate::bootstrap::networking::NetworkCleanupConfig::try_new(
         network_mode(mode),
         config.bridge_name.clone(),
         config.wireguard_device.clone(),

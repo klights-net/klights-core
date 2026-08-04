@@ -17,7 +17,7 @@ use klights_networking::rootless::{
 };
 use klights_types::PodSubnet;
 
-use crate::networking::NetworkPlane;
+use super::NetworkPlane;
 
 pub(crate) struct NetworkBootStores {
     pub(crate) subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
@@ -56,39 +56,20 @@ pub enum NetworkBoot {
 impl NetworkBoot {
     /// Dispatch on the validated focused network mode and run its boot path.
     pub(crate) async fn boot(
-        cfg: &crate::networking::NetworkBootConfig,
+        cfg: &super::NetworkBootConfig,
         stores: NetworkBootStores,
         cancel: tokio_util::sync::CancellationToken,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Result<Self> {
         match cfg.mode() {
-            crate::networking::NetworkMode::Root => {
+            super::NetworkMode::Root => {
                 let plane = NetworkPlane::boot(cfg, stores, cancel, task_supervisor).await?;
                 Ok(Self::Root(plane))
             }
-            crate::networking::NetworkMode::Rootless => {
+            super::NetworkMode::Rootless => {
                 let plane = boot_rootless(cfg, stores, cancel, task_supervisor).await?;
                 Ok(Self::Rootless(plane))
             }
-        }
-    }
-
-    /// Borrow the root-mode `NetworkPlane` if present. Returns `None` in
-    /// rootless mode.
-    pub fn root_plane(&self) -> Option<&Arc<NetworkPlane>> {
-        match self {
-            Self::Root(p) => Some(p),
-            Self::Rootless(_) => None,
-        }
-    }
-
-    /// Borrow the rootless-mode plane if present. Returns `None` in root mode.
-    /// Phase 2 reconcilers (peer route install, hostport publication) attach
-    /// here.
-    pub fn rootless_plane(&self) -> Option<&Arc<RootlessNetworkPlane>> {
-        match self {
-            Self::Rootless(p) => Some(p),
-            Self::Root(_) => None,
         }
     }
 
@@ -117,7 +98,7 @@ impl NetworkBoot {
 }
 
 pub(crate) async fn boot_rootless(
-    cfg: &crate::networking::NetworkBootConfig,
+    cfg: &super::NetworkBootConfig,
     stores: NetworkBootStores,
     cancel: tokio_util::sync::CancellationToken,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
@@ -142,7 +123,7 @@ pub(crate) async fn boot_rootless(
             cfg.wireguard_port(),
         )
         .map_err(anyhow::Error::new)?,
-        klights_networking::PodLinkMtu::try_new(crate::networking::pod_link_mtu_for_encryption(
+        klights_networking::PodLinkMtu::try_new(super::pod_link_mtu_for_encryption(
             cfg.encryption(),
         ))
         .map_err(anyhow::Error::msg)?,
@@ -265,8 +246,8 @@ mod tests {
         let subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation> =
             cluster_api.clone();
         let topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> = cluster_api;
-        let focused = crate::networking::NetworkBootConfig::try_new(
-            crate::networking::NetworkMode::Rootless,
+        let focused = crate::bootstrap::networking::NetworkBootConfig::try_new(
+            crate::bootstrap::networking::NetworkMode::Rootless,
             &cfg.bridge_name,
             &cfg.node_name,
             &cfg.cluster_cidr,
@@ -294,10 +275,7 @@ mod tests {
         .await
         .expect("rootless dispatch must succeed");
 
-        assert!(
-            boot.root_plane().is_none(),
-            "rootless dispatch must not return a root NetworkPlane"
-        );
+        let _peer_router = boot.peer_router();
         let row = db
             .get_node_subnet(&cfg.node_name)
             .await

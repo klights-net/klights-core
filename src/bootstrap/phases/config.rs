@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::KlightsConfig;
+use crate::bootstrap::networking::NetworkCleanup;
 use crate::bootstrap::{CliFlags, NodeMode};
-use crate::networking::NetworkCleanup;
 use klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy;
 use klights_supervisor::TaskSupervisor;
 

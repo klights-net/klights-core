@@ -44,7 +44,8 @@ pub(crate) fn runtime_dependencies_for_test(
             db_handle,
         ),
     );
-    let services = Arc::new(crate::networking::test_support::MockServiceRouter::default());
+    let services =
+        Arc::new(crate::bootstrap::networking::test_support::MockServiceRouter::default());
     klights_controllers::ControllerRuntimeDependencies {
         wall_time: chrono::Utc::now,
         resource_query: leader.clone(),

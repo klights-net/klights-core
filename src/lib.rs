@@ -14,7 +14,6 @@ mod grpc_test_support;
 #[cfg(feature = "integration-test-harness")]
 pub mod integration_test_harness;
 pub mod kubelet;
-pub mod networking;
 pub mod paths;
 pub mod pidfile;
 pub(crate) mod pod_repository_composition;

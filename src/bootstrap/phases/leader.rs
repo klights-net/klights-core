@@ -131,7 +131,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::networking::test_support::MockNetworkProvider;
+    use crate::bootstrap::networking::test_support::MockNetworkProvider;
     use serde_json::Value;
     use std::net::Ipv4Addr;
 
