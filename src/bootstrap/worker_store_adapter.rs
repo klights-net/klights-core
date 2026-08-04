@@ -39,8 +39,8 @@ pub(crate) async fn start_worker_store_adapter(
         .context("worker watch mirrors")?;
 
     if let Some(discovery_client) = discovery_client {
-        use crate::bootstrap::controlplane_discovery::{
-            ControlplaneDiscoveryEvent, extract_controlplane_endpoint,
+        use klights_leader_api::{
+            ControlplaneDiscoveryEvent, WatchEventType, extract_controlplane_endpoint,
         };
         use std::collections::HashMap;
         let mut discovery_rx = discovery_rx;
@@ -85,12 +85,12 @@ pub(crate) async fn start_worker_store_adapter(
                         let mut next_discovered: HashMap<String, String> = HashMap::new();
                         let mut leader_endpoint = None;
                         for node in nodes.items {
-                            let event = klights_watch::WatchEvent {
-                                event_type: klights_watch::EventType::Added,
-                                object: node.data.clone(),
-                                encoded_payload: None,
-                            };
-                            match extract_controlplane_endpoint(&event) {
+                            match extract_controlplane_endpoint(
+                                WatchEventType::Added,
+                                node.data.as_ref(),
+                                klights_network_api::GRPC_PORT_ANNOTATION,
+                                crate::bootstrap::config::DEFAULT_TLS_PORT,
+                            ) {
                                 ControlplaneDiscoveryEvent::Upsert {
                                     node_name,
                                     endpoint,

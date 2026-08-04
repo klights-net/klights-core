@@ -14,7 +14,10 @@ pub use controlplane_join::{
     ControlplaneMemberQuery, ControlplaneMemberQueryFuture, RaftStorageAttestation,
     RaftStorageLogAttestation, RemoteNodeHostFacts, RemoteNodeMode, RemoteNodeRegistrationSnapshot,
 };
-pub use peer_endpoint::{PeerEndpoint, node_external_ip, peer_endpoint_from_node};
+pub use peer_endpoint::{
+    ControlplaneDiscoveryEvent, PeerEndpoint, extract_controlplane_endpoint, node_external_ip,
+    peer_endpoint_from_node,
+};
 pub use replication::{
     JoinRequest, JoinResponse, JoinRole, MetadataRequest, MetadataResponse,
     require_exact_command_codec,

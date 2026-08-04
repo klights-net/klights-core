@@ -5,7 +5,6 @@ pub mod cluster_meta;
 pub(crate) mod composition_adapters;
 pub mod config;
 pub(crate) mod controller_adapters;
-pub mod controlplane_discovery;
 pub(crate) mod controlplane_join_adapters;
 pub mod credential_store;
 pub(crate) mod finalizer_lifecycle_adapter;
