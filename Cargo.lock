@@ -1979,7 +1979,6 @@ dependencies = [
  "bytes",
  "cel",
  "chrono",
- "flate2",
  "futures",
  "hyper 1.9.0",
  "hyper-util",

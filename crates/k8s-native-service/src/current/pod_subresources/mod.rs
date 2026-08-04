@@ -56,9 +56,6 @@ pub(in crate::current) async fn get_pod_log(
 }
 
 #[cfg(test)]
-pub(crate) use crate::streaming::{exec_spdy, spdy_framing};
-
-#[cfg(test)]
 mod native_tests;
 
 #[cfg(test)]

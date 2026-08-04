@@ -177,8 +177,7 @@ where
         Ok(response)
     } else {
         Err(AppError::BadRequest(
-            "Only WebSocket upgrade supported for portforward (SPDY not yet implemented)"
-                .to_string(),
+            "Pod port-forward requires a WebSocket upgrade".to_string(),
         ))
     }
 }

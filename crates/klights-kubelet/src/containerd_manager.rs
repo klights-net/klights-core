@@ -203,6 +203,49 @@ fn registry_proxy_config_requires_restart(
     proxy_enabled && existing_config != Some(expected_config)
 }
 
+fn cleanup_cni_install_temporary(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+fn install_cni_binary_atomically_blocking(source: &Path, plugin_path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let source = std::fs::canonicalize(source)
+        .with_context(|| format!("Failed to resolve klights executable {}", source.display()))?;
+    let temporary = plugin_path.with_file_name(format!(".klights-cni.tmp.{}", std::process::id()));
+    cleanup_cni_install_temporary(&temporary);
+    if std::fs::hard_link(&source, &temporary).is_err()
+        && let Err(error) = std::fs::copy(&source, &temporary)
+    {
+        cleanup_cni_install_temporary(&temporary);
+        return Err(error).with_context(|| {
+            format!(
+                "Failed to copy {} to {}",
+                source.display(),
+                temporary.display()
+            )
+        });
+    }
+    let mut permissions = match std::fs::metadata(&temporary) {
+        Ok(metadata) => metadata.permissions(),
+        Err(error) => {
+            cleanup_cni_install_temporary(&temporary);
+            return Err(error).with_context(|| format!("Failed to stat {}", temporary.display()));
+        }
+    };
+    permissions.set_mode(0o755);
+    if let Err(error) = std::fs::set_permissions(&temporary, permissions) {
+        cleanup_cni_install_temporary(&temporary);
+        return Err(error).with_context(|| format!("Failed to chmod {}", temporary.display()));
+    }
+    if let Err(error) = std::fs::rename(&temporary, plugin_path) {
+        cleanup_cni_install_temporary(&temporary);
+        return Err(error)
+            .with_context(|| format!("Failed to atomically install {}", plugin_path.display()));
+    }
+    Ok(())
+}
+
 impl ContainerdManager {
     fn rootless_runc_wrapper_path(data_dir: &str) -> PathBuf {
         let mut wrapper = PathBuf::from(data_dir);
@@ -342,16 +385,13 @@ impl ContainerdManager {
             )
             .await?;
         let plugin_path = plugin_dir.join("klights-cni");
-        let current_exe_for_link = current_exe.clone();
+        let current_exe_for_install = current_exe.clone();
         file_process
             .run_blocking_file_keyed(
-                "containerd_install_cni_symlink",
+                "containerd_install_cni_binary",
                 plugin_path.display().to_string(),
-                move || -> Result<()> {
-                    let _ = std::fs::remove_file(&plugin_path);
-                    std::os::unix::fs::symlink(&current_exe_for_link, &plugin_path)
-                        .with_context(|| format!("Failed to symlink {}", plugin_path.display()))?;
-                    Ok(())
+                move || {
+                    install_cni_binary_atomically_blocking(&current_exe_for_install, &plugin_path)
                 },
             )
             .await
@@ -1998,5 +2038,121 @@ mod tests {
             rpc_socket.to_string_lossy().into_owned()
         );
         assert!(parsed.get("mode").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_installed_cni_binary_is_regular_and_survives_source_removal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("cargo-target-klights");
+        let cni_bin = dir.path().join("node-cni-bin");
+        std::fs::write(&source, b"stable-cni-binary").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        ContainerdManager::install_klights_cni_binary(
+            &test_file_process_executor(),
+            cni_bin.to_str().unwrap(),
+            &source,
+        )
+        .await
+        .unwrap();
+
+        let installed = cni_bin.join("klights-cni");
+        let metadata = std::fs::symlink_metadata(&installed).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert!(!metadata.file_type().is_symlink());
+
+        std::fs::remove_file(&source).unwrap();
+        assert_eq!(std::fs::read(&installed).unwrap(), b"stable-cni-binary");
+        assert_ne!(metadata.permissions().mode() & 0o111, 0);
+    }
+
+    #[tokio::test]
+    async fn test_installed_cni_binary_refreshes_atomically_and_preserves_argv0() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        fn write_executable(path: &Path, version: &str) {
+            std::fs::write(
+                path,
+                format!("#!/bin/sh\nprintf '{version}:%s:%s\\n' \"$(basename \"$0\")\" \"$*\"\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        fn invoke(path: &Path) -> String {
+            let output = Command::new(path).arg("probe").output().unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("cargo-target-klights");
+        let refreshed_source = dir.path().join("cargo-target-klights.v2");
+        let cni_bin = dir.path().join("node-cni-bin");
+        let installed = cni_bin.join("klights-cni");
+        write_executable(&source, "v1");
+
+        ContainerdManager::install_klights_cni_binary(
+            &test_file_process_executor(),
+            cni_bin.to_str().unwrap(),
+            &source,
+        )
+        .await
+        .unwrap();
+        assert_eq!(invoke(&installed), "v1:klights-cni:probe\n");
+
+        write_executable(&refreshed_source, "v2");
+        std::fs::rename(&refreshed_source, &source).unwrap();
+        ContainerdManager::install_klights_cni_binary(
+            &test_file_process_executor(),
+            cni_bin.to_str().unwrap(),
+            &source,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(invoke(&installed), "v2:klights-cni:probe\n");
+        assert!(std::fs::read_dir(&cni_bin).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".klights-cni.tmp.")
+        }));
+
+        std::fs::remove_file(&source).unwrap();
+        assert_eq!(invoke(&installed), "v2:klights-cni:probe\n");
+    }
+
+    #[tokio::test]
+    async fn test_failed_cni_binary_install_removes_temporary_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("cargo-target-klights");
+        let cni_bin = dir.path().join("node-cni-bin");
+        std::fs::create_dir(&cni_bin).unwrap();
+        std::fs::create_dir(cni_bin.join("klights-cni")).unwrap();
+        std::fs::write(&source, b"stable-cni-binary").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = ContainerdManager::install_klights_cni_binary(
+            &test_file_process_executor(),
+            cni_bin.to_str().unwrap(),
+            &source,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(cni_bin.join("klights-cni").is_dir());
+        assert!(std::fs::read_dir(&cni_bin).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".klights-cni.tmp.")
+        }));
     }
 }

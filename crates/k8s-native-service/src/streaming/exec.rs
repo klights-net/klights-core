@@ -114,7 +114,7 @@ where
         state.streaming_dependencies().local_node_name.as_ref(),
     );
 
-    // Check for WebSocket upgrade (kubectl v1.29+ uses WebSocket with v5 subprotocol)
+    // Kubernetes v1.34 remotecommand uses WebSocket with the v5 subprotocol.
     let upgrade_header = req
         .headers()
         .get(header::UPGRADE)
@@ -131,25 +131,6 @@ where
                     "replication service not available for remote pod exec".to_string(),
                 )
             })?;
-        if exec_spdy::is_spdy_upgrade(req.headers()) {
-            return pod_exec_remote_spdy_stream(
-                state,
-                RemotePodExecStreamRequest {
-                    req,
-                    node_exec,
-                    node_name,
-                    target: ExecTarget {
-                        namespace,
-                        pod_name: name,
-                        container_id,
-                        command,
-                    },
-                    stream_options,
-                    attach: false,
-                },
-            )
-            .await;
-        }
         if !upgrade_header.eq_ignore_ascii_case("websocket") {
             return Err(AppError::BadRequest(format!(
                 "Pod exec for pod on remote node '{}' requires WebSocket upgrade",
@@ -192,10 +173,9 @@ where
         .await;
     }
 
-    let spdy_upgrade = exec_spdy::is_spdy_upgrade(req.headers());
-    if !spdy_upgrade && !upgrade_header.eq_ignore_ascii_case("websocket") {
+    if !upgrade_header.eq_ignore_ascii_case("websocket") {
         return Err(AppError::BadRequest(
-            "Pod exec requires SPDY or WebSocket upgrade".to_string(),
+            "Pod exec requires WebSocket upgrade".to_string(),
         ));
     }
 
@@ -214,8 +194,19 @@ where
         container_id,
         command,
     };
-    if spdy_upgrade {
-        pod_exec_remote_spdy_stream(
+    if !stdin && !tty {
+        pod_exec_remote_websocket_sync(
+            state,
+            RemotePodExecSyncRequest {
+                req,
+                node_exec,
+                node_name,
+                target,
+            },
+        )
+        .await
+    } else {
+        pod_exec_remote_websocket_stream(
             state,
             RemotePodExecStreamRequest {
                 req,
@@ -227,37 +218,6 @@ where
             },
         )
         .await
-    } else if upgrade_header.eq_ignore_ascii_case("websocket") {
-        if !stdin && !tty {
-            pod_exec_remote_websocket_sync(
-                state,
-                RemotePodExecSyncRequest {
-                    req,
-                    node_exec,
-                    node_name,
-                    target,
-                },
-            )
-            .await
-        } else {
-            pod_exec_remote_websocket_stream(
-                state,
-                RemotePodExecStreamRequest {
-                    req,
-                    node_exec,
-                    node_name,
-                    target,
-                    stream_options,
-                    attach: false,
-                },
-            )
-            .await
-        }
-    } else {
-        Err(AppError::BadRequest(format!(
-            "Invalid Upgrade header: {}. WebSocket upgrade required",
-            upgrade_header
-        )))
     }
 }
 
@@ -378,76 +338,6 @@ where
         .header(header::SEC_WEBSOCKET_PROTOCOL, subprotocol)
         .body(axum::body::Body::empty())
         .map_err(|e| AppError::Internal(format!("Failed to build WebSocket response: {}", e)))
-}
-
-async fn pod_exec_remote_spdy_stream<S>(
-    state: Arc<S>,
-    request: RemotePodExecStreamRequest,
-) -> Result<Response, AppError>
-where
-    S: StreamingState + 'static,
-{
-    let RemotePodExecStreamRequest {
-        req,
-        node_exec,
-        node_name,
-        target,
-        stream_options,
-        attach,
-    } = request;
-
-    if stream_options.stdin || stream_options.tty {
-        return Err(AppError::BadRequest(format!(
-            "SPDY {} for pod on remote node '{}' currently supports non-interactive streams; use WebSocket for stdin/tty",
-            if attach { "attach" } else { "exec" },
-            node_name
-        )));
-    }
-
-    let selected_subprotocol = exec_spdy::negotiate_spdy_subprotocol(req.headers());
-    let task_supervisor = state.streaming_dependencies().task_supervisor.clone();
-    let task_supervisor_for_handler = task_supervisor.clone();
-    let request = exec_spdy::SpdyExecStreamRequest {
-        stdin: stream_options.stdin,
-        stdout: stream_options.stdout,
-        stderr: stream_options.stderr,
-        tty: stream_options.tty,
-        attach,
-    };
-
-    let on_upgrade = hyper::upgrade::on(req);
-    if let Err(err) = task_supervisor
-        .spawn_async(
-            klights_supervisor::TaskCategory::Others,
-            "pod_exec_remote_spdy_upgrade",
-            async move {
-                match on_upgrade.await {
-                    Ok(upgraded) => {
-                        let io = hyper_util::rt::TokioIo::new(upgraded);
-                        exec_spdy::handle_remote_exec_spdy(
-                            io,
-                            exec_spdy::RemoteExecSpdyRequest {
-                                node_exec,
-                                task_supervisor: task_supervisor_for_handler,
-                                node_name,
-                                target,
-                                stream_request: request,
-                            },
-                        )
-                        .await;
-                    }
-                    Err(err) => {
-                        tracing::error!("Remote SPDY exec upgrade failed: {}", err);
-                    }
-                }
-            },
-        )
-        .await
-    {
-        tracing::warn!("Failed to spawn remote pod exec SPDY task: {}", err);
-    }
-
-    exec_spdy::spdy_switching_protocols_response(selected_subprotocol)
 }
 
 async fn pod_exec_remote_websocket_sync<S>(
@@ -620,20 +510,6 @@ where
                     "replication service not available for remote pod attach".to_string(),
                 )
             })?;
-        if exec_spdy::is_spdy_upgrade(req.headers()) {
-            return pod_exec_remote_spdy_stream(
-                state,
-                RemotePodExecStreamRequest {
-                    req,
-                    node_exec,
-                    node_name,
-                    target,
-                    stream_options,
-                    attach: true,
-                },
-            )
-            .await;
-        }
         if !upgrade_header.eq_ignore_ascii_case("websocket") {
             return Err(AppError::BadRequest(format!(
                 "Pod attach for pod on remote node '{}' requires WebSocket upgrade",
@@ -654,10 +530,9 @@ where
         .await;
     }
 
-    let spdy_upgrade = exec_spdy::is_spdy_upgrade(req.headers());
-    if !spdy_upgrade && !upgrade_header.eq_ignore_ascii_case("websocket") {
+    if !upgrade_header.eq_ignore_ascii_case("websocket") {
         return Err(AppError::BadRequest(
-            "Pod attach requires SPDY or WebSocket upgrade".to_string(),
+            "Pod attach requires WebSocket upgrade".to_string(),
         ));
     }
 
@@ -670,38 +545,18 @@ where
             AppError::Internal("local node exec runtime is not available".to_string())
         })?;
     let node_name = state.streaming_dependencies().local_node_name.to_string();
-    if spdy_upgrade {
-        pod_exec_remote_spdy_stream(
-            state,
-            RemotePodExecStreamRequest {
-                req,
-                node_exec,
-                node_name,
-                target,
-                stream_options,
-                attach: true,
-            },
-        )
-        .await
-    } else if upgrade_header.eq_ignore_ascii_case("websocket") {
-        pod_exec_remote_websocket_stream(
-            state,
-            RemotePodExecStreamRequest {
-                req,
-                node_exec,
-                node_name,
-                target,
-                stream_options,
-                attach: true,
-            },
-        )
-        .await
-    } else {
-        Err(AppError::BadRequest(format!(
-            "Invalid Upgrade header: {}. WebSocket upgrade required",
-            upgrade_header
-        )))
-    }
+    pod_exec_remote_websocket_stream(
+        state,
+        RemotePodExecStreamRequest {
+            req,
+            node_exec,
+            node_name,
+            target,
+            stream_options,
+            attach: true,
+        },
+    )
+    .await
 }
 
 // Derive Sec-WebSocket-Accept key from Sec-WebSocket-Key (RFC 6455)

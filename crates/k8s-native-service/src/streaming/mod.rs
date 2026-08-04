@@ -26,12 +26,10 @@ use crate::{
 
 mod backend_proxy_headers;
 mod exec;
-pub(crate) mod exec_spdy;
 mod exec_ws;
 mod node_proxy;
 mod portforward;
 mod proxy;
-pub(crate) mod spdy_framing;
 
 /// Complete focused capabilities used by Kubernetes streaming routes.
 #[derive(Clone)]
@@ -224,9 +222,6 @@ pub mod test_support {
         PodGetRequest, PodListRequest, PodListResult, PodOwnerListRequest, PodQuery,
         PodRepositoryError, PodRepositoryFuture,
     };
-
-    pub use super::exec_spdy::*;
-    pub use super::spdy_framing::*;
 
     pub(super) struct UnavailableStreaming;
 
