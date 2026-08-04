@@ -966,7 +966,7 @@ impl RootPodRepositoryComposition {
                 deletion: deletion.clone(),
                 admission_resources: native.clone(),
                 spec_validation: native.clone(),
-                admission: crate::resource_admission_adapter::ResourceAdmissionAdapter::new(
+                admission: crate::bootstrap::composition_adapters::resource_admission_adapter::ResourceAdmissionAdapter::new(
                     self.api_identity.clone(),
                     self.db.clone(),
                 ),

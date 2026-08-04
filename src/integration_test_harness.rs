@@ -1430,7 +1430,7 @@ impl NativeApiTestHarness {
             crate::bootstrap::controller_adapters::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
                 datastore.clone(),
             ),
-            crate::resource_admission_adapter::ResourceAdmissionAdapter::new(
+            crate::bootstrap::composition_adapters::resource_admission_adapter::ResourceAdmissionAdapter::new(
                 identity,
                 datastore.clone(),
             ),

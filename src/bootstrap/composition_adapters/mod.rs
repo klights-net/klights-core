@@ -18,5 +18,6 @@ pub(crate) mod pod_native_adapter;
 pub(crate) mod positioned_watch_adapter;
 pub(crate) mod projected_token_resource_adapter;
 pub(crate) mod remote_informer_cache_adapter;
+pub(crate) mod resource_admission_adapter;
 pub(crate) mod signing_key_state_adapter;
 pub(crate) mod watch_stream_adapter;

@@ -16,11 +16,8 @@ use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use crate::resource_admission_adapter::{
-    CaBundleClientCache, RootAdmissionQuery, RootAdmissionWebhookClient, RootWebhookTargetResolver,
-    add_timeout_query, build_webhook_http_client, ca_bundle_fingerprint,
-    lock_ca_bundle_cache_for_test,
-};
+use crate::bootstrap::composition_adapters::resource_admission_adapter::DatastoreAdmissionQuery;
+use k8s_native_service::admission::{ReqwestAdmissionWebhookClient, ServiceWebhookTargetResolver};
 
 fn deterministic_api_identity() -> Arc<dyn k8s_native_service::ApiIdentityGenerator> {
     Arc::new(
@@ -118,9 +115,9 @@ impl AdmissionWebhookClient for FakeAdmissionWebhookClient {
 
 macro_rules! admission_engine_for_db_handle {
     ($engine:ident, $db_handle:expr) => {
-        let admission_query: Arc<dyn AdmissionQuery> = RootAdmissionQuery::new($db_handle);
-        let admission_resolver = RootWebhookTargetResolver::new(admission_query.clone());
-        let admission_client = RootAdmissionWebhookClient::new();
+        let admission_query: Arc<dyn AdmissionQuery> = DatastoreAdmissionQuery::new($db_handle);
+        let admission_resolver = ServiceWebhookTargetResolver::new(admission_query.clone());
+        let admission_client = ReqwestAdmissionWebhookClient::new();
         let admission_identity = deterministic_api_identity();
         let $engine = AdmissionEngine::new(
             admission_identity.as_ref(),
@@ -135,8 +132,8 @@ async fn resolve_webhook_target_for_test(
     db: crate::datastore::DatastoreHandle,
     client_config: &Value,
 ) -> std::result::Result<WebhookTarget, AdmissionDependencyError> {
-    let query: Arc<dyn AdmissionQuery> = RootAdmissionQuery::new(db);
-    RootWebhookTargetResolver::new(query)
+    let query: Arc<dyn AdmissionQuery> = DatastoreAdmissionQuery::new(db);
+    ServiceWebhookTargetResolver::new(query)
         .resolve(client_config)
         .await
 }
@@ -665,87 +662,6 @@ fn test_should_reinvoke_ifneeded_webhook_after_later_mutation() {
     assert!(!should_reinvoke_webhook(true, None));
 }
 
-#[test]
-fn test_webhook_http_client_for_invalid_cabundle_errors() {
-    let cfg = json!({"caBundle": "%%%not-base64%%%"});
-    let err = build_webhook_http_client(&cfg, None)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("Invalid base64"));
-}
-
-fn test_ca_bundle(name: &str) -> String {
-    use base64::Engine;
-
-    let cert = rcgen::generate_simple_self_signed(vec![name.to_string()]).unwrap();
-    base64::engine::general_purpose::STANDARD.encode(cert.cert.pem().as_bytes())
-}
-
-#[test]
-fn test_webhook_http_client_cache_source_uses_fingerprint_and_no_expect() {
-    // R4: invariant now enforced by check_supervisor_spawn.sh
-}
-
-#[test]
-fn test_webhook_ca_bundle_cache_hits_by_fingerprint() {
-    let bundle = test_ca_bundle("cache-hit.example");
-    let config = json!({"caBundle": bundle});
-    let fingerprint = ca_bundle_fingerprint(&config).unwrap();
-    let mut cache = CaBundleClientCache::new_for_test(4);
-
-    cache.client_for(&config).unwrap();
-    cache.client_for(&config).unwrap();
-
-    assert_eq!(cache.len_for_test(), 1);
-    assert!(cache.contains_for_test(&fingerprint));
-}
-
-#[test]
-fn test_webhook_ca_bundle_cache_evicts_lru_entry() {
-    let bundle_a = test_ca_bundle("cache-a.example");
-    let bundle_b = test_ca_bundle("cache-b.example");
-    let bundle_c = test_ca_bundle("cache-c.example");
-    let config_a = json!({"caBundle": bundle_a});
-    let config_b = json!({"caBundle": bundle_b});
-    let config_c = json!({"caBundle": bundle_c});
-    let fingerprint_a = ca_bundle_fingerprint(&config_a).unwrap();
-    let fingerprint_b = ca_bundle_fingerprint(&config_b).unwrap();
-    let fingerprint_c = ca_bundle_fingerprint(&config_c).unwrap();
-    let mut cache = CaBundleClientCache::new_for_test(2);
-
-    cache.client_for(&config_a).unwrap();
-    cache.client_for(&config_b).unwrap();
-    cache.client_for(&config_a).unwrap();
-    cache.client_for(&config_c).unwrap();
-
-    assert_eq!(cache.len_for_test(), 2);
-    assert!(cache.contains_for_test(&fingerprint_a));
-    assert!(!cache.contains_for_test(&fingerprint_b));
-    assert!(cache.contains_for_test(&fingerprint_c));
-}
-
-#[test]
-fn test_webhook_ca_bundle_cache_poisoned_lock_returns_error() {
-    let cache = Arc::new(Mutex::new(CaBundleClientCache::new_for_test(1)));
-    let poisoned = Arc::clone(&cache);
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = std::thread::spawn(move || {
-        let _guard = poisoned.lock().unwrap();
-        panic!("poison caBundle cache");
-    })
-    .join();
-    std::panic::set_hook(default_hook);
-    assert!(result.is_err());
-
-    let err = match lock_ca_bundle_cache_for_test(&cache) {
-        Ok(_) => panic!("poisoned cache lock must return an error"),
-        Err(err) => err.to_string(),
-    };
-
-    assert!(err.contains("caBundle client cache poisoned"));
-}
-
 // ========================
 // is_admission_allowed tests
 // ========================
@@ -1263,7 +1179,7 @@ async fn test_get_namespace_labels_reads_namespace_table() {
     .await
     .unwrap();
 
-    let query = RootAdmissionQuery::new(db_handle);
+    let query = DatastoreAdmissionQuery::new(db_handle);
     let labels = get_namespace_labels(query.as_ref(), "label-ns").await;
     assert_eq!(
         labels.get("webhook-ready").map(String::as_str),
@@ -1743,48 +1659,5 @@ async fn test_webhook_configuration_objects_are_exempt_from_dynamic_admission() 
     assert_eq!(
         got, create_target,
         "webhook configuration objects must bypass dynamic mutating admission"
-    );
-}
-
-// ========================
-// add_timeout_query tests
-// ========================
-
-#[test]
-fn test_add_timeout_query_appends_timeout_seconds_when_no_existing_query() {
-    let url = add_timeout_query("https://hook.example.com/v1/admit", 7).unwrap();
-    let parsed = reqwest::Url::parse(&url).unwrap();
-    let pairs: Vec<(String, String)> = parsed
-        .query_pairs()
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
-    assert_eq!(pairs, vec![("timeout".to_string(), "7s".to_string())]);
-}
-
-#[test]
-fn test_add_timeout_query_preserves_existing_query_string() {
-    let url = add_timeout_query("https://hook.example.com/admit?foo=bar", 30).unwrap();
-    let parsed = reqwest::Url::parse(&url).unwrap();
-    let pairs: Vec<(String, String)> = parsed
-        .query_pairs()
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
-    assert!(
-        pairs.contains(&("foo".to_string(), "bar".to_string())),
-        "existing query pair must be preserved: {pairs:?}"
-    );
-    assert!(
-        pairs.contains(&("timeout".to_string(), "30s".to_string())),
-        "timeout pair must be appended: {pairs:?}"
-    );
-}
-
-#[test]
-fn test_add_timeout_query_returns_error_for_unparseable_url() {
-    let err = add_timeout_query("not a url", 10).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Invalid webhook URL") || msg.contains("not a url"),
-        "error must reference the bad URL; got: {msg}"
     );
 }

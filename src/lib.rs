@@ -22,7 +22,6 @@ pub mod networking;
 pub mod paths;
 pub mod pidfile;
 pub(crate) mod pod_repository_composition;
-mod resource_admission_adapter;
 #[cfg(test)]
 mod service_pod_integration_tests;
 #[cfg(test)]

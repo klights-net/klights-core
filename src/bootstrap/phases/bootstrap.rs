@@ -1596,7 +1596,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         crate::bootstrap::controller_adapters::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
             db_handle.clone(),
         ),
-        crate::resource_admission_adapter::ResourceAdmissionAdapter::new(
+        crate::bootstrap::composition_adapters::resource_admission_adapter::ResourceAdmissionAdapter::new(
             api_identity,
             db_handle.clone(),
         ),

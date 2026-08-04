@@ -6,8 +6,10 @@ pub mod request_context;
 mod selectors;
 #[cfg(any(test, feature = "test-support"))]
 pub mod selectors;
+mod service_target;
 mod validating_policy;
 mod webhook_call;
+mod webhook_http;
 #[cfg(not(any(test, feature = "test-support")))]
 mod webhook_response;
 #[cfg(any(test, feature = "test-support"))]
@@ -22,6 +24,7 @@ pub use request_context::AdmissionRequestContext;
 use request_context::{is_admission_operation, is_webhook_configuration_resource};
 use selectors::get_namespace_labels_value;
 use serde_json::Value;
+pub use service_target::ServiceWebhookTargetResolver;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use validating_policy::run_validating_admission_policies;
@@ -31,6 +34,7 @@ pub use validating_policy::{
 };
 use webhook_call::call_webhook;
 pub use webhook_call::format_webhook_call_error;
+pub use webhook_http::ReqwestAdmissionWebhookClient;
 use webhook_response::{
     apply_mutation, build_admission_review, ensure_webhook_allowed, webhook_warnings,
 };
