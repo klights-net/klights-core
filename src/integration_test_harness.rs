@@ -19,6 +19,60 @@ pub use klights_cluster_datastore::sqlite::embedded::{
     ResourceMutationPauseOperation as IntegrationResourceMutationPauseOperation,
 };
 
+/// Resolves one admission webhook target through the root's concrete
+/// datastore-to-native-service composition. This exists only for base-owned
+/// full-adapter integration tests and does not expose the private adapter.
+pub async fn resolve_admission_webhook_target_for_integration(
+    db: IntegrationDatastoreHandle,
+    client_config: &serde_json::Value,
+) -> Result<
+    k8s_native_service::admission::WebhookTarget,
+    k8s_native_service::admission::AdmissionDependencyError,
+> {
+    use k8s_native_service::admission::WebhookTargetResolver as _;
+
+    let query: Arc<dyn k8s_native_service::admission::AdmissionQuery> =
+        crate::bootstrap::composition_adapters::resource_admission_adapter::DatastoreAdmissionQuery::new(db);
+    k8s_native_service::admission::ServiceWebhookTargetResolver::new(query)
+        .resolve(client_config)
+        .await
+}
+
+/// Reads Namespace labels through the root admission query composition.
+pub async fn admission_namespace_labels_for_integration(
+    db: IntegrationDatastoreHandle,
+    namespace: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let query: Arc<dyn k8s_native_service::admission::AdmissionQuery> =
+        crate::bootstrap::composition_adapters::resource_admission_adapter::DatastoreAdmissionQuery::new(db);
+    k8s_native_service::admission::selectors::get_namespace_labels(query.as_ref(), namespace).await
+}
+
+/// Runs one mutating or validating pass through the exact concrete admission
+/// dependencies assembled by root. Kept narrow and feature-only for the
+/// base-owned cross-adapter integration suite.
+pub async fn run_admission_for_integration(
+    db: IntegrationDatastoreHandle,
+    context: &k8s_native_service::admission::AdmissionRequestContext,
+    is_mutating: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let identity = DeterministicApiIdentity::default();
+    let query: Arc<dyn k8s_native_service::admission::AdmissionQuery> =
+        crate::bootstrap::composition_adapters::resource_admission_adapter::DatastoreAdmissionQuery::new(db);
+    let target_resolver: Arc<dyn k8s_native_service::admission::WebhookTargetResolver> =
+        k8s_native_service::admission::ServiceWebhookTargetResolver::new(Arc::clone(&query));
+    let webhook_client: Arc<dyn k8s_native_service::admission::AdmissionWebhookClient> =
+        k8s_native_service::admission::ReqwestAdmissionWebhookClient::new();
+    k8s_native_service::admission::AdmissionEngine::new(
+        &identity,
+        query.as_ref(),
+        target_resolver.as_ref(),
+        webhook_client.as_ref(),
+    )
+    .run_with_context(context, is_mutating)
+    .await
+}
+
 #[derive(Clone)]
 pub struct IntegrationWatchHistoryFailureControl {
     fail: Arc<std::sync::atomic::AtomicBool>,

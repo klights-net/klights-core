@@ -1,6 +1,3 @@
-#[cfg(test)]
-#[path = "admission/tests.rs"]
-mod admission_tests;
 mod allocator;
 pub mod cli;
 mod cluster_engine;

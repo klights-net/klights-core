@@ -1,28 +1,32 @@
-use k8s_native_service::admission::request_context::{
-    is_admission_operation, parse_api_group_version,
-};
-use k8s_native_service::admission::selectors::{get_namespace_labels, matches_label_selector};
-use k8s_native_service::admission::webhook_response::{
+use super::request_context::{is_admission_operation, parse_api_group_version};
+use super::selectors::matches_label_selector;
+use super::webhook_response::{
     apply_mutation, build_admission_review, ensure_webhook_allowed, is_admission_allowed,
     webhook_denial_message, webhook_warnings,
 };
-use k8s_native_service::admission::webhook_rules::{
+use super::webhook_rules::{
     evaluate_match_conditions, matches_webhook_rules, should_call_webhook, should_reinvoke_webhook,
     webhook_side_effects_allow_dry_run, webhook_timeout_seconds,
 };
-use k8s_native_service::admission::*;
-use serde_json::Value;
-use serde_json::json;
-use std::net::SocketAddr;
+use super::*;
+use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
-use crate::bootstrap::composition_adapters::resource_admission_adapter::DatastoreAdmissionQuery;
-use k8s_native_service::admission::{ReqwestAdmissionWebhookClient, ServiceWebhookTargetResolver};
+#[derive(Default)]
+struct DeterministicApiIdentity;
 
-fn deterministic_api_identity() -> Arc<dyn k8s_native_service::ApiIdentityGenerator> {
-    Arc::new(
-        crate::bootstrap::controller_adapters::system_identity_adapter::SystemIdentityGenerator,
-    )
+impl crate::ApiIdentityGenerator for DeterministicApiIdentity {
+    fn generate_name(&self, prefix: &str) -> String {
+        format!("{prefix}00000")
+    }
+
+    fn new_uid(&self) -> String {
+        "00000000-0000-4000-8000-000000000000".to_string()
+    }
+}
+
+fn deterministic_api_identity() -> Arc<dyn crate::ApiIdentityGenerator> {
+    Arc::new(DeterministicApiIdentity)
 }
 
 #[derive(Default)]
@@ -112,32 +116,6 @@ impl AdmissionWebhookClient for FakeAdmissionWebhookClient {
         Ok(json!({"response": {"allowed": true}}))
     }
 }
-
-macro_rules! admission_engine_for_db_handle {
-    ($engine:ident, $db_handle:expr) => {
-        let admission_query: Arc<dyn AdmissionQuery> = DatastoreAdmissionQuery::new($db_handle);
-        let admission_resolver = ServiceWebhookTargetResolver::new(admission_query.clone());
-        let admission_client = ReqwestAdmissionWebhookClient::new();
-        let admission_identity = deterministic_api_identity();
-        let $engine = AdmissionEngine::new(
-            admission_identity.as_ref(),
-            admission_query.as_ref(),
-            admission_resolver.as_ref(),
-            admission_client.as_ref(),
-        );
-    };
-}
-
-async fn resolve_webhook_target_for_test(
-    db: crate::datastore::DatastoreHandle,
-    client_config: &Value,
-) -> std::result::Result<WebhookTarget, AdmissionDependencyError> {
-    let query: Arc<dyn AdmissionQuery> = DatastoreAdmissionQuery::new(db);
-    ServiceWebhookTargetResolver::new(query)
-        .resolve(client_config)
-        .await
-}
-
 fn test_ctx(
     api_version: &str,
     resource: &str,
@@ -523,7 +501,7 @@ fn test_admission_webhook_objectselector_uses_cached_parse() {
     // the underlying webhook Value's objectSelector after caching MUST
     // NOT affect future calls — the cache is the source of truth, and a
     // stale cache reflects exactly the selector that was registered.
-    use k8s_native_service::admission::webhook_rules::CachedWebhook;
+    use crate::admission::webhook_rules::CachedWebhook;
 
     let mut webhook = json!({
         "name": "obj-selector.example.com",
@@ -550,7 +528,7 @@ fn test_admission_webhook_objectselector_uses_cached_parse() {
     let ctx = test_ctx("v1", "configmaps", "CREATE", Some("default"), None);
 
     assert!(
-        k8s_native_service::admission::webhook_rules::should_call_cached_webhook(
+        crate::admission::webhook_rules::should_call_cached_webhook(
             &cached,
             &ctx,
             &matching_resource,
@@ -559,7 +537,7 @@ fn test_admission_webhook_objectselector_uses_cached_parse() {
         .unwrap()
     );
     assert!(
-        !k8s_native_service::admission::webhook_rules::should_call_cached_webhook(
+        !crate::admission::webhook_rules::should_call_cached_webhook(
             &cached,
             &ctx,
             &non_matching_resource,
@@ -573,7 +551,7 @@ fn test_admission_webhook_objectselector_uses_cached_parse() {
     // The cached selector is unchanged, so the demo-labeled resource still matches
     // and the other-labeled one still doesn't.
     assert!(
-        k8s_native_service::admission::webhook_rules::should_call_cached_webhook(
+        crate::admission::webhook_rules::should_call_cached_webhook(
             &cached,
             &ctx,
             &matching_resource,
@@ -582,7 +560,7 @@ fn test_admission_webhook_objectselector_uses_cached_parse() {
         .unwrap()
     );
     assert!(
-        !k8s_native_service::admission::webhook_rules::should_call_cached_webhook(
+        !crate::admission::webhook_rules::should_call_cached_webhook(
             &cached,
             &ctx,
             &non_matching_resource,
@@ -594,7 +572,7 @@ fn test_admission_webhook_objectselector_uses_cached_parse() {
     // Re-cache after the mutation — now the OTHER label matches.
     let recached = CachedWebhook::from_value(webhook);
     assert!(
-        k8s_native_service::admission::webhook_rules::should_call_cached_webhook(
+        crate::admission::webhook_rules::should_call_cached_webhook(
             &recached,
             &ctx,
             &non_matching_resource,
@@ -606,7 +584,7 @@ fn test_admission_webhook_objectselector_uses_cached_parse() {
 
 #[test]
 fn test_admission_cached_webhook_objectselector_match_expressions() {
-    use k8s_native_service::admission::webhook_rules::CachedWebhook;
+    use crate::admission::webhook_rules::CachedWebhook;
 
     let webhook = json!({
         "name": "expr.example.com",
@@ -636,7 +614,7 @@ fn test_admission_cached_webhook_objectselector_match_expressions() {
         "metadata": {"name": "cm", "namespace": "default", "labels": {"tier": "data"}},
     });
     assert!(
-        k8s_native_service::admission::webhook_rules::should_call_cached_webhook(
+        crate::admission::webhook_rules::should_call_cached_webhook(
             &cached,
             &ctx,
             &fe_resource,
@@ -645,7 +623,7 @@ fn test_admission_cached_webhook_objectselector_match_expressions() {
         .unwrap()
     );
     assert!(
-        !k8s_native_service::admission::webhook_rules::should_call_cached_webhook(
+        !crate::admission::webhook_rules::should_call_cached_webhook(
             &cached,
             &ctx,
             &data_resource,
@@ -851,367 +829,6 @@ fn test_ensure_webhook_allowed_rejects_denied_response() {
     assert!(err.contains("Admission denied by webhook"));
     assert!(err.contains("this webhook denies all requests"));
 }
-
-// ========================
-// resolve_webhook_target tests
-// ========================
-
-#[tokio::test]
-async fn test_resolve_webhook_target_from_url_field() {
-    let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    let client_config = json!({"url": "https://webhook.example.com/validate"});
-
-    let target = resolve_webhook_target_for_test(db_handle, &client_config)
-        .await
-        .unwrap();
-    assert_eq!(target.base_url, "https://webhook.example.com/validate");
-    assert_eq!(target.dns_override, None);
-}
-
-#[tokio::test]
-async fn test_resolve_webhook_target_from_service_reference() {
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-
-    // Create a Service in the DB
-    let service = json!({
-        "apiVersion": "v1",
-        "kind": "Service",
-        "metadata": {
-            "name": "webhook-service",
-            "namespace": "cert-manager"
-        },
-        "spec": {
-            "clusterIP": "10.43.200.50",
-            "ports": [{"port": 443}]
-        }
-    });
-    db.create_resource(
-        "v1",
-        "Service",
-        Some("cert-manager"),
-        "webhook-service",
-        service,
-    )
-    .await
-    .unwrap();
-    db.create_resource(
-        "v1",
-        "Endpoints",
-        Some("cert-manager"),
-        "webhook-service",
-        json!({
-            "apiVersion": "v1",
-            "kind": "Endpoints",
-            "metadata": {
-                "name": "webhook-service",
-                "namespace": "cert-manager"
-            },
-            "subsets": [{
-                "addresses": [{"ip": "10.42.1.10"}],
-                "ports": [{"port": 443}]
-            }]
-        }),
-    )
-    .await
-    .unwrap();
-
-    let client_config = json!({
-        "service": {
-            "name": "webhook-service",
-            "namespace": "cert-manager",
-            "path": "/validate"
-        }
-    });
-
-    let target = resolve_webhook_target_for_test(db_handle, &client_config)
-        .await
-        .unwrap();
-    assert_eq!(
-        target.base_url,
-        "https://webhook-service.cert-manager.svc:443/validate"
-    );
-    assert_eq!(
-        target.dns_override,
-        Some((
-            "webhook-service.cert-manager.svc".to_string(),
-            SocketAddr::from((std::net::Ipv4Addr::new(10, 43, 200, 50), 443)),
-        ))
-    );
-}
-
-#[tokio::test]
-async fn test_resolve_webhook_target_service_with_port_specified() {
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-
-    let service = json!({
-        "apiVersion": "v1",
-        "kind": "Service",
-        "metadata": {
-            "name": "webhook-service",
-            "namespace": "default"
-        },
-        "spec": {
-            "clusterIP": "10.43.128.100",
-            "ports": [{"port": 8443}, {"port": 9443}]
-        }
-    });
-    db.create_resource("v1", "Service", Some("default"), "webhook-service", service)
-        .await
-        .unwrap();
-    db.create_resource(
-        "v1",
-        "Endpoints",
-        Some("default"),
-        "webhook-service",
-        json!({
-            "apiVersion": "v1",
-            "kind": "Endpoints",
-            "metadata": {
-                "name": "webhook-service",
-                "namespace": "default"
-            },
-            "subsets": [{
-                "addresses": [{"ip": "10.42.1.20"}],
-                "ports": [{"port": 9443}]
-            }]
-        }),
-    )
-    .await
-    .unwrap();
-
-    let client_config = json!({
-        "service": {
-            "name": "webhook-service",
-            "namespace": "default",
-            "port": 9443
-        }
-    });
-
-    let target = resolve_webhook_target_for_test(db_handle, &client_config)
-        .await
-        .unwrap();
-    assert_eq!(target.base_url, "https://webhook-service.default.svc:9443");
-    assert_eq!(
-        target.dns_override,
-        Some((
-            "webhook-service.default.svc".to_string(),
-            SocketAddr::from((std::net::Ipv4Addr::new(10, 43, 128, 100), 9443)),
-        ))
-    );
-}
-
-#[tokio::test]
-async fn test_resolve_webhook_target_leaves_target_port_translation_to_service_dataplane() {
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-
-    let service = json!({
-        "apiVersion": "v1",
-        "kind": "Service",
-        "metadata": {
-            "name": "webhook-service",
-            "namespace": "default"
-        },
-        "spec": {
-            "clusterIP": "10.43.128.100",
-            "ports": [{"name":"https","port":443}]
-        }
-    });
-    db.create_resource("v1", "Service", Some("default"), "webhook-service", service)
-        .await
-        .unwrap();
-
-    let endpoints = json!({
-        "apiVersion": "v1",
-        "kind": "Endpoints",
-        "metadata": {
-            "name": "webhook-service",
-            "namespace": "default"
-        },
-        "subsets": [{
-            "addresses": [{"ip": "10.42.0.55"}],
-            "ports": [{"name":"https","port":9443}]
-        }]
-    });
-    db.create_resource(
-        "v1",
-        "Endpoints",
-        Some("default"),
-        "webhook-service",
-        endpoints,
-    )
-    .await
-    .unwrap();
-
-    let client_config = json!({
-        "service": {
-            "name": "webhook-service",
-            "namespace": "default"
-        }
-    });
-
-    let target = resolve_webhook_target_for_test(db_handle, &client_config)
-        .await
-        .unwrap();
-    assert_eq!(target.base_url, "https://webhook-service.default.svc:443");
-    assert_eq!(
-        target.dns_override,
-        Some((
-            "webhook-service.default.svc".to_string(),
-            SocketAddr::from((std::net::Ipv4Addr::new(10, 43, 128, 100), 443)),
-        ))
-    );
-}
-
-#[tokio::test]
-async fn test_resolve_webhook_target_keeps_remote_endpoint_behind_service_dataplane() {
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-
-    db.create_resource(
-        "v1",
-        "Service",
-        Some("webhook-7540"),
-        "e2e-test-webhook",
-        json!({
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": {
-                "name": "e2e-test-webhook",
-                "namespace": "webhook-7540"
-            },
-            "spec": {
-                "clusterIP": "10.43.128.100",
-                "ports": [{"name": "https", "port": 8443, "targetPort": 8444}]
-            }
-        }),
-    )
-    .await
-    .unwrap();
-    db.create_resource(
-        "discovery.k8s.io/v1",
-        "EndpointSlice",
-        Some("webhook-7540"),
-        "e2e-test-webhook-remote",
-        json!({
-            "apiVersion": "discovery.k8s.io/v1",
-            "kind": "EndpointSlice",
-            "metadata": {
-                "name": "e2e-test-webhook-remote",
-                "namespace": "webhook-7540",
-                "labels": {"kubernetes.io/service-name": "e2e-test-webhook"}
-            },
-            "ports": [{"name": "https", "port": 8444, "protocol": "TCP"}],
-            "endpoints": [{
-                "addresses": ["10.42.2.55"],
-                "conditions": {"ready": true},
-                "nodeName": "mn-replica"
-            }]
-        }),
-    )
-    .await
-    .unwrap();
-
-    let target = resolve_webhook_target_for_test(
-        db_handle,
-        &json!({
-            "service": {
-                "name": "e2e-test-webhook",
-                "namespace": "webhook-7540",
-                "path": "/always-allow-delay-5s",
-                "port": 8443
-            }
-        }),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(
-        target.base_url,
-        "https://e2e-test-webhook.webhook-7540.svc:8443/always-allow-delay-5s"
-    );
-    assert_eq!(
-        target.dns_override,
-        Some((
-            "e2e-test-webhook.webhook-7540.svc".to_string(),
-            SocketAddr::from((std::net::Ipv4Addr::new(10, 43, 128, 100), 8443)),
-        )),
-        "the apiserver must enter the Service dataplane; it must not pin the first remote Pod endpoint"
-    );
-}
-
-#[tokio::test]
-async fn test_resolve_webhook_target_service_not_found_returns_error() {
-    let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-
-    let client_config = json!({
-        "service": {
-            "name": "nonexistent",
-            "namespace": "default"
-        }
-    });
-
-    let result = resolve_webhook_target_for_test(db_handle, &client_config).await;
-    assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("Service not found")
-    );
-}
-
-#[tokio::test]
-async fn test_get_namespace_labels_reads_namespace_table() {
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    db.create_namespace(
-        "label-ns",
-        json!({
-            "apiVersion": "v1",
-            "kind": "Namespace",
-            "metadata": {
-                "name": "label-ns",
-                "labels": {
-                    "webhook-ready": "true",
-                    "team": "platform"
-                }
-            }
-        }),
-    )
-    .await
-    .unwrap();
-
-    let query = DatastoreAdmissionQuery::new(db_handle);
-    let labels = get_namespace_labels(query.as_ref(), "label-ns").await;
-    assert_eq!(
-        labels.get("webhook-ready").map(String::as_str),
-        Some("true")
-    );
-    assert_eq!(labels.get("team").map(String::as_str), Some("platform"));
-}
-
-#[tokio::test]
-async fn test_admission_engine_shared_runner_no_webhooks_keeps_resource() {
-    let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    admission_engine_for_db_handle!(engine, db_handle);
-    let pod = json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {"name": "p0", "namespace": "default"},
-        "spec": {"containers": [{"name": "c", "image": "busybox"}]}
-    });
-
-    let mutated = engine
-        .run_mutating(&pod, "v1", "Pod", "CREATE")
-        .await
-        .unwrap();
-    assert_eq!(mutated, pod);
-
-    let validated = engine
-        .run_validating(&pod, "v1", "Pod", "CREATE")
-        .await
-        .unwrap();
-    assert_eq!(validated, pod);
-}
-
 #[tokio::test]
 async fn test_admission_engine_accepts_focused_lookup_trait_object() {
     let query = FakeAdmissionQuery::default();
@@ -1312,352 +929,4 @@ fn test_admission_request_context_from_legacy_fields() {
     assert_eq!(ctx.resource, "pods");
     assert_eq!(ctx.namespace.as_deref(), Some("default"));
     assert_eq!(ctx.operation, "CREATE");
-}
-
-#[tokio::test]
-async fn test_engine_skips_non_write_operations_even_if_webhook_exists() {
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    admission_engine_for_db_handle!(engine, db_handle);
-
-    // Matching webhook exists, but non-write ops must not trigger callout.
-    let mwc = json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "MutatingWebhookConfiguration",
-        "metadata": {"name": "mwc-skip-read-ops"},
-        "webhooks": [{
-            "name": "m.example.com",
-            "clientConfig": {"url": "https://127.0.0.1:1/mutate"},
-            "rules": [{
-                "operations": ["*"],
-                "apiVersions": ["v1"],
-                "resources": ["pods"]
-            }]
-        }]
-    });
-    db.create_resource(
-        "admissionregistration.k8s.io/v1",
-        "MutatingWebhookConfiguration",
-        None,
-        "mwc-skip-read-ops",
-        mwc,
-    )
-    .await
-    .unwrap();
-
-    let pod = json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {"name": "p0", "namespace": "default"},
-        "spec": {"containers": [{"name": "c", "image": "busybox"}]}
-    });
-
-    let got = engine.run_mutating(&pod, "v1", "Pod", "GET").await.unwrap();
-    assert_eq!(got, pod);
-}
-
-#[tokio::test]
-async fn test_namespace_selector_non_match_skips_namespaced_call() {
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    admission_engine_for_db_handle!(engine, db_handle);
-
-    let ns = json!({
-        "apiVersion": "v1",
-        "kind": "Namespace",
-        "metadata": {"name": "default", "labels": {"team": "a"}}
-    });
-    db.create_resource("v1", "Namespace", None, "default", ns)
-        .await
-        .unwrap();
-
-    let mwc = json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "MutatingWebhookConfiguration",
-        "metadata": {"name": "mwc-ns-selector-skip"},
-        "webhooks": [{
-            "name": "m.example.com",
-            "failurePolicy": "Fail",
-            "namespaceSelector": {"matchLabels": {"team": "b"}},
-            "clientConfig": {"url": "https://127.0.0.1:1/mutate"},
-            "rules": [{
-                "operations": ["CREATE"],
-                "apiGroups": [""],
-                "apiVersions": ["v1"],
-                "resources": ["pods"]
-            }]
-        }]
-    });
-    db.create_resource(
-        "admissionregistration.k8s.io/v1",
-        "MutatingWebhookConfiguration",
-        None,
-        "mwc-ns-selector-skip",
-        mwc,
-    )
-    .await
-    .unwrap();
-
-    let pod = json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {"name": "p0", "namespace": "default"},
-        "spec": {"containers": [{"name": "c", "image": "busybox"}]}
-    });
-
-    // Selector mismatch must skip callout (no error despite unreachable webhook URL).
-    let got = engine
-        .run_mutating(&pod, "v1", "Pod", "CREATE")
-        .await
-        .unwrap();
-    assert_eq!(got, pod);
-}
-
-#[tokio::test]
-async fn test_namespace_selector_non_match_skips_failing_match_condition() {
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    admission_engine_for_db_handle!(engine, db_handle);
-
-    let ns = json!({
-        "apiVersion": "v1",
-        "kind": "Namespace",
-        "metadata": {"name": "default", "labels": {"team": "a"}}
-    });
-    db.create_resource("v1", "Namespace", None, "default", ns)
-        .await
-        .unwrap();
-
-    let mwc = json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "MutatingWebhookConfiguration",
-        "metadata": {"name": "mwc-ns-selector-before-match-condition"},
-        "webhooks": [{
-            "name": "m.example.com",
-            "failurePolicy": "Fail",
-            "namespaceSelector": {"matchLabels": {"team": "b"}},
-            "matchConditions": [{
-                "name": "would-error-if-evaluated",
-                "expression": "request.doesNotExist.field == 'x'"
-            }],
-            "clientConfig": {"url": "https://127.0.0.1:1/mutate"},
-            "rules": [{
-                "operations": ["CREATE"],
-                "apiGroups": [""],
-                "apiVersions": ["v1"],
-                "resources": ["pods"]
-            }]
-        }]
-    });
-    db.create_resource(
-        "admissionregistration.k8s.io/v1",
-        "MutatingWebhookConfiguration",
-        None,
-        "mwc-ns-selector-before-match-condition",
-        mwc,
-    )
-    .await
-    .unwrap();
-
-    let pod = json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {"name": "p0", "namespace": "default"},
-        "spec": {"containers": [{"name": "c", "image": "busybox"}]}
-    });
-
-    let got = engine
-        .run_mutating(&pod, "v1", "Pod", "CREATE")
-        .await
-        .expect("selector mismatch must skip matchConditions and callout");
-    assert_eq!(got, pod);
-}
-
-#[tokio::test]
-async fn test_namespace_selector_ignored_for_cluster_scoped_request() {
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    admission_engine_for_db_handle!(engine, db_handle);
-
-    let mwc = json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "MutatingWebhookConfiguration",
-        "metadata": {"name": "mwc-cluster-scope"},
-        "webhooks": [{
-            "name": "m.example.com",
-            "failurePolicy": "Fail",
-            "namespaceSelector": {"matchLabels": {"team": "b"}},
-            "clientConfig": {"url": "https://127.0.0.1:1/mutate"},
-            "rules": [{
-                "operations": ["CREATE"],
-                "apiGroups": [""],
-                "apiVersions": ["v1"],
-                "resources": ["namespaces"]
-            }]
-        }]
-    });
-    db.create_resource(
-        "admissionregistration.k8s.io/v1",
-        "MutatingWebhookConfiguration",
-        None,
-        "mwc-cluster-scope",
-        mwc,
-    )
-    .await
-    .unwrap();
-
-    let ns_obj = json!({
-        "apiVersion": "v1",
-        "kind": "Namespace",
-        "metadata": {"name": "ns-a"}
-    });
-
-    // Cluster-scoped request: namespaceSelector must be ignored, so webhook call is attempted.
-    let err = engine
-        .run_mutating(&ns_obj, "v1", "Namespace", "CREATE")
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("Webhook call failed"));
-}
-
-#[tokio::test]
-async fn test_dry_run_rejects_webhook_with_side_effects() {
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    admission_engine_for_db_handle!(engine, db_handle);
-    let mwc = json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "MutatingWebhookConfiguration",
-        "metadata": {"name": "mwc-dryrun-sideeffects"},
-        "webhooks": [{
-            "name": "m.example.com",
-            "sideEffects": "Some",
-            "clientConfig": {"url": "https://127.0.0.1:1/mutate"},
-            "rules": [{
-                "operations": ["CREATE"],
-                "apiGroups": [""],
-                "apiVersions": ["v1"],
-                "resources": ["pods"]
-            }]
-        }]
-    });
-    db.create_resource(
-        "admissionregistration.k8s.io/v1",
-        "MutatingWebhookConfiguration",
-        None,
-        "mwc-dryrun-sideeffects",
-        mwc,
-    )
-    .await
-    .unwrap();
-
-    let pod = json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {"name": "p0", "namespace": "default"},
-        "spec": {"containers": [{"name": "c", "image": "busybox"}]}
-    });
-    let mut ctx = AdmissionRequestContext::from_legacy(&pod, "v1", "Pod", "CREATE");
-    ctx.dry_run = Some(true);
-    let err = engine
-        .run_with_context(&ctx, true)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("sideEffects does not allow dryRun"));
-}
-
-#[tokio::test]
-async fn test_webhook_call_error_includes_timeout_query_parameter() {
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    admission_engine_for_db_handle!(engine, db_handle);
-
-    let vwc = json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "ValidatingWebhookConfiguration",
-        "metadata": {"name": "vwc-timeout-query"},
-        "webhooks": [{
-            "name": "v.example.com",
-            "failurePolicy": "Fail",
-            "timeoutSeconds": 1,
-            "clientConfig": {"url": "https://127.0.0.1:1/always-allow-delay-5s"},
-            "rules": [{
-                "operations": ["CREATE"],
-                "apiGroups": [""],
-                "apiVersions": ["v1"],
-                "resources": ["configmaps"]
-            }]
-        }]
-    });
-    db.create_resource(
-        "admissionregistration.k8s.io/v1",
-        "ValidatingWebhookConfiguration",
-        None,
-        "vwc-timeout-query",
-        vwc,
-    )
-    .await
-    .unwrap();
-
-    let cm = json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": {"name": "cm0", "namespace": "default"}
-    });
-    let err = engine
-        .run_validating(&cm, "v1", "ConfigMap", "CREATE")
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("/always-allow-delay-5s?timeout=1s"),
-        "webhook errors must include timeout query parameter, got: {}",
-        err
-    );
-}
-
-#[tokio::test]
-async fn test_webhook_configuration_objects_are_exempt_from_dynamic_admission() {
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    admission_engine_for_db_handle!(engine, db_handle);
-
-    let mwc = json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "MutatingWebhookConfiguration",
-        "metadata": {"name": "mwc-block-webhook-config-create"},
-        "webhooks": [{
-            "name": "m.blocker.example.com",
-            "failurePolicy": "Fail",
-            "clientConfig": {"url": "https://127.0.0.1:1/block"},
-            "rules": [{
-                "operations": ["CREATE"],
-                "apiGroups": ["admissionregistration.k8s.io"],
-                "apiVersions": ["v1"],
-                "resources": ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"]
-            }]
-        }]
-    });
-    db.create_resource(
-        "admissionregistration.k8s.io/v1",
-        "MutatingWebhookConfiguration",
-        None,
-        "mwc-block-webhook-config-create",
-        mwc,
-    )
-    .await
-    .unwrap();
-
-    let create_target = json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "ValidatingWebhookConfiguration",
-        "metadata": {"name": "target-vwc"},
-        "webhooks": []
-    });
-    let ctx = AdmissionRequestContext::from_legacy(
-        &create_target,
-        "admissionregistration.k8s.io/v1",
-        "ValidatingWebhookConfiguration",
-        "CREATE",
-    );
-    let got = engine.run_with_context(&ctx, true).await.unwrap();
-    assert_eq!(
-        got, create_target,
-        "webhook configuration objects must bypass dynamic mutating admission"
-    );
 }

@@ -19,6 +19,9 @@ mod webhook_rules;
 #[cfg(any(test, feature = "test-support"))]
 pub mod webhook_rules;
 
+#[cfg(test)]
+mod tests;
+
 use anyhow::Result;
 pub use request_context::AdmissionRequestContext;
 use request_context::{is_admission_operation, is_webhook_configuration_resource};
