@@ -245,12 +245,16 @@ impl SpdyConnection {
     where
         S: AsyncWrite + Unpin,
     {
-        let mut frame = Vec::with_capacity(8 + data.len());
-        frame.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
-        frame.push(if fin { FLAG_FIN } else { 0 });
-        frame.extend_from_slice(&(data.len() as u32).to_be_bytes()[1..]);
-        frame.extend_from_slice(data);
-        stream.write_all(&frame).await?;
+        anyhow::ensure!(
+            data.len() <= 0x00ff_ffff,
+            "SPDY DATA frame exceeds the 24-bit payload limit"
+        );
+        let mut header = [0_u8; 8];
+        header[..4].copy_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+        header[4] = if fin { FLAG_FIN } else { 0 };
+        header[5..].copy_from_slice(&(data.len() as u32).to_be_bytes()[1..]);
+        stream.write_all(&header).await?;
+        stream.write_all(data).await?;
         stream.flush().await?;
         Ok(())
     }

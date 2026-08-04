@@ -13,6 +13,7 @@ use klights_node_api::{
 
 const SPDY_UPGRADE_VALUE: &str = "SPDY/3.1";
 const SPDY_PROTOCOL_HEADER: &str = "X-Stream-Protocol-Version";
+const SPDY_EXEC_DATA_CHUNK_BYTES: usize = 64 * 1024;
 const OPTIONAL_STREAM_NEGOTIATION_GRACE: std::time::Duration =
     std::time::Duration::from_millis(100);
 
@@ -223,9 +224,99 @@ where
     S: AsyncWrite + Unpin,
 {
     if let Some(stream_id) = streams.stream_id_for(channel) {
-        client_spdy
-            .write_data_frame(client_stream, stream_id, data, fin)
+        if data.is_empty() {
+            client_spdy
+                .write_data_frame(client_stream, stream_id, data, fin)
+                .await?;
+        } else {
+            let chunk_count = data.len().div_ceil(SPDY_EXEC_DATA_CHUNK_BYTES);
+            for (index, chunk) in data.chunks(SPDY_EXEC_DATA_CHUNK_BYTES).enumerate() {
+                client_spdy
+                    .write_data_frame(
+                        client_stream,
+                        stream_id,
+                        chunk,
+                        fin && index + 1 == chunk_count,
+                    )
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct SpdyExecOutputState {
+    stdout_finished: bool,
+    stderr_finished: bool,
+    error_finished: bool,
+}
+
+impl SpdyExecOutputState {
+    fn is_finished(&self, channel: StreamType) -> bool {
+        match channel {
+            StreamType::Stdout => self.stdout_finished,
+            StreamType::Stderr => self.stderr_finished,
+            StreamType::Error => self.error_finished,
+            StreamType::Stdin | StreamType::Resize | StreamType::Data => false,
+        }
+    }
+
+    fn record_fin(&mut self, channel: StreamType) {
+        match channel {
+            StreamType::Stdout => self.stdout_finished = true,
+            StreamType::Stderr => self.stderr_finished = true,
+            StreamType::Error => self.error_finished = true,
+            StreamType::Stdin | StreamType::Resize | StreamType::Data => {}
+        }
+    }
+}
+
+async fn write_spdy_exec_output<S>(
+    client_spdy: &SpdyConnection,
+    client_stream: &mut S,
+    streams: &SpdyClientStreams,
+    state: &mut SpdyExecOutputState,
+    channel: StreamType,
+    data: &[u8],
+    fin: bool,
+) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    anyhow::ensure!(
+        !state.is_finished(channel),
+        "SPDY exec runtime emitted data after {channel:?} FIN"
+    );
+    write_spdy_exec_channel_frame(client_spdy, client_stream, streams, channel, data, fin).await?;
+    if fin {
+        state.record_fin(channel);
+    }
+    Ok(())
+}
+
+async fn finish_spdy_exec_output_streams<S>(
+    client_spdy: &SpdyConnection,
+    client_stream: &mut S,
+    streams: &SpdyClientStreams,
+    state: &mut SpdyExecOutputState,
+) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    for channel in [StreamType::Stdout, StreamType::Stderr] {
+        if streams.stream_id_for(channel).is_some() && !state.is_finished(channel) {
+            write_spdy_exec_output(
+                client_spdy,
+                client_stream,
+                streams,
+                state,
+                channel,
+                &[],
+                true,
+            )
             .await?;
+        }
     }
     Ok(())
 }
@@ -234,11 +325,13 @@ async fn write_spdy_exec_error<S>(
     client_spdy: &SpdyConnection,
     client_stream: &mut S,
     streams: &SpdyClientStreams,
+    state: &mut SpdyExecOutputState,
     message: String,
 ) -> anyhow::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
+    finish_spdy_exec_output_streams(client_spdy, client_stream, streams, state).await?;
     let payload = serde_json::json!({
         "metadata": {},
         "status": "Failure",
@@ -246,10 +339,11 @@ where
         "details": {"causes": []}
     })
     .to_string();
-    write_spdy_exec_channel_frame(
+    write_spdy_exec_output(
         client_spdy,
         client_stream,
         streams,
+        state,
         StreamType::Error,
         payload.as_bytes(),
         true,
@@ -270,16 +364,16 @@ where
     let client_writer = SpdyConnection::new();
     let mut pending_input: Option<klights_node_api::NodeExecFrame> = None;
     let mut pending_output: Option<klights_node_api::NodeExecFrame> = None;
+    let mut output_state = SpdyExecOutputState::default();
 
-    loop {
+    let relay_result = loop {
         tokio::select! {
             result = async {
                 let frame = pending_input.as_ref().expect("guarded pending input");
                 session.send_frame(frame.clone()).await
             }, if pending_input.is_some() => {
                 if let Err(error) = result {
-                    let _ = session.cancel().await;
-                    return Err(error.into());
+                    break Err(error.into());
                 }
                 pending_input = None;
             }
@@ -293,13 +387,23 @@ where
                     ExecStreamChannel::Stdin | ExecStreamChannel::Resize => None,
                 };
                 if let Some(channel) = channel {
-                    write_spdy_exec_channel_frame(
+                    let terminal = frame.is_terminal();
+                    if terminal {
+                        finish_spdy_exec_output_streams(
+                            &client_writer,
+                            &mut client_write,
+                            &streams,
+                            &mut output_state,
+                        ).await?;
+                    }
+                    write_spdy_exec_output(
                         &client_writer,
                         &mut client_write,
                         &streams,
+                        &mut output_state,
                         channel,
                         frame.data(),
-                        frame.fin(),
+                        frame.fin() || terminal,
                     ).await?;
                 }
                 Ok::<bool, anyhow::Error>(frame.is_terminal())
@@ -307,22 +411,19 @@ where
                 let terminal = match result {
                     Ok(terminal) => terminal,
                     Err(error) => {
-                        let _ = session.cancel().await;
-                        return Err(error);
+                        break Err(error);
                     }
                 };
                 pending_output = None;
                 if terminal {
-                    let _ = session.cancel().await;
-                    return Ok(());
+                    break Ok(());
                 }
             }
             inbound = client_spdy.read_frame(&mut client_read), if pending_input.is_none() => {
                 let inbound = match inbound {
                     Ok(frame) => frame,
                     Err(error) => {
-                        let _ = session.cancel().await;
-                        return Err(error);
+                        break Err(error);
                     }
                 };
                 match inbound {
@@ -342,13 +443,11 @@ where
                     }
                     SpdyFrame::Ping { id } => {
                         if let Err(error) = client_writer.write_ping(&mut client_write, id).await {
-                            let _ = session.cancel().await;
-                            return Err(error);
+                            break Err(error);
                         }
                     }
                     SpdyFrame::RstStream { .. } | SpdyFrame::GoAway => {
-                        let _ = session.cancel().await;
-                        return Ok(());
+                        break Ok(());
                     }
                     SpdyFrame::SynReply { .. }
                     | SpdyFrame::Settings
@@ -361,19 +460,48 @@ where
                 let outbound = match outbound {
                     Ok(frame) => frame,
                     Err(error) => {
-                        let _ = session.cancel().await;
-                        return Err(error.into());
+                        let runtime_error = anyhow::Error::from(error);
+                        if let Err(write_error) = write_spdy_exec_error(
+                            &client_writer,
+                            &mut client_write,
+                            &streams,
+                            &mut output_state,
+                            format!("remote exec runtime failed: {runtime_error}"),
+                        ).await {
+                            break Err(write_error);
+                        }
+                        break Err(runtime_error);
                     }
                 };
                 match outbound {
                     Some(frame) => pending_output = Some(frame),
                     None => {
-                        let _ = session.cancel().await;
-                        return Ok(());
+                        let error = anyhow::anyhow!(
+                            "remote exec runtime ended before terminal status"
+                        );
+                        if let Err(write_error) = write_spdy_exec_error(
+                            &client_writer,
+                            &mut client_write,
+                            &streams,
+                            &mut output_state,
+                            error.to_string(),
+                        ).await {
+                            break Err(write_error);
+                        }
+                        break Err(error);
                     }
                 }
             }
         }
+    };
+
+    let _ = session.cancel().await;
+    let flush_result = client_write.flush().await;
+    let shutdown_result = client_write.shutdown().await;
+    match (relay_result, flush_result, shutdown_result) {
+        (Err(error), _, _) => Err(error),
+        (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => Err(error.into()),
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
     }
 }
 
@@ -451,9 +579,15 @@ where
         }
         Err(err) => {
             tracing::error!("Remote SPDY exec stream open failed: {}", err);
-            let _ =
-                write_spdy_exec_error(&client_spdy, &mut client_stream, &streams, err.to_string())
-                    .await;
+            let mut output_state = SpdyExecOutputState::default();
+            let _ = write_spdy_exec_error(
+                &client_spdy,
+                &mut client_stream,
+                &streams,
+                &mut output_state,
+                err.to_string(),
+            )
+            .await;
         }
     }
 
@@ -477,8 +611,92 @@ mod remote_full_duplex_tests {
     use klights_node_api::{
         BoundedByteStream, ByteStreamBounds, ByteStreamError, ByteStreamFuture, NodeExecFrame,
     };
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncReadExt, ReadBuf};
     use tokio::sync::mpsc;
+
+    const EXPECTED_MAX_DATA_CHUNK_BYTES: usize = 64 * 1024;
+
+    struct ShutdownTrackedIo<S> {
+        inner: S,
+        shutdown_called: std::sync::Arc<AtomicBool>,
+    }
+
+    impl<S> ShutdownTrackedIo<S> {
+        fn new(inner: S, shutdown_called: std::sync::Arc<AtomicBool>) -> Self {
+            Self {
+                inner,
+                shutdown_called,
+            }
+        }
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for ShutdownTrackedIo<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for ShutdownTrackedIo<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            self.shutdown_called.store(true, Ordering::Release);
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[derive(Debug)]
+    struct PeerDataFrame {
+        stream_id: u32,
+        data: Vec<u8>,
+        fin: bool,
+    }
+
+    async fn read_peer_data_frame<S>(stream: &mut S) -> std::io::Result<Option<PeerDataFrame>>
+    where
+        S: AsyncRead + Unpin,
+    {
+        let mut header = [0_u8; 8];
+        let first = stream.read(&mut header[..1]).await?;
+        if first == 0 {
+            return Ok(None);
+        }
+        stream.read_exact(&mut header[1..]).await?;
+        assert_eq!(header[0] & 0x80, 0, "peer expected a SPDY DATA frame");
+        let stream_id = u32::from_be_bytes([header[0] & 0x7f, header[1], header[2], header[3]]);
+        let fin = header[4] & 0x01 != 0;
+        let length = u32::from_be_bytes([0, header[5], header[6], header[7]]) as usize;
+        let mut data = vec![0_u8; length];
+        stream.read_exact(&mut data).await?;
+        Ok(Some(PeerDataFrame {
+            stream_id,
+            data,
+            fin,
+        }))
+    }
 
     struct FakeSession {
         input_tx: mpsc::Sender<NodeExecFrame>,
@@ -581,5 +799,159 @@ mod remote_full_duplex_tests {
         drop(client_io);
         assert!(relay.await.unwrap().is_err());
         assert!(cancelled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn sonobuoy_stdout_is_chunked_byte_exact_and_closed_before_status_and_eof() {
+        let payload_len = 8 * 1024 * 1024 + 37;
+        let payload: Vec<u8> = (0..payload_len).map(|index| (index % 251) as u8).collect();
+        let (server_io, mut peer_io) = tokio::io::duplex(128 * 1024);
+        let shutdown_called = std::sync::Arc::new(AtomicBool::new(false));
+        let server_io = ShutdownTrackedIo::new(server_io, shutdown_called.clone());
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        let (output_tx, output_rx) = mpsc::channel(3);
+        output_tx
+            .send(NodeExecFrame::new(
+                ExecStreamChannel::Stdout,
+                payload.clone(),
+                false,
+            ))
+            .await
+            .unwrap();
+        output_tx
+            .send(NodeExecFrame::new(
+                ExecStreamChannel::Stdout,
+                Vec::new(),
+                true,
+            ))
+            .await
+            .unwrap();
+        output_tx
+            .send(NodeExecFrame::new(
+                ExecStreamChannel::Error,
+                br#"{"status":"Success","metadata":{}}"#.to_vec(),
+                true,
+            ))
+            .await
+            .unwrap();
+        drop(output_tx);
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let session = Box::new(FakeSession {
+            input_tx,
+            output_rx: tokio::sync::Mutex::new(output_rx),
+            cancelled: cancelled.clone(),
+        });
+        let streams = SpdyClientStreams {
+            stdin: None,
+            stdout: Some(3),
+            stderr: None,
+            error: Some(5),
+            resize: None,
+        };
+        let relay = tokio::spawn(bridge_remote_exec_full_duplex(
+            SpdyConnection::new(),
+            server_io,
+            streams,
+            session,
+        ));
+
+        let mut received = Vec::with_capacity(payload_len);
+        let mut saw_stdout_fin = false;
+        let mut saw_status_fin = false;
+        while let Some(frame) = read_peer_data_frame(&mut peer_io).await.unwrap() {
+            assert!(
+                frame.data.len() <= EXPECTED_MAX_DATA_CHUNK_BYTES,
+                "SPDY DATA payload exceeded the bounded chunk policy: {} bytes",
+                frame.data.len()
+            );
+            match frame.stream_id {
+                3 => {
+                    assert!(!saw_stdout_fin, "stdout data followed stdout FIN");
+                    received.extend_from_slice(&frame.data);
+                    if frame.fin {
+                        saw_stdout_fin = true;
+                    }
+                }
+                5 => {
+                    assert!(saw_stdout_fin, "terminal status preceded stdout FIN");
+                    assert!(
+                        !frame.data.is_empty(),
+                        "terminal status payload is required"
+                    );
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&frame.data).unwrap()["status"],
+                        "Success"
+                    );
+                    assert!(frame.fin, "terminal status must carry FIN");
+                    saw_status_fin = true;
+                }
+                other => panic!("unexpected peer stream {other}"),
+            }
+        }
+
+        assert_eq!(received, payload);
+        assert!(saw_stdout_fin);
+        assert!(saw_status_fin);
+        assert!(relay.await.unwrap().is_ok());
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(shutdown_called.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_synthesizes_requested_output_fins_before_status_and_shutdown() {
+        let (server_io, mut peer_io) = tokio::io::duplex(4096);
+        let shutdown_called = std::sync::Arc::new(AtomicBool::new(false));
+        let server_io = ShutdownTrackedIo::new(server_io, shutdown_called.clone());
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        let (output_tx, output_rx) = mpsc::channel(1);
+        output_tx
+            .send(NodeExecFrame::new(
+                ExecStreamChannel::Error,
+                br#"{"status":"Failure","message":"runtime failed","metadata":{}}"#.to_vec(),
+                false,
+            ))
+            .await
+            .unwrap();
+        drop(output_tx);
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let session = Box::new(FakeSession {
+            input_tx,
+            output_rx: tokio::sync::Mutex::new(output_rx),
+            cancelled: cancelled.clone(),
+        });
+        let streams = SpdyClientStreams {
+            stdin: None,
+            stdout: Some(3),
+            stderr: Some(5),
+            error: Some(7),
+            resize: None,
+        };
+        let relay = tokio::spawn(bridge_remote_exec_full_duplex(
+            SpdyConnection::new(),
+            server_io,
+            streams,
+            session,
+        ));
+
+        let stdout_fin = read_peer_data_frame(&mut peer_io).await.unwrap().unwrap();
+        assert_eq!(stdout_fin.stream_id, 3);
+        assert!(stdout_fin.data.is_empty());
+        assert!(stdout_fin.fin);
+        let stderr_fin = read_peer_data_frame(&mut peer_io).await.unwrap().unwrap();
+        assert_eq!(stderr_fin.stream_id, 5);
+        assert!(stderr_fin.data.is_empty());
+        assert!(stderr_fin.fin);
+        let status = read_peer_data_frame(&mut peer_io).await.unwrap().unwrap();
+        assert_eq!(status.stream_id, 7);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&status.data).unwrap()["status"],
+            "Failure"
+        );
+        assert!(status.fin);
+        assert!(read_peer_data_frame(&mut peer_io).await.unwrap().is_none());
+
+        assert!(relay.await.unwrap().is_ok());
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(shutdown_called.load(Ordering::Acquire));
     }
 }
