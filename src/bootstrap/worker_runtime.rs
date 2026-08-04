@@ -64,7 +64,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             // immediately instead of waiting on the gRPC handshake to
             // time out. Falls back to leader_endpoints[0] if every probe
             // fails — the legacy connect path then surfaces the error.
-            let chosen = crate::bootstrap::leader_reconnect::pick_reachable_leader_endpoint(
+            let chosen = klights_leader_rpc::client::pick_reachable_leader_endpoint(
                 &task_supervisor,
                 leader_endpoints,
             )

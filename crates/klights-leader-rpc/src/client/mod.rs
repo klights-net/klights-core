@@ -6,6 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context as TaskContext, Poll};
 
+mod reconnect;
+pub use reconnect::pick_reachable_leader_endpoint;
+
 use anyhow::{Context, Result, anyhow};
 use futures::StreamExt as _;
 use hyper_util::rt::TokioIo;

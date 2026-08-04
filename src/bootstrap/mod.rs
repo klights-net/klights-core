@@ -13,7 +13,6 @@ pub(crate) mod grpc_raft_transport_adapter;
 pub(crate) mod grpc_runtime_adapter;
 pub mod init;
 pub mod kubelet_ports;
-pub mod leader_reconnect;
 pub mod logging;
 pub(crate) mod maintenance;
 pub(crate) mod network_adapters;

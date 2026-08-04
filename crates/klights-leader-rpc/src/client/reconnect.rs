@@ -25,7 +25,7 @@ use klights_supervisor::TaskSupervisor;
 /// Per-attempt connect timeout (5 s) chosen so that the worst case of
 /// `rounds * endpoints * timeout` stays inside the K8s `node-monitor-
 /// grace-period` (`50 s`).
-pub const DEFAULT_PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Try each endpoint in `endpoints` in order, retrying up to `rounds`
 /// full passes. Returns the index of the endpoint that succeeded along
@@ -34,7 +34,7 @@ pub const DEFAULT_PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// `supervisor.timeout` provides the per-attempt deadline so the work is
 /// tracked by the supervisor for shutdown integration.
-pub async fn connect_round_robin<F, Fut, T>(
+async fn connect_round_robin<F, Fut, T>(
     supervisor: &Arc<TaskSupervisor>,
     name: &str,
     endpoints: &[String],
