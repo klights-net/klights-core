@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-const SPDY3_DICT: &[u8] = b"\x00\x00\x00\x07options\x00\x00\x00\x04head\x00\x00\x00\x04post\x00\x00\x00\x03put\x00\x00\x00\x06delete\x00\x00\x00\x05trace\x00\x00\x00\x06accept\x00\x00\x00\x0eaccept-charset\x00\x00\x00\x0faccept-encoding\x00\x00\x00\x0faccept-language\x00\x00\x00\raccept-ranges\x00\x00\x00\x03age\x00\x00\x00\x05allow\x00\x00\x00\rauthorization\x00\x00\x00\rcache-control\x00\x00\x00\nconnection\x00\x00\x00\x0ccontent-base\x00\x00\x00\x10content-encoding\x00\x00\x00\x10content-language\x00\x00\x00\x0econtent-length\x00\x00\x00\x10content-location\x00\x00\x00\x0bcontent-md5\x00\x00\x00\rcontent-range\x00\x00\x00\x0ccontent-type\x00\x00\x00\x04date\x00\x00\x00\x04etag\x00\x00\x00\x06expect\x00\x00\x00\x07expires\x00\x00\x00\x04from\x00\x00\x00\x04host\x00\x00\x00\x08if-match\x00\x00\x00\x11if-modified-since\x00\x00\x00\rif-none-match\x00\x00\x00\x08if-range\x00\x00\x00\x13if-unmodified-since\x00\x00\x00\rlast-modified\x00\x00\x00\x08location\x00\x00\x00\x0cmax-forwards\x00\x00\x00\x06pragma\x00\x00\x00\x12proxy-authenticate\x00\x00\x00\x13proxy-authorization\x00\x00\x00\x05range\x00\x00\x00\x07referer\x00\x00\x00\x0bretry-after\x00\x00\x00\x06server\x00\x00\x00\x02te\x00\x00\x00\x07trailer\x00\x00\x00\x11transfer-encoding\x00\x00\x00\x07upgrade\x00\x00\x00\nuser-agent\x00\x00\x00\x04vary\x00\x00\x00\x03via\x00\x00\x00\x07warning\x00\x00\x00\x10www-authenticate\x00\x00\x00\x06method\x00\x00\x00\x03get\x00\x00\x00\x06status\x00\x00\x00\x06200 OK\x00\x00\x00\x07version\x00\x00\x00\x08HTTP/1.1\x00\x00\x00\x03url\x00\x00\x00\x06public\x00\x00\x00\nset-cookie\x00\x00\x00\nkeep-alive\x00\x00\x00\x06origin100101201202205206300302303304305306307402405406407408409410411412413414415416417502504505203 Non-Authoritative Information204 No Content301 Moved Permanently400 Bad Request401 Unauthorized403 Forbidden404 Not Found500 Internal Server Error501 Not Implemented503 Service UnavailableJan Feb Mar Apr May Jun Jul Aug Sept Oct Nov Dec 00:00:00 Mon, Tue, Wed, Thu, Fri, Sat, Sun, GMTchunked,text/html,image/png,image/jpg,image/gif,application/xml,application/xhtml+xml,text/plain,text/javascript,publicprivatemax-age=gzip,deflate,sdchcharset=utf-8charset=iso-8859-1utf-,*,enq=0.";
+const SPDY3_DICT: &[u8] = b"\x00\x00\x00\x07options\x00\x00\x00\x04head\x00\x00\x00\x04post\x00\x00\x00\x03put\x00\x00\x00\x06delete\x00\x00\x00\x05trace\x00\x00\x00\x06accept\x00\x00\x00\x0eaccept-charset\x00\x00\x00\x0faccept-encoding\x00\x00\x00\x0faccept-language\x00\x00\x00\raccept-ranges\x00\x00\x00\x03age\x00\x00\x00\x05allow\x00\x00\x00\rauthorization\x00\x00\x00\rcache-control\x00\x00\x00\nconnection\x00\x00\x00\x0ccontent-base\x00\x00\x00\x10content-encoding\x00\x00\x00\x10content-language\x00\x00\x00\x0econtent-length\x00\x00\x00\x10content-location\x00\x00\x00\x0bcontent-md5\x00\x00\x00\rcontent-range\x00\x00\x00\x0ccontent-type\x00\x00\x00\x04date\x00\x00\x00\x04etag\x00\x00\x00\x06expect\x00\x00\x00\x07expires\x00\x00\x00\x04from\x00\x00\x00\x04host\x00\x00\x00\x08if-match\x00\x00\x00\x11if-modified-since\x00\x00\x00\rif-none-match\x00\x00\x00\x08if-range\x00\x00\x00\x13if-unmodified-since\x00\x00\x00\rlast-modified\x00\x00\x00\x08location\x00\x00\x00\x0cmax-forwards\x00\x00\x00\x06pragma\x00\x00\x00\x12proxy-authenticate\x00\x00\x00\x13proxy-authorization\x00\x00\x00\x05range\x00\x00\x00\x07referer\x00\x00\x00\x0bretry-after\x00\x00\x00\x06server\x00\x00\x00\x02te\x00\x00\x00\x07trailer\x00\x00\x00\x11transfer-encoding\x00\x00\x00\x07upgrade\x00\x00\x00\nuser-agent\x00\x00\x00\x04vary\x00\x00\x00\x03via\x00\x00\x00\x07warning\x00\x00\x00\x10www-authenticate\x00\x00\x00\x06method\x00\x00\x00\x03get\x00\x00\x00\x06status\x00\x00\x00\x06200 OK\x00\x00\x00\x07version\x00\x00\x00\x08HTTP/1.1\x00\x00\x00\x03url\x00\x00\x00\x06public\x00\x00\x00\nset-cookie\x00\x00\x00\nkeep-alive\x00\x00\x00\x06origin100101201202205206300302303304305306307402405406407408409410411412413414415416417502504505203 Non-Authoritative Information204 No Content301 Moved Permanently400 Bad Request401 Unauthorized403 Forbidden404 Not Found500 Internal Server Error501 Not Implemented503 Service UnavailableJan Feb Mar Apr May Jun Jul Aug Sept Oct Nov Dec 00:00:00 Mon, Tue, Wed, Thu, Fri, Sat, Sun, GMTchunked,text/html,image/png,image/jpg,image/gif,application/xml,application/xhtml+xml,text/plain,text/javascript,publicprivatemax-age=gzip,deflate,sdchcharset=utf-8charset=iso-8859-1,utf-,*,enq=0.";
 
 const SYN_STREAM: u16 = 1;
 const SYN_REPLY: u16 = 2;
@@ -360,6 +360,93 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Copied independently from moby/spdystream v0.2.0 spdy/dictionary.go.
+    // Do not derive this interoperability oracle from the production constant.
+    const MOBY_V0_2_0_SPDY3_DICT: &[u8] = b"\x00\x00\x00\x07options\x00\x00\x00\x04head\x00\x00\x00\x04post\x00\x00\x00\x03put\x00\x00\x00\x06delete\x00\x00\x00\x05trace\x00\x00\x00\x06accept\x00\x00\x00\x0eaccept-charset\x00\x00\x00\x0faccept-encoding\x00\x00\x00\x0faccept-language\x00\x00\x00\x0daccept-ranges\x00\x00\x00\x03age\x00\x00\x00\x05allow\x00\x00\x00\x0dauthorization\x00\x00\x00\rcache-control\x00\x00\x00\nconnection\x00\x00\x00\x0ccontent-base\x00\x00\x00\x10content-encoding\x00\x00\x00\x10content-language\x00\x00\x00\x0econtent-length\x00\x00\x00\x10content-location\x00\x00\x00\x0bcontent-md5\x00\x00\x00\rcontent-range\x00\x00\x00\x0ccontent-type\x00\x00\x00\x04date\x00\x00\x00\x04etag\x00\x00\x00\x06expect\x00\x00\x00\x07expires\x00\x00\x00\x04from\x00\x00\x00\x04host\x00\x00\x00\x08if-match\x00\x00\x00\x11if-modified-since\x00\x00\x00\rif-none-match\x00\x00\x00\x08if-range\x00\x00\x00\x13if-unmodified-since\x00\x00\x00\rlast-modified\x00\x00\x00\x08location\x00\x00\x00\x0cmax-forwards\x00\x00\x00\x06pragma\x00\x00\x00\x12proxy-authenticate\x00\x00\x00\x13proxy-authorization\x00\x00\x00\x05range\x00\x00\x00\x07referer\x00\x00\x00\x0bretry-after\x00\x00\x00\x06server\x00\x00\x00\x02te\x00\x00\x00\x07trailer\x00\x00\x00\x11transfer-encoding\x00\x00\x00\x07upgrade\x00\x00\x00\nuser-agent\x00\x00\x00\x04vary\x00\x00\x00\x03via\x00\x00\x00\x07warning\x00\x00\x00\x10www-authenticate\x00\x00\x00\x06method\x00\x00\x00\x03get\x00\x00\x00\x06status\x00\x00\x00\x06200 OK\x00\x00\x00\x07version\x00\x00\x00\x08HTTP/1.1\x00\x00\x00\x03url\x00\x00\x00\x06public\x00\x00\x00\nset-cookie\x00\x00\x00\nkeep-alive\x00\x00\x00\x06origin100101201202205206300302303304305306307402405406407408409410411412413414415416417502504505203 Non-Authoritative Information204 No Content301 Moved Permanently400 Bad Request401 Unauthorized403 Forbidden404 Not Found500 Internal Server Error501 Not Implemented503 Service UnavailableJan Feb Mar Apr May Jun Jul Aug Sept Oct Nov Dec 00:00:00 Mon, Tue, Wed, Thu, Fri, Sat, Sun, GMTchunked,text/html,image/png,image/jpg,image/gif,application/xml,application/xhtml+xml,text/plain,text/javascript,publicprivatemax-age=gzip,deflate,sdchcharset=utf-8charset=iso-8859-1,utf-,*,enq=0.";
+    const MOBY_V0_2_0_DICTIONARY_ADLER32: u32 = 0xe3c6_a7c2;
+    const MOBY_SONOBUOY_STDOUT_SYN_STREAM: &[u8] = b"\x80\x03\x00\x01\x00\x00\x00\x2b\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x78\xf9\xe3\xc6\xa7\xc2\x62\x60\x60\x60\x04\xa7\xb3\x92\xa2\xd4\xc4\x5c\x68\x51\xc2\x56\x5c\x92\x92\x5f\x5a\x02\x00\x00\x00\xff\xff";
+
+    fn adler32(bytes: &[u8]) -> u32 {
+        const MOD_ADLER: u32 = 65_521;
+        let mut a = 1_u32;
+        let mut b = 0_u32;
+        for byte in bytes {
+            a = (a + u32::from(*byte)) % MOD_ADLER;
+            b = (b + a) % MOD_ADLER;
+        }
+        (b << 16) | a
+    }
+
+    fn decode_with_moby_v0_2_0_dictionary(compressed: &[u8]) -> Vec<u8> {
+        let mut decoder = flate2::Decompress::new(true);
+        let mut output = [0_u8; 4096];
+        let error = decoder
+            .decompress(compressed, &mut output, flate2::FlushDecompress::Sync)
+            .expect_err("moby SPDY header block must request its preset dictionary");
+        assert_eq!(
+            error.needs_dictionary(),
+            Some(MOBY_V0_2_0_DICTIONARY_ADLER32)
+        );
+        assert_eq!(
+            decoder
+                .set_dictionary(MOBY_V0_2_0_SPDY3_DICT)
+                .expect("canonical moby SPDY dictionary"),
+            MOBY_V0_2_0_DICTIONARY_ADLER32
+        );
+        let input_position = decoder.total_in() as usize;
+        let output_position = decoder.total_out() as usize;
+        decoder
+            .decompress(
+                &compressed[input_position..],
+                &mut output[output_position..],
+                flate2::FlushDecompress::Sync,
+            )
+            .expect("canonical moby SPDY header block must decompress");
+        output[..decoder.total_out() as usize].to_vec()
+    }
+
+    #[test]
+    fn api_spdy_dictionary_matches_moby_v0_2_0_contract() {
+        assert_eq!(SPDY3_DICT.len(), 1423);
+        assert_eq!(adler32(SPDY3_DICT), MOBY_V0_2_0_DICTIONARY_ADLER32);
+        assert!(SPDY3_DICT.ends_with(b"charset=iso-8859-1,utf-,*,enq=0."));
+        assert_eq!(SPDY3_DICT, MOBY_V0_2_0_SPDY3_DICT);
+    }
+
+    #[tokio::test]
+    async fn api_decodes_canonical_moby_syn_stream_for_sonobuoy_stdout_only() {
+        // Sonobuoy retrieve uses stdout=true with stdin/stderr/tty disabled.
+        let mut connection = SpdyConnection::new();
+        let mut wire = MOBY_SONOBUOY_STDOUT_SYN_STREAM;
+        let frame = connection.read_frame(&mut wire).await.unwrap();
+        match frame {
+            SpdyFrame::SynStream { stream_id, headers } => {
+                assert_eq!(stream_id, 1);
+                assert_eq!(
+                    headers.get("streamtype").map(String::as_str),
+                    Some("stdout")
+                );
+            }
+            other => panic!("expected moby SYN_STREAM, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn api_emitted_syn_reply_headers_decode_with_canonical_moby_dictionary() {
+        let mut connection = SpdyConnection::new();
+        let mut wire = Vec::new();
+        connection.write_syn_reply(&mut wire, 1).await.unwrap();
+
+        assert_eq!(&wire[..4], &[0x80, 0x03, 0x00, 0x02]);
+        let payload_len = u32::from_be_bytes([0, wire[5], wire[6], wire[7]]) as usize;
+        assert_eq!(wire.len(), 8 + payload_len);
+        assert_eq!(&wire[8..12], &1_u32.to_be_bytes());
+        assert_eq!(
+            decode_with_moby_v0_2_0_dictionary(&wire[12..]),
+            0_u32.to_be_bytes()
+        );
+    }
 
     #[tokio::test]
     async fn server_framing_accepts_multiple_streams_without_node_codec() {
