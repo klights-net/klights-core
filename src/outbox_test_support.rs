@@ -65,22 +65,6 @@ pub fn outbox_from_node_db(node_db: impl NodeLocalStoresRef) -> Outbox {
     outbox_with_notify(node_db, Arc::new(Notify::new()))
 }
 
-pub async fn test_outbox() -> Outbox {
-    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
-        klights_supervisor::TaskCategoryConfig::default(),
-    ));
-    let (stores, _) = crate::datastore::node_local::selector::open_node_local_with_sqlite(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
-        None,
-        supervisor,
-        None,
-        "sqlite:node-local-test",
-    )
-    .await
-    .expect("open node-local for test outbox");
-    outbox_from_node_db(stores)
-}
-
 pub fn outbox_with_notify(node_db: impl NodeLocalStoresRef, notify: Arc<Notify>) -> Outbox {
     let node_db = node_db.node_local_stores();
     Outbox::compose(

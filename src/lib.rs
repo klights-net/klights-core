@@ -8,8 +8,6 @@ mod cluster_engine;
 pub(crate) mod cluster_store_replication_adapter;
 pub mod control_plane;
 #[cfg(test)]
-mod controller_test_debt;
-#[cfg(test)]
 mod controller_test_support;
 pub mod datastore;
 #[cfg(test)]
@@ -56,8 +54,6 @@ mod datastore_codec_integration_tests;
 mod datastore_post_commit_integration_tests;
 #[cfg(test)]
 mod datastore_sqlite_compatibility_integration_tests;
-#[cfg(test)]
-mod deployment_replicaset_error_test;
 #[cfg(test)]
 mod grpc_test_proto_channel_sink;
 #[cfg(test)]

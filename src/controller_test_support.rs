@@ -19,13 +19,6 @@ pub(crate) fn inject_resource_version(
     data
 }
 
-pub(crate) fn test_reconcile_context<'a>(
-    coordination: &'a klights_controllers::ControllerCoordination,
-    node_name: &'a str,
-) -> klights_controllers::ControllerReconcileContext<'a> {
-    klights_controllers::ControllerReconcileContext::at(coordination, node_name, chrono::Utc::now())
-}
-
 pub(crate) fn controller_store_for_test(
     db: &crate::datastore::sqlite::Datastore,
 ) -> crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort {
@@ -148,23 +141,6 @@ pub(crate) fn default_queue_only_dispatcher_for_test() -> klights_controllers::C
     )))
 }
 
-struct TestGcNonPodFinalizationPort;
-
-impl klights_reconcile_api::GcNonPodFinalizationPort for TestGcNonPodFinalizationPort {
-    fn finalize_non_pod(
-        &self,
-        _request: klights_reconcile_api::GcNonPodFinalizationRequest,
-    ) -> klights_reconcile_api::GcNonPodFinalizationFuture<'_> {
-        Box::pin(async { Ok(klights_reconcile_api::GcNonPodFinalizationOutcome::Gone) })
-    }
-}
-
-pub fn non_pod_finalization_port_for_test()
--> &'static dyn klights_reconcile_api::GcNonPodFinalizationPort {
-    static PORT: TestGcNonPodFinalizationPort = TestGcNonPodFinalizationPort;
-    &PORT
-}
-
 /// Build a `PodRepository` over the supplied in-memory `Datastore` for use
 /// in controller unit tests that exercise `reconcile_deployment` /
 /// `reconcile_replicaset` without going through the full dispatcher.
@@ -285,29 +261,4 @@ pub(crate) async fn pod_repository_with_node_local_for_test(
     )
     .repository;
     (Arc::new(repository), node_local)
-}
-
-/// Build the leader/deferred `PodRepository` shape used by multinode
-/// controller tests, where metadata writes go through the outbox before the
-/// local store observes them.
-pub async fn deferred_outbox_pod_repository_for_test(
-    db: &crate::datastore::sqlite::Datastore,
-) -> Arc<crate::kubelet::pod_repository::PodRepository> {
-    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
-        klights_supervisor::TaskCategoryConfig::default(),
-    ));
-    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-    let side_effects = Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
-    let outbox = Arc::new(crate::outbox_test_support::test_outbox().await);
-    let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
-    Arc::new(
-        crate::kubelet::pod_repository::PodRepository::new_with_scheduling_mode_and_outbox(
-            db_handle,
-            supervisor,
-            side_effects,
-            metrics,
-            crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
-            Some(outbox),
-        ),
-    )
 }
