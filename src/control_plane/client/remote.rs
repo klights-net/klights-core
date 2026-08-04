@@ -97,7 +97,9 @@ impl RemoteApiClient {
             node_name,
             grpc: None,
             supervisor: None,
-            cache: Arc::new(crate::remote_informer_cache_adapter::WatchCacheAdapter::new()),
+            cache: Arc::new(
+                crate::bootstrap::composition_adapters::remote_informer_cache_adapter::WatchCacheAdapter::new(),
+            ),
             worker_informers_started: Arc::new(AtomicBool::new(false)),
             watch_idle_timeout: WATCH_IDLE_TIMEOUT,
         }
@@ -837,7 +839,9 @@ mod tests {
                 grpc,
                 supervisor,
                 remote_node_name,
-                Arc::new(crate::remote_informer_cache_adapter::WatchCacheAdapter::new()),
+                Arc::new(
+                    crate::bootstrap::composition_adapters::remote_informer_cache_adapter::WatchCacheAdapter::new(),
+                ),
             ),
             db,
             handle,

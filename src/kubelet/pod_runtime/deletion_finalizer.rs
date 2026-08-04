@@ -83,12 +83,13 @@ impl RealPodDeletionFinalizer {
         metrics: Arc<klights_controllers::side_effects::SideEffectMetrics>,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
-        let bound_pod_finalization = crate::bound_pod_finalization_adapter::new_for_root(
-            store.clone(),
-            cluster_api.clone(),
-            outbox.clone(),
-            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
-        );
+        let bound_pod_finalization =
+            crate::bootstrap::composition_adapters::bound_pod_finalization_adapter::new_for_root(
+                store.clone(),
+                cluster_api.clone(),
+                outbox.clone(),
+                Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+            );
         let mutation_reconcile = Arc::new(
             crate::bootstrap::controller_adapters::pod_reconcile_adapter::PodReconcileAdapter::new(
                 store.db().clone(),

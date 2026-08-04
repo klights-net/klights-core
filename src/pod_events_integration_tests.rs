@@ -31,7 +31,10 @@ async fn emit_pod_event(
 ) -> Result<Value> {
     let node_db = test_node_db().await?;
     let outbox = crate::outbox_test_support::outbox_from_node_db(node_db.clone());
-    let query = crate::pod_event_adapter::DatastorePodEventAdapter::new(ds);
+    let query =
+        crate::bootstrap::composition_adapters::pod_event_adapter::DatastorePodEventAdapter::new(
+            ds,
+        );
     let event = emit_pod_event_with_outbox(
         &query,
         Some(&outbox),
@@ -55,8 +58,14 @@ async fn emit_control_plane_pod_event(
     effect: &dyn DatastoreBackend,
     record: PodEventRecord<'_>,
 ) -> Result<Value> {
-    let query = crate::pod_event_adapter::DatastorePodEventAdapter::new(query);
-    let effect = crate::pod_event_adapter::DatastorePodEventAdapter::new(effect);
+    let query =
+        crate::bootstrap::composition_adapters::pod_event_adapter::DatastorePodEventAdapter::new(
+            query,
+        );
+    let effect =
+        crate::bootstrap::composition_adapters::pod_event_adapter::DatastorePodEventAdapter::new(
+            effect,
+        );
     klights_kubelet::pod_events::emit_control_plane_pod_event(&query, &effect, record).await
 }
 
@@ -508,7 +517,7 @@ mod tests {
         let ds = crate::datastore::test_support::in_memory().await;
         let pod = create_test_pod();
 
-        let query = crate::pod_event_adapter::DatastorePodEventAdapter::new(&ds);
+        let query = crate::bootstrap::composition_adapters::pod_event_adapter::DatastorePodEventAdapter::new(&ds);
         emit_pod_event_with_outbox(
             &query,
             None,

@@ -413,7 +413,9 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for RootPodEventSink {
             },
         });
         let query =
-            crate::pod_event_adapter::DatastorePodEventAdapter::new(self.datastore.as_ref());
+            crate::bootstrap::composition_adapters::pod_event_adapter::DatastorePodEventAdapter::new(
+                self.datastore.as_ref(),
+            );
         klights_kubelet::pod_events::emit_pod_event_with_outbox(
             &query,
             self.outbox.as_deref(),
@@ -474,7 +476,9 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for WorkerPodEventSink {
             },
         });
         let query =
-            crate::pod_event_adapter::LeaderPodEventQuery::new(self.resource_query.as_ref());
+            crate::bootstrap::composition_adapters::pod_event_adapter::LeaderPodEventQuery::new(
+                self.resource_query.as_ref(),
+            );
         klights_kubelet::pod_events::emit_worker_pod_event(
             &query,
             self.outbox.as_ref(),

@@ -23,7 +23,7 @@ pub(crate) async fn start_worker_store_adapter(
                 network_topology: remote_api_client.clone(),
                 cleanup_intents: remote_api_client,
                 transition_projectors: std::sync::Arc::new(
-                    crate::remote_informer_cache_adapter::WatchCacheAdapter::new(),
+                    crate::bootstrap::composition_adapters::remote_informer_cache_adapter::WatchCacheAdapter::new(),
                 ),
                 watch_events: std::sync::Arc::new(
                     crate::control_plane::client::worker_store::WorkerWatchBus::new(),

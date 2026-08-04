@@ -179,7 +179,9 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             follower_grpc_client.clone(),
             task_supervisor.clone(),
             config.node_name.clone(),
-            std::sync::Arc::new(crate::remote_informer_cache_adapter::WatchCacheAdapter::new()),
+            std::sync::Arc::new(
+                crate::bootstrap::composition_adapters::remote_informer_cache_adapter::WatchCacheAdapter::new(),
+            ),
         ),
     );
     let leader_ports =

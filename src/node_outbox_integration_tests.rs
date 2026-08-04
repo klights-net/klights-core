@@ -2176,7 +2176,7 @@ mod tests {
                 "uid": "pod-uid-1"
             }
         });
-        let query = crate::pod_event_adapter::DatastorePodEventAdapter::new(db.as_ref());
+        let query = crate::bootstrap::composition_adapters::pod_event_adapter::DatastorePodEventAdapter::new(db.as_ref());
         klights_kubelet::pod_events::emit_pod_event_with_outbox(
             &query,
             Some(&outbox),

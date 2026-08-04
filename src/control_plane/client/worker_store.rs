@@ -386,7 +386,7 @@ impl WorkerStoreAdapter {
                 network_topology: cluster_api.clone(),
                 cleanup_intents: cluster_api,
                 transition_projectors: Arc::new(
-                    crate::remote_informer_cache_adapter::WatchCacheAdapter::new(),
+                    crate::bootstrap::composition_adapters::remote_informer_cache_adapter::WatchCacheAdapter::new(),
                 ),
                 watch_events: Arc::new(WorkerWatchBus::new()),
             },
@@ -2593,7 +2593,9 @@ mod tests {
         });
 
         let query =
-            crate::pod_event_adapter::LeaderPodEventQuery::new(adapter.resource_query.as_ref());
+            crate::bootstrap::composition_adapters::pod_event_adapter::LeaderPodEventQuery::new(
+                adapter.resource_query.as_ref(),
+            );
         klights_kubelet::pod_events::emit_worker_pod_event(
             &query,
             &outbox,

@@ -70,8 +70,9 @@ pub struct PodRepositoryBuildConfig {
     #[cfg(not(test))]
     pub api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
     #[cfg(test)]
-    pub(crate) scheduler_bind_gate:
-        Option<Arc<crate::pod_native_adapter::SchedulerBindGateForTest>>,
+    pub(crate) scheduler_bind_gate: Option<
+        Arc<crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest>,
+    >,
     #[cfg(not(test))]
     pub gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
 }
@@ -97,7 +98,9 @@ struct RootPodRepositoryComposition {
     controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
     #[cfg(test)]
-    scheduler_bind_gate: Option<Arc<crate::pod_native_adapter::SchedulerBindGateForTest>>,
+    scheduler_bind_gate: Option<
+        Arc<crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest>,
+    >,
 }
 
 pub(crate) struct RootPodRepositoryParts {
@@ -927,15 +930,16 @@ impl RootPodRepositoryComposition {
                 self.controller_identity.clone(),
             ),
         );
-        let native = crate::pod_native_adapter::RootPodNativeAdapter::new(
-            dependencies.store.clone(),
-            dependencies.status_only.clone(),
-            dependencies.delete_coordinator.clone(),
-            self.db.clone(),
-            self.wall_clock.clone(),
-            #[cfg(test)]
-            self.scheduler_bind_gate.clone(),
-        );
+        let native =
+            crate::bootstrap::composition_adapters::pod_native_adapter::RootPodNativeAdapter::new(
+                dependencies.store.clone(),
+                dependencies.status_only.clone(),
+                dependencies.delete_coordinator.clone(),
+                self.db.clone(),
+                self.wall_clock.clone(),
+                #[cfg(test)]
+                self.scheduler_bind_gate.clone(),
+            );
         let pod_query: Arc<dyn klights_pod_api::PodQuery> = native.clone();
         let persistence: Arc<dyn klights_pod_api::PodPersistence> = native.clone();
         let status_persistence: Arc<dyn klights_pod_api::PodStatusPersistence> = native.clone();
@@ -1127,12 +1131,13 @@ pub(crate) fn build_pod_repository_parts(
         delete_coordinator,
     });
     let delivery_outbox = outbox.map(|outbox| outbox as Arc<dyn klights_leader_api::NodeOutbox>);
-    let bound_pod_finalization = crate::bound_pod_finalization_adapter::new_for_root(
-        store.clone(),
-        cluster_api.clone(),
-        delivery_outbox.clone(),
-        wall_clock.clone(),
-    );
+    let bound_pod_finalization =
+        crate::bootstrap::composition_adapters::bound_pod_finalization_adapter::new_for_root(
+            store.clone(),
+            cluster_api.clone(),
+            delivery_outbox.clone(),
+            wall_clock.clone(),
+        );
     let repository_parts = PodRepository::build_parts_with_adapters(
         PodRepositoryCoreDependencies {
             store,
@@ -1192,7 +1197,7 @@ pub(crate) fn build_worker_pod_repository_parts(
     let status_only: Arc<dyn StateOnlyWriter> =
         Arc::new(StatusOnlyWriterService::new(store.clone()));
     let outbox: Arc<dyn klights_leader_api::NodeOutbox> = config.outbox;
-    let root_deletion = crate::bound_pod_finalization_adapter::RootBoundPodFinalization::new(
+    let root_deletion = crate::bootstrap::composition_adapters::bound_pod_finalization_adapter::RootBoundPodFinalization::new(
         store.clone(),
         Some(config.resource_query.clone()),
         Some(outbox.clone()),

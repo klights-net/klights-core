@@ -62,7 +62,7 @@ fn pod_status_command(namespace: &str, name: &str, uid: &str) -> StorageCommand 
 }
 
 fn pod_delete_command(namespace: &str, name: &str, uid: &str) -> StorageCommand {
-    crate::bound_pod_finalization_adapter::author(
+    crate::bootstrap::composition_adapters::bound_pod_finalization_adapter::author(
         namespace.to_string(),
         name.to_string(),
         uid.to_string(),

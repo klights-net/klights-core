@@ -2781,7 +2781,7 @@ async fn build_repo_with_scheduling_mode(
 
 async fn build_repo_with_scheduling_mode_and_gate(
     scheduling_mode: crate::pod_repository_composition::PodSchedulingMode,
-    gate: Arc<crate::pod_native_adapter::SchedulerBindGateForTest>,
+    gate: Arc<crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest>,
 ) -> super::PodRepository {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
@@ -7744,7 +7744,9 @@ async fn leader_scheduler_concurrent_wave_reserves_node_capacity_once() {
 async fn leader_scheduler_starts_bounded_bind_wave_concurrently() {
     use super::PodReader;
 
-    let gate = Arc::new(crate::pod_native_adapter::SchedulerBindGateForTest::new());
+    let gate = Arc::new(
+        crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest::new(),
+    );
     let repo = Arc::new(
         build_repo_with_scheduling_mode_and_gate(
             crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
@@ -12332,7 +12334,7 @@ async fn deletion_finalizer_reissues_missing_delete_mark_through_outbox() {
         })),
     };
     let cluster_api = Arc::new(FakeLeaderApiClient::new(pod_resource));
-    let root_deletion = crate::bound_pod_finalization_adapter::RootBoundPodFinalization::new(
+    let root_deletion = crate::bootstrap::composition_adapters::bound_pod_finalization_adapter::RootBoundPodFinalization::new(
         store.clone(),
         Some(cluster_api.clone()),
         Some(outbox.clone()),

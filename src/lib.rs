@@ -21,10 +21,7 @@ pub mod kubelet;
 pub mod networking;
 pub mod paths;
 pub mod pidfile;
-mod pod_event_adapter;
-mod pod_native_adapter;
 pub(crate) mod pod_repository_composition;
-mod remote_informer_cache_adapter;
 mod resource_admission_adapter;
 #[cfg(test)]
 mod service_pod_integration_tests;
@@ -39,8 +36,6 @@ mod cluster_engine_composition_tests;
 // as part of `./build.sh`.
 
 mod bootstrap;
-mod bound_pod_finalization_adapter;
-
 #[cfg(test)]
 mod datastore_codec_integration_tests;
 #[cfg(test)]

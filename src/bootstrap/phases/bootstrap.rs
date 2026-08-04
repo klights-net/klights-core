@@ -1898,7 +1898,9 @@ mod tests {
             grpc,
             supervisor,
             "cp1".to_string(),
-            Arc::new(crate::remote_informer_cache_adapter::WatchCacheAdapter::new()),
+            Arc::new(
+                crate::bootstrap::composition_adapters::remote_informer_cache_adapter::WatchCacheAdapter::new(),
+            ),
         ))
     }
 

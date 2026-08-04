@@ -1093,7 +1093,9 @@ fn build_remote_forwarder(
         grpc.clone(),
         supervisor,
         config.node_name.clone(),
-        Arc::new(crate::remote_informer_cache_adapter::WatchCacheAdapter::new()),
+        Arc::new(
+            crate::bootstrap::composition_adapters::remote_informer_cache_adapter::WatchCacheAdapter::new(),
+        ),
     ));
     RemoteForwarderParts {
         leader_ports: crate::control_plane::client::LeaderClientPorts::from_client(remote.clone()),
