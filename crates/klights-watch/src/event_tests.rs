@@ -1,6 +1,41 @@
 use crate::*;
 
 #[test]
+fn watch_event_filter_matches_hydrated_labels() {
+    let event = WatchEvent::added(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "cm-with-labels",
+            "namespace": "default",
+            "resourceVersion": "42",
+            "labels": {"watch-this-configmap": "multiple-watchers-A"}
+        }
+    }));
+
+    assert!(event.matches_filter(
+        "ConfigMap",
+        Some("default"),
+        Some("watch-this-configmap=multiple-watchers-A"),
+    ));
+    assert!(!event.matches_filter(
+        "ConfigMap",
+        Some("default"),
+        Some("watch-this-configmap=multiple-watchers-B"),
+    ));
+    assert!(event.matches_filter(
+        "ConfigMap",
+        Some("default"),
+        Some("watch-this-configmap!=multiple-watchers-B"),
+    ));
+    assert!(!event.matches_filter(
+        "ConfigMap",
+        Some("default"),
+        Some("watch-this-configmap!=multiple-watchers-A"),
+    ));
+}
+
+#[test]
 fn watch_event_constructors_preserve_wire_type_and_object() {
     let added = WatchEvent::added(serde_json::json!({
         "apiVersion": "v1",

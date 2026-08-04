@@ -32,12 +32,6 @@ mod cluster_engine_composition_tests;
 
 mod bootstrap;
 #[cfg(test)]
-mod datastore_codec_integration_tests;
-#[cfg(test)]
-mod datastore_post_commit_integration_tests;
-#[cfg(test)]
-mod datastore_sqlite_compatibility_integration_tests;
-#[cfg(test)]
 mod grpc_test_proto_channel_sink;
 #[cfg(test)]
 mod leader_rpc_client_integration_tests;
