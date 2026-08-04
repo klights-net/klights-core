@@ -1614,7 +1614,7 @@ async fn raft_append_entries_rejects_bootstrap_token() {
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
-    let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+    let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
         .await
         .unwrap();
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -2800,7 +2800,7 @@ async fn get_metadata_rpc_rejects_bootstrap_token_after_join_bootstrap() {
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
-    let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+    let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
         .await
         .unwrap();
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -2848,7 +2848,7 @@ async fn renew_node_lease_rpc_rejects_bootstrap_token_on_leader() {
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
-    let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+    let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
         .await
         .unwrap();
     let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
@@ -3707,7 +3707,7 @@ async fn apply_outbox_pod_status_enqueues_matching_service() {
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
-        crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+        crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
             .await
             .unwrap()
     };

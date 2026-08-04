@@ -147,9 +147,10 @@ mod cases {
             crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
                 .await
                 .unwrap();
-            let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
-                .await
-                .unwrap();
+            let token =
+                crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
+                    .await
+                    .unwrap();
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
             let service = Arc::new(crate::grpc_test_support::replication_service(
                 db.clone(),
@@ -486,7 +487,7 @@ mod cases {
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
-        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+        let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -546,9 +547,10 @@ mod cases {
             )
             .await
             .expect("create namespace");
-        let token = crate::bootstrap::cluster_meta::read_join_token(leader_db.as_ref())
-            .await
-            .expect("read token");
+        let token =
+            crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(leader_db.as_ref())
+                .await
+                .expect("read token");
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let client = ReplicationGrpcClient::new(
             GrpcClientConfig {
@@ -662,7 +664,7 @@ mod cases {
             .await
             .expect("compact durable watch history");
 
-        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+        let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
             .await
             .expect("read token");
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -751,7 +753,7 @@ mod cases {
             )
             .await
             .expect("create anchor namespace");
-        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+        let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
             .await
             .expect("read token");
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -960,9 +962,10 @@ mod cases {
             .await
             .expect("trim durable watch window");
 
-        let token = crate::bootstrap::cluster_meta::read_join_token(leader_db.as_ref())
-            .await
-            .expect("read token");
+        let token =
+            crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(leader_db.as_ref())
+                .await
+                .expect("read token");
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let client = ReplicationGrpcClient::new(
             GrpcClientConfig {
@@ -1075,7 +1078,7 @@ mod cases {
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
-        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+        let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -1391,7 +1394,7 @@ mod cases {
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
-        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+        let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -1477,7 +1480,7 @@ mod cases {
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
-        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+        let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -1566,7 +1569,7 @@ mod cases {
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
-        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+        let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -1801,7 +1804,7 @@ mod cases {
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
-        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+        let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -1920,7 +1923,7 @@ mod cases {
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
-        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+        let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -2163,7 +2166,7 @@ mod cases {
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
-        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+        let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -2236,7 +2239,7 @@ mod cases {
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
-        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+        let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -2349,7 +2352,7 @@ mod cases {
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
-        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+        let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -2546,7 +2549,7 @@ mod cases {
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
-        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+        let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -2666,7 +2669,7 @@ mod cases {
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
-        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+        let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));

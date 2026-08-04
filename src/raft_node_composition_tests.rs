@@ -1653,7 +1653,7 @@ mod tests {
         let leader_db = test_db().await;
         crate::bootstrap::cluster_meta::write_cluster_membership(
             leader_db.as_ref(),
-            &crate::control_plane::client::membership::ClusterMembership {
+            &klights_cluster_core::ClusterMembership {
                 cluster_id: "cluster-a".to_string(),
                 voters: vec!["mn-controlplane1".to_string()],
                 term: 0,

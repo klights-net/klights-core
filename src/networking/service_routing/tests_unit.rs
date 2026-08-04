@@ -100,7 +100,7 @@ impl FreshServiceInventoryClient {
     async fn fresh_list_for_test(
         &self,
         req: crate::control_plane::client::ListRequest,
-    ) -> anyhow::Result<crate::control_plane::client::ListResponse> {
+    ) -> anyhow::Result<crate::datastore::ResourceList> {
         if req.api_version == "discovery.k8s.io/v1" && req.kind == "EndpointSlice" {
             self.endpointslice_list_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

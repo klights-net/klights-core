@@ -3,7 +3,6 @@ pub mod apply;
 pub mod informer;
 pub mod leader_proxy;
 pub mod local;
-pub mod membership;
 pub mod remote;
 pub mod worker_store;
 
@@ -18,11 +17,6 @@ use std::sync::Arc;
 
 use crate::datastore::{Resource, ResourceList};
 use klights_watch::WatchEvent;
-
-pub type Pod = Resource;
-pub type ConfigMap = Resource;
-pub type Secret = Resource;
-pub type Node = Resource;
 
 pub(crate) fn focused_node_subnet(
     subnet: klights_cluster_store::StoredNodeSubnet,
@@ -130,8 +124,6 @@ pub struct ListRequest {
     pub limit: Option<i64>,
     pub continue_token: Option<String>,
 }
-
-pub type ListResponse = ResourceList;
 
 pub(crate) fn query_error(error: impl std::fmt::Display) -> ResourceQueryError {
     ResourceQueryError::query_failed(error.to_string())

@@ -23,8 +23,6 @@ use klights_leader_api::{
 };
 use tokio_util::sync::CancellationToken;
 
-#[cfg(test)]
-use super::Pod;
 use super::informer::{RemoteInformerCache, list as list_cached, replace_scope, scope_for_request};
 use super::{
     ListRequest, ResourceList, focused_watch_event, legacy_list_request, legacy_list_response,
@@ -129,7 +127,7 @@ impl RemoteApiClient {
     /// In tests, directly insert a pod into the informer cache without going
     /// through gRPC. This lets us test cache-hit read paths independently.
     #[cfg(test)]
-    pub async fn cache_insert_pod(&self, pod: Pod) {
+    pub async fn cache_insert_pod(&self, pod: Resource) {
         self.cache.insert(pod).await;
     }
 
@@ -704,6 +702,7 @@ mod tests {
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::backend::DatastoreHandle;
     use crate::outbox_test_support::OutboxPayload;
+    use klights_cluster_core::Resource;
     use klights_cluster_core::command::StorageCommand;
     use klights_leader_api::JoinRole;
     use klights_leader_api::OutboxDeliveryError as OutboxApplyError;
@@ -777,7 +776,7 @@ mod tests {
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
-        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+        let token = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db.as_ref())
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -845,7 +844,7 @@ mod tests {
         )
     }
 
-    fn make_pod(ns: &str, name: &str, uid: &str, node_name: &str, phase: &str) -> super::Pod {
+    fn make_pod(ns: &str, name: &str, uid: &str, node_name: &str, phase: &str) -> Resource {
         let data = json!({
             "apiVersion": "v1",
             "kind": "Pod",

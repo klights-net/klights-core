@@ -9,16 +9,7 @@
 //! `bootstrap.kubernetes.io/token` Secrets in `kube-system`.
 
 use anyhow::Result;
-
-pub use klights_cluster_core::ClusterMetadata;
-
-/// Metadata keys stored in `_klights_meta`.
-pub use klights_cluster_store::{
-    CLUSTER_ID_META_KEY as KEY_CLUSTER_ID, LEADER_EPOCH_META_KEY as KEY_LEADER_EPOCH,
-};
-pub const KEY_RAFT_VOTERS: &str = klights_cluster_store::RAFT_VOTERS_META_KEY;
-pub const KEY_RAFT_TERM: &str = klights_cluster_store::RAFT_TERM_META_KEY;
-pub const KEY_RAFT_LEADER_HINT: &str = klights_cluster_store::RAFT_LEADER_HINT_META_KEY;
+use klights_cluster_core::{ClusterMembership, ClusterMetadata};
 
 /// Generate a new random cluster ID (UUID v4).
 #[cfg(any(test, feature = "integration-test-harness"))]
@@ -39,13 +30,17 @@ use crate::datastore::backend::DatastoreBackend;
 #[cfg(any(test, feature = "integration-test-harness"))]
 pub async fn ensure_cluster_metadata(db: &dyn DatastoreBackend) -> Result<()> {
     // Check if cluster_id already exists
-    let existing = db.get_klights_meta(KEY_CLUSTER_ID).await?;
+    let existing = db
+        .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
+        .await?;
 
     if existing.is_none() {
         let cluster_id = generate_cluster_id();
 
-        db.set_klights_meta(KEY_CLUSTER_ID, &cluster_id).await?;
-        db.set_klights_meta(KEY_LEADER_EPOCH, "0").await?;
+        db.set_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY, &cluster_id)
+            .await?;
+        db.set_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY, "0")
+            .await?;
 
         tracing::info!(
             cluster_id = %cluster_id,
@@ -63,12 +58,12 @@ pub async fn ensure_cluster_metadata(db: &dyn DatastoreBackend) -> Result<()> {
 /// Returns an error if metadata has not been initialized.
 pub async fn read_cluster_metadata(db: &dyn DatastoreBackend) -> Result<ClusterMetadata> {
     let cluster_id = db
-        .get_klights_meta(KEY_CLUSTER_ID)
+        .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
         .await?
         .ok_or_else(|| anyhow::anyhow!("cluster_id not initialized"))?;
 
     let leader_epoch: i64 = db
-        .get_klights_meta(KEY_LEADER_EPOCH)
+        .get_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY)
         .await?
         .unwrap_or_else(|| "0".to_string())
         .parse()
@@ -85,61 +80,59 @@ pub async fn read_cluster_metadata(db: &dyn DatastoreBackend) -> Result<ClusterM
 
 pub async fn write_cluster_membership(
     db: &dyn DatastoreBackend,
-    membership: &crate::control_plane::client::membership::ClusterMembership,
+    membership: &ClusterMembership,
 ) -> Result<()> {
-    db.set_klights_meta(KEY_CLUSTER_ID, &membership.cluster_id)
-        .await?;
-    db.set_klights_meta(KEY_RAFT_VOTERS, &serde_json::to_string(&membership.voters)?)
-        .await?;
-    db.set_klights_meta(KEY_RAFT_TERM, &membership.term.to_string())
-        .await?;
     db.set_klights_meta(
-        KEY_RAFT_LEADER_HINT,
+        klights_cluster_store::CLUSTER_ID_META_KEY,
+        &membership.cluster_id,
+    )
+    .await?;
+    db.set_klights_meta(
+        klights_cluster_store::RAFT_VOTERS_META_KEY,
+        &serde_json::to_string(&membership.voters)?,
+    )
+    .await?;
+    db.set_klights_meta(
+        klights_cluster_store::RAFT_TERM_META_KEY,
+        &membership.term.to_string(),
+    )
+    .await?;
+    db.set_klights_meta(
+        klights_cluster_store::RAFT_LEADER_HINT_META_KEY,
         membership.leader_hint.as_deref().unwrap_or(""),
     )
     .await?;
     Ok(())
 }
 
-pub async fn read_cluster_membership(
-    db: &dyn DatastoreBackend,
-) -> Result<crate::control_plane::client::membership::ClusterMembership> {
+pub async fn read_cluster_membership(db: &dyn DatastoreBackend) -> Result<ClusterMembership> {
     let cluster_id = db
-        .get_klights_meta(KEY_CLUSTER_ID)
+        .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
         .await?
         .ok_or_else(|| anyhow::anyhow!("cluster_id not initialized"))?;
     let voters = db
-        .get_klights_meta(KEY_RAFT_VOTERS)
+        .get_klights_meta(klights_cluster_store::RAFT_VOTERS_META_KEY)
         .await?
         .map(|raw| serde_json::from_str(&raw))
         .transpose()?
         .unwrap_or_default();
     let term = db
-        .get_klights_meta(KEY_RAFT_TERM)
+        .get_klights_meta(klights_cluster_store::RAFT_TERM_META_KEY)
         .await?
         .unwrap_or_else(|| "0".to_string())
         .parse()
         .unwrap_or(0);
     let leader_hint = db
-        .get_klights_meta(KEY_RAFT_LEADER_HINT)
+        .get_klights_meta(klights_cluster_store::RAFT_LEADER_HINT_META_KEY)
         .await?
         .filter(|hint| !hint.is_empty());
 
-    Ok(
-        crate::control_plane::client::membership::ClusterMembership {
-            cluster_id,
-            voters,
-            term,
-            leader_hint,
-        },
-    )
-}
-
-/// Deprecated compatibility shim for code paths still being renamed from
-/// join-token terminology. Returns a live Kubernetes bootstrap token.
-#[cfg(test)]
-pub async fn read_join_token(db: &dyn DatastoreBackend) -> Result<String> {
-    crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(db).await
+    Ok(ClusterMembership {
+        cluster_id,
+        voters,
+        term,
+        leader_hint,
+    })
 }
 
 #[cfg(test)]
@@ -165,16 +158,27 @@ mod tests {
         let db = crate::datastore::test_support::in_memory().await;
 
         // Before ensure, no metadata
-        assert!(db.get_klights_meta(KEY_CLUSTER_ID).await.unwrap().is_none());
+        assert!(
+            db.get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         ensure_cluster_metadata(&db).await.unwrap();
 
         // After ensure, all keys exist
-        let cluster_id = db.get_klights_meta(KEY_CLUSTER_ID).await.unwrap();
+        let cluster_id = db
+            .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
+            .await
+            .unwrap();
         assert!(cluster_id.is_some());
         assert!(uuid::Uuid::parse_str(&cluster_id.unwrap()).is_ok());
 
-        let epoch = db.get_klights_meta(KEY_LEADER_EPOCH).await.unwrap();
+        let epoch = db
+            .get_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY)
+            .await
+            .unwrap();
         assert_eq!(epoch.as_deref(), Some("0"));
 
         let secrets = db
@@ -214,7 +218,11 @@ mod tests {
         let db = crate::datastore::test_support::in_memory().await;
 
         ensure_cluster_metadata(&db).await.unwrap();
-        let first_id = db.get_klights_meta(KEY_CLUSTER_ID).await.unwrap().unwrap();
+        let first_id = db
+            .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
+            .await
+            .unwrap()
+            .unwrap();
         let first_worker = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(&db)
             .await
             .unwrap();
@@ -225,7 +233,11 @@ mod tests {
 
         // Second call should not change values
         ensure_cluster_metadata(&db).await.unwrap();
-        let second_id = db.get_klights_meta(KEY_CLUSTER_ID).await.unwrap().unwrap();
+        let second_id = db
+            .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
+            .await
+            .unwrap()
+            .unwrap();
         let second_worker = crate::bootstrap::bootstrap_token::ensure_worker_bootstrap_token(&db)
             .await
             .unwrap();
@@ -276,8 +288,12 @@ mod tests {
         let db = crate::datastore::test_support::in_memory().await;
         ensure_cluster_metadata(&db).await.unwrap();
 
-        let membership = crate::control_plane::client::membership::ClusterMembership {
-            cluster_id: db.get_klights_meta(KEY_CLUSTER_ID).await.unwrap().unwrap(),
+        let membership = klights_cluster_core::ClusterMembership {
+            cluster_id: db
+                .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
+                .await
+                .unwrap()
+                .unwrap(),
             voters: vec!["mn-leader".to_string(), "mn-leader-2".to_string()],
             term: 7,
             leader_hint: Some("mn-leader-2".to_string()),
@@ -291,11 +307,15 @@ mod tests {
     async fn membership_change_commits_update_meta() {
         let db = crate::datastore::test_support::in_memory().await;
         ensure_cluster_metadata(&db).await.unwrap();
-        let cluster_id = db.get_klights_meta(KEY_CLUSTER_ID).await.unwrap().unwrap();
+        let cluster_id = db
+            .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
+            .await
+            .unwrap()
+            .unwrap();
 
         write_cluster_membership(
             &db,
-            &crate::control_plane::client::membership::ClusterMembership {
+            &klights_cluster_core::ClusterMembership {
                 cluster_id: cluster_id.clone(),
                 voters: vec!["mn-leader".to_string()],
                 term: 1,
@@ -306,7 +326,7 @@ mod tests {
         .unwrap();
         write_cluster_membership(
             &db,
-            &crate::control_plane::client::membership::ClusterMembership {
+            &klights_cluster_core::ClusterMembership {
                 cluster_id: cluster_id.clone(),
                 voters: vec!["mn-leader".to_string(), "mn-leader-2".to_string()],
                 term: 2,

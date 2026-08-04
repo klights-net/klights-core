@@ -446,14 +446,6 @@ fn validate_bootstrap_token_secret(
     })
 }
 
-#[cfg(test)]
-pub async fn ensure_default_bootstrap_token(
-    db: &dyn DatastoreBackend,
-    _ttl: std::time::Duration,
-) -> Result<String> {
-    ensure_worker_bootstrap_token(db).await
-}
-
 pub async fn rotate_bootstrap_token_secret_for_get(
     db: &dyn DatastoreBackend,
     resource: &Resource,
@@ -1032,12 +1024,8 @@ mod tests {
     async fn ensure_default_bootstrap_token_reuses_live_default_token() {
         let db = crate::datastore::test_support::in_memory().await;
 
-        let first = ensure_default_bootstrap_token(&db, std::time::Duration::from_secs(3600))
-            .await
-            .unwrap();
-        let second = ensure_default_bootstrap_token(&db, std::time::Duration::from_secs(3600))
-            .await
-            .unwrap();
+        let first = ensure_worker_bootstrap_token(&db).await.unwrap();
+        let second = ensure_worker_bootstrap_token(&db).await.unwrap();
 
         assert_eq!(first, second);
         validate_bootstrap_token(&db, &first).await.unwrap();

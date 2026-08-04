@@ -553,7 +553,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 // here would turn the fail-closed gate into a cold-start
                 // deadlock before the replication server can start.
                 let needs_seed_metadata = db_handle
-                    .get_klights_meta(crate::bootstrap::cluster_meta::KEY_CLUSTER_ID)
+                    .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
                     .await
                     .context("Failed to inspect restored cluster identity")?
                     .is_none();
@@ -574,7 +574,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     let db_for_membership: &dyn crate::datastore::DatastoreBackend = &*db_handle;
                     crate::bootstrap::cluster_meta::write_cluster_membership(
                         db_for_membership,
-                        &crate::control_plane::client::membership::ClusterMembership {
+                        &klights_cluster_core::ClusterMembership {
                             cluster_id,
                             voters: initial_voters_for_role(role, &config.node_name),
                             term: 0,

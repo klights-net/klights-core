@@ -12,9 +12,8 @@ use crate::datastore::node_local::LegacyDeliveryTestStore as _;
 use anyhow::Result;
 use serde_json::json;
 
-use crate::control_plane::client::{
-    ListRequest, ListResponse, legacy_list_request, query_list_result,
-};
+use crate::control_plane::client::{ListRequest, legacy_list_request, query_list_result};
+use crate::datastore::ResourceList;
 use klights_leader_api::{
     CacheReadinessFuture, CacheReadinessRequest, LeaderCacheReadiness, LeaderResourceQuery,
     LeaderWatch, LeaderWatchFuture, ResourceGetRequest, ResourceListRequest, ResourceListResult,
@@ -155,7 +154,7 @@ impl FakeLeaderApiClient {
         &self,
         req: &ListRequest,
         items: &[crate::datastore::Resource],
-    ) -> ListResponse {
+    ) -> ResourceList {
         let mut list = crate::datastore::ResourceList {
             items: Vec::new(),
             resource_version: self.pod.resource_version,
