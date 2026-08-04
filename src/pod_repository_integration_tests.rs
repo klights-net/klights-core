@@ -3379,8 +3379,11 @@ async fn set_pod_status_reconciles_namespace_termination_for_late_pod() {
         "actor finalization should remove the terminating late Pod"
     );
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
+    let namespace_store = crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(
+        db.clone(),
+    );
     k8s_native_service::reconcile_namespace_termination_at(
-        db.as_ref(),
+        namespace_store.as_ref(),
         "term-status",
         metrics.as_ref(),
         chrono::DateTime::UNIX_EPOCH,

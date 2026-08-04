@@ -576,10 +576,11 @@ mod tests {
     #[tokio::test]
     async fn reconcile_namespace_termination_already_deleted_is_ok() {
         let db = crate::datastore::test_support::in_memory().await;
+        let store = RootNamespaceTerminationStore::new(Arc::new(db.clone()));
         let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
 
         k8s_native_service::reconcile_namespace_termination_at(
-            &db,
+            store.as_ref(),
             "ghost-ns",
             metrics.as_ref(),
             chrono::DateTime::UNIX_EPOCH,
@@ -598,6 +599,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_namespace_termination_success_does_not_increment_counter() {
         let db = crate::datastore::test_support::in_memory().await;
+        let store = RootNamespaceTerminationStore::new(Arc::new(db.clone()));
         let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
         let ns_name = "term-test-ns";
         db.create_namespace(
@@ -617,7 +619,7 @@ mod tests {
         .expect("create ns");
 
         k8s_native_service::reconcile_namespace_termination_at(
-            &db,
+            store.as_ref(),
             ns_name,
             metrics.as_ref(),
             chrono::DateTime::UNIX_EPOCH,

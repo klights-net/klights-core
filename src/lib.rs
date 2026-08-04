@@ -2,7 +2,6 @@
 #[path = "admission/tests.rs"]
 mod admission_tests;
 mod allocator;
-mod api_helpers_adapter;
 pub mod cli;
 mod cluster_engine;
 pub mod control_plane;
