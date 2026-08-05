@@ -11,8 +11,6 @@ pub mod pod_subsystem;
 pub mod pod_termination;
 pub mod pod_watch_handlers;
 pub mod pod_watch_source;
-#[cfg(test)]
-mod probe_manager_integration;
 pub mod reconciler;
 #[cfg(test)]
 mod volume_integration_tests;

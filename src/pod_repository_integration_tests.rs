@@ -12991,6 +12991,33 @@ async fn old_uid_operations_do_not_mutate_replacement() {
         assert_replacement_unchanged(&live, &before);
     }
 
+    // --- set_probe_readiness_for_uid ---
+    {
+        let name = "probe-readiness";
+        let before = create_replacement_pod(&repo, ns, name).await;
+        let err = repo
+            .set_probe_readiness_for_uid(ns, name, stale_uid, "app", false, None)
+            .await;
+        assert!(
+            err.is_err(),
+            "stale UID set_probe_readiness_for_uid must be rejected"
+        );
+        let live = repo.get_pod(ns, name).await.unwrap().expect("pod exists");
+        assert_replacement_unchanged(&live, &before);
+
+        let updated = repo
+            .set_probe_readiness_for_uid(ns, name, "uid-new", "app", false, None)
+            .await
+            .expect("matching UID readiness update must succeed");
+        assert_eq!(updated.uid, "uid-new");
+        assert!(updated.resource_version > before.resource_version);
+        assert_eq!(
+            updated.data.pointer("/status/conditions/0/status"),
+            Some(&json!("False")),
+            "matching UID readiness command must update the owning pod"
+        );
+    }
+
     // --- finalize_bound_with_uid ---
     {
         let name = "delete";
