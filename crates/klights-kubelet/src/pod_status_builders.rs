@@ -1,17 +1,15 @@
-#[cfg(test)]
-use klights_kubelet::pod_status_logic::{ContainerBackoffState, ContainerInfo};
-use klights_kubelet::pod_status_logic::{
+#[cfg(any(test, feature = "test-support"))]
+use crate::pod_status_logic::{ContainerBackoffState, ContainerInfo};
+use crate::pod_status_logic::{
     REASON_ERR_IMAGE_PULL, REASON_IMAGE_PULL_BACK_OFF, REASON_POD_INITIALIZING,
     classify_failure_reason,
 };
 use serde_json::Value;
 
-#[cfg(test)]
-pub fn cri_timestamp_from_ns(ns: i64) -> String {
+#[cfg(any(test, feature = "test-support"))]
+pub fn cri_timestamp_from_ns(ns: i64, operation_now: chrono::DateTime<chrono::Utc>) -> String {
     if ns <= 0 {
-        return klights_cluster_core::k8s_time::format_legacy_timestamp(
-            klights_supervisor::SystemWallClock::now_utc(),
-        );
+        return klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now);
     }
     let secs = ns / 1_000_000_000;
     let sub_ns = (ns % 1_000_000_000) as u32;
@@ -19,15 +17,11 @@ pub fn cri_timestamp_from_ns(ns: i64) -> String {
     // detect no-change and avoid infinite write-loops.
     chrono::DateTime::from_timestamp(secs, sub_ns)
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S.%fZ").to_string())
-        .unwrap_or_else(|| {
-            klights_cluster_core::k8s_time::format_legacy_timestamp(
-                klights_supervisor::SystemWallClock::now_utc(),
-            )
-        })
+        .unwrap_or_else(|| klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now))
 }
 
 /// Build status object for completed init container
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn build_init_container_status(
     name: &str,
     image: &str,
@@ -62,7 +56,7 @@ pub fn build_init_container_status(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct EphemeralContainerStatusFixture<'a> {
     pub container_name: &'a str,
     pub container_id: Option<&'a str>,
@@ -74,8 +68,11 @@ pub struct EphemeralContainerStatusFixture<'a> {
     pub image_ref: &'a str,
 }
 
-#[cfg(test)]
-pub fn build_ephemeral_container_status(fixture: EphemeralContainerStatusFixture<'_>) -> Value {
+#[cfg(any(test, feature = "test-support"))]
+pub fn build_ephemeral_container_status(
+    fixture: EphemeralContainerStatusFixture<'_>,
+    operation_now: chrono::DateTime<chrono::Utc>,
+) -> Value {
     let EphemeralContainerStatusFixture {
         container_name,
         container_id,
@@ -89,15 +86,15 @@ pub fn build_ephemeral_container_status(fixture: EphemeralContainerStatusFixture
     let state_obj = match state {
         1 => serde_json::json!({
             "running": {
-                "startedAt": cri_timestamp_from_ns(started_at_ns)
+                "startedAt": cri_timestamp_from_ns(started_at_ns, operation_now)
             }
         }),
         2 => serde_json::json!({
             "terminated": {
                 "exitCode": exit_code,
                 "reason": if exit_code == 0 { "Completed" } else { "Error" },
-                "startedAt": cri_timestamp_from_ns(started_at_ns),
-                "finishedAt": cri_timestamp_from_ns(finished_at_ns),
+                "startedAt": cri_timestamp_from_ns(started_at_ns, operation_now),
+                "finishedAt": cri_timestamp_from_ns(finished_at_ns, operation_now),
             }
         }),
         _ => serde_json::json!({
@@ -122,11 +119,12 @@ pub fn build_ephemeral_container_status(fixture: EphemeralContainerStatusFixture
     status
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn build_container_statuses(
     containers: &[(String, ContainerInfo)],
     restart_counts: &std::collections::HashMap<String, i32>,
     ready_containers: &std::collections::HashSet<String>,
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<Value> {
     // Call backoff-aware version with empty backoff state for backward compatibility
     let empty_backoff = std::collections::HashMap::new();
@@ -135,18 +133,20 @@ pub fn build_container_statuses(
         restart_counts,
         &empty_backoff,
         ready_containers,
+        operation_now,
     )
 }
 
 /// Build container statuses with backoff state awareness for CrashLoopBackOff detection
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn build_container_statuses_with_backoff(
     containers: &[(String, ContainerInfo)],
     restart_counts: &std::collections::HashMap<String, i32>,
     backoff_state: &std::collections::HashMap<String, ContainerBackoffState>,
     ready_containers: &std::collections::HashSet<String>,
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<Value> {
-    let now = chrono::Utc::now().timestamp();
+    let now = operation_now.timestamp();
 
     containers.iter().map(|(name, info)| {
         let restart_count = restart_counts.get(name).copied().unwrap_or(0);
@@ -174,7 +174,7 @@ pub fn build_container_statuses_with_backoff(
                     // Running
                     serde_json::json!({
                         "running": {
-                            "startedAt": cri_timestamp_from_ns(info.started_at)
+                            "startedAt": cri_timestamp_from_ns(info.started_at, operation_now)
                         }
                     })
                 }
@@ -183,8 +183,8 @@ pub fn build_container_statuses_with_backoff(
                     let reason = if info.exit_code == 0 { "Completed" } else { "Error" };
                     let mut terminated = serde_json::json!({
                         "exitCode": info.exit_code,
-                        "finishedAt": cri_timestamp_from_ns(info.finished_at),
-                        "startedAt": cri_timestamp_from_ns(info.started_at),
+                        "finishedAt": cri_timestamp_from_ns(info.finished_at, operation_now),
+                        "startedAt": cri_timestamp_from_ns(info.started_at, operation_now),
                         "reason": reason
                     });
                     if !info.termination_message.is_empty() {
@@ -499,11 +499,12 @@ pub fn build_image_pull_error_statuses(pod: &Value, error_msg: &str) -> Vec<Valu
 
 /// Build init container statuses when an init container failed.
 /// The failed container shows terminated.reason=Error; prior ones show Completed.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn build_failed_init_container_statuses(
     pod: &Value,
     failed_name: &str,
     exit_code: i32,
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<Value> {
     let init_containers = pod
         .pointer("/spec/initContainers")
@@ -512,9 +513,7 @@ pub fn build_failed_init_container_statuses(
         return vec![];
     };
 
-    let now = klights_cluster_core::k8s_time::format_legacy_timestamp(
-        klights_supervisor::SystemWallClock::now_utc(),
-    );
+    let now = klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now);
     let mut statuses = Vec::new();
     for c in init_containers {
         let name = c.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
@@ -654,6 +653,24 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn operation_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-08-05T03:04:05Z")
+            .expect("fixed operation time")
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn cri_timestamp_fallback_uses_explicit_operation_time() {
+        assert_eq!(
+            cri_timestamp_from_ns(0, operation_now()),
+            "2026-08-05T03:04:05.000000000Z"
+        );
+        assert_eq!(
+            cri_timestamp_from_ns(1_000_000_000, operation_now()),
+            "1970-01-01T00:00:01.000000000Z"
+        );
+    }
+
     #[test]
     fn test_build_container_statuses_crashloopbackoff_waiting() {
         let containers = vec![(
@@ -673,7 +690,7 @@ mod tests {
         let mut restart_counts = HashMap::new();
         restart_counts.insert("nginx".to_string(), 3);
 
-        let now = chrono::Utc::now().timestamp();
+        let now = operation_now().timestamp();
         let mut backoff_state = HashMap::new();
         backoff_state.insert(
             "nginx".to_string(),
@@ -687,6 +704,7 @@ mod tests {
             &restart_counts,
             &backoff_state,
             &std::collections::HashSet::new(),
+            operation_now(),
         );
         assert_eq!(statuses.len(), 1);
 
@@ -697,11 +715,9 @@ mod tests {
         // Should have waiting state with CrashLoopBackOff reason
         assert!(status["state"]["waiting"].is_object());
         assert_eq!(status["state"]["waiting"]["reason"], "CrashLoopBackOff");
-        assert!(
-            status["state"]["waiting"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("back-off")
+        assert_eq!(
+            status["state"]["waiting"]["message"],
+            "back-off 30s restarting failed container"
         );
     }
 
@@ -726,6 +742,7 @@ mod tests {
             &containers,
             &restart_counts,
             &std::collections::HashSet::new(),
+            operation_now(),
         );
         assert_eq!(statuses.len(), 1);
 
@@ -756,6 +773,7 @@ mod tests {
             &containers,
             &restart_counts,
             &std::collections::HashSet::new(),
+            operation_now(),
         );
         assert_eq!(statuses.len(), 1);
 
@@ -786,6 +804,7 @@ mod tests {
             &containers,
             &HashMap::new(),
             &std::collections::HashSet::new(),
+            operation_now(),
         );
         assert_eq!(statuses.len(), 1);
         let status = &statuses[0];
@@ -834,6 +853,7 @@ mod tests {
             &containers,
             &HashMap::new(),
             &std::collections::HashSet::new(),
+            operation_now(),
         );
         assert_eq!(statuses.len(), 1);
         let status = &statuses[0];
@@ -895,6 +915,7 @@ mod tests {
             &containers,
             &HashMap::new(),
             &std::collections::HashSet::new(),
+            operation_now(),
         );
         let terminated = &statuses[0]["state"]["terminated"];
         assert_eq!(terminated["exitCode"], 0);
@@ -923,6 +944,7 @@ mod tests {
             &containers,
             &restart_counts,
             &std::collections::HashSet::new(),
+            operation_now(),
         );
         assert_eq!(statuses.len(), 1);
 
@@ -933,16 +955,19 @@ mod tests {
 
     #[test]
     fn test_build_ephemeral_container_status_running() {
-        let status = build_ephemeral_container_status(EphemeralContainerStatusFixture {
-            container_name: "debugger",
-            container_id: Some("abc123"),
-            state: 1,
-            started_at_ns: 1_712_700_000_000_000_000,
-            finished_at_ns: 0,
-            exit_code: 0,
-            image: "busybox",
-            image_ref: "docker.io/library/busybox:latest",
-        });
+        let status = build_ephemeral_container_status(
+            EphemeralContainerStatusFixture {
+                container_name: "debugger",
+                container_id: Some("abc123"),
+                state: 1,
+                started_at_ns: 1_712_700_000_000_000_000,
+                finished_at_ns: 0,
+                exit_code: 0,
+                image: "busybox",
+                image_ref: "docker.io/library/busybox:latest",
+            },
+            operation_now(),
+        );
         assert_eq!(status["name"], "debugger");
         assert_eq!(status["containerID"], "containerd://abc123");
         assert!(status.pointer("/state/running/startedAt").is_some());
@@ -952,16 +977,19 @@ mod tests {
 
     #[test]
     fn test_build_ephemeral_container_status_waiting_without_runtime_id() {
-        let status = build_ephemeral_container_status(EphemeralContainerStatusFixture {
-            container_name: "debugger",
-            container_id: None,
-            state: 0,
-            started_at_ns: 0,
-            finished_at_ns: 0,
-            exit_code: 0,
-            image: "busybox",
-            image_ref: "",
-        });
+        let status = build_ephemeral_container_status(
+            EphemeralContainerStatusFixture {
+                container_name: "debugger",
+                container_id: None,
+                state: 0,
+                started_at_ns: 0,
+                finished_at_ns: 0,
+                exit_code: 0,
+                image: "busybox",
+                image_ref: "",
+            },
+            operation_now(),
+        );
         assert_eq!(status["name"], "debugger");
         assert!(status.get("containerID").is_none());
         assert_eq!(

@@ -241,7 +241,12 @@ fn test_container_ready_should_respect_readiness_probe() {
     // Test 1: Container running but readiness probe not yet succeeded
     // Simulate: Ready condition is False (probe hasn't succeeded yet)
     let ready_containers_empty = HashSet::new();
-    let statuses = build_container_statuses(&containers, &restart_counts, &ready_containers_empty);
+    let statuses = build_container_statuses(
+        &containers,
+        &restart_counts,
+        &ready_containers_empty,
+        chrono::DateTime::UNIX_EPOCH,
+    );
     let status = &statuses[0];
     let ready = status.get("ready").and_then(|r| r.as_bool()).unwrap();
 
@@ -255,7 +260,12 @@ fn test_container_ready_should_respect_readiness_probe() {
     // Simulate: Ready condition is True (probe succeeded)
     let mut ready_containers = HashSet::new();
     ready_containers.insert("app".to_string());
-    let statuses = build_container_statuses(&containers, &restart_counts, &ready_containers);
+    let statuses = build_container_statuses(
+        &containers,
+        &restart_counts,
+        &ready_containers,
+        chrono::DateTime::UNIX_EPOCH,
+    );
     let status = &statuses[0];
     let ready = status.get("ready").and_then(|r| r.as_bool()).unwrap();
 

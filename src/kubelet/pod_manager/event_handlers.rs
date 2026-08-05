@@ -451,7 +451,7 @@ pub(super) async fn apply_pod_phase_update(
         namespace,
         pod_name,
     } = request;
-    use crate::kubelet::pod_status_builders::build_container_statuses;
+    use klights_kubelet::pod_status_builders::build_container_statuses;
     use klights_kubelet::pod_status_logic::extract_ready_containers_from_pod_condition;
 
     use crate::kubelet::pod_repository::{PodStatusWriter, RuntimeReconcileStatus};
@@ -466,8 +466,12 @@ pub(super) async fn apply_pod_phase_update(
     // Build updated containerStatuses
     // Pass readiness probe results: containers with successful readiness probes are marked ready
     let ready_containers = extract_ready_containers_from_pod_condition(&pod_resource.data);
-    let mut container_statuses =
-        build_container_statuses(container_infos, restart_counts, &ready_containers);
+    let mut container_statuses = build_container_statuses(
+        container_infos,
+        restart_counts,
+        &ready_containers,
+        chrono::DateTime::UNIX_EPOCH,
+    );
     if container_statuses.is_empty() && has_create_container_config_error_status(&pod_resource.data)
     {
         container_statuses = pod_resource

@@ -36,6 +36,7 @@ pub mod pod_repository;
 pub mod pod_sandbox;
 pub mod pod_sandbox_config;
 pub mod pod_startup_error;
+pub mod pod_status_builders;
 pub mod pod_status_logic;
 pub mod pod_volume_manager;
 pub mod probe_manager;

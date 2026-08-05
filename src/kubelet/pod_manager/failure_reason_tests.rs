@@ -72,7 +72,8 @@ fn build_failed_init_container_statuses_shows_terminated_error() {
             ]
         }
     });
-    let statuses = super::build_failed_init_container_statuses(&pod, "init2", 1);
+    let statuses =
+        super::build_failed_init_container_statuses(&pod, "init2", 1, chrono::DateTime::UNIX_EPOCH);
     assert_eq!(statuses.len(), 2);
     // init1 completed successfully
     assert_eq!(statuses[0]["name"], "init1");

@@ -692,7 +692,7 @@ impl PodStatusService {
         pod_uid: &str,
         error_message: &str,
     ) -> Result<PodStatusWriteResult> {
-        use crate::kubelet::pod_status_builders::{
+        use klights_kubelet::pod_status_builders::{
             build_creation_error_statuses, build_image_pull_error_statuses,
             build_retrying_init_container_statuses,
         };

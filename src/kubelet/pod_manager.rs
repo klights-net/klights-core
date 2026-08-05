@@ -1,11 +1,6 @@
 #[cfg(test)]
 use crate::kubelet::pod_runtime_state::{PodRuntimeState, StartupDecision, decide_startup_action};
 #[cfg(test)]
-use crate::kubelet::pod_status_builders::{
-    build_container_statuses, build_creation_error_statuses, build_failed_init_container_statuses,
-    cri_timestamp_from_ns,
-};
-#[cfg(test)]
 use crate::kubelet::pod_watch_handlers::NoopPersistentVolumeEventHandler;
 use crate::kubelet::pod_watch_handlers::PersistentVolumeEventHandler;
 use crate::kubelet::pod_watch_source::{
@@ -27,6 +22,11 @@ use klights_kubelet::pod_creation_state::{
 use klights_kubelet::pod_lifecycle_actor::message::{LifecycleMessage, PodLifecycleKey};
 use klights_kubelet::pod_lifecycle_actor::state::{
     PodLifecycleStateTracker, new_pod_lifecycle_state_tracker,
+};
+#[cfg(test)]
+use klights_kubelet::pod_status_builders::{
+    build_container_statuses, build_creation_error_statuses, build_failed_init_container_statuses,
+    cri_timestamp_from_ns,
 };
 #[cfg(test)]
 use klights_kubelet::pod_status_logic::{ContainerInfo, compute_pod_phase, should_restart};
@@ -798,8 +798,8 @@ fn runtime_restart_last_state(info: &ContainerInfo) -> Value {
         "terminated": {
             "exitCode": info.exit_code,
             "reason": reason,
-            "startedAt": cri_timestamp_from_ns(info.started_at),
-            "finishedAt": cri_timestamp_from_ns(info.finished_at),
+            "startedAt": cri_timestamp_from_ns(info.started_at, chrono::DateTime::UNIX_EPOCH),
+            "finishedAt": cri_timestamp_from_ns(info.finished_at, chrono::DateTime::UNIX_EPOCH),
         }
     });
     if !info.termination_message.is_empty()
