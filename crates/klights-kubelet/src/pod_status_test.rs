@@ -1,9 +1,9 @@
 //! Tests for pod status update behavior
 //!
 //! These tests verify pod condition management and status computation.
-use klights_kubelet::pod_status_logic::ContainerInfo;
-use klights_kubelet::pod_status_logic::compute_pod_phase;
-use klights_kubelet::pod_status_logic::get_condition_last_transition_time;
+use super::ContainerInfo;
+use super::compute_pod_phase;
+use super::get_condition_last_transition_time;
 use serde_json::json;
 
 #[cfg(test)]

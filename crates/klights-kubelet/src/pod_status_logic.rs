@@ -298,6 +298,10 @@ pub fn extract_ready_containers_from_pod_condition(
 }
 
 #[cfg(test)]
+#[path = "pod_status_test.rs"]
+mod pod_status_test;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

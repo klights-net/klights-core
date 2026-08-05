@@ -14,8 +14,6 @@ pub mod pod_resources;
 pub mod pod_runtime_state;
 pub mod pod_service_envs;
 pub mod pod_status_builders;
-#[cfg(test)]
-pub mod pod_status_test;
 pub mod pod_status_writer;
 pub mod pod_subsystem;
 pub mod pod_termination;
