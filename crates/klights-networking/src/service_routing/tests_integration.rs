@@ -53,6 +53,104 @@ mod integration_tests {
         ))
     }
 
+    struct EmptyRoutingState;
+
+    impl RoutingStateSource for EmptyRoutingState {
+        fn service_routing_snapshot(&self) -> RoutingStateFuture<'_, ServiceRoutingSnapshot> {
+            Box::pin(async { Ok(ServiceRoutingSnapshot::default()) })
+        }
+
+        fn network_policy_snapshot(&self) -> RoutingStateFuture<'_, NetworkPolicySnapshot> {
+            Box::pin(async { Ok(NetworkPolicySnapshot::default()) })
+        }
+    }
+
+    struct PendingLeaderWatch;
+
+    impl klights_leader_api::LeaderWatch for PendingLeaderWatch {
+        fn watch_resources(
+            &self,
+            _request: klights_leader_api::WatchRequest,
+        ) -> klights_leader_api::LeaderWatchFuture<'_> {
+            Box::pin(async {
+                Ok(klights_leader_api::WatchStream::unpositioned_test_stream(
+                    futures::stream::pending(),
+                ))
+            })
+        }
+    }
+
+    struct PendingEndpointSubscription;
+
+    impl klights_network_api::PodEndpointEventSubscription for PendingEndpointSubscription {
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<
+            Option<
+                std::result::Result<
+                    klights_network_api::PodEndpointEvent,
+                    klights_network_api::PodEndpointError,
+                >,
+            >,
+        > {
+            std::task::Poll::Pending
+        }
+    }
+
+    struct EmptyEndpointSource;
+
+    impl klights_network_api::PodEndpointEventSource for EmptyEndpointSource {
+        fn subscribe(
+            &self,
+        ) -> klights_network_api::PodEndpointFuture<'_, klights_network_api::PodEndpointEventStream>
+        {
+            Box::pin(async {
+                Ok(Box::pin(PendingEndpointSubscription)
+                    as klights_network_api::PodEndpointEventStream)
+            })
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root/netfilter access"]
+    async fn test_worker_exits_within_100ms_on_cancel() {
+        use klights_network_api::ServiceRouter;
+        use tokio_util::sync::CancellationToken;
+
+        let cancel = CancellationToken::new();
+        let task_supervisor = test_task_supervisor();
+        let rt = NftServiceRouter::boot(NftServiceRouterBoot::new(
+            NftServiceRouterStores::new(
+                std::sync::Arc::new(EmptyRoutingState),
+                std::sync::Arc::new(PendingLeaderWatch),
+                std::sync::Arc::new(EmptyEndpointSource),
+            ),
+            NftServiceRouterTableConfig::new("node-a", "klights-test-shutdown", "klights-test"),
+            NftServiceRouterNetworkConfig::new(
+                PodSubnet::parse("10.42.0.0/24").unwrap(),
+                ClusterCidr::parse("10.42.0.0/16").unwrap(),
+                ClusterCidr::parse("10.43.128.0/17").unwrap(),
+                ServiceRoutingMode::new(),
+            ),
+            NftServiceRouterRuntime::new(
+                std::time::Duration::from_millis(50),
+                cancel,
+                task_supervisor,
+            ),
+        ))
+        .await
+        .expect("boot router");
+
+        let started = std::time::Instant::now();
+        let _ = rt.cleanup().await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "cleanup took {:?}",
+            started.elapsed()
+        );
+    }
+
     fn build(name: &str) -> KlightsTable {
         let nf = Netfilter::new(test_task_supervisor()).expect("Netfilter::new");
         let pod = PodSubnet::parse("10.99.0.0/24").expect("static cidr");
