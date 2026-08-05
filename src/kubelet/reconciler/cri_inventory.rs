@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey;
-use crate::kubelet::pod_lifecycle_router::{
+use klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey;
+use klights_kubelet::pod_lifecycle_router::{
     OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
 };
 use klights_kubelet::runtime::cri::{ContainerRuntimeState, CriPodSandboxSummary, CriRuntime};
@@ -474,11 +474,11 @@ pub mod tests {
 
     fn actor_router_with_recorder() -> (
         std::sync::Arc<PodLifecycleRouter>,
-        std::sync::Arc<crate::kubelet::pod_lifecycle_router::executor::RecordingExecutor>,
+        std::sync::Arc<klights_kubelet::pod_lifecycle_router::executor::RecordingExecutor>,
     ) {
-        use crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
-        use crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry;
-        use crate::kubelet::pod_lifecycle_router::executor::{PodWorkExecutor, RecordingExecutor};
+        use klights_kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
+        use klights_kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry;
+        use klights_kubelet::pod_lifecycle_router::executor::{PodWorkExecutor, RecordingExecutor};
 
         let recorder = RecordingExecutor::new();
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(

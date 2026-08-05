@@ -1,24 +1,10 @@
 #[cfg(test)]
-use crate::kubelet::pod_creation_state::PodStartRetryState;
-#[cfg(test)]
-use crate::kubelet::pod_creation_state::PodStartSource;
-use crate::kubelet::pod_creation_state::{
-    PodCreationTracker, PodStartRetryTracker, clear_pod_creation_inflight,
-    should_clear_pod_creation_inflight,
-};
-use crate::kubelet::pod_lifecycle_actor::message::{LifecycleMessage, PodLifecycleKey};
-use crate::kubelet::pod_lifecycle_actor::state::{
-    PodLifecycleStateTracker, new_pod_lifecycle_state_tracker,
-};
-#[cfg(test)]
 use crate::kubelet::pod_runtime_state::{PodRuntimeState, StartupDecision, decide_startup_action};
 #[cfg(test)]
 use crate::kubelet::pod_status_builders::{
     build_container_statuses, build_creation_error_statuses, build_failed_init_container_statuses,
     cri_timestamp_from_ns,
 };
-#[cfg(test)]
-use crate::kubelet::pod_status_logic::{ContainerInfo, compute_pod_phase, should_restart};
 #[cfg(test)]
 use crate::kubelet::pod_watch_handlers::NoopPersistentVolumeEventHandler;
 use crate::kubelet::pod_watch_handlers::PersistentVolumeEventHandler;
@@ -30,6 +16,20 @@ use anyhow::Result;
 #[cfg(test)]
 use event_handlers::{PodPhaseUpdateRequest, apply_pod_phase_update};
 use futures::StreamExt as _;
+#[cfg(test)]
+use klights_kubelet::pod_creation_state::PodStartRetryState;
+#[cfg(test)]
+use klights_kubelet::pod_creation_state::PodStartSource;
+use klights_kubelet::pod_creation_state::{
+    PodCreationTracker, PodStartRetryTracker, clear_pod_creation_inflight,
+    should_clear_pod_creation_inflight,
+};
+use klights_kubelet::pod_lifecycle_actor::message::{LifecycleMessage, PodLifecycleKey};
+use klights_kubelet::pod_lifecycle_actor::state::{
+    PodLifecycleStateTracker, new_pod_lifecycle_state_tracker,
+};
+#[cfg(test)]
+use klights_kubelet::pod_status_logic::{ContainerInfo, compute_pod_phase, should_restart};
 use klights_leader_api::{LeaderWatchError, WatchEventType};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -125,7 +125,7 @@ struct PodRecovery<'a> {
     pod_repo: &'a Arc<crate::kubelet::pod_repository::PodRepository>,
     node_name: &'a str,
     retry_state: &'a PodStartRetryTracker,
-    pod_lifecycle_router: std::sync::Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
+    pod_lifecycle_router: std::sync::Arc<klights_kubelet::pod_lifecycle_router::PodLifecycleRouter>,
 }
 async fn spawn_cri_event_forwarder(
     cri: Arc<dyn klights_kubelet::runtime::cri::CriRuntime>,
@@ -722,7 +722,7 @@ async fn schedule_active_deadline_timer_for_modified_pod(
     now_unix_seconds: i64,
     registry: deadline_timers::DeadlineTimerRegistry,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
-    pod_lifecycle_router: std::sync::Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
+    pod_lifecycle_router: std::sync::Arc<klights_kubelet::pod_lifecycle_router::PodLifecycleRouter>,
 ) {
     deadline_timers::schedule_active_deadline_timer_for_modified_pod(
         pod,

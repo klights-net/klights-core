@@ -1229,11 +1229,11 @@ fn remote_pod_delete_resignal_due(payload: &mut Value, now_ms: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
-    use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleWorkKind};
-    use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
-    use crate::kubelet::pod_lifecycle_router::executor::{ExecutorError, PodWorkExecutor};
     use klights_controllers::side_effects::SideEffectMetrics;
+    use klights_kubelet::pod_lifecycle_core::action::PodAction;
+    use klights_kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleWorkKind};
+    use klights_kubelet::pod_lifecycle_router::LifecycleReplyHandle;
+    use klights_kubelet::pod_lifecycle_router::executor::{ExecutorError, PodWorkExecutor};
 
     #[derive(Clone, Copy)]
     struct TestCoordinationState {
@@ -1522,16 +1522,16 @@ mod tests {
     fn test_router(
         supervisor: &Arc<klights_supervisor::TaskSupervisor>,
         executor: Arc<dyn PodWorkExecutor>,
-    ) -> Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter> {
+    ) -> Arc<klights_kubelet::pod_lifecycle_router::PodLifecycleRouter> {
         let registry = Arc::new(
-            crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry::new(
+            klights_kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry::new(
                 supervisor.clone(),
-                crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
+                klights_kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
                 Arc::new(std::sync::Mutex::new(executor.clone())),
             ),
         );
         Arc::new(
-            crate::kubelet::pod_lifecycle_router::PodLifecycleRouter::new_actor_with_executor(
+            klights_kubelet::pod_lifecycle_router::PodLifecycleRouter::new_actor_with_executor(
                 registry, executor,
             ),
         )

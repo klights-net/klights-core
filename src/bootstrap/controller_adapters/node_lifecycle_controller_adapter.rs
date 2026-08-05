@@ -5,13 +5,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
 use crate::datastore::{DatastoreBackend, DatastoreHandle, ResourceListQuery};
-use crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey;
-use crate::kubelet::pod_lifecycle_router::{
-    OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
-};
 use klights_cluster_core::Resource;
 use klights_controllers::node_lifecycle::{
     NodeLifecyclePodStore, NodeLifecycleStore, NodeLostPodLifecycleSink,
+};
+use klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey;
+use klights_kubelet::pod_lifecycle_router::{
+    OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
 };
 
 trait DatastoreNodeLifecycleAccess {

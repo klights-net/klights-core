@@ -28,12 +28,12 @@ impl klights_leader_api::LeaderClusterStatusMetadata for ApiClusterStatusMetadat
 }
 
 pub(crate) struct ApiPodStartRetryDiagnostics {
-    tracker: crate::kubelet::pod_creation_state::PodStartRetryTracker,
+    tracker: klights_kubelet::pod_creation_state::PodStartRetryTracker,
 }
 
 impl ApiPodStartRetryDiagnostics {
     pub(crate) fn new(
-        tracker: crate::kubelet::pod_creation_state::PodStartRetryTracker,
+        tracker: klights_kubelet::pod_creation_state::PodStartRetryTracker,
     ) -> Arc<Self> {
         Arc::new(Self { tracker })
     }

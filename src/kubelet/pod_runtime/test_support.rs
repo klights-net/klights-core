@@ -116,7 +116,7 @@ impl crate::kubelet::pod_runtime::network::PodNetworkRuntime for MockPodNetworkR
             }
             if f == "network_assignment_timeout" {
                 return Err(anyhow::Error::new(
-                    crate::kubelet::pod_startup_error::PodStartupErrorKind::NetworkAssignmentTimedOut,
+                    klights_kubelet::pod_startup_error::PodStartupErrorKind::NetworkAssignmentTimedOut,
                 )
                 .context("pod network assignment wait timed out for sandbox"));
             }
@@ -1244,7 +1244,7 @@ impl PodRuntimeService for MockPodRuntimeService {
     async fn check_slot_admission(
         &self,
         request: super::service::PodSlotAdmissionRequest,
-        reply_to: crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle,
+        reply_to: klights_kubelet::pod_lifecycle_router::LifecycleReplyHandle,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         self.check_fail("check_slot_admission")?;
@@ -1269,8 +1269,8 @@ impl PodRuntimeService for MockPodRuntimeService {
                 cancelled: cancel.is_cancelled(),
             });
         let _ = reply_to
-            .route(crate::kubelet::pod_lifecycle_core::message::LifecycleMessage::SlotAdmissionGranted {
-                key: crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey::new(
+            .route(klights_kubelet::pod_lifecycle_core::message::LifecycleMessage::SlotAdmissionGranted {
+                key: klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey::new(
                     &key.namespace,
                     &key.name,
                     &key.uid,
@@ -1288,7 +1288,7 @@ impl PodRuntimeService for MockPodRuntimeService {
         &self,
         key: PodRuntimeKey,
         delay: std::time::Duration,
-        _reply_to: crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle,
+        _reply_to: klights_kubelet::pod_lifecycle_router::LifecycleReplyHandle,
     ) -> anyhow::Result<()> {
         self.check_fail("schedule_retry")?;
         self.calls
@@ -1309,7 +1309,7 @@ impl PodRuntimeService for MockPodRuntimeService {
         delay: std::time::Duration,
         error_message: String,
         attempt: u32,
-        _reply_to: crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle,
+        _reply_to: klights_kubelet::pod_lifecycle_router::LifecycleReplyHandle,
     ) -> anyhow::Result<()> {
         self.check_fail("schedule_start_pod_retry")?;
         self.calls
@@ -1622,7 +1622,7 @@ impl PodRuntimeHarness {
             node_name: "test-node".into(),
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: "klights-test".into(),
-            sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+            sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
             paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),

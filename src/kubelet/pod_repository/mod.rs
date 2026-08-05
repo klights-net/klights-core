@@ -1153,7 +1153,7 @@ impl PodRepository {
 
     pub fn set_pod_lifecycle_router_for_node(
         &self,
-        router: Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
+        router: Arc<klights_kubelet::pod_lifecycle_router::PodLifecycleRouter>,
         local_node_name: String,
     ) {
         self.workqueue

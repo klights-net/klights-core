@@ -1,7 +1,7 @@
 use super::*;
-#[cfg(test)]
-use crate::kubelet::pod_status_logic::ContainerInfo;
 use crate::kubelet::pod_watch_source::PodWatchEvent as WatchEvent;
+#[cfg(test)]
+use klights_kubelet::pod_status_logic::ContainerInfo;
 use klights_leader_api::WatchEventType as EventType;
 
 pub(super) async fn enqueue_job_reconcile_for_terminal_watch_pod(
@@ -25,7 +25,7 @@ pub(super) struct WatchEventHandlerContext<'a> {
     pub retry_state: &'a PodStartRetryTracker,
     pub pod_lifecycle_state: &'a PodLifecycleStateTracker,
     pub pod_lifecycle_router:
-        std::sync::Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
+        std::sync::Arc<klights_kubelet::pod_lifecycle_router::PodLifecycleRouter>,
     pub task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     pub file_process: klights_supervisor::FileProcessExecutor,
     pub deadline_timers: super::deadline_timers::DeadlineTimerRegistry,
@@ -256,8 +256,11 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
         clear_pod_creation_inflight(pod_creation_tracker, namespace, name).await;
         clear_pod_start_retry_state(retry_state, namespace, name).await;
         if let Some(key) = pod_lifecycle_key_from_pod(&event.object) {
-            crate::kubelet::pod_lifecycle_actor::state::remove_pod_state(pod_lifecycle_state, &key)
-                .await;
+            klights_kubelet::pod_lifecycle_actor::state::remove_pod_state(
+                pod_lifecycle_state,
+                &key,
+            )
+            .await;
         }
         let orphan_enqueued =
             match crate::kubelet::reconciler::orphan::OrphanScanner::scan_deleted_event(
@@ -284,7 +287,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
                 key.namespace.as_str(),
                 key.pod_name.as_str(),
                 key.pod_uid.as_str(),
-                crate::kubelet::pod_lifecycle_core::message::POD_CLEANUP_REASON_NODE_LOST,
+                klights_kubelet::pod_lifecycle_core::message::POD_CLEANUP_REASON_NODE_LOST,
             ) {
                 Ok(request) => {
                     if let Err(err) = pod_cleanup_intents
@@ -449,7 +452,7 @@ pub(super) async fn apply_pod_phase_update(
         pod_name,
     } = request;
     use crate::kubelet::pod_status_builders::build_container_statuses;
-    use crate::kubelet::pod_status_logic::extract_ready_containers_from_pod_condition;
+    use klights_kubelet::pod_status_logic::extract_ready_containers_from_pod_condition;
 
     use crate::kubelet::pod_repository::{PodStatusWriter, RuntimeReconcileStatus};
     tracing::info!(
@@ -725,19 +728,19 @@ mod tests {
             .repository,
         );
 
-        let registry = Arc::new(crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry::new(
+        let registry = Arc::new(klights_kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry::new(
             supervisor,
-            crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
+            klights_kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
             Arc::new(std::sync::Mutex::new(
                 Arc::new(
-                    crate::kubelet::pod_lifecycle_router::executor::NoopExecutor
-                ) as Arc<dyn crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor>,
+                    klights_kubelet::pod_lifecycle_router::executor::NoopExecutor
+                ) as Arc<dyn klights_kubelet::pod_lifecycle_router::executor::PodWorkExecutor>,
             )),
         ));
         let router = Arc::new(
-            crate::kubelet::pod_lifecycle_router::PodLifecycleRouter::new_actor_with_executor(
+            klights_kubelet::pod_lifecycle_router::PodLifecycleRouter::new_actor_with_executor(
                 registry,
-                Arc::new(crate::kubelet::pod_lifecycle_router::executor::NoopExecutor),
+                Arc::new(klights_kubelet::pod_lifecycle_router::executor::NoopExecutor),
             ),
         );
         pod_repo.set_pod_lifecycle_router_for_node(router, "worker-a".to_string());
@@ -876,19 +879,19 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(PodStartRetryState::new()));
         let pod_lifecycle_state = new_pod_lifecycle_state_tracker();
         let registry = Arc::new(
-            crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry::new(
+            klights_kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry::new(
                 supervisor.clone(),
-                crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
+                klights_kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
                 Arc::new(std::sync::Mutex::new(
-                    Arc::new(crate::kubelet::pod_lifecycle_router::executor::NoopExecutor)
-                        as Arc<dyn crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor>,
+                    Arc::new(klights_kubelet::pod_lifecycle_router::executor::NoopExecutor)
+                        as Arc<dyn klights_kubelet::pod_lifecycle_router::executor::PodWorkExecutor>,
                 )),
             ),
         );
         let pod_lifecycle_router = Arc::new(
-            crate::kubelet::pod_lifecycle_router::PodLifecycleRouter::new_actor_with_executor(
+            klights_kubelet::pod_lifecycle_router::PodLifecycleRouter::new_actor_with_executor(
                 registry,
-                Arc::new(crate::kubelet::pod_lifecycle_router::executor::NoopExecutor),
+                Arc::new(klights_kubelet::pod_lifecycle_router::executor::NoopExecutor),
             ),
         );
 

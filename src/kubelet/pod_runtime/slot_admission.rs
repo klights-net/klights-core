@@ -1,9 +1,9 @@
-use crate::kubelet::pod_lifecycle_core::message::{
-    LifecycleMessage, PodLifecycleKey, PodLifecycleWorkFailure, PodLifecycleWorkKind,
-};
-use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
 use crate::kubelet::pod_runtime::service::PodRuntimeKey;
 use crate::kubelet::pod_runtime::store::PodSlotAdmission;
+use klights_kubelet::pod_lifecycle_core::message::{
+    LifecycleMessage, PodLifecycleKey, PodLifecycleWorkFailure, PodLifecycleWorkKind,
+};
+use klights_kubelet::pod_lifecycle_router::LifecycleReplyHandle;
 use tokio_util::sync::CancellationToken;
 
 /// Request object for UID-qualified pod slot admission checks.

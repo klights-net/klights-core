@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use crate::kubelet::pod_lifecycle_core::message::{
+use anyhow::{Context, Result};
+use klights_kubelet::pod_lifecycle_core::message::{
     LifecycleMessage, POD_CLEANUP_REASON_NODE_LOST, PodLifecycleKey,
 };
-use crate::kubelet::pod_lifecycle_router::{
+use klights_kubelet::pod_lifecycle_router::{
     OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
 };
-use anyhow::{Context, Result};
 use klights_kubelet::runtime::cri::CriRuntime;
 use klights_leader_api::{
     CacheReadinessRequest, LeaderCacheReadiness, LeaderPodCleanupIntents, LeaderResourceQuery,
@@ -301,10 +301,10 @@ mod tests {
         assert_eq!(
             actions,
             vec![StartupAction::FinalizeOrphan {
-                key: crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey::new(
+                key: klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey::new(
                     "default", "web", "old-uid",
                 ),
-                reason: crate::kubelet::pod_lifecycle_router::OrphanReason::UidChangedWhileDown,
+                reason: klights_kubelet::pod_lifecycle_router::OrphanReason::UidChangedWhileDown,
             }]
         );
     }

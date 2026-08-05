@@ -3,7 +3,6 @@
 use k8s_cri::v1::PodSandboxConfig;
 
 use crate::kubelet::pod_env::EnvSourceReader;
-use crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey;
 use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
 use crate::kubelet::pod_runtime::events::PodEventSink;
 use crate::kubelet::pod_runtime::filesystem::PodFilesystem;
@@ -21,6 +20,7 @@ use crate::kubelet::pod_runtime::test_support::{
     MockPodRuntimeService, MockPodSlotAdmission, MockRuntimeCall,
 };
 use crate::kubelet::pod_runtime::volumes::PodVolumeRuntime;
+use klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -118,9 +118,9 @@ async fn real_runtime_schedule_retry_emits_retry_due_after_delay() {
     let harness = crate::kubelet::pod_runtime::test_support::PodRuntimeHarness::new().await;
     let key = PodRuntimeKey::new("default", "retry-pod", "uid-retry");
     let (tx, mut rx) = tokio::sync::mpsc::channel::<
-        crate::kubelet::pod_lifecycle_core::message::LifecycleMessage,
+        klights_kubelet::pod_lifecycle_core::message::LifecycleMessage,
     >(8);
-    let reply_to = crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle::direct(tx);
+    let reply_to = klights_kubelet::pod_lifecycle_router::LifecycleReplyHandle::direct(tx);
 
     harness
         .runtime
@@ -133,7 +133,7 @@ async fn real_runtime_schedule_retry_emits_retry_due_after_delay() {
         .expect("retry wakeup must arrive")
         .expect("reply channel must stay open");
     match message {
-        crate::kubelet::pod_lifecycle_core::message::LifecycleMessage::RetryDue { key } => {
+        klights_kubelet::pod_lifecycle_core::message::LifecycleMessage::RetryDue { key } => {
             assert_eq!(key.namespace, "default");
             assert_eq!(key.name, "retry-pod");
             assert_eq!(key.uid, "uid-retry");
@@ -161,9 +161,9 @@ async fn real_runtime_schedule_start_pod_retry_writes_status_event_and_wakeup() 
 
     let key = PodRuntimeKey::new("default", "runtime-retry", "uid-rr");
     let (tx, mut rx) = tokio::sync::mpsc::channel::<
-        crate::kubelet::pod_lifecycle_core::message::LifecycleMessage,
+        klights_kubelet::pod_lifecycle_core::message::LifecycleMessage,
     >(8);
-    let reply_to = crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle::direct(tx);
+    let reply_to = klights_kubelet::pod_lifecycle_router::LifecycleReplyHandle::direct(tx);
     let error_message = "Failed to pull image missing.example/app:1".to_string();
 
     harness
@@ -211,7 +211,7 @@ async fn real_runtime_schedule_start_pod_retry_writes_status_event_and_wakeup() 
         .expect("retry wakeup must arrive")
         .expect("reply channel must stay open");
     match message {
-        crate::kubelet::pod_lifecycle_core::message::LifecycleMessage::RetryDue { key } => {
+        klights_kubelet::pod_lifecycle_core::message::LifecycleMessage::RetryDue { key } => {
             assert_eq!(key.uid, "uid-rr");
         }
         other => panic!("expected RetryDue, got {other:?}"),
@@ -243,9 +243,9 @@ async fn real_runtime_schedule_start_pod_retry_rejects_stale_uid_but_wakes() {
 
     let stale_key = PodRuntimeKey::new("default", "runtime-stale", "uid-stale");
     let (tx, mut rx) = tokio::sync::mpsc::channel::<
-        crate::kubelet::pod_lifecycle_core::message::LifecycleMessage,
+        klights_kubelet::pod_lifecycle_core::message::LifecycleMessage,
     >(8);
-    let reply_to = crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle::direct(tx);
+    let reply_to = klights_kubelet::pod_lifecycle_router::LifecycleReplyHandle::direct(tx);
 
     harness
         .runtime
@@ -273,7 +273,7 @@ async fn real_runtime_schedule_start_pod_retry_rejects_stale_uid_but_wakes() {
         .expect("retry wakeup must arrive")
         .expect("reply channel must stay open");
     match message {
-        crate::kubelet::pod_lifecycle_core::message::LifecycleMessage::RetryDue { key } => {
+        klights_kubelet::pod_lifecycle_core::message::LifecycleMessage::RetryDue { key } => {
             assert_eq!(key.uid, "uid-stale");
         }
         other => panic!("expected RetryDue, got {other:?}"),
@@ -974,7 +974,7 @@ async fn mock_pod_runtime_service_records_all_methods() {
     mock.reconcile_cri_leftovers(key.clone()).await.unwrap();
     mock.reconcile_ephemeral(key.clone(), None).await.unwrap();
     let (tx, _rx) = tokio::sync::mpsc::channel::<
-        crate::kubelet::pod_lifecycle_core::message::LifecycleMessage,
+        klights_kubelet::pod_lifecycle_core::message::LifecycleMessage,
     >(1);
     mock.check_slot_admission(
         crate::kubelet::pod_runtime::service::PodSlotAdmissionRequest {
@@ -984,7 +984,7 @@ async fn mock_pod_runtime_service_records_all_methods() {
             start_after_admit: true,
             operation_id: 8,
         },
-        crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle::direct(tx),
+        klights_kubelet::pod_lifecycle_router::LifecycleReplyHandle::direct(tx),
         cancel.clone(),
     )
     .await
@@ -1177,7 +1177,7 @@ async fn real_pod_runtime_service_constructor_requires_all_object_ports() {
         node_name: "node-1".into(),
         service_cidr: "10.43.128.0/17".into(),
         containerd_namespace: "klights-test".into(),
-        sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+        sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
         node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
         paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
             "/tmp/klights-runtime-test",
@@ -1527,7 +1527,8 @@ async fn real_runtime_start_pod_uses_provided_snapshot_without_fresh_liveness_re
                 node_name: "test-node".to_string(),
                 service_cidr: "10.43.128.0/17".to_string(),
                 containerd_namespace: "klights-test".to_string(),
-                sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+                sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(
+                ),
                 node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
                 paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                     std::path::PathBuf::from("/tmp/klights-runtime-test"),
@@ -3919,7 +3920,7 @@ async fn fixture_runtime_with_node(
         node_name: node_name.to_string(),
         service_cidr: "10.43.128.0/17".into(),
         containerd_namespace: "klights-test".into(),
-        sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+        sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
         node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
         paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
             "/tmp/klights-runtime-test",
@@ -4116,7 +4117,7 @@ async fn fixture_runtime_with_cluster(
         node_name: node_name.to_string(),
         service_cidr: "10.43.128.0/17".into(),
         containerd_namespace: "klights-test".into(),
-        sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+        sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
         node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
         paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
             "/tmp/klights-runtime-test",
@@ -5528,7 +5529,7 @@ async fn reconcile_ephemeral_full_sequence_with_parity() {
         node_name: "test-node".into(),
         service_cidr: "10.96.0.0/12".into(),
         containerd_namespace: "klights-test".into(),
-        sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+        sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
         node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
         paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
             "/tmp/klights-runtime-test",
@@ -9031,7 +9032,7 @@ async fn mocked_runtime_does_not_create_termination_log_file_directly() {
             node_name: "test-node".into(),
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: runtime_namespace.into(),
-            sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+            sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
             paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
@@ -9104,7 +9105,7 @@ async fn mocked_runtime_does_not_read_termination_message_file_directly() {
             node_name: "test-node".into(),
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: runtime_namespace.into(),
-            sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+            sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
             paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
@@ -9218,7 +9219,7 @@ async fn termination_message_mount_path_with_parity() {
             node_name: "test-node".into(),
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: runtime_namespace.into(),
-            sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+            sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
             paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
@@ -9294,7 +9295,7 @@ async fn hosts_file_mount_path_with_parity() {
             node_name: "test-node".into(),
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: runtime_namespace.into(),
-            sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+            sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
             paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
@@ -9374,7 +9375,7 @@ async fn termination_message_file_handling_with_parity() {
             node_name: "test-node".into(),
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: runtime_namespace.into(),
-            sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+            sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
             paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
@@ -9777,7 +9778,7 @@ async fn kubernetes_service_envs_with_parity() {
             node_name: "test-node".into(),
             service_cidr: "10.96.0.0/12".into(),
             containerd_namespace: "klights-test".into(),
-            sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+            sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
             paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
@@ -10159,14 +10160,14 @@ async fn wait_for_pod_status(
 
 #[tokio::test]
 async fn real_runtime_actor_cycle_starts_reconciles_running_and_deletes_pod() {
-    use crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
-    use crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry;
-    use crate::kubelet::pod_lifecycle_core::message::LifecycleMessage;
-    use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
-    use crate::kubelet::pod_lifecycle_router::executor::{
+    use crate::kubelet::pod_runtime::test_support::PodRuntimeHarness;
+    use klights_kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
+    use klights_kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry;
+    use klights_kubelet::pod_lifecycle_core::message::LifecycleMessage;
+    use klights_kubelet::pod_lifecycle_router::PodLifecycleRouter;
+    use klights_kubelet::pod_lifecycle_router::executor::{
         NoopExecutor, PodLifecycleExecutor, PodWorkExecutor,
     };
-    use crate::kubelet::pod_runtime::test_support::PodRuntimeHarness;
 
     let harness = PodRuntimeHarness::new().await;
     let pod = serde_json::json!({
@@ -10508,7 +10509,8 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
                 node_name: "test-node".into(),
                 service_cidr: "10.43.128.0/17".into(),
                 containerd_namespace: "klights-test".into(),
-                sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+                sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(
+                ),
                 node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
                 paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                     std::path::PathBuf::from("/tmp/klights-runtime-test"),
@@ -10779,10 +10781,10 @@ async fn started_cri_event_overrides_lagging_created_status_snapshot() {
 #[cfg(test)]
 mod task4_runtime_observations {
     use super::*;
-    use crate::kubelet::pod_lifecycle_core::state::PodLifecycleState;
     use crate::kubelet::pod_runtime::service::PodRuntimeKey;
     use crate::kubelet::pod_runtime::service::RuntimeReconcileHint;
     use crate::kubelet::pod_runtime::test_support::PodRuntimeHarness;
+    use klights_kubelet::pod_lifecycle_core::state::PodLifecycleState;
     use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     #[test]

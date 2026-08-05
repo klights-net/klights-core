@@ -5,9 +5,9 @@ use crate::kubelet::pod_runtime::status_helpers::{
     pod_status_container_id_by_name, pod_status_ip, replace_container_status,
     restart_last_state_from_runtime_status, restarted_running_container_status,
 };
-use crate::kubelet::pod_sandbox_config::build_sandbox_config_with_runtime_inputs;
 use crate::kubelet::pod_termination::find_pod_container_spec;
 use klights_kubelet::lifecycle::LifecycleCommand;
+use klights_kubelet::pod_sandbox_config::build_sandbox_config_with_runtime_inputs;
 
 pub(super) async fn handle_lifecycle_command(
     service: &RealPodRuntimeService,
@@ -163,7 +163,7 @@ pub(super) async fn handle_lifecycle_command(
             let default_spec = serde_json::json!({});
             let pod_spec = pod.get("spec").unwrap_or(&default_spec);
             let sandbox_config = build_sandbox_config_with_runtime_inputs(
-                crate::kubelet::pod_sandbox_config::SandboxIdentity {
+                klights_kubelet::pod_sandbox_config::SandboxIdentity {
                     pod_name,
                     namespace,
                     pod_uid,

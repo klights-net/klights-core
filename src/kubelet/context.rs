@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use crate::kubelet::pod_creation_state::PodStartRetryTracker;
-use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
 use crate::kubelet::pod_repository::PodRepository;
 use klights_kubelet::outbox::Outbox;
+use klights_kubelet::pod_creation_state::PodStartRetryTracker;
+use klights_kubelet::pod_lifecycle_router::PodLifecycleRouter;
 
 pub(crate) type PodLifecycleReceiver = Arc<
     tokio::sync::Mutex<

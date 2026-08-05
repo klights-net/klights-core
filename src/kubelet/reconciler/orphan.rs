@@ -1,8 +1,8 @@
-use crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey;
-use crate::kubelet::pod_lifecycle_router::{
+use crate::kubelet::pod_watch_source::PodWatchEvent;
+use klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey;
+use klights_kubelet::pod_lifecycle_router::{
     OrphanReason, PodLifecycleRouteError, PodLifecycleRouter, enqueue_orphan_finalize,
 };
-use crate::kubelet::pod_watch_source::PodWatchEvent;
 use klights_leader_api::WatchEventType;
 
 pub struct OrphanScanner;

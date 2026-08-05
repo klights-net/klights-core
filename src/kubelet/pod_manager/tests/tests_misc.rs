@@ -1,5 +1,5 @@
 use super::*;
-use crate::kubelet::pod_sandbox_config::build_sandbox_config_with_dns_policy;
+use klights_kubelet::pod_sandbox_config::build_sandbox_config_with_dns_policy;
 
 #[test]
 fn pod_start_retry_uses_one_shot_delay_not_interval_scan() {

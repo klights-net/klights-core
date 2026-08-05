@@ -6,7 +6,7 @@ impl<'a> PodRecovery<'a> {
         node_name: &'a str,
         retry_state: &'a PodStartRetryTracker,
         pod_lifecycle_router: std::sync::Arc<
-            crate::kubelet::pod_lifecycle_router::PodLifecycleRouter,
+            klights_kubelet::pod_lifecycle_router::PodLifecycleRouter,
         >,
     ) -> Self {
         Self {
@@ -20,8 +20,8 @@ impl<'a> PodRecovery<'a> {
     pub(super) async fn recover_existing_pods(&mut self) -> Result<()> {
         // Route through PodReader so the v1/Pod read boundary stays
         // inside `PodStore`.
-        use crate::kubelet::pod_lifecycle_core::message::LifecycleMessage;
         use crate::kubelet::pod_repository::PodReader;
+        use klights_kubelet::pod_lifecycle_core::message::LifecycleMessage;
         let field_selector = super::pod_watcher_node_field_selector(self.node_name);
         let pod_list = self
             .pod_repo
@@ -59,10 +59,10 @@ impl<'a> PodRecovery<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kubelet::pod_lifecycle_core::action::PodAction;
-    use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
-    use crate::kubelet::pod_lifecycle_router::executor::RecordingExecutor;
     use crate::kubelet::pod_repository::PodObjectWriter;
+    use klights_kubelet::pod_lifecycle_core::action::PodAction;
+    use klights_kubelet::pod_lifecycle_router::PodLifecycleRouter;
+    use klights_kubelet::pod_lifecycle_router::executor::RecordingExecutor;
     use std::sync::Arc;
 
     async fn wait_for_recorded_action(
@@ -123,17 +123,17 @@ mod tests {
             .expect("create recovery pod");
 
         let recorder = RecordingExecutor::new();
-        let registry = Arc::new(crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry::new(
+        let registry = Arc::new(klights_kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry::new(
             supervisor,
-            crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
+            klights_kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
             Arc::new(std::sync::Mutex::new(recorder.clone())),
         ));
         let router = Arc::new(PodLifecycleRouter::new_actor_with_executor(
             registry,
             recorder.clone(),
         ));
-        let retry_state: crate::kubelet::pod_creation_state::PodStartRetryTracker = Arc::new(
-            tokio::sync::Mutex::new(crate::kubelet::pod_creation_state::PodStartRetryState::new()),
+        let retry_state: klights_kubelet::pod_creation_state::PodStartRetryTracker = Arc::new(
+            tokio::sync::Mutex::new(klights_kubelet::pod_creation_state::PodStartRetryState::new()),
         );
         let mut recovery = PodRecovery::new(&pod_repo, "test-node", &retry_state, router);
 

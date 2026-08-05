@@ -11,12 +11,12 @@ use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 use crate::kubelet::context::HostIpState;
-use crate::kubelet::pod_status_logic::{
-    compute_initialized_condition, get_condition_last_transition_time,
-};
 use klights_cluster_core::Resource;
 use klights_kubelet::outbox::OutboxOperation;
 use klights_kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
+use klights_kubelet::pod_status_logic::{
+    compute_initialized_condition, get_condition_last_transition_time,
+};
 use klights_leader_api::LeaderResourceQuery;
 use klights_reconcile_api::{PodMutationReconcileRequest, PodMutationReconcileSink};
 
@@ -696,7 +696,7 @@ impl PodStatusService {
             build_creation_error_statuses, build_image_pull_error_statuses,
             build_retrying_init_container_statuses,
         };
-        use crate::kubelet::pod_status_logic::{
+        use klights_kubelet::pod_status_logic::{
             is_image_pull_error_msg, parse_init_container_failure,
         };
 

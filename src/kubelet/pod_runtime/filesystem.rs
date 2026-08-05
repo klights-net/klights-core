@@ -80,12 +80,12 @@ impl PodFilesystem for RealPodFilesystem {
         key: &PodRuntimeKey,
         pod: &serde_json::Value,
     ) -> anyhow::Result<()> {
-        if crate::kubelet::pod_hosts::is_host_network(pod) {
+        if klights_kubelet::pod_hosts::is_host_network(pod) {
             return Ok(());
         }
 
         let spec = pod.get("spec");
-        let hostname = crate::kubelet::pod_hosts::resolve_hostname(spec.unwrap_or(pod), &key.name);
+        let hostname = klights_kubelet::pod_hosts::resolve_hostname(spec.unwrap_or(pod), &key.name);
         let pod_ip = pod
             .pointer("/status/podIP")
             .and_then(|v| v.as_str())
@@ -99,7 +99,7 @@ impl PodFilesystem for RealPodFilesystem {
             .cloned();
         let host_aliases_ref: Option<&Vec<serde_json::Value>> = host_aliases.as_ref();
 
-        let hosts_content = crate::kubelet::pod_hosts::build_etc_hosts(
+        let hosts_content = klights_kubelet::pod_hosts::build_etc_hosts(
             &hostname,
             pod_ip,
             subdomain,

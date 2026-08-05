@@ -1,4 +1,4 @@
-use crate::kubelet::pod_status_logic::classify_failure_reason;
+use klights_kubelet::pod_status_logic::classify_failure_reason;
 
 #[test]
 fn pull_image_anyhow_chain_is_err_image_pull() {

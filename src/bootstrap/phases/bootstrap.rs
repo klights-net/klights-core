@@ -624,13 +624,13 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             projected_tokens: Some(kubelet_status_delivery.projected_tokens.clone()),
             node_name: config.node_name.clone(),
             service_cidr: config.service_cidr.clone(),
-            lifecycle_concurrency: crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
+            lifecycle_concurrency: klights_kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
             pod_actor_idle_grace:
-                crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+                klights_kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
             sandbox_inputs,
             node_capacity: kubelet_capacity,
             paths: runtime_paths.clone(),
-            lifecycle_route_mode: crate::kubelet::pod_lifecycle_router::PodLifecycleRouteMode::Actor,
+            lifecycle_route_mode: klights_kubelet::pod_lifecycle_router::PodLifecycleRouteMode::Actor,
             cri: cri_for_pod_watcher.clone().map(SharedCriClient::new),
             registry_proxy: config.registry_proxy.enabled().then(|| {
                 klights_kubelet::registry_proxy::ContainerdRegistryProxyConfigurator::new(
@@ -812,8 +812,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     ));
     side_effects.set_controller_dispatcher(controller_dispatcher.clone());
     local_api_client.set_controller_dispatcher(controller_dispatcher.clone());
-    let pod_start_retry_state: crate::kubelet::pod_creation_state::PodStartRetryTracker = Arc::new(
-        tokio::sync::Mutex::new(crate::kubelet::pod_creation_state::PodStartRetryState::new()),
+    let pod_start_retry_state: klights_kubelet::pod_creation_state::PodStartRetryTracker = Arc::new(
+        tokio::sync::Mutex::new(klights_kubelet::pod_creation_state::PodStartRetryState::new()),
     );
     side_effects.set_pod_ports(api_pod_repository.clone(), api_pod_repository.clone());
     let oidc_authenticator = compose_oidc_authenticator(config, supervisor.as_ref())

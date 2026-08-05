@@ -17,12 +17,12 @@ use crate::datastore::{
     PositionedWatchReplayRead, Resource, ResourceList, ResourcePreconditions, WatchReplayPosition,
     WatchStore, WatchTarget, WatchTargetScope,
 };
-use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
-use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
 use klights_cluster_core::LogApplyPodCleanupIntentRow;
 #[cfg(test)]
 use klights_cluster_core::command::{CommandMeta, StorageCommand};
 use klights_cluster_store::{ReplayAvailability, ReplayRetentionBoundary};
+use klights_kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
+use klights_kubelet::pod_lifecycle_router::PodLifecycleRouter;
 use klights_leader_api::{
     LeaderWatch, LeaderWatchError, NodeDataplaneQuery, NodeSubnetAllocationRequest,
     NodeSubnetQuery, PeerSubnetsQuery, PodCleanupIntentAckRequest, PodCleanupIntentListRequest,
@@ -1556,7 +1556,7 @@ mod tests {
     use crate::control_plane::client::local::LocalApiClient;
     use crate::datastore::node_local::LegacyDeliveryTestStore as _;
     use crate::datastore::{NetworkMetadataStore, ResourceListStore, ResourceStore};
-    use crate::kubelet::pod_lifecycle_router::{
+    use klights_kubelet::pod_lifecycle_router::{
         PodLifecycleDiagnostics, PodLifecycleRouteBackend, PodLifecycleRouteError,
         PodLifecycleRouteMode,
     };
@@ -3710,24 +3710,24 @@ mod tests {
             Arc::new(LocalPodLeaderApi),
             "worker-a".to_string(),
         ));
-        let executor = crate::kubelet::pod_lifecycle_router::executor::RecordingExecutor::new();
+        let executor = klights_kubelet::pod_lifecycle_router::executor::RecordingExecutor::new();
         let registry = Arc::new(
-            crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry::new(
+            klights_kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry::new(
                 supervisor.clone(),
-                crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
+                klights_kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
                 Arc::new(std::sync::Mutex::new(
                     executor.clone()
                         as Arc<
-                            dyn crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor,
+                            dyn klights_kubelet::pod_lifecycle_router::executor::PodWorkExecutor,
                         >,
                 )),
             ),
         );
         let router = Arc::new(
-            crate::kubelet::pod_lifecycle_router::PodLifecycleRouter::new_actor_with_executor(
+            klights_kubelet::pod_lifecycle_router::PodLifecycleRouter::new_actor_with_executor(
                 registry,
                 executor.clone()
-                    as Arc<dyn crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor>,
+                    as Arc<dyn klights_kubelet::pod_lifecycle_router::executor::PodWorkExecutor>,
             ),
         );
         adapter.set_pod_lifecycle_router(router);
@@ -3770,10 +3770,10 @@ mod tests {
             let start_seen = observed.iter().any(|action| {
                 matches!(
                     action,
-                    crate::kubelet::pod_lifecycle_core::action::PodAction::StartPod {
+                    klights_kubelet::pod_lifecycle_core::action::PodAction::StartPod {
                         key, ..
                     }
-                    | crate::kubelet::pod_lifecycle_core::action::PodAction::CheckSlotAdmission {
+                    | klights_kubelet::pod_lifecycle_core::action::PodAction::CheckSlotAdmission {
                         key,
                         ..
                     } if key.name == "startable" && key.uid == "uid-startable"
@@ -3782,7 +3782,7 @@ mod tests {
             let stop_seen = observed.iter().any(|action| {
                 matches!(
                     action,
-                    crate::kubelet::pod_lifecycle_core::action::PodAction::StopPod {
+                    klights_kubelet::pod_lifecycle_core::action::PodAction::StopPod {
                         key, ..
                     } if key.name == "terminating" && key.uid == "uid-terminating"
                 )

@@ -25,7 +25,7 @@ impl NetworkRuntimeInputs {
 pub(crate) async fn capture_sandbox_inputs(
     file_process: &klights_supervisor::FileProcessExecutor,
     node_mode: &crate::bootstrap::NodeMode,
-) -> crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs {
+) -> klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs {
     let (primary, resolved_upstream) = tokio::join!(
         klights_supervisor::runtime_fs::read_utf8_async(file_process, "/etc/resolv.conf"),
         klights_supervisor::runtime_fs::read_utf8_async(
@@ -33,8 +33,8 @@ pub(crate) async fn capture_sandbox_inputs(
             "/run/systemd/resolve/resolv.conf"
         ),
     );
-    crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs {
-        host_dns: crate::kubelet::pod_dns::HostDnsConfig::from_resolv_conf_contents(
+    klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs {
+        host_dns: klights_kubelet::pod_dns::HostDnsConfig::from_resolv_conf_contents(
             primary.as_deref().ok(),
             resolved_upstream.as_deref().ok(),
         ),

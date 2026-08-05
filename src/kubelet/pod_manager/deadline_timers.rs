@@ -67,7 +67,7 @@ pub(super) async fn schedule_active_deadline_timer_for_modified_pod(
     now_unix_seconds: i64,
     registry: DeadlineTimerRegistry,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
-    pod_lifecycle_router: std::sync::Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
+    pod_lifecycle_router: std::sync::Arc<klights_kubelet::pod_lifecycle_router::PodLifecycleRouter>,
 ) {
     let Some((namespace, pod_name, delay_secs, schedule_key)) =
         parse_deadline_timer_delay_secs_at(pod, now_unix_seconds)

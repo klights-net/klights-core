@@ -1,4 +1,3 @@
-use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
 pub use crate::kubelet::pod_runtime::service_dependencies::RealPodRuntimeServiceDependencies;
 pub use crate::kubelet::pod_runtime::slot_admission::PodSlotAdmissionRequest;
 pub use crate::kubelet::pod_runtime::types::{
@@ -6,6 +5,7 @@ pub use crate::kubelet::pod_runtime::types::{
     PodStartResult,
 };
 use klights_kubelet::lifecycle::LifecycleCommand;
+use klights_kubelet::pod_lifecycle_router::LifecycleReplyHandle;
 pub use klights_kubelet::runtime::{PodRuntimeService, RuntimeReconcileHint};
 use tokio_util::sync::CancellationToken;
 
@@ -30,7 +30,7 @@ pub struct RuntimeConfig {
     pub node_name: String,
     pub service_cidr: String,
     pub containerd_namespace: String,
-    pub sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs,
+    pub sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs,
     pub node_capacity: klights_kubelet::node_capacity::NodeCapacity,
     pub paths: klights_kubelet::runtime_paths::KubeletRuntimePaths,
 }
@@ -65,12 +65,12 @@ use crate::kubelet::pod_runtime::status_helpers::{
 use crate::kubelet::pod_runtime::status_projection;
 use crate::kubelet::pod_runtime::store::{PodRuntimeStore, PodSlotAdmission};
 use crate::kubelet::pod_runtime::volumes::PodVolumeRuntime;
-use crate::kubelet::pod_sandbox_config::build_sandbox_config_with_runtime_inputs;
-use crate::kubelet::pod_startup_error::PodStartupErrorKind;
 use crate::kubelet::pod_status_builders::{
     build_initial_pending_status, build_pod_initializing_app_statuses,
 };
 use crate::kubelet::pod_termination::{find_pod_container_spec, get_termination_message_path};
+use klights_kubelet::pod_sandbox_config::build_sandbox_config_with_runtime_inputs;
+use klights_kubelet::pod_startup_error::PodStartupErrorKind;
 use klights_kubelet::runtime::cri::{
     ContainerRuntimeControl, CriRuntime, CriRuntimeContainerEventKind,
     CriRuntimeContainerEventStream,
@@ -123,7 +123,7 @@ fn managed_hosts_file_path(
     key: &PodRuntimeKey,
     pod: &serde_json::Value,
 ) -> Option<String> {
-    if crate::kubelet::pod_hosts::is_host_network(pod) {
+    if klights_kubelet::pod_hosts::is_host_network(pod) {
         return None;
     }
 
@@ -140,7 +140,7 @@ fn append_managed_hosts_mount(mounts: &mut Vec<k8s_cri::v1::Mount>, hosts_file_p
     let Some(host_path) = hosts_file_path else {
         return;
     };
-    if crate::kubelet::pod_hosts::container_has_etc_hosts_mount(mounts) {
+    if klights_kubelet::pod_hosts::container_has_etc_hosts_mount(mounts) {
         return;
     }
 
@@ -369,7 +369,7 @@ impl RealPodRuntimeService {
         let default_spec = serde_json::json!({});
         let pod_spec = pod.get("spec").unwrap_or(&default_spec);
         let sandbox_config = build_sandbox_config_with_runtime_inputs(
-            crate::kubelet::pod_sandbox_config::SandboxIdentity {
+            klights_kubelet::pod_sandbox_config::SandboxIdentity {
                 pod_name: &key.name,
                 namespace: &key.namespace,
                 pod_uid: &key.uid,
@@ -1066,7 +1066,7 @@ impl PodRuntimeService for RealPodRuntimeService {
         let default_spec = serde_json::json!({});
         let pod_spec = pod.get("spec").unwrap_or(&default_spec);
         let sandbox_config = build_sandbox_config_with_runtime_inputs(
-            crate::kubelet::pod_sandbox_config::SandboxIdentity {
+            klights_kubelet::pod_sandbox_config::SandboxIdentity {
                 pod_name: &key.name,
                 namespace: &key.namespace,
                 pod_uid: &key.uid,
@@ -2398,7 +2398,7 @@ impl PodRuntimeService for RealPodRuntimeService {
         let default_spec = serde_json::json!({});
         let pod_spec = pod.get("spec").unwrap_or(&default_spec);
         let sandbox_config = build_sandbox_config_with_runtime_inputs(
-            crate::kubelet::pod_sandbox_config::SandboxIdentity {
+            klights_kubelet::pod_sandbox_config::SandboxIdentity {
                 pod_name: &key.name,
                 namespace: &key.namespace,
                 pod_uid: &key.uid,

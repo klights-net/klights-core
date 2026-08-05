@@ -18,11 +18,11 @@ use crate::datastore::DatastoreBackend;
 #[cfg(test)]
 use crate::kubelet::pod_endpoints::reconcile_endpoints_for_pod;
 #[cfg(test)]
-use crate::kubelet::pod_status_logic::{
+use anyhow::Result;
+#[cfg(test)]
+use klights_kubelet::pod_status_logic::{
     compute_initialized_condition, get_condition_last_transition_time,
 };
-#[cfg(test)]
-use anyhow::Result;
 #[cfg(test)]
 use serde_json::Value;
 

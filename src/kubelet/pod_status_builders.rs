@@ -1,6 +1,6 @@
 #[cfg(test)]
-use crate::kubelet::pod_status_logic::{ContainerBackoffState, ContainerInfo};
-use crate::kubelet::pod_status_logic::{
+use klights_kubelet::pod_status_logic::{ContainerBackoffState, ContainerInfo};
+use klights_kubelet::pod_status_logic::{
     REASON_ERR_IMAGE_PULL, REASON_IMAGE_PULL_BACK_OFF, REASON_POD_INITIALIZING,
     classify_failure_reason,
 };

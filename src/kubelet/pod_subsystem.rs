@@ -6,11 +6,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
-use crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry;
-use crate::kubelet::pod_lifecycle_router::executor::{PodLifecycleExecutor, PodWorkExecutor};
-use crate::kubelet::pod_lifecycle_router::{PodLifecycleRouteMode, PodLifecycleRouter};
-use crate::kubelet::pod_lifecycle_service::PodLifecycleService;
 use crate::kubelet::pod_repository::PodRepository;
 use crate::kubelet::pod_repository::background::PodRepositoryBackground;
 use crate::kubelet::pod_repository::facade::PodRepositoryParts;
@@ -19,6 +14,11 @@ use crate::kubelet::pod_runtime::service::{
     PodRuntimeService, RealPodRuntimeService, RealPodRuntimeServiceDependencies,
 };
 use crate::kubelet::pod_runtime::store::{PodRuntimeStore, PodSlotAdmission};
+use klights_kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
+use klights_kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry;
+use klights_kubelet::pod_lifecycle_router::executor::{PodLifecycleExecutor, PodWorkExecutor};
+use klights_kubelet::pod_lifecycle_router::{PodLifecycleRouteMode, PodLifecycleRouter};
+use klights_kubelet::pod_lifecycle_service::PodLifecycleService;
 use klights_kubelet::probe_manager::ProbeManager;
 use klights_supervisor::TaskSupervisor;
 
@@ -44,7 +44,7 @@ pub struct PodSubsystemConfig {
     pub service_cidr: String,
     pub lifecycle_concurrency: PodLifecycleConcurrencyConfig,
     pub pod_actor_idle_grace: std::time::Duration,
-    pub sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs,
+    pub sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs,
     pub node_capacity: klights_kubelet::node_capacity::NodeCapacity,
     pub paths: klights_kubelet::runtime_paths::KubeletRuntimePaths,
     pub lifecycle_route_mode: PodLifecycleRouteMode,
@@ -95,7 +95,7 @@ struct RuntimeServiceBuildRequest {
     service_router: Option<Arc<dyn klights_network_api::ServiceRouter>>,
     node_name: String,
     service_cidr: String,
-    sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs,
+    sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs,
     node_capacity: klights_kubelet::node_capacity::NodeCapacity,
     paths: klights_kubelet::runtime_paths::KubeletRuntimePaths,
     resource_query: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
@@ -141,7 +141,7 @@ impl PodSubsystem {
                 config.supervisor.clone(),
                 lifecycle_concurrency.clone(),
                 Arc::new(std::sync::Mutex::new(Arc::new(
-                    crate::kubelet::pod_lifecycle_router::executor::NoopExecutor,
+                    klights_kubelet::pod_lifecycle_router::executor::NoopExecutor,
                 ))),
                 config.pod_actor_idle_grace,
                 lifecycle_wall_clock.clone(),
@@ -374,10 +374,10 @@ impl PodSubsystem {
 mod tests {
     use super::*;
     use crate::datastore::DatastoreHandle;
-    use crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
     use crate::pod_repository_composition::PodSchedulingMode;
     use klights_controllers::side_effects::SideEffectMetrics;
     use klights_controllers::side_effects::SideEffectRegistry;
+    use klights_kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
 
     fn fixture_supervisor() -> Arc<TaskSupervisor> {
         Arc::new(TaskSupervisor::new(
@@ -432,8 +432,8 @@ mod tests {
             lifecycle_concurrency: PodLifecycleConcurrencyConfig::production_default(),
             lifecycle_route_mode: PodLifecycleRouteMode::Actor,
             pod_actor_idle_grace:
-                crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
-            sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+                klights_kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
             node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
             paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
                 std::path::PathBuf::from("/tmp/klights-pod-subsystem-test"),
@@ -705,22 +705,22 @@ mod tests {
         // Verify lifecycle service is functional post-construction.
         assert_eq!(
             subsystem.lifecycle_service.mode(),
-            crate::kubelet::pod_lifecycle_router::PodLifecycleRouteMode::Actor
+            klights_kubelet::pod_lifecycle_router::PodLifecycleRouteMode::Actor
         );
 
         // Replace executor with a fresh NoopExecutor — must not panic.
         let new_executor: Arc<dyn PodWorkExecutor> =
-            Arc::new(crate::kubelet::pod_lifecycle_router::executor::NoopExecutor);
+            Arc::new(klights_kubelet::pod_lifecycle_router::executor::NoopExecutor);
         subsystem.set_work_executor(new_executor);
 
         // Lifecycle service still reports correct mode after executor swap.
         assert_eq!(
             subsystem.lifecycle_service.mode(),
-            crate::kubelet::pod_lifecycle_router::PodLifecycleRouteMode::Actor
+            klights_kubelet::pod_lifecycle_router::PodLifecycleRouteMode::Actor
         );
 
         // Router is still functional: can route a message after executor swap.
-        let key = crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey::new(
+        let key = klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey::new(
             "default",
             "exec-wire-pod",
             "uid-exec-wire",
@@ -728,7 +728,7 @@ mod tests {
         subsystem
             .lifecycle_service
             .route(
-                crate::kubelet::pod_lifecycle_core::message::LifecycleMessage::RetryDue {
+                klights_kubelet::pod_lifecycle_core::message::LifecycleMessage::RetryDue {
                     key: key.clone(),
                 },
             )
@@ -747,7 +747,8 @@ mod tests {
         let _ = std::any::type_name::<crate::kubelet::pod_subsystem::PodSubsystem>();
         let _ = std::any::type_name::<crate::kubelet::pod_subsystem::PodSubsystemConfig>();
         // Lifecycle service
-        let _ = std::any::type_name::<crate::kubelet::pod_lifecycle_service::PodLifecycleService>();
+        let _ =
+            std::any::type_name::<klights_kubelet::pod_lifecycle_service::PodLifecycleService>();
         // Runtime service port
         let _ =
             std::any::type_name::<dyn crate::kubelet::pod_runtime::service::PodRuntimeService>();

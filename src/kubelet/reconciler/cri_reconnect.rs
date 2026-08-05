@@ -3,12 +3,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
-use crate::kubelet::pod_lifecycle_core::message::LifecycleMessage;
-use crate::kubelet::pod_lifecycle_router::{
-    OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
-};
 use crate::kubelet::reconciler::cri_inventory::{
     CriContainerInventory, CriInventoryAction, cleanup_cold_sandbox, diff_cri_inventory,
+};
+use klights_kubelet::pod_lifecycle_core::message::LifecycleMessage;
+use klights_kubelet::pod_lifecycle_router::{
+    OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
 };
 use klights_kubelet::runtime::cri::{ContainerRuntimeControl, CriRuntime};
 use klights_leader_api::{CacheReadinessRequest, LeaderCacheReadiness, LeaderResourceQuery};

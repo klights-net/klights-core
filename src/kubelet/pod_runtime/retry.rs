@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
-use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
 use crate::kubelet::pod_runtime::events::PodEventSink;
 use crate::kubelet::pod_runtime::repository::PodRuntimeRepository;
 use crate::kubelet::pod_runtime::service::PodRuntimeKey;
+use klights_kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
+use klights_kubelet::pod_lifecycle_router::LifecycleReplyHandle;
 use klights_supervisor::TaskSupervisor;
 
 fn lifecycle_key_from_runtime_key(key: &PodRuntimeKey) -> PodLifecycleKey {

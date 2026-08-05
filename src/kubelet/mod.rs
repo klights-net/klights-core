@@ -2,40 +2,18 @@ pub mod context;
 pub mod file_blocking;
 pub mod pod_cluster_runtime;
 pub mod pod_container_config;
-pub mod pod_creation_state {
-    pub use klights_kubelet::pod_creation_state::*;
-}
-pub mod pod_dns {
-    pub use klights_kubelet::pod_dns::*;
-}
 pub mod pod_endpoints;
 pub mod pod_env;
 pub mod pod_field_ref;
 pub mod pod_fs;
-pub mod pod_hosts {
-    pub use klights_kubelet::pod_hosts::*;
-}
 pub mod pod_manager;
 // pub mod pod_owner_reconcile; // removed — events flow top-down only
 pub mod pod_repository;
 pub mod pod_resources;
 #[cfg(test)]
 pub mod pod_runtime_state;
-#[cfg(test)]
-pub mod pod_sandbox {
-    pub use klights_kubelet::pod_sandbox::*;
-}
-pub mod pod_sandbox_config {
-    pub use klights_kubelet::pod_sandbox_config::*;
-}
 pub mod pod_service_envs;
-pub mod pod_startup_error {
-    pub use klights_kubelet::pod_startup_error::*;
-}
 pub mod pod_status_builders;
-pub mod pod_status_logic {
-    pub use klights_kubelet::pod_status_logic::*;
-}
 #[cfg(test)]
 pub mod pod_status_test;
 pub mod pod_status_writer;
@@ -74,8 +52,4 @@ pub mod runtime_paths {
 #[cfg(test)]
 mod volume_integration_tests;
 
-pub mod pod_lifecycle_actor;
-pub mod pod_lifecycle_core;
-pub mod pod_lifecycle_router;
-pub mod pod_lifecycle_service;
 pub mod pod_runtime;
