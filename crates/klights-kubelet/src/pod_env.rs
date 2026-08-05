@@ -1,6 +1,6 @@
+use crate::pod_field_ref::{resolve_field_ref, resolve_resource_field_ref_with_capacity};
+use crate::pod_service_envs::ServiceEnvSource;
 use async_trait::async_trait;
-use klights_kubelet::pod_field_ref::{resolve_field_ref, resolve_resource_field_ref_with_capacity};
-use klights_kubelet::pod_service_envs::ServiceEnvSource;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -98,55 +98,6 @@ impl ServiceEnvSource for LeaderApiEnvSourceReader {
     }
 }
 
-#[cfg(test)]
-struct DatastoreEnvSourceReader<'a> {
-    db: &'a dyn crate::datastore::DatastoreBackend,
-}
-
-#[cfg(test)]
-#[async_trait]
-impl EnvSourceReader for DatastoreEnvSourceReader<'_> {
-    async fn secret(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
-        self.db
-            .get_resource("v1", "Secret", Some(namespace), name)
-            .await
-    }
-
-    async fn config_map(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
-        self.db
-            .get_resource("v1", "ConfigMap", Some(namespace), name)
-            .await
-    }
-}
-
-#[cfg(test)]
-#[async_trait]
-impl ServiceEnvSource for DatastoreEnvSourceReader<'_> {
-    async fn services(
-        &self,
-        namespace: &str,
-    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>> {
-        Ok(self
-            .db
-            .list_resources(
-                "v1",
-                "Service",
-                Some(namespace),
-                crate::datastore::ResourceListQuery::all(),
-            )
-            .await?
-            .items)
-    }
-}
-
 /// Collect env vars that have a literal `value` field (not `valueFrom`).
 /// Needed for subPathExpr expansion, which must see all env vars.
 pub fn collect_literal_env_vars(
@@ -172,7 +123,7 @@ pub fn collect_literal_env_vars(
 pub fn collect_value_from_env_vars_for_subpath_with_capacity(
     container_spec: &Value,
     pod_data: &Value,
-    node_capacity: klights_kubelet::node_capacity::NodeCapacity,
+    node_capacity: crate::node_capacity::NodeCapacity,
 ) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     let Some(env_array) = container_spec.get("env").and_then(|e| e.as_array()) else {
@@ -205,18 +156,6 @@ pub fn collect_value_from_env_vars_for_subpath_with_capacity(
     }
 
     map
-}
-
-/// Resolve env vars that use `valueFrom.secretKeyRef` or `valueFrom.configMapKeyRef`.
-/// Returns a map of env var name -> resolved value.
-#[cfg(test)]
-pub async fn resolve_env_value_from(
-    container_spec: &Value,
-    namespace: &str,
-    db: &dyn crate::datastore::DatastoreBackend,
-) -> std::collections::HashMap<String, String> {
-    let source = DatastoreEnvSourceReader { db };
-    resolve_env_value_from_source(container_spec, namespace, &source).await
 }
 
 /// Resolve env vars that use `valueFrom.secretKeyRef` or `valueFrom.configMapKeyRef`.
@@ -356,20 +295,6 @@ pub async fn resolve_env_value_from_source(
     resolved
 }
 
-/// Resolve envFrom entries (bulk injection of all Secret/ConfigMap keys as env vars)
-/// K8s envFrom allows injecting ALL keys from a Secret or ConfigMap as environment variables.
-/// With optional prefix, each key is prefixed (e.g., key "foo" with prefix "CFG_" becomes "CFG_foo").
-/// envFrom vars are added BEFORE individual env vars (individual vars override envFrom).
-#[cfg(test)]
-pub async fn resolve_env_from(
-    container_spec: &Value,
-    namespace: &str,
-    db: &dyn crate::datastore::DatastoreBackend,
-) -> Vec<(String, String)> {
-    let source = DatastoreEnvSourceReader { db };
-    resolve_env_from_source(container_spec, namespace, &source).await
-}
-
 /// Resolve envFrom entries through the supplied source reader.
 pub async fn resolve_env_from_source(
     container_spec: &Value,
@@ -482,7 +407,7 @@ pub fn build_subpath_env_with_capacity(
     pod_data: &Value,
     resolved_env_from: &[(String, String)],
     resolved_env: &std::collections::HashMap<String, String>,
-    node_capacity: klights_kubelet::node_capacity::NodeCapacity,
+    node_capacity: crate::node_capacity::NodeCapacity,
 ) -> std::collections::HashMap<String, String> {
     let mut subpath_env: std::collections::HashMap<String, String> =
         resolved_env_from.iter().cloned().collect();
@@ -510,7 +435,7 @@ pub fn collect_value_from_env_vars_for_subpath(
     collect_value_from_env_vars_for_subpath_with_capacity(
         container_spec,
         pod_data,
-        klights_kubelet::node_capacity::NodeCapacity::default(),
+        crate::node_capacity::NodeCapacity::default(),
     )
 }
 
@@ -526,13 +451,112 @@ pub fn build_subpath_env(
         pod_data,
         resolved_env_from,
         resolved_env,
-        klights_kubelet::node_capacity::NodeCapacity::default(),
+        crate::node_capacity::NodeCapacity::default(),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct TestEnvSourceReader {
+        secrets: std::collections::HashMap<(String, String), klights_cluster_core::Resource>,
+        config_maps: std::collections::HashMap<(String, String), klights_cluster_core::Resource>,
+    }
+
+    impl TestEnvSourceReader {
+        fn insert_secret(&mut self, data: Value) {
+            let resource = test_resource("Secret", data);
+            self.secrets.insert(resource_key(&resource), resource);
+        }
+
+        fn insert_config_map(&mut self, data: Value) {
+            let resource = test_resource("ConfigMap", data);
+            self.config_maps.insert(resource_key(&resource), resource);
+        }
+    }
+
+    fn resource_key(resource: &klights_cluster_core::Resource) -> (String, String) {
+        (
+            resource.namespace.clone().unwrap_or_default(),
+            resource.name.clone(),
+        )
+    }
+
+    fn test_resource(kind: &str, data: Value) -> klights_cluster_core::Resource {
+        let namespace = data
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .unwrap_or("default")
+            .to_string();
+        let name = data
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or(kind)
+            .to_string();
+        klights_cluster_core::Resource {
+            id: 0,
+            api_version: "v1".to_string(),
+            kind: kind.to_string(),
+            namespace: Some(namespace.clone()),
+            name: name.clone(),
+            uid: format!("{namespace}-{name}-uid"),
+            data: data.into(),
+            resource_version: 1,
+        }
+    }
+
+    #[async_trait]
+    impl EnvSourceReader for TestEnvSourceReader {
+        async fn secret(
+            &self,
+            namespace: &str,
+            name: &str,
+        ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
+            Ok(self
+                .secrets
+                .get(&(namespace.to_string(), name.to_string()))
+                .cloned())
+        }
+
+        async fn config_map(
+            &self,
+            namespace: &str,
+            name: &str,
+        ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
+            Ok(self
+                .config_maps
+                .get(&(namespace.to_string(), name.to_string()))
+                .cloned())
+        }
+    }
+
+    #[async_trait]
+    impl ServiceEnvSource for TestEnvSourceReader {
+        async fn services(
+            &self,
+            _namespace: &str,
+        ) -> anyhow::Result<Vec<klights_cluster_core::Resource>> {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn resolve_env_value_from(
+        container_spec: &Value,
+        namespace: &str,
+        source: &TestEnvSourceReader,
+    ) -> std::collections::HashMap<String, String> {
+        resolve_env_value_from_source(container_spec, namespace, source).await
+    }
+
+    async fn resolve_env_from(
+        container_spec: &Value,
+        namespace: &str,
+        source: &TestEnvSourceReader,
+    ) -> Vec<(String, String)> {
+        resolve_env_from_source(container_spec, namespace, source).await
+    }
 
     #[test]
     fn test_collect_literal_env_vars_returns_literal_values() {
@@ -587,7 +611,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_env_value_from_secret_key_ref() {
         use base64::Engine;
-        let db = crate::datastore::test_support::in_memory().await;
+        let mut source = TestEnvSourceReader::default();
 
         // Create namespace
 
@@ -603,9 +627,7 @@ mod tests {
                 "tls.key": base64::engine::general_purpose::STANDARD.encode("private-key-data")
             }
         });
-        db.create_resource("v1", "Secret", Some("default"), "my-tls", secret)
-            .await
-            .unwrap();
+        source.insert_secret(secret);
 
         // Container spec with secretKeyRef
         let container_spec = serde_json::json!({
@@ -617,7 +639,7 @@ mod tests {
             ]
         });
 
-        let resolved = resolve_env_value_from(&container_spec, "default", &db).await;
+        let resolved = resolve_env_value_from(&container_spec, "default", &source).await;
 
         // secretKeyRef vars should be resolved
         assert_eq!(
@@ -634,10 +656,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_env_value_from_secret_key_dash() {
         use base64::Engine;
-        let db = crate::datastore::test_support::in_memory().await;
-
-        let ns = serde_json::json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"secrets-test"}});
-        db.create_namespace("secrets-test", ns).await.unwrap();
+        let mut source = TestEnvSourceReader::default();
 
         // Create secret with dash key (conformance test scenario)
         let secret = serde_json::json!({
@@ -649,15 +668,7 @@ mod tests {
                 "data.2": base64::engine::general_purpose::STANDARD.encode("value-2"),
             }
         });
-        db.create_resource(
-            "v1",
-            "Secret",
-            Some("secrets-test"),
-            "secret-test-abc",
-            secret,
-        )
-        .await
-        .unwrap();
+        source.insert_secret(secret);
 
         let container_spec = serde_json::json!({
             "image": "busybox",
@@ -667,7 +678,7 @@ mod tests {
             ]
         });
 
-        let resolved = resolve_env_value_from(&container_spec, "secrets-test", &db).await;
+        let resolved = resolve_env_value_from(&container_spec, "secrets-test", &source).await;
         assert_eq!(
             resolved.get("data-1").map(|s| s.as_str()),
             Some("value-1"),
@@ -682,7 +693,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_env_value_from_configmap_key_ref() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let mut source = TestEnvSourceReader::default();
 
         let cm = serde_json::json!({
             "apiVersion": "v1",
@@ -690,9 +701,7 @@ mod tests {
             "metadata": {"name": "app-config", "namespace": "default"},
             "data": {"log_level": "debug", "port": "8080"}
         });
-        db.create_resource("v1", "ConfigMap", Some("default"), "app-config", cm)
-            .await
-            .unwrap();
+        source.insert_config_map(cm);
 
         let container_spec = serde_json::json!({
             "image": "app:latest",
@@ -701,13 +710,13 @@ mod tests {
             ]
         });
 
-        let resolved = resolve_env_value_from(&container_spec, "default", &db).await;
+        let resolved = resolve_env_value_from(&container_spec, "default", &source).await;
         assert_eq!(resolved.get("LOG_LEVEL").unwrap(), "debug");
     }
 
     #[tokio::test]
     async fn test_resolve_env_value_from_missing_secret_optional() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let source = TestEnvSourceReader::default();
 
         let container_spec = serde_json::json!({
             "image": "app:latest",
@@ -716,7 +725,7 @@ mod tests {
             ]
         });
 
-        let resolved = resolve_env_value_from(&container_spec, "default", &db).await;
+        let resolved = resolve_env_value_from(&container_spec, "default", &source).await;
         // Optional missing secret should not produce a value
         assert!(!resolved.contains_key("OPT_VAR"));
     }
@@ -724,23 +733,21 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_env_value_from_missing_key_in_existing_secret() {
         use base64::Engine;
-        let db = crate::datastore::test_support::in_memory().await;
+        let mut source = TestEnvSourceReader::default();
 
         let secret = serde_json::json!({
             "apiVersion": "v1", "kind": "Secret",
             "metadata": {"name": "my-secret", "namespace": "default"},
             "data": {"existing-key": base64::engine::general_purpose::STANDARD.encode("value")}
         });
-        db.create_resource("v1", "Secret", Some("default"), "my-secret", secret)
-            .await
-            .unwrap();
+        source.insert_secret(secret);
 
         let spec = serde_json::json!({
             "image": "app",
             "env": [{"name": "MISSING", "valueFrom": {"secretKeyRef": {"name": "my-secret", "key": "nonexistent-key"}}}]
         });
 
-        let resolved = resolve_env_value_from(&spec, "default", &db).await;
+        let resolved = resolve_env_value_from(&spec, "default", &source).await;
         assert!(
             !resolved.contains_key("MISSING"),
             "Missing key should not produce a value"
@@ -749,7 +756,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_env_value_from_invalid_base64_in_secret() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let mut source = TestEnvSourceReader::default();
 
         // Secret with invalid base64 in data
         let secret = serde_json::json!({
@@ -757,16 +764,14 @@ mod tests {
             "metadata": {"name": "bad-secret", "namespace": "default"},
             "data": {"key": "!!!not-valid-base64!!!"}
         });
-        db.create_resource("v1", "Secret", Some("default"), "bad-secret", secret)
-            .await
-            .unwrap();
+        source.insert_secret(secret);
 
         let spec = serde_json::json!({
             "image": "app",
             "env": [{"name": "BAD", "valueFrom": {"secretKeyRef": {"name": "bad-secret", "key": "key"}}}]
         });
 
-        let resolved = resolve_env_value_from(&spec, "default", &db).await;
+        let resolved = resolve_env_value_from(&spec, "default", &source).await;
         assert!(
             !resolved.contains_key("BAD"),
             "Invalid base64 should not produce a value"
@@ -775,32 +780,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_env_value_from_no_env_array_returns_empty() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let source = TestEnvSourceReader::default();
 
         let spec = serde_json::json!({"image": "app"});
-        let resolved = resolve_env_value_from(&spec, "default", &db).await;
+        let resolved = resolve_env_value_from(&spec, "default", &source).await;
         assert!(resolved.is_empty(), "No env array should return empty map");
     }
 
     #[tokio::test]
     async fn test_resolve_env_value_from_configmap_missing_key_non_optional() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let mut source = TestEnvSourceReader::default();
 
         let cm = serde_json::json!({
             "apiVersion": "v1", "kind": "ConfigMap",
             "metadata": {"name": "my-cm", "namespace": "default"},
             "data": {"real-key": "real-value"}
         });
-        db.create_resource("v1", "ConfigMap", Some("default"), "my-cm", cm)
-            .await
-            .unwrap();
+        source.insert_config_map(cm);
 
         let spec = serde_json::json!({
             "image": "app",
             "env": [{"name": "MISS", "valueFrom": {"configMapKeyRef": {"name": "my-cm", "key": "no-such-key"}}}]
         });
 
-        let resolved = resolve_env_value_from(&spec, "default", &db).await;
+        let resolved = resolve_env_value_from(&spec, "default", &source).await;
         assert!(
             !resolved.contains_key("MISS"),
             "Missing CM key should not produce a value"
@@ -809,7 +812,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_env_value_from_skips_plain_value_vars() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let source = TestEnvSourceReader::default();
 
         let spec = serde_json::json!({
             "image": "app",
@@ -819,7 +822,7 @@ mod tests {
             ]
         });
 
-        let resolved = resolve_env_value_from(&spec, "default", &db).await;
+        let resolved = resolve_env_value_from(&spec, "default", &source).await;
         assert!(
             resolved.is_empty(),
             "Plain value env vars should not appear in resolved map"
@@ -829,7 +832,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_env_from_secret_ref() {
         use base64::Engine;
-        let db = crate::datastore::test_support::in_memory().await;
+        let mut source = TestEnvSourceReader::default();
 
         // Create Secret with base64-encoded data
         let secret_data = serde_json::json!({
@@ -841,15 +844,13 @@ mod tests {
                 "PASSWORD": base64::engine::general_purpose::STANDARD.encode("secret123")
             }
         });
-        db.create_resource("v1", "Secret", Some("default"), "my-secret", secret_data)
-            .await
-            .unwrap();
+        source.insert_secret(secret_data);
 
         let container_spec = serde_json::json!({
             "envFrom": [{"secretRef": {"name": "my-secret"}}]
         });
 
-        let result = resolve_env_from(&container_spec, "default", &db).await;
+        let result = resolve_env_from(&container_spec, "default", &source).await;
 
         assert_eq!(result.len(), 2);
         assert!(result.contains(&("USERNAME".to_string(), "admin".to_string())));
@@ -858,7 +859,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_env_from_configmap_ref() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let mut source = TestEnvSourceReader::default();
 
         // Create ConfigMap
         let cm_data = serde_json::json!({
@@ -870,15 +871,13 @@ mod tests {
                 "CACHE_SIZE": "100"
             }
         });
-        db.create_resource("v1", "ConfigMap", Some("default"), "my-config", cm_data)
-            .await
-            .unwrap();
+        source.insert_config_map(cm_data);
 
         let container_spec = serde_json::json!({
             "envFrom": [{"configMapRef": {"name": "my-config"}}]
         });
 
-        let result = resolve_env_from(&container_spec, "default", &db).await;
+        let result = resolve_env_from(&container_spec, "default", &source).await;
 
         assert_eq!(result.len(), 2);
         assert!(result.contains(&("LOG_LEVEL".to_string(), "debug".to_string())));
@@ -887,7 +886,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_env_from_with_prefix() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let mut source = TestEnvSourceReader::default();
 
         // Create ConfigMap
         let cm_data = serde_json::json!({
@@ -896,15 +895,13 @@ mod tests {
             "metadata": {"name": "my-config", "namespace": "default"},
             "data": {"KEY": "value"}
         });
-        db.create_resource("v1", "ConfigMap", Some("default"), "my-config", cm_data)
-            .await
-            .unwrap();
+        source.insert_config_map(cm_data);
 
         let container_spec = serde_json::json!({
             "envFrom": [{"prefix": "APP_", "configMapRef": {"name": "my-config"}}]
         });
 
-        let result = resolve_env_from(&container_spec, "default", &db).await;
+        let result = resolve_env_from(&container_spec, "default", &source).await;
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "APP_KEY");
@@ -913,13 +910,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_env_from_optional_missing_skipped() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let source = TestEnvSourceReader::default();
 
         let container_spec = serde_json::json!({
             "envFrom": [{"secretRef": {"name": "missing-secret", "optional": true}}]
         });
 
-        let result = resolve_env_from(&container_spec, "default", &db).await;
+        let result = resolve_env_from(&container_spec, "default", &source).await;
 
         // Missing optional resource should be skipped, not error
         assert_eq!(result.len(), 0);
@@ -936,13 +933,11 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use crate::kubelet::pod_env::{EnvSourceReader, LeaderApiEnvSourceReader};
+        use super::super::{EnvSourceReader, LeaderApiEnvSourceReader};
         use klights_cluster_core::Resource;
         use klights_leader_api::{
-            CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderCacheReadiness,
-            LeaderResourceQuery, LeaderWatch, LeaderWatchError, LeaderWatchFuture,
-            ResourceGetRequest, ResourceListRequest, ResourceListResult, ResourceQueryConsistency,
-            ResourceQueryError, ResourceQueryFuture, WatchRequest,
+            LeaderResourceQuery, ResourceGetRequest, ResourceListRequest, ResourceListResult,
+            ResourceQueryConsistency, ResourceQueryError, ResourceQueryFuture,
         };
 
         struct FreshOnlyLeaderApiClient {
@@ -984,26 +979,6 @@ mod tests {
                 })
             }
         }
-
-        impl LeaderWatch for FreshOnlyLeaderApiClient {
-            fn watch_resources(&self, _req: WatchRequest) -> LeaderWatchFuture<'_> {
-                Box::pin(async { Err(LeaderWatchError::unavailable("unexpected watch_resources")) })
-            }
-        }
-
-        impl LeaderCacheReadiness for FreshOnlyLeaderApiClient {
-            fn wait_cache_ready(&self, _scope: CacheReadinessRequest) -> CacheReadinessFuture<'_> {
-                Box::pin(async {
-                    Err(CacheReadinessError::unavailable(
-                        "unexpected wait_cache_ready",
-                    ))
-                })
-            }
-        }
-
-        crate::control_plane::client::impl_unavailable_leader_pod_effects!(
-            FreshOnlyLeaderApiClient
-        );
 
         fn secret_resource() -> Resource {
             Resource {

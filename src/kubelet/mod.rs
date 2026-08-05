@@ -3,7 +3,6 @@ pub mod file_blocking;
 pub mod pod_cluster_runtime;
 pub mod pod_container_config;
 pub mod pod_endpoints;
-pub mod pod_env;
 pub mod pod_fs;
 pub mod pod_manager;
 // pub mod pod_owner_reconcile; // removed — events flow top-down only

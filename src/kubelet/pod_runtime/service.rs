@@ -174,7 +174,7 @@ pub struct RealPodRuntimeService {
     hostports: Arc<dyn HostPortRuntime>,
     events: Arc<dyn PodEventSink>,
     hooks: Arc<dyn PodHookRuntime>,
-    env_source: Arc<dyn crate::kubelet::pod_env::EnvSourceReader>,
+    env_source: Arc<dyn klights_kubelet::pod_env::EnvSourceReader>,
     finalizer: Arc<dyn PodDeletionFinalizer>,
     supervisor: Arc<TaskSupervisor>,
     pub(super) config: RuntimeConfig,
@@ -241,19 +241,19 @@ impl RealPodRuntimeService {
         &self,
         request: ContainerConfigBuildRequest<'_>,
     ) -> anyhow::Result<k8s_cri::v1::ContainerConfig> {
-        let resolved_env_from = crate::kubelet::pod_env::resolve_env_from_source(
+        let resolved_env_from = klights_kubelet::pod_env::resolve_env_from_source(
             request.container,
             &request.key.namespace,
             self.env_source.as_ref(),
         )
         .await;
-        let resolved_env = crate::kubelet::pod_env::resolve_env_value_from_source(
+        let resolved_env = klights_kubelet::pod_env::resolve_env_value_from_source(
             request.container,
             &request.key.namespace,
             self.env_source.as_ref(),
         )
         .await;
-        let subpath_env = crate::kubelet::pod_env::build_subpath_env_with_capacity(
+        let subpath_env = klights_kubelet::pod_env::build_subpath_env_with_capacity(
             request.container,
             request.pod,
             &resolved_env_from,

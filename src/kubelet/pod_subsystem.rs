@@ -330,7 +330,7 @@ impl PodSubsystem {
                     cri_runtime.clone(),
                     supervisor.clone(),
                 )),
-                env_source: Arc::new(crate::kubelet::pod_env::LeaderApiEnvSourceReader::new(
+                env_source: Arc::new(klights_kubelet::pod_env::LeaderApiEnvSourceReader::new(
                     volume_resource_query,
                 )),
                 finalizer: deletion_finalizer,

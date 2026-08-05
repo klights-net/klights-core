@@ -2,7 +2,6 @@
 
 use k8s_cri::v1::PodSandboxConfig;
 
-use crate::kubelet::pod_env::EnvSourceReader;
 use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
 use crate::kubelet::pod_runtime::events::PodEventSink;
 use crate::kubelet::pod_runtime::filesystem::PodFilesystem;
@@ -20,6 +19,7 @@ use crate::kubelet::pod_runtime::test_support::{
     MockPodRuntimeService, MockPodSlotAdmission, MockRuntimeCall,
 };
 use crate::kubelet::pod_runtime::volumes::PodVolumeRuntime;
+use klights_kubelet::pod_env::EnvSourceReader;
 use klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey;
 use klights_kubelet::pod_service_envs::ServiceEnvSource;
 use std::sync::Arc;
@@ -1144,7 +1144,7 @@ async fn fixture_pod_repository() -> std::sync::Arc<crate::kubelet::pod_reposito
 
 async fn fixture_env_source(
     _node_name: &str,
-) -> std::sync::Arc<dyn crate::kubelet::pod_env::EnvSourceReader> {
+) -> std::sync::Arc<dyn klights_kubelet::pod_env::EnvSourceReader> {
     std::sync::Arc::new(crate::kubelet::pod_runtime::test_support::MockEnvSourceReader::new())
 }
 
@@ -10484,7 +10484,7 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
             "test-node".to_string(),
             crate::control_plane::client::local::always_leader_watch(),
         ));
-    let env_source = std::sync::Arc::new(crate::kubelet::pod_env::LeaderApiEnvSourceReader::new(
+    let env_source = std::sync::Arc::new(klights_kubelet::pod_env::LeaderApiEnvSourceReader::new(
         cluster_api,
     ));
 

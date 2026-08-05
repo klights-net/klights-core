@@ -1,6 +1,45 @@
 use super::*;
-use crate::kubelet::pod_env::{resolve_env_from, resolve_env_value_from};
+use klights_kubelet::pod_env::{
+    EnvSourceReader, resolve_env_from_source, resolve_env_value_from_source,
+};
+use klights_kubelet::pod_service_envs::ServiceEnvSource;
 use std::collections::HashMap;
+
+struct SecretEnvSource {
+    secret: klights_cluster_core::Resource,
+}
+
+#[async_trait::async_trait]
+impl EnvSourceReader for SecretEnvSource {
+    async fn secret(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
+        Ok(
+            (self.secret.namespace.as_deref() == Some(namespace) && self.secret.name == name)
+                .then(|| self.secret.clone()),
+        )
+    }
+
+    async fn config_map(
+        &self,
+        _namespace: &str,
+        _name: &str,
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
+        Ok(None)
+    }
+}
+
+#[async_trait::async_trait]
+impl ServiceEnvSource for SecretEnvSource {
+    async fn services(
+        &self,
+        _namespace: &str,
+    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>> {
+        Ok(Vec::new())
+    }
+}
 
 fn test_pod_data() -> serde_json::Value {
     serde_json::json!({
@@ -197,19 +236,24 @@ fn test_build_container_config_log_path() {
 #[tokio::test]
 async fn test_secret_env_var_injected_in_container_config() {
     use base64::Engine;
-    let db = crate::datastore::test_support::in_memory().await;
-
-    let ns = serde_json::json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"secrets-test"}});
-    db.create_namespace("secrets-test", ns).await.unwrap();
 
     let secret = serde_json::json!({
         "apiVersion": "v1", "kind": "Secret",
         "metadata": {"name": "my-secret", "namespace": "secrets-test"},
         "data": {"data-1": base64::engine::general_purpose::STANDARD.encode("value-1")}
     });
-    db.create_resource("v1", "Secret", Some("secrets-test"), "my-secret", secret)
-        .await
-        .unwrap();
+    let source = SecretEnvSource {
+        secret: klights_cluster_core::Resource {
+            id: 0,
+            api_version: "v1".to_string(),
+            kind: "Secret".to_string(),
+            namespace: Some("secrets-test".to_string()),
+            name: "my-secret".to_string(),
+            uid: "secret-uid".to_string(),
+            data: secret.into(),
+            resource_version: 1,
+        },
+    };
 
     let container_spec = serde_json::json!({
         "image": "busybox",
@@ -218,8 +262,9 @@ async fn test_secret_env_var_injected_in_container_config() {
     let pod =
         serde_json::json!({"metadata": {"name": "p", "namespace": "secrets-test", "uid": "u1"}});
 
-    let resolved_env_from = resolve_env_from(&container_spec, "secrets-test", &db).await;
-    let resolved_env = resolve_env_value_from(&container_spec, "secrets-test", &db).await;
+    let resolved_env_from = resolve_env_from_source(&container_spec, "secrets-test", &source).await;
+    let resolved_env =
+        resolve_env_value_from_source(&container_spec, "secrets-test", &source).await;
 
     let config = build_container_config(
         &container_spec,

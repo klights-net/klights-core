@@ -1470,7 +1470,7 @@ impl MockEnvSourceReader {
 }
 
 #[async_trait::async_trait]
-impl crate::kubelet::pod_env::EnvSourceReader for MockEnvSourceReader {
+impl klights_kubelet::pod_env::EnvSourceReader for MockEnvSourceReader {
     async fn secret(
         &self,
         namespace: &str,

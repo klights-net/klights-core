@@ -1,6 +1,6 @@
 use crate::kubelet::pod_endpoints::reconcile_endpoints_for_pod;
-use crate::kubelet::pod_env::collect_literal_env_vars;
 use crate::kubelet::pod_status_writer::{PodStatusUpdate, update_pod_status};
+use klights_kubelet::pod_env::collect_literal_env_vars;
 use std::collections::HashMap;
 
 fn build_mounts(
