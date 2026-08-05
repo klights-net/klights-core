@@ -9,7 +9,6 @@ pub mod pod_fs;
 pub mod pod_manager;
 // pub mod pod_owner_reconcile; // removed — events flow top-down only
 pub mod pod_repository;
-pub mod pod_resources;
 pub mod pod_service_envs;
 pub mod pod_status_writer;
 pub mod pod_subsystem;
