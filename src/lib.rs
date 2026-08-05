@@ -2,8 +2,6 @@ mod allocator;
 pub mod cli;
 mod cluster_engine;
 pub mod control_plane;
-#[cfg(test)]
-mod controller_test_support;
 pub mod datastore;
 #[cfg(test)]
 mod endpoint_reconcile_integration_tests;

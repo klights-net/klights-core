@@ -1365,7 +1365,7 @@ mod inner_gate_tests {
             crate::control_plane::client::local::always_leader_watch(),
         );
         let dispatcher =
-            Arc::new(crate::controller_test_support::default_queue_only_dispatcher_for_test());
+            Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::default_queue_only_dispatcher_for_test());
         client.set_controller_dispatcher(dispatcher.clone());
         let command = StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
@@ -2308,7 +2308,7 @@ mod inner_gate_tests {
         let (tx, rx) = watch::channel(false);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
         client.set_controller_dispatcher(Arc::new(
-            crate::controller_test_support::default_queue_only_dispatcher_for_test(),
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::default_queue_only_dispatcher_for_test(),
         ));
 
         // Pre-promotion: write refused.
@@ -2356,7 +2356,7 @@ mod inner_gate_tests {
         let (tx, rx) = watch::channel(true);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
         client.set_controller_dispatcher(Arc::new(
-            crate::controller_test_support::default_queue_only_dispatcher_for_test(),
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::default_queue_only_dispatcher_for_test(),
         ));
 
         // Pre-demotion: write succeeds.

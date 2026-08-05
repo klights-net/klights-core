@@ -1931,7 +1931,7 @@ async fn test_apply_pod_phase_update_reconciles_pdb_on_ready_transition() {
 
     klights_controllers::pdb::reconcile_pdb_at(
         &db,
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         &pdb,
         chrono::Utc::now(),
     )
@@ -2151,7 +2151,7 @@ async fn test_enqueue_job_reconcile_no_owner_is_noop() {
     let db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
-    let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let pod_repo = crate::kubelet::pod_repository::pod_repository_for_test(&db);
     let pod = serde_json::json!({
         "metadata": {"name": "pod", "namespace": "default"},
         "spec": {"nodeName": "node"},
@@ -2166,7 +2166,7 @@ async fn test_enqueue_job_reconcile_non_job_owner_is_noop() {
     let db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
-    let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let pod_repo = crate::kubelet::pod_repository::pod_repository_for_test(&db);
     let pod = serde_json::json!({
         "metadata": {
             "name": "pod",
@@ -2187,7 +2187,7 @@ async fn test_enqueue_job_reconcile_enqueues_job_key_via_dispatcher() {
         "10.43.128.0/17",
     ));
     let dispatcher = std::sync::Arc::new(
-        crate::controller_test_support::queue_only_dispatcher_for_test(service_ipam),
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::queue_only_dispatcher_for_test(service_ipam),
     );
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
@@ -2283,7 +2283,7 @@ async fn test_terminal_watch_modified_pod_enqueues_job_reconcile() {
         "10.43.128.0/17",
     ));
     let dispatcher = std::sync::Arc::new(
-        crate::controller_test_support::queue_only_dispatcher_for_test(service_ipam),
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::queue_only_dispatcher_for_test(service_ipam),
     );
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
@@ -2379,7 +2379,7 @@ async fn test_enqueue_job_reconcile_skips_when_dispatcher_not_bound() {
     let db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
-    let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
+    let pod_repo = crate::kubelet::pod_repository::pod_repository_for_test(&db);
     let pod = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",

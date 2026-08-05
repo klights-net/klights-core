@@ -22,7 +22,7 @@ async fn reconcile_service(
         service_ipam,
         &NodePortAllocator::new(),
         chrono::Utc::now(),
-        crate::controller_test_support::deterministic_controller_identity().as_ref(),
+        crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity().as_ref(),
     )
     .await
 }
@@ -84,10 +84,11 @@ async fn test_service_stale_snapshot_after_delete_does_not_recreate_endpoints() 
         .create_resource("v1", "Service", Some("default"), "stale-svc", service)
         .await
         .unwrap();
-    let stale_snapshot = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let stale_snapshot =
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::inject_resource_version(
+            created.data,
+            created.resource_version,
+        );
 
     db.delete_resource("v1", "Service", Some("default"), "stale-svc")
         .await
@@ -95,7 +96,7 @@ async fn test_service_stale_snapshot_after_delete_does_not_recreate_endpoints() 
 
     reconcile_service(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         &stale_snapshot,
         &service_ipam,
     )
@@ -174,14 +175,15 @@ async fn service_reconcile_commits_endpointslice_and_legacy_endpoints_in_one_bat
         .create_resource("v1", "Service", Some("default"), "latency-svc", service)
         .await
         .unwrap();
-    let service_snapshot = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let service_snapshot =
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::inject_resource_version(
+            created.data,
+            created.resource_version,
+        );
 
     reconcile_service(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         &service_snapshot,
         &service_ipam,
     )
@@ -445,7 +447,7 @@ async fn test_reconcile_service_preserves_headless_cluster_ip_none() {
 
     let result = reconcile_service(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         &service,
         &service_ipam,
     )
@@ -522,7 +524,7 @@ async fn test_reconcile_service_allocates_cluster_ip_when_not_set() {
 
     let result = reconcile_service(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         &service,
         &service_ipam,
     )
@@ -595,7 +597,7 @@ async fn test_service_external_name_no_cluster_ip() {
 
     let result = reconcile_service(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         &service,
         &service_ipam,
     )
@@ -663,7 +665,7 @@ async fn test_service_external_name_no_endpoints() {
 
     let _result = reconcile_service(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         &service,
         &service_ipam,
     )
@@ -721,7 +723,7 @@ async fn test_service_external_name_no_endpoint_slice() {
 
     let _result = reconcile_service(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         &service,
         &service_ipam,
     )
@@ -808,14 +810,15 @@ async fn test_reconcile_service_defaults_single_stack_ip_family_fields() {
         .create_resource("v1", "Service", Some("default"), "family-defaults", service)
         .await
         .unwrap();
-    let service = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let service =
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::inject_resource_version(
+            created.data,
+            created.resource_version,
+        );
 
     let result = reconcile_service(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         &service,
         &service_ipam,
     )
@@ -1030,7 +1033,7 @@ async fn service_reconcile_recovers_cluster_ip_after_generic_service_delete() {
     let ipam = ServiceIpam::new("10.0.0.0/30");
     let alloc = NodePortAllocator::new();
     alloc.set_ready();
-    let pod_reader = crate::controller_test_support::pod_repository_for_test(&db);
+    let pod_reader = crate::kubelet::pod_repository::pod_repository_for_test(&db);
 
     let mut first = serde_json::json!({
         "apiVersion": "v1",
@@ -1056,7 +1059,7 @@ async fn service_reconcile_recovers_cluster_ip_after_generic_service_delete() {
         &ipam,
         &alloc,
         chrono::Utc::now(),
-        crate::controller_test_support::deterministic_controller_identity().as_ref(),
+        crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity().as_ref(),
     )
     .await
     .unwrap();
@@ -1093,7 +1096,7 @@ async fn service_reconcile_recovers_cluster_ip_after_generic_service_delete() {
         &ipam,
         &alloc,
         chrono::Utc::now(),
-        crate::controller_test_support::deterministic_controller_identity().as_ref(),
+        crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity().as_ref(),
     )
     .await
     .unwrap();
@@ -1138,12 +1141,12 @@ async fn reconcile_idempotent_does_not_churn_resource_version() {
 
     let result = reconcile_service_with_nodeport_at(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         &svc,
         &ipam,
         &alloc,
         chrono::Utc::now(),
-        crate::controller_test_support::deterministic_controller_identity().as_ref(),
+        crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity().as_ref(),
     )
     .await
     .unwrap();
@@ -1157,12 +1160,12 @@ async fn reconcile_idempotent_does_not_churn_resource_version() {
     // Second reconcile — no changes, must not bump resourceVersion.
     let result2 = reconcile_service_with_nodeport_at(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         &result,
         &ipam,
         &alloc,
         chrono::Utc::now(),
-        crate::controller_test_support::deterministic_controller_identity().as_ref(),
+        crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity().as_ref(),
     )
     .await
     .unwrap();

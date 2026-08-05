@@ -40,7 +40,7 @@ mod tests {
             "10.43.128.0/17",
         ));
         let dispatcher =
-            Arc::new(crate::controller_test_support::queue_only_dispatcher_for_test(service_ipam));
+            Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::queue_only_dispatcher_for_test(service_ipam));
         let slot = klights_controllers::side_effects::ControllerDispatcherSlot::new();
         slot.set(dispatcher.clone());
 

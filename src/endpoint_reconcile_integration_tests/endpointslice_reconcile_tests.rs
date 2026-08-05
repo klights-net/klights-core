@@ -26,10 +26,11 @@ async fn test_mirror_endpoints_sets_owner_reference() {
         .create_resource("v1", "Endpoints", Some("default"), "my-svc", endpoints)
         .await
         .unwrap();
-    let endpoints = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let endpoints =
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::inject_resource_version(
+            created.data,
+            created.resource_version,
+        );
 
     mirror_endpoints_to_endpointslice(&controller_store(&db), &endpoints)
         .await
@@ -82,10 +83,11 @@ async fn test_mirror_endpoints_stale_snapshot_after_delete_does_not_recreate_sli
         .create_resource("v1", "Endpoints", Some("default"), "gone-svc", endpoints)
         .await
         .unwrap();
-    let stale_snapshot = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let stale_snapshot =
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::inject_resource_version(
+            created.data,
+            created.resource_version,
+        );
 
     db.delete_resource("v1", "Endpoints", Some("default"), "gone-svc")
         .await
@@ -151,7 +153,7 @@ async fn test_reconcile_endpoints_named_target_port_resolves_to_container_port()
 
     reconcile_endpoints(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         "nginx-service",
         "test",
         Some(&selector),
@@ -217,7 +219,7 @@ async fn test_reconcile_endpoints_numeric_string_target_port_and_skip_unresolved
 
     reconcile_endpoints(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         "multi-endpoint-test",
         "test",
         Some(&selector),
@@ -289,7 +291,7 @@ async fn test_reconcile_endpoints_preserves_service_port_name() {
 
     reconcile_endpoints(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         "svc",
         "test",
         Some(&selector),
@@ -367,7 +369,7 @@ async fn test_endpointslice_deleted_when_service_deleted_via_cascade() {
     let ports = json!([{"port": 80, "targetPort": 8080}]);
     reconcile_endpointslice(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         "test-service",
         "test-service-uid-123",
         "test",

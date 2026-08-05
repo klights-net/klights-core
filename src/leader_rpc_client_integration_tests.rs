@@ -1102,7 +1102,7 @@ mod cases {
             supervisor.clone(),
         ));
         let controller_dispatcher =
-            Arc::new(crate::controller_test_support::default_queue_only_dispatcher_for_test());
+            Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::default_queue_only_dispatcher_for_test());
         let app = crate::grpc_test_support::mount_service_with_controller_dispatcher(
             axum::Router::new(),
             service.clone(),

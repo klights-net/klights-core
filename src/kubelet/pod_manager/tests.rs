@@ -30,7 +30,7 @@ pub(super) fn fixture_pod_repository(
         None,
         Some(supervisor.clone()),
         Some(db_handle.clone()),
-        crate::controller_test_support::deterministic_controller_identity(),
+        crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
     ));
     let repo = std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(
         db_handle,

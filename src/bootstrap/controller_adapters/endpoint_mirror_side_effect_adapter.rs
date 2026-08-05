@@ -77,7 +77,7 @@ mod tests {
 
         klights_controllers::side_effects::endpoint_mirror::effect(port(
             db_handle,
-            crate::controller_test_support::deterministic_controller_identity(),
+            crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         ))
         .apply_delete(&endpoints)
         .await

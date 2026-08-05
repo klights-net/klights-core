@@ -44,6 +44,79 @@ fn generate(prefix: &str) -> String {
 }
 
 #[cfg(test)]
+fn deterministic_generated_name(prefix: &str, value: u64) -> String {
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    const SUFFIX_SPACE: u64 = 36_u64.pow(5);
+    // Five Kubernetes name characters have a finite namespace. Exhaustion is
+    // the only point at which this deterministic fake wraps.
+    let mut remaining = value % SUFFIX_SPACE;
+    let mut suffix = [b'0'; 5];
+    for slot in suffix.iter_mut().rev() {
+        *slot = ALPHABET[(remaining % 36) as usize];
+        remaining /= 36;
+    }
+    format!(
+        "{prefix}{}",
+        std::str::from_utf8(&suffix).expect("ASCII suffix")
+    )
+}
+
+#[cfg(test)]
+fn deterministic_uuid_v4(value: u64) -> String {
+    let first = ((value & 0x000f_ffff) << 12) | ((value >> 20) & 0x0fff);
+    let second = (value >> 32) & 0xffff;
+    let third = 0x4000 | ((value >> 48) & 0x0fff);
+    let fourth = 0x8000 | ((value >> 60) & 0x000f);
+    format!("{first:08x}-{second:04x}-{third:04x}-{fourth:04x}-000000000000")
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct DeterministicControllerIdentityGenerator {
+    sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(test)]
+impl klights_controllers::ControllerIdentityGenerator for DeterministicControllerIdentityGenerator {
+    fn generate_name(&self, prefix: &str) -> String {
+        let value = self
+            .sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        deterministic_generated_name(prefix, value)
+    }
+
+    fn new_uid(&self) -> String {
+        let value = self
+            .sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        deterministic_uuid_v4(value)
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ControllerIdentityTestGraph {
+    sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(test)]
+impl ControllerIdentityTestGraph {
+    pub(crate) fn identity(
+        &self,
+    ) -> std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator> {
+        std::sync::Arc::new(DeterministicControllerIdentityGenerator {
+            sequence: self.sequence.clone(),
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn deterministic_controller_identity()
+-> std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator> {
+    ControllerIdentityTestGraph::default().identity()
+}
+
+#[cfg(test)]
 mod tests {
     use super::{SystemIdentityGenerator, generate};
     use klights_controllers::ControllerIdentityGenerator;

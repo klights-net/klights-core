@@ -3909,7 +3909,7 @@ async fn apply_outbox_pod_status_enqueues_matching_service() {
     .await
     .unwrap();
     let dispatcher =
-        Arc::new(crate::controller_test_support::default_queue_only_dispatcher_for_test());
+        Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::default_queue_only_dispatcher_for_test());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(crate::grpc_test_support::replication_service(
         db.clone(),
@@ -4041,7 +4041,7 @@ async fn channel_snapshot_sink_forwards_typed_restore_operations() {
         &db,
         &crate::paths::ca_cert_path(&crate::paths::runtime_namespace()),
         chrono::DateTime::UNIX_EPOCH,
-        crate::controller_test_support::deterministic_controller_identity().as_ref(),
+        crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity().as_ref(),
     )
     .await
     .unwrap();

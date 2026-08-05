@@ -26,10 +26,11 @@ async fn test_mirror_endpoints_to_endpointslice_sets_empty_name_for_unnamed_port
         .create_resource("v1", "Endpoints", Some("test"), "manual-service", endpoints)
         .await
         .unwrap();
-    let endpoints = crate::controller_test_support::inject_resource_version(
-        created.data,
-        created.resource_version,
-    );
+    let endpoints =
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::inject_resource_version(
+            created.data,
+            created.resource_version,
+        );
 
     mirror_endpoints_to_endpointslice(&controller_store(&db), &endpoints)
         .await
@@ -102,7 +103,7 @@ async fn test_reconcile_endpoints_creates_endpoints_for_matching_pods() {
     // Reconcile endpoints
     reconcile_endpoints(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         "nginx-service",
         "test",
         Some(&selector),
@@ -192,7 +193,7 @@ async fn test_reconcile_endpoints_empty_when_no_matching_pods() {
     // Reconcile endpoints
     reconcile_endpoints(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         "nginx-service",
         "test",
         Some(&selector),
@@ -251,7 +252,7 @@ async fn test_reconcile_endpoints_updates_existing_endpoints() {
     // First reconcile creates endpoints
     reconcile_endpoints(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         "nginx-service",
         "test",
         Some(&selector),
@@ -288,7 +289,7 @@ async fn test_reconcile_endpoints_updates_existing_endpoints() {
     // Second reconcile updates endpoints
     reconcile_endpoints(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         "nginx-service",
         "test",
         Some(&selector),
@@ -359,7 +360,7 @@ async fn test_reconcile_endpoints_uses_target_port() {
 
     reconcile_endpoints(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         "nginx-service",
         "test",
         Some(&selector),
@@ -409,7 +410,7 @@ async fn test_reconcile_endpoints_excludes_pods_with_zero_ip() {
 
     reconcile_endpoints(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         "nginx-svc",
         "test",
         Some(&selector),
@@ -458,7 +459,7 @@ async fn test_reconcile_endpoints_excludes_pods_with_empty_ip() {
 
     reconcile_endpoints(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         "nginx-svc",
         "test",
         Some(&selector),
@@ -509,7 +510,7 @@ async fn test_reconcile_endpoints_no_selector_creates_empty_subsets() {
     // K8s behavior: controller does NOT create Endpoints when service has no selector
     reconcile_endpoints(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         "headless-svc",
         "test",
         None,
@@ -541,7 +542,7 @@ async fn test_reconcile_endpoints_empty_selector_does_not_create_endpoints() {
 
     reconcile_endpoints(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         "selectorless-svc",
         "test",
         Some(&selector),
@@ -588,7 +589,7 @@ async fn test_reconcile_endpoints_falls_back_to_port_when_no_target_port() {
 
     reconcile_endpoints(
         &controller_store(&db),
-        crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
         "nginx-svc",
         "test",
         Some(&selector),

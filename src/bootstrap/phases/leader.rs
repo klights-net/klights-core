@@ -157,7 +157,7 @@ mod tests {
             &db,
             &crate::paths::ca_cert_path(&crate::paths::runtime_namespace()),
             chrono::DateTime::UNIX_EPOCH,
-            crate::controller_test_support::deterministic_controller_identity().as_ref(),
+            crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity().as_ref(),
         )
         .await
         .expect("default namespaces");

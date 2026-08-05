@@ -1086,3 +1086,136 @@ impl ControllerEffectPort for RootControllerEffectPort {
         &self.local_path_provisioner_root
     }
 }
+
+#[cfg(test)]
+pub(crate) fn inject_resource_version(
+    data: impl Into<Arc<serde_json::Value>>,
+    resource_version: i64,
+) -> serde_json::Value {
+    let mut data = Arc::unwrap_or_clone(data.into());
+    if let Some(metadata) = data
+        .get_mut("metadata")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        metadata.insert(
+            "resourceVersion".to_string(),
+            serde_json::Value::String(resource_version.to_string()),
+        );
+    }
+    data
+}
+
+#[cfg(test)]
+pub(crate) fn controller_store_for_test(
+    db: &crate::datastore::sqlite::Datastore,
+) -> RootControllerLeaderPort {
+    RootControllerLeaderPort::new(Arc::new(db.clone()))
+}
+
+#[cfg(test)]
+fn runtime_dependencies_for_test(
+    db: &crate::datastore::sqlite::Datastore,
+    node_name: &str,
+) -> klights_controllers::ControllerRuntimeDependencies {
+    let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
+    let repository = crate::kubelet::pod_repository::pod_repository_for_test(db);
+    let leader = Arc::new(RootControllerLeaderPort::new(db_handle.clone()));
+    let pods = Arc::new(RootControllerPodPort::new_for_test(repository.clone()));
+    let non_pod_finalization: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort> = Arc::new(
+        crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
+            db_handle,
+        ),
+    );
+    let services = Arc::new(klights_networking::test_support::MockServiceRouter::default());
+    klights_controllers::ControllerRuntimeDependencies {
+        wall_time: chrono::Utc::now,
+        resource_query: leader.clone(),
+        deployment_store: leader.clone(),
+        replicaset_store: leader.clone(),
+        statefulset_store: leader.clone(),
+        daemonset_store: leader.clone(),
+        job_store: leader.clone(),
+        service_store: leader.clone(),
+        pvc_store: leader.clone(),
+        pdb_store: leader.clone(),
+        replicationcontroller_store: leader.clone(),
+        apiservice_store: leader.clone(),
+        csr_status_store: leader,
+        pod_query: repository.clone(),
+        pdb_pod_reader: repository.clone(),
+        deployment_pod_reader: repository.clone(),
+        deployment_pod_mutation: pods.clone(),
+        replicaset_pod_mutation: pods.clone(),
+        statefulset_pod_mutation: pods.clone(),
+        daemonset_pod_mutation: pods.clone(),
+        job_pod_mutation: pods.clone(),
+        replicationcontroller_pod_mutation: pods,
+        pod_delete_sink: repository,
+        reconcile: Arc::new(RootControllerReconcilePort::new(non_pod_finalization)),
+        network: Arc::new(RootControllerNetworkPort::new(services)),
+        effects: Arc::new(RootControllerEffectPort::new(
+            crate::kubelet::file_blocking::test_file_process_executor(),
+            crate::KlightsConfig::test_default()
+                .data_root
+                .join("local-path-provisioner"),
+        )),
+        coordination: Arc::new(klights_controllers::ControllerCoordination::new()),
+        node_name: Arc::from(node_name),
+    }
+}
+
+#[cfg(test)]
+struct NoopHpaReconcilePort;
+
+#[cfg(test)]
+#[async_trait]
+impl klights_controllers::hpa::HpaReconcilePort for NoopHpaReconcilePort {
+    async fn reconcile(
+        &self,
+        _resource: &serde_json::Value,
+        _reconcile_time: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn dispatcher_for_test(
+    db: &crate::datastore::sqlite::Datastore,
+    service_ipam: Arc<klights_controllers::service::ServiceIpam>,
+) -> Arc<klights_controllers::ControllerDispatcher> {
+    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
+    ));
+    Arc::new(klights_controllers::ControllerDispatcher::new_complete(
+        service_ipam,
+        Arc::new(klights_controllers::service::NodePortAllocator::new()),
+        supervisor,
+        None,
+        Arc::new(klights_controllers::hpa::HpaController::new(Arc::new(
+            NoopHpaReconcilePort,
+        ))),
+        runtime_dependencies_for_test(db, "test-node"),
+        super::system_identity_adapter::deterministic_controller_identity(),
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn queue_only_dispatcher_for_test(
+    service_ipam: Arc<klights_controllers::service::ServiceIpam>,
+) -> klights_controllers::ControllerDispatcher {
+    klights_controllers::ControllerDispatcher::with_task_supervisor(
+        service_ipam,
+        Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        )),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn default_queue_only_dispatcher_for_test() -> klights_controllers::ControllerDispatcher
+{
+    queue_only_dispatcher_for_test(Arc::new(klights_controllers::service::ServiceIpam::new(
+        "10.43.128.0/17",
+    )))
+}

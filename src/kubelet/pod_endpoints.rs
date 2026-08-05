@@ -219,7 +219,7 @@ mod tests {
         // Call reconcile_endpoints_for_pod (simulating pod watcher event)
         reconcile_endpoints_for_pod(
             &db,
-            crate::controller_test_support::pod_repository_for_test(&db).as_ref(),
+            crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
             &pod,
             None,
         )
