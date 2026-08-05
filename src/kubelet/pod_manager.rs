@@ -1,6 +1,4 @@
 #[cfg(test)]
-use crate::kubelet::pod_runtime_state::{PodRuntimeState, StartupDecision, decide_startup_action};
-#[cfg(test)]
 use crate::kubelet::pod_watch_handlers::NoopPersistentVolumeEventHandler;
 use crate::kubelet::pod_watch_handlers::PersistentVolumeEventHandler;
 use crate::kubelet::pod_watch_source::{
@@ -23,6 +21,8 @@ use klights_kubelet::pod_lifecycle_actor::message::{LifecycleMessage, PodLifecyc
 use klights_kubelet::pod_lifecycle_actor::state::{
     PodLifecycleStateTracker, new_pod_lifecycle_state_tracker,
 };
+#[cfg(test)]
+use klights_kubelet::pod_runtime_state::{PodRuntimeState, StartupDecision, decide_startup_action};
 #[cfg(test)]
 use klights_kubelet::pod_status_builders::{
     build_container_statuses, build_creation_error_statuses, build_failed_init_container_statuses,

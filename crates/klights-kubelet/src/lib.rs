@@ -33,6 +33,8 @@ pub mod pod_lifecycle_core;
 pub mod pod_lifecycle_router;
 pub mod pod_lifecycle_service;
 pub mod pod_repository;
+#[cfg(any(test, feature = "test-support"))]
+pub mod pod_runtime_state;
 pub mod pod_sandbox;
 pub mod pod_sandbox_config;
 pub mod pod_startup_error;
