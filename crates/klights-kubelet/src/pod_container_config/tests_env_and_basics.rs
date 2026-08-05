@@ -1,8 +1,6 @@
 use super::*;
-use klights_kubelet::pod_env::{
-    EnvSourceReader, resolve_env_from_source, resolve_env_value_from_source,
-};
-use klights_kubelet::pod_service_envs::ServiceEnvSource;
+use crate::pod_env::{EnvSourceReader, resolve_env_from_source, resolve_env_value_from_source};
+use crate::pod_service_envs::ServiceEnvSource;
 use std::collections::HashMap;
 
 struct SecretEnvSource {

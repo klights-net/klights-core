@@ -23,6 +23,7 @@ mod node_role_labels;
 mod node_status_merge;
 mod node_status_projection;
 pub mod outbox;
+pub mod pod_container_config;
 pub mod pod_creation_state;
 pub mod pod_deletion_finalizer;
 pub mod pod_dns;

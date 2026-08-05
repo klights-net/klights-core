@@ -66,6 +66,9 @@ use crate::kubelet::pod_runtime::status_projection;
 use crate::kubelet::pod_runtime::store::{PodRuntimeStore, PodSlotAdmission};
 use crate::kubelet::pod_runtime::volumes::PodVolumeRuntime;
 use crate::kubelet::pod_termination::{find_pod_container_spec, get_termination_message_path};
+use klights_kubelet::pod_container_config::{
+    build_container_config_with_capacity, check_run_as_non_root,
+};
 use klights_kubelet::pod_sandbox_config::build_sandbox_config_with_runtime_inputs;
 use klights_kubelet::pod_startup_error::PodStartupErrorKind;
 use klights_kubelet::pod_status_builders::{
@@ -260,16 +263,15 @@ impl RealPodRuntimeService {
             &resolved_env,
             self.config.node_capacity,
         );
-        let mut container_config =
-            crate::kubelet::pod_container_config::build_container_config_with_capacity(
-                request.container,
-                request.pod,
-                request.container_name,
-                request.kubernetes_service_ip,
-                &resolved_env_from,
-                &resolved_env,
-                self.config.node_capacity,
-            );
+        let mut container_config = build_container_config_with_capacity(
+            request.container,
+            request.pod,
+            request.container_name,
+            request.kubernetes_service_ip,
+            &resolved_env_from,
+            &resolved_env,
+            self.config.node_capacity,
+        );
         let service_envs = klights_kubelet::pod_service_envs::resolve_service_envs_from_source(
             &request.key.namespace,
             self.env_source.as_ref(),
@@ -1572,11 +1574,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                 }
             };
 
-            if let Err(message) = crate::kubelet::pod_container_config::check_run_as_non_root(
-                &pod,
-                container,
-                container_name,
-            ) {
+            if let Err(message) = check_run_as_non_root(&pod, container, container_name) {
                 tracing::warn!(
                     container = container_name,
                     "Container rejected: {}",
@@ -2418,9 +2416,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                 continue;
             }
 
-            if let Err(message) =
-                crate::kubelet::pod_container_config::check_run_as_non_root(&pod, ec, ec_name)
-            {
+            if let Err(message) = check_run_as_non_root(&pod, ec, ec_name) {
                 tracing::warn!(
                     namespace = key.namespace,
                     name = key.name,
