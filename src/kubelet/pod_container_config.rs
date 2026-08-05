@@ -1,9 +1,9 @@
-use crate::kubelet::pod_field_ref::{resolve_field_ref, resolve_resource_field_ref_with_capacity};
 use k8s_cri::v1::{
     ContainerConfig, ContainerMetadata, ImageSpec, KeyValue, LinuxContainerConfig,
     LinuxContainerResources,
 };
 use klights_kubelet::env::expand_env_var_references;
+use klights_kubelet::pod_field_ref::{resolve_field_ref, resolve_resource_field_ref_with_capacity};
 use klights_kubelet::pod_resources::{parse_cpu_resource, parse_memory_resource};
 use serde_json::Value;
 

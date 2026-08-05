@@ -76,7 +76,7 @@ pub fn resolve_field_ref(field_path: &str, pod_data: &Value) -> String {
 pub fn resolve_resource_field_ref_with_capacity(
     resource: &str,
     container_spec: &Value,
-    node_capacity: klights_kubelet::node_capacity::NodeCapacity,
+    node_capacity: crate::node_capacity::NodeCapacity,
 ) -> String {
     let raw_value = match resource {
         "limits.cpu" => container_spec
@@ -121,7 +121,7 @@ pub fn resolve_resource_field_ref_with_capacity(
     // - ephemeral-storage: quantity → bytes
     if resource.contains("memory") || resource.contains("ephemeral-storage") {
         // Convert memory/storage quantity to bytes
-        klights_kubelet::volumes::parse_k8s_quantity(raw)
+        crate::volumes::parse_k8s_quantity(raw)
             .map(|bytes| bytes.to_string())
             .unwrap_or_else(|_| raw.to_string())
     } else if resource.contains("cpu") {
@@ -148,7 +148,7 @@ pub fn resolve_resource_field_ref(resource: &str, container_spec: &Value) -> Str
     resolve_resource_field_ref_with_capacity(
         resource,
         container_spec,
-        klights_kubelet::node_capacity::NodeCapacity::default(),
+        crate::node_capacity::NodeCapacity::default(),
     )
 }
 
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn missing_limits_use_the_injected_node_capacity() {
         let container_spec = serde_json::json!({"name": "app", "resources": {}});
-        let capacity = klights_kubelet::node_capacity::NodeCapacity::new(123_456, 37);
+        let capacity = crate::node_capacity::NodeCapacity::new(123_456, 37);
 
         assert_eq!(
             resolve_resource_field_ref_with_capacity("limits.memory", &container_spec, capacity,),

@@ -27,6 +27,7 @@ pub mod pod_creation_state;
 pub mod pod_deletion_finalizer;
 pub mod pod_dns;
 pub mod pod_events;
+pub mod pod_field_ref;
 pub mod pod_hosts;
 pub mod pod_lifecycle_actor;
 pub mod pod_lifecycle_core;

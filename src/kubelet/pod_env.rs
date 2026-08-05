@@ -1,5 +1,5 @@
-use crate::kubelet::pod_field_ref::{resolve_field_ref, resolve_resource_field_ref_with_capacity};
 use async_trait::async_trait;
+use klights_kubelet::pod_field_ref::{resolve_field_ref, resolve_resource_field_ref_with_capacity};
 use serde_json::Value;
 use std::sync::Arc;
 
