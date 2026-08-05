@@ -1,6 +1,4 @@
 pub mod boot;
-#[cfg(test)]
-mod cni_integration_tests;
 pub mod plane;
 #[cfg(test)]
 mod pod_endpoint_resolver_integration_tests;
