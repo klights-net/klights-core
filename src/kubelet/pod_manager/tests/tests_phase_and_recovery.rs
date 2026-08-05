@@ -9,12 +9,7 @@ async fn process_volumes(
     pod: &serde_json::Value,
 ) -> anyhow::Result<std::collections::HashMap<String, String>> {
     let file_process = crate::kubelet::file_blocking::test_file_process_executor();
-    let paths = klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
-        crate::kubelet::runtime_paths::for_test(containerd_namespace)
-            .data_root()
-            .to_path_buf(),
-    )
-    .unwrap();
+    let paths = kubelet_runtime_paths_for_test(containerd_namespace);
     let manager = klights_kubelet::pod_volume_manager::PodVolumeManager::new(
         &file_process,
         sources,
@@ -332,9 +327,8 @@ async fn test_pvc_added_event_triggers_reconciliation() {
     // Call reconcile_pvc (what handle_watch_event will do)
     klights_controllers::pvc::reconcile_pvc(
         &crate::kubelet::file_blocking::test_file_process_executor(),
-        &crate::kubelet::runtime_paths::for_test("pod-manager-pvc-tests")
+        &kubelet_runtime_paths_for_test("pod-manager-pvc-tests")
             .data_root()
-            .to_path_buf()
             .join("local-path-provisioner"),
         &db,
         &pvc_with_rv,
@@ -421,9 +415,8 @@ async fn test_pv_added_event_triggers_pending_pvc_reconciliation() {
 
     klights_controllers::pvc::reconcile_pvc(
         &crate::kubelet::file_blocking::test_file_process_executor(),
-        &crate::kubelet::runtime_paths::for_test("pod-manager-pvc-tests")
+        &kubelet_runtime_paths_for_test("pod-manager-pvc-tests")
             .data_root()
-            .to_path_buf()
             .join("local-path-provisioner"),
         &db,
         &pvc_with_rv,
@@ -499,9 +492,8 @@ async fn test_pv_added_event_triggers_pending_pvc_reconciliation() {
             }
             klights_controllers::pvc::reconcile_pvc(
                 &crate::kubelet::file_blocking::test_file_process_executor(),
-                &crate::kubelet::runtime_paths::for_test("pod-manager-pvc-tests")
+                &kubelet_runtime_paths_for_test("pod-manager-pvc-tests")
                     .data_root()
-                    .to_path_buf()
                     .join("local-path-provisioner"),
                 &db,
                 &pvc_with_rv,

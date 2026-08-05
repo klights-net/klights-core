@@ -92,14 +92,17 @@ fn test_build_mounts_sa_volume_via_volume_mount() {
         }]
     });
     let mut volume_paths = HashMap::new();
-    let projected_path = crate::kubelet::runtime_paths::for_test("klights")
-        .volumes_root()
-        .join("test-pod")
-        .join("volumes")
-        .join("projected")
-        .join("kube-api-access-abc12")
-        .to_string_lossy()
-        .into_owned();
+    let projected_path = klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
+        crate::paths::test_data_root_path("klights"),
+    )
+    .expect("kubelet test runtime path must be absolute")
+    .volumes_root()
+    .join("test-pod")
+    .join("volumes")
+    .join("projected")
+    .join("kube-api-access-abc12")
+    .to_string_lossy()
+    .into_owned();
     volume_paths.insert("kube-api-access-abc12".to_string(), projected_path);
 
     let mounts = build_mounts(&container, &volume_paths, &std::collections::HashMap::new())

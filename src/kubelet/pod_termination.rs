@@ -229,7 +229,10 @@ mod tests {
 
     #[test]
     fn test_termination_log_host_path_returns_expected_path() {
-        let runtime_paths = crate::kubelet::runtime_paths::for_test("klights");
+        let runtime_paths = klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
+            crate::paths::test_data_root_path("klights"),
+        )
+        .expect("kubelet test runtime path must be absolute");
         let path = termination_log_host_path(&runtime_paths, "default", "mypod", "mycontainer");
         assert_eq!(
             path,

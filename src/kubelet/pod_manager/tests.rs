@@ -8,6 +8,15 @@ mod tests_phase_and_recovery;
 /// pod_manager test files that previously called migrated helpers
 /// (`apply_pod_phase_update`, `mark_pod_failed`, `mark_pod_start_pending_for_retry`)
 /// with only a raw datastore.
+pub(super) fn kubelet_runtime_paths_for_test(
+    namespace: &str,
+) -> klights_kubelet::runtime_paths::KubeletRuntimePaths {
+    klights_kubelet::runtime_paths::KubeletRuntimePaths::new(crate::paths::test_data_root_path(
+        namespace,
+    ))
+    .expect("kubelet test runtime path must be absolute")
+}
+
 pub(super) fn fixture_pod_repository(
     db: &crate::datastore::sqlite::Datastore,
 ) -> std::sync::Arc<crate::kubelet::pod_repository::PodRepository> {
