@@ -1504,7 +1504,10 @@ impl crate::kubelet::pod_env::EnvSourceReader for MockEnvSourceReader {
             .get(&(namespace.to_string(), name.to_string()))
             .cloned())
     }
+}
 
+#[async_trait::async_trait]
+impl klights_kubelet::pod_service_envs::ServiceEnvSource for MockEnvSourceReader {
     async fn services(&self, namespace: &str) -> anyhow::Result<Vec<crate::datastore::Resource>> {
         self.calls
             .lock()

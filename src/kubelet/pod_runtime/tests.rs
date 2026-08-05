@@ -21,6 +21,7 @@ use crate::kubelet::pod_runtime::test_support::{
 };
 use crate::kubelet::pod_runtime::volumes::PodVolumeRuntime;
 use klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey;
+use klights_kubelet::pod_service_envs::ServiceEnvSource;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 

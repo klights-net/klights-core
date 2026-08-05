@@ -39,6 +39,7 @@ pub mod pod_resources;
 pub mod pod_runtime_state;
 pub mod pod_sandbox;
 pub mod pod_sandbox_config;
+pub mod pod_service_envs;
 pub mod pod_startup_error;
 pub mod pod_status_builders;
 pub mod pod_status_logic;

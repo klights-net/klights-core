@@ -1,31 +1,21 @@
 /// Generate K8s service discovery env vars for all Services in a namespace.
 /// K8s injects these into every pod: {SERVICE_NAME}_SERVICE_HOST, {SERVICE_NAME}_SERVICE_PORT,
 /// plus per-port vars like {SERVICE_NAME}_PORT, {SERVICE_NAME}_PORT_{PORT}_{PROTO}_*.
-#[cfg(test)]
-pub async fn resolve_service_envs(
-    namespace: &str,
-    db: &dyn crate::datastore::DatastoreBackend,
-) -> Vec<(String, String)> {
-    let services = match db
-        .list_resources(
-            "v1",
-            "Service",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await
-    {
-        Ok(list) => list.items,
-        Err(_) => return Vec::new(),
-    };
-
-    service_envs_from_resources(&services)
+#[async_trait::async_trait]
+pub trait ServiceEnvSource: Send + Sync {
+    async fn services(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>>;
 }
 
-pub async fn resolve_service_envs_from_source(
+pub async fn resolve_service_envs_from_source<S>(
     namespace: &str,
-    source: &dyn crate::kubelet::pod_env::EnvSourceReader,
-) -> Vec<(String, String)> {
+    source: &S,
+) -> Vec<(String, String)>
+where
+    S: ServiceEnvSource + ?Sized,
+{
     match source.services(namespace).await {
         Ok(services) => service_envs_from_resources(&services),
         Err(_) => Vec::new(),
@@ -129,10 +119,55 @@ fn service_envs_from_resources(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct TestServiceEnvSource {
+        services: Vec<klights_cluster_core::Resource>,
+    }
+
+    impl TestServiceEnvSource {
+        fn new(services: Vec<klights_cluster_core::Resource>) -> Self {
+            Self { services }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ServiceEnvSource for TestServiceEnvSource {
+        async fn services(
+            &self,
+            _namespace: &str,
+        ) -> anyhow::Result<Vec<klights_cluster_core::Resource>> {
+            Ok(self.services.clone())
+        }
+    }
+
+    fn test_service(data: Value) -> klights_cluster_core::Resource {
+        let name = data
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or("service")
+            .to_string();
+        let namespace = data
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .unwrap_or("default")
+            .to_string();
+        klights_cluster_core::Resource {
+            id: 0,
+            api_version: "v1".to_string(),
+            kind: "Service".to_string(),
+            namespace: Some(namespace),
+            name: name.clone(),
+            uid: format!("{name}-uid"),
+            data: Arc::new(data),
+            resource_version: 1,
+        }
+    }
 
     #[tokio::test]
     async fn test_resolve_service_envs_generates_service_discovery_vars() {
-        let db = crate::datastore::test_support::in_memory().await;
         // Create a Service with ClusterIP and ports
         let svc = serde_json::json!({
             "apiVersion": "v1",
@@ -146,11 +181,9 @@ mod tests {
                 ]
             }
         });
-        db.create_resource("v1", "Service", Some("default"), "my-svc", svc)
-            .await
-            .unwrap();
+        let source = TestServiceEnvSource::new(vec![test_service(svc)]);
 
-        let envs = resolve_service_envs("default", &db).await;
+        let envs = resolve_service_envs_from_source("default", &source).await;
         let env_map: std::collections::HashMap<String, String> = envs.into_iter().collect();
 
         // {PREFIX}_SERVICE_HOST
@@ -203,7 +236,6 @@ mod tests {
     /// FOOSERVICE_PORT_8765_TCP_ADDR) because empty-string protocol produced empty proto_upper.
     #[tokio::test]
     async fn test_resolve_service_envs_empty_protocol_defaults_to_tcp() {
-        let db = crate::datastore::test_support::in_memory().await;
         // Service with empty-string protocol (as K8s API may return when field is omitted)
         let svc = serde_json::json!({
             "apiVersion": "v1", "kind": "Service",
@@ -213,11 +245,9 @@ mod tests {
                 "ports": [{"port": 8765, "protocol": ""}]  // empty string protocol
             }
         });
-        db.create_resource("v1", "Service", Some("default"), "fooservice", svc)
-            .await
-            .unwrap();
+        let source = TestServiceEnvSource::new(vec![test_service(svc)]);
 
-        let envs = resolve_service_envs("default", &db).await;
+        let envs = resolve_service_envs_from_source("default", &source).await;
         let env_map: std::collections::HashMap<String, String> = envs.into_iter().collect();
 
         // Must use TCP as default protocol — no double underscores in names
@@ -261,7 +291,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_service_envs_skips_headless_services() {
-        let db = crate::datastore::test_support::in_memory().await;
         let svc = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Service",
@@ -271,11 +300,9 @@ mod tests {
                 "ports": [{"port": 80, "protocol": "TCP"}]
             }
         });
-        db.create_resource("v1", "Service", Some("default"), "headless", svc)
-            .await
-            .unwrap();
+        let source = TestServiceEnvSource::new(vec![test_service(svc)]);
 
-        let envs = resolve_service_envs("default", &db).await;
+        let envs = resolve_service_envs_from_source("default", &source).await;
         assert!(
             envs.is_empty(),
             "Headless services (clusterIP=None) should not generate env vars"
@@ -284,8 +311,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_service_envs_empty_namespace() {
-        let db = crate::datastore::test_support::in_memory().await;
-        let envs = resolve_service_envs("empty-ns", &db).await;
+        let source = TestServiceEnvSource::default();
+        let envs = resolve_service_envs_from_source("empty-ns", &source).await;
         assert!(envs.is_empty(), "No services means no env vars");
     }
 }

@@ -270,7 +270,7 @@ impl RealPodRuntimeService {
                 &resolved_env,
                 self.config.node_capacity,
             );
-        let service_envs = crate::kubelet::pod_service_envs::resolve_service_envs_from_source(
+        let service_envs = klights_kubelet::pod_service_envs::resolve_service_envs_from_source(
             &request.key.namespace,
             self.env_source.as_ref(),
         )

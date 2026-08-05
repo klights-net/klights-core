@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use klights_kubelet::pod_field_ref::{resolve_field_ref, resolve_resource_field_ref_with_capacity};
+use klights_kubelet::pod_service_envs::ServiceEnvSource;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use klights_leader_api::{
 };
 
 #[async_trait]
-pub trait EnvSourceReader: Send + Sync {
+pub trait EnvSourceReader: ServiceEnvSource + Send + Sync {
     async fn secret(
         &self,
         namespace: &str,
@@ -21,11 +22,6 @@ pub trait EnvSourceReader: Send + Sync {
         namespace: &str,
         name: &str,
     ) -> anyhow::Result<Option<klights_cluster_core::Resource>>;
-
-    async fn services(
-        &self,
-        namespace: &str,
-    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>>;
 }
 
 pub struct LeaderApiEnvSourceReader {
@@ -77,7 +73,10 @@ impl EnvSourceReader for LeaderApiEnvSourceReader {
             .await
             .map_err(anyhow::Error::new)
     }
+}
 
+#[async_trait]
+impl ServiceEnvSource for LeaderApiEnvSourceReader {
     async fn services(
         &self,
         namespace: &str,
@@ -126,7 +125,11 @@ impl EnvSourceReader for DatastoreEnvSourceReader<'_> {
             .get_resource("v1", "ConfigMap", Some(namespace), name)
             .await
     }
+}
 
+#[cfg(test)]
+#[async_trait]
+impl ServiceEnvSource for DatastoreEnvSourceReader<'_> {
     async fn services(
         &self,
         namespace: &str,
