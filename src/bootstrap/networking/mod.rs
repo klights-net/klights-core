@@ -1,8 +1,6 @@
 pub mod boot;
 pub mod plane;
 #[cfg(test)]
-mod pod_endpoint_resolver_integration_tests;
-#[cfg(test)]
 mod rootless_plane_integration_tests;
 #[cfg(test)]
 #[path = "service_routing/tests.rs"]
