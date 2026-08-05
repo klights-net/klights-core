@@ -100,3 +100,19 @@ impl PodNetworkRuntime for RealPodNetworkRuntime {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod focused_datapath_tests {
+    use super::{PodRuntimeStore, RealPodNetworkRuntime};
+    use crate::kubelet::pod_repository::PodRepository;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_kubelet_caller_takes_only_datapath() {
+        let _constructor: fn(
+            Arc<dyn klights_network_api::Datapath>,
+            Arc<PodRepository>,
+            Arc<dyn PodRuntimeStore>,
+        ) -> RealPodNetworkRuntime = RealPodNetworkRuntime::new;
+    }
+}

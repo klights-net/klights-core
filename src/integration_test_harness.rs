@@ -1293,7 +1293,7 @@ impl NativeApiTestHarness {
             config.data_root.join("etc/ca.crt"),
             controller_identity.clone(),
         );
-        let network = crate::bootstrap::networking::test_support::mock_network(datastore.clone());
+        let network = klights_networking::test_support::mock_network();
         let controller_leader_ports = Arc::new(
             crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(datastore.clone()),
         );

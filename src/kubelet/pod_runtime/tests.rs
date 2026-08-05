@@ -540,7 +540,7 @@ async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_matc
         },
     );
     let repository = Arc::new(parts.repository);
-    let datapath = Arc::new(crate::bootstrap::networking::test_support::MockNetworkProvider::new());
+    let datapath = Arc::new(klights_networking::test_support::MockNetworkProvider::new());
     let old_key = PodRuntimeKey::new("ns", "same-name", "old-uid");
     let new_key = PodRuntimeKey::new("ns", "same-name", "new-uid");
     let pod_runtime_store = node_local_runtime_store().await;
@@ -573,7 +573,7 @@ async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_matc
     assert!(
         datapath.calls().iter().all(|call| !matches!(
             call,
-            crate::bootstrap::networking::test_support::NetworkCall::CniDel { .. }
+            klights_networking::test_support::NetworkCall::CniDel { .. }
         )),
         "CNI delete must not run on UID/sandbox mismatch"
     );

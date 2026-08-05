@@ -198,6 +198,13 @@ impl PeerRouter for RecordingRouter {
     }
 }
 
+#[test]
+fn test_node_subnet_caller_takes_only_peer_router() {
+    fn controller_call(_pr: &dyn PeerRouter) {}
+    let router = RecordingRouter::default();
+    controller_call(&router);
+}
+
 #[derive(Default)]
 struct NoopReadinessPublisher;
 

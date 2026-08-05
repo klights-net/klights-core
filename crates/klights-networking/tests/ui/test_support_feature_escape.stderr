@@ -7,7 +7,7 @@ error[E0433]: cannot find `test_support` in `networking`
 note: found an item that was configured out
  --> src/lib.rs
   |
-  | #[cfg(feature = "test-support")]
-  |       ------------------------ the item is gated behind the `test-support` feature
-  | pub mod test_support {
+  | #[cfg(any(test, feature = "test-support"))]
+  |          -------------------------------- the item is gated here
+  | pub mod test_support;
   |         ^^^^^^^^^^^^

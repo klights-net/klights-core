@@ -325,8 +325,14 @@ impl klights_network_api::PeerRouter for RootPeerDataplane {
 
 #[cfg(test)]
 mod tests {
-    use super::apply_wireguard_peer_route_with_rollback;
+    use super::{RootPeerDataplane, apply_wireguard_peer_route_with_rollback};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn test_root_peer_dataplane_implements_peer_router() {
+        fn assert_impl<T: klights_network_api::PeerRouter>() {}
+        assert_impl::<RootPeerDataplane>();
+    }
 
     #[tokio::test]
     async fn route_failure_rolls_back_route_and_peer_before_returning() {

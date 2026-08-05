@@ -32,7 +32,5 @@ pub use root_datapath::RootDatapath;
 pub use subnet_allocator::NodeSubnetAllocator;
 pub use types::{BridgeName, PodLinkMtu};
 
-#[cfg(feature = "test-support")]
-pub mod test_support {
-    pub use crate::pod_link::allocate_ip_with_reclaim;
-}
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;

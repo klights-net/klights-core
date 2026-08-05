@@ -3,6 +3,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+pub use crate::pod_link::allocate_ip_with_reclaim;
+
 #[derive(Clone, Debug)]
 pub enum NetworkCall {
     CniAdd {
@@ -423,11 +425,9 @@ impl Default for MockServiceRouter {
 /// shape every test fixture used to wire `network: Arc<dyn ...>` and
 /// `services: Arc<dyn ...>` separately, so the post-Task-7 ApiState
 /// fixture stays one line.
-pub fn mock_network(
-    _db: crate::datastore::DatastoreHandle,
-) -> std::sync::Arc<crate::bootstrap::networking::Network> {
+pub fn mock_network() -> std::sync::Arc<crate::Network> {
     let provider = Arc::new(MockNetworkProvider::new());
-    std::sync::Arc::new(crate::bootstrap::networking::Network::new(
+    std::sync::Arc::new(crate::Network::new(
         provider.clone(),
         provider,
         Arc::new(MockServiceRouter::new()),
@@ -477,64 +477,9 @@ impl klights_network_api::ServiceRouter for MockServiceRouter {
     }
 }
 
-impl klights_reconcile_api::ServiceRoutingSync for MockServiceRouter {
-    fn request_service_routing_sync(
-        &self,
-    ) -> Result<(), klights_reconcile_api::ReconcileSinkError> {
-        klights_network_api::ServiceRouter::request_services_sync(self).map_err(|error| {
-            klights_reconcile_api::ReconcileSinkError::unavailable(error.to_string())
-        })
-    }
-}
-
 #[cfg(test)]
 mod peer_endpoint_tests {
     use super::*;
-
-    // ---------- trait-split tests (Task 4) ----------
-
-    /// Compile-time check: `MockNetworkProvider` satisfies `Datapath`. If
-    /// the trait split regresses (Datapath demands a method NetworkPlane /
-    /// the mock can't provide), this fails at build time.
-    #[test]
-    fn test_network_plane_implements_datapath() {
-        fn assert_impl<T: klights_network_api::Datapath>() {}
-        assert_impl::<MockNetworkProvider>();
-        // NetworkPlane impls Datapath via the same trait surface — verify
-        // by erasing through `dyn`.
-        let _erase = |p: std::sync::Arc<crate::bootstrap::networking::plane::NetworkPlane>| {
-            let _: std::sync::Arc<dyn klights_network_api::Datapath> = p;
-        };
-    }
-
-    /// Compile-time check: `MockNetworkProvider` satisfies `PeerRouter`.
-    #[test]
-    fn test_root_peer_dataplane_implements_peer_router() {
-        fn assert_impl<T: klights_network_api::PeerRouter>() {}
-        assert_impl::<MockNetworkProvider>();
-        assert_impl::<klights_networking::RootPeerDataplane>();
-    }
-
-    /// Compile-time check: a kubelet-style caller takes only `&dyn Datapath`
-    /// and never reaches peer-router methods. The test compiles iff the
-    /// signature shape holds.
-    #[test]
-    fn test_kubelet_caller_takes_only_datapath() {
-        fn kubelet_call(_dp: &dyn klights_network_api::Datapath) {}
-        let mock = MockNetworkProvider::new();
-        kubelet_call(&mock);
-    }
-
-    /// Compile-time check: a node_subnet-style caller takes only
-    /// `&dyn PeerRouter`.
-    #[test]
-    fn test_node_subnet_caller_takes_only_peer_router() {
-        fn controller_call(_pr: &dyn klights_network_api::PeerRouter) {}
-        let mock = MockNetworkProvider::new();
-        controller_call(&mock);
-    }
-
-    // ---------- Datapath::host_ip tests (Task 8) ----------
 
     /// Datapath::host_ip returns the configured value via the mock —
     /// in the production NetworkPlane it returns the cached field set

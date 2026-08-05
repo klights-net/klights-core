@@ -3,9 +3,6 @@ pub mod plane;
 #[cfg(test)]
 #[path = "service_routing/tests.rs"]
 mod service_routing_adapter_tests;
-#[cfg(any(test, feature = "integration-test-harness"))]
-pub mod test_support;
-
 #[cfg(test)]
 mod contract_conformance_tests {
     fn assert_datapath<T: klights_network_api::Datapath>() {}
@@ -13,6 +10,11 @@ mod contract_conformance_tests {
     fn assert_service_router<T: klights_network_api::ServiceRouter>() {}
     fn assert_endpoint_resolver<T: klights_network_api::PodEndpointResolver>() {}
     fn assert_endpoint_source<T: klights_network_api::PodEndpointEventSource>() {}
+
+    #[test]
+    fn test_network_plane_implements_datapath() {
+        assert_datapath::<super::NetworkPlane>();
+    }
 
     #[test]
     fn concrete_network_adapters_implement_focused_ports() {
@@ -60,14 +62,13 @@ mod network_facade_tests {
 
     #[test]
     fn test_network_accessors_preserve_composed_capability_identity() {
-        let provider =
-            Arc::new(crate::bootstrap::networking::test_support::MockNetworkProvider::new());
+        let provider = Arc::new(klights_networking::test_support::MockNetworkProvider::new());
         let datapath: Arc<dyn klights_network_api::Datapath> = provider.clone();
         let peering: Arc<dyn klights_network_api::PeerRouter> = provider;
         let services: Arc<dyn klights_network_api::ServiceRouter> =
-            Arc::new(crate::bootstrap::networking::test_support::MockServiceRouter::new());
+            Arc::new(klights_networking::test_support::MockServiceRouter::new());
         let resolver: Arc<dyn klights_network_api::PodEndpointResolver> =
-            Arc::new(crate::bootstrap::networking::test_support::MockPodEndpointResolver);
+            Arc::new(klights_networking::test_support::MockPodEndpointResolver);
         let network = Network::new(
             datapath.clone(),
             peering.clone(),
@@ -85,12 +86,10 @@ mod network_facade_tests {
     /// must drain before datapath shuts down.
     #[tokio::test]
     async fn test_network_shutdown_calls_each_subtrait_shutdown_in_order() {
-        let provider =
-            Arc::new(crate::bootstrap::networking::test_support::MockNetworkProvider::new());
-        let services =
-            Arc::new(crate::bootstrap::networking::test_support::MockServiceRouter::new());
+        let provider = Arc::new(klights_networking::test_support::MockNetworkProvider::new());
+        let services = Arc::new(klights_networking::test_support::MockServiceRouter::new());
         let resolver: Arc<dyn klights_network_api::PodEndpointResolver> =
-            Arc::new(crate::bootstrap::networking::test_support::MockPodEndpointResolver);
+            Arc::new(klights_networking::test_support::MockPodEndpointResolver);
         let net = Network::new(
             provider.clone(),
             provider.clone(),
@@ -110,7 +109,7 @@ mod network_facade_tests {
             .filter(|call| {
                 matches!(
                     call,
-                    crate::bootstrap::networking::test_support::NetworkCall::Shutdown
+                    klights_networking::test_support::NetworkCall::Shutdown
                 )
             })
             .count();
