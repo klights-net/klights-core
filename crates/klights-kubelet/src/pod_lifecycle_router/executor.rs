@@ -599,7 +599,7 @@ mod tests {
     async fn pod_lifecycle_executor_constructor_accepts_runtime_service_object() {
         use std::sync::Arc;
 
-        use crate::test_support::MockPodRuntimeService;
+        use crate::runtime::test_support::MockPodRuntimeService;
 
         let mock_runtime: Arc<dyn PodRuntimeService> = Arc::new(MockPodRuntimeService::new());
 
@@ -696,7 +696,7 @@ mod tests {
 
     // ── Task 7.3: dispatch_via_runtime tests ──
 
-    use crate::test_support::MockPodRuntimeService;
+    use crate::runtime::test_support::MockPodRuntimeService;
 
     fn dummy_reply_handle() -> LifecycleReplyHandle {
         let (tx, _rx) = tokio::sync::mpsc::channel::<LifecycleMessage>(64);
@@ -735,7 +735,7 @@ mod tests {
         let calls = mock.recorded_calls();
         assert_eq!(calls.len(), 1, "exactly one runtime call");
         match &calls[0] {
-            crate::test_support::MockRuntimeCall::StartPod {
+            crate::runtime::test_support::MockRuntimeCall::StartPod {
                 namespace,
                 name,
                 uid,
@@ -811,7 +811,7 @@ mod tests {
         assert_eq!(calls.len(), 3, "three runtime calls");
         assert!(matches!(
             &calls[0],
-            crate::test_support::MockRuntimeCall::StopPod {
+            crate::runtime::test_support::MockRuntimeCall::StopPod {
                 namespace,
                 name,
                 uid,
@@ -820,7 +820,7 @@ mod tests {
         ));
         assert!(matches!(
             &calls[1],
-            crate::test_support::MockRuntimeCall::FinalizeStartup {
+            crate::runtime::test_support::MockRuntimeCall::FinalizeStartup {
                 namespace,
                 name,
                 uid,
@@ -829,7 +829,7 @@ mod tests {
         ));
         assert!(matches!(
             &calls[2],
-            crate::test_support::MockRuntimeCall::FinalizeDeletion {
+            crate::runtime::test_support::MockRuntimeCall::FinalizeDeletion {
                 namespace,
                 name,
                 uid,
@@ -934,25 +934,25 @@ mod tests {
 
         for call in mock.recorded_calls() {
             let (ns, name, uid) = match &call {
-                crate::test_support::MockRuntimeCall::StartPod {
+                crate::runtime::test_support::MockRuntimeCall::StartPod {
                     namespace,
                     name,
                     uid,
                     ..
                 } => (namespace, name, uid),
-                crate::test_support::MockRuntimeCall::StopPod {
+                crate::runtime::test_support::MockRuntimeCall::StopPod {
                     namespace,
                     name,
                     uid,
                     ..
                 } => (namespace, name, uid),
-                crate::test_support::MockRuntimeCall::FinalizeStartup {
+                crate::runtime::test_support::MockRuntimeCall::FinalizeStartup {
                     namespace,
                     name,
                     uid,
                     ..
                 } => (namespace, name, uid),
-                crate::test_support::MockRuntimeCall::FinalizeDeletion {
+                crate::runtime::test_support::MockRuntimeCall::FinalizeDeletion {
                     namespace,
                     name,
                     uid,
@@ -1044,23 +1044,23 @@ mod tests {
         let calls = mock.recorded_calls();
         assert_eq!(calls.len(), 4, "four runtime calls");
         assert!(matches!(&calls[0],
-            crate::test_support::MockRuntimeCall::ReconcileRuntime {
+            crate::runtime::test_support::MockRuntimeCall::ReconcileRuntime {
                 namespace, name, uid, ..
             } if namespace == "ns" && name == "rec-runtime" && uid == "uid-rr"
         ));
         assert!(matches!(&calls[1],
-            crate::test_support::MockRuntimeCall::ReconcileCriLeftovers {
+            crate::runtime::test_support::MockRuntimeCall::ReconcileCriLeftovers {
                 namespace, name, uid
             } if namespace == "ns" && name == "rec-cri" && uid == "uid-rc"
         ));
         assert!(matches!(&calls[2],
-            crate::test_support::MockRuntimeCall::ReconcileEphemeral {
+            crate::runtime::test_support::MockRuntimeCall::ReconcileEphemeral {
                 namespace, name, uid
             } if namespace == "ns" && name == "rec-eph" && uid == "uid-re"
         ));
         assert!(matches!(
             &calls[3],
-            crate::test_support::MockRuntimeCall::HandleCommand { .. }
+            crate::runtime::test_support::MockRuntimeCall::HandleCommand { .. }
         ));
     }
 
@@ -1101,7 +1101,7 @@ mod tests {
         assert_eq!(calls.len(), 2, "two runtime retry calls");
         assert!(matches!(
             &calls[0],
-            crate::test_support::MockRuntimeCall::ScheduleRetry {
+            crate::runtime::test_support::MockRuntimeCall::ScheduleRetry {
                 namespace,
                 name,
                 uid,
@@ -1113,7 +1113,7 @@ mod tests {
         ));
         assert!(matches!(
             &calls[1],
-            crate::test_support::MockRuntimeCall::ScheduleStartPodRetry {
+            crate::runtime::test_support::MockRuntimeCall::ScheduleStartPodRetry {
                 namespace,
                 name,
                 uid,
@@ -1168,7 +1168,7 @@ mod tests {
         );
         assert!(matches!(
             &calls[0],
-            crate::test_support::MockRuntimeCall::CheckSlotAdmission {
+            crate::runtime::test_support::MockRuntimeCall::CheckSlotAdmission {
                 namespace,
                 name,
                 uid,
@@ -1224,7 +1224,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert!(matches!(
             &calls[0],
-            crate::test_support::MockRuntimeCall::FinalizeStartup {
+            crate::runtime::test_support::MockRuntimeCall::FinalizeStartup {
                 namespace,
                 name,
                 uid,
@@ -1267,7 +1267,7 @@ mod tests {
         let calls = mock.recorded_calls();
         assert_eq!(calls.len(), 1);
         match &calls[0] {
-            crate::test_support::MockRuntimeCall::HandleCommand { command_name } => {
+            crate::runtime::test_support::MockRuntimeCall::HandleCommand { command_name } => {
                 assert!(
                     command_name.contains(command_uid),
                     "command must carry UID {command_uid}, got: {command_name}"

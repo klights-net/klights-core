@@ -219,3 +219,155 @@ impl PodFilesystem for RealPodFilesystem {
         Ok(())
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    // --- MockPodFilesystem ---
+
+    pub(crate) struct MockPodFilesystem {
+        calls: Mutex<Vec<String>>,
+        termination_messages: Mutex<HashMap<String, String>>,
+    }
+
+    impl Default for MockPodFilesystem {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl MockPodFilesystem {
+        pub(crate) fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                termination_messages: Mutex::new(HashMap::new()),
+            }
+        }
+
+        pub(crate) fn clear_calls(&self) {
+            self.calls.lock().unwrap().clear();
+        }
+
+        pub(crate) fn recorded_calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        pub(crate) fn set_termination_message(
+            &self,
+            key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+            container_name: &str,
+            message: &str,
+        ) {
+            self.termination_messages.lock().unwrap().insert(
+                Self::termination_key(key, container_name),
+                message.to_string(),
+            );
+        }
+
+        fn termination_key(
+            key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+            container_name: &str,
+        ) -> String {
+            format!(
+                "{}/{}/{}/{}",
+                key.namespace, key.name, key.uid, container_name
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::kubelet::pod_runtime::filesystem::PodFilesystem for MockPodFilesystem {
+        async fn write_hosts(
+            &self,
+            key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+            _pod: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "write_hosts:{}/{}/{}",
+                key.namespace, key.name, key.uid
+            ));
+            Ok(())
+        }
+
+        async fn create_log_directory(
+            &self,
+            key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+        ) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "create_log:{}/{}/{}",
+                key.namespace, key.name, key.uid
+            ));
+            Ok(())
+        }
+
+        async fn ensure_termination_log_file(
+            &self,
+            key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+            container_name: &str,
+        ) -> String {
+            self.calls.lock().unwrap().push(format!(
+                "ensure_termination_log:{}/{}/{}/{}",
+                key.namespace, key.name, key.uid, container_name
+            ));
+            format!(
+                "mock://termination/{}/{}/{}/{}",
+                key.namespace, key.name, key.uid, container_name
+            )
+        }
+
+        async fn read_termination_message(
+            &self,
+            key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+            container_name: &str,
+            policy: &str,
+            exit_code: i32,
+        ) -> String {
+            self.calls.lock().unwrap().push(format!(
+                "read_termination_message:{}/{}/{}/{}:{}:{}",
+                key.namespace, key.name, key.uid, container_name, policy, exit_code
+            ));
+            self.termination_messages
+                .lock()
+                .unwrap()
+                .get(&Self::termination_key(key, container_name))
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        async fn cleanup_cgroup(
+            &self,
+            key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+        ) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "cleanup_cgroup:{}/{}/{}",
+                key.namespace, key.name, key.uid
+            ));
+            Ok(())
+        }
+
+        async fn apply_fs_group(
+            &self,
+            key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+            _pod: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "apply_fs_group:{}/{}/{}",
+                key.namespace, key.name, key.uid
+            ));
+            Ok(())
+        }
+
+        async fn cleanup_pod_filesystem(
+            &self,
+            key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+        ) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "cleanup_fs:{}/{}/{}",
+                key.namespace, key.name, key.uid
+            ));
+            Ok(())
+        }
+    }
+}

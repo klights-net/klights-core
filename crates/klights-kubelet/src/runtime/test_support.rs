@@ -7,6 +7,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::cri::{CriRuntimeContainerEvent, CriRuntimeContainerEventKind};
 
+use crate::lifecycle::LifecycleCommand;
+use crate::runtime::{
+    PodDeletionFinalizeResult, PodFinalizeStartupResult, PodRuntimeKey, PodRuntimeService,
+    PodStartResult,
+};
+
 type MockSandboxRecord = (String, String, String, String, String);
 
 /// Minimal valid Pod spec for unit tests. Has metadata + one container.
@@ -34,14 +40,6 @@ pub fn pod_json(ns: &str, name: &str, uid: &str, image: &str) -> Value {
 pub fn scheduled_pod_json(ns: &str, name: &str, uid: &str, node_name: &str) -> Value {
     let mut p = pod_json(ns, name, uid, "nginx:1.25");
     p["spec"]["nodeName"] = json!(node_name);
-    p
-}
-
-/// Pod with deletionTimestamp set + recorded sandbox (Task 9 stop tests).
-pub fn terminating_pod_json(ns: &str, name: &str, uid: &str, sandbox_id: &str) -> Value {
-    let mut p = pod_json(ns, name, uid, "nginx:1.25");
-    p["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
-    p["status"]["sandboxId"] = json!(sandbox_id);
     p
 }
 
@@ -590,6 +588,888 @@ impl crate::runtime::cri::ContainerRuntimeControl for MockContainerRuntimeContro
                 container_id: container_id.to_string(),
             });
         Ok(None)
+    }
+}
+
+// --- MockPodRuntimeStore ---
+
+pub struct MockPodRuntimeStore {
+    sandboxes: Mutex<std::collections::HashMap<(String, String, String), String>>,
+    calls: Mutex<Vec<String>>,
+    record_failure: Mutex<Option<String>>,
+    lookup_failure: Mutex<Option<String>>,
+}
+
+impl Default for MockPodRuntimeStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MockPodRuntimeStore {
+    pub fn new() -> Self {
+        Self {
+            sandboxes: Mutex::new(std::collections::HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            record_failure: Mutex::new(None),
+            lookup_failure: Mutex::new(None),
+        }
+    }
+
+    pub fn clear_calls(&self) {
+        self.calls.lock().unwrap().clear();
+    }
+
+    pub fn recorded_calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    pub fn fail_record_sandbox(&self, message: impl Into<String>) {
+        *self.record_failure.lock().unwrap() = Some(message.into());
+    }
+
+    pub fn fail_sandbox_lookup(&self, message: impl Into<String>) {
+        *self.lookup_failure.lock().unwrap() = Some(message.into());
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::runtime::store::PodRuntimeStore for MockPodRuntimeStore {
+    async fn record_sandbox(
+        &self,
+        key: &crate::runtime::PodRuntimeKey,
+        sandbox_id: &str,
+    ) -> anyhow::Result<()> {
+        self.calls.lock().unwrap().push(format!(
+            "record_sandbox:{}/{}/{}={}",
+            key.namespace, key.name, key.uid, sandbox_id
+        ));
+        if let Some(message) = self.record_failure.lock().unwrap().clone() {
+            anyhow::bail!("{message}");
+        }
+        self.sandboxes.lock().unwrap().insert(
+            (key.namespace.clone(), key.name.clone(), key.uid.clone()),
+            sandbox_id.to_string(),
+        );
+        Ok(())
+    }
+
+    async fn get_sandbox_id(
+        &self,
+        key: &crate::runtime::PodRuntimeKey,
+    ) -> anyhow::Result<Option<String>> {
+        self.calls.lock().unwrap().push(format!(
+            "get_sandbox_id:{}/{}/{}",
+            key.namespace, key.name, key.uid
+        ));
+        if let Some(message) = self.lookup_failure.lock().unwrap().clone() {
+            anyhow::bail!("{message}");
+        }
+        Ok(self
+            .sandboxes
+            .lock()
+            .unwrap()
+            .get(&(key.namespace.clone(), key.name.clone(), key.uid.clone()))
+            .cloned())
+    }
+
+    async fn delete_sandbox(&self, key: &crate::runtime::PodRuntimeKey) -> anyhow::Result<()> {
+        self.calls.lock().unwrap().push(format!(
+            "delete_sandbox:{}/{}/{}",
+            key.namespace, key.name, key.uid
+        ));
+        self.sandboxes.lock().unwrap().remove(&(
+            key.namespace.clone(),
+            key.name.clone(),
+            key.uid.clone(),
+        ));
+        Ok(())
+    }
+}
+
+// --- MockPodSlotAdmission ---
+
+pub struct MockPodSlotAdmission {
+    calls: Mutex<Vec<String>>,
+    slot_tx: tokio::sync::broadcast::Sender<klights_node_store::PodSlotAdmissionEvent>,
+    admitted: Mutex<bool>,
+}
+
+struct MockPodSlotSubscription {
+    receiver: tokio::sync::broadcast::Receiver<klights_node_store::PodSlotAdmissionEvent>,
+}
+
+impl klights_node_store::PodSlotEventSubscription for MockPodSlotSubscription {
+    fn next_event(
+        &mut self,
+    ) -> klights_node_store::RuntimeWorkFuture<'_, Option<klights_node_store::PodSlotAdmissionEvent>>
+    {
+        Box::pin(async move {
+            match self.receiver.recv().await {
+                Ok(event) => Ok(Some(event)),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => Ok(None),
+                Err(error) => Err(klights_node_store::RuntimeWorkError::retryable(
+                    error.to_string(),
+                )),
+            }
+        })
+    }
+}
+
+impl Default for MockPodSlotAdmission {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MockPodSlotAdmission {
+    pub fn new() -> Self {
+        let (slot_tx, _) = tokio::sync::broadcast::channel(16);
+        Self {
+            calls: Mutex::new(Vec::new()),
+            slot_tx,
+            admitted: Mutex::new(true),
+        }
+    }
+
+    pub fn set_admitted(&self, admitted: bool) {
+        *self.admitted.lock().unwrap() = admitted;
+    }
+
+    pub fn clear_calls(&self) {
+        self.calls.lock().unwrap().clear();
+    }
+
+    pub fn recorded_calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::runtime::store::PodSlotAdmission for MockPodSlotAdmission {
+    fn subscribe(&self) -> Box<dyn klights_node_store::PodSlotEventSubscription> {
+        Box::new(MockPodSlotSubscription {
+            receiver: self.slot_tx.subscribe(),
+        })
+    }
+
+    async fn try_admit(
+        &self,
+        key: &crate::runtime::PodRuntimeKey,
+        node_name: &str,
+    ) -> anyhow::Result<klights_node_store::PodSlotAdmissionResult> {
+        self.calls.lock().unwrap().push(format!(
+            "try_admit:{}/{}/{}@{}",
+            key.namespace, key.name, key.uid, node_name
+        ));
+        if *self.admitted.lock().unwrap() {
+            Ok(klights_node_store::PodSlotAdmissionResult::Admitted {
+                observed_pod_version: klights_node_store::ObservedPodVersion::try_new(1)?,
+            })
+        } else {
+            Ok(klights_node_store::PodSlotAdmissionResult::Blocked {
+                blocking_uid: "blocker-uid".into(),
+                blocking_node: "blocker-node".into(),
+                state: klights_node_store::PodSlotAdmissionState::Terminating,
+                observed_pod_version: klights_node_store::ObservedPodVersion::try_new(1)?,
+            })
+        }
+    }
+
+    async fn clear_slot(&self, key: &crate::runtime::PodRuntimeKey) -> anyhow::Result<()> {
+        self.calls.lock().unwrap().push(format!(
+            "clear_slot:{}/{}/{}",
+            key.namespace, key.name, key.uid
+        ));
+        Ok(())
+    }
+}
+// --- MockPodRuntimeService ---
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MockRuntimeCall {
+    StartPod {
+        namespace: String,
+        name: String,
+        uid: String,
+        /// Pod snapshot passed to start_pod; None when no pod was carried.
+        has_pod: bool,
+        /// Whether the cancellation token was triggered (cancel was signalled).
+        cancelled: bool,
+    },
+    StopPod {
+        namespace: String,
+        name: String,
+        uid: String,
+        sandbox_id: Option<String>,
+    },
+    FinalizeStartup {
+        namespace: String,
+        name: String,
+        uid: String,
+        has_pod: bool,
+        sandbox_id_hint: Option<String>,
+    },
+    FinalizeDeletion {
+        namespace: String,
+        name: String,
+        uid: String,
+    },
+    ReconcileRuntime {
+        namespace: String,
+        name: String,
+        uid: String,
+        hint_container_ids: Vec<String>,
+    },
+    ReconcileCriLeftovers {
+        namespace: String,
+        name: String,
+        uid: String,
+    },
+    ReconcileEphemeral {
+        namespace: String,
+        name: String,
+        uid: String,
+    },
+    CheckSlotAdmission {
+        namespace: String,
+        name: String,
+        uid: String,
+        has_pod: bool,
+        resource_version: Option<i64>,
+        start_after_admit: bool,
+        operation_id: u64,
+        cancelled: bool,
+    },
+    HandleCommand {
+        command_name: String,
+    },
+    ScheduleRetry {
+        namespace: String,
+        name: String,
+        uid: String,
+        delay_ms: u128,
+    },
+    ScheduleStartPodRetry {
+        namespace: String,
+        name: String,
+        uid: String,
+        delay_ms: u128,
+        attempt: u32,
+        error_message: String,
+    },
+}
+
+impl MockRuntimeCall {
+    fn from_key(op: &str, key: &PodRuntimeKey) -> Self {
+        let (namespace, name, uid) = (key.namespace.clone(), key.name.clone(), key.uid.clone());
+        match op {
+            "start_pod" => MockRuntimeCall::StartPod {
+                namespace,
+                name,
+                uid,
+                has_pod: false,
+                cancelled: false,
+            },
+            "stop_pod" => MockRuntimeCall::StopPod {
+                namespace,
+                name,
+                uid,
+                sandbox_id: None,
+            },
+            "finalize_startup" => MockRuntimeCall::FinalizeStartup {
+                namespace,
+                name,
+                uid,
+                has_pod: false,
+                sandbox_id_hint: None,
+            },
+            "finalize_deletion" => MockRuntimeCall::FinalizeDeletion {
+                namespace,
+                name,
+                uid,
+            },
+            "reconcile_runtime" => MockRuntimeCall::ReconcileRuntime {
+                namespace,
+                name,
+                uid,
+                hint_container_ids: vec![],
+            },
+            "reconcile_cri_leftovers" => MockRuntimeCall::ReconcileCriLeftovers {
+                namespace,
+                name,
+                uid,
+            },
+            "reconcile_ephemeral" => MockRuntimeCall::ReconcileEphemeral {
+                namespace,
+                name,
+                uid,
+            },
+            _ => panic!("unknown runtime call kind"),
+        }
+    }
+}
+
+/// Recording mock for `PodRuntimeService`. Every method records its call
+/// with UID-keyed arguments. Start and deletion-finalize results are
+/// configurable; per-method error injection is supported.
+pub struct MockPodRuntimeService {
+    calls: Mutex<Vec<MockRuntimeCall>>,
+    start_result: Mutex<PodStartResult>,
+    finalize_startup_result: Mutex<PodFinalizeStartupResult>,
+    finalize_result: Mutex<PodDeletionFinalizeResult>,
+    fail_method: Mutex<Option<String>>,
+    /// When set, `stop_pod` returns a typed `PodOwnershipError` instead of
+    /// the generic injected failure. Used to exercise the lifecycle
+    /// executor's ownership-mismatch classification (P0 StopPod loop).
+    stop_ownership_error: Mutex<Option<crate::runtime::PodOwnershipError>>,
+    /// CancellationToken captured from the last `start_pod` call; cloned
+    /// into the mock so tests can signal cancellation externally.
+    start_pod_cancel: Mutex<Option<CancellationToken>>,
+}
+
+impl Default for MockPodRuntimeService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MockPodRuntimeService {
+    pub fn new() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            start_result: Mutex::new(PodStartResult::Started { sandbox_id: None }),
+            finalize_startup_result: Mutex::new(PodFinalizeStartupResult::Unconfirmed),
+            finalize_result: Mutex::new(PodDeletionFinalizeResult::DeletedOrAlreadyGone),
+            fail_method: Mutex::new(None),
+            stop_ownership_error: Mutex::new(None),
+            start_pod_cancel: Mutex::new(None),
+        }
+    }
+
+    pub fn set_start_result(&self, result: PodStartResult) {
+        *self.start_result.lock().unwrap() = result;
+    }
+
+    pub fn set_finalize_result(&self, result: PodDeletionFinalizeResult) {
+        *self.finalize_result.lock().unwrap() = result;
+    }
+
+    pub fn set_finalize_startup_result(&self, result: PodFinalizeStartupResult) {
+        *self.finalize_startup_result.lock().unwrap() = result;
+    }
+
+    /// Cause the next call to the named method to return an error.
+    pub fn set_fail_method(&self, method_name: &str) {
+        *self.fail_method.lock().unwrap() = Some(method_name.to_string());
+    }
+
+    /// Cause the next `stop_pod` call to fail with a typed `PodOwnershipError`
+    /// (terminal/non-retryable) instead of a generic injected failure.
+    pub fn set_stop_pod_ownership_error(&self, local_node: &str, target_node: Option<&str>) {
+        *self.stop_ownership_error.lock().unwrap() = Some(crate::runtime::PodOwnershipError {
+            local_node: local_node.to_string(),
+            target_node: target_node.map(|s| s.to_string()),
+        });
+    }
+
+    pub fn recorded_calls(&self) -> Vec<MockRuntimeCall> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    /// Take the `CancellationToken` captured from the last `start_pod` call.
+    pub fn take_start_pod_cancel(&self) -> Option<CancellationToken> {
+        self.start_pod_cancel.lock().unwrap().take()
+    }
+
+    fn check_fail(&self, method: &str) -> anyhow::Result<()> {
+        if let Some(ref f) = *self.fail_method.lock().unwrap()
+            && f == method
+        {
+            anyhow::bail!("injected failure for: {}", method);
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl PodRuntimeService for MockPodRuntimeService {
+    async fn start_pod(
+        &self,
+        key: PodRuntimeKey,
+        pod: Option<serde_json::Value>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<PodStartResult> {
+        self.check_fail("start_pod")?;
+        // Store cancel token so tests can signal cancellation.
+        *self.start_pod_cancel.lock().unwrap() = Some(cancel.clone());
+        self.calls.lock().unwrap().push(MockRuntimeCall::StartPod {
+            namespace: key.namespace.clone(),
+            name: key.name.clone(),
+            uid: key.uid.clone(),
+            has_pod: pod.is_some(),
+            cancelled: cancel.is_cancelled(),
+        });
+        Ok(self.start_result.lock().unwrap().clone())
+    }
+
+    async fn stop_pod(
+        &self,
+        key: PodRuntimeKey,
+        _pod: Option<serde_json::Value>,
+        sandbox_id: Option<String>,
+    ) -> anyhow::Result<()> {
+        if let Some(own) = self.stop_ownership_error.lock().unwrap().take() {
+            self.calls.lock().unwrap().push(MockRuntimeCall::StopPod {
+                namespace: key.namespace.clone(),
+                name: key.name.clone(),
+                uid: key.uid.clone(),
+                sandbox_id,
+            });
+            return Err(anyhow::Error::new(own));
+        }
+        self.check_fail("stop_pod")?;
+        self.calls.lock().unwrap().push(MockRuntimeCall::StopPod {
+            namespace: key.namespace.clone(),
+            name: key.name.clone(),
+            uid: key.uid.clone(),
+            sandbox_id,
+        });
+        Ok(())
+    }
+
+    async fn finalize_startup(
+        &self,
+        key: PodRuntimeKey,
+        pod: Option<serde_json::Value>,
+        sandbox_id_hint: Option<String>,
+    ) -> anyhow::Result<PodFinalizeStartupResult> {
+        self.check_fail("finalize_startup")?;
+        self.calls
+            .lock()
+            .unwrap()
+            .push(MockRuntimeCall::FinalizeStartup {
+                namespace: key.namespace.clone(),
+                name: key.name.clone(),
+                uid: key.uid.clone(),
+                has_pod: pod.is_some(),
+                sandbox_id_hint,
+            });
+        Ok(self.finalize_startup_result.lock().unwrap().clone())
+    }
+
+    async fn finalize_deletion(
+        &self,
+        key: PodRuntimeKey,
+    ) -> anyhow::Result<PodDeletionFinalizeResult> {
+        self.check_fail("finalize_deletion")?;
+        self.calls
+            .lock()
+            .unwrap()
+            .push(MockRuntimeCall::from_key("finalize_deletion", &key));
+        Ok(self.finalize_result.lock().unwrap().clone())
+    }
+
+    async fn reconcile_runtime(
+        &self,
+        key: PodRuntimeKey,
+        hint: crate::runtime::RuntimeReconcileHint,
+    ) -> anyhow::Result<()> {
+        self.check_fail("reconcile_runtime")?;
+        self.calls
+            .lock()
+            .unwrap()
+            .push(MockRuntimeCall::ReconcileRuntime {
+                namespace: key.namespace.clone(),
+                name: key.name.clone(),
+                uid: key.uid.clone(),
+                hint_container_ids: hint.container_ids().map(str::to_string).collect(),
+            });
+        Ok(())
+    }
+
+    async fn reconcile_cri_leftovers(&self, key: PodRuntimeKey) -> anyhow::Result<()> {
+        self.check_fail("reconcile_cri_leftovers")?;
+        self.calls
+            .lock()
+            .unwrap()
+            .push(MockRuntimeCall::from_key("reconcile_cri_leftovers", &key));
+        Ok(())
+    }
+
+    async fn reconcile_ephemeral(
+        &self,
+        key: PodRuntimeKey,
+        _pod: Option<serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        self.check_fail("reconcile_ephemeral")?;
+        self.calls
+            .lock()
+            .unwrap()
+            .push(MockRuntimeCall::from_key("reconcile_ephemeral", &key));
+        Ok(())
+    }
+
+    async fn handle_lifecycle_command(&self, command: LifecycleCommand) -> anyhow::Result<()> {
+        self.check_fail("handle_lifecycle_command")?;
+        self.calls
+            .lock()
+            .unwrap()
+            .push(MockRuntimeCall::HandleCommand {
+                command_name: format!("{:?}", command).chars().take(60).collect(),
+            });
+        Ok(())
+    }
+
+    async fn check_slot_admission(
+        &self,
+        request: crate::runtime::PodSlotAdmissionRequest,
+        reply_to: crate::pod_lifecycle_router::LifecycleReplyHandle,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
+        self.check_fail("check_slot_admission")?;
+        let crate::runtime::PodSlotAdmissionRequest {
+            key,
+            pod,
+            resource_version,
+            start_after_admit,
+            operation_id,
+        } = request;
+        self.calls
+            .lock()
+            .unwrap()
+            .push(MockRuntimeCall::CheckSlotAdmission {
+                namespace: key.namespace.clone(),
+                name: key.name.clone(),
+                uid: key.uid.clone(),
+                has_pod: !pod.is_null(),
+                resource_version,
+                start_after_admit,
+                operation_id,
+                cancelled: cancel.is_cancelled(),
+            });
+        let _ = reply_to
+            .route(
+                crate::pod_lifecycle_core::message::LifecycleMessage::SlotAdmissionGranted {
+                    key: crate::pod_lifecycle_core::message::PodLifecycleKey::new(
+                        &key.namespace,
+                        &key.name,
+                        &key.uid,
+                    ),
+                    operation_id,
+                    pod,
+                    resource_version,
+                    start_after_admit,
+                },
+            )
+            .await;
+        Ok(())
+    }
+
+    async fn schedule_retry(
+        &self,
+        key: PodRuntimeKey,
+        delay: std::time::Duration,
+        _reply_to: crate::pod_lifecycle_router::LifecycleReplyHandle,
+    ) -> anyhow::Result<()> {
+        self.check_fail("schedule_retry")?;
+        self.calls
+            .lock()
+            .unwrap()
+            .push(MockRuntimeCall::ScheduleRetry {
+                namespace: key.namespace,
+                name: key.name,
+                uid: key.uid,
+                delay_ms: delay.as_millis(),
+            });
+        Ok(())
+    }
+
+    async fn schedule_start_pod_retry(
+        &self,
+        key: PodRuntimeKey,
+        delay: std::time::Duration,
+        error_message: String,
+        attempt: u32,
+        _reply_to: crate::pod_lifecycle_router::LifecycleReplyHandle,
+    ) -> anyhow::Result<()> {
+        self.check_fail("schedule_start_pod_retry")?;
+        self.calls
+            .lock()
+            .unwrap()
+            .push(MockRuntimeCall::ScheduleStartPodRetry {
+                namespace: key.namespace,
+                name: key.name,
+                uid: key.uid,
+                delay_ms: delay.as_millis(),
+                attempt,
+                error_message,
+            });
+        Ok(())
+    }
+}
+// --- MockPodDeletionFinalizer ---
+
+/// Mock deletion finalizer for testing actor finalization paths.
+pub struct MockPodDeletionFinalizer {
+    calls: Mutex<Vec<PodRuntimeKey>>,
+    pub outcome: Mutex<PodDeletionFinalizeResult>,
+    pub fail: Mutex<Option<String>>,
+}
+
+impl Default for MockPodDeletionFinalizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MockPodDeletionFinalizer {
+    pub fn new() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            outcome: Mutex::new(PodDeletionFinalizeResult::DeletedOrAlreadyGone),
+            fail: Mutex::new(None),
+        }
+    }
+
+    pub fn recorded_calls(&self) -> Vec<PodRuntimeKey> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    pub fn set_outcome(&self, outcome: PodDeletionFinalizeResult) {
+        *self.outcome.lock().unwrap() = outcome;
+    }
+
+    pub fn set_fail(&self, msg: &str) {
+        *self.fail.lock().unwrap() = Some(msg.to_string());
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::pod_deletion_finalizer::PodDeletionFinalizer for MockPodDeletionFinalizer {
+    async fn finalize_after_actor_cleanup(
+        &self,
+        key: &PodRuntimeKey,
+    ) -> anyhow::Result<PodDeletionFinalizeResult> {
+        self.calls.lock().unwrap().push(key.clone());
+        if let Some(ref msg) = *self.fail.lock().unwrap() {
+            anyhow::bail!("{}", msg);
+        }
+        Ok(self.outcome.lock().unwrap().clone())
+    }
+}
+// --- MockEnvSourceReader ---
+
+type EnvSourceKey = (String, String);
+
+/// Recording mock for env source lookups. Backed only by in-memory maps.
+pub struct MockEnvSourceReader {
+    calls: Mutex<Vec<String>>,
+    secrets: Mutex<HashMap<EnvSourceKey, klights_cluster_core::Resource>>,
+    config_maps: Mutex<HashMap<EnvSourceKey, klights_cluster_core::Resource>>,
+    services: Mutex<HashMap<String, Vec<klights_cluster_core::Resource>>>,
+}
+
+impl Default for MockEnvSourceReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MockEnvSourceReader {
+    pub fn new() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            secrets: Mutex::new(HashMap::new()),
+            config_maps: Mutex::new(HashMap::new()),
+            services: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn recorded_calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    pub fn insert_secret(&self, namespace: &str, name: &str, data: Value) {
+        self.secrets.lock().unwrap().insert(
+            (namespace.to_string(), name.to_string()),
+            Self::resource("v1", "Secret", namespace, name, data),
+        );
+    }
+
+    pub fn insert_config_map(&self, namespace: &str, name: &str, data: Value) {
+        self.config_maps.lock().unwrap().insert(
+            (namespace.to_string(), name.to_string()),
+            Self::resource("v1", "ConfigMap", namespace, name, data),
+        );
+    }
+
+    pub fn insert_service(&self, namespace: &str, name: &str, data: Value) {
+        self.services
+            .lock()
+            .unwrap()
+            .entry(namespace.to_string())
+            .or_default()
+            .push(Self::resource("v1", "Service", namespace, name, data));
+    }
+
+    fn resource(
+        api_version: &str,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+        mut data: Value,
+    ) -> klights_cluster_core::Resource {
+        if let Some(obj) = data.as_object_mut() {
+            obj.entry("apiVersion".to_string())
+                .or_insert_with(|| json!(api_version));
+            obj.entry("kind".to_string()).or_insert_with(|| json!(kind));
+            let metadata = obj
+                .entry("metadata".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(meta) = metadata.as_object_mut() {
+                meta.entry("namespace".to_string())
+                    .or_insert_with(|| json!(namespace));
+                meta.entry("name".to_string())
+                    .or_insert_with(|| json!(name));
+            }
+        }
+        klights_cluster_core::Resource {
+            id: 0,
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            namespace: Some(namespace.to_string()),
+            name: name.to_string(),
+            uid: format!("{namespace}-{name}-uid"),
+            data: std::sync::Arc::new(data),
+            resource_version: 1,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::pod_env::EnvSourceReader for MockEnvSourceReader {
+    async fn secret(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("secret:{namespace}/{name}"));
+        Ok(self
+            .secrets
+            .lock()
+            .unwrap()
+            .get(&(namespace.to_string(), name.to_string()))
+            .cloned())
+    }
+
+    async fn config_map(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("config_map:{namespace}/{name}"));
+        Ok(self
+            .config_maps
+            .lock()
+            .unwrap()
+            .get(&(namespace.to_string(), name.to_string()))
+            .cloned())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::pod_service_envs::ServiceEnvSource for MockEnvSourceReader {
+    async fn services(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("services:{namespace}"));
+        Ok(self
+            .services
+            .lock()
+            .unwrap()
+            .get(namespace)
+            .cloned()
+            .unwrap_or_default())
+    }
+}
+// --- MockPodHookRuntime ---
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MockHookCall {
+    pub hook_type: String,
+    pub container_id: String,
+    pub pod_ip: String,
+}
+
+pub struct MockPodHookRuntime {
+    calls: Mutex<Vec<MockHookCall>>,
+    outcome: Mutex<crate::runtime::hooks::HookOutcome>,
+}
+
+impl Default for MockPodHookRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MockPodHookRuntime {
+    pub fn new() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            outcome: Mutex::new(crate::runtime::hooks::HookOutcome::Succeeded),
+        }
+    }
+
+    pub fn set_outcome(&self, outcome: crate::runtime::hooks::HookOutcome) {
+        *self.outcome.lock().unwrap() = outcome;
+    }
+
+    pub fn recorded_calls(&self) -> Vec<MockHookCall> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::runtime::hooks::PodHookRuntime for MockPodHookRuntime {
+    async fn execute_post_start(
+        &self,
+        container_id: &str,
+        pod_ip: &str,
+        _hook: &serde_json::Value,
+        _container_spec: &serde_json::Value,
+    ) -> anyhow::Result<crate::runtime::hooks::HookOutcome> {
+        self.calls.lock().unwrap().push(MockHookCall {
+            hook_type: "postStart".to_string(),
+            container_id: container_id.to_string(),
+            pod_ip: pod_ip.to_string(),
+        });
+        Ok(self.outcome.lock().unwrap().clone())
+    }
+
+    async fn execute_pre_stop(
+        &self,
+        container_id: &str,
+        pod_ip: &str,
+        _hook: &serde_json::Value,
+        _container_spec: &serde_json::Value,
+    ) -> anyhow::Result<crate::runtime::hooks::HookOutcome> {
+        self.calls.lock().unwrap().push(MockHookCall {
+            hook_type: "preStop".to_string(),
+            container_id: container_id.to_string(),
+            pod_ip: pod_ip.to_string(),
+        });
+        Ok(self.outcome.lock().unwrap().clone())
     }
 }
 

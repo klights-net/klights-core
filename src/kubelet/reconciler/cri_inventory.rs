@@ -504,7 +504,7 @@ pub mod tests {
     /// dir/cgroup/volumes), NOT a CRI-only sandbox teardown.
     #[tokio::test]
     async fn cleanup_cold_sandbox_with_identity_routes_to_orphan_finalize() {
-        use crate::kubelet::pod_runtime::test_support::{MockCriOperation, MockCriRuntime};
+        use klights_kubelet::runtime::test_support::{MockCriOperation, MockCriRuntime};
 
         let (router, recorder) = actor_router_with_recorder();
         let cri = MockCriRuntime::new();
@@ -545,7 +545,7 @@ pub mod tests {
     /// falls back to a direct CRI sandbox teardown.
     #[tokio::test]
     async fn cleanup_cold_sandbox_without_identity_tears_down_cri_only() {
-        use crate::kubelet::pod_runtime::test_support::{MockCriOperation, MockCriRuntime};
+        use klights_kubelet::runtime::test_support::{MockCriOperation, MockCriRuntime};
 
         let (router, recorder) = actor_router_with_recorder();
         let cri = MockCriRuntime::new();

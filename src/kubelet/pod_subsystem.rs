@@ -401,7 +401,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let runtime_service =
-            Arc::new(crate::kubelet::pod_runtime::test_support::MockPodRuntimeService::new());
+            Arc::new(klights_kubelet::runtime::test_support::MockPodRuntimeService::new());
         let supervisor = fixture_supervisor();
         let side_effects = Arc::new(SideEffectRegistry::new());
         let metrics = SideEffectMetrics::new();
@@ -448,11 +448,11 @@ mod tests {
             service_router: None,
             runtime_service: Some(runtime_service),
             runtime_store: Arc::new(
-                crate::kubelet::pod_runtime::test_support::MockPodRuntimeStore::new(),
+                klights_kubelet::runtime::test_support::MockPodRuntimeStore::new(),
             ),
             wall_clock: Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             slot_admission: Arc::new(
-                crate::kubelet::pod_runtime::test_support::MockPodSlotAdmission::new(),
+                klights_kubelet::runtime::test_support::MockPodSlotAdmission::new(),
             ),
             event_sink: Arc::new(crate::bootstrap::kubelet_ports::RootPodEventSink::new(
                 None,
@@ -534,7 +534,7 @@ mod tests {
     async fn pod_subsystem_accepts_injected_runtime_service() {
         let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let injected =
-            Arc::new(crate::kubelet::pod_runtime::test_support::MockPodRuntimeService::new())
+            Arc::new(klights_kubelet::runtime::test_support::MockPodRuntimeService::new())
                 as Arc<dyn PodRuntimeService>;
         let mut config = fixture_config(db);
         config.runtime_service = Some(injected.clone());

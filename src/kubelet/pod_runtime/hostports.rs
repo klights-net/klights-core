@@ -299,3 +299,121 @@ mod tests {
         assert!(format!("{err:#}").contains("hostPort 21017/TCP is already allocated"));
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Mutex;
+
+    // --- MockHostPortRuntime ---
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) enum MockHostPortOp {
+        Add {
+            namespace: String,
+            name: String,
+            uid: String,
+        },
+        Remove {
+            namespace: String,
+            name: String,
+            uid: String,
+        },
+        Check {
+            namespace: String,
+            name: String,
+            uid: String,
+        },
+    }
+
+    pub(crate) struct MockHostPortRuntime {
+        calls: Mutex<Vec<MockHostPortOp>>,
+        check_error: Mutex<Option<String>>,
+        add_error: Mutex<Option<String>>,
+        hang_add: Mutex<bool>,
+    }
+
+    impl Default for MockHostPortRuntime {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl MockHostPortRuntime {
+        pub(crate) fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                check_error: Mutex::new(None),
+                add_error: Mutex::new(None),
+                hang_add: Mutex::new(false),
+            }
+        }
+
+        pub(crate) fn clear_calls(&self) {
+            self.calls.lock().unwrap().clear();
+        }
+
+        pub(crate) fn recorded_calls(&self) -> Vec<MockHostPortOp> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        pub(crate) fn reject_next_check(&self, message: &str) {
+            *self.check_error.lock().unwrap() = Some(message.to_string());
+        }
+
+        pub(crate) fn hang_add_host_ports(&self) {
+            *self.hang_add.lock().unwrap() = true;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::kubelet::pod_runtime::hostports::HostPortRuntime for MockHostPortRuntime {
+        async fn add_host_ports(
+            &self,
+            pod: &klights_network_api::PodHostPorts,
+        ) -> anyhow::Result<()> {
+            let key = pod.pod();
+            self.calls.lock().unwrap().push(MockHostPortOp::Add {
+                namespace: key.namespace.clone(),
+                name: key.name.clone(),
+                uid: key.uid.clone(),
+            });
+            if let Some(message) = self.add_error.lock().unwrap().take() {
+                anyhow::bail!("{message}");
+            }
+            let should_hang = *self.hang_add.lock().unwrap();
+            if should_hang {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+
+        async fn remove_host_ports(
+            &self,
+            pod: &klights_network_api::PodHostPorts,
+        ) -> anyhow::Result<()> {
+            let key = pod.pod();
+            self.calls.lock().unwrap().push(MockHostPortOp::Remove {
+                namespace: key.namespace.clone(),
+                name: key.name.clone(),
+                uid: key.uid.clone(),
+            });
+            Ok(())
+        }
+
+        async fn check_host_port_admission(
+            &self,
+            pod: &klights_network_api::PodHostPorts,
+        ) -> anyhow::Result<()> {
+            let key = pod.pod();
+            self.calls.lock().unwrap().push(MockHostPortOp::Check {
+                namespace: key.namespace.clone(),
+                name: key.name.clone(),
+                uid: key.uid.clone(),
+            });
+            if let Some(message) = self.check_error.lock().unwrap().take() {
+                anyhow::bail!("{message}");
+            }
+            Ok(())
+        }
+    }
+}

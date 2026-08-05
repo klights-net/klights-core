@@ -38,7 +38,5 @@ pub mod volumes;
 #[cfg(test)]
 pub mod parity;
 #[cfg(test)]
-pub mod test_support;
-#[cfg(test)]
 pub mod tests;
 pub mod types;

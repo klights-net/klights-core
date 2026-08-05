@@ -122,3 +122,155 @@ impl ProbeRuntime for RealProbeRuntime {
         Ok(())
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::kubelet::pod_runtime::service::PodRuntimeKey;
+    use std::sync::Mutex;
+
+    // --- MockProbeRuntime ---
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) enum MockProbeCall {
+        RecordStartedSandbox {
+            namespace: String,
+            name: String,
+            uid: String,
+            sandbox_id: String,
+        },
+        Start {
+            namespace: String,
+            name: String,
+            uid: String,
+            sandbox_id: String,
+        },
+        MarkStartedSandboxFinalized {
+            namespace: String,
+            name: String,
+            uid: String,
+            sandbox_id: String,
+        },
+        Stop {
+            namespace: String,
+            name: String,
+            uid: String,
+        },
+    }
+
+    pub(crate) struct MockProbeRuntime {
+        calls: Mutex<Vec<MockProbeCall>>,
+        started_sandboxes: Mutex<std::collections::HashMap<PodRuntimeKey, (String, bool)>>,
+    }
+
+    impl Default for MockProbeRuntime {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl MockProbeRuntime {
+        pub(crate) fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                started_sandboxes: Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+
+        pub(crate) fn clear_calls(&self) {
+            self.calls.lock().unwrap().clear();
+            self.started_sandboxes.lock().unwrap().clear();
+        }
+
+        pub(crate) fn recorded_calls(&self) -> Vec<MockProbeCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::kubelet::pod_runtime::probes::ProbeRuntime for MockProbeRuntime {
+        async fn record_started_sandbox(
+            &self,
+            key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+            sandbox_id: &str,
+        ) -> anyhow::Result<crate::kubelet::pod_runtime::probes::StartupFinalizationAction>
+        {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(MockProbeCall::RecordStartedSandbox {
+                    namespace: key.namespace.clone(),
+                    name: key.name.clone(),
+                    uid: key.uid.clone(),
+                    sandbox_id: sandbox_id.to_string(),
+                });
+            let mut started_sandboxes = self.started_sandboxes.lock().unwrap();
+            match started_sandboxes.get_mut(key) {
+                Some((existing_sandbox_id, finalized))
+                    if existing_sandbox_id == sandbox_id && *finalized =>
+                {
+                    Ok(crate::kubelet::pod_runtime::probes::StartupFinalizationAction::AlreadyFinalized)
+                }
+                Some((existing_sandbox_id, finalized)) => {
+                    *existing_sandbox_id = sandbox_id.to_string();
+                    *finalized = false;
+                    Ok(crate::kubelet::pod_runtime::probes::StartupFinalizationAction::RunFinalizers)
+                }
+                None => {
+                    started_sandboxes.insert(key.clone(), (sandbox_id.to_string(), false));
+                    Ok(crate::kubelet::pod_runtime::probes::StartupFinalizationAction::RunFinalizers)
+                }
+            }
+        }
+
+        async fn start_probes(
+            &self,
+            key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+            sandbox_id: &str,
+            _pod: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push(MockProbeCall::Start {
+                namespace: key.namespace.clone(),
+                name: key.name.clone(),
+                uid: key.uid.clone(),
+                sandbox_id: sandbox_id.to_string(),
+            });
+            Ok(())
+        }
+
+        async fn mark_started_sandbox_finalized(
+            &self,
+            key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+            sandbox_id: &str,
+        ) -> anyhow::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(MockProbeCall::MarkStartedSandboxFinalized {
+                    namespace: key.namespace.clone(),
+                    name: key.name.clone(),
+                    uid: key.uid.clone(),
+                    sandbox_id: sandbox_id.to_string(),
+                });
+            if let Some((existing_sandbox_id, finalized)) =
+                self.started_sandboxes.lock().unwrap().get_mut(key)
+                && existing_sandbox_id == sandbox_id
+            {
+                *finalized = true;
+            }
+            Ok(())
+        }
+
+        async fn stop_probes(
+            &self,
+            key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+        ) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push(MockProbeCall::Stop {
+                namespace: key.namespace.clone(),
+                name: key.name.clone(),
+                uid: key.uid.clone(),
+            });
+            self.started_sandboxes.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+}

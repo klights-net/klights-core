@@ -67,8 +67,6 @@ pub mod volumes;
 mod node_conditions_tests;
 #[cfg(test)]
 mod phase15b2_red_tests;
-#[cfg(test)]
-mod test_support;
 
 #[cfg(any(test, feature = "test-support"))]
 mod phase15d_test_support;

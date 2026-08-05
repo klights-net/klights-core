@@ -258,3 +258,81 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Mutex;
+
+    // --- MockPodVolumeRuntime ---
+
+    pub(crate) struct MockPodVolumeRuntime {
+        calls: Mutex<Vec<String>>,
+        process_error: Mutex<Option<String>>,
+        hang_process: Mutex<bool>,
+    }
+
+    impl Default for MockPodVolumeRuntime {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl MockPodVolumeRuntime {
+        pub(crate) fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                process_error: Mutex::new(None),
+                hang_process: Mutex::new(false),
+            }
+        }
+
+        pub(crate) fn clear_calls(&self) {
+            self.calls.lock().unwrap().clear();
+        }
+
+        pub(crate) fn fail_process_volumes(&self, message: impl Into<String>) {
+            *self.process_error.lock().unwrap() = Some(message.into());
+        }
+
+        pub(crate) fn hang_process_volumes(&self) {
+            *self.hang_process.lock().unwrap() = true;
+        }
+
+        pub(crate) fn recorded_calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::kubelet::pod_runtime::volumes::PodVolumeRuntime for MockPodVolumeRuntime {
+        async fn process_volumes(
+            &self,
+            key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+            _pod: &serde_json::Value,
+        ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+            self.calls.lock().unwrap().push(format!(
+                "process_volumes:{}/{}/{}",
+                key.namespace, key.name, key.uid
+            ));
+            if let Some(message) = self.process_error.lock().unwrap().take() {
+                anyhow::bail!("{message}");
+            }
+            let should_hang = *self.hang_process.lock().unwrap();
+            if should_hang {
+                std::future::pending::<()>().await;
+            }
+            Ok(std::collections::HashMap::new())
+        }
+
+        async fn cleanup_volumes(
+            &self,
+            key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+        ) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "cleanup_volumes:{}/{}/{}",
+                key.namespace, key.name, key.uid
+            ));
+            Ok(())
+        }
+    }
+}

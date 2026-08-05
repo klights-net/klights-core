@@ -977,8 +977,8 @@ mod tests {
     // ── Task 13.4: backend pluggability seam ──
 
     use crate::pod_lifecycle_core::action::PodAction;
+    use crate::runtime::test_support::MockPodRuntimeService;
     use crate::runtime::{PodRuntimeKey, PodRuntimeService};
-    use crate::test_support::MockPodRuntimeService;
     use tokio_util::sync::CancellationToken;
 
     /// Test-only backend that proves a third backend can be added without
@@ -1114,7 +1114,7 @@ mod tests {
         let calls = mock_runtime.recorded_calls();
         assert_eq!(calls.len(), 1, "runtime must receive exactly one call");
         match &calls[0] {
-            crate::test_support::MockRuntimeCall::StartPod {
+            crate::runtime::test_support::MockRuntimeCall::StartPod {
                 namespace,
                 name,
                 uid,

@@ -2,26 +2,34 @@
 
 use k8s_cri::v1::PodSandboxConfig;
 
+use crate::kubelet::pod_cluster_runtime::{FakeCluster, FakeNode};
 use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
 use crate::kubelet::pod_runtime::events::PodEventSink;
+use crate::kubelet::pod_runtime::events::test_support::MockPodEventSink;
 use crate::kubelet::pod_runtime::filesystem::PodFilesystem;
+use crate::kubelet::pod_runtime::filesystem::test_support::MockPodFilesystem;
 use crate::kubelet::pod_runtime::hooks::HookOutcome;
 use crate::kubelet::pod_runtime::hostports::HostPortRuntime;
+use crate::kubelet::pod_runtime::hostports::test_support::{MockHostPortOp, MockHostPortRuntime};
+use crate::kubelet::pod_runtime::network::test_support::{MockNetworkOp, MockPodNetworkRuntime};
 use crate::kubelet::pod_runtime::probes::ProbeRuntime;
+use crate::kubelet::pod_runtime::probes::test_support::{MockProbeCall, MockProbeRuntime};
 use crate::kubelet::pod_runtime::service::{
     PodDeletionFinalizeResult, PodOwnershipError, PodRuntimeKey, PodStartResult,
     RealPodRuntimeServiceDependencies,
 };
 use crate::kubelet::pod_runtime::service::{PodFinalizeStartupResult, PodRuntimeService};
 use crate::kubelet::pod_runtime::store::{PodRuntimeStore, PodSlotAdmission};
-use crate::kubelet::pod_runtime::test_support::{
-    MockContainerRuntimeControl, MockPodDeletionFinalizer, MockPodHookRuntime,
-    MockPodRuntimeService, MockPodSlotAdmission, MockRuntimeCall,
-};
 use crate::kubelet::pod_runtime::volumes::PodVolumeRuntime;
+use crate::kubelet::pod_runtime::volumes::test_support::MockPodVolumeRuntime;
 use klights_kubelet::pod_env::EnvSourceReader;
 use klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey;
 use klights_kubelet::pod_service_envs::ServiceEnvSource;
+use klights_kubelet::runtime::test_support::{
+    MockContainerControlOp, MockContainerRuntimeControl, MockCriOperation, MockCriRuntime,
+    MockEnvSourceReader, MockPodDeletionFinalizer, MockPodHookRuntime, MockPodRuntimeService,
+    MockPodRuntimeStore, MockPodSlotAdmission, MockRuntimeCall,
+};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -64,13 +72,6 @@ async fn admit_runtime_key(
     )
     .await
     .expect("admit test runtime row");
-}
-
-#[test]
-fn pod_runtime_module_exports_only_declared_submodules() {
-    // This module only exports test_support and service; no production
-    // behaviour is leaked directly. This test exists to fail fast if
-    // someone adds uncontrolled re-exports to mod.rs.
 }
 
 // --- Task 1.2: PodRuntimeKey identity and result types ---
@@ -125,7 +126,7 @@ fn pod_runtime_service_methods_are_uid_keyed() {
 
 #[tokio::test]
 async fn real_runtime_schedule_retry_emits_retry_due_after_delay() {
-    let harness = crate::kubelet::pod_runtime::test_support::PodRuntimeHarness::new().await;
+    let harness = PodRuntimeHarness::new().await;
     let key = PodRuntimeKey::new("default", "retry-pod", "uid-retry");
     let (tx, mut rx) = tokio::sync::mpsc::channel::<
         klights_kubelet::pod_lifecycle_core::message::LifecycleMessage,
@@ -156,7 +157,7 @@ async fn real_runtime_schedule_retry_emits_retry_due_after_delay() {
 async fn real_runtime_schedule_start_pod_retry_writes_status_event_and_wakeup() {
     use crate::kubelet::pod_repository::PodReader;
 
-    let harness = crate::kubelet::pod_runtime::test_support::PodRuntimeHarness::new().await;
+    let harness = PodRuntimeHarness::new().await;
     let pod = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -232,7 +233,7 @@ async fn real_runtime_schedule_start_pod_retry_writes_status_event_and_wakeup() 
 async fn real_runtime_schedule_start_pod_retry_rejects_stale_uid_but_wakes() {
     use crate::kubelet::pod_repository::PodReader;
 
-    let harness = crate::kubelet::pod_runtime::test_support::PodRuntimeHarness::new().await;
+    let harness = PodRuntimeHarness::new().await;
     let pod = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -318,11 +319,6 @@ fn shared_cri_runtime_clones_client_per_call_without_mutex() {
 
 // --- Task 2.3: MockCriRuntime ---
 
-use crate::kubelet::pod_runtime::test_support::{
-    MockContainerControlOp, MockCriOperation, MockCriRuntime, MockHostPortOp, MockHostPortRuntime,
-    MockNetworkOp, MockPodEventSink, MockPodFilesystem, MockPodNetworkRuntime,
-    MockPodVolumeRuntime, MockProbeCall, MockProbeRuntime,
-};
 use klights_kubelet::runtime::cri::{ContainerRuntimeState, CriRuntime};
 
 #[tokio::test]
@@ -446,8 +442,6 @@ fn pod_network_runtime_release_carries_uid() {
 }
 
 // --- Task 3.2: PodRuntimeStore trait and mock ---
-
-use crate::kubelet::pod_runtime::test_support::MockPodRuntimeStore;
 
 #[test]
 fn pod_runtime_store_sandbox_methods_require_uid() {
@@ -603,7 +597,7 @@ fn filesystem_and_volume_ports_record_pod_identity_arguments() {
 async fn mock_filesystem_records_hosts_logs_cgroups_and_fsgroup() {
     let fs = MockPodFilesystem::new();
     let key = PodRuntimeKey::new("ns", "pod", "uid-1");
-    let pod = crate::kubelet::pod_runtime::test_support::pod_json("ns", "pod", "uid-1", "img");
+    let pod = klights_kubelet::runtime::test_support::pod_json("ns", "pod", "uid-1", "img");
 
     fs.write_hosts(&key, &pod).await.unwrap();
     fs.create_log_directory(&key).await.unwrap();
@@ -784,7 +778,7 @@ async fn fs_group_volume_ownership_with_parity() {
 async fn mock_volume_runtime_records_process_and_cleanup() {
     let vol = MockPodVolumeRuntime::new();
     let key = PodRuntimeKey::new("ns", "pod", "uid-1");
-    let pod = crate::kubelet::pod_runtime::test_support::pod_json("ns", "pod", "uid-1", "img");
+    let pod = klights_kubelet::runtime::test_support::pod_json("ns", "pod", "uid-1", "img");
 
     vol.process_volumes(&key, &pod).await.unwrap();
     vol.cleanup_volumes(&key).await.unwrap();
@@ -1121,7 +1115,7 @@ async fn fixture_pod_repository() -> std::sync::Arc<crate::kubelet::pod_reposito
     // These runtime tests place pods in conventional non-system namespaces. The
     // API create path enforces the upstream NamespaceLifecycle rule (target
     // namespace must exist), so seed them as a live cluster would have them.
-    crate::kubelet::pod_runtime::test_support::seed_runtime_test_namespaces(&handle).await;
+    seed_runtime_test_namespaces(&handle).await;
     std::mem::forget(ds);
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
@@ -1154,32 +1148,26 @@ async fn fixture_pod_repository() -> std::sync::Arc<crate::kubelet::pod_reposito
 async fn fixture_env_source(
     _node_name: &str,
 ) -> std::sync::Arc<dyn klights_kubelet::pod_env::EnvSourceReader> {
-    std::sync::Arc::new(crate::kubelet::pod_runtime::test_support::MockEnvSourceReader::new())
+    std::sync::Arc::new(MockEnvSourceReader::new())
 }
 
 #[tokio::test]
 async fn real_pod_runtime_service_constructor_requires_all_object_ports() {
     // Verify the constructor accepts and stores every required port.
     let cri = std::sync::Arc::new(MockCriRuntime::new());
-    let container_control = std::sync::Arc::new(
-        crate::kubelet::pod_runtime::test_support::MockContainerRuntimeControl::new(),
-    );
+    let container_control = std::sync::Arc::new(MockContainerRuntimeControl::new());
     let network = std::sync::Arc::new(MockPodNetworkRuntime::new());
     let store = std::sync::Arc::new(MockPodRuntimeStore::new());
-    let slot_admission =
-        std::sync::Arc::new(crate::kubelet::pod_runtime::test_support::MockPodSlotAdmission::new());
+    let slot_admission = std::sync::Arc::new(MockPodSlotAdmission::new());
     let repo = fixture_pod_repository().await;
     let filesystem = std::sync::Arc::new(MockPodFilesystem::new());
     let volumes = std::sync::Arc::new(MockPodVolumeRuntime::new());
     let probes = std::sync::Arc::new(MockProbeRuntime::new());
     let hostports = std::sync::Arc::new(MockHostPortRuntime::new());
     let events = std::sync::Arc::new(MockPodEventSink::new());
-    let hooks =
-        std::sync::Arc::new(crate::kubelet::pod_runtime::test_support::MockPodHookRuntime::new());
+    let hooks = std::sync::Arc::new(MockPodHookRuntime::new());
     let env_source = fixture_env_source("node-1").await;
-    let finalizer = std::sync::Arc::new(
-        crate::kubelet::pod_runtime::test_support::MockPodDeletionFinalizer::new(),
-    );
+    let finalizer = std::sync::Arc::new(MockPodDeletionFinalizer::new());
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
@@ -1227,7 +1215,7 @@ async fn real_pod_runtime_service_constructor_requires_all_object_ports() {
 #[tokio::test]
 async fn real_pod_runtime_service_constructs_from_mock_dependencies() {
     // Construct via the PodRuntimeHarness — verifies all mock wiring compiles.
-    let harness = crate::kubelet::pod_runtime::test_support::PodRuntimeHarness::new().await;
+    let harness = PodRuntimeHarness::new().await;
     harness
         .env_source
         .config_map("default", "missing")
@@ -1243,7 +1231,6 @@ async fn real_pod_runtime_service_constructs_from_mock_dependencies() {
 // --- Task 8.2: RealPodRuntimeService::start_pod identity/admission/status ---
 
 use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
-use crate::kubelet::pod_runtime::test_support::PodRuntimeHarness;
 
 struct SnapshotOnlyStartRepository {
     inner: Arc<crate::kubelet::pod_repository::PodRepository>,
@@ -1408,7 +1395,7 @@ impl crate::kubelet::pod_runtime::repository::PodRuntimeRepository for SnapshotO
 #[tokio::test]
 async fn real_runtime_start_pod_rejects_uid_mismatch_before_cri() {
     let harness = PodRuntimeHarness::new().await;
-    let pod = crate::kubelet::pod_runtime::test_support::pod_json(
+    let pod = klights_kubelet::runtime::test_support::pod_json(
         "ns",
         "test-pod",
         "correct-uid",
@@ -1448,12 +1435,8 @@ async fn real_runtime_start_pod_rejects_uid_mismatch_before_cri() {
 #[tokio::test]
 async fn real_runtime_start_pod_writes_pending_status_before_pull() {
     let harness = PodRuntimeHarness::new().await;
-    let pod = crate::kubelet::pod_runtime::test_support::pod_json(
-        "ns",
-        "test-pod",
-        "uid-1",
-        "nginx:latest",
-    );
+    let pod =
+        klights_kubelet::runtime::test_support::pod_json("ns", "test-pod", "uid-1", "nginx:latest");
 
     // Create pod in the repository.
     harness
@@ -1501,7 +1484,7 @@ async fn real_runtime_start_pod_writes_pending_status_before_pull() {
 #[tokio::test]
 async fn real_runtime_start_pod_uses_provided_snapshot_without_fresh_liveness_read() {
     let harness = PodRuntimeHarness::new().await;
-    let pod = crate::kubelet::pod_runtime::test_support::pod_json(
+    let pod = klights_kubelet::runtime::test_support::pod_json(
         "ns",
         "cached-pod",
         "uid-cache",
@@ -1569,7 +1552,7 @@ async fn real_runtime_start_pod_uses_provided_snapshot_without_fresh_liveness_re
 #[tokio::test]
 async fn real_runtime_start_pod_does_not_write_status_to_replacement_uid() {
     let harness = PodRuntimeHarness::new().await;
-    let old_pod = crate::kubelet::pod_runtime::test_support::pod_json(
+    let old_pod = klights_kubelet::runtime::test_support::pod_json(
         "ns",
         "test-pod",
         "old-uid",
@@ -1636,7 +1619,7 @@ async fn real_runtime_start_pod_does_not_write_status_to_replacement_uid() {
 use serde_json::{Value, json};
 
 fn pod_with_pull_policy(ns: &str, name: &str, uid: &str, image: &str, policy: &str) -> Value {
-    let mut p = crate::kubelet::pod_runtime::test_support::pod_json(ns, name, uid, image);
+    let mut p = klights_kubelet::runtime::test_support::pod_json(ns, name, uid, image);
     p["spec"]["containers"][0]["imagePullPolicy"] = json!(policy);
     p
 }
@@ -1865,7 +1848,7 @@ async fn real_runtime_start_pod_records_sandbox_and_reads_assignment() {
 async fn start_pod_recovery_skips_already_realized_running_sandbox_with_parity() {
     let harness = PodRuntimeHarness::new().await;
     let key = PodRuntimeKey::new("ns", "restart-survivor", "uid-restart");
-    let mut pod = crate::kubelet::pod_runtime::test_support::pod_json(
+    let mut pod = klights_kubelet::runtime::test_support::pod_json(
         &key.namespace,
         &key.name,
         &key.uid,
@@ -1955,7 +1938,7 @@ async fn start_pod_recovery_skips_already_realized_running_sandbox_with_parity()
 async fn start_pod_recovery_returns_failed_when_volume_reconcile_fails() {
     let harness = PodRuntimeHarness::new().await;
     let key = PodRuntimeKey::new("ns", "restart-survivor", "uid-restart");
-    let mut pod = crate::kubelet::pod_runtime::test_support::pod_json(
+    let mut pod = klights_kubelet::runtime::test_support::pod_json(
         &key.namespace,
         &key.name,
         &key.uid,
@@ -3826,7 +3809,6 @@ fn multi_node_traits_mutating_methods_require_uid() {
 // --- Task 11.2: FakeNode and FakeCluster test doubles ---
 
 use crate::kubelet::pod_cluster_runtime::{ClusterRuntimeView, NodeRuntimeView};
-use crate::kubelet::pod_runtime::test_support::{FakeCluster, FakeNode};
 
 #[test]
 fn fake_cluster_nodes_keep_runtime_arguments_isolated() {
@@ -3905,24 +3887,18 @@ async fn fixture_runtime_with_node(
 ) {
     let repo = fixture_pod_repository().await;
     let cri = std::sync::Arc::new(MockCriRuntime::new());
-    let container_control = std::sync::Arc::new(
-        crate::kubelet::pod_runtime::test_support::MockContainerRuntimeControl::new(),
-    );
+    let container_control = std::sync::Arc::new(MockContainerRuntimeControl::new());
     let network = std::sync::Arc::new(MockPodNetworkRuntime::new());
     let store = std::sync::Arc::new(MockPodRuntimeStore::new());
-    let slot_admission =
-        std::sync::Arc::new(crate::kubelet::pod_runtime::test_support::MockPodSlotAdmission::new());
+    let slot_admission = std::sync::Arc::new(MockPodSlotAdmission::new());
     let filesystem = std::sync::Arc::new(MockPodFilesystem::new());
     let volumes = std::sync::Arc::new(MockPodVolumeRuntime::new());
     let probes = std::sync::Arc::new(MockProbeRuntime::new());
     let hostports = std::sync::Arc::new(MockHostPortRuntime::new());
     let events = std::sync::Arc::new(MockPodEventSink::new());
-    let hooks =
-        std::sync::Arc::new(crate::kubelet::pod_runtime::test_support::MockPodHookRuntime::new());
+    let hooks = std::sync::Arc::new(MockPodHookRuntime::new());
     let env_source = fixture_env_source(node_name).await;
-    let finalizer = std::sync::Arc::new(
-        crate::kubelet::pod_runtime::test_support::MockPodDeletionFinalizer::new(),
-    );
+    let finalizer = std::sync::Arc::new(MockPodDeletionFinalizer::new());
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
@@ -3972,7 +3948,7 @@ async fn fixture_runtime_with_node(
     (cri, runtime, repo)
 }
 
-use crate::kubelet::pod_runtime::test_support::scheduled_pod_json;
+use klights_kubelet::runtime::test_support::scheduled_pod_json;
 
 #[tokio::test]
 async fn worker_runtime_starts_local_pod_and_does_not_touch_leader_cri() {
@@ -4102,24 +4078,18 @@ async fn fixture_runtime_with_cluster(
 ) {
     let repo = fixture_pod_repository().await;
     let cri = std::sync::Arc::new(MockCriRuntime::new());
-    let container_control = std::sync::Arc::new(
-        crate::kubelet::pod_runtime::test_support::MockContainerRuntimeControl::new(),
-    );
+    let container_control = std::sync::Arc::new(MockContainerRuntimeControl::new());
     let network = std::sync::Arc::new(MockPodNetworkRuntime::new());
     let store = std::sync::Arc::new(MockPodRuntimeStore::new());
-    let slot_admission =
-        std::sync::Arc::new(crate::kubelet::pod_runtime::test_support::MockPodSlotAdmission::new());
+    let slot_admission = std::sync::Arc::new(MockPodSlotAdmission::new());
     let filesystem = std::sync::Arc::new(MockPodFilesystem::new());
     let volumes = std::sync::Arc::new(MockPodVolumeRuntime::new());
     let probes = std::sync::Arc::new(MockProbeRuntime::new());
     let hostports = std::sync::Arc::new(MockHostPortRuntime::new());
     let events = std::sync::Arc::new(MockPodEventSink::new());
-    let hooks =
-        std::sync::Arc::new(crate::kubelet::pod_runtime::test_support::MockPodHookRuntime::new());
+    let hooks = std::sync::Arc::new(MockPodHookRuntime::new());
     let env_source = fixture_env_source(node_name).await;
-    let finalizer = std::sync::Arc::new(
-        crate::kubelet::pod_runtime::test_support::MockPodDeletionFinalizer::new(),
-    );
+    let finalizer = std::sync::Arc::new(MockPodDeletionFinalizer::new());
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
@@ -4461,8 +4431,6 @@ async fn mock_dependency_matrix_network() {
 /// Runtime store: sandbox rows isolated by UID; same-name old/new preserved.
 #[tokio::test]
 async fn mock_dependency_matrix_runtime_store() {
-    use crate::kubelet::pod_runtime::test_support::MockPodRuntimeStore;
-
     let store = MockPodRuntimeStore::new();
     let old_key = PodRuntimeKey::new("ns", "same-name", "uid-old");
     let new_key = PodRuntimeKey::new("ns", "same-name", "uid-new");
@@ -4488,8 +4456,6 @@ async fn mock_dependency_matrix_runtime_store() {
 /// Repository: MockPodRuntimeStore validates stale UID is rejected.
 #[tokio::test]
 async fn mock_dependency_matrix_repository() {
-    use crate::kubelet::pod_runtime::test_support::MockPodRuntimeStore;
-
     let store = MockPodRuntimeStore::new();
     let key = PodRuntimeKey::new("ns", "repo-pod", "uid-repo");
     let stale_key = PodRuntimeKey::new("ns", "repo-pod", "uid-stale");
@@ -4768,7 +4734,7 @@ async fn mock_dependency_matrix_event_sink() {
 /// datastore, leader API, or filesystem.
 #[tokio::test]
 async fn mock_dependency_matrix_env_source() {
-    let mock = crate::kubelet::pod_runtime::test_support::MockEnvSourceReader::new();
+    let mock = MockEnvSourceReader::new();
 
     mock.insert_secret(
         "ns",
@@ -4870,7 +4836,6 @@ async fn shared_cri_runtime_implements_container_runtime_control_with_parity() {
     // Trait object conversion compiles only if SharedCriRuntime: ContainerRuntimeControl.
     fn _assert_impl(_: &dyn ContainerRuntimeControl) {}
     // Verify mock also implements the trait (Task 20.1 coverage gate).
-    use crate::kubelet::pod_runtime::test_support::MockContainerRuntimeControl;
     let mock = MockContainerRuntimeControl::new();
     let result = mock.list_containers(Some("sb-1")).await;
     assert!(result.is_ok());
@@ -10147,7 +10112,7 @@ async fn real_runtime_reconcile_treats_cri_numeric_running_state_as_running() {
 }
 
 async fn wait_for_pod_status(
-    harness: &crate::kubelet::pod_runtime::test_support::PodRuntimeHarness,
+    harness: &PodRuntimeHarness,
     key: &PodRuntimeKey,
     predicate: impl Fn(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
@@ -10170,7 +10135,6 @@ async fn wait_for_pod_status(
 
 #[tokio::test]
 async fn real_runtime_actor_cycle_starts_reconciles_running_and_deletes_pod() {
-    use crate::kubelet::pod_runtime::test_support::PodRuntimeHarness;
     use klights_kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
     use klights_kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry;
     use klights_kubelet::pod_lifecycle_core::message::LifecycleMessage;
@@ -10793,7 +10757,6 @@ mod task4_runtime_observations {
     use super::*;
     use crate::kubelet::pod_runtime::service::PodRuntimeKey;
     use crate::kubelet::pod_runtime::service::RuntimeReconcileHint;
-    use crate::kubelet::pod_runtime::test_support::PodRuntimeHarness;
     use klights_kubelet::pod_lifecycle_core::state::PodLifecycleState;
     use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
@@ -10869,7 +10832,6 @@ mod task4_runtime_observations {
 
     #[tokio::test]
     async fn runtime_reconcile_uses_hinted_container_when_listing_is_partially_stale() {
-        use crate::kubelet::pod_runtime::test_support::PodRuntimeHarness;
         let harness = PodRuntimeHarness::new().await;
         let image = "registry.k8s.io/e2e-test-images/busybox:1.37.0-1";
         let key = PodRuntimeKey::new("container-runtime", "partial-stale", "uid-partial-stale");
@@ -11101,5 +11063,268 @@ mod task4_runtime_observations {
                 "container must be terminated: {s}"
             );
         }
+    }
+}
+
+/// Conventional non-system namespaces these runtime tests place pods in. The
+/// API create path enforces the upstream NamespaceLifecycle rule (target
+/// namespace must exist), so harnesses seed these as a live cluster would.
+/// (System namespaces like `default`/`kube-system` are always considered
+/// present, so they need not be listed here.)
+const RUNTIME_TEST_NAMESPACES: &[&str] = &[
+    "ns",
+    "statefulset",
+    "sonobuoy",
+    "deleted-ns",
+    "init-container",
+    "container-probe",
+    "container-runtime",
+    "dns-debug",
+    "downward-api",
+    "e2e-debug",
+    "kubelet-test",
+    "logs",
+    "pod-network-test",
+    "pods",
+    "security-context",
+    "sysctl",
+    "var-expansion",
+];
+
+/// Seed every conventional runtime-test namespace into `handle`.
+async fn seed_runtime_test_namespaces(handle: &crate::datastore::DatastoreHandle) {
+    for ns in RUNTIME_TEST_NAMESPACES {
+        crate::datastore::DatastoreBackend::seed_namespace_for_test(handle.as_ref(), ns).await;
+    }
+}
+
+// --- PodRuntimeHarness ---
+
+/// Wires every mockable port for `RealPodRuntimeService` unit tests.
+/// Extended task-by-task; starts with all ports needed by Task 8.1.
+struct PodRuntimeHarness {
+    cri: std::sync::Arc<MockCriRuntime>,
+    container_control: std::sync::Arc<MockContainerRuntimeControl>,
+    network: std::sync::Arc<MockPodNetworkRuntime>,
+    store: std::sync::Arc<MockPodRuntimeStore>,
+    slot_admission: std::sync::Arc<MockPodSlotAdmission>,
+    db_handle: crate::datastore::DatastoreHandle,
+    repo: std::sync::Arc<crate::kubelet::pod_repository::PodRepository>,
+    filesystem: std::sync::Arc<MockPodFilesystem>,
+    volumes: std::sync::Arc<MockPodVolumeRuntime>,
+    probes: std::sync::Arc<MockProbeRuntime>,
+    hostports: std::sync::Arc<MockHostPortRuntime>,
+    events: std::sync::Arc<MockPodEventSink>,
+    hooks: std::sync::Arc<MockPodHookRuntime>,
+    env_source: std::sync::Arc<MockEnvSourceReader>,
+    finalizer: std::sync::Arc<MockPodDeletionFinalizer>,
+    supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
+    node_view: std::sync::Arc<FakeNode>,
+    runtime: std::sync::Arc<crate::kubelet::pod_runtime::service::RealPodRuntimeService>,
+}
+
+impl PodRuntimeHarness {
+    /// Construct with all-default mocks and an in-memory repository.
+    async fn new() -> Self {
+        Self::new_with_runtime_config(crate::kubelet::pod_runtime::service::RuntimeConfig {
+            node_name: "test-node".into(),
+            service_cidr: "10.43.128.0/17".into(),
+            containerd_namespace: "klights-test".into(),
+            sandbox_inputs: klights_kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+            node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
+            paths: klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
+                std::path::PathBuf::from("/tmp/klights-runtime-test"),
+            )
+            .unwrap(),
+        })
+        .await
+    }
+
+    async fn new_with_runtime_config(
+        config: crate::kubelet::pod_runtime::service::RuntimeConfig,
+    ) -> Self {
+        let (ds, handle) = crate::datastore::selector::sqlite_in_memory_store_for_test().await;
+        // The API create path enforces the upstream NamespaceLifecycle rule
+        // (target namespace must exist). Seed the conventional namespaces these
+        // runtime tests place pods in, mirroring a live cluster.
+        seed_runtime_test_namespaces(&handle).await;
+        // Keep ds alive so the handle stays valid.
+        std::mem::forget(ds);
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let side_effects =
+            std::sync::Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
+        let metrics: std::sync::Arc<klights_controllers::side_effects::SideEffectMetrics> =
+            klights_controllers::side_effects::SideEffectMetrics::new();
+        let node_local =
+            crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
+        let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
+            crate::kubelet::pod_repository::PodRepositoryBuildConfig {
+                db: handle.clone(),
+                pod_workqueue_store: Some(node_local.clone()),
+                supervisor: supervisor.clone(),
+                side_effects,
+                metrics,
+                pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(
+                    node_local,
+                ),
+                assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
+                scheduling_mode:
+                    crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+                outbox: None,
+                cluster_api: None,
+                controller_identity:
+                    crate::controller_test_support::deterministic_controller_identity(),
+                scheduler_bind_gate: None,
+            },
+        );
+        let repo = std::sync::Arc::new(parts.repository);
+        let cri = std::sync::Arc::new(MockCriRuntime::new());
+        let container_control = std::sync::Arc::new(MockContainerRuntimeControl::new());
+        let network = std::sync::Arc::new(MockPodNetworkRuntime::new());
+        let store = std::sync::Arc::new(MockPodRuntimeStore::new());
+        let slot_admission = std::sync::Arc::new(MockPodSlotAdmission::new());
+        let filesystem = std::sync::Arc::new(MockPodFilesystem::new());
+        let volumes = std::sync::Arc::new(MockPodVolumeRuntime::new());
+        let probes = std::sync::Arc::new(MockProbeRuntime::new());
+        let hostports = std::sync::Arc::new(MockHostPortRuntime::new());
+        let events = std::sync::Arc::new(MockPodEventSink::new());
+        let hooks = std::sync::Arc::new(MockPodHookRuntime::new());
+        let env_source = std::sync::Arc::new(MockEnvSourceReader::new());
+        let finalizer = std::sync::Arc::new(MockPodDeletionFinalizer::new());
+
+        let node_view = std::sync::Arc::new(FakeNode::new(&config.node_name));
+        let cluster_view = std::sync::Arc::new(
+            super::super::pod_cluster_runtime::RepositoryClusterRuntimeView::new(repo.clone()),
+        );
+
+        let runtime = std::sync::Arc::new(
+            crate::kubelet::pod_runtime::service::RealPodRuntimeService::new(
+                RealPodRuntimeServiceDependencies {
+                    cri: cri.clone(),
+                    container_control: container_control.clone(),
+                    network: network.clone(),
+                    store: store.clone(),
+                    clock: std::sync::Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+                    slot_admission: slot_admission.clone(),
+                    repository: repo.clone(),
+                    filesystem: filesystem.clone(),
+                    volumes: volumes.clone(),
+                    probes: probes.clone(),
+                    hostports: hostports.clone(),
+                    events: events.clone(),
+                    hooks: hooks.clone(),
+                    env_source: env_source.clone(),
+                    finalizer: finalizer.clone(),
+                    supervisor: supervisor.clone(),
+                    config,
+                    node_view: node_view.clone(),
+                    cluster_view,
+                },
+            ),
+        );
+
+        Self {
+            cri,
+            container_control,
+            network,
+            store,
+            slot_admission,
+            db_handle: handle,
+            repo,
+            filesystem,
+            volumes,
+            probes,
+            hostports,
+            events,
+            hooks,
+            env_source,
+            finalizer,
+            supervisor,
+            node_view,
+            runtime,
+        }
+    }
+
+    async fn create_runtime_pod(&self, pod: serde_json::Value) {
+        use crate::kubelet::pod_repository::PodObjectWriter;
+
+        let namespace = pod
+            .pointer("/metadata/namespace")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default")
+            .to_string();
+        let name = pod
+            .pointer("/metadata/name")
+            .and_then(|v| v.as_str())
+            .expect("test pod must have metadata.name")
+            .to_string();
+        let node_name = pod
+            .pointer("/spec/nodeName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("test-node")
+            .to_string();
+
+        // The API create path enforces the upstream NamespaceLifecycle rule
+        // (target namespace must exist). Ensure the pod's namespace is present,
+        // mirroring a live cluster where the namespace always pre-exists.
+        self.db_handle.seed_namespace_for_test(&namespace).await;
+
+        self.repo
+            .create_controller_pod(&namespace, &name, &node_name, pod)
+            .await
+            .expect("create runtime test pod");
+    }
+
+    async fn stored_pod(
+        &self,
+        key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+    ) -> serde_json::Value {
+        use crate::kubelet::pod_repository::PodReader;
+
+        self.repo
+            .get_pod_for_uid(&key.namespace, &key.name, &key.uid)
+            .await
+            .expect("read runtime test pod")
+            .expect("runtime test pod should exist")
+            .data
+            .as_ref()
+            .clone()
+    }
+
+    async fn start_pod_through_runtime(
+        &self,
+        key: crate::kubelet::pod_runtime::service::PodRuntimeKey,
+        pod: serde_json::Value,
+    ) -> crate::kubelet::pod_runtime::service::PodStartResult {
+        self.runtime
+            .start_pod(key, Some(pod), CancellationToken::new())
+            .await
+            .expect("start pod through runtime")
+    }
+
+    fn simulate_running_containers(&self, containers: impl IntoIterator<Item = String>) {
+        self.container_control.set_container_states(
+            containers
+                .into_iter()
+                .map(|container_id| {
+                    (
+                        container_id,
+                        klights_kubelet::runtime::cri::ContainerRuntimeState::Running,
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    async fn reconcile_runtime(&self, key: crate::kubelet::pod_runtime::service::PodRuntimeKey) {
+        self.runtime
+            .reconcile_runtime(
+                key,
+                crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
+            )
+            .await
+            .expect("reconcile runtime");
     }
 }

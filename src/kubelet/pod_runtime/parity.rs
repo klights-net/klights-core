@@ -35,12 +35,15 @@ impl klights_controllers::ControllerIdentityGenerator for ParityControllerIdenti
     }
 }
 
-// Re-export mock types from test_support for convenience.
-use super::test_support::{
-    FakeNode, MockContainerControlOp, MockContainerRuntimeControl, MockCriCall, MockCriRuntime,
-    MockHostPortOp, MockHostPortRuntime, MockNetworkOp, MockPodEvent, MockPodEventSink,
-    MockPodFilesystem, MockPodNetworkRuntime, MockPodRuntimeStore, MockPodSlotAdmission,
-    MockPodVolumeRuntime, MockProbeCall, MockProbeRuntime, pod_json,
+use super::events::test_support::{MockPodEvent, MockPodEventSink};
+use super::filesystem::test_support::MockPodFilesystem;
+use super::hostports::test_support::{MockHostPortOp, MockHostPortRuntime};
+use super::network::test_support::{MockNetworkOp, MockPodNetworkRuntime};
+use super::probes::test_support::{MockProbeCall, MockProbeRuntime};
+use super::volumes::test_support::MockPodVolumeRuntime;
+use klights_kubelet::runtime::test_support::{
+    MockContainerControlOp, MockContainerRuntimeControl, MockCriCall, MockCriRuntime,
+    MockPodRuntimeStore, MockPodSlotAdmission, pod_json,
 };
 
 // ── Recording types ──
@@ -112,7 +115,7 @@ pub enum RecordingClusterCall {
 /// `Recording` — never on individual fields. Partial-field assertions
 /// miss regressions in uncompared channels.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Recording {
+pub(crate) struct Recording {
     pub cri: Vec<MockCriCall>,
     pub container_control: Vec<MockContainerControlOp>,
     pub network: Vec<MockNetworkOp>,
@@ -229,7 +232,7 @@ impl ClusterRuntimeView for RecordingClusterRuntimeView {
 
 /// Harness that wires every mockable port for parity comparison between
 /// legacy and refactored Pod lifecycle code paths.
-pub struct ParityFixture {
+pub(crate) struct ParityFixture {
     pub cri: Arc<MockCriRuntime>,
     pub container_control: Arc<MockContainerRuntimeControl>,
     pub network: Arc<MockPodNetworkRuntime>,
@@ -242,7 +245,6 @@ pub struct ParityFixture {
     pub events: Arc<MockPodEventSink>,
     pub cluster_view: Arc<RecordingClusterRuntimeView>,
     pub repository: Arc<PodRepository>,
-    pub node_view: Arc<FakeNode>,
     pub outbox_log: Arc<Mutex<Vec<OutboxEvent>>>,
 }
 
@@ -288,7 +290,6 @@ impl ParityFixture {
             events: Arc::new(MockPodEventSink::new()),
             cluster_view: Arc::new(RecordingClusterRuntimeView::new()),
             repository,
-            node_view: Arc::new(FakeNode::new("test-node")),
             outbox_log: Arc::new(Mutex::new(Vec::new())),
         }
     }

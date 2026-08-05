@@ -526,3 +526,114 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+// --- FakeNode ---
+
+/// Fake node implementing `NodeRuntimeView` for multi-node tests.
+pub(crate) struct FakeNode {
+    node_name: String,
+}
+
+#[cfg(test)]
+impl FakeNode {
+    pub(crate) fn new(node_name: &str) -> Self {
+        Self {
+            node_name: node_name.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl NodeRuntimeView for FakeNode {
+    fn node_name(&self) -> &str {
+        &self.node_name
+    }
+
+    fn owns_pod_runtime(&self, pod: &serde_json::Value) -> bool {
+        pod.pointer("/spec/nodeName")
+            .and_then(|v| v.as_str())
+            .is_some_and(|n| n == self.node_name)
+    }
+}
+
+// --- FakeCluster ---
+
+/// Records forwarded status updates for multi-node tests.
+#[cfg(test)]
+type StatusForward = (
+    crate::kubelet::pod_runtime::service::PodRuntimeKey,
+    serde_json::Value,
+);
+/// Fake cluster implementing `ClusterRuntimeView` for multi-node tests.
+#[cfg(test)]
+pub(crate) struct FakeCluster {
+    fresh_pods:
+        std::sync::Mutex<std::collections::HashMap<(String, String), crate::datastore::Resource>>,
+    status_forwards: std::sync::Mutex<Vec<StatusForward>>,
+}
+
+#[cfg(test)]
+impl Default for FakeCluster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+impl FakeCluster {
+    pub(crate) fn new() -> Self {
+        Self {
+            fresh_pods: std::sync::Mutex::new(std::collections::HashMap::new()),
+            status_forwards: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn recorded_status_forwards(&self) -> Vec<StatusForward> {
+        self.status_forwards.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+#[cfg(test)]
+impl ClusterRuntimeView for FakeCluster {
+    async fn get_fresh_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        Ok(self
+            .fresh_pods
+            .lock()
+            .unwrap()
+            .get(&(namespace.to_string(), name.to_string()))
+            .cloned())
+    }
+
+    async fn forward_pod_status(
+        &self,
+        key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+        status: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.status_forwards
+            .lock()
+            .unwrap()
+            .push((key.clone(), status));
+        Ok(crate::datastore::Resource {
+            id: 0,
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some(key.namespace.clone()),
+            name: key.name.clone(),
+            uid: key.uid.clone(),
+            data: std::sync::Arc::new(serde_json::json!({
+                "metadata": {
+                    "namespace": key.namespace,
+                    "name": key.name,
+                    "uid": key.uid,
+                },
+            })),
+            resource_version: 1,
+        })
+    }
+}
