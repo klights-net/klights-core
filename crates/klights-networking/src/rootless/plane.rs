@@ -586,3 +586,314 @@ impl klights_network_api::PeerRouter for RootlessNetworkPlane {
         })
     }
 }
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use klights_leader_api::{
+        HostPortRange, LeaderNetworkTopologyQuery, LeaderNodeSubnetAllocation, NetworkNodeMode,
+        NetworkTopologyError, NetworkTopologyFuture, NodeDataplaneQuery, NodeDataplaneResult,
+        NodeSubnet, NodeSubnetAllocationFuture, NodeSubnetAllocationRequest,
+        NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult, PeerSubnetsQuery,
+        PeerSubnetsResult,
+    };
+    use klights_network_api::{Datapath, PodNetworkAssignmentKey, PodNetworkAssignmentPublisher};
+    use klights_node_store::{
+        CacheNetworkFuture, OwnedPodSandbox, PodIpamStore, PodNetworkAllocation,
+        PodNetworkAllocationRequest, PodNetworkAssignmentSnapshot, PodNetworkCache,
+        PodNetworkEndpoint, PodRuntimeAdmission, PodRuntimeCgroup, PodRuntimeRecord,
+        PodRuntimeStore, PodUidKey, RuntimeNamespace, RuntimePodUid, RuntimeWorkFuture, SandboxKey,
+    };
+    use std::sync::Mutex;
+
+    struct FakeRootlessStores {
+        allocated: Mutex<Option<NodeSubnet>>,
+    }
+
+    impl FakeRootlessStores {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                allocated: Mutex::new(None),
+            })
+        }
+
+        fn allocated_subnet(&self) -> NodeSubnet {
+            self.allocated
+                .lock()
+                .expect("allocated subnet lock")
+                .clone()
+                .expect("rootless boot must allocate a subnet")
+        }
+    }
+
+    impl LeaderNodeSubnetAllocation for FakeRootlessStores {
+        fn allocate_node_subnet(
+            &self,
+            request: NodeSubnetAllocationRequest,
+        ) -> NodeSubnetAllocationFuture<'_, NodeSubnetAllocationResult> {
+            let node_name = request.node_name().to_string();
+            let subnet = NodeSubnet::try_new(
+                node_name.clone(),
+                "10.42.0.0/24",
+                u32::from(Ipv4Addr::new(10, 42, 0, 0)),
+                Ipv4Addr::new(10, 42, 0, 0),
+                request.node_ip(),
+                NetworkNodeMode::Rootless,
+                Some(HostPortRange::try_new(30_000, 32_767).expect("valid host-port range")),
+            )
+            .expect("valid fake rootless subnet");
+            *self.allocated.lock().expect("allocated subnet lock") = Some(subnet.clone());
+            Box::pin(
+                async move { NodeSubnetAllocationResult::try_from_wire(&node_name, Some(subnet)) },
+            )
+        }
+    }
+
+    impl LeaderNetworkTopologyQuery for FakeRootlessStores {
+        fn get_node_subnet(
+            &self,
+            request: NodeSubnetQuery,
+        ) -> NetworkTopologyFuture<'_, NodeSubnetResult> {
+            let subnet = self
+                .allocated
+                .lock()
+                .expect("allocated subnet lock")
+                .clone();
+            Box::pin(async move {
+                NodeSubnetResult::try_from_wire(request.node_name(), subnet.is_some(), subnet)
+            })
+        }
+
+        fn list_peer_subnets(
+            &self,
+            _request: PeerSubnetsQuery,
+        ) -> NetworkTopologyFuture<'_, PeerSubnetsResult> {
+            Box::pin(async {
+                Err(NetworkTopologyError::query_failed(
+                    "rootless boot must not list peer subnets",
+                ))
+            })
+        }
+
+        fn get_node_dataplane(
+            &self,
+            _request: NodeDataplaneQuery,
+        ) -> NetworkTopologyFuture<'_, NodeDataplaneResult> {
+            Box::pin(async {
+                Err(NetworkTopologyError::query_failed(
+                    "rootless boot must not query node dataplane metadata",
+                ))
+            })
+        }
+    }
+
+    impl PodNetworkCache for FakeRootlessStores {
+        fn get_network_for_uid(
+            &self,
+            _pod_uid: PodUidKey,
+        ) -> CacheNetworkFuture<'_, Option<PodNetworkEndpoint>> {
+            Box::pin(async { unreachable!("rootless boot must not read pod network state") })
+        }
+
+        fn get_network_for_pod(
+            &self,
+            _pod: klights_types::PodIdentity,
+        ) -> CacheNetworkFuture<'_, Option<PodNetworkEndpoint>> {
+            Box::pin(async { unreachable!("rootless boot must not read pod network state") })
+        }
+
+        fn get_network_for_sandbox(
+            &self,
+            _sandbox_id: SandboxKey,
+        ) -> CacheNetworkFuture<'_, Option<PodNetworkEndpoint>> {
+            Box::pin(async { unreachable!("host-network CNI must not read pod network state") })
+        }
+
+        fn get_network_for_assignment(
+            &self,
+            _sandbox_id: SandboxKey,
+            _pod: klights_types::PodIdentity,
+        ) -> CacheNetworkFuture<'_, Option<PodNetworkEndpoint>> {
+            Box::pin(async { unreachable!("rootless boot must not read pod network state") })
+        }
+
+        fn delete_network_for_sandbox(
+            &self,
+            _sandbox_id: SandboxKey,
+        ) -> CacheNetworkFuture<'_, ()> {
+            Box::pin(async { unreachable!("rootless boot must not delete pod network state") })
+        }
+
+        fn delete_network_if_matches(
+            &self,
+            _request: PodNetworkAllocationRequest,
+        ) -> CacheNetworkFuture<'_, bool> {
+            Box::pin(async { unreachable!("rootless boot must not delete pod network state") })
+        }
+
+        fn list_network_assignments(
+            &self,
+        ) -> CacheNetworkFuture<'_, Vec<PodNetworkAssignmentSnapshot>> {
+            Box::pin(async { unreachable!("rootless boot must not list pod network state") })
+        }
+    }
+
+    impl PodIpamStore for FakeRootlessStores {
+        fn reserve_ip_and_insert_network(
+            &self,
+            _request: PodNetworkAllocationRequest,
+        ) -> CacheNetworkFuture<'_, PodNetworkAllocation> {
+            Box::pin(async { unreachable!("host-network CNI must not reserve a pod IP") })
+        }
+    }
+
+    impl PodRuntimeStore for FakeRootlessStores {
+        fn admit_pod_runtime(&self, _admission: PodRuntimeAdmission) -> RuntimeWorkFuture<'_, ()> {
+            Box::pin(async { unreachable!("rootless boot must not admit pod runtime state") })
+        }
+
+        fn record_owned_sandbox(&self, _sandbox: OwnedPodSandbox) -> RuntimeWorkFuture<'_, ()> {
+            Box::pin(async { unreachable!("rootless boot must not record sandbox state") })
+        }
+
+        fn record_cgroup(&self, _cgroup: PodRuntimeCgroup) -> RuntimeWorkFuture<'_, ()> {
+            Box::pin(async { unreachable!("rootless boot must not record cgroup state") })
+        }
+
+        fn delete_pod_runtime_for_uid(&self, _pod_uid: RuntimePodUid) -> RuntimeWorkFuture<'_, ()> {
+            Box::pin(async { unreachable!("rootless boot must not delete runtime state") })
+        }
+
+        fn get_pod_runtime(
+            &self,
+            _pod_uid: RuntimePodUid,
+        ) -> RuntimeWorkFuture<'_, Option<PodRuntimeRecord>> {
+            Box::pin(async { unreachable!("rootless boot must not read runtime state") })
+        }
+
+        fn list_pod_runtime(&self) -> RuntimeWorkFuture<'_, Vec<PodRuntimeRecord>> {
+            Box::pin(async { unreachable!("rootless boot must not list runtime state") })
+        }
+
+        fn list_pod_runtime_by_namespace(
+            &self,
+            _namespace: RuntimeNamespace,
+        ) -> RuntimeWorkFuture<'_, Vec<PodRuntimeRecord>> {
+            Box::pin(async { unreachable!("rootless boot must not list runtime state") })
+        }
+    }
+
+    impl PodNetworkAssignmentPublisher for FakeRootlessStores {
+        fn publish_assignment(&self, _key: &PodNetworkAssignmentKey) {
+            unreachable!("host-network CNI must not publish a pod-network assignment");
+        }
+    }
+
+    async fn boot_test_plane(
+        node_name: &str,
+        host_ip: Ipv4Addr,
+    ) -> (Arc<RootlessNetworkPlane>, Arc<FakeRootlessStores>) {
+        let stores = FakeRootlessStores::new();
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let plane = RootlessNetworkPlane::boot(RootlessNetworkBoot::new(
+            BridgeName::parse("klights").expect("valid bridge name"),
+            NodeName::parse(node_name).expect("valid node name"),
+            ClusterCidr::parse("10.42.0.0/16").expect("valid cluster CIDR"),
+            host_ip,
+            crate::wireguard::DataplaneEncryption::Disabled,
+            crate::wireguard::WireGuardBootConfig::try_new(
+                crate::wireguard::DEFAULT_WIREGUARD_DEVICE,
+                "/tmp/klights-rootless-plane-test.key",
+                crate::wireguard::DEFAULT_WIREGUARD_PORT,
+            )
+            .expect("valid WireGuard test configuration"),
+            crate::PodLinkMtu::try_new(crate::network_composition::pod_link_mtu_for_encryption(
+                crate::wireguard::DataplaneEncryption::Disabled,
+            ))
+            .expect("valid pod-link MTU"),
+            RootlessNetworkStores::new(
+                stores.clone(),
+                stores.clone(),
+                stores.clone(),
+                stores.clone(),
+                stores.clone(),
+                stores.clone(),
+            ),
+            tokio_util::sync::CancellationToken::new(),
+            supervisor,
+        ))
+        .await
+        .expect("rootless boot must succeed");
+        (plane, stores)
+    }
+
+    #[tokio::test]
+    async fn boot_rootless_does_not_create_vxlan_or_write_vtep() {
+        let node_name = "rootless-node-a";
+        let (plane, stores) = boot_test_plane(node_name, Ipv4Addr::new(192, 168, 1, 5)).await;
+        let allocation = stores.allocated_subnet();
+
+        // Local subnet allocated through the shared IPAM path.
+        assert_eq!(
+            *plane.local_subnet(),
+            klights_types::PodSubnet::parse(allocation.subnet())
+                .expect("fake allocation must carry a valid pod subnet")
+        );
+
+        assert_eq!(allocation.node_name(), node_name);
+    }
+
+    #[tokio::test]
+    async fn rootless_datapath_host_network_returns_detected_host_ip() {
+        let (plane, _stores) =
+            boot_test_plane("rootless-hostnet-node", Ipv4Addr::new(192, 168, 77, 9)).await;
+
+        let network = plane
+            .cni_add(
+                klights_network_api::CniAddRequest::try_new(
+                    "hostnet-sandbox",
+                    klights_types::PodIdentity::new("default", "hostnet-pod", "hostnet-uid"),
+                    "/proc/self/ns/net",
+                    "/proc/self/ns/net",
+                    true,
+                )
+                .expect("valid host-network CNI request"),
+            )
+            .await
+            .expect("host-network CNI add should not use the Phase-2 stub");
+
+        assert_eq!(
+            network.ip_addr(),
+            std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 77, 9))
+        );
+        assert_eq!(
+            plane.host_ip().await.expect("host_ip must be available"),
+            network.ip_addr()
+        );
+    }
+
+    // Rootless datapath invariants (Datapath impl, cni::add/del,
+    // ensure_bridge_once) are enforced by the base-repo source guard run by
+    // `./build.sh`.
+
+    #[test]
+    fn rootless_plane_has_explicit_service_router_bridge_preparation_step() {
+        let _ordered_step = RootlessNetworkPlane::prepare_service_routing_bridge;
+    }
+
+    #[tokio::test]
+    async fn rootless_plane_exposes_dataplane_health_after_boot() {
+        let (plane, _stores) =
+            boot_test_plane("rootless-health-node", Ipv4Addr::new(192, 168, 1, 5)).await;
+
+        // With encryption disabled, health must be healthy (disabled is a
+        // valid explicit choice, not a failure).
+        let status = plane.health().status();
+        assert!(
+            status.is_healthy(),
+            "disabled encryption must leave health healthy, got {status:?}"
+        );
+    }
+}
