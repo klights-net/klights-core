@@ -37,3 +37,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true, features = ["clock"] }
+tikv-jemalloc-ctl = { workspace = true }
+tikv-jemallocator = { workspace = true }

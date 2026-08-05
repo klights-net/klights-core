@@ -292,7 +292,36 @@ fn endpoint_slice_entries_reference_pod(
 mod tests {
     use super::*;
 
+    use crate::side_effects::service_pod;
     use serde_json::json;
+
+    #[global_allocator]
+    static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+    #[test]
+    fn unchanged_endpoint_classification_is_allocation_free() {
+        let previous = json!({
+            "metadata": {"labels": {"app": "web"}},
+            "status": {
+                "phase": "Running",
+                "podIP": "10.42.0.8",
+                "podIPs": [{"ip": "10.42.0.8"}],
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let updated = previous.clone();
+        let allocated =
+            tikv_jemalloc_ctl::thread::allocatedp::read().expect("read thread allocation counter");
+        let before = allocated.get();
+        for _ in 0..4096 {
+            std::hint::black_box(service_pod::pod_endpoint_state_changed(&previous, &updated));
+        }
+        assert_eq!(
+            allocated.get() - before,
+            0,
+            "borrowed unchanged-Pod classification must stay allocation-free"
+        );
+    }
 
     #[test]
     fn endpoint_targetref_matching_is_uid_safe_for_ready_and_not_ready_addresses() {
