@@ -70,7 +70,9 @@ async fn get_ready_condition(
 
 #[tokio::test]
 async fn test_update_pod_condition_readiness_success_sets_ready_true() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     create_test_pod(
         &db,
@@ -100,7 +102,9 @@ async fn test_update_pod_condition_readiness_success_sets_ready_true() {
 
 #[tokio::test]
 async fn test_update_pod_condition_readiness_success_sets_container_status_ready() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     // Create pod with containerStatuses where ready=false (readiness probe not yet passed)
     let pod = json!({
@@ -149,7 +153,9 @@ async fn test_update_pod_condition_readiness_success_sets_container_status_ready
 
 #[tokio::test]
 async fn test_update_pod_condition_readiness_failure_sets_container_status_not_ready() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     // Create pod with containerStatuses where ready=true (readiness probe previously passed)
     let pod = json!({
@@ -198,7 +204,9 @@ async fn test_update_pod_condition_readiness_failure_sets_container_status_not_r
 
 #[tokio::test]
 async fn test_update_pod_condition_readiness_failure_sets_ready_false() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     create_test_pod(
         &db,
@@ -228,7 +236,9 @@ async fn test_update_pod_condition_readiness_failure_sets_ready_false() {
 
 #[tokio::test]
 async fn test_update_pod_condition_liveness_is_noop() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     create_test_pod(
         &db,
@@ -262,7 +272,9 @@ async fn test_update_pod_condition_liveness_is_noop() {
 
 #[tokio::test]
 async fn test_update_pod_condition_updates_existing_ready_condition() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     // Pod starts with Ready=True and an extra condition
     create_test_pod(
@@ -322,7 +334,9 @@ async fn test_update_pod_condition_updates_existing_ready_condition() {
 
 #[tokio::test]
 async fn test_update_pod_condition_creates_ready_condition_if_missing() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     // Pod with conditions array but no Ready condition
     create_test_pod(
@@ -372,7 +386,9 @@ async fn test_update_pod_condition_creates_ready_condition_if_missing() {
 
 #[tokio::test]
 async fn test_update_pod_condition_invalid_pod_key_returns_error() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
 
     // Pod key without slash separator
@@ -391,7 +407,9 @@ async fn test_update_pod_condition_invalid_pod_key_returns_error() {
 
 #[tokio::test]
 async fn test_update_pod_condition_deleted_pod_returns_ok() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
 
     // Pod doesn't exist in DB — function should return Ok (early return)
@@ -412,7 +430,9 @@ async fn test_update_pod_condition_deleted_pod_returns_ok() {
 
 #[tokio::test]
 async fn test_update_pod_condition_for_uid_does_not_update_recreated_same_name_pod() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     let pod = json!({
         "apiVersion": "v1",
@@ -458,7 +478,9 @@ async fn test_update_pod_condition_for_uid_does_not_update_recreated_same_name_p
 
 #[tokio::test]
 async fn test_update_pod_condition_for_uid_updates_matching_pod_uid() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     let pod = json!({
         "apiVersion": "v1",
@@ -504,7 +526,9 @@ async fn test_update_pod_condition_for_uid_updates_matching_pod_uid() {
 
 #[tokio::test]
 async fn test_start_probes_missing_metadata_returns_error() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     let pm = probe_manager_for_test(&db_handle);
     let pod = json!({"spec": {"containers": []}});
@@ -515,7 +539,9 @@ async fn test_start_probes_missing_metadata_returns_error() {
 
 #[tokio::test]
 async fn test_start_probes_missing_spec_returns_error() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     let pm = probe_manager_for_test(&db_handle);
     let pod = json!({"metadata": {"name": "p", "namespace": "ns"}});
@@ -526,7 +552,9 @@ async fn test_start_probes_missing_spec_returns_error() {
 
 #[tokio::test]
 async fn test_start_probes_missing_pod_ip_returns_error() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     let pm = probe_manager_for_test(&db_handle);
     let pod = json!({
@@ -541,7 +569,9 @@ async fn test_start_probes_missing_pod_ip_returns_error() {
 
 #[tokio::test]
 async fn test_start_probes_no_probes_defined_succeeds_with_no_tasks() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     let pm = probe_manager_for_test(&db_handle);
     let pod = json!({
@@ -559,7 +589,9 @@ async fn test_start_probes_no_probes_defined_succeeds_with_no_tasks() {
 
 #[tokio::test]
 async fn test_start_probes_spawns_tasks_for_readiness_and_liveness() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     let pm = probe_manager_for_test(&db_handle);
     let pod = json!({
@@ -587,7 +619,9 @@ async fn test_start_probes_spawns_tasks_for_readiness_and_liveness() {
 
 #[tokio::test]
 async fn test_stop_probes_removes_tasks() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     let pm = probe_manager_for_test(&db_handle);
     let pod = json!({
@@ -619,7 +653,9 @@ async fn test_stop_probes_removes_tasks() {
 
 #[tokio::test]
 async fn test_stop_probes_for_uid_leaves_recreated_same_name_pod_tasks() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     let pm = probe_manager_for_test(&db_handle);
 
@@ -668,7 +704,9 @@ async fn test_stop_probes_for_uid_leaves_recreated_same_name_pod_tasks() {
 
 #[tokio::test]
 async fn test_stop_probes_nonexistent_pod_is_noop() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     let pm = probe_manager_for_test(&db_handle);
     // Should not panic or error
@@ -677,7 +715,9 @@ async fn test_stop_probes_nonexistent_pod_is_noop() {
 
 #[tokio::test]
 async fn test_start_probes_multiple_containers_each_with_probes() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     let pm = probe_manager_for_test(&db_handle);
     let pod = json!({
@@ -714,7 +754,9 @@ async fn test_start_probes_multiple_containers_each_with_probes() {
 
 #[tokio::test]
 async fn test_update_pod_condition_readiness_toggle_preserves_transition_time() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     create_test_pod(&db, "default", "toggle-pod", vec![
     json!({"type": "Ready", "status": "True", "reason": "ReadinessProbeSucceeded", "lastTransitionTime": "2026-01-01T00:00:00Z"})
@@ -759,7 +801,9 @@ async fn test_update_pod_condition_readiness_toggle_preserves_transition_time() 
 #[tokio::test]
 async fn test_update_pod_condition_startup_probe_is_noop() {
     // Startup probes don't update pod conditions directly (they gate liveness/readiness)
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     create_test_pod(&db, "default", "startup-pod", vec![]).await;
 
@@ -784,7 +828,9 @@ async fn test_update_pod_condition_startup_probe_is_noop() {
 
 #[tokio::test]
 async fn test_start_probes_with_startup_probe_spawns_task() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     let pm = probe_manager_for_test(&db_handle.clone());
 

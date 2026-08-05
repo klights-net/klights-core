@@ -1638,7 +1638,7 @@ impl PodRuntimeHarness {
     pub async fn new_with_runtime_config(
         config: crate::kubelet::pod_runtime::service::RuntimeConfig,
     ) -> Self {
-        let (ds, handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (ds, handle) = crate::datastore::selector::sqlite_in_memory_store_for_test().await;
         // The API create path enforces the upstream NamespaceLifecycle rule
         // (target namespace must exist). Seed the conventional namespaces these
         // runtime tests place pods in, mirroring a live cluster.
@@ -1764,7 +1764,7 @@ impl PodRuntimeHarness {
         // The API create path enforces the upstream NamespaceLifecycle rule
         // (target namespace must exist). Ensure the pod's namespace is present,
         // mirroring a live cluster where the namespace always pre-exists.
-        crate::datastore::test_support::ensure_namespace(self.db_handle.as_ref(), &namespace).await;
+        self.db_handle.seed_namespace_for_test(&namespace).await;
 
         self.repo
             .create_controller_pod(&namespace, &name, &node_name, pod)

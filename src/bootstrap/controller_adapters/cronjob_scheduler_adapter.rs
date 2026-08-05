@@ -107,8 +107,9 @@ mod tests {
 
     #[tokio::test]
     async fn positioned_watch_uses_exact_initial_snapshot_handoff() {
-        let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
+        let (db, db_handle) =
+            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&db);
         db.create_resource(
             "batch/v1",
             "CronJob",

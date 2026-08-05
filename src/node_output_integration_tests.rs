@@ -510,7 +510,9 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_marks_node_not_ready_when_peers_disconnected() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         create_ready_node(&db, "node-a").await;
 
         let health = DataplaneHealth::new_healthy();
@@ -539,7 +541,9 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_recovers_node_ready_when_peers_reconnect() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         create_ready_node(&db, "node-a").await;
 
         let health = DataplaneHealth::new_healthy();
@@ -575,7 +579,9 @@ mod tests {
     async fn refresh_network_conditions_stamps_current_git_commit() {
         use klights_controllers::annotations::GIT_COMMIT_ANNOTATION;
 
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Node",
@@ -625,7 +631,9 @@ mod tests {
     async fn node_effect_git_commit_refresh_uses_uid_rv_resource_command() {
         use klights_controllers::annotations::GIT_COMMIT_ANNOTATION;
 
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Node",
@@ -673,7 +681,9 @@ mod tests {
 
     #[tokio::test]
     async fn register_node_without_dataplane_health_preserves_network_unavailable() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Node",
@@ -725,7 +735,9 @@ mod tests {
 
     #[tokio::test]
     async fn register_node_refresh_preserves_existing_network_conditions() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Node",
@@ -779,7 +791,9 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_is_noop_when_conditions_unchanged() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         create_ready_node(&db, "node-a").await;
 
         // Health already Healthy => same conditions already present => no write.
@@ -880,7 +894,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_node_creates_node_resource() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
 
         register_node(
             &db,
@@ -943,7 +959,9 @@ mod tests {
 
     #[tokio::test]
     async fn typed_registration_snapshot_preserves_remote_host_facts_exactly() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let snapshot = NodeRegistrationSnapshot {
             node_name: "remote-cp".to_string(),
             node_mode: klights_controllers::annotations::NodePeerMode::Root,
@@ -1019,7 +1037,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_seed_leader_register_node_omits_self_dataplane_endpoint_external_ip() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
 
         register_node(
             &db,
@@ -1050,7 +1070,9 @@ mod tests {
 
     #[tokio::test]
     async fn register_node_at_addresses_separates_internal_and_external_ip_for_worker() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let addresses = NodeRegistrationAddresses::new(
             "172.31.11.2".to_string(),
             Some("10.99.0.11".to_string()),
@@ -1093,7 +1115,9 @@ mod tests {
 
     #[tokio::test]
     async fn register_node_at_addresses_preserves_existing_external_ip_when_refresh_has_none() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let role = crate::bootstrap::NodeRole::Worker {
             leader_endpoints: vec!["https://10.99.0.10:7679".to_string()],
             token: Some("token".to_string()),
@@ -1142,7 +1166,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_node_publishes_allocated_pod_cidr() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.allocate_node_subnet("test-node", "10.50.0.0/16", "192.0.2.10")
             .await
             .unwrap();
@@ -1179,7 +1205,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_node_refreshes_existing_node_internal_ip() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Node",
@@ -1251,7 +1279,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_node_refreshes_creation_timestamp_on_restart() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Node",
@@ -1302,7 +1332,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_node_sets_capacity_and_allocatable() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
 
         register_node(
             &db,
@@ -1356,7 +1388,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_node_sets_ready_condition() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
 
         register_node(
             &db,
@@ -1411,7 +1445,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_node_has_leader_role_label() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
 
         register_node(
             &db,
@@ -1445,7 +1481,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_node_has_worker_role_label() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
 
         register_node(
             &db,
@@ -1478,7 +1516,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_node_prunes_stale_klights_role_labels_on_refresh() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Node",
@@ -1535,7 +1575,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_node_version_format() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
 
         register_node(
             &db,
@@ -1569,7 +1611,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_node_rootless_uses_injected_kubelet_version_profile() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let mode = crate::bootstrap::NodeMode::Rootless {
             rootlesskit_pid: 0,
             user_netns: std::path::PathBuf::from("/proc/self/ns/net"),
@@ -1602,7 +1646,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_node_sets_daemon_endpoints_kubelet_port() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         register_node(
             &db,
             "test-node",
@@ -1688,8 +1734,10 @@ mod tests {
         // T6: the production heartbeat is memory-only. It renews via the lease
         // client (worker -> leader RPC / leader-local tracker) and must never
         // write a Lease row to cluster.db.
-        let db = crate::datastore::test_support::in_memory().await;
-        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&db);
         let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
         let client = std::sync::Arc::new(RecordingLeaseRenewClient::new());
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -1735,8 +1783,11 @@ mod tests {
         use crate::datastore::node_local::selector;
         use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
-        let cluster: crate::datastore::DatastoreHandle =
-            std::sync::Arc::new(crate::datastore::test_support::in_memory().await);
+        let cluster: crate::datastore::DatastoreHandle = std::sync::Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let created = cluster
             .create_resource(
                 "v1",
@@ -1825,8 +1876,11 @@ mod tests {
         use crate::datastore::node_local::selector;
         use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
-        let cluster: crate::datastore::DatastoreHandle =
-            std::sync::Arc::new(crate::datastore::test_support::in_memory().await);
+        let cluster: crate::datastore::DatastoreHandle = std::sync::Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let leader_query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery> =
             std::sync::Arc::new(crate::control_plane::client::local::LocalApiClient::new(
                 cluster,
@@ -1883,7 +1937,9 @@ mod tests {
         use klights_controllers::annotations::{
             DEFAULT_HOSTPORT_RANGE, HOSTPORT_RANGE_ANNOTATION, NODE_MODE_ANNOTATION,
         };
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let mode = crate::bootstrap::NodeMode::Rootless {
             rootlesskit_pid: 0,
             user_netns: std::path::PathBuf::from("/proc/self/ns/net"),
@@ -1930,7 +1986,9 @@ mod tests {
     #[tokio::test]
     async fn node_status_root_publishes_empty_hostport_annotation() {
         use klights_controllers::annotations::{HOSTPORT_RANGE_ANNOTATION, NODE_MODE_ANNOTATION};
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         register_node(
             &db,
             "root-node-x",
@@ -1984,7 +2042,9 @@ mod tests {
     #[tokio::test]
     async fn node_status_publishes_git_commit_annotation() {
         use klights_controllers::annotations::GIT_COMMIT_ANNOTATION;
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         register_node(
             &db,
             "commit-node-x",

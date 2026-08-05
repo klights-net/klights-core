@@ -177,7 +177,8 @@ mod tests {
 
     #[tokio::test]
     async fn non_pod_port_rejects_pod_without_touching_datastore() {
-        let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (db, db_handle) =
+            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let pod = db
             .create_resource(
                 "v1",

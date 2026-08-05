@@ -192,7 +192,9 @@ mod tests {
         PodSideEffectPortsSlot,
         Arc<TaskSupervisor>,
     ) {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),

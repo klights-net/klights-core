@@ -90,7 +90,11 @@ mod cases {
             }
         }
 
-        let inner: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let inner: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let proposer = Arc::new(InlineProposer {
             inner: inner.clone(),
@@ -144,8 +148,11 @@ mod cases {
 
     #[tokio::test]
     async fn sequenced_facade_rejects_committed_apply_through_both_trait_views() {
-        let passive: crate::datastore::backend::DatastoreHandle =
-            Arc::new(crate::datastore::test_support::in_memory().await);
+        let passive: crate::datastore::backend::DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let ds = SequencedDatastore::new(passive.clone(), Arc::new(PanicProposal));
 
         assert_application_apply_rejected(
@@ -164,7 +171,7 @@ mod cases {
         assert_application_apply_rejected(
             DatastoreBackend::apply_log_apply_commit(
                 &ds,
-                crate::datastore::test_support::test_live_commit(1, Vec::new()),
+                klights_cluster_datastore::test_support::test_live_commit(1, Vec::new()),
             )
             .await
             .expect_err("application facade must reject legacy committed apply"),
@@ -173,7 +180,7 @@ mod cases {
         assert_application_apply_rejected(
             DatastoreBackend::apply_raft_log_apply_commit(
                 &ds,
-                crate::datastore::test_support::test_live_commit(2, Vec::new()),
+                klights_cluster_datastore::test_support::test_live_commit(2, Vec::new()),
             )
             .await
             .expect_err("application facade must reject Raft committed apply"),
@@ -182,7 +189,7 @@ mod cases {
         assert_application_apply_rejected(
             DatastoreBackend::apply_raft_log_apply_commit_receipt(
                 &ds,
-                crate::datastore::test_support::test_live_commit(3, Vec::new()),
+                klights_cluster_datastore::test_support::test_live_commit(3, Vec::new()),
             )
             .await
             .expect_err("application facade must reject Raft committed apply outcomes"),
@@ -205,7 +212,7 @@ mod cases {
         assert_application_apply_rejected(
             crate::datastore::ReplicationStore::apply_log_apply_commit(
                 &ds,
-                crate::datastore::test_support::test_live_commit(4, Vec::new()),
+                klights_cluster_datastore::test_support::test_live_commit(4, Vec::new()),
             )
             .await
             .expect_err("replication compatibility facade must reject legacy committed apply"),
@@ -214,7 +221,7 @@ mod cases {
         assert_application_apply_rejected(
             crate::datastore::ReplicationStore::apply_raft_log_apply_commit(
                 &ds,
-                crate::datastore::test_support::test_live_commit(5, Vec::new()),
+                klights_cluster_datastore::test_support::test_live_commit(5, Vec::new()),
             )
             .await
             .expect_err("replication compatibility facade must reject Raft committed apply"),
@@ -223,7 +230,7 @@ mod cases {
         assert_application_apply_rejected(
             crate::datastore::ReplicationStore::apply_raft_log_apply_commit_receipt(
                 &ds,
-                crate::datastore::test_support::test_live_commit(6, Vec::new()),
+                klights_cluster_datastore::test_support::test_live_commit(6, Vec::new()),
             )
             .await
             .expect_err(
@@ -484,8 +491,11 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_backend_raft_apply_returns_terminal_conflict_result() {
-        let inner: crate::datastore::backend::DatastoreHandle =
-            Arc::new(crate::datastore::test_support::in_memory().await);
+        let inner: crate::datastore::backend::DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         inner
             .create_resource(
                 "v1",
@@ -503,7 +513,7 @@ mod cases {
             .await
             .expect("seed existing resource");
         let ds = inner;
-        let commit = crate::datastore::test_support::test_live_commit(
+        let commit = klights_cluster_datastore::test_support::test_live_commit(
             0,
             vec![klights_cluster_core::LogApplyMutation::PutResource(
                 klights_cluster_core::LogApplyResourceRow {
@@ -716,8 +726,11 @@ mod cases {
 
     #[tokio::test]
     async fn no_op_watch_events_gc_does_not_allocate_local_raft_rv() {
-        let inner: crate::datastore::backend::DatastoreHandle =
-            Arc::new(crate::datastore::test_support::in_memory().await);
+        let inner: crate::datastore::backend::DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let ds = SequencedDatastore::new(inner.clone(), Arc::new(PanicProposal));
         let before = inner.get_current_resource_version().await.unwrap();
 
@@ -804,8 +817,11 @@ mod cases {
 
     #[tokio::test]
     async fn no_op_applied_outbox_gc_does_not_allocate_local_raft_rv() {
-        let inner: crate::datastore::backend::DatastoreHandle =
-            Arc::new(crate::datastore::test_support::in_memory().await);
+        let inner: crate::datastore::backend::DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let ds = SequencedDatastore::new(inner.clone(), Arc::new(PanicProposal));
         let before = inner.get_current_resource_version().await.unwrap();
 
@@ -900,7 +916,9 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_apply_preserves_preconditions_through_codec() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Pod",
@@ -966,7 +984,9 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_apply_create_converges_existing_resource_without_conflict() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "ConfigMap",
@@ -1018,7 +1038,9 @@ mod cases {
 
     #[tokio::test]
     async fn public_create_rejects_existing_name_with_different_uid() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Pod",
@@ -1060,7 +1082,9 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_apply_create_replaces_stale_same_name_different_uid() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Pod",
@@ -1168,7 +1192,9 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_apply_update_rejects_stale_resource_version() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "ConfigMap",
@@ -1231,7 +1257,9 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_apply_main_update_allows_status_only_rv_advance() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let created = db
             .create_resource(
                 "apps/v1",
@@ -1313,7 +1341,9 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_apply_main_update_rejects_true_spec_conflict() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let created = db
             .create_resource(
                 "apps/v1",
@@ -1395,7 +1425,9 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_apply_main_update_rejects_same_name_replacement() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let created = db
             .create_resource(
                 "apps/v1",
@@ -1508,7 +1540,9 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_apply_status_rejects_status_only_rv_conflict() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let created = db
             .create_resource(
                 "v1",
@@ -1587,7 +1621,9 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_apply_patch_rejects_stale_resource_version() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "ConfigMap",
@@ -1649,7 +1685,9 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_apply_patch_allows_status_only_rv_advance() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let created = db
             .create_resource(
                 "apps/v1",
@@ -1727,7 +1765,9 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_apply_patch_rejects_true_spec_conflict() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let created = db
             .create_resource(
                 "apps/v1",
@@ -1807,7 +1847,9 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_apply_patch_rejects_same_name_replacement() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let created = db
             .create_resource(
                 "apps/v1",
@@ -1919,7 +1961,9 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_apply_status_rejects_stale_resource_version() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Pod",
@@ -2027,7 +2071,9 @@ mod cases {
 
     #[tokio::test]
     async fn delete_resource_exposes_committed_rv_for_leader_log_apply() {
-        let leader = crate::datastore::test_support::in_memory().await;
+        let leader = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let deleted = leader
             .create_resource(
                 "v1",
@@ -2075,7 +2121,9 @@ mod cases {
         assert!(delete_rv > deleted.resource_version);
         assert!(later.resource_version > delete_rv);
 
-        let follower = crate::datastore::test_support::in_memory().await;
+        let follower = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         follower
             .apply_log_apply_commit(klights_cluster_core::LogApplyCommit::put_resource(&deleted))
             .await
@@ -2101,7 +2149,9 @@ mod cases {
     #[tokio::test]
     async fn lease_renew_outbox_does_not_route_through_proposer() {
         let (ds, calls) = make_ds_with_inline_proposer().await;
-        let inner = crate::datastore::test_support::in_memory().await;
+        let inner = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         inner
             .create_resource(
                 "coordination.k8s.io/v1",
@@ -2220,7 +2270,11 @@ mod cases {
     async fn datastore_applier_maps_all_variants() {
         use klights_cluster_core::command::StorageCommand;
 
-        let db = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let meta = klights_cluster_core::command::CommandMeta {
             command_id: klights_cluster_core::command::CommandId("test".into()),
             codec_version: klights_cluster_core::command::COMMAND_CODEC_VERSION,
@@ -2331,7 +2385,11 @@ mod cases {
         }
 
         let proposer = Arc::new(InlineProposer {
-            inner: Arc::new(crate::datastore::test_support::in_memory().await),
+            inner: Arc::new(
+                crate::datastore::sqlite::Datastore::new_in_memory()
+                    .await
+                    .unwrap(),
+            ),
             calls: Default::default(),
         });
         let inner = proposer.inner.clone();
@@ -2402,7 +2460,11 @@ mod cases {
         let proposer = Arc::new(RecordingProposer {
             calls: Default::default(),
         });
-        let inner: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let inner: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let db = SequencedDatastore::new(inner, proposer.clone());
         db.apply_resource_batch(vec![
             ResourceBatchOperation::Put {
@@ -2495,7 +2557,11 @@ mod cases {
         }
 
         let proposer = Arc::new(InlineProposer {
-            inner: Arc::new(crate::datastore::test_support::in_memory().await),
+            inner: Arc::new(
+                crate::datastore::sqlite::Datastore::new_in_memory()
+                    .await
+                    .unwrap(),
+            ),
             calls: Default::default(),
         });
         let inner = proposer.inner.clone();
@@ -2613,7 +2679,11 @@ mod cases {
             }
         }
 
-        let inner: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let inner: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         inner
             .create_resource(
                 "v1",
@@ -2935,7 +3005,9 @@ mod cases {
             COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
         };
 
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let meta = CommandMeta {
             command_id: CommandId("ensure-cluster-metadata".to_string()),
             codec_version: COMMAND_CODEC_VERSION,
@@ -3013,8 +3085,11 @@ mod cases {
         SequencedDatastore,
         std::sync::Arc<dyn crate::datastore::DatastoreBackend>,
     ) {
-        let inner: std::sync::Arc<dyn crate::datastore::DatastoreBackend> =
-            std::sync::Arc::new(crate::datastore::test_support::in_memory().await);
+        let inner: std::sync::Arc<dyn crate::datastore::DatastoreBackend> = std::sync::Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         struct FollowerProposer;
         #[async_trait]
         impl super::super::RaftProposal for FollowerProposer {
@@ -3274,7 +3349,9 @@ mod cases {
     async fn replicated_update_resource_preserves_disruption_target_over_newer_kubelet_status() {
         use crate::bootstrap::sequenced_datastore::apply_command_to_backend;
 
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         // Victim is already Running on the node with the four kubelet-rebuilt
         // conditions and no DisruptionTarget.
         db.create_resource(
@@ -3426,7 +3503,9 @@ mod cases {
     async fn replicated_scheduler_bind_overwrites_pod_scheduled_pending_condition() {
         use crate::bootstrap::sequenced_datastore::apply_command_to_backend;
 
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Pod",
@@ -3556,7 +3635,9 @@ mod cases {
     async fn leader_direct_status_apply_preserves_disruption_target_without_outbox_stamp() {
         use crate::bootstrap::sequenced_datastore::apply_command_to_backend;
 
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         // Post-preemption victim: terminating with the four kubelet-rebuilt
         // conditions plus the scheduler-owned DisruptionTarget condition.
         db.create_resource(
@@ -3659,7 +3740,9 @@ mod cases {
     async fn replicated_stale_status_preserves_live_job_status_scalars() {
         use crate::bootstrap::sequenced_datastore::apply_command_to_backend;
 
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let created = db
             .create_resource(
                 "batch/v1",
@@ -3765,7 +3848,9 @@ mod cases {
     ) -> crate::datastore::Resource {
         use crate::bootstrap::sequenced_datastore::apply_command_to_backend;
 
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let created = db
             .create_resource(
                 case.api_version,
@@ -4125,7 +4210,9 @@ mod cases {
     async fn replicated_fresh_service_status_replaces_load_balancer_and_preserves_conditions() {
         use crate::bootstrap::sequenced_datastore::apply_command_to_backend;
 
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let created = db
             .create_resource(
                 "v1",

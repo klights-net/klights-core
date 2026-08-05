@@ -149,7 +149,9 @@ mod tests {
 
     #[tokio::test]
     async fn leader_kubernetes_service_reconcile_moves_endpoint_to_current_gateway() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         klights_controllers::namespace::init_default_namespaces_with_ca_path(
             &crate::kubelet::file_blocking::test_file_process_executor(),
             &db,

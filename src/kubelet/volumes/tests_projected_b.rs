@@ -3,7 +3,9 @@ use super::*;
 #[tokio::test]
 async fn test_projected_volume_missing_configmap_logs_error() {
     // Test that missing configMap produces error, not silent skip
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -44,7 +46,9 @@ async fn test_projected_volume_missing_configmap_logs_error() {
 
 #[tokio::test]
 async fn test_projected_volume_optional_missing_configmap_creates_empty_volume() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -84,7 +88,9 @@ async fn test_projected_volume_optional_missing_configmap_creates_empty_volume()
 #[tokio::test]
 async fn test_projected_volume_configmap_missing_key_errors() {
     // Test that missing key in configMap data produces error with logging
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -136,7 +142,9 @@ async fn test_projected_volume_configmap_missing_key_errors() {
 
 #[tokio::test]
 async fn test_projected_volume_optional_configmap_missing_key_is_skipped() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -185,7 +193,9 @@ async fn test_projected_volume_optional_configmap_missing_key_is_skipped() {
 
 #[tokio::test]
 async fn test_projected_volume_optional_missing_secret_creates_empty_volume() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -224,7 +234,9 @@ async fn test_projected_volume_optional_missing_secret_creates_empty_volume() {
 
 #[tokio::test]
 async fn test_projected_volume_optional_secret_missing_key_is_skipped() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -277,7 +289,9 @@ async fn test_projected_volume_optional_secret_missing_key_is_skipped() {
 #[tokio::test]
 async fn test_projected_volume_secret_writes_files() {
     // Test projected volume with secret source
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -338,7 +352,9 @@ async fn test_projected_volume_secret_writes_files() {
 #[tokio::test]
 async fn test_projected_volume_configmap_without_items_writes_all_keys() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -406,7 +422,9 @@ async fn test_projected_volume_configmap_without_items_writes_all_keys() {
 async fn test_projected_volume_configmap_items_per_file_mode() {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -483,7 +501,9 @@ async fn test_projected_volume_configmap_items_per_file_mode() {
 async fn test_projected_volume_secret_without_items_writes_all_keys() {
     use base64::Engine;
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -546,7 +566,9 @@ async fn test_projected_volume_secret_items_per_file_mode() {
     use base64::Engine;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -610,7 +632,9 @@ async fn test_projected_volume_secret_items_per_file_mode() {
 #[tokio::test]
 async fn test_projected_volume_downward_api_resource_field_ref() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -671,7 +695,9 @@ async fn test_projected_volume_downward_api_resource_field_ref() {
 async fn test_projected_volume_combines_configmap_secret_downward_api() {
     use base64::Engine;
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -757,7 +783,9 @@ async fn test_projected_volume_combines_configmap_secret_downward_api() {
 #[tokio::test]
 async fn test_projected_volume_missing_secret_returns_error() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -802,7 +830,9 @@ async fn test_projected_volume_missing_secret_returns_error() {
 #[tokio::test]
 async fn test_projected_volume_missing_sa_token_returns_error() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -851,7 +881,9 @@ async fn test_projected_volume_missing_sa_token_returns_error() {
 #[tokio::test]
 async fn test_projected_volume_sources_not_array_returns_error() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -895,7 +927,9 @@ async fn test_projected_volume_sources_not_array_returns_error() {
 #[tokio::test]
 async fn test_projected_volume_configmap_no_data_field_returns_error() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -950,7 +984,9 @@ async fn test_projected_volume_configmap_no_data_field_returns_error() {
 #[tokio::test]
 async fn test_projected_volume_sa_token_default_path_is_token() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 

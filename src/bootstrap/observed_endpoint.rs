@@ -343,7 +343,9 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_published_self_heals_when_local_node_has_external_ip() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.dataplane_encryption = klights_networking::wireguard::DataplaneEncryption::Disabled;
@@ -386,7 +388,9 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_published_keeps_observing_without_external_ip() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.dataplane_encryption = klights_networking::wireguard::DataplaneEncryption::Disabled;

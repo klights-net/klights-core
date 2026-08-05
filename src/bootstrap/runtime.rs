@@ -741,7 +741,9 @@ mod tests {
 
     #[tokio::test]
     async fn publish_local_dataplane_metadata_writes_explicit_disabled_route_metadata() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.external_endpoint = Some("192.0.2.10".to_string());

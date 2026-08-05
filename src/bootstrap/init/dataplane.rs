@@ -301,7 +301,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_local_external_endpoint_prefers_config_external_endpoint() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.external_endpoint = Some("203.0.113.10".to_string());
@@ -314,7 +316,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_local_external_endpoint_falls_back_to_node_external_ip() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.external_endpoint = None;
@@ -349,7 +353,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_local_external_endpoint_none_without_endpoint_or_external_ip() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.external_endpoint = None;
@@ -384,7 +390,9 @@ mod tests {
 
     #[tokio::test]
     async fn self_heal_publishes_node_dataplane_from_registered_external_ip() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.external_endpoint = None;
@@ -432,7 +440,9 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_node_dataplane_published_writes_when_missing() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.dataplane_encryption = klights_networking::wireguard::DataplaneEncryption::Disabled;
@@ -461,7 +471,9 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_node_dataplane_published_is_noop_when_row_exists() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.dataplane_encryption = klights_networking::wireguard::DataplaneEncryption::Disabled;
@@ -509,7 +521,9 @@ mod tests {
 
     #[tokio::test]
     async fn self_heal_is_noop_without_resolvable_endpoint() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.external_endpoint = None;

@@ -772,8 +772,10 @@ mod tests {
         DatastoreHandle,
         tokio::task::JoinHandle<()>,
     ) {
-        let concrete_db = crate::datastore::test_support::in_memory().await;
-        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&concrete_db);
+        let concrete_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&concrete_db);
         let db: DatastoreHandle = Arc::new(concrete_db);
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await

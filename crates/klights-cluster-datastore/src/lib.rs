@@ -11,5 +11,8 @@ pub mod redb;
 pub mod signing_key_state;
 pub mod sqlite;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 #[cfg(test)]
 pub mod test_fixtures;

@@ -1131,7 +1131,9 @@ impl NativeApiTestHarness {
             bootstrap_token_authenticator,
         } = options;
         let auth_clock = auth_clock.unwrap_or_else(|| Arc::new(klights_auth::clock::SystemClock));
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let passive_reads = if let Some(fail) = watch_history_failure {
             let focused_reads = db.focused_read_store();
             crate::datastore::selector::PassiveReadPorts::new(
@@ -1143,7 +1145,7 @@ impl NativeApiTestHarness {
                 focused_reads,
             )
         } else {
-            crate::datastore::test_support::sqlite_passive_read_ports(&db)
+            crate::datastore::selector::sqlite_passive_read_ports(&db)
         };
         let datastore: IntegrationDatastoreHandle = Arc::new(db.clone());
         let config = crate::KlightsConfig::test_default();

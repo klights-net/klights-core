@@ -29,7 +29,9 @@ async fn reconcile_service(
 
 #[tokio::test]
 async fn test_service_stale_snapshot_after_delete_does_not_recreate_endpoints() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let service_ipam = ServiceIpam::new("10.43.128.0/17");
 
     db.create_resource(
@@ -125,7 +127,9 @@ async fn test_service_stale_snapshot_after_delete_does_not_recreate_endpoints() 
 
 #[tokio::test]
 async fn service_reconcile_commits_endpointslice_and_legacy_endpoints_in_one_batch() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let service_ipam = ServiceIpam::new("10.43.128.0/17");
 
     db.create_resource(
@@ -396,7 +400,9 @@ fn test_normal_service_clusterip_allocated() {
 #[tokio::test]
 #[ignore] // Ignored by default, run manually with --ignored flag as root
 async fn test_reconcile_service_preserves_headless_cluster_ip_none() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let service_ipam = ServiceIpam::new("10.43.128.0/17");
 
     // Create a headless service (clusterIP: None)
@@ -472,7 +478,9 @@ async fn test_reconcile_service_preserves_headless_cluster_ip_none() {
 #[tokio::test]
 #[ignore] // Ignored by default, run manually with --ignored flag as root
 async fn test_reconcile_service_allocates_cluster_ip_when_not_set() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let service_ipam = ServiceIpam::new("10.43.128.0/17");
 
     // Create a normal service without clusterIP
@@ -550,7 +558,9 @@ async fn test_reconcile_service_allocates_cluster_ip_when_not_set() {
 #[tokio::test]
 #[ignore] // Requires root for nftables/netlink
 async fn test_service_external_name_no_cluster_ip() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let service_ipam = ServiceIpam::new("10.43.128.0/17");
 
     let mut service = json!({
@@ -616,7 +626,9 @@ async fn test_service_external_name_no_cluster_ip() {
 #[tokio::test]
 #[ignore] // Requires root for nftables/netlink
 async fn test_service_external_name_no_endpoints() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let service_ipam = ServiceIpam::new("10.43.128.0/17");
 
     let mut service = json!({
@@ -672,7 +684,9 @@ async fn test_service_external_name_no_endpoints() {
 #[tokio::test]
 #[ignore] // Requires root for nftables/netlink
 async fn test_service_external_name_no_endpoint_slice() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let service_ipam = ServiceIpam::new("10.43.128.0/17");
 
     let mut service = json!({
@@ -774,7 +788,9 @@ fn test_reconcile_service_defaults_type_to_clusterip_when_empty() {
 
 #[tokio::test]
 async fn test_reconcile_service_defaults_single_stack_ip_family_fields() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let service_ipam = ServiceIpam::new("10.43.128.0/17");
 
     let service = json!({
@@ -908,11 +924,12 @@ fn test_nodeport_allocator_sets_ready_after_bootstrap() {
 
 #[tokio::test]
 async fn test_nodeport_allocator_rebuild_scans_existing_services() {
-    use crate::datastore::test_support::in_memory;
     use std::sync::Arc;
 
     // Create in-memory DB with existing services having NodePorts
-    let db = in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let ns = "default";
 
     // Create a service with an existing NodePort
@@ -1007,7 +1024,9 @@ fn service_ipam_exhaustion_returns_error() {
 
 #[tokio::test]
 async fn service_reconcile_recovers_cluster_ip_after_generic_service_delete() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let ipam = ServiceIpam::new("10.0.0.0/30");
     let alloc = NodePortAllocator::new();
     alloc.set_ready();
@@ -1086,7 +1105,9 @@ async fn service_reconcile_recovers_cluster_ip_after_generic_service_delete() {
 /// changes must not bump the persisted resourceVersion.
 #[tokio::test]
 async fn reconcile_idempotent_does_not_churn_resource_version() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let ipam = ServiceIpam::new("10.43.128.0/17");
     let alloc = NodePortAllocator::new();
     alloc.set_ready();
@@ -1158,7 +1179,9 @@ async fn reconcile_idempotent_does_not_churn_resource_version() {
 #[tokio::test]
 async fn create_service_returns_error_when_allocation_fails() {
     // /30 CIDR has exactly one usable ClusterIP (network+2 = .2, broadcast-1 = .2)
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let service_ipam = ServiceIpam::new("10.0.0.0/30");
     let nodeport_alloc = NodePortAllocator::new();
     nodeport_alloc.set_ready();
@@ -1226,7 +1249,9 @@ async fn create_service_returns_error_when_allocation_fails() {
 #[tokio::test]
 async fn prepare_service_for_create_populates_allocated_fields() {
     // A normal Service create allocates a ClusterIP and populates the spec.
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let service_ipam = ServiceIpam::new("10.43.128.0/17");
     let nodeport_alloc = NodePortAllocator::new();
     nodeport_alloc.set_ready();

@@ -155,7 +155,9 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_cluster_metadata_creates_on_first_boot() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
 
         // Before ensure, no metadata
         assert!(
@@ -215,7 +217,9 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_cluster_metadata_idempotent_on_restart() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
 
         ensure_cluster_metadata(&db).await.unwrap();
         let first_id = db
@@ -262,7 +266,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_cluster_metadata_returns_initialized_values() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         ensure_cluster_metadata(&db).await.unwrap();
 
         let meta = read_cluster_metadata(&db).await.unwrap();
@@ -274,7 +280,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_cluster_metadata_fails_before_init() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let result = read_cluster_metadata(&db).await;
         assert!(result.is_err());
     }
@@ -285,7 +293,9 @@ mod tests {
 
     #[tokio::test]
     async fn voters_row_round_trips() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         ensure_cluster_metadata(&db).await.unwrap();
 
         let membership = klights_cluster_core::ClusterMembership {
@@ -305,7 +315,9 @@ mod tests {
 
     #[tokio::test]
     async fn membership_change_commits_update_meta() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         ensure_cluster_metadata(&db).await.unwrap();
         let cluster_id = db
             .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)

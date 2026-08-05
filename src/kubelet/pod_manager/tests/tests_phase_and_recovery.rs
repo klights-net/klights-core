@@ -249,7 +249,9 @@ fn test_restart_policy_unknown_defaults_to_no_restart() {
 async fn test_pvc_added_event_triggers_reconciliation() {
     use serde_json::json;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create a PersistentVolume (Available)
     let pv = json!({
@@ -360,7 +362,9 @@ async fn test_pvc_added_event_triggers_reconciliation() {
 async fn test_pv_added_event_triggers_pending_pvc_reconciliation() {
     use serde_json::json;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create a PVC first (no matching PV yet, should stay Pending)
     let pvc = json!({
@@ -546,7 +550,9 @@ fn make_pvc_pod(pvc_name: &str) -> Value {
 
 #[tokio::test]
 async fn test_process_volumes_pvc_not_found_returns_error() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let pod = make_pvc_pod("missing-pvc");
 
     let result = process_volumes(
@@ -568,7 +574,9 @@ async fn test_process_volumes_pvc_not_found_returns_error() {
 
 #[tokio::test]
 async fn test_process_volumes_pvc_not_bound_returns_error_with_phase() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create namespace
     db.create_resource(
@@ -608,7 +616,9 @@ async fn test_process_volumes_pvc_not_bound_returns_error_with_phase() {
 
 #[tokio::test]
 async fn test_process_volumes_pvc_bound_but_pv_not_found_returns_error() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
             "v1", "Namespace", None, "default",
@@ -647,7 +657,9 @@ async fn test_process_volumes_pvc_bound_but_pv_not_found_returns_error() {
 
 #[tokio::test]
 async fn test_process_volumes_pvc_bound_pv_with_hostpath_returns_path() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
             "v1", "Namespace", None, "default",
@@ -703,7 +715,9 @@ async fn test_process_volumes_pvc_bound_pv_with_hostpath_returns_path() {
 
 #[tokio::test]
 async fn test_process_volumes_pvc_bound_no_volume_name_returns_error() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
             "v1", "Namespace", None, "default",
@@ -747,7 +761,9 @@ async fn test_process_volumes_pvc_bound_no_volume_name_returns_error() {
 
 #[tokio::test]
 async fn test_process_volumes_pvc_bound_pv_no_hostpath_returns_error() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
             "v1", "Namespace", None, "default",

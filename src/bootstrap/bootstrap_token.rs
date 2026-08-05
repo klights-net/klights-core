@@ -675,7 +675,9 @@ mod tests {
 
     #[tokio::test]
     async fn fixed_worker_and_controlplane_token_secret_names_validate() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         create_scoped_bootstrap_token_secret_for_test(
             &db,
             BootstrapTokenScope::Worker,
@@ -722,7 +724,9 @@ mod tests {
 
     #[tokio::test]
     async fn fixed_join_token_secrets_store_single_token_data_field() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         create_scoped_bootstrap_token_secret_for_test(
             &db,
             BootstrapTokenScope::Worker,
@@ -767,7 +771,9 @@ mod tests {
 
     #[tokio::test]
     async fn validation_accepts_legacy_split_token_data_fields() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Secret",
@@ -809,7 +815,9 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_migrates_legacy_fixed_secret_to_single_token_field() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Secret",
@@ -858,7 +866,9 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_bootstrap_token_validation_rejects_wrong_join_scope() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         create_scoped_bootstrap_token_secret_for_test(
             &db,
             BootstrapTokenScope::Controlplane,
@@ -875,7 +885,9 @@ mod tests {
         .expect_err("controlplane token must not validate for worker joins");
         assert!(err.to_string().contains("worker bootstrap token"));
 
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         create_scoped_bootstrap_token_secret_for_test(
             &db,
             BootstrapTokenScope::Worker,
@@ -895,7 +907,9 @@ mod tests {
 
     #[tokio::test]
     async fn get_rotates_fixed_token_when_less_than_fifteen_minutes_remain() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         create_scoped_bootstrap_token_secret_with_ttl_for_test(
             &db,
             BootstrapTokenScope::Worker,
@@ -940,7 +954,9 @@ mod tests {
 
     #[tokio::test]
     async fn get_keeps_fixed_token_when_more_than_fifteen_minutes_remain() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         create_scoped_bootstrap_token_secret_with_ttl_for_test(
             &db,
             BootstrapTokenScope::Controlplane,
@@ -972,7 +988,9 @@ mod tests {
 
     #[tokio::test]
     async fn validate_bootstrap_token_rejects_expired_secret() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         create_scoped_bootstrap_token_secret_with_ttl_for_test(
             &db,
             BootstrapTokenScope::Worker,
@@ -990,7 +1008,9 @@ mod tests {
 
     #[tokio::test]
     async fn validate_bootstrap_token_rejects_secret_without_authentication_usage() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Secret",
@@ -1022,7 +1042,9 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_default_bootstrap_token_reuses_live_default_token() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
 
         let first = ensure_worker_bootstrap_token(&db).await.unwrap();
         let second = ensure_worker_bootstrap_token(&db).await.unwrap();
@@ -1035,7 +1057,9 @@ mod tests {
     async fn validate_bootstrap_token_rejects_invalid_extra_groups() {
         // Phase 2B: bootstrap tokens must reject auth-extra-groups that don't
         // start with system:bootstrappers:.
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let token_id = "abcdef";
         let secret_val = "0123456789abcdef";
         db.create_resource(

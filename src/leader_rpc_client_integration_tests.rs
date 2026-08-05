@@ -140,9 +140,10 @@ mod cases {
             let namespace = format!("grpc-tls-leader-{}", unique_suffix());
             let (ca_cert_path, wrong_ca_cert_path, node_cert_pem, node_key_pem) =
                 write_leader_tls_files(&namespace);
-            let concrete_db = crate::datastore::test_support::in_memory().await;
-            let passive_reads =
-                crate::datastore::test_support::sqlite_passive_read_ports(&concrete_db);
+            let concrete_db = crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap();
+            let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&concrete_db);
             let db: DatastoreHandle = Arc::new(concrete_db);
             crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
                 .await
@@ -365,8 +366,10 @@ mod cases {
         tokio::sync::watch::Sender<bool>,
         tokio::task::JoinHandle<()>,
     ) {
-        let concrete_db = crate::datastore::test_support::in_memory().await;
-        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&concrete_db);
+        let concrete_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&concrete_db);
         let db: DatastoreHandle = Arc::new(concrete_db);
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
@@ -401,7 +404,11 @@ mod cases {
             next.run(request).await
         }
 
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
@@ -483,7 +490,11 @@ mod cases {
 
     #[tokio::test]
     async fn observed_leader_endpoint_uses_connected_peer_ip_for_hostname_endpoint() {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
@@ -1074,7 +1085,11 @@ mod cases {
         DatastoreHandle,
         tokio::task::JoinHandle<()>,
     ) {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
@@ -1390,7 +1405,11 @@ mod cases {
         // deadline must abort the wedged call, evict the lane, and surface
         // Retryable so the dispatcher re-sends on a fresh connection.
         use klights_leader_api::OutboxDeliveryError as OutboxApplyError;
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
@@ -1476,7 +1495,11 @@ mod cases {
         // a wedged call must abort at the per-call deadline, evict ONLY the
         // Status lane, and leave the Read lane's warm pool intact (lane
         // isolation).
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
@@ -1565,7 +1588,11 @@ mod cases {
         // wall-clock bound — i.e. it routes through `unary_call`'s deadline.
         use klights_leader_api::ProjectedServiceAccountTokenRequest;
         use klights_types::ResourceKey;
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
@@ -1800,7 +1827,11 @@ mod cases {
         // `raft_unary_deadline`, surface a deadline-exceeded error, and evict
         // ONLY the Raft lane so the next attempt rebuilds a fresh connection
         // while sibling lanes keep their warm pools.
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
@@ -1919,7 +1950,11 @@ mod cases {
         )
         .unwrap();
 
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
@@ -2021,9 +2056,11 @@ mod cases {
         tokio::fs::create_dir_all(&log_dir).await.unwrap();
 
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let concrete_pod_event_db = crate::datastore::test_support::in_memory().await;
+        let concrete_pod_event_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let passive_reads =
-            crate::datastore::test_support::sqlite_passive_read_ports(&concrete_pod_event_db);
+            crate::datastore::selector::sqlite_passive_read_ports(&concrete_pod_event_db);
         let pod_event_db: crate::datastore::DatastoreHandle = Arc::new(concrete_pod_event_db);
         let positioned_watch =
             crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
@@ -2162,7 +2199,11 @@ mod cases {
 
     #[tokio::test]
     async fn client_replies_to_node_exec_sync_requests_on_connect_stream() {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
@@ -2235,7 +2276,11 @@ mod cases {
 
     #[tokio::test]
     async fn client_replies_to_node_metrics_requests_on_connect_stream() {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
@@ -2348,7 +2393,11 @@ mod cases {
 
     #[tokio::test]
     async fn client_bridges_node_exec_stream_frames_on_connect_stream() {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
@@ -2545,7 +2594,11 @@ mod cases {
     async fn raft_timeout_client(
         wedge_path_suffix: &'static str,
     ) -> (ReplicationGrpcClient, tokio::task::JoinHandle<()>) {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
@@ -2665,7 +2718,11 @@ mod cases {
         // The server decodes an empty/invalid payload and returns an error
         // inside the response body (not a transport-level tonic::Status).
         // The client must NOT call invalidate_lane — the Raft lane stays warm.
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();

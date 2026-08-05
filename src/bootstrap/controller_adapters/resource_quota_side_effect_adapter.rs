@@ -64,7 +64,8 @@ pub(crate) fn port(
 mod adapter_tests {
     #[tokio::test]
     async fn test_resource_quota_recount_name() {
-        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_db, db_handle) =
+            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let effect = klights_controllers::side_effects::resource_quota::effect(super::port(
             db_handle,
             klights_controllers::side_effects::PodSideEffectPortsSlot::new(),

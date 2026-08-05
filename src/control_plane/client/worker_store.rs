@@ -1699,7 +1699,9 @@ mod tests {
 
     #[tokio::test]
     async fn network_metadata_surfaces_forward_through_focused_leader_ports() {
-        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let dataplane = klights_cluster_store::DataplanePeerMetadata::try_new(
             "worker-b".to_string(),
             klights_cluster_store::DataplaneMode::Root,
@@ -1912,7 +1914,9 @@ mod tests {
 
     #[tokio::test]
     async fn failed_snapshot_pod_route_retries_without_committing_reflector_or_membership() {
-        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         cluster_db
             .create_resource(
                 "v1",
@@ -2659,7 +2663,9 @@ mod tests {
         // list no longer than the limit and cleared the leader-provided
         // continue_token / remaining_item_count — workers' LIST silently dropped
         // the rest of the collection. Pagination must be applied exactly once.
-        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         for name in ["cm-a", "cm-b", "cm-c"] {
             cluster_db
                 .create_resource(
@@ -2747,7 +2753,9 @@ mod tests {
 
     #[tokio::test]
     async fn worker_watch_replay_respects_resume_resource_version() {
-        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         for name in ["cm-a", "cm-b", "cm-c"] {
             cluster_db
                 .create_resource(
@@ -2830,7 +2838,9 @@ mod tests {
 
     #[tokio::test]
     async fn worker_scalar_watch_replay_never_synthesizes_events_from_live_list_state() {
-        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         cluster_db
             .create_resource(
                 "v1",
@@ -2885,7 +2895,9 @@ mod tests {
 
     #[tokio::test]
     async fn worker_watch_replay_preserves_mirrored_delete_events() {
-        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let cluster_api = Arc::new(LocalApiClient::new(
             Arc::new(cluster_db.clone()),
             "worker-a".to_string(),
@@ -2950,7 +2962,9 @@ mod tests {
 
     #[tokio::test]
     async fn worker_watch_replay_marks_resumed_bound_pod_snapshot_changes_modified() {
-        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let created = cluster_db
             .create_resource(
                 "v1",
@@ -3071,7 +3085,9 @@ mod tests {
 
     #[tokio::test]
     async fn reads_cluster_objects_through_worker_cache_and_runtime_rows_from_node_local() {
-        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         cluster_db
             .create_resource(
                 "v1",
@@ -3144,7 +3160,9 @@ mod tests {
 
     #[tokio::test]
     async fn watch_mirror_publishes_existing_node_pods_on_startup() {
-        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         cluster_db
             .create_resource(
                 "v1",
@@ -3221,7 +3239,9 @@ mod tests {
 
     #[tokio::test]
     async fn watch_mirror_publishes_namespace_events_on_startup() {
-        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         cluster_db
             .create_namespace(
                 "terminating-ns",

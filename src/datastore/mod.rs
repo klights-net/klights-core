@@ -45,9 +45,6 @@ pub use types::{
     SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget, WatchTargetScope,
 };
 
-#[cfg(any(test, feature = "integration-test-harness"))]
-pub mod test_support;
-
 #[cfg(test)]
 pub use sqlite::create_staged_post_commit;
 #[cfg(any(test, feature = "integration-test-harness"))]

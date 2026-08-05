@@ -133,7 +133,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_emit_pod_event_creates_valid_event_json() {
-        let ds = crate::datastore::test_support::in_memory().await;
+        let ds = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let pod = create_test_pod();
 
         let event = emit_pod_event(
@@ -205,7 +207,9 @@ mod tests {
 
     #[tokio::test]
     async fn control_plane_event_uses_supplied_operation_timestamp() {
-        let ds = crate::datastore::test_support::in_memory().await;
+        let ds = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let pod = create_test_pod();
         let operation_now = chrono::DateTime::parse_from_rfc3339("2026-07-29T12:34:56.789Z")
             .expect("fixed timestamp should parse")
@@ -241,7 +245,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_emit_pod_event_uses_correct_involved_object() {
-        let ds = crate::datastore::test_support::in_memory().await;
+        let ds = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let pod = create_test_pod();
 
         let event = emit_pod_event(
@@ -283,7 +289,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_emit_pod_event_normal_type() {
-        let ds = crate::datastore::test_support::in_memory().await;
+        let ds = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let pod = create_test_pod();
 
         let event = emit_pod_event(
@@ -303,7 +311,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_emit_pod_event_warning_type() {
-        let ds = crate::datastore::test_support::in_memory().await;
+        let ds = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let pod = create_test_pod();
 
         let event = emit_pod_event(
@@ -323,7 +333,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_emit_pod_event_unique_names() {
-        let ds = crate::datastore::test_support::in_memory().await;
+        let ds = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let pod = create_test_pod();
 
         let event1 = emit_pod_event(
@@ -366,7 +378,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_emit_pod_event_dedupes_scheduled_for_same_pod_message_and_source() {
-        let ds = crate::datastore::test_support::in_memory().await;
+        let ds = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let pod = create_test_pod();
 
         emit_pod_event(
@@ -412,7 +426,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_emit_pod_event_does_not_dedupe_non_scheduled_events() {
-        let ds = crate::datastore::test_support::in_memory().await;
+        let ds = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let pod = create_test_pod();
 
         emit_pod_event(
@@ -458,7 +474,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_emit_pod_event_skips_persisting_in_terminating_namespace() {
-        let ds = crate::datastore::test_support::in_memory().await;
+        let ds = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         ds.create_namespace(
             "terminating-events",
             serde_json::json!({
@@ -514,7 +532,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_emit_pod_event_with_outbox_none_is_rejected() {
-        let ds = crate::datastore::test_support::in_memory().await;
+        let ds = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let pod = create_test_pod();
 
         let query = crate::bootstrap::composition_adapters::pod_event_adapter::DatastorePodEventAdapter::new(&ds);

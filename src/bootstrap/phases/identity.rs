@@ -652,8 +652,11 @@ mod tests {
         let joiner_fixture = crate::paths::test_data_root_fixture(&joiner_namespace);
         let leader_data_root = leader_fixture.path().to_path_buf();
         let joiner_data_root = joiner_fixture.path().to_path_buf();
-        let db: crate::datastore::DatastoreHandle =
-            std::sync::Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: crate::datastore::DatastoreHandle = std::sync::Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();

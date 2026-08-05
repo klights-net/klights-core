@@ -233,7 +233,9 @@ mod tests {
 
     #[tokio::test]
     async fn network_boot_dispatches_rootless_mode_to_rootless_plane() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let cfg = rootless_test_config("rootless-dispatch-node");
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),

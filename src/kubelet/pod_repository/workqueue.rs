@@ -1402,7 +1402,7 @@ mod tests {
         crate::datastore::DatastoreHandle,
         std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
     ) {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let store = Arc::new(PodStore::new(db.clone()));
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
@@ -1427,7 +1427,7 @@ mod tests {
         crate::datastore::DatastoreHandle,
         std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
     ) {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let store = Arc::new(PodStore::new(db.clone()));
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
@@ -1447,7 +1447,7 @@ mod tests {
 
     #[tokio::test]
     async fn leadership_gain_discovers_terminating_unbound_pod_without_local_queue_row() {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let store = Arc::new(PodStore::new(db.clone()));
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
@@ -1623,7 +1623,8 @@ mod tests {
 
     #[tokio::test]
     async fn stale_lease_cannot_delete_unscheduled_pod_after_demote_promote_aba() {
-        let (_datastore, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_datastore, db) =
+            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let store = Arc::new(PodStore::new(db.clone()));
         let deletion = compose_leader_unscheduled_deletion(store.clone());
         let created = db
@@ -2767,7 +2768,7 @@ mod tests {
     /// be delayed by the sleep duration.
     #[tokio::test]
     async fn reconciler_exits_on_root_cancellation() {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let store = Arc::new(PodStore::new(db.clone()));
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),

@@ -40,7 +40,9 @@ fn test_volume_path(
 async fn test_projected_volume_configmap_uses_default_mode() {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -101,7 +103,9 @@ async fn test_projected_volume_configmap_uses_default_mode() {
 async fn test_projected_volume_downward_api_per_file_mode() {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -154,7 +158,9 @@ async fn test_projected_volume_downward_api_per_file_mode() {
 #[tokio::test]
 async fn test_extract_resource_field_ref_limits_memory_absent_returns_node_allocatable() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Pod with NO resource limits set — like a burstable or best-effort pod
     let pod = json!({
@@ -197,7 +203,9 @@ async fn test_secret_volume_refresh_on_update() {
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create a Secret with initial data
     use base64::Engine;
@@ -316,7 +324,9 @@ async fn test_projected_secret_refresh_uses_event_payload_for_new_keys() {
 
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let old_value = base64::engine::general_purpose::STANDARD.encode("value-1");
     let new_value = base64::engine::general_purpose::STANDARD.encode("value-3");
 
@@ -401,7 +411,9 @@ async fn test_projected_secret_delete_event_clears_volume_with_stale_db_secret()
 
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let old_value = base64::engine::general_purpose::STANDARD.encode("value-1");
 
     db.create_resource(
@@ -476,7 +488,9 @@ async fn test_projected_configmap_delete_event_clears_existing_volume_with_missi
 
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
         "v1",
@@ -550,7 +564,9 @@ async fn test_secret_delete_event_clears_direct_volume_with_stale_db_secret() {
 
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let old_value = base64::engine::general_purpose::STANDARD.encode("value-1");
 
     db.create_resource(
@@ -623,7 +639,9 @@ async fn test_configmap_volume_refresh_uses_event_payload_for_new_keys() {
 
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
         "v1",
@@ -705,7 +723,9 @@ async fn test_configmap_volume_refresh_on_update() {
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create a ConfigMap with initial data
     db.create_resource(
@@ -816,7 +836,9 @@ async fn test_configmap_volume_refresh_prunes_removed_keys() {
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
         "v1",
@@ -918,7 +940,9 @@ async fn test_configmap_volume_refresh_clears_files_on_source_delete() {
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
         "v1",
@@ -996,7 +1020,9 @@ async fn test_secret_volume_refreshes_existing_terminal_pod_mounts() {
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create a Secret
     use base64::Engine;

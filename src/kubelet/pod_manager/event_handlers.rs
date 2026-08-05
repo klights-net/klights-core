@@ -806,7 +806,8 @@ mod tests {
 
     #[tokio::test]
     async fn namespace_termination_event_enqueues_actor_delete_for_terminating_local_pod() {
-        let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (db, db_handle) =
+            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let supervisor = fixture_supervisor();
         let (pod_repo, node_local) = fixture_pod_repo(db_handle.clone(), supervisor).await;
 
@@ -868,7 +869,8 @@ mod tests {
     async fn configmap_watch_refresh_uses_injected_runtime_paths() {
         let temp = tempfile::tempdir().expect("create kubelet test fixture");
 
-        let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (db, db_handle) =
+            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let supervisor = fixture_supervisor();
         let (pod_repo, _node_local) = fixture_pod_repo(db_handle.clone(), supervisor.clone()).await;
         let pod_cleanup_intents: Arc<dyn klights_leader_api::LeaderPodCleanupIntents> =

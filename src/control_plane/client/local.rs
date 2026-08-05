@@ -653,7 +653,7 @@ impl LocalApiClient {
     ) -> Self {
         Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process_with_reads(
             db,
-            crate::datastore::test_support::unused_fail_closed_passive_read_ports(),
+            crate::datastore::selector::unused_fail_closed_passive_read_ports(),
             authoring_node,
             containerd_namespace,
             node_lease_tracker,
@@ -1324,7 +1324,11 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn local_protobuf_pod_status_reconciles_json_endpoint_tables() {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let service = db
             .create_resource(
                 "v1",
@@ -1447,7 +1451,9 @@ mod inner_gate_tests {
     /// work happens.
     #[tokio::test]
     async fn local_api_client_refuses_apply_outbox_when_not_leader() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         make_pod(&db).await;
         let (_tx, rx) = watch::channel(false);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
@@ -1469,7 +1475,11 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn outbox_terminal_decision_local_invalid_and_malformed_rows_consume_in_order() {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         db.create_resource(
             "v1",
             "Node",
@@ -1592,7 +1602,11 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn exact_codec_rejection_precedes_decode_ledger_and_watermark() {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let client = LocalApiClient::new(
             db.clone(),
             "node-a".to_string(),
@@ -1657,7 +1671,9 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn local_resource_command_is_leader_gated_before_datastore_mutation() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let (_tx, rx) = watch::channel(false);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
         let request = ResourceCommandRequest::try_new(StorageCommand::CreateResource {
@@ -1689,7 +1705,9 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn local_resource_command_returns_the_created_resource() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let (_tx, rx) = watch::channel(true);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
         let request = ResourceCommandRequest::try_new(StorageCommand::CreateResource {
@@ -1715,7 +1733,9 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn local_resource_command_preserves_duplicate_create_as_already_exists() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let (_tx, rx) = watch::channel(true);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
         let command = StorageCommand::CreateResource {
@@ -1747,7 +1767,9 @@ mod inner_gate_tests {
     /// `allocate_node_subnet` writes cluster state and must be gated.
     #[tokio::test]
     async fn local_api_client_refuses_allocate_node_subnet_when_not_leader() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let (_tx, rx) = watch::channel(false);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
 
@@ -1772,7 +1794,9 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn local_api_client_maps_subnet_exhaustion_to_typed_error() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let (_tx, rx) = watch::channel(true);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
 
@@ -1803,7 +1827,9 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn local_api_client_refuses_network_topology_query_when_not_leader() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let (_tx, rx) = watch::channel(false);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
         let request =
@@ -1821,7 +1847,9 @@ mod inner_gate_tests {
     /// Cached reads may use follower-applied state, but LeaderFresh must not.
     #[tokio::test]
     async fn local_api_client_allows_reads_when_not_leader() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         make_pod(&db).await;
         let (_tx, rx) = watch::channel(false);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
@@ -1906,8 +1934,10 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn local_selector_watch_synthesizes_deleted_when_pod_leaves_node() {
-        let concrete_db = crate::datastore::test_support::in_memory().await;
-        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&concrete_db);
+        let concrete_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&concrete_db);
         let db: DatastoreHandle = Arc::new(concrete_db);
         let pod = db
             .create_resource(
@@ -1995,8 +2025,10 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn local_positioned_watch_resolves_namespaced_crd_for_all_namespaces_delivery() {
-        let concrete_db = crate::datastore::test_support::in_memory().await;
-        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&concrete_db);
+        let concrete_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&concrete_db);
         let db: DatastoreHandle = Arc::new(concrete_db);
         register_watch_scope_crd(&db, "example.com", "Widget", "widgets", true).await;
         let (_tx, rx) = watch::channel(true);
@@ -2034,8 +2066,10 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn local_positioned_watch_resolves_cluster_scoped_crd_delivery() {
-        let concrete_db = crate::datastore::test_support::in_memory().await;
-        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&concrete_db);
+        let concrete_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&concrete_db);
         let db: DatastoreHandle = Arc::new(concrete_db);
         register_watch_scope_crd(
             &db,
@@ -2088,7 +2122,9 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn exact_position_selector_watch_replays_late_lower_rv_leave_as_deleted() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let selected = serde_json::json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
@@ -2165,7 +2201,7 @@ mod inner_gate_tests {
         .await
         .unwrap();
 
-        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
+        let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&db);
         let db: DatastoreHandle = Arc::new(db);
         let (_tx, rx) = watch::channel(true);
         let client = LocalApiClient::new_with_passive_reads(db, passive_reads, "node-a".into(), rx);
@@ -2202,8 +2238,10 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn local_omitted_rv_watch_starts_after_existing_objects() {
-        let concrete_db = crate::datastore::test_support::in_memory().await;
-        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&concrete_db);
+        let concrete_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&concrete_db);
         let db: DatastoreHandle = Arc::new(concrete_db);
         db.create_resource(
             "v1",
@@ -2263,7 +2301,9 @@ mod inner_gate_tests {
     /// re-construction or rewiring.
     #[tokio::test]
     async fn local_api_client_flips_to_accepting_writes_on_promotion() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         make_pod(&db).await;
         let (tx, rx) = watch::channel(false);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
@@ -2309,7 +2349,9 @@ mod inner_gate_tests {
     /// writes on the next call.
     #[tokio::test]
     async fn local_api_client_revokes_writes_on_demotion() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         make_pod(&db).await;
         let (tx, rx) = watch::channel(true);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
@@ -2353,7 +2395,9 @@ mod inner_gate_tests {
     /// mutation and must surface a retryable result after demotion.
     #[tokio::test]
     async fn outbox_apply_client_respects_leader_gate() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         make_pod(&db).await;
         let (_tx, rx) = watch::channel(false);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
@@ -2418,7 +2462,11 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn local_projected_token_capability_remains_self_node_scoped() {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let client = LocalApiClient::new(db, "leader-cp1".to_string(), always_leader_watch());
         let request = ProjectedServiceAccountTokenRequest::try_new(
             "default",
@@ -2533,7 +2581,11 @@ mod inner_gate_tests {
                     future
                 })
             };
-            let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+            let db: DatastoreHandle = Arc::new(
+                crate::datastore::sqlite::Datastore::new_in_memory()
+                    .await
+                    .unwrap(),
+            );
             let (leadership_tx, leadership_rx) = watch::channel(true);
             let data_root = tempfile::tempdir().unwrap();
             let namespace = data_root.path().to_str().unwrap().to_string();
@@ -2546,7 +2598,7 @@ mod inner_gate_tests {
                 LocalApiClient::new_with_node_lease_tracker_namespace_signing_key_and_file_process(
                     LocalApiPersistencePorts::new(
                         db.clone(),
-                        crate::datastore::test_support::unused_fail_closed_passive_read_ports(),
+                        crate::datastore::selector::unused_fail_closed_passive_read_ports(),
                         test_watch_signals(&db),
                     ),
                     "node-a".to_string(),
@@ -2652,7 +2704,11 @@ mod inner_gate_tests {
         AuthenticatedProjectedTokenIssuer,
         ProjectedServiceAccountTokenRequest,
     ) {
-        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         seed_projected_token_adapter_resources(db.as_ref()).await;
         let data_root = tempfile::tempdir().unwrap();
         let namespace = data_root.path().to_str().unwrap().to_string();
@@ -2667,7 +2723,7 @@ mod inner_gate_tests {
             LocalApiClient::new_with_node_lease_tracker_namespace_signing_key_and_file_process(
                 LocalApiPersistencePorts::new(
                     db.clone(),
-                    crate::datastore::test_support::unused_fail_closed_passive_read_ports(),
+                    crate::datastore::selector::unused_fail_closed_passive_read_ports(),
                     test_watch_signals(&db),
                 ),
                 "leader-cp1".to_string(),
@@ -2752,7 +2808,9 @@ mod inner_gate_tests {
     /// cluster.db has no trace of a proposal.
     #[tokio::test]
     async fn delegated_outbox_service_refuses_before_proposal_on_non_leader() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         make_pod(&db).await;
         let pre_rv = db
             .get_resource("v1", "Pod", Some("default"), "web")

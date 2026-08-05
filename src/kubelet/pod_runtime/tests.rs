@@ -525,7 +525,7 @@ async fn mock_network_records_assignment_and_release() {
 
 #[tokio::test]
 async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_match() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
@@ -1117,7 +1117,7 @@ async fn mock_pod_runtime_service_error_injection() {
 use crate::kubelet::pod_runtime::service::RuntimeConfig;
 
 async fn fixture_pod_repository() -> std::sync::Arc<crate::kubelet::pod_repository::PodRepository> {
-    let (ds, handle) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (ds, handle) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     // These runtime tests place pods in conventional non-system namespaces. The
     // API create path enforces the upstream NamespaceLifecycle rule (target
     // namespace must exist), so seed them as a live cluster would have them.
@@ -10439,7 +10439,7 @@ async fn production_wired_runtime_reconcile_uses_oo_ports() {
 async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finalization() {
     use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
 
-    let (ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     db.seed_namespace_for_test("sonobuoy").await;
     std::mem::forget(ds);
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(

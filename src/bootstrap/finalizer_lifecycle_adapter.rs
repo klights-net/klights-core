@@ -304,7 +304,9 @@ mod tests {
 
     #[tokio::test]
     async fn finalized_effects_route_bound_pod_children_to_actor_sink() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let db_handle: DatastoreHandle = Arc::new(db.clone());
         db.create_resource(
             "v1",

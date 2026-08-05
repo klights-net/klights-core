@@ -4,7 +4,9 @@ use super::*;
 async fn test_mirror_endpoints_sets_owner_reference() {
     // P0-E2E-20260423-09: mirror EndpointSlice must carry an ownerReference
     // so GC deletes it when the Endpoints is deleted.
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "default"}});
     db.create_resource("v1", "Namespace", None, "default", ns)
         .await
@@ -58,7 +60,9 @@ async fn test_mirror_endpoints_sets_owner_reference() {
 
 #[tokio::test]
 async fn test_mirror_endpoints_stale_snapshot_after_delete_does_not_recreate_slice() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "default"}});
     db.create_resource("v1", "Namespace", None, "default", ns)
         .await
@@ -108,7 +112,9 @@ async fn test_mirror_endpoints_stale_snapshot_after_delete_does_not_recreate_sli
 
 #[tokio::test]
 async fn test_reconcile_endpoints_named_target_port_resolves_to_container_port() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});
     db.create_resource("v1", "Namespace", None, "test", ns)
@@ -171,7 +177,9 @@ async fn test_reconcile_endpoints_named_target_port_resolves_to_container_port()
 
 #[tokio::test]
 async fn test_reconcile_endpoints_numeric_string_target_port_and_skip_unresolved_named_port() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});
     db.create_resource("v1", "Namespace", None, "test", ns)
@@ -239,7 +247,9 @@ async fn test_reconcile_endpoints_numeric_string_target_port_and_skip_unresolved
 
 #[tokio::test]
 async fn test_reconcile_endpoints_preserves_service_port_name() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});
     db.create_resource("v1", "Namespace", None, "test", ns)
@@ -306,7 +316,9 @@ async fn test_reconcile_endpoints_preserves_service_port_name() {
 
 #[tokio::test]
 async fn test_endpointslice_deleted_when_service_deleted_via_cascade() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create namespace
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});

@@ -1748,7 +1748,9 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_style_proxy_composition_dispatches_correctly() {
         use crate::control_plane::client::local::LocalApiClient;
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let (tx, rx) = watch::channel(true); // simulate seed cp1
         let local_real = Arc::new(LocalApiClient::new(Arc::new(db), "cp1".into(), rx.clone()));
         let stub_remote = Arc::new(StubRemoteForwarder::new("cp1".into()));

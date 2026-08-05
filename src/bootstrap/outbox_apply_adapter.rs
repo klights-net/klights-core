@@ -287,7 +287,9 @@ mod review_regressions {
 
     #[tokio::test]
     async fn watermarked_stale_uid_bound_pod_row_advances_stream_without_side_effect_command() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Namespace",

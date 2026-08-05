@@ -242,8 +242,11 @@ mod tests {
         klights_cluster_core::Resource,
         klights_cluster_core::Resource,
     ) {
-        let db: crate::datastore::DatastoreHandle =
-            std::sync::Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: crate::datastore::DatastoreHandle = std::sync::Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let pv = db
             .create_resource(
                 "v1",
@@ -379,8 +382,11 @@ mod tests {
 
     #[tokio::test]
     async fn leader_pv_event_picks_smallest_sufficient_pv() {
-        let db: crate::datastore::DatastoreHandle =
-            std::sync::Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: crate::datastore::DatastoreHandle = std::sync::Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         db.create_resource(
             "v1",
             "PersistentVolume",

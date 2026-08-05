@@ -44,7 +44,8 @@ pub(crate) fn port(db: DatastoreHandle) -> Arc<dyn JobSideEffectStore> {
 mod tests {
     #[tokio::test]
     async fn test_job_reconcile_name() {
-        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_db, db_handle) =
+            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let effect = klights_controllers::side_effects::job::effect(
             super::port(db_handle),
             klights_controllers::side_effects::ControllerDispatcherSlot::new(),

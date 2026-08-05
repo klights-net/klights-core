@@ -278,7 +278,7 @@ async fn grpc_test_server_with_policy(
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(&db)
         .await
         .unwrap();
-    let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
+    let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&db);
     let db: DatastoreHandle = Arc::new(db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(crate::grpc_test_support::replication_service(
@@ -335,7 +335,9 @@ async fn grpc_test_server_with_policy(
 
 #[tokio::test]
 async fn server_rejects_request_over_policy_message_limit() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let policy = klights_leader_rpc::transport_policy::GrpcTransportPolicy {
         max_message_bytes: 1024,
         ..Default::default()
@@ -397,7 +399,9 @@ async fn server_rejects_request_over_policy_message_limit() {
 
 #[tokio::test]
 async fn fresh_idle_watch_heartbeat_carries_the_sampled_anchor() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     db.create_namespace(
         "anchor",
         serde_json::json!({"metadata": {"name": "anchor"}}),
@@ -455,7 +459,9 @@ async fn fresh_idle_watch_heartbeat_carries_the_sampled_anchor() {
 
 #[tokio::test]
 async fn watch_stream_emits_bookmark_during_stream_local_silence_under_nonmatching_traffic() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     db.create_namespace("hb", serde_json::json!({"metadata": {"name": "hb"}}))
         .await
         .unwrap();
@@ -542,7 +548,9 @@ async fn watch_stream_emits_bookmark_during_stream_local_silence_under_nonmatchi
 
 #[tokio::test]
 async fn watch_stream_replays_lower_matching_pod_on_nonmatching_high_rv_signal() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(&db)
         .await
         .unwrap();
@@ -669,7 +677,9 @@ async fn grpc_leader_server(
     super::GrpcReplicationServer,
     tokio::sync::watch::Sender<bool>,
 ) {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     grpc_leader_server_with_db(db, is_leader).await
 }
 
@@ -683,7 +693,7 @@ async fn grpc_leader_server_with_db(
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(&db)
         .await
         .unwrap();
-    let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
+    let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&db);
     let db: DatastoreHandle = Arc::new(db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(crate::grpc_test_support::replication_service(
@@ -735,7 +745,9 @@ fn configmap(name: &str) -> serde_json::Value {
 }
 
 async fn configmap_replay_db() -> (crate::datastore::sqlite::Datastore, i64) {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(&db)
         .await
         .unwrap();
@@ -819,7 +831,9 @@ fn custom_resource_watch_request(
 async fn grpc_watch_resolves_namespaced_crd_for_all_namespaces_delivery() {
     use futures::StreamExt;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     register_grpc_watch_scope_crd(&db, "example.com", "Widget", "widgets", true).await;
     let (grpc, _leader_tx) = grpc_leader_server_with_db(db.clone(), true).await;
     let mut stream = grpc
@@ -860,7 +874,9 @@ async fn grpc_watch_resolves_namespaced_crd_for_all_namespaces_delivery() {
 async fn grpc_watch_resolves_cluster_scoped_crd_delivery() {
     use futures::StreamExt;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     register_grpc_watch_scope_crd(
         &db,
         "cluster.example.com",
@@ -1463,7 +1479,11 @@ fn request_with_admin_cert<T>(message: T) -> tonic::Request<T> {
 // ── CRIT-1: raft RPC authentication ──
 
 async fn raft_test_server() -> super::GrpcReplicationServer {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(crate::grpc_test_support::replication_service(
         db.clone(),
@@ -1610,7 +1630,11 @@ async fn submit_resource_command_accepts_controlplane_create() {
 
 #[tokio::test]
 async fn raft_append_entries_rejects_bootstrap_token() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -1792,7 +1816,9 @@ async fn raft_install_snapshot_rejects_admin_certificate() {
 
 #[tokio::test]
 async fn renew_node_lease_rejects_mismatched_node() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db: DatastoreHandle = Arc::new(db);
     let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         chrono::DateTime::parse_from_rfc3339("2026-05-25T00:00:00Z")
@@ -1829,7 +1855,11 @@ async fn renew_node_lease_rejects_mismatched_node() {
 
 #[tokio::test]
 async fn node_effect_rpc_rejects_nonpositive_lease_duration_before_tracker_mutation() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         chrono::Utc::now(),
     ));
@@ -1860,7 +1890,11 @@ async fn node_effect_rpc_rejects_nonpositive_lease_duration_before_tracker_mutat
 
 #[tokio::test]
 async fn outbox_terminal_decision_rpc_rejects_smuggling_and_malformed_rows_in_order() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let created = db
         .create_resource(
             "v1",
@@ -2011,7 +2045,11 @@ async fn outbox_terminal_decision_rpc_rejects_smuggling_and_malformed_rows_in_or
 
 #[tokio::test]
 async fn node_effect_rpc_rejects_wrong_uid_before_committed_apply() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let created = db
         .create_resource(
             "v1",
@@ -2079,7 +2117,11 @@ async fn node_effect_rpc_rejects_wrong_uid_before_committed_apply() {
 
 #[tokio::test]
 async fn grpc_apply_outbox_accepts_joining_controlplane_node_status() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let created = db
         .create_resource(
             "v1",
@@ -2184,7 +2226,11 @@ async fn grpc_apply_outbox_accepts_joining_controlplane_node_status() {
 
 #[tokio::test]
 async fn outbox_transport_contract_rpc_rejects_unvalidated_stream_identity() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(crate::grpc_test_support::replication_service(
         db.clone(),
@@ -2228,7 +2274,11 @@ async fn outbox_transport_contract_rpc_rejects_unvalidated_stream_identity() {
 
 #[tokio::test]
 async fn cleanup_intent_list_requires_current_leader_and_same_node_authority() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(crate::grpc_test_support::replication_service(
         db.clone(),
@@ -2265,7 +2315,11 @@ async fn cleanup_intent_list_requires_current_leader_and_same_node_authority() {
 
 #[tokio::test]
 async fn cleanup_intent_ack_requires_current_leader_before_mutation() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(crate::grpc_test_support::replication_service(
         db.clone(),
@@ -2413,7 +2467,9 @@ async fn renew_node_lease_rejects_renew_time_skew_over_100_seconds() {
     let wall_time = chrono::DateTime::parse_from_rfc3339("2040-02-03T04:05:06Z")
         .unwrap()
         .with_timezone(&chrono::Utc);
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db: DatastoreHandle = Arc::new(db);
     let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         wall_time,
@@ -2453,7 +2509,9 @@ async fn renew_node_lease_rejects_renew_time_skew_over_100_seconds() {
 
 #[tokio::test]
 async fn apply_outbox_rejects_node_dataplane_for_mismatched_author() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let db: DatastoreHandle = Arc::new(db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(crate::grpc_test_support::replication_service(
@@ -2502,7 +2560,11 @@ async fn apply_outbox_rejects_node_dataplane_for_mismatched_author() {
 
 #[tokio::test]
 async fn get_metadata_rpc_returns_cluster_metadata_for_node_cert() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -2530,7 +2592,11 @@ async fn get_metadata_rpc_returns_cluster_metadata_for_node_cert() {
 
 #[tokio::test]
 async fn observe_peer_endpoint_records_authenticated_node_remote_ip() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(crate::grpc_test_support::replication_service(
         db.clone(),
@@ -2574,7 +2640,9 @@ async fn node_effect_observed_leader_endpoint_enqueues_external_ip_status() {
         }
     }
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let addresses =
         klights_kubelet::node::NodeRegistrationAddresses::new("172.31.10.2".to_string(), None);
     let profile = klights_kubelet::node_config::NodeRegistrationProfile::new(
@@ -2659,7 +2727,11 @@ async fn node_effect_observed_leader_endpoint_enqueues_external_ip_status() {
 
 #[tokio::test]
 async fn node_effect_join_external_ip_uses_fresh_exact_status_after_metadata_cas() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let created = db
         .create_resource(
             "v1",
@@ -2776,7 +2848,11 @@ async fn node_effect_join_external_ip_uses_fresh_exact_status_after_metadata_cas
 
 #[tokio::test]
 async fn get_metadata_rpc_rejects_missing_node_client_certificate() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -2796,7 +2872,11 @@ async fn get_metadata_rpc_rejects_missing_node_client_certificate() {
 
 #[tokio::test]
 async fn get_metadata_rpc_rejects_bootstrap_token_after_join_bootstrap() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -2819,7 +2899,11 @@ async fn get_metadata_rpc_rejects_bootstrap_token_after_join_bootstrap() {
 
 #[tokio::test]
 async fn get_metadata_rpc_accepts_node_client_cert_without_bootstrap_token() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -2844,7 +2928,11 @@ async fn get_metadata_rpc_accepts_node_client_cert_without_bootstrap_token() {
 
 #[tokio::test]
 async fn renew_node_lease_rpc_rejects_bootstrap_token_on_leader() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -2884,7 +2972,11 @@ async fn renew_node_lease_rpc_updates_memory_without_cluster_db_write() {
     let wall_time = chrono::DateTime::parse_from_rfc3339("2040-02-03T04:05:06Z")
         .unwrap()
         .with_timezone(&chrono::Utc);
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -2940,7 +3032,11 @@ async fn renew_node_lease_rpc_updates_memory_without_cluster_db_write() {
 
 #[tokio::test]
 async fn renew_node_lease_rpc_rejects_follower_local_heartbeat_write() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -2982,7 +3078,11 @@ async fn renew_node_lease_rpc_rejects_follower_local_heartbeat_write() {
 #[tokio::test]
 async fn sign_controlplane_csr_sends_private_key_material_to_cp_and_replica() {
     for node_name in ["mn-controlplane2", "mn-replica"] {
-        let db = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         create_scoped_token_for_test(
             db.as_ref(),
             "123456.fedcba9876543210",
@@ -3049,7 +3149,11 @@ async fn sign_controlplane_csr_rejects_worker_node_cert_without_controlplane_tok
     // impersonation). grpc_test_server_with_signing_ca wires no join
     // handler, so membership cannot be confirmed and the request fails
     // closed.
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     // Only a *worker*-scoped token exists; the supplied token can never be a
     // valid controlplane join token.
     create_scoped_token_for_test(
@@ -3095,7 +3199,11 @@ async fn join_as_controlplane_rejects_worker_node_cert_without_controlplane_toke
     // a raft member. It must NOT be admitted as a voter/learner — otherwise
     // it would receive the full replicated cluster.db (all Secrets) and
     // quorum influence.
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3143,7 +3251,11 @@ async fn join_as_controlplane_rejects_worker_node_cert_without_controlplane_toke
 async fn join_as_controlplane_accepts_valid_controlplane_token_for_first_join() {
     // First join: caller is not yet a member (NonMember handler) but presents
     // a valid controlplane bootstrap token → admitted.
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3230,7 +3342,11 @@ fn raft_node_id_for_node_name_in_test(node_name: &str) -> u64 {
 
 #[tokio::test]
 async fn mount_service_accepts_replication_router_prefix() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3253,7 +3369,11 @@ async fn mounted_router_does_not_send_plain_rest_unknown_paths_to_grpc() {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3290,7 +3410,11 @@ async fn mounted_router_does_not_send_plain_rest_unknown_paths_to_grpc() {
 
 #[tokio::test]
 async fn mounted_router_serves_grpc_get_metadata() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3313,7 +3437,11 @@ async fn mounted_router_serves_grpc_get_metadata() {
 
 #[tokio::test]
 async fn mounted_router_serves_grpc_reflection_for_replication_service() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let (endpoint, _service, handle) = grpc_test_server(db).await;
     let channel = tonic::transport::Endpoint::from_shared(endpoint)
         .unwrap()
@@ -3353,7 +3481,11 @@ async fn mounted_router_serves_grpc_reflection_for_replication_service() {
 
 #[tokio::test]
 async fn connect_rejects_invalid_token_without_persisting_dataplane_metadata() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let (endpoint, _service, handle) = grpc_test_server(db.clone()).await;
     let mut join = valid_join();
     join.token = "wrong-token".to_string();
@@ -3378,7 +3510,11 @@ async fn connect_rejects_invalid_token_without_persisting_dataplane_metadata() {
 
 #[tokio::test]
 async fn connect_persists_dataplane_endpoint_from_observed_peer_ip() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let (endpoint, _service, handle) =
         grpc_test_server_with_node_cert(db.clone(), "worker-1").await;
     let mut join = valid_join();
@@ -3411,7 +3547,11 @@ async fn connect_persists_dataplane_endpoint_from_observed_peer_ip() {
 
 #[tokio::test]
 async fn connect_refreshes_existing_node_external_ip_from_observed_peer_ip() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let (endpoint, _service, handle) =
         grpc_test_server_with_node_cert(db.clone(), "worker-1").await;
     db.create_resource(
@@ -3459,7 +3599,11 @@ async fn connect_refreshes_existing_node_external_ip_from_observed_peer_ip() {
 
 #[tokio::test]
 async fn connect_accepts_valid_join_and_returns_dataplane_peers() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3504,7 +3648,11 @@ async fn connect_accepts_valid_join_and_returns_dataplane_peers() {
 
 #[tokio::test]
 async fn connect_follower_progress_heartbeats_never_regress_below_initial_rv() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3569,7 +3717,11 @@ async fn connect_follower_progress_heartbeats_never_regress_below_initial_rv() {
 
 #[tokio::test]
 async fn accepted_legacy_controlplane_rejoin_without_snapshot_persists_dataplane_metadata() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3625,7 +3777,11 @@ async fn accepted_legacy_controlplane_rejoin_without_snapshot_persists_dataplane
 
 #[tokio::test]
 async fn accepted_controlplane_join_uses_observed_peer_ip_for_dataplane_and_raft_addr() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
         .await
         .unwrap();
@@ -3702,7 +3858,11 @@ async fn accepted_controlplane_join_uses_observed_peer_ip_for_dataplane_and_raft
 
 #[tokio::test]
 async fn apply_outbox_pod_status_enqueues_matching_service() {
-    let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db: DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let _token = {
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
@@ -3873,7 +4033,9 @@ async fn channel_snapshot_sink_forwards_typed_restore_operations() {
 
     // Build a fixture cluster with a couple of resources so the snapshot
     // emitter has real commits to stream.
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     klights_controllers::namespace::init_default_namespaces_with_ca_path(
         &crate::kubelet::file_blocking::test_file_process_executor(),
         &db,

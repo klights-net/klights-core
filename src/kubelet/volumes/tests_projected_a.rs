@@ -3,7 +3,9 @@ use super::*;
 #[tokio::test]
 async fn test_projected_volume_with_service_account_token() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -44,7 +46,9 @@ async fn test_projected_volume_with_service_account_token() {
 #[tokio::test]
 async fn test_projected_volume_create_uses_keyed_blocking_boundary() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -85,7 +89,9 @@ async fn test_projected_volume_create_uses_keyed_blocking_boundary() {
 #[tokio::test]
 async fn test_projected_volume_with_configmap_source() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -139,7 +145,9 @@ async fn test_projected_volume_with_configmap_source() {
 #[tokio::test]
 async fn test_projected_volume_with_downward_api_source() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -180,7 +188,9 @@ async fn test_projected_volume_with_downward_api_source() {
 #[tokio::test]
 async fn test_projected_volume_combines_multiple_sources() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -245,7 +255,9 @@ async fn test_projected_volume_combines_multiple_sources() {
 async fn test_projected_volume_respects_default_mode() {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -435,7 +447,9 @@ fn test_hostpath_volume_none_type_no_validation() {
 async fn test_refresh_downward_api_updates_annotation_file() {
     use tempfile::TempDir;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp_dir = TempDir::new().unwrap();
     let volumes_root = tmp_dir.path().to_str().unwrap();
 
@@ -576,7 +590,9 @@ async fn test_refresh_downward_api_skips_projected_volumes() {
     // corrupted bind mounts.
     use tempfile::TempDir;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp_dir = TempDir::new().unwrap();
     let volumes_root = tmp_dir.path().to_str().unwrap();
 
@@ -649,7 +665,9 @@ async fn test_refresh_projected_downward_api_updates_labels_file() {
     // at the correct volumes/projected/{name}/ path.
     use tempfile::TempDir;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp_dir = TempDir::new().unwrap();
     let volumes_root = tmp_dir.path().to_str().unwrap();
 
@@ -761,7 +779,9 @@ async fn test_refresh_projected_downward_api_updates_labels_file() {
 async fn test_projected_volume_configmap_writes_files() {
     // Regression test: projected volume with configMap source was silently skipping file writes
     // This test reproduces the kube-root-ca.crt ConfigMap scenario from Sonobuoy failures
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -827,7 +847,9 @@ async fn test_projected_volume_configmap_writes_files() {
 #[tokio::test]
 async fn test_projected_volume_configmap_with_items() {
     // Test projected volume with items key→path mapping
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 

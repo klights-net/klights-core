@@ -2,7 +2,9 @@ use super::*;
 
 #[tokio::test]
 async fn test_mirror_endpoints_to_endpointslice_sets_empty_name_for_unnamed_port() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});
     db.create_resource("v1", "Namespace", None, "test", ns)
         .await
@@ -52,7 +54,9 @@ async fn test_mirror_endpoints_to_endpointslice_sets_empty_name_for_unnamed_port
 
 #[tokio::test]
 async fn test_reconcile_endpoints_creates_endpoints_for_matching_pods() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create namespace
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});
@@ -156,7 +160,9 @@ async fn test_reconcile_endpoints_creates_endpoints_for_matching_pods() {
 
 #[tokio::test]
 async fn test_reconcile_endpoints_empty_when_no_matching_pods() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create namespace
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});
@@ -214,7 +220,9 @@ async fn test_reconcile_endpoints_empty_when_no_matching_pods() {
 
 #[tokio::test]
 async fn test_reconcile_endpoints_updates_existing_endpoints() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create namespace
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});
@@ -315,7 +323,9 @@ async fn test_reconcile_endpoints_updates_existing_endpoints() {
 
 #[tokio::test]
 async fn test_reconcile_endpoints_uses_target_port() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create namespace
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});
@@ -376,7 +386,9 @@ async fn test_reconcile_endpoints_uses_target_port() {
 
 #[tokio::test]
 async fn test_reconcile_endpoints_excludes_pods_with_zero_ip() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let pod = json!({
         "apiVersion": "v1",
@@ -423,7 +435,9 @@ async fn test_reconcile_endpoints_excludes_pods_with_zero_ip() {
 
 #[tokio::test]
 async fn test_reconcile_endpoints_excludes_pods_with_empty_ip() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let pod = json!({
         "apiVersion": "v1",
@@ -470,7 +484,9 @@ async fn test_reconcile_endpoints_excludes_pods_with_empty_ip() {
 
 #[tokio::test]
 async fn test_reconcile_endpoints_no_selector_creates_empty_subsets() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create a pod (should not be matched when no selector)
     let pod = json!({
@@ -517,7 +533,9 @@ async fn test_reconcile_endpoints_no_selector_creates_empty_subsets() {
 
 #[tokio::test]
 async fn test_reconcile_endpoints_empty_selector_does_not_create_endpoints() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let selector = json!({});
     let ports = json!([{"port": 80}]);
 
@@ -546,7 +564,9 @@ async fn test_reconcile_endpoints_empty_selector_does_not_create_endpoints() {
 
 #[tokio::test]
 async fn test_reconcile_endpoints_falls_back_to_port_when_no_target_port() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let pod = json!({
         "apiVersion": "v1",

@@ -168,7 +168,7 @@ impl GrpcReplicationServerTestExt for GrpcReplicationServer {
         build_test_server(
             service,
             db,
-            crate::datastore::test_support::unused_fail_closed_passive_read_ports(),
+            crate::datastore::selector::unused_fail_closed_passive_read_ports(),
             None,
             None,
         )
@@ -190,7 +190,7 @@ impl GrpcReplicationServerTestExt for GrpcReplicationServer {
         build_test_server(
             service,
             db,
-            crate::datastore::test_support::unused_fail_closed_passive_read_ports(),
+            crate::datastore::selector::unused_fail_closed_passive_read_ports(),
             Some(controller_dispatcher),
             None,
         )
@@ -204,7 +204,7 @@ impl GrpcReplicationServerTestExt for GrpcReplicationServer {
         build_test_server(
             service,
             db,
-            crate::datastore::test_support::unused_fail_closed_passive_read_ports(),
+            crate::datastore::selector::unused_fail_closed_passive_read_ports(),
             None,
             Some(node_lease_tracker),
         )
@@ -298,7 +298,7 @@ pub(crate) fn mount_service_full(
     node_lifecycle_status: Option<Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>>,
     transport_policy: Arc<klights_leader_rpc::transport_policy::GrpcTransportPolicy>,
 ) -> axum::Router {
-    let passive_reads = crate::datastore::test_support::unused_fail_closed_passive_read_ports();
+    let passive_reads = crate::datastore::selector::unused_fail_closed_passive_read_ports();
     mount_service_full_with_passive_reads(
         app,
         service,

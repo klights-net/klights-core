@@ -150,6 +150,15 @@ impl Datastore {
     }
 
     #[cfg(test)]
+    pub async fn new_in_memory_with_handle() -> (Self, super::DatastoreHandle) {
+        let datastore = Self::new_in_memory()
+            .await
+            .expect("test-support in-memory Datastore init");
+        let handle: super::DatastoreHandle = std::sync::Arc::new(datastore.clone());
+        (datastore, handle)
+    }
+
+    #[cfg(test)]
     pub async fn new_persistent(
         db_root: &std::path::Path,
         supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,

@@ -228,7 +228,9 @@ mod tests {
 
     #[tokio::test]
     async fn hostport_admission_allows_same_name_recreate_with_different_uid() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Pod",
@@ -261,7 +263,9 @@ mod tests {
 
     #[tokio::test]
     async fn hostport_admission_rejects_different_name_same_node_same_port() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Pod",

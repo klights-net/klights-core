@@ -341,7 +341,7 @@ async fn build_repo_with_scheduling_mode_for_outbox(
     crate::datastore::DatastoreHandle,
     std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
 ) {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
     let outbox = Arc::new(crate::outbox_test_support::outbox_from_node_db(
         node_db.clone(),
@@ -380,7 +380,7 @@ async fn drain_repo_outbox(
 
 #[tokio::test]
 async fn pod_repository_constructs_with_db_and_supervisor() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
@@ -391,7 +391,7 @@ async fn pod_repository_constructs_with_db_and_supervisor() {
 
 #[tokio::test]
 async fn pod_repository_build_parts_exposes_repository_and_background_without_starting() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
@@ -423,7 +423,7 @@ async fn pod_repository_build_parts_exposes_repository_and_background_without_st
 
 #[tokio::test]
 async fn pod_repository_build_parts_does_not_start_workqueue_until_background_start() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
@@ -465,7 +465,7 @@ async fn pod_repository_build_parts_does_not_start_workqueue_until_background_st
 /// call it during construction.
 #[tokio::test]
 async fn pod_workqueue_runner_start_calls_workqueue_start_once() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
@@ -506,7 +506,7 @@ async fn pod_workqueue_runner_start_calls_workqueue_start_once() {
 async fn pod_object_service_requires_uid_for_mutating_paths() {
     use super::PodObjectWriter;
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
@@ -601,7 +601,7 @@ async fn pod_object_service_requires_uid_for_mutating_paths() {
 async fn pod_status_service_writes_are_uid_preconditioned() {
     use super::PodStatusWriter;
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
@@ -652,7 +652,7 @@ async fn pod_status_service_writes_are_uid_preconditioned() {
 async fn mark_start_pending_for_retry_writes_err_image_pull_then_image_pull_backoff() {
     use super::PodStatusWriter;
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
@@ -735,7 +735,7 @@ async fn mark_start_pending_for_retry_writes_err_image_pull_then_image_pull_back
 async fn mark_start_pending_for_retry_rejects_stale_uid() {
     use super::PodStatusWriter;
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
@@ -777,7 +777,7 @@ async fn mark_start_pending_for_retry_rejects_stale_uid() {
 async fn pod_subresource_service_status_and_ephemeral_updates_require_uid() {
     use super::PodSubresourceWriter;
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
@@ -844,7 +844,7 @@ async fn pod_subresource_service_status_and_ephemeral_updates_require_uid() {
 async fn pod_network_service_pod_network_rows_are_uid_keyed() {
     use super::PodNetworkReader;
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
@@ -864,7 +864,7 @@ async fn pod_network_service_pod_network_rows_are_uid_keyed() {
 async fn pod_watch_service_preserves_resource_version_and_uid() {
     use super::PodWatchSource;
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
@@ -957,7 +957,7 @@ fn deadline_timer_runner_schedules_uid_bound_wakeups() {
 /// cannot mutate or delete a same-name replacement Pod.
 #[tokio::test]
 async fn pod_store_mutating_methods_require_uid_or_create_context() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let store = super::store::PodStore::new(db.clone());
 
     let pod_new = json!({
@@ -1026,7 +1026,7 @@ async fn pod_store_mutating_methods_require_uid_or_create_context() {
 async fn worker_status_enqueue_does_not_bypass_leader_side_effects() {
     use super::PodStatusWriter;
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
     let outbox = Arc::new(crate::outbox_test_support::outbox_from_node_db(
         node_db.clone(),
@@ -1112,7 +1112,7 @@ async fn worker_status_enqueue_does_not_bypass_leader_side_effects() {
 
 #[tokio::test]
 async fn kubelet_pod_reader_uses_leader_api_when_configured() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let pod = crate::datastore::Resource {
         id: 1,
         api_version: "v1".to_string(),
@@ -1152,7 +1152,7 @@ async fn kubelet_pod_reader_uses_leader_api_when_configured() {
 
 #[tokio::test]
 async fn kubelet_pod_reader_uses_fresh_leader_api_for_single_pod_reads() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let stale_pod = crate::datastore::Resource {
         id: 1,
         api_version: "v1".to_string(),
@@ -1248,7 +1248,7 @@ async fn kubelet_pod_reader_uses_fresh_leader_api_for_single_pod_reads() {
 async fn runtime_reconcile_reads_pending_status_checkpoint_from_node_db() {
     use super::PodStatusWriter;
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
     let outbox = Arc::new(crate::outbox_test_support::outbox_from_node_db(
         node_db.clone(),
@@ -1351,7 +1351,7 @@ async fn runtime_reconcile_reads_pending_status_checkpoint_from_node_db() {
 async fn get_pod_for_uid_overlays_local_status_checkpoint_for_read_your_own_write() {
     use super::{PodReader, PodStatusWriter};
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
     let outbox = Arc::new(crate::outbox_test_support::outbox_from_node_db(
         node_db.clone(),
@@ -1450,7 +1450,7 @@ async fn get_pod_for_uid_overlays_local_status_checkpoint_for_read_your_own_writ
 async fn outbox_status_reads_current_pod_through_leader_api() {
     use super::PodStatusWriter;
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
     let outbox = Arc::new(crate::outbox_test_support::outbox_from_node_db(
         node_db.clone(),
@@ -1531,7 +1531,7 @@ async fn outbox_status_reads_current_pod_through_leader_api() {
 async fn outbox_sandbox_annotation_uses_leader_api_and_outbox() {
     use super::PodMetadataWriter;
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
     let outbox = Arc::new(crate::outbox_test_support::outbox_from_node_db(
         node_db.clone(),
@@ -1627,7 +1627,7 @@ async fn outbox_sandbox_annotation_uses_leader_api_and_outbox() {
 async fn controller_owner_reference_update_commits_to_leader_store_not_node_outbox() {
     use super::PodObjectWriter;
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let created = db
         .create_resource(
             "v1",
@@ -1702,7 +1702,7 @@ async fn non_leader_pod_object_writer_without_outbox_retries_later() {
     use super::PodMetadataWriter;
     use super::PodObjectWriter;
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let pod = crate::datastore::Resource {
         id: 1,
         api_version: "v1".to_string(),
@@ -1827,7 +1827,7 @@ async fn non_leader_pod_object_writer_without_outbox_retries_later() {
 async fn non_leader_pod_status_writer_without_outbox_retries_later() {
     use super::PodStatusWriter;
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let pod = crate::datastore::Resource {
         id: 1,
         api_version: "v1".to_string(),
@@ -1909,8 +1909,9 @@ async fn non_leader_pod_status_writer_without_outbox_retries_later() {
 
 #[tokio::test]
 async fn worker_actor_finalization_enqueues_uid_qualified_pod_delete_outbox() {
-    let (_ds, direct_db) = crate::datastore::test_support::in_memory_with_handle().await;
-    let (_leader_ds, leader_db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, direct_db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+    let (_leader_ds, leader_db) =
+        crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
     let outbox = Arc::new(crate::outbox_test_support::outbox_from_node_db(
         node_db.clone(),
@@ -2019,7 +2020,8 @@ async fn worker_actor_finalization_enqueues_uid_qualified_pod_delete_outbox() {
 
 #[tokio::test]
 async fn worker_actor_finalization_preserves_checkpoint_until_committed_removal() {
-    let (_direct_store, direct_db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_direct_store, direct_db) =
+        crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
     node_db
         .legacy_upsert_pod_status_checkpoint(
@@ -2155,7 +2157,7 @@ async fn worker_actor_finalization_uses_fresh_leader_read_before_emitting_finali
 #[tokio::test]
 async fn worker_actor_finalization_serializes_same_uid_write_without_actor_retry() {
     let (cluster_db, cluster_handle) =
-        crate::datastore::test_support::in_memory_with_handle().await;
+        crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let cluster_store = super::store::PodStore::new(cluster_handle.clone());
     let created = cluster_store
         .create(
@@ -2266,7 +2268,7 @@ fn make_pod(name: &str, owner_uid: Option<&str>, label: Option<(&str, &str)>) ->
 
 #[tokio::test]
 async fn pod_store_round_trips_create_get_list_update_delete() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let store = PodStore::new(db);
 
     // create
@@ -2415,7 +2417,7 @@ async fn delete_unscheduled_through_leader(
 
 #[tokio::test]
 async fn delete_unscheduled_removes_terminating_unscheduled_pod() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let store = Arc::new(PodStore::new(db));
     let created = store
         .create("default", "u1", make_pod("u1", None, None))
@@ -2444,7 +2446,7 @@ async fn delete_unscheduled_removes_terminating_unscheduled_pod() {
 
 #[tokio::test]
 async fn delete_unscheduled_defers_when_kubelet_picked_pod_up() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let store = Arc::new(PodStore::new(db));
     let mut pod = make_pod("s1", None, None);
     pod["spec"]["nodeName"] = json!("node-a");
@@ -2472,7 +2474,7 @@ async fn delete_unscheduled_defers_when_kubelet_picked_pod_up() {
 
 #[tokio::test]
 async fn delete_unscheduled_waits_for_finalizers() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let store = Arc::new(PodStore::new(db));
     let mut pod = make_pod("f1", None, None);
     pod["metadata"]["finalizers"] = json!(["example.com/hold"]);
@@ -2497,7 +2499,7 @@ async fn delete_unscheduled_waits_for_finalizers() {
 
 #[tokio::test]
 async fn delete_unscheduled_refuses_non_terminating_pod() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let store = Arc::new(PodStore::new(db));
     let created = store
         .create("default", "live1", make_pod("live1", None, None))
@@ -2522,7 +2524,7 @@ async fn delete_unscheduled_refuses_non_terminating_pod() {
 
 #[tokio::test]
 async fn delete_unscheduled_is_idempotent_for_missing_or_replaced_uid() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let store = Arc::new(PodStore::new(db));
 
     // Missing Pod — nothing to remove.
@@ -2555,7 +2557,7 @@ async fn delete_unscheduled_is_idempotent_for_missing_or_replaced_uid() {
 }
 
 async fn build_repo() -> super::PodRepository {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
@@ -2563,7 +2565,7 @@ async fn build_repo() -> super::PodRepository {
 }
 
 async fn build_repo_with_bound_side_effects() -> Arc<super::PodRepository> {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = Arc::new(crate::bootstrap::side_effects::default_registry(
@@ -2742,8 +2744,11 @@ impl klights_replication::proposal::RaftProposal for StatusRacingRaftProposal {
 async fn build_raft_repo_with_status_race_on_delete(
     pod_name: &str,
 ) -> (super::PodRepository, Arc<AtomicUsize>) {
-    let inner: crate::datastore::DatastoreHandle =
-        Arc::new(crate::datastore::test_support::in_memory().await);
+    let inner: crate::datastore::DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let bumps = Arc::new(AtomicUsize::new(0));
     let proposal = Arc::new(StatusRacingRaftProposal {
         inner: inner.clone(),
@@ -2766,7 +2771,7 @@ async fn build_raft_repo_with_status_race_on_delete(
 async fn build_repo_with_scheduling_mode(
     scheduling_mode: crate::pod_repository_composition::PodSchedulingMode,
 ) -> super::PodRepository {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
@@ -2783,7 +2788,7 @@ async fn build_repo_with_scheduling_mode_and_gate(
     scheduling_mode: crate::pod_repository_composition::PodSchedulingMode,
     gate: Arc<crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest>,
 ) -> super::PodRepository {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
@@ -2809,7 +2814,7 @@ async fn build_repo_with_dispatcher() -> (
     crate::datastore::DatastoreHandle,
     Arc<klights_controllers::ControllerDispatcher>,
 ) {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let side_effects = Arc::new(crate::bootstrap::side_effects::default_registry(
@@ -2881,7 +2886,7 @@ async fn pod_reader_list_pods_paginates_via_limit_and_continue_token() {
 #[tokio::test]
 async fn cluster_backed_pod_reader_list_pods_uses_fresh_leader_list() {
     use super::PodReader;
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let pod = crate::datastore::Resource {
         id: 1,
         api_version: "v1".to_string(),
@@ -3937,7 +3942,7 @@ impl StateOnlyWriter for ProbeReadinessRaceStatusWriter {
 
 #[tokio::test]
 async fn set_pod_status_retries_implicit_rv_conflict_after_scheduler_update() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let store = Arc::new(PodStore::new(db));
     store
         .create("default", "scheduled-race", pending_pod("scheduled-race"))
@@ -6194,7 +6199,7 @@ async fn set_probe_readiness_matching_state_does_not_write_status() {
 
 #[tokio::test]
 async fn set_probe_readiness_retries_unpinned_rv_conflict() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let store = Arc::new(PodStore::new(db));
     store
         .create(
@@ -6247,7 +6252,7 @@ async fn set_probe_readiness_retries_unpinned_rv_conflict() {
 
 #[tokio::test]
 async fn set_probe_readiness_exhausts_unpinned_conflict_retries() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let store = Arc::new(PodStore::new(db));
     store
         .create(
@@ -6294,7 +6299,7 @@ async fn set_probe_readiness_exhausts_unpinned_conflict_retries() {
 
 #[tokio::test]
 async fn set_probe_readiness_pinned_rv_conflict_does_not_retry() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let store = Arc::new(PodStore::new(db));
     let created = store
         .create(
@@ -6853,7 +6858,7 @@ async fn reserve_test_network_assignment(
 #[tokio::test]
 async fn read_pod_network_assignment_returns_assigned_ip() {
     use super::PodNetworkReader;
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let node_local = super::test_node_local_store(supervisor.clone()).await;
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
@@ -7065,7 +7070,7 @@ async fn read_pod_network_assignment_retries_then_succeeds() {
     use super::PodNetworkReader;
     use klights_network_api::{PodNetworkAssignmentKey, PodNetworkAssignmentPublisher};
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let node_local = super::test_node_local_store(supervisor.clone()).await;
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
@@ -7249,7 +7254,7 @@ async fn read_pod_network_assignment_tolerates_cni_db_backlog() {
     use super::PodNetworkReader;
     use klights_network_api::{PodNetworkAssignmentKey, PodNetworkAssignmentPublisher};
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let node_local = super::test_node_local_store(supervisor.clone()).await;
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
@@ -11600,7 +11605,7 @@ fn ordinary_pod_error_mapping_preserves_kubernetes_error_categories() {
 async fn delete_pod_runs_side_effects_after_marking_terminating_with_original_pod() {
     use super::PodObjectWriter;
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let observed = Arc::new(tokio::sync::Mutex::new(None));
@@ -12154,7 +12159,7 @@ async fn update_pod_owner_references_returns_conflict_on_stale_rv() {
 async fn pod_store_update_status_with_concurrent_writer_returns_conflict() {
     // Two readers see the same resource_version. The first writer wins.
     // The second writer must observe a 409 Conflict.
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let store = PodStore::new(db);
 
     let created = store
@@ -12216,7 +12221,7 @@ fn make_terminating_pod(name: &str, uid: &str) -> serde_json::Value {
 }
 
 async fn build_finalizer() -> RealPodDeletionFinalizer {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let store = Arc::new(PodStore::new(db));
     let gc_pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink> =
         Arc::new(crate::gc_ownership_integration_tests::NoOpGcPodDeleteSink);
@@ -12234,7 +12239,7 @@ async fn build_finalizer() -> RealPodDeletionFinalizer {
 
 #[tokio::test]
 async fn deletion_finalizer_without_outbox_retries_later() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let pod = make_terminating_pod("leader-finalize-no-outbox", "uid-leader-finalize-no-outbox");
     let store = Arc::new(PodStore::new(db.clone()));
     store
@@ -12305,7 +12310,7 @@ async fn deletion_finalizer_without_outbox_retries_later() {
 
 #[tokio::test]
 async fn deletion_finalizer_reissues_missing_delete_mark_through_outbox() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let store = Arc::new(PodStore::new(db));
     let node_db = fixture_node_local().await;
     let outbox = Arc::new(crate::outbox_test_support::outbox_from_node_db(
@@ -12615,7 +12620,7 @@ async fn emptydir_survivor_diagnosis_records_mark_workqueue_and_actor_state() {
     use klights_controllers::gc::cascade_delete_with_uid;
     use klights_reconcile_api::GcPodDeleteSink;
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let (repo, node_local) = fixture_repository_with_node_local(db.clone()).await;
 
     let ns = "emptydir-diag";
@@ -12754,7 +12759,7 @@ async fn emptydir_survivor_diagnosis_records_mark_workqueue_and_actor_state() {
 async fn gc_marked_pod_enqueues_uid_bound_workqueue_entry() {
     use klights_reconcile_api::{GcPodDeleteRequest, GcPodDeleteSink};
 
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let (repo, node_local) = fixture_repository_with_node_local(db.clone()).await;
 
     let ns = "gc-mark-enqueue";
@@ -13009,7 +13014,7 @@ async fn old_uid_operations_do_not_mutate_replacement() {
 ///    old-UID deferred-delete entry.
 #[tokio::test]
 async fn deferred_delete_preserves_same_name_replacement() {
-    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let store = Arc::new(PodStore::new(db));
 
     // (1) Picked-up terminating Pod: nodeName is set → DeferToActor.
@@ -13238,8 +13243,11 @@ async fn build_store_with_delete_cas_race(
     crate::datastore::DatastoreHandle,
     Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let inner: crate::datastore::DatastoreHandle =
-        Arc::new(crate::datastore::test_support::in_memory().await);
+    let inner: crate::datastore::DatastoreHandle = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let raced = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let proposal = Arc::new(DeleteCasRacingRaftProposal {
         inner: inner.clone(),

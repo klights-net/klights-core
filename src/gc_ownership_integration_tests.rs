@@ -432,7 +432,9 @@ impl GcPodDeleteSink for ConcurrentBlockingGcPodDeleteSink {
 
 #[tokio::test]
 async fn test_cascade_delete_three_level_chain() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create Deployment (level 1)
     let deploy_uid = "deploy-uid-gc";
@@ -515,7 +517,9 @@ async fn test_cascade_delete_three_level_chain() {
 
 #[tokio::test]
 async fn test_cascade_delete_single_level() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let rs_uid = "rs-uid-single";
     db.create_resource(
@@ -583,7 +587,9 @@ async fn test_cascade_delete_single_level() {
 
 #[tokio::test]
 async fn test_cascade_delete_marks_finalizer_held_child_without_recursing() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let owner_uid = "owner-finalizer-cascade";
     db.create_resource(
@@ -674,7 +680,9 @@ async fn test_cascade_delete_marks_finalizer_held_child_without_recursing() {
 
 #[tokio::test]
 async fn test_cascade_delete_preserves_dependents_with_another_live_owner() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
         "v1",
@@ -778,7 +786,9 @@ async fn test_cascade_delete_preserves_dependents_with_another_live_owner() {
 
 #[tokio::test]
 async fn orphan_owner_ref_removal_survives_continuous_child_status_churn() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let owner_uid = "deployment-status-churn-uid";
 
     db.create_resource(
@@ -855,7 +865,9 @@ async fn orphan_owner_ref_removal_survives_continuous_child_status_churn() {
 
 #[tokio::test]
 async fn orphan_children_returns_error_when_owner_ref_update_does_not_commit() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let owner_uid = "deployment-orphan-failure-uid";
 
     db.create_resource(
@@ -911,7 +923,9 @@ async fn orphan_children_returns_error_when_owner_ref_update_does_not_commit() {
 
 #[tokio::test]
 async fn test_reconcile_owner_references_deletes_dangling_dependent_and_cascades_children() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let rs = db
         .create_resource(
@@ -986,7 +1000,9 @@ async fn test_reconcile_owner_references_deletes_dangling_dependent_and_cascades
 
 #[tokio::test]
 async fn test_reconcile_owner_references_preserves_live_owner_and_removes_dangling_refs() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
         "v1",
@@ -1061,7 +1077,9 @@ async fn test_reconcile_owner_references_preserves_live_owner_and_removes_dangli
 
 #[tokio::test]
 async fn test_reconcile_owner_references_treats_non_foreground_deleting_owner_as_live() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
         "apps/v1",
@@ -1122,7 +1140,9 @@ async fn test_reconcile_owner_references_treats_non_foreground_deleting_owner_as
 
 #[tokio::test]
 async fn test_reconcile_owner_references_treats_foreground_deleting_owner_as_collectable() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
         "apps/v1",
@@ -1184,7 +1204,9 @@ async fn test_reconcile_owner_references_treats_foreground_deleting_owner_as_col
 #[tokio::test]
 async fn test_reconcile_owner_references_preserves_cluster_dependent_with_namespaced_custom_owner_ref()
  {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
         "apiextensions.k8s.io/v1",
@@ -1270,7 +1292,9 @@ async fn test_reconcile_owner_references_preserves_cluster_dependent_with_namesp
 
 #[tokio::test]
 async fn test_cascade_delete_no_owned_resources() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create a pod with no ownerReferences
     db.create_resource(
@@ -1308,7 +1332,9 @@ async fn test_cascade_delete_no_owned_resources() {
 
 #[tokio::test]
 async fn test_cascade_delete_empty_uid() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create a resource that should NOT be deleted
     db.create_resource(
@@ -1349,7 +1375,9 @@ async fn test_cascade_delete_empty_uid() {
 
 #[tokio::test]
 async fn test_orphan_children_removes_owner_references() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let owner_uid = "owner-uid";
     db.create_resource(
@@ -1419,7 +1447,9 @@ async fn test_orphan_children_removes_owner_references() {
 
 #[tokio::test]
 async fn test_orphan_children_removes_empty_uid_ownerrefs_by_name_kind() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
         "apps/v1",
@@ -1491,7 +1521,9 @@ async fn test_orphan_children_removes_empty_uid_ownerrefs_by_name_kind() {
 
 #[tokio::test]
 async fn test_foreground_deletion_deletes_children_first() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let owner_uid = "owner-uid-fg";
     db.create_resource(
@@ -1573,7 +1605,9 @@ async fn test_foreground_deletion_deletes_children_first() {
 
 #[tokio::test]
 async fn foreground_delete_finalizes_owner_after_shared_dependents_are_unblocked() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let owner = db
         .create_resource(
@@ -1680,7 +1714,9 @@ async fn foreground_delete_finalizes_owner_after_shared_dependents_are_unblocked
 
 #[tokio::test]
 async fn foreground_owner_ready_after_hard_deleted_child_and_shared_dependents_orphaned() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
         "v1",
@@ -1805,7 +1841,9 @@ async fn foreground_owner_ready_after_hard_deleted_child_and_shared_dependents_o
 
 #[tokio::test]
 async fn gc_foreground_owner_with_mixed_pods_waits_for_pod_cleanup() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let sink = RecordingGcPodDeleteSink::new();
 
     let owner_uid = "owner-rc-to-delete-uid";
@@ -2033,7 +2071,9 @@ async fn gc_foreground_owner_with_mixed_pods_waits_for_pod_cleanup() {
 
 #[tokio::test]
 async fn foreground_gc_requests_independent_pod_deletes_concurrently() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let owner_uid = "owner-rc-concurrent-delete-uid";
     db.create_resource(
@@ -2114,7 +2154,9 @@ async fn foreground_gc_requests_independent_pod_deletes_concurrently() {
 
 #[tokio::test]
 async fn foreground_gc_skips_duplicate_pod_delete_requests_across_retries() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let owner_uid = "owner-rc-no-dup-delete-uid";
     db.create_resource(
@@ -2217,7 +2259,9 @@ async fn assert_foreground_delete_reservation_released_after(
     first_result: FirstGcPodDeleteResult,
     suffix: &str,
 ) {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let owner_uid = format!("foreground-release-owner-{suffix}");
     let owner_name = format!("foreground-release-{suffix}");
     let child_uid = format!("foreground-release-child-{suffix}");
@@ -2307,7 +2351,9 @@ async fn test_cascade_delete_circular_empty_uid_ownerrefs() {
     // Replicates the K8s GC conformance test: 3 ConfigMaps in a circular
     // ownerRef chain where all ownerRef.uid fields are "". Deleting cm1
     // should cascade-delete cm2 and cm3 by name+kind lookup.
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
             "v1",
@@ -2394,7 +2440,9 @@ async fn test_cascade_delete_circular_empty_uid_ownerrefs() {
 
 #[tokio::test]
 async fn cascade_delete_pod_owner_cycle_marks_each_dependent_once() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let sink = RecordingGcPodDeleteSink::new();
 
     for (name, uid, owner_name, owner_uid) in [
@@ -2460,7 +2508,9 @@ async fn cascade_delete_pod_owner_cycle_marks_each_dependent_once() {
 
 #[tokio::test]
 async fn test_cascade_delete_matches_owner_uid_in_nonzero_ownerref_position() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
         "apps/v1",
@@ -2530,7 +2580,9 @@ async fn test_cascade_delete_matches_owner_uid_in_nonzero_ownerref_position() {
 
 #[tokio::test]
 async fn gc_cascade_pod_child_uses_actor_delete_sink() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let sink = RecordingGcPodDeleteSink::new();
 
     // Create a Deployment owner
@@ -2624,7 +2676,9 @@ async fn gc_cascade_pod_child_uses_actor_delete_sink() {
 
 #[tokio::test]
 async fn gc_foreground_pod_child_uses_actor_delete_sink() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let sink = RecordingGcPodDeleteSink::new();
 
     // Create a foreground-deleting owner (Deployment with foregroundDeletion finalizer)
@@ -2702,7 +2756,9 @@ async fn gc_foreground_pod_child_uses_actor_delete_sink() {
 
 #[tokio::test]
 async fn gc_foreground_pod_child_already_terminating_is_not_redeleted() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let sink = RecordingGcPodDeleteSink::new();
 
     db.create_resource(
@@ -2771,7 +2827,9 @@ async fn gc_foreground_pod_child_already_terminating_is_not_redeleted() {
 
 #[tokio::test]
 async fn gc_foreground_pod_child_already_terminating_allows_owner_finalization_after_cleanup() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let sink = RecordingGcPodDeleteSink::new();
 
     let owner = db
@@ -2856,7 +2914,9 @@ async fn gc_foreground_pod_child_already_terminating_allows_owner_finalization_a
 
 #[tokio::test]
 async fn gc_reconcile_dangling_pod_owner_uses_actor_delete_sink() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let sink = RecordingGcPodDeleteSink::new();
 
     // Create a Pod with only a dangling owner reference
@@ -2910,7 +2970,9 @@ async fn gc_pod_delete_is_uid_guarded_against_same_name_replacement() {
     // different UID exists, the GC request must NOT affect the replacement.
     // The sink records the UID, and production code uses DeleteOptions with
     // UID preconditions to reject stale requests.
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create a "stale" Pod identity with old UID
     db.create_resource(
@@ -3012,7 +3074,9 @@ async fn gc_pod_delete_is_uid_guarded_against_same_name_replacement() {
 
 #[tokio::test]
 async fn gc_cascade_non_pod_child_still_hard_deletes() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let sink = NoOpGcPodDeleteSink;
 
     // Create a Deployment owner
@@ -3094,7 +3158,9 @@ fn rc_child_pod(ns: &str, name: &str, uid: &str, rc_uid: &str) -> serde_json::Va
 
 #[tokio::test]
 async fn owner_cascade_sweep_marks_all_children_and_self_extinguishes() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     db.create_namespace("ed", json!({"metadata": {"name": "ed"}}))
         .await
         .unwrap();
@@ -3165,7 +3231,9 @@ async fn owner_cascade_sweep_marks_all_children_and_self_extinguishes() {
 
 #[tokio::test]
 async fn rc_background_delete_drives_all_running_children_to_finalization() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     db.create_namespace("ed-finalize", json!({"metadata": {"name": "ed-finalize"}}))
         .await
         .unwrap();
@@ -3248,7 +3316,9 @@ async fn rc_background_delete_drives_all_running_children_to_finalization() {
 
 #[tokio::test]
 async fn owner_cascade_sweep_signals_reschedule_when_child_not_yet_terminating() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     db.create_namespace("ed", json!({"metadata": {"name": "ed"}}))
         .await
         .unwrap();
@@ -3307,7 +3377,9 @@ async fn owner_cascade_sweep_signals_reschedule_when_child_not_yet_terminating()
 
 #[tokio::test]
 async fn burst_delete_of_many_rcs_leaves_no_orphan_pods() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     db.create_namespace("ed-burst", json!({"metadata": {"name": "ed-burst"}}))
         .await
         .unwrap();

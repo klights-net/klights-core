@@ -465,7 +465,7 @@ mod tests {
     /// Task 5.1: Config struct requires repository, router, and node identity.
     #[tokio::test]
     async fn pod_subsystem_config_requires_repository_router_and_node_identity() {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let config = fixture_config(db);
         assert_eq!(config.node_name, "node-1");
         // Repository builder parameters are present.
@@ -481,7 +481,7 @@ mod tests {
     /// background work.
     #[tokio::test]
     async fn pod_subsystem_constructs_repository_and_router_without_starting_background() {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let config = fixture_config(db);
 
         let subsystem = PodSubsystem::new(config).expect("PodSubsystem construction must succeed");
@@ -502,7 +502,7 @@ mod tests {
     /// Task 5.2: explicit start() boundary.
     #[tokio::test]
     async fn pod_subsystem_start_has_explicit_background_start_contract() {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let _cfg = fixture_config(db);
         // This test verifies that PodSubsystem::start() exists, is
         // callable, and follows the explicit-start contract. The
@@ -513,7 +513,7 @@ mod tests {
     /// and repeated calls are safe (idempotent).
     #[tokio::test]
     async fn pod_subsystem_start_starts_repository_background_once() {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let config = fixture_config(db);
 
         let subsystem = PodSubsystem::new(config).unwrap();
@@ -532,7 +532,7 @@ mod tests {
 
     #[tokio::test]
     async fn pod_subsystem_accepts_injected_runtime_service() {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let injected =
             Arc::new(crate::kubelet::pod_runtime::test_support::MockPodRuntimeService::new())
                 as Arc<dyn PodRuntimeService>;
@@ -549,7 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn pod_subsystem_without_injected_runtime_requires_real_runtime_dependencies() {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let mut config = fixture_config(db);
         config.runtime_service = None;
         config.cri = None;
@@ -573,7 +573,7 @@ mod tests {
     /// RealPodRuntimeService construction in Task 24.
     #[tokio::test]
     async fn pod_subsystem_config_carries_runtime_dependencies() {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let config = fixture_config(db.clone());
         assert_eq!(config.node_name, "node-1");
         assert_eq!(config.service_cidr, "10.43.128.0/17");
@@ -605,7 +605,7 @@ mod tests {
     /// wiring.
     #[tokio::test]
     async fn bootstrap_constructs_real_pod_runtime_service_and_binds_executor() {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let sock_path = temp_dir.path().join("cri.sock");
         let _listener =
@@ -647,7 +647,7 @@ mod tests {
     /// explicit start.
     #[tokio::test]
     async fn leader_bootstrap_constructs_pod_subsystem_with_leader_objects() {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let config =
             fixture_config_with_scheduling_mode(db, PodSchedulingMode::DeferredMultiNodeLeader);
 
@@ -673,7 +673,7 @@ mod tests {
     /// exposes all components and supports explicit start.
     #[tokio::test]
     async fn worker_bootstrap_constructs_pod_subsystem_with_worker_objects() {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let config = fixture_config_with_scheduling_mode(db, PodSchedulingMode::InlineSingleNode);
 
         let subsystem = PodSubsystem::new(config).expect("PodSubsystem construction must succeed");
@@ -697,7 +697,7 @@ mod tests {
     /// PodLifecycleService to the underlying router.
     #[tokio::test]
     async fn pod_subsystem_bootstrap_wires_runtime_executor() {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let config = fixture_config(db);
 
         let subsystem = PodSubsystem::new(config).expect("PodSubsystem construction must succeed");

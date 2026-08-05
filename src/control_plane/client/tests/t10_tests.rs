@@ -53,7 +53,11 @@ fn encode_outbox_command(command: StorageCommand) -> Vec<u8> {
 
 #[tokio::test]
 async fn outbox_apply_records_ledger_in_same_transaction_as_mutation() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     db.create_resource(
         "v1",
         "Pod",
@@ -106,7 +110,11 @@ async fn outbox_apply_records_ledger_in_same_transaction_as_mutation() {
 
 #[tokio::test]
 async fn pod_status_outbox_applies_stale_rv_snapshot_to_same_uid_live_pod() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let created = db
         .create_resource(
             "v1",
@@ -204,7 +212,11 @@ async fn pod_status_outbox_applies_stale_rv_snapshot_to_same_uid_live_pod() {
 
 #[tokio::test]
 async fn pod_status_outbox_stale_rv_still_rejects_same_name_different_uid() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let created = db
         .create_resource(
             "v1",
@@ -251,7 +263,11 @@ async fn pod_status_outbox_stale_rv_still_rejects_same_name_different_uid() {
 
 #[tokio::test]
 async fn transactional_worker_lease_renew_does_not_touch_cluster_db() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let created = db
         .create_resource(
             "coordination.k8s.io/v1",
@@ -342,7 +358,11 @@ async fn transactional_worker_lease_renew_does_not_touch_cluster_db() {
 
 #[tokio::test]
 async fn transactional_worker_node_status_ignores_stale_rv_and_updates_commit() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let created = db
         .create_resource(
             "v1",
@@ -489,7 +509,11 @@ async fn transactional_worker_node_status_ignores_stale_rv_and_updates_commit() 
 
 #[tokio::test]
 async fn transactional_worker_node_status_preserves_newer_leader_unknown_condition() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let created = db
         .create_resource(
             "v1",
@@ -585,7 +609,11 @@ async fn transactional_worker_node_status_preserves_newer_leader_unknown_conditi
 async fn outbox_apply_rolls_back_mutation_when_ledger_insert_fails() {
     // The mutation and ledger are one transaction. A mutation failure must leave
     // neither durable state behind, so the same delivery can be retried.
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
 
     // Call db.apply_outbox_transactionally directly (bypasses apply.rs which
     // catches NotFound first). The pod does not exist, so the atomic apply fails.
@@ -658,7 +686,11 @@ async fn outbox_apply_rolls_back_mutation_when_ledger_insert_fails() {
 
 #[tokio::test]
 async fn outbox_apply_rejects_incomplete_ledger_row_without_age_based_recovery() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     db.create_resource(
         "v1",
         "Pod",
@@ -723,7 +755,11 @@ async fn outbox_apply_rejects_incomplete_ledger_row_without_age_based_recovery()
 
 #[tokio::test]
 async fn outbox_apply_rejects_fresh_incomplete_ledger_row_without_consuming_it() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     db.create_resource(
         "v1",
         "Pod",
@@ -780,7 +816,11 @@ async fn outbox_apply_rejects_fresh_incomplete_ledger_row_without_consuming_it()
 
 #[tokio::test]
 async fn duplicate_outbox_apply_mutates_resource_once() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     db.create_resource(
         "v1",
         "Pod",
@@ -836,7 +876,11 @@ async fn duplicate_outbox_apply_mutates_resource_once() {
 
 #[tokio::test]
 async fn applied_outbox_gc_prunes_ttl_expired() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     db.create_resource(
         "v1",
         "Pod",
@@ -906,7 +950,11 @@ async fn applied_outbox_gc_prunes_ttl_expired() {
 
 #[tokio::test]
 async fn applied_outbox_gc_does_not_touch_recent() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -946,7 +994,11 @@ async fn applied_outbox_gc_does_not_touch_recent() {
 
 #[tokio::test]
 async fn applied_outbox_gc_prunes_event_create_and_unknown_operations() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1005,7 +1057,11 @@ async fn applied_outbox_gc_prunes_event_create_and_unknown_operations() {
 async fn idempotency_survives_gc_replay() {
     // After GC prunes an applied_outbox row, replaying the same outbox
     // must be harmless and produce a consistent result.
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let db = Arc::new(
+        crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
 
     // Create the pod first so the outer UID check passes.
     // Note: pod_status_payload hardcodes name "web".

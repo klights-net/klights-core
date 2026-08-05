@@ -903,7 +903,8 @@ mod delivery_authorization_tests {
 
     #[tokio::test]
     async fn pod_metadata_finalization_authorization_is_structural_and_node_bound() {
-        let (_datastore, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_datastore, db) =
+            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let finalize = |namespace: &str, name: &str, uid: &str, node_name: &str| {
             StorageCommand::FinalizeBoundPod {
                 namespace: namespace.to_string(),

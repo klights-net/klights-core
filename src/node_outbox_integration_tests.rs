@@ -1643,7 +1643,9 @@ mod tests {
 
     #[tokio::test]
     async fn stale_pod_status_outbox_does_not_block_actor_finalize_delete() {
-        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let created = cluster_db
             .create_resource(
                 "v1",
@@ -1785,7 +1787,9 @@ mod tests {
 
     #[tokio::test]
     async fn outbox_terminal_decision_unknown_operation_consumes_assigned_sequence() {
-        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let (node_db, sqlite_node_db) =
             crate::datastore::node_local::selector::open_node_local_with_sqlite(
                 BackendKind::Sqlite,
@@ -1959,7 +1963,9 @@ mod tests {
 
     #[tokio::test]
     async fn assigned_empty_payload_uses_a_durable_terminal_sentinel() {
-        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let node_db = crate::datastore::node_local::selector::open_node_local(
             BackendKind::Sqlite,
             None,

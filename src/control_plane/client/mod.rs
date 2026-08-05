@@ -403,8 +403,11 @@ mod tests {
 
     #[tokio::test]
     async fn node_effect_ports_gate_follower_lease_before_tracker_mutation() {
-        let db: crate::datastore::DatastoreHandle =
-            Arc::new(crate::datastore::test_support::in_memory().await);
+        let db: crate::datastore::DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
             chrono::Utc::now(),
         ));
@@ -451,7 +454,9 @@ mod tests {
 
     #[tokio::test]
     async fn node_effect_lease_renewal_has_no_cluster_rv_watch_or_lease_row() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
             chrono::Utc::now(),
         ));
@@ -493,7 +498,9 @@ mod tests {
 
     #[tokio::test]
     async fn node_effect_lifecycle_status_preserves_spec_metadata_and_conflicts_stale_rv() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let created = db
             .create_resource(
                 "v1",
@@ -675,7 +682,9 @@ mod tests {
 
     #[tokio::test]
     async fn local_client_reads_pods_through_focused_resource_query() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Pod",
@@ -714,7 +723,9 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_intent_ack_is_idempotent_and_never_touches_same_name_pod_row() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let replacement = db
             .create_resource(
                 "v1",
@@ -769,7 +780,9 @@ mod tests {
 
     #[tokio::test]
     async fn local_client_apply_outbox_is_idempotent_and_uid_bound() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Pod",
@@ -889,7 +902,9 @@ mod tests {
 
     #[tokio::test]
     async fn local_client_apply_outbox_returns_committed_resource_version() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "Pod",
@@ -938,7 +953,9 @@ mod tests {
 
     #[tokio::test]
     async fn local_client_pod_delete_outbox_reconciles_terminating_namespace() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_namespace(
             "worker-finalize-ns",
             serde_json::json!({
@@ -1072,7 +1089,9 @@ mod tests {
 
     #[tokio::test]
     async fn local_client_pod_delete_outbox_finalizes_ready_foreground_owner() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         db.create_resource(
             "v1",
             "ReplicationController",
@@ -1180,7 +1199,9 @@ mod tests {
 
     #[tokio::test]
     async fn local_client_serves_network_metadata_without_calling_forwarder() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let client = LocalApiClient::new(
             Arc::new(db.clone()),
             "node-a".to_string(),

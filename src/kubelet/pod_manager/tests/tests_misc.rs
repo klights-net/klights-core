@@ -23,7 +23,9 @@ fn pod_watcher_limits_pod_events_to_local_node_field_selector() {
 
 #[tokio::test]
 async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_aware_handler() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
@@ -127,7 +129,9 @@ fn deprecated_lifecycle_helpers_removed() {
 
 #[tokio::test]
 async fn lifecycle_message_from_command_uses_command_uid_not_live_pod_uid() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     db.create_resource(
         "v1",
         "Pod",
@@ -595,7 +599,9 @@ fn test_watch_startup_reconciliation_skips_realized_pod_with_pod_ip() {
 #[tokio::test]
 async fn test_mark_pod_start_pending_for_retry_keeps_image_pull_non_terminal() {
     use crate::kubelet::pod_repository::PodStatusWriter;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let pod = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -650,7 +656,9 @@ async fn test_mark_pod_start_pending_for_retry_keeps_image_pull_non_terminal() {
 #[tokio::test]
 async fn test_mark_pod_start_pending_for_retry_replaces_existing_pull_status_with_image_error() {
     use crate::kubelet::pod_repository::PodStatusWriter;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let pod = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -725,7 +733,9 @@ async fn test_mark_pod_start_pending_for_retry_replaces_existing_pull_status_wit
 #[tokio::test]
 async fn test_mark_pod_start_pending_for_retry_rebuilds_status_for_retrying_init_failure() {
     use crate::kubelet::pod_repository::PodStatusWriter;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let pod = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -861,7 +871,9 @@ async fn test_mark_pod_start_pending_for_retry_rebuilds_status_for_retrying_init
 /// ContainerStoppedEvent was missed.
 #[tokio::test]
 async fn test_apply_pod_phase_update_preserves_create_container_config_error_when_cri_empty() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let initial_pod = serde_json::json!({
         "apiVersion": "v1",
@@ -944,7 +956,9 @@ async fn test_apply_pod_phase_update_preserves_create_container_config_error_whe
 #[tokio::test]
 async fn test_apply_pod_phase_update_preserves_live_create_container_config_error_when_snapshot_stale()
  {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let initial_pod = serde_json::json!({
         "apiVersion": "v1",
@@ -1045,7 +1059,9 @@ async fn test_apply_pod_phase_update_preserves_live_create_container_config_erro
 
 #[tokio::test]
 async fn test_apply_pod_phase_update_running_to_succeeded_on_clean_exit_never() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Seed a Running pod in the datastore (mirrors what create_pod writes
     // after starting the container).
@@ -1147,7 +1163,9 @@ async fn test_apply_pod_phase_update_running_to_succeeded_on_clean_exit_never() 
 
 #[tokio::test]
 async fn test_apply_pod_phase_update_keeps_failed_init_pod_terminal() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let initial_pod = serde_json::json!({
         "apiVersion": "v1",
@@ -1262,7 +1280,9 @@ async fn test_apply_pod_phase_update_keeps_failed_init_pod_terminal() {
 /// doesn't own.
 #[tokio::test]
 async fn test_apply_pod_phase_update_preserves_unrelated_status_fields() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let initial_pod = serde_json::json!({
         "apiVersion": "v1",
@@ -1363,7 +1383,9 @@ async fn test_apply_pod_phase_update_preserves_unrelated_status_fields() {
 
 #[tokio::test]
 async fn test_apply_pod_phase_update_never_decreases_restart_count() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let initial_pod = serde_json::json!({
         "apiVersion": "v1",
@@ -1449,7 +1471,9 @@ async fn test_apply_pod_phase_update_never_decreases_restart_count() {
 
 #[tokio::test]
 async fn test_runtime_restart_status_increment_uses_live_pod_with_stale_snapshot() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let initial_pod = serde_json::json!({
         "apiVersion": "v1",
@@ -1542,7 +1566,9 @@ async fn test_runtime_restart_status_increment_uses_live_pod_with_stale_snapshot
 
 #[tokio::test]
 async fn test_apply_pod_phase_update_preserves_same_container_started_at() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let initial_started_at = "2026-04-30T00:00:00Z";
     let initial_pod = serde_json::json!({
@@ -1635,7 +1661,9 @@ async fn test_apply_pod_phase_update_preserves_same_container_started_at() {
 
 #[tokio::test]
 async fn test_apply_pod_phase_update_reuses_running_started_at_when_terminal() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let initial_started_at = "2026-04-30T00:00:00Z";
     let initial_pod = serde_json::json!({
@@ -1716,7 +1744,9 @@ async fn test_apply_pod_phase_update_reuses_running_started_at_when_terminal() {
 
 #[tokio::test]
 async fn test_apply_pod_phase_update_survives_status_conflict() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let initial_pod = serde_json::json!({
         "apiVersion": "v1",
@@ -1844,7 +1874,9 @@ async fn test_apply_pod_phase_update_survives_status_conflict() {
 
 #[tokio::test]
 async fn test_apply_pod_phase_update_reconciles_pdb_on_ready_transition() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let pdb = serde_json::json!({
         "apiVersion": "policy/v1",
@@ -1962,7 +1994,9 @@ async fn test_apply_pod_phase_update_reconciles_pdb_on_ready_transition() {
 
 #[tokio::test]
 async fn test_apply_pod_phase_update_repairs_pod_ips_arrays() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let pod = serde_json::json!({
         "apiVersion": "v1",
@@ -2036,7 +2070,9 @@ async fn test_apply_pod_phase_update_repairs_pod_ips_arrays() {
 
 #[tokio::test]
 async fn test_apply_pod_phase_update_repairs_scalar_pod_ips_from_arrays() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let pod = serde_json::json!({
         "apiVersion": "v1",
@@ -2112,7 +2148,9 @@ async fn test_apply_pod_phase_update_repairs_scalar_pod_ips_from_arrays() {
 
 #[tokio::test]
 async fn test_enqueue_job_reconcile_no_owner_is_noop() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
     let pod = serde_json::json!({
         "metadata": {"name": "pod", "namespace": "default"},
@@ -2125,7 +2163,9 @@ async fn test_enqueue_job_reconcile_no_owner_is_noop() {
 
 #[tokio::test]
 async fn test_enqueue_job_reconcile_non_job_owner_is_noop() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
     let pod = serde_json::json!({
         "metadata": {
@@ -2142,7 +2182,7 @@ async fn test_enqueue_job_reconcile_non_job_owner_is_noop() {
 
 #[tokio::test]
 async fn test_enqueue_job_reconcile_enqueues_job_key_via_dispatcher() {
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (db, db_handle) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let service_ipam = std::sync::Arc::new(klights_controllers::service::ServiceIpam::new(
         "10.43.128.0/17",
     ));
@@ -2238,7 +2278,7 @@ async fn test_enqueue_job_reconcile_enqueues_job_key_via_dispatcher() {
 
 #[tokio::test]
 async fn test_terminal_watch_modified_pod_enqueues_job_reconcile() {
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (db, db_handle) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let service_ipam = std::sync::Arc::new(klights_controllers::service::ServiceIpam::new(
         "10.43.128.0/17",
     ));
@@ -2336,7 +2376,9 @@ async fn test_terminal_watch_modified_pod_enqueues_job_reconcile() {
 
 #[tokio::test]
 async fn test_enqueue_job_reconcile_skips_when_dispatcher_not_bound() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
     let pod = serde_json::json!({
         "apiVersion": "v1",

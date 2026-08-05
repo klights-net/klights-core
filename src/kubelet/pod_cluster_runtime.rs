@@ -201,7 +201,7 @@ mod tests {
     use crate::kubelet::pod_runtime::service::PodRuntimeKey;
 
     async fn build_repo() -> PodRepository {
-        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));

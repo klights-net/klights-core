@@ -184,7 +184,9 @@ fn test_create_empty_dir_memory_medium_with_size_limit() {
 async fn test_configmap_volume_sets_0644_permissions_by_default() {
     use std::os::unix::fs::PermissionsExt;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -227,7 +229,9 @@ async fn test_configmap_volume_sets_0644_permissions_by_default() {
 
 #[tokio::test]
 async fn test_configmap_create_uses_keyed_blocking_boundary() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -265,7 +269,9 @@ async fn test_configmap_create_uses_keyed_blocking_boundary() {
 async fn test_configmap_volume_respects_default_mode() {
     use std::os::unix::fs::PermissionsExt;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -306,7 +312,9 @@ async fn test_configmap_volume_respects_default_mode() {
 
 #[tokio::test]
 async fn test_configmap_volume_items_filters_keys() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -359,7 +367,9 @@ async fn test_configmap_volume_items_filters_keys() {
 
 #[tokio::test]
 async fn test_configmap_volume_items_renames_files() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -409,7 +419,9 @@ async fn test_configmap_volume_items_renames_files() {
 async fn test_configmap_volume_items_per_file_mode() {
     use std::os::unix::fs::PermissionsExt;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -464,7 +476,9 @@ async fn test_configmap_volume_items_per_file_mode() {
 async fn test_configmap_volume_replaces_stale_directory() {
     // Regression test: if a previous run left a directory where a file should be,
     // the new run must remove it and write the file correctly.
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -520,7 +534,9 @@ async fn test_configmap_volume_replaces_stale_directory() {
 async fn test_configmap_volume_corefile_is_file_not_directory() {
     // Regression test: CoreDNS crash-loops because Corefile is mounted as directory
     // The ConfigMap volume should create regular files, not directories
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -579,7 +595,9 @@ async fn test_configmap_volume_corefile_is_file_not_directory() {
 async fn test_configmap_volume_binary_data_written_as_bytes() {
     use base64::Engine;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -622,7 +640,9 @@ async fn test_configmap_volume_binary_data_written_as_bytes() {
 async fn test_configmap_volume_binary_data_and_data_combined() {
     use base64::Engine;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -666,7 +686,9 @@ async fn test_configmap_volume_binary_data_and_data_combined() {
 async fn test_configmap_volume_only_binary_data_no_data_field_succeeds() {
     use base64::Engine;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -710,7 +732,9 @@ async fn test_secret_volume_sets_0644_permissions_by_default() {
     use base64::Engine;
     use std::os::unix::fs::PermissionsExt;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -754,7 +778,9 @@ async fn test_secret_volume_respects_default_mode() {
     use base64::Engine;
     use std::os::unix::fs::PermissionsExt;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -798,7 +824,9 @@ async fn test_secret_volume_respects_default_mode() {
 async fn test_secret_volume_items_filters_and_renames() {
     use base64::Engine;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -859,7 +887,9 @@ async fn test_secret_volume_items_filters_and_renames() {
 #[tokio::test]
 async fn test_secret_create_uses_keyed_blocking_boundary() {
     use base64::Engine;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 

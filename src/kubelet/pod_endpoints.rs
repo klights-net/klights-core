@@ -154,7 +154,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "Requires root for nftables/netlink"]
     async fn test_reconcile_endpoints_for_pod_matches_service() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
 
         // Create namespace
         let ns = serde_json::json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});

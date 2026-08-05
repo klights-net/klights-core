@@ -43,7 +43,9 @@ mod tests {
 
     #[tokio::test]
     async fn endpoint_mirror_delete_hook_removes_mirrored_slice() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
         db.create_resource(
             "discovery.k8s.io/v1",

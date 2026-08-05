@@ -547,7 +547,8 @@ mod tests {
 
     #[tokio::test]
     async fn root_namespace_termination_reconciler_is_the_controller_effect_port() {
-        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_db, db_handle) =
+            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
         let store = RootNamespaceTerminationStore::new(db_handle);
         let reconciler = RootNamespaceTerminationReconciler::new(store, metrics);
@@ -557,7 +558,8 @@ mod tests {
 
     #[tokio::test]
     async fn root_namespace_termination_reconciler_shares_metrics_arc() {
-        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_db, db_handle) =
+            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
         let store = RootNamespaceTerminationStore::new(db_handle);
         let _reconciler = RootNamespaceTerminationReconciler::new(store, metrics.clone());
@@ -575,7 +577,9 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_namespace_termination_already_deleted_is_ok() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let store = RootNamespaceTerminationStore::new(Arc::new(db.clone()));
         let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
 
@@ -598,7 +602,9 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_namespace_termination_success_does_not_increment_counter() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let store = RootNamespaceTerminationStore::new(Arc::new(db.clone()));
         let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
         let ns_name = "term-test-ns";
@@ -637,7 +643,8 @@ mod tests {
 
     #[tokio::test]
     async fn stale_http_authority_scope_rejects_write_after_demote_promote_aba() {
-        let (_datastore, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_datastore, db) =
+            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let store = RootNamespaceTerminationStore::new(db.clone());
         let (authority, publisher) =
             klights_replication::authority::WatchLeaderAuthority::channel(true, None);

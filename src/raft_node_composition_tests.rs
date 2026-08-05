@@ -652,8 +652,11 @@ mod tests {
         .expect("open node-local executor");
         let node_local =
             Arc::new(NodeLocalStores::from_executor(node_executor).expect("create node-local db"));
-        let backend: Arc<crate::datastore::sqlite::Datastore> =
-            Arc::new(crate::datastore::test_support::in_memory().await);
+        let backend: Arc<crate::datastore::sqlite::Datastore> = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let backend_for_caller = backend.clone();
         let raft_node = start_test_node(
             node_id,
@@ -749,8 +752,11 @@ mod tests {
             .expect("open node-local executor");
             let node_local =
                 Arc::new(NodeLocalStores::from_executor(exec).expect("create node-local db"));
-            let backend: Arc<crate::datastore::sqlite::Datastore> =
-                Arc::new(crate::datastore::test_support::in_memory().await);
+            let backend: Arc<crate::datastore::sqlite::Datastore> = Arc::new(
+                crate::datastore::sqlite::Datastore::new_in_memory()
+                    .await
+                    .unwrap(),
+            );
             let factory = LoopbackRaftNetworkFactory::new(registry.clone());
             let n = start_test_node(
                 id,
@@ -914,8 +920,11 @@ mod tests {
             .expect("open node-local executor");
             let node_local =
                 Arc::new(NodeLocalStores::from_executor(exec).expect("create node-local db"));
-            let backend: Arc<crate::datastore::sqlite::Datastore> =
-                Arc::new(crate::datastore::test_support::in_memory().await);
+            let backend: Arc<crate::datastore::sqlite::Datastore> = Arc::new(
+                crate::datastore::sqlite::Datastore::new_in_memory()
+                    .await
+                    .unwrap(),
+            );
             let factory = LoopbackRaftNetworkFactory::new(registry.clone());
             let node = start_test_node(
                 id,
@@ -1029,8 +1038,11 @@ mod tests {
         .expect("open node-local executor");
         let node_local =
             Arc::new(NodeLocalStores::from_executor(exec).expect("create node-local db"));
-        let backend: Arc<crate::datastore::sqlite::Datastore> =
-            Arc::new(crate::datastore::test_support::in_memory().await);
+        let backend: Arc<crate::datastore::sqlite::Datastore> = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let node = start_test_node(
             10,
             "n10".to_string(),
@@ -1112,8 +1124,11 @@ mod tests {
         .expect("open node-local executor");
         let node_local =
             Arc::new(NodeLocalStores::from_executor(exec).expect("create node-local db"));
-        let backend: Arc<crate::datastore::sqlite::Datastore> =
-            Arc::new(crate::datastore::test_support::in_memory().await);
+        let backend: Arc<crate::datastore::sqlite::Datastore> = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let factory = LoopbackRaftNetworkFactory::new(registry.clone());
         let node = start_test_node(
             id,
@@ -1470,8 +1485,11 @@ mod tests {
     }
 
     async fn test_db() -> crate::datastore::DatastoreHandle {
-        let ds: crate::datastore::DatastoreHandle =
-            Arc::new(crate::datastore::test_support::in_memory().await);
+        let ds: crate::datastore::DatastoreHandle = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         ds
     }
 
@@ -2057,8 +2075,11 @@ mod tests {
         .await
         .unwrap();
         let node_local = Arc::new(NodeLocalStores::from_executor(executor).unwrap());
-        let backend: Arc<crate::datastore::sqlite::Datastore> =
-            Arc::new(crate::datastore::test_support::in_memory().await);
+        let backend: Arc<crate::datastore::sqlite::Datastore> = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let client = Arc::new(AdmissionFenceClient {
             ready: std::sync::atomic::AtomicBool::new(false),
             append_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -2521,8 +2542,11 @@ mod tests {
         .await
         .unwrap();
         let nl1 = Arc::new(NodeLocalStores::from_executor(exec1).unwrap());
-        let be1: Arc<crate::datastore::sqlite::Datastore> =
-            Arc::new(crate::datastore::test_support::in_memory().await);
+        let be1: Arc<crate::datastore::sqlite::Datastore> = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let leader_network = LoopbackRaftNetworkFactory::new(registry.clone());
         let leader = start_test_node(
             leader_id,
@@ -2555,8 +2579,11 @@ mod tests {
         .await
         .unwrap();
         let nl2 = Arc::new(NodeLocalStores::from_executor(exec2).unwrap());
-        let be2: Arc<crate::datastore::sqlite::Datastore> =
-            Arc::new(crate::datastore::test_support::in_memory().await);
+        let be2: Arc<crate::datastore::sqlite::Datastore> = Arc::new(
+            crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap(),
+        );
         let voter_network = LoopbackRaftNetworkFactory::new(registry.clone());
         let voter_node = start_test_node(
             voter_id,

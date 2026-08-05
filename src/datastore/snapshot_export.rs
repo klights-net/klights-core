@@ -567,7 +567,9 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_generates_entries() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
 
         // Create some resources
         db.create_resource(
@@ -598,7 +600,9 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_after_current_rv_still_contains_authoritative_state() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
 
         db.create_resource(
             "v1",
@@ -629,7 +633,9 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_replays_resource_deletes_since_rv() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
 
         let created = db
             .create_resource(
@@ -670,7 +676,9 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_restore_preserves_durable_watch_history() {
-        let leader = crate::datastore::test_support::in_memory().await;
+        let leader = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let current = leader
             .create_resource(
                 "v1",
@@ -728,7 +736,9 @@ mod tests {
         );
 
         let snapshot = generate_snapshot(&leader, 0).await.unwrap();
-        let follower = crate::datastore::test_support::in_memory().await;
+        let follower = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         follower
             .replace_replicated_resource_state(
                 snapshot,
@@ -745,7 +755,9 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_restore_preserves_retained_watch_event_ids() {
-        let leader = crate::datastore::test_support::in_memory().await;
+        let leader = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         for index in 0..5 {
             leader
                 .create_resource(
@@ -775,7 +787,9 @@ mod tests {
 
         let position = leader.current_watch_replay_position().await.unwrap();
         let snapshot = generate_snapshot(&leader, 0).await.unwrap();
-        let follower = crate::datastore::test_support::in_memory().await;
+        let follower = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         follower
             .replace_replicated_resource_state(
                 snapshot,
@@ -806,7 +820,9 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_restore_preserves_allocator_high_water_with_empty_history() {
-        let leader = crate::datastore::test_support::in_memory().await;
+        let leader = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         leader
             .create_resource(
                 "v1",
@@ -826,7 +842,9 @@ mod tests {
         assert!(leader.gc_watch_events(0, -1).await.unwrap() > 0);
 
         let snapshot = generate_snapshot(&leader, 0).await.unwrap();
-        let follower = crate::datastore::test_support::in_memory().await;
+        let follower = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         follower
             .replace_replicated_resource_state(
                 snapshot,
@@ -889,7 +907,9 @@ mod tests {
     async fn snapshot_generation_preserves_outbox_stream_watermarks() {
         use klights_cluster_core::OutboxStreamWatermark;
 
-        let leader = crate::datastore::test_support::in_memory().await;
+        let leader = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let watermark = OutboxStreamWatermark {
             client_id: "snapshot-client".to_string(),
             stream_id: 7,
@@ -926,7 +946,9 @@ mod tests {
 
         let leader_rv = leader.get_current_resource_version().await.unwrap();
         let snapshot = generate_snapshot(&leader, 0).await.unwrap();
-        let follower = crate::datastore::test_support::in_memory().await;
+        let follower = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         follower
             .replace_replicated_resource_state(snapshot, leader_rv, None, None, None)
             .await
@@ -948,7 +970,9 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_generation_preserves_applied_outbox_dedup_rows() {
-        let leader = crate::datastore::test_support::in_memory().await;
+        let leader = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         leader
             .create_resource(
                 "v1",
@@ -977,7 +1001,9 @@ mod tests {
             .unwrap();
 
         let snapshot = generate_snapshot(&leader, 0).await.unwrap();
-        let follower = crate::datastore::test_support::in_memory().await;
+        let follower = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         follower
             .replace_replicated_resource_state(
                 snapshot,
@@ -996,7 +1022,9 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_restore_preserves_rv_counter_for_next_raft_apply() {
-        let leader = crate::datastore::test_support::in_memory().await;
+        let leader = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         leader
             .create_resource(
                 "v1",
@@ -1016,7 +1044,9 @@ mod tests {
         let leader_rv = leader.get_current_resource_version().await.unwrap();
         let snapshot = generate_snapshot(&leader, 0).await.unwrap();
 
-        let follower = crate::datastore::test_support::in_memory().await;
+        let follower = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         follower
             .replace_replicated_resource_state(snapshot, leader_rv, None, None, None)
             .await
@@ -1143,7 +1173,9 @@ mod tests {
         use klights_cluster_core::BuildOutboxOutcome;
         use klights_cluster_core::OutboxStreamWatermark;
 
-        let leader = crate::datastore::test_support::in_memory().await;
+        let leader = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         create_pod_for_status_snapshot(&leader, "uid-1").await;
         let watermark = OutboxStreamWatermark {
             client_id: "worker-a-epoch".to_string(),
@@ -1182,7 +1214,9 @@ mod tests {
         let leader_rv = leader.get_current_resource_version().await.unwrap();
         let snapshot = generate_snapshot(&leader, 0).await.unwrap();
 
-        let follower = crate::datastore::test_support::in_memory().await;
+        let follower = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         follower
             .replace_replicated_resource_state(snapshot, leader_rv, None, None, None)
             .await
@@ -1225,7 +1259,9 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_after_rv_is_still_authoritative_for_destructive_restore() {
-        let leader = crate::datastore::test_support::in_memory().await;
+        let leader = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let baseline = leader
             .create_resource(
                 "v1",
@@ -1263,7 +1299,9 @@ mod tests {
         let snapshot = generate_snapshot(&leader, baseline.resource_version)
             .await
             .unwrap();
-        let follower = crate::datastore::test_support::in_memory().await;
+        let follower = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         follower
             .replace_replicated_resource_state(
                 snapshot,
@@ -1300,7 +1338,9 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_includes_live_namespaced_rows_without_live_namespace() {
-        let leader = crate::datastore::test_support::in_memory().await;
+        let leader = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         leader
             .create_resource(
                 "v1",
@@ -1329,7 +1369,9 @@ mod tests {
             .unwrap();
 
         let snapshot = generate_snapshot(&leader, 0).await.unwrap();
-        let follower = crate::datastore::test_support::in_memory().await;
+        let follower = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         follower
             .replace_replicated_resource_state(
                 snapshot,
@@ -1377,7 +1419,9 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_includes_cluster_peer_state() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let subnet = db
             .allocate_node_subnet("leader", "10.42.0.0/16", "192.0.2.1")
             .await
@@ -1436,7 +1480,9 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_includes_cluster_scoped_resources() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let node = db
             .create_resource(
                 "v1",
@@ -1474,7 +1520,9 @@ mod tests {
 
     #[tokio::test]
     async fn staging_restore_successful() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
 
         // Create a resource (simulating leader state)
         db.create_resource(
@@ -1503,7 +1551,9 @@ mod tests {
 
     #[tokio::test]
     async fn failed_copy_leaves_old_data_untouched() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
 
         // Create initial data
         db.create_resource(
@@ -1557,7 +1607,9 @@ mod tests {
     // boundary, dedup ledger intact.
     #[tokio::test]
     async fn snapshot_emits_complete_watch_history_across_page_boundaries() {
-        let leader = crate::datastore::test_support::in_memory().await;
+        let leader = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         // Insert strictly more watch_events than SNAPSHOT_EMIT_PAGE_SIZE so the
         // emitter's paged loop crosses at least one boundary.
         let n = super::SNAPSHOT_EMIT_PAGE_SIZE + 2;
@@ -1583,7 +1635,9 @@ mod tests {
 
         let leader_rv = leader.get_current_resource_version().await.unwrap();
         let snapshot = generate_snapshot(&leader, 0).await.unwrap();
-        let follower = crate::datastore::test_support::in_memory().await;
+        let follower = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         follower
             .replace_replicated_resource_state(snapshot, leader_rv, None, None, None)
             .await
@@ -1617,7 +1671,9 @@ mod tests {
             ("outbox-heavy", 1, super::SNAPSHOT_EMIT_PAGE_SIZE + 1),
             ("mixed", 5, 7),
         ] {
-            let leader = crate::datastore::test_support::in_memory().await;
+            let leader = crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap();
             for i in 0..n_resources {
                 leader
                     .create_resource(

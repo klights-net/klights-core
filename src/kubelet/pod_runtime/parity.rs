@@ -249,7 +249,7 @@ pub struct ParityFixture {
 impl ParityFixture {
     /// Construct every mock with empty state and an in-memory repository.
     pub async fn new() -> Self {
-        let (ds, handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (ds, handle) = crate::datastore::selector::sqlite_in_memory_store_for_test().await;
         std::mem::forget(ds);
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),

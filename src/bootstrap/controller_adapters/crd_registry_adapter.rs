@@ -115,7 +115,9 @@ mod tests {
 
     #[tokio::test]
     async fn datastore_reader_is_registry_source_of_truth() {
-        let db = crate::datastore::test_support::in_memory().await;
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
         let registry = CrdRegistry::new();
         db.create_resource(
             "apiextensions.k8s.io/v1",
@@ -162,7 +164,7 @@ mod tests {
             .await
             .unwrap();
         let handle: DatastoreHandle = Arc::new(db.clone());
-        let passive_reads = crate::datastore::test_support::sqlite_passive_read_ports(&db);
+        let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&db);
         let registry = CrdRegistry::new();
         let cancel = CancellationToken::new();
         let watcher = tokio::spawn(run_crd_registry_watch_with_components(

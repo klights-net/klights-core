@@ -48,7 +48,7 @@ fn unchanged_endpoint_classification_is_allocation_free() {
 
 #[tokio::test]
 async fn service_sink_gates_irrelevant_updates_and_stale_targetref_self_extinguishes() {
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (db, db_handle) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     let sink = Arc::new(RecordingServiceSink::default());
     let slot = ControllerDispatcherSlot::with_service_reconcile_sink(sink.clone());
 
@@ -176,7 +176,7 @@ async fn service_sink_gates_irrelevant_updates_and_stale_targetref_self_extingui
 
 #[tokio::test]
 async fn selectorless_manual_endpoints_and_slices_are_never_pod_cleanup_targets() {
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (db, db_handle) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     db.create_resource(
         "v1",
         "Service",

@@ -3,7 +3,9 @@ use super::*;
 #[tokio::test]
 async fn test_downward_api_volume_creates_file_with_metadata_name() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -41,7 +43,9 @@ async fn test_downward_api_volume_creates_file_with_metadata_name() {
 #[tokio::test]
 async fn test_downward_api_create_uses_keyed_blocking_boundary() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -77,7 +81,9 @@ async fn test_downward_api_create_uses_keyed_blocking_boundary() {
 #[tokio::test]
 async fn test_downward_api_volume_metadata_namespace() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let pod = json!({
         "apiVersion": "v1",
@@ -105,7 +111,9 @@ async fn test_downward_api_volume_metadata_namespace() {
 #[tokio::test]
 async fn test_downward_api_volume_metadata_labels() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let pod = json!({
         "apiVersion": "v1",
@@ -137,7 +145,9 @@ async fn test_downward_api_volume_metadata_labels() {
 #[tokio::test]
 async fn test_downward_api_volume_metadata_annotations() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let pod = json!({
         "apiVersion": "v1",
@@ -169,7 +179,9 @@ async fn test_downward_api_volume_metadata_annotations() {
 #[tokio::test]
 async fn test_downward_api_volume_status_pod_ip() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let pod = json!({
         "apiVersion": "v1",
@@ -199,7 +211,9 @@ async fn test_downward_api_volume_status_pod_ip() {
 #[tokio::test]
 async fn test_downward_api_volume_spec_node_name() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let pod = json!({
         "apiVersion": "v1",
@@ -229,7 +243,9 @@ async fn test_downward_api_volume_spec_node_name() {
 #[tokio::test]
 async fn test_downward_api_volume_spec_service_account_name() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let pod = json!({
         "apiVersion": "v1",
@@ -259,7 +275,9 @@ async fn test_downward_api_volume_spec_service_account_name() {
 #[tokio::test]
 async fn test_downward_api_volume_resource_field_ref_limits_cpu() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let pod = json!({
         "apiVersion": "v1",
@@ -312,7 +330,9 @@ async fn test_downward_api_volume_resource_field_ref_limits_cpu() {
 #[tokio::test]
 async fn test_downward_api_volume_resource_field_ref_default_container() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let pod = json!({
         "apiVersion": "v1",
@@ -364,7 +384,9 @@ async fn test_downward_api_volume_resource_field_ref_default_container() {
 #[tokio::test]
 async fn test_extract_resource_field_ref_missing_resources_returns_default() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Pod with NO resources block on its container
     let pod = json!({
@@ -424,7 +446,9 @@ async fn test_extract_resource_field_ref_missing_resources_returns_default() {
 #[tokio::test]
 async fn test_downward_api_volume_creates_labels_file() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -463,7 +487,9 @@ async fn test_downward_api_volume_creates_labels_file() {
 #[tokio::test]
 async fn test_downward_api_volume_creates_resource_limits_file() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -520,7 +546,9 @@ async fn test_downward_api_volume_default_mode_permissions() {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -555,7 +583,9 @@ async fn test_downward_api_volume_custom_mode_permissions() {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -595,7 +625,9 @@ async fn test_downward_api_volume_per_file_mode_override() {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
 
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -640,7 +672,9 @@ async fn test_downward_api_volume_per_file_mode_override() {
 #[tokio::test]
 async fn test_downward_api_refresh_uses_keyed_blocking_boundary() {
     use serde_json::json;
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 

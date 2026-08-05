@@ -2,7 +2,9 @@ use super::*;
 
 #[tokio::test]
 async fn service_endpoint_batch_reconcile_creates_slice_and_endpoints_with_same_rv() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     db.create_resource(
         "v1",
         "Pod",
@@ -77,7 +79,9 @@ async fn service_endpoint_batch_reconcile_creates_slice_and_endpoints_with_same_
 
 #[tokio::test]
 async fn service_endpoint_batch_reconcile_is_noop_when_desired_state_matches() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let pod_repo = crate::controller_test_support::pod_repository_for_test(&db);
     reconcile_service_endpoints_batch(
         &controller_store(&db),
@@ -116,7 +120,9 @@ async fn service_endpoint_batch_reconcile_is_noop_when_desired_state_matches() {
 
 #[tokio::test]
 async fn test_reconcile_endpoints_skips_terminating_namespace() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_namespace(
         "terminating",
@@ -207,7 +213,9 @@ async fn test_reconcile_endpoints_skips_terminating_namespace() {
 // P2: Endpoint reconciliation deduplication tests
 #[tokio::test]
 async fn test_endpoint_reconciliation_dedup_skips_when_unchanged() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create namespace
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});
@@ -282,7 +290,9 @@ async fn test_endpoint_reconciliation_dedup_skips_when_unchanged() {
 
 #[tokio::test]
 async fn test_endpoint_reconciliation_dedup_updates_when_changed() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create namespace
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});
@@ -372,7 +382,9 @@ async fn test_endpoint_reconciliation_dedup_updates_when_changed() {
 
 #[tokio::test]
 async fn test_reconcile_endpoints_ready_pods_in_addresses() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create namespace
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});
@@ -438,7 +450,9 @@ async fn test_reconcile_endpoints_ready_pods_in_addresses() {
 
 #[tokio::test]
 async fn test_reconcile_endpoints_and_slices_exclude_terminating_pods() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});
     db.create_resource("v1", "Namespace", None, "test", ns)
@@ -541,7 +555,9 @@ async fn test_reconcile_endpoints_and_slices_exclude_terminating_pods() {
 
 #[tokio::test]
 async fn test_reconcile_endpoints_not_ready_pods_in_not_ready_addresses() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create namespace
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});
@@ -648,7 +664,9 @@ async fn test_reconcile_endpoints_not_ready_pods_in_not_ready_addresses() {
 
 #[tokio::test]
 async fn test_reconcile_endpoints_publish_not_ready_all_in_addresses() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create namespace
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});
@@ -739,7 +757,9 @@ async fn test_reconcile_endpoints_publish_not_ready_all_in_addresses() {
 
 #[tokio::test]
 async fn test_reconcile_endpoints_includes_hostname_for_statefulset_pods() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "default"}});
     db.create_resource("v1", "Namespace", None, "default", ns)
@@ -804,7 +824,9 @@ async fn test_reconcile_endpoints_includes_hostname_for_statefulset_pods() {
 
 #[tokio::test]
 async fn test_reconcile_endpoints_no_hostname_when_subdomain_differs() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "default"}});
     db.create_resource("v1", "Namespace", None, "default", ns)
@@ -864,7 +886,9 @@ async fn test_reconcile_endpoints_no_hostname_when_subdomain_differs() {
 
 #[tokio::test]
 async fn test_reconcile_endpoints_splits_named_target_ports_per_resolved_port() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     db.create_resource(
         "v1",
@@ -951,7 +975,9 @@ async fn test_reconcile_endpoints_splits_named_target_ports_per_resolved_port() 
 
 #[tokio::test]
 async fn test_mirror_endpoints_to_endpointslice_creates_matching_endpointslice() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create namespace
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});
@@ -1053,7 +1079,9 @@ async fn test_mirror_endpoints_to_endpointslice_creates_matching_endpointslice()
 
 #[tokio::test]
 async fn test_mirror_endpoints_to_endpointslice_updates_existing_mirror() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});
     db.create_resource("v1", "Namespace", None, "test", ns)
@@ -1135,7 +1163,9 @@ async fn test_mirror_endpoints_to_endpointslice_updates_existing_mirror() {
 
 #[tokio::test]
 async fn test_mirror_endpoints_skips_if_skip_mirror_label_set() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create namespace
     let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "test"}});

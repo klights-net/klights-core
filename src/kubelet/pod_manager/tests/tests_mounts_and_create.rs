@@ -422,7 +422,9 @@ fn test_create_pod_fallback_uid_is_injected_for_fieldref() {
 
 #[tokio::test]
 async fn test_update_pod_status_triggers_endpoint_reconciliation() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create namespace
     let ns = serde_json::json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "default"}});
@@ -537,7 +539,9 @@ async fn test_update_pod_status_triggers_endpoint_reconciliation() {
 
 #[tokio::test]
 async fn test_update_pod_status_running_without_container_statuses_sets_ready_conditions() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let pod = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -591,7 +595,9 @@ async fn test_update_pod_status_running_without_container_statuses_sets_ready_co
 
 #[tokio::test]
 async fn test_update_pod_status_preserves_restart_count_and_last_state() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
     let pod = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -666,7 +672,9 @@ async fn test_update_pod_status_preserves_restart_count_and_last_state() {
 #[tokio::test]
 #[ignore = "Requires root for nftables/netlink"]
 async fn test_endpoints_populated_on_pod_modified_event() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
 
     // Create namespace
     let ns =

@@ -80,7 +80,8 @@ mod tests {
 
     #[tokio::test]
     async fn boot_recovery_routes_existing_pods_through_actor_startpod() {
-        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_db, db_handle) =
+            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));

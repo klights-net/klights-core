@@ -291,7 +291,8 @@ mod tests {
 
     #[tokio::test]
     async fn maintenance_rejects_nonpositive_watch_retention() {
-        let (_db, sequenced) = crate::datastore::test_support::in_memory_with_handle().await;
+        let (_db, sequenced) =
+            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));

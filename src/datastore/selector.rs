@@ -70,6 +70,105 @@ impl PassiveReadPorts {
     }
 }
 
+#[cfg(test)]
+const UNUSED_READ_DIAGNOSTIC: &str = "positioned watch is declared unused by this test fixture";
+
+#[cfg(test)]
+struct UnusedFailClosedPassiveRead;
+
+#[cfg(test)]
+impl klights_cluster_store::ClusterResourceRead for UnusedFailClosedPassiveRead {
+    fn get_resource(
+        &self,
+        _request: klights_cluster_store::ResourceGetRequest,
+    ) -> klights_cluster_store::ResourceReadFuture<'_, Option<klights_cluster_core::Resource>> {
+        Box::pin(async {
+            Err(klights_cluster_store::ResourceReadError::UnsupportedMode {
+                message: UNUSED_READ_DIAGNOSTIC.to_string(),
+            })
+        })
+    }
+
+    fn list_resources(
+        &self,
+        _request: klights_cluster_store::ResourceListRequest,
+    ) -> klights_cluster_store::ResourceReadFuture<'_, klights_cluster_store::ResourceListRead>
+    {
+        Box::pin(async {
+            Err(klights_cluster_store::ResourceReadError::UnsupportedMode {
+                message: UNUSED_READ_DIAGNOSTIC.to_string(),
+            })
+        })
+    }
+}
+
+#[cfg(test)]
+impl klights_cluster_store::DurableWatchHistoryRead for UnusedFailClosedPassiveRead {
+    fn replay_watch_history(
+        &self,
+        _request: klights_cluster_store::WatchHistoryRequest,
+    ) -> klights_cluster_store::WatchHistoryFuture<'_, klights_cluster_store::WatchHistoryRead>
+    {
+        Box::pin(async {
+            Err(klights_cluster_store::WatchHistoryError::UnsupportedMode {
+                message: UNUSED_READ_DIAGNOSTIC.to_string(),
+            })
+        })
+    }
+
+    fn list_replay_floors(
+        &self,
+    ) -> klights_cluster_store::WatchHistoryFuture<'_, Vec<klights_cluster_store::DurableReplayFloor>>
+    {
+        Box::pin(async {
+            Err(klights_cluster_store::WatchHistoryError::UnsupportedMode {
+                message: UNUSED_READ_DIAGNOSTIC.to_string(),
+            })
+        })
+    }
+}
+
+#[cfg(test)]
+impl klights_cluster_store::DurableAllocatorRead for UnusedFailClosedPassiveRead {
+    fn read_allocator_state(
+        &self,
+    ) -> klights_cluster_store::AllocatorStateFuture<'_, klights_cluster_store::DurableAllocatorState>
+    {
+        Box::pin(async {
+            Err(
+                klights_cluster_store::AllocatorStateError::UnsupportedMode {
+                    message: UNUSED_READ_DIAGNOSTIC.to_string(),
+                },
+            )
+        })
+    }
+}
+
+/// Fail-closed datastore-free focused reads for tests that construct a local
+/// API client but declare its positioned-watch capability unused.
+#[cfg(test)]
+pub(crate) fn unused_fail_closed_passive_read_ports() -> PassiveReadPorts {
+    let reads = Arc::new(UnusedFailClosedPassiveRead);
+    PassiveReadPorts::new(reads.clone(), reads.clone(), reads)
+}
+
+/// Build test-only passive read ports directly from the SQLite destination
+/// adapter before the concrete store is erased behind `DatastoreHandle`.
+#[cfg(any(test, feature = "integration-test-harness"))]
+pub(crate) fn sqlite_passive_read_ports(db: &sqlite::Datastore) -> PassiveReadPorts {
+    let focused_reads = db.focused_read_store();
+    PassiveReadPorts::new(focused_reads.clone(), focused_reads.clone(), focused_reads)
+}
+
+/// Construct the root SQLite test adapter before kubelet fixtures receive its
+/// erased datastore handle. This keeps concrete cluster storage out of the
+/// kubelet-owned test surface.
+#[cfg(test)]
+pub(crate) async fn sqlite_in_memory_store_for_test() -> (sqlite::Datastore, super::DatastoreHandle)
+{
+    sqlite::Datastore::new_in_memory_with_handle().await
+}
+
 /// Root-only result of selecting one passive persistence backend.
 ///
 /// The legacy backend remains available while callers that already consume
@@ -218,13 +317,17 @@ pub(crate) async fn open(
 
 #[cfg(test)]
 mod tests {
-    use super::{OpenedPassiveStore, PassiveStoreOpenRequest, open, open_with_sink};
+    use super::{
+        OpenedPassiveStore, PassiveStoreOpenRequest, UNUSED_READ_DIAGNOSTIC, open, open_with_sink,
+        unused_fail_closed_passive_read_ports,
+    };
     use crate::datastore::{
         PositionedWatchReplayRead, ResourceListQuery as LegacyResourceListQuery, WatchTarget,
     };
     use klights_cluster_store::{
-        DurableWatchTarget, ResourceCollectionScope, ResourceListQuery, ResourceListRead,
-        ResourceListRequest, WatchHistoryRead, WatchHistoryRequest,
+        AllocatorStateError, DurableWatchTarget, ResourceCollectionScope, ResourceGetRequest,
+        ResourceListQuery, ResourceListRead, ResourceListRequest, ResourceReadError,
+        WatchHistoryError, WatchHistoryRead, WatchHistoryRequest,
     };
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use serde_json::json;
@@ -252,6 +355,87 @@ mod tests {
     fn concrete_read_stores_own_every_focused_read_port() {
         assert_all_focused_read_ports::<klights_cluster_datastore::sqlite::SqliteReadStore>();
         assert_all_focused_read_ports::<klights_cluster_datastore::redb::RedbReadStore>();
+    }
+
+    #[tokio::test]
+    async fn unused_fail_closed_passive_read_ports_reject_every_operation() {
+        let ports = unused_fail_closed_passive_read_ports();
+
+        let get_error = ports
+            .resource_reads()
+            .get_resource(ResourceGetRequest::new(
+                "v1",
+                "ConfigMap",
+                Some("default".to_string()),
+                "unused",
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            get_error,
+            ResourceReadError::UnsupportedMode { message }
+                if message == UNUSED_READ_DIAGNOSTIC
+        ));
+
+        let list_error = ports
+            .resource_reads()
+            .list_resources(ResourceListRequest::new(
+                "v1",
+                "ConfigMap",
+                ResourceCollectionScope::Namespace("default".to_string()),
+                ResourceListQuery::all(),
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            list_error,
+            ResourceReadError::UnsupportedMode { message }
+                if message == UNUSED_READ_DIAGNOSTIC
+        ));
+
+        let history_error = ports
+            .history_reads()
+            .replay_watch_history(
+                WatchHistoryRequest::new(
+                    vec![DurableWatchTarget::namespaced_in_namespace(
+                        "v1",
+                        "ConfigMap",
+                        "default",
+                    )],
+                    klights_cluster_core::WatchReplayPosition::default(),
+                    1,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            history_error,
+            WatchHistoryError::UnsupportedMode { message }
+                if message == UNUSED_READ_DIAGNOSTIC
+        ));
+
+        let floors_error = ports
+            .history_reads()
+            .list_replay_floors()
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            floors_error,
+            WatchHistoryError::UnsupportedMode { message }
+                if message == UNUSED_READ_DIAGNOSTIC
+        ));
+
+        let allocator_error = ports
+            .allocator_reads()
+            .read_allocator_state()
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            allocator_error,
+            AllocatorStateError::UnsupportedMode { message }
+                if message == UNUSED_READ_DIAGNOSTIC
+        ));
     }
 
     async fn open_selected(request: PassiveStoreOpenRequest<'_>) -> OpenedPassiveStore {
