@@ -14,7 +14,7 @@ pub(crate) use crate::node_status_merge::preserve_existing_network_conditions;
 pub use crate::node_status_merge::{
     merge_existing_node_mutable_fields, merge_node_status_for_update, set_node_external_ip,
 };
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(feature = "test-support")]
 pub(super) use crate::node_status_projection::stamp_git_commit_annotation;
 pub(super) use crate::node_status_projection::{NodeNetworkConditions, apply_network_conditions};
 pub use crate::node_status_projection::{

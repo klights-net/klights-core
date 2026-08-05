@@ -1,24 +1,11 @@
 use super::*;
 
-fn make_pod_reader(
-    db: &crate::datastore::sqlite::Datastore,
-) -> std::sync::Arc<dyn klights_pod_api::PodQuery> {
-    use klights_controllers::side_effects::SideEffectMetrics;
-    use klights_controllers::side_effects::SideEffectRegistry;
-    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
-    let supervisor = std::sync::Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-    let metrics = SideEffectMetrics::new();
-    let side_effects = std::sync::Arc::new(SideEffectRegistry::new());
-    std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(
-        std::sync::Arc::new(db.clone()),
-        supervisor,
-        side_effects,
-        metrics,
-    ))
+fn make_pod_reader(db: &TestVolumeSources) -> std::sync::Arc<dyn klights_pod_api::PodQuery> {
+    std::sync::Arc::new(db.clone())
 }
 
 fn test_pod_dir_id(namespace: &str, pod_name: &str, uid: &str) -> String {
-    klights_kubelet::volumes::pod_volume_dir_id(namespace, pod_name, uid)
+    pod_volume_dir_id(namespace, pod_name, uid)
 }
 
 fn test_volume_path(
@@ -40,9 +27,7 @@ fn test_volume_path(
 async fn test_projected_volume_configmap_uses_default_mode() {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -72,7 +57,7 @@ async fn test_projected_volume_configmap_uses_default_mode() {
 
     // defaultMode 0o400
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
-        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
+        file_process: &file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -103,9 +88,7 @@ async fn test_projected_volume_configmap_uses_default_mode() {
 async fn test_projected_volume_downward_api_per_file_mode() {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -127,7 +110,7 @@ async fn test_projected_volume_downward_api_per_file_mode() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
-        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
+        file_process: &file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "ns1",
@@ -158,9 +141,7 @@ async fn test_projected_volume_downward_api_per_file_mode() {
 #[tokio::test]
 async fn test_extract_resource_field_ref_limits_memory_absent_returns_node_allocatable() {
     use serde_json::json;
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
 
     // Pod with NO resource limits set — like a burstable or best-effort pod
     let pod = json!({
@@ -203,9 +184,7 @@ async fn test_secret_volume_refresh_on_update() {
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
 
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
 
     // Create a Secret with initial data
     use base64::Engine;
@@ -295,7 +274,7 @@ async fn test_secret_volume_refresh_on_update() {
         .unwrap();
     let before = blocking_fs_keyed_call_count();
     refresh_secret_configmap_volumes_from_event(
-        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &file_process_executor(),
         "Secret",
         "default",
         "my-secret",
@@ -324,9 +303,7 @@ async fn test_projected_secret_refresh_uses_event_payload_for_new_keys() {
 
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
     let old_value = base64::engine::general_purpose::STANDARD.encode("value-1");
     let new_value = base64::engine::general_purpose::STANDARD.encode("value-3");
 
@@ -388,7 +365,7 @@ async fn test_projected_secret_refresh_uses_event_payload_for_new_keys() {
     });
 
     refresh_secret_configmap_volumes_from_event(
-        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &file_process_executor(),
         "Secret",
         "default",
         "projected-secret",
@@ -411,9 +388,7 @@ async fn test_projected_secret_delete_event_clears_volume_with_stale_db_secret()
 
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
     let old_value = base64::engine::general_purpose::STANDARD.encode("value-1");
 
     db.create_resource(
@@ -465,7 +440,7 @@ async fn test_projected_secret_delete_event_clears_volume_with_stale_db_secret()
     fs::write(format!("{}/data-1", vol_path), "value-1").unwrap();
 
     refresh_secret_configmap_volumes_after_delete(
-        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &file_process_executor(),
         "Secret",
         "default",
         "deleted-secret",
@@ -488,9 +463,7 @@ async fn test_projected_configmap_delete_event_clears_existing_volume_with_missi
 
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
 
     db.create_resource(
         "v1",
@@ -540,7 +513,7 @@ async fn test_projected_configmap_delete_event_clears_existing_volume_with_missi
     fs::write(format!("{}/data-1", vol_path), "value-1").unwrap();
 
     refresh_secret_configmap_volumes_after_delete(
-        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &file_process_executor(),
         "ConfigMap",
         "default",
         "deleted-config",
@@ -564,9 +537,7 @@ async fn test_secret_delete_event_clears_direct_volume_with_stale_db_secret() {
 
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
     let old_value = base64::engine::general_purpose::STANDARD.encode("value-1");
 
     db.create_resource(
@@ -616,7 +587,7 @@ async fn test_secret_delete_event_clears_direct_volume_with_stale_db_secret() {
     fs::write(format!("{}/data-1", vol_path), "value-1").unwrap();
 
     refresh_secret_configmap_volumes_after_delete(
-        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &file_process_executor(),
         "Secret",
         "default",
         "deleted-secret",
@@ -639,9 +610,7 @@ async fn test_configmap_volume_refresh_uses_event_payload_for_new_keys() {
 
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
 
     db.create_resource(
         "v1",
@@ -700,7 +669,7 @@ async fn test_configmap_volume_refresh_uses_event_payload_for_new_keys() {
     });
 
     refresh_secret_configmap_volumes_from_event(
-        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &file_process_executor(),
         "ConfigMap",
         "default",
         "direct-config",
@@ -723,9 +692,7 @@ async fn test_configmap_volume_refresh_on_update() {
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
 
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
 
     // Create a ConfigMap with initial data
     db.create_resource(
@@ -807,7 +774,7 @@ async fn test_configmap_volume_refresh_on_update() {
         .unwrap();
     let before = blocking_fs_keyed_call_count();
     refresh_secret_configmap_volumes_from_event(
-        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &file_process_executor(),
         "ConfigMap",
         "default",
         "my-config",
@@ -836,9 +803,7 @@ async fn test_configmap_volume_refresh_prunes_removed_keys() {
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
 
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
 
     db.create_resource(
         "v1",
@@ -912,7 +877,7 @@ async fn test_configmap_volume_refresh_prunes_removed_keys() {
         .unwrap()
         .unwrap();
     refresh_secret_configmap_volumes_from_event(
-        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &file_process_executor(),
         "ConfigMap",
         "default",
         "my-config",
@@ -940,9 +905,7 @@ async fn test_configmap_volume_refresh_clears_files_on_source_delete() {
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
 
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
 
     db.create_resource(
         "v1",
@@ -996,7 +959,7 @@ async fn test_configmap_volume_refresh_clears_files_on_source_delete() {
         .unwrap();
 
     refresh_secret_configmap_volumes_after_delete(
-        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &file_process_executor(),
         "ConfigMap",
         "default",
         "my-config",
@@ -1020,9 +983,7 @@ async fn test_secret_volume_refreshes_existing_terminal_pod_mounts() {
     let tmp = TempDir::new().unwrap();
     let volumes_root = tmp.path().to_str().unwrap();
 
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
 
     // Create a Secret
     use base64::Engine;
@@ -1082,7 +1043,7 @@ async fn test_secret_volume_refreshes_existing_terminal_pod_mounts() {
         .unwrap()
         .unwrap();
     refresh_secret_configmap_volumes_from_event(
-        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &file_process_executor(),
         "Secret",
         "default",
         "skip-secret",

@@ -5,6 +5,9 @@ mod downward_api;
 mod projected;
 pub(crate) mod shared;
 
+#[cfg(test)]
+mod tests;
+
 pub fn pod_volume_dir_id(namespace: &str, name: &str, uid: &str) -> String {
     format!("{namespace}_{name}_{uid}")
 }

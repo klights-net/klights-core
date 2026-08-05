@@ -12,7 +12,5 @@ pub mod pod_termination;
 pub mod pod_watch_handlers;
 pub mod pod_watch_source;
 pub mod reconciler;
-#[cfg(test)]
-mod volume_integration_tests;
 
 pub mod pod_runtime;

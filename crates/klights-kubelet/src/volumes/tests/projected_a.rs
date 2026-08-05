@@ -3,9 +3,7 @@ use super::*;
 #[tokio::test]
 async fn test_projected_volume_with_service_account_token() {
     use serde_json::json;
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -25,7 +23,7 @@ async fn test_projected_volume_with_service_account_token() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
-        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
+        file_process: &file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -46,9 +44,7 @@ async fn test_projected_volume_with_service_account_token() {
 #[tokio::test]
 async fn test_projected_volume_create_uses_keyed_blocking_boundary() {
     use serde_json::json;
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -68,7 +64,7 @@ async fn test_projected_volume_create_uses_keyed_blocking_boundary() {
 
     let before = blocking_fs_keyed_call_count();
     let _ = create_projected_volume_at(ProjectedVolumeAtRequest {
-        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
+        file_process: &file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -89,9 +85,7 @@ async fn test_projected_volume_create_uses_keyed_blocking_boundary() {
 #[tokio::test]
 async fn test_projected_volume_with_configmap_source() {
     use serde_json::json;
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -122,7 +116,7 @@ async fn test_projected_volume_with_configmap_source() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
-        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
+        file_process: &file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -145,9 +139,7 @@ async fn test_projected_volume_with_configmap_source() {
 #[tokio::test]
 async fn test_projected_volume_with_downward_api_source() {
     use serde_json::json;
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -167,7 +159,7 @@ async fn test_projected_volume_with_downward_api_source() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
-        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
+        file_process: &file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -188,9 +180,7 @@ async fn test_projected_volume_with_downward_api_source() {
 #[tokio::test]
 async fn test_projected_volume_combines_multiple_sources() {
     use serde_json::json;
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -224,7 +214,7 @@ async fn test_projected_volume_combines_multiple_sources() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
-        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
+        file_process: &file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -255,9 +245,7 @@ async fn test_projected_volume_combines_multiple_sources() {
 async fn test_projected_volume_respects_default_mode() {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -277,7 +265,7 @@ async fn test_projected_volume_respects_default_mode() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
-        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
+        file_process: &file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -447,9 +435,7 @@ fn test_hostpath_volume_none_type_no_validation() {
 async fn test_refresh_downward_api_updates_annotation_file() {
     use tempfile::TempDir;
 
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
     let tmp_dir = TempDir::new().unwrap();
     let volumes_root = tmp_dir.path().to_str().unwrap();
 
@@ -490,10 +476,9 @@ async fn test_refresh_downward_api_updates_annotation_file() {
 
     // Create downward API volume with initial annotations.
     let items = pod_json["spec"]["volumes"][0]["downwardAPI"]["items"].clone();
-    let pod_dir_id =
-        klights_kubelet::volumes::pod_volume_dir_id("default", "test-pod", "uid-test-pod");
+    let pod_dir_id = pod_volume_dir_id("default", "test-pod", "uid-test-pod");
     create_downward_api_volume_at_with_db_name(DownwardApiVolumeWithDbNameRequest {
-        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
+        file_process: &file_process_executor(),
         volumes_root,
         sources: &db,
         namespace: "default",
@@ -502,7 +487,7 @@ async fn test_refresh_downward_api_updates_annotation_file() {
         volume_name: "podinfo",
         default_mode: None,
         items: &items,
-        node_capacity: klights_kubelet::node_capacity::NodeCapacity::default(),
+        node_capacity: crate::node_capacity::NodeCapacity::default(),
     })
     .await
     .unwrap();
@@ -557,10 +542,10 @@ async fn test_refresh_downward_api_updates_annotation_file() {
         .unwrap();
 
     refresh_downward_api_volumes(
-        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &file_process_executor(),
         &pod_for_refresh.data,
         volumes_root,
-        klights_kubelet::node_capacity::NodeCapacity::default(),
+        crate::node_capacity::NodeCapacity::default(),
     )
     .await
     .unwrap();
@@ -590,9 +575,7 @@ async fn test_refresh_downward_api_skips_projected_volumes() {
     // corrupted bind mounts.
     use tempfile::TempDir;
 
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
     let tmp_dir = TempDir::new().unwrap();
     let volumes_root = tmp_dir.path().to_str().unwrap();
 
@@ -633,16 +616,16 @@ async fn test_refresh_downward_api_skips_projected_volumes() {
 
     // Call refresh — should NOT create any files for the projected volume
     refresh_downward_api_volumes(
-        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &file_process_executor(),
         &pod_resource.data,
         volumes_root,
-        klights_kubelet::node_capacity::NodeCapacity::default(),
+        crate::node_capacity::NodeCapacity::default(),
     )
     .await
     .unwrap();
 
     // The volumes/downward-api/ directory must NOT exist
-    let pod_dir_id = klights_kubelet::volumes::pod_volume_dir_id("default", "sa-pod", "uid-sa-pod");
+    let pod_dir_id = pod_volume_dir_id("default", "sa-pod", "uid-sa-pod");
     let phantom_dir = format!("{}/{pod_dir_id}/volumes/downward-api", volumes_root);
     assert!(
         !std::path::Path::new(&phantom_dir).exists(),
@@ -665,9 +648,7 @@ async fn test_refresh_projected_downward_api_updates_labels_file() {
     // at the correct volumes/projected/{name}/ path.
     use tempfile::TempDir;
 
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
     let tmp_dir = TempDir::new().unwrap();
     let volumes_root = tmp_dir.path().to_str().unwrap();
 
@@ -702,8 +683,7 @@ async fn test_refresh_projected_downward_api_updates_labels_file() {
         .unwrap();
 
     // Simulate pod startup: create the projected volume directory with initial content.
-    let pod_dir_id =
-        klights_kubelet::volumes::pod_volume_dir_id("default", "label-pod", "uid-label-pod");
+    let pod_dir_id = pod_volume_dir_id("default", "label-pod", "uid-label-pod");
     let vol_dir = format!("{}/{pod_dir_id}/volumes/projected/podinfo", volumes_root);
     std::fs::create_dir_all(&vol_dir).unwrap();
     std::fs::write(format!("{}/labels", vol_dir), "app=\"initial\"\n").unwrap();
@@ -741,10 +721,10 @@ async fn test_refresh_projected_downward_api_updates_labels_file() {
 
     // Refresh volumes
     refresh_downward_api_volumes(
-        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &file_process_executor(),
         &updated_pod,
         volumes_root,
-        klights_kubelet::node_capacity::NodeCapacity::default(),
+        crate::node_capacity::NodeCapacity::default(),
     )
     .await
     .unwrap();
@@ -779,9 +759,7 @@ async fn test_refresh_projected_downward_api_updates_labels_file() {
 async fn test_projected_volume_configmap_writes_files() {
     // Regression test: projected volume with configMap source was silently skipping file writes
     // This test reproduces the kube-root-ca.crt ConfigMap scenario from Sonobuoy failures
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -814,7 +792,7 @@ async fn test_projected_volume_configmap_writes_files() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
-        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
+        file_process: &file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -847,9 +825,7 @@ async fn test_projected_volume_configmap_writes_files() {
 #[tokio::test]
 async fn test_projected_volume_configmap_with_items() {
     // Test projected volume with items key→path mapping
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
+    let db = TestVolumeSources::new_in_memory().await.unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_str().unwrap();
 
@@ -879,7 +855,7 @@ async fn test_projected_volume_configmap_with_items() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
-        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
+        file_process: &file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
