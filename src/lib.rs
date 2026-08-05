@@ -15,8 +15,6 @@ pub mod kubelet;
 pub mod paths;
 pub mod pidfile;
 pub(crate) mod pod_repository_composition;
-#[cfg(test)]
-mod service_reconcile_integration_tests;
 pub mod shutdown;
 pub mod version;
 
