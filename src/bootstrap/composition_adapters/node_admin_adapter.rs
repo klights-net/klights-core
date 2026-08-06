@@ -151,7 +151,7 @@ mod tests {
     use super::*;
 
     use crate::datastore::backend_kind::BackendKind;
-    use crate::datastore::node_local::sqlite::DeadLetterTestInsert;
+    use crate::datastore::node_local::DeadLetterTestInsert;
     use crate::datastore::node_local::{
         LegacyDeliveryTestStore as _, NodeLocalStores, OutboxInsert, selector,
     };
@@ -172,7 +172,7 @@ mod tests {
     }
 
     fn pod_status_payload() -> Vec<u8> {
-        crate::outbox_test_support::OutboxPayload::from_command(
+        crate::integration_test_harness::node_delivery_support::OutboxPayload::from_command(
             klights_cluster_core::StorageCommand::UpdateStatus {
                 api_version: "v1".to_string(),
                 kind: "Pod".to_string(),

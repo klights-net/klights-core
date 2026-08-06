@@ -27,7 +27,7 @@ pub(crate) struct NodeLocalStores {
     delivery: Arc<SqliteDeliveryStore>,
     network: Arc<SqliteNodeNetworkStateStore>,
     runtime_work: Arc<SqliteRuntimeWorkStore>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     executor: DbExecutor,
 }
 
@@ -48,12 +48,12 @@ impl NodeLocalStores {
                 wall_clock.clone(),
             )),
             runtime_work: Arc::new(SqliteRuntimeWorkStore::new(executor.clone(), wall_clock)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "integration-test-harness"))]
             executor,
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub(crate) fn from_executor(executor: DbExecutor) -> Result<Self> {
         Self::from_executor_with_clock(executor, Arc::new(klights_supervisor::SystemWallClock))
     }
@@ -128,7 +128,7 @@ impl NodeLocalStores {
         self.runtime_work.clone()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub(crate) fn delivery_ref(&self) -> &SqliteDeliveryStore {
         &self.delivery
     }
@@ -143,7 +143,7 @@ impl NodeLocalStores {
         &self.runtime_work
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub(crate) fn executor_for_test(&self) -> DbExecutor {
         self.executor.clone()
     }

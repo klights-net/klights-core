@@ -1,14 +1,12 @@
 use anyhow::Result;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use anyhow::anyhow;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use rusqlite::OptionalExtension;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use serde_json::Value;
-#[cfg(test)]
-use sha2::{Digest, Sha256};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct PodStatusCheckpoint {
     pub pod_uid: String,
@@ -20,23 +18,7 @@ pub struct PodStatusCheckpoint {
     pub updated_ms: i64,
 }
 
-/// Node-local snapshot of runtime reconcile observations.
-///
-/// Mirrors `RuntimeReconcileObservations` (kubelet/pod_runtime/observations.rs)
-/// but persisted to node.db so CRI events observed for a Pod UID survive an
-/// actor or worker restart when CRI/containerd may have already dropped the
-/// short-lived container details. UID-bound and node-local only; never
-/// replicated through cluster.db or raft.
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeObservationCheckpoint {
-    pub pod_uid: String,
-    pub container_ids: Vec<String>,
-    pub generation: u64,
-    pub updated_ms: i64,
-}
-
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxInsert {
     pub idempotency_key: String,
@@ -54,7 +36,7 @@ pub struct OutboxInsert {
     pub next_due_ms: i64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxRow {
     pub id: i64,
@@ -82,7 +64,7 @@ pub struct OutboxRow {
     pub last_error: Option<String>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DeadLetterRow {
     pub id: i64,
@@ -106,7 +88,7 @@ pub struct DeadLetterRow {
     pub moved_at_ms: i64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeadLetterTestInsert<'a> {
     pub idempotency_key: &'a str,
@@ -124,7 +106,7 @@ pub struct DeadLetterTestInsert<'a> {
     pub moved_at_ms: i64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct OutboxStats {
     pub pending: i64,
@@ -134,7 +116,7 @@ pub struct OutboxStats {
     pub dispatch_errors_total: i64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 impl super::NodeLocalStores {
     pub(crate) async fn with_test_connection<T, F>(
         &self,
@@ -148,7 +130,7 @@ impl super::NodeLocalStores {
         self.executor_for_test().call_raw(query_name, f).await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub async fn outbox_stream_position_for_test(
         &self,
         idempotency_key: &str,
@@ -167,7 +149,7 @@ impl super::NodeLocalStores {
         .map_err(|error| anyhow!("outbox stream-position test read failed: {error}"))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub async fn set_outbox_operation_for_test(
         &self,
         idempotency_key: &str,
@@ -196,7 +178,7 @@ impl super::NodeLocalStores {
         .map_err(|error| anyhow!("outbox operation test update failed: {error}"))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub async fn outbox_operation_for_test(&self, idempotency_key: &str) -> Result<Option<String>> {
         let idempotency_key = idempotency_key.to_string();
         self.with_test_connection("node_local:outbox_operation_test_read", move |conn| {
@@ -212,7 +194,7 @@ impl super::NodeLocalStores {
         .map_err(|error| anyhow!("outbox operation test read failed: {error}"))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub async fn insert_dead_letter_test_only(&self, row: DeadLetterTestInsert<'_>) -> Result<()> {
         let idempotency_key = row.idempotency_key.to_string();
         let operation = row.operation.to_string();
@@ -261,14 +243,4 @@ impl super::NodeLocalStores {
         .await
         .map_err(|error| anyhow!("dead letter test insert failed: {error}"))
     }
-}
-
-#[cfg(test)]
-pub fn outbox_stream_id(subject_key: &str) -> i64 {
-    let digest = Sha256::digest(subject_key.as_bytes());
-    let mut shard_bytes = [0_u8; 8];
-    shard_bytes.copy_from_slice(&digest[..8]);
-    let value = u64::from_be_bytes(shard_bytes);
-    let stream_id = (value & i64::MAX as u64) as i64;
-    if stream_id == 0 { 1 } else { stream_id }
 }

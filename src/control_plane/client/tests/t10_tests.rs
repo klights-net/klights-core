@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::control_plane::client::apply::{apply_outbox_transactionally, gc_applied_outbox};
 use crate::datastore::ResourcePreconditions;
-use crate::outbox_test_support::OutboxPayload;
+use crate::integration_test_harness::node_delivery_support::OutboxPayload;
 use klights_cluster_core::OutboxApplyOutcome as OutboxApplyResult;
 use klights_cluster_core::command::StorageCommand;
 use klights_kubelet::node_outbox::payload::OutboxOperation;

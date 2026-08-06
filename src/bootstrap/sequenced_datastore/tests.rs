@@ -2198,7 +2198,10 @@ mod cases {
                 resource_version: Some(1),
             },
         };
-        let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+        let payload =
+            crate::integration_test_harness::node_delivery_support::OutboxPayload::from_command(
+                command,
+            )
             .encode_protobuf()
             .unwrap();
 
@@ -2234,7 +2237,10 @@ mod cases {
             name: "from-outbox".into(),
             data: json!({"metadata": {"name": "from-outbox", "namespace": "default"}}),
         };
-        let payload = crate::outbox_test_support::OutboxPayload::from_command(command)
+        let payload =
+            crate::integration_test_harness::node_delivery_support::OutboxPayload::from_command(
+                command,
+            )
             .encode_protobuf()
             .unwrap();
 
@@ -2567,17 +2573,18 @@ mod cases {
         let inner = proposer.inner.clone();
         let ds = SequencedDatastore::new(inner.clone(), proposer.clone());
 
-        let payload = crate::outbox_test_support::OutboxPayload::from_command(
-            StorageCommand::CreateResource {
-                api_version: "v1".into(),
-                kind: "ConfigMap".into(),
-                namespace: Some("default".into()),
-                name: "from-outbox".into(),
-                data: json!({"metadata": {"name": "from-outbox", "namespace": "default"}}),
-            },
-        )
-        .encode_protobuf()
-        .unwrap();
+        let payload =
+            crate::integration_test_harness::node_delivery_support::OutboxPayload::from_command(
+                StorageCommand::CreateResource {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: Some("default".into()),
+                    name: "from-outbox".into(),
+                    data: json!({"metadata": {"name": "from-outbox", "namespace": "default"}}),
+                },
+            )
+            .encode_protobuf()
+            .unwrap();
 
         let result = ds
             .apply_outbox_transactionally(
@@ -3151,17 +3158,18 @@ mod cases {
     #[tokio::test]
     async fn raft_mode_follower_proposer_rejects_outbox_apply_no_local_mutation() {
         let (ds, inner) = make_ds_with_follower_proposer().await;
-        let payload = crate::outbox_test_support::OutboxPayload::from_command(
-            StorageCommand::CreateResource {
-                api_version: "v1".into(),
-                kind: "ConfigMap".into(),
-                namespace: Some("default".into()),
-                name: "follower-outbox".into(),
-                data: json!({"metadata": {"name": "follower-outbox"}}),
-            },
-        )
-        .encode_protobuf()
-        .unwrap();
+        let payload =
+            crate::integration_test_harness::node_delivery_support::OutboxPayload::from_command(
+                StorageCommand::CreateResource {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: Some("default".into()),
+                    name: "follower-outbox".into(),
+                    data: json!({"metadata": {"name": "follower-outbox"}}),
+                },
+            )
+            .encode_protobuf()
+            .unwrap();
         let err = ds
             .apply_outbox_transactionally(
                 "key",

@@ -23,14 +23,6 @@ mod cluster_engine_composition_tests;
 
 mod bootstrap;
 #[cfg(test)]
-mod node_outbox_integration_tests;
-#[cfg(test)]
-mod node_output_integration_tests;
-#[cfg(test)]
-mod outbox_test_support;
-#[cfg(test)]
-mod pod_events_integration_tests;
-#[cfg(test)]
 mod shutdown_test;
 
 pub use bootstrap::config::DbEncryption;

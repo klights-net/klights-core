@@ -8,19 +8,14 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use klights_node_store::{
     DeadLetterEntry, DeadLetterKey, DeadLetterMoveRequest, DeadLetterReplayRequest,
-    DeadLetterStore, OutboxAttemptFailure, OutboxAttemptFailureRecord, OutboxBatchClaimRequest,
-    OutboxClaimRequest, OutboxCompletion, OutboxDispatcherStore, OutboxEnqueue, OutboxLease,
-    OutboxNow, OutboxProducerStore, OutboxRecord, OutboxStatusStampStore, OutboxSupersedeRequest,
-    PodCheckpointKey, PodStatusCheckpointApplied, PodStatusCheckpointStore,
-    PodStatusCheckpointUpsert, RuntimeObservationCheckpointStore, RuntimeObservationGeneration,
+    DeadLetterStore, OutboxAttemptFailure, OutboxBatchClaimRequest, OutboxClaimRequest,
+    OutboxCompletion, OutboxDispatcherStore, OutboxEnqueue, OutboxNow, OutboxProducerStore,
+    OutboxRecord, OutboxStatusStampStore, PodCheckpointKey, PodStatusCheckpointApplied,
+    PodStatusCheckpointStore, PodStatusCheckpointUpsert,
 };
 use klights_types::{PodIdentity, ResourceKey};
 
-use super::sqlite::RuntimeObservationCheckpoint;
-use super::{
-    DeadLetterRow, OutboxFailureDisposition, OutboxInsert, OutboxRow, OutboxStats,
-    PodStatusCheckpoint,
-};
+use super::{DeadLetterRow, OutboxInsert, OutboxRow, OutboxStats, PodStatusCheckpoint};
 
 fn persistence(error: impl std::fmt::Display) -> anyhow::Error {
     anyhow!(error.to_string())
@@ -117,7 +112,6 @@ pub trait LegacyDeliveryTestStore:
     + OutboxStatusStampStore
     + DeadLetterStore
     + PodStatusCheckpointStore
-    + RuntimeObservationCheckpointStore
     + Send
     + Sync
 {
@@ -141,18 +135,6 @@ pub trait LegacyDeliveryTestStore:
             .map_err(persistence)
     }
 
-    async fn legacy_renew_outbox_lease(
-        &self,
-        id: i64,
-        lease_token: &str,
-        leased_until_ms: i64,
-    ) -> Result<bool> {
-        let lease = OutboxLease::try_new(id, lease_token, leased_until_ms).map_err(persistence)?;
-        OutboxDispatcherStore::renew_outbox_lease(self, lease)
-            .await
-            .map_err(persistence)
-    }
-
     async fn legacy_mark_outbox_attempt_failed(
         &self,
         id: i64,
@@ -165,38 +147,6 @@ pub trait LegacyDeliveryTestStore:
         OutboxDispatcherStore::mark_outbox_attempt_failed(self, failure)
             .await
             .map_err(persistence)
-    }
-
-    async fn legacy_record_outbox_failure(
-        &self,
-        id: i64,
-        lease_token: &str,
-        backoff_until_ms: i64,
-        error: &str,
-        max_attempts: i64,
-    ) -> Result<OutboxFailureDisposition> {
-        let failure = OutboxAttemptFailureRecord::try_new(
-            id,
-            lease_token,
-            backoff_until_ms,
-            error,
-            max_attempts,
-        )
-        .map_err(persistence)?;
-        let disposition = OutboxDispatcherStore::record_outbox_failure(self, failure)
-            .await
-            .map_err(persistence)?;
-        Ok(match disposition {
-            klights_node_store::OutboxFailureDisposition::RetryScheduled => {
-                OutboxFailureDisposition::RetryScheduled
-            }
-            klights_node_store::OutboxFailureDisposition::DeadLettered => {
-                OutboxFailureDisposition::DeadLettered
-            }
-            klights_node_store::OutboxFailureDisposition::LeaseLost => {
-                OutboxFailureDisposition::LeaseLost
-            }
-        })
     }
 
     async fn legacy_complete_outbox(&self, id: i64, lease_token: &str) -> Result<bool> {
@@ -219,20 +169,6 @@ pub trait LegacyDeliveryTestStore:
             .await
             .map(|rows| rows.into_iter().map(outbox_row).collect())
             .map_err(persistence)
-    }
-
-    async fn legacy_complete_superseded_status_outbox_for_terminal_pod_delete(
-        &self,
-        subject_key: &str,
-        terminal_delete_id: i64,
-    ) -> Result<usize> {
-        let request = OutboxSupersedeRequest::try_new(subject_key, terminal_delete_id)
-            .map_err(persistence)?;
-        OutboxDispatcherStore::complete_superseded_status_outbox_for_terminal_pod_delete(
-            self, request,
-        )
-        .await
-        .map_err(persistence)
     }
 
     async fn legacy_requeue_expired_outbox_leases(&self, now_ms: i64) -> Result<usize> {
@@ -265,14 +201,6 @@ pub trait LegacyDeliveryTestStore:
         DeadLetterStore::list_dead_letter(self)
             .await
             .map(|rows| rows.into_iter().map(dead_letter_row).collect())
-            .map_err(persistence)
-    }
-
-    async fn legacy_get_dead_letter(&self, id: i64) -> Result<Option<DeadLetterRow>> {
-        let key = DeadLetterKey::try_new(id).map_err(persistence)?;
-        DeadLetterStore::get_dead_letter(self, key)
-            .await
-            .map(|row| row.map(dead_letter_row))
             .map_err(persistence)
     }
 
@@ -364,56 +292,6 @@ pub trait LegacyDeliveryTestStore:
             .await
             .map_err(persistence)
     }
-
-    async fn legacy_delete_pod_status_checkpoint(&self, pod_uid: &str) -> Result<()> {
-        let key = PodCheckpointKey::try_new(pod_uid).map_err(persistence)?;
-        PodStatusCheckpointStore::delete_pod_status_checkpoint(self, key)
-            .await
-            .map_err(persistence)
-    }
-
-    async fn legacy_upsert_runtime_observation_checkpoint(
-        &self,
-        checkpoint: RuntimeObservationCheckpoint,
-    ) -> Result<()> {
-        let generation =
-            RuntimeObservationGeneration::try_from(checkpoint.generation).map_err(persistence)?;
-        let checkpoint = klights_node_store::RuntimeObservationCheckpoint::try_new(
-            checkpoint.pod_uid,
-            checkpoint.container_ids,
-            generation,
-            checkpoint.updated_ms,
-        )
-        .map_err(persistence)?;
-        RuntimeObservationCheckpointStore::upsert_runtime_observation_checkpoint(self, checkpoint)
-            .await
-            .map_err(persistence)
-    }
-
-    async fn legacy_get_runtime_observation_checkpoint(
-        &self,
-        pod_uid: &str,
-    ) -> Result<Option<RuntimeObservationCheckpoint>> {
-        let key = PodCheckpointKey::try_new(pod_uid).map_err(persistence)?;
-        RuntimeObservationCheckpointStore::get_runtime_observation_checkpoint(self, key)
-            .await
-            .map(|checkpoint| {
-                checkpoint.map(|checkpoint| RuntimeObservationCheckpoint {
-                    pod_uid: checkpoint.pod_uid().to_string(),
-                    container_ids: checkpoint.container_ids().to_vec(),
-                    generation: checkpoint.generation().get() as u64,
-                    updated_ms: checkpoint.updated_ms(),
-                })
-            })
-            .map_err(persistence)
-    }
-
-    async fn legacy_delete_runtime_observation_checkpoint(&self, pod_uid: &str) -> Result<()> {
-        let key = PodCheckpointKey::try_new(pod_uid).map_err(persistence)?;
-        RuntimeObservationCheckpointStore::delete_runtime_observation_checkpoint(self, key)
-            .await
-            .map_err(persistence)
-    }
 }
 
 impl<T> LegacyDeliveryTestStore for T where
@@ -422,7 +300,6 @@ impl<T> LegacyDeliveryTestStore for T where
         + OutboxStatusStampStore
         + DeadLetterStore
         + PodStatusCheckpointStore
-        + RuntimeObservationCheckpointStore
         + Send
         + Sync
         + ?Sized

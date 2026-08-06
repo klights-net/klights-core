@@ -24,7 +24,10 @@ pub async fn apply_outbox_transactionally(
     klights_cluster_core::OutboxApplyError,
 > {
     // Run UID-mismatch check here (allowed file for Pod DB calls)
-    let decoded = crate::outbox_test_support::OutboxPayload::decode_protobuf(payload)
+    let decoded =
+        crate::integration_test_harness::node_delivery_support::OutboxPayload::decode_protobuf(
+            payload,
+        )
         .map_err(|e| klights_cluster_core::OutboxApplyError::Retryable(e.to_string()))?;
     reject_pod_uid_mismatch(db, &decoded.command)
         .await
@@ -165,7 +168,10 @@ async fn apply_outbox_to_local_leader_with_node_operation(
     authoring_node: &str,
     watermark: Option<OutboxStreamWatermark>,
 ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-    let command = crate::outbox_test_support::OutboxPayload::decode_protobuf(&payload)
+    let command =
+        crate::integration_test_harness::node_delivery_support::OutboxPayload::decode_protobuf(
+            &payload,
+        )
         .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?
         .command;
     crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
