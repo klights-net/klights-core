@@ -1105,7 +1105,7 @@ pub(crate) fn inject_resource_version(
     data
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub(crate) fn controller_store_for_test(
     db: &crate::datastore::sqlite::Datastore,
 ) -> RootControllerLeaderPort {

@@ -3,9 +3,6 @@ pub mod cli;
 mod cluster_engine;
 pub mod control_plane;
 pub mod datastore;
-#[cfg(test)]
-#[cfg(test)]
-mod gc_ownership_integration_tests;
 #[cfg(any(test, feature = "integration-test-harness"))]
 pub mod integration_test_harness;
 pub mod kubelet;

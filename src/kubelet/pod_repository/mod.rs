@@ -129,36 +129,6 @@ pub(crate) fn pod_repository_for_test(
 }
 
 #[cfg(test)]
-pub(crate) async fn pod_repository_with_node_local_for_test(
-    db: &crate::datastore::sqlite::Datastore,
-) -> (
-    Arc<PodRepository>,
-    Arc<crate::datastore::node_local::NodeLocalStores>,
-) {
-    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
-        klights_supervisor::TaskCategoryConfig::default(),
-    ));
-    let node_local = test_node_local_store(supervisor.clone()).await;
-    let db_handle: DatastoreHandle = Arc::new(db.clone());
-    let repository = PodRepository::build_parts(PodRepositoryBuildConfig {
-        db: db_handle,
-        pod_workqueue_store: Some(node_local.clone()),
-        supervisor,
-        side_effects: Arc::new(SideEffectRegistry::new()),
-        metrics: SideEffectMetrics::new(),
-        pod_network_cache: test_pod_network_cache(node_local.clone()),
-        assignment_waiter: test_assignment_bus(),
-        scheduling_mode: PodSchedulingMode::InlineSingleNode,
-        outbox: None,
-        cluster_api: None,
-        controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
-        scheduler_bind_gate: None,
-    })
-    .repository;
-    (Arc::new(repository), node_local)
-}
-
-#[cfg(test)]
 impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
     fn get_network_for_uid(
         &self,
