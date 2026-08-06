@@ -16,7 +16,7 @@ use klights_leader_api::{
     ProjectedServiceAccountTokenFuture, ProjectedServiceAccountTokenRequest, ResourceGetRequest,
     ResourceListRequest, ResourceListResult, ResourceQueryFuture, WatchRequest,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use klights_leader_api::{
     LeaderResourceCommand, ResourceCommandFuture, ResourceCommandRequest, ResourceCommandResult,
 };
@@ -120,7 +120,7 @@ fn projected_token_issue_test_probe(namespace: &str) -> Option<ProjectedTokenIss
 #[cfg(test)]
 use klights_leader_api::{ResourceQueryConsistency, pod_get_request};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 fn test_watch_signals(db: &DatastoreHandle) -> Arc<dyn klights_watch::WatchSignalSubscribe> {
     let sink = db.commit_observation_sink();
     sink.as_any()
@@ -135,7 +135,7 @@ pub(crate) struct LocalApiPersistencePorts {
 }
 
 impl LocalApiPersistencePorts {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub(crate) fn new(
         db: DatastoreHandle,
         passive_reads: crate::datastore::selector::PassiveReadPorts,
@@ -405,7 +405,7 @@ impl LeaderOutboxDelivery for RootCommittedOutboxDelivery {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 #[derive(Clone)]
 struct LocalApiTestServices {
     resource_command: Arc<dyn LeaderResourceCommand>,
@@ -417,7 +417,7 @@ pub struct LocalApiClient {
     db: DatastoreHandle,
     positioned_watch: klights_watch::PositionedWatchService,
     pod_store: Arc<PodStore>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     test_services: LocalApiTestServices,
     authoring_node: String,
     containerd_namespace: String,
@@ -605,13 +605,14 @@ impl LocalApiClient {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub(crate) fn new_with_node_lease_tracker_and_passive_reads(
         db: DatastoreHandle,
         passive_reads: crate::datastore::selector::PassiveReadPorts,
         authoring_node: String,
         node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
         is_leader_rx: watch::Receiver<bool>,
+        file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
         Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process_with_reads(
             db,
@@ -620,7 +621,7 @@ impl LocalApiClient {
             std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string()),
             node_lease_tracker,
             is_leader_rx,
-            crate::kubelet::file_blocking::test_file_process_executor(),
+            file_process,
         )
     }
 
@@ -662,7 +663,7 @@ impl LocalApiClient {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn new_with_node_lease_tracker_and_containerd_namespace_and_file_process_with_reads(
         db: DatastoreHandle,
         passive_reads: crate::datastore::selector::PassiveReadPorts,
@@ -701,7 +702,7 @@ impl LocalApiClient {
         let pod_store = Arc::new(crate::pod_repository_composition::new_pod_store(db.clone()));
         let crypto = file_process.crypto_executor();
         let outbox_side_effects = Arc::new(RootOutboxSideEffectState::new(db.clone()));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "integration-test-harness"))]
         let test_services = {
             let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
                 crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()),
@@ -738,7 +739,7 @@ impl LocalApiClient {
             }
         };
         Self {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "integration-test-harness"))]
             test_services,
             db: db.clone(),
             positioned_watch,
@@ -882,7 +883,7 @@ impl LeaderResourceQuery for LocalApiClient {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 impl LeaderResourceCommand for LocalApiClient {
     fn submit_resource_command(
         &self,
@@ -894,14 +895,14 @@ impl LeaderResourceCommand for LocalApiClient {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 impl LeaderOutboxDelivery for LocalApiClient {
     fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
         self.test_services.outbox_delivery.deliver_outbox(request)
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 impl LeaderAuthenticatedOutboxDelivery for LocalApiClient {
     fn deliver_authenticated_outbox(
         &self,

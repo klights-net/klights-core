@@ -699,14 +699,14 @@ mod tests {
         let leader_supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let service = std::sync::Arc::new(crate::grpc_test_support::replication_service(
-            db.clone(),
-            leader_supervisor.clone(),
-        ));
-        let app = crate::grpc_test_support::mount_service_full(
+        let composition =
+            crate::integration_test_harness::IntegrationLeaderRpcComposition::new(db.clone());
+        let service =
+            std::sync::Arc::new(composition.replication_service(leader_supervisor.clone()));
+        let app = composition.mount_service_full(
             axum::Router::new(),
             service,
-            db,
+            None,
             None,
             None,
             None,

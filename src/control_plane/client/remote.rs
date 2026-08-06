@@ -775,7 +775,10 @@ mod tests {
         let concrete_db = crate::datastore::sqlite::Datastore::new_in_memory()
             .await
             .unwrap();
-        let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&concrete_db);
+        let passive_reads =
+            crate::integration_test_harness::IntegrationLeaderRpcComposition::passive_reads_for(
+                &concrete_db,
+            );
         let db: DatastoreHandle = Arc::new(concrete_db);
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
@@ -784,15 +787,23 @@ mod tests {
             .await
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(crate::grpc_test_support::replication_service(
-            db.clone(),
-            supervisor.clone(),
-        ));
-        let app = crate::grpc_test_support::mount_service_with_passive_reads(
+        let composition =
+            crate::integration_test_harness::IntegrationLeaderRpcComposition::new(db.clone());
+        let service = Arc::new(composition.replication_service(supervisor.clone()));
+        let app = composition.mount_service_full(
             axum::Router::new(),
             service,
-            db.clone(),
-            passive_reads,
+            Some(passive_reads),
+            None,
+            None,
+            None,
+            None,
+            "",
+            None,
+            None,
+            None,
+            None,
+            None,
             klights_leader_rpc::transport_policy::GrpcTransportPolicy::shared_default(),
         );
         // Simulate the mTLS identity edge: the shared test server provides the
@@ -811,7 +822,11 @@ mod tests {
                 }
             },
         ));
-        let (endpoint, handle) = crate::grpc_test_support::serve_tls_test_app(app).await;
+        let (endpoint, handle) =
+            crate::integration_test_harness::IntegrationLeaderRpcComposition::serve_tls_test_app(
+                app,
+            )
+            .await;
         let grpc = Arc::new(
             ReplicationGrpcClient::connect(
                 GrpcClientConfig {

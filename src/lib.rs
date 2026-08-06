@@ -7,9 +7,7 @@ pub mod datastore;
 mod endpoint_reconcile_integration_tests;
 #[cfg(test)]
 mod gc_ownership_integration_tests;
-#[cfg(test)]
-mod grpc_test_support;
-#[cfg(feature = "integration-test-harness")]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub mod integration_test_harness;
 pub mod kubelet;
 pub mod paths;
@@ -24,12 +22,6 @@ mod cluster_engine_composition_tests;
 // as part of `./build.sh`.
 
 mod bootstrap;
-#[cfg(test)]
-mod grpc_test_proto_channel_sink;
-#[cfg(test)]
-mod leader_rpc_client_integration_tests;
-#[cfg(test)]
-mod leader_rpc_server_tests;
 #[cfg(test)]
 mod node_outbox_integration_tests;
 #[cfg(test)]
@@ -46,11 +38,6 @@ pub use bootstrap::config::KlightsConfig;
 
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[cfg(test)]
-pub(crate) use grpc_test_support::{
-    GrpcReplicationServer, mount_configured_test_service, mount_service, mount_service_full,
-};
 
 fn cli_flags_for_runtime(cli: cli::Cli) -> Result<Option<bootstrap::CliFlags>, String> {
     let role = match cli.node_role()? {

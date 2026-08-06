@@ -70,13 +70,13 @@ impl PassiveReadPorts {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 const UNUSED_READ_DIAGNOSTIC: &str = "positioned watch is declared unused by this test fixture";
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 struct UnusedFailClosedPassiveRead;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 impl klights_cluster_store::ClusterResourceRead for UnusedFailClosedPassiveRead {
     fn get_resource(
         &self,
@@ -102,7 +102,7 @@ impl klights_cluster_store::ClusterResourceRead for UnusedFailClosedPassiveRead 
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 impl klights_cluster_store::DurableWatchHistoryRead for UnusedFailClosedPassiveRead {
     fn replay_watch_history(
         &self,
@@ -128,7 +128,7 @@ impl klights_cluster_store::DurableWatchHistoryRead for UnusedFailClosedPassiveR
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 impl klights_cluster_store::DurableAllocatorRead for UnusedFailClosedPassiveRead {
     fn read_allocator_state(
         &self,
@@ -146,7 +146,7 @@ impl klights_cluster_store::DurableAllocatorRead for UnusedFailClosedPassiveRead
 
 /// Fail-closed datastore-free focused reads for tests that construct a local
 /// API client but declare its positioned-watch capability unused.
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub(crate) fn unused_fail_closed_passive_read_ports() -> PassiveReadPorts {
     let reads = Arc::new(UnusedFailClosedPassiveRead);
     PassiveReadPorts::new(reads.clone(), reads.clone(), reads)

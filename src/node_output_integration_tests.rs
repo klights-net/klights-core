@@ -95,32 +95,6 @@ pub(crate) async fn refresh_node_network_conditions(
     Ok(NodeNetworkRefreshResult::Updated)
 }
 
-pub(crate) async fn register_node_at_addresses(
-    file_process: &klights_supervisor::FileProcessExecutor,
-    db: &dyn crate::datastore::DatastoreBackend,
-    node_name: &str,
-    profile: &klights_kubelet::node_config::NodeRegistrationProfile,
-    dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,
-    addresses: &NodeRegistrationAddresses,
-) -> Result<()> {
-    let snapshot = NodeRegistrationSnapshot::capture_local(
-        file_process,
-        node_name,
-        profile,
-        addresses.clone(),
-        None,
-        None,
-    )
-    .await;
-    crate::bootstrap::node_registration_adapter::register_node_snapshot(
-        db,
-        None,
-        dataplane_health,
-        &snapshot,
-    )
-    .await
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn register_node_with_outbox(
     file_process: &klights_supervisor::FileProcessExecutor,

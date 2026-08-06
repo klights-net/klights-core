@@ -1027,9 +1027,43 @@ impl RootPodRepositoryComposition {
     }
 }
 
+#[cfg(not(test))]
 pub(crate) fn build_pod_repository_parts(
     config: PodRepositoryBuildConfig,
     leader_coordination: Option<Arc<dyn klights_leader_api::ControllerCoordination>>,
+) -> RootPodRepositoryParts {
+    build_pod_repository_parts_inner(config, leader_coordination)
+}
+
+#[cfg(test)]
+pub(crate) fn build_pod_repository_parts(
+    config: PodRepositoryBuildConfig,
+    leader_coordination: Option<Arc<dyn klights_leader_api::ControllerCoordination>>,
+) -> RootPodRepositoryParts {
+    build_pod_repository_parts_inner(config, leader_coordination, None)
+}
+
+#[cfg(test)]
+pub(crate) fn build_pod_repository_parts_with_test_support(
+    config: PodRepositoryBuildConfig,
+    leader_coordination: Option<Arc<dyn klights_leader_api::ControllerCoordination>>,
+    api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
+    gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
+) -> RootPodRepositoryParts {
+    build_pod_repository_parts_inner(
+        config,
+        leader_coordination,
+        Some((api_identity, gc_coordination)),
+    )
+}
+
+fn build_pod_repository_parts_inner(
+    config: PodRepositoryBuildConfig,
+    leader_coordination: Option<Arc<dyn klights_leader_api::ControllerCoordination>>,
+    #[cfg(test)] test_support: Option<(
+        Arc<dyn k8s_native_service::ApiIdentityGenerator>,
+        Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
+    )>,
 ) -> RootPodRepositoryParts {
     let PodRepositoryBuildConfig {
         db,
@@ -1051,12 +1085,15 @@ pub(crate) fn build_pod_repository_parts(
         gc_coordination,
     } = config;
     #[cfg(test)]
-    let gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination> =
-        Arc::new(klights_controllers::ControllerCoordination::new());
-    #[cfg(test)]
-    let api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator> = Arc::new(
-        crate::bootstrap::controller_adapters::system_identity_adapter::SystemIdentityGenerator,
-    );
+    let (api_identity, gc_coordination) = test_support.unwrap_or_else(|| {
+        (
+            Arc::new(
+                crate::bootstrap::controller_adapters::system_identity_adapter::SystemIdentityGenerator,
+            ) as Arc<dyn k8s_native_service::ApiIdentityGenerator>,
+            Arc::new(klights_controllers::ControllerCoordination::new())
+                as Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
+        )
+    });
     let _ = scheduling_mode;
     #[cfg(not(test))]
     let resource_query = cluster_api
