@@ -776,7 +776,7 @@ mod tests {
             .await
             .unwrap();
         let passive_reads =
-            crate::integration_test_harness::IntegrationLeaderRpcComposition::passive_reads_for(
+            crate::integration_test_harness::leader_rpc::IntegrationLeaderRpcComposition::passive_reads_for(
                 &concrete_db,
             );
         let db: DatastoreHandle = Arc::new(concrete_db);
@@ -788,7 +788,9 @@ mod tests {
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let composition =
-            crate::integration_test_harness::IntegrationLeaderRpcComposition::new(db.clone());
+            crate::integration_test_harness::leader_rpc::IntegrationLeaderRpcComposition::new(
+                db.clone(),
+            );
         let service = Arc::new(composition.replication_service(supervisor.clone()));
         let app = composition.mount_service_full(
             axum::Router::new(),
@@ -823,7 +825,7 @@ mod tests {
             },
         ));
         let (endpoint, handle) =
-            crate::integration_test_harness::IntegrationLeaderRpcComposition::serve_tls_test_app(
+            crate::integration_test_harness::leader_rpc::IntegrationLeaderRpcComposition::serve_tls_test_app(
                 app,
             )
             .await;

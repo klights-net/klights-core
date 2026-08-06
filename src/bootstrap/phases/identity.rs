@@ -700,7 +700,9 @@ mod tests {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let composition =
-            crate::integration_test_harness::IntegrationLeaderRpcComposition::new(db.clone());
+            crate::integration_test_harness::leader_rpc::IntegrationLeaderRpcComposition::new(
+                db.clone(),
+            );
         let service =
             std::sync::Arc::new(composition.replication_service(leader_supervisor.clone()));
         let app = composition.mount_service_full(
