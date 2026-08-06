@@ -107,17 +107,17 @@ impl klights_replication::materializer::RaftCommitMaterializer for DatastoreRaft
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 struct TestNoopPostCommitWakeup;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 impl klights_leader_api::PostCommitWakeup for TestNoopPostCommitWakeup {
     fn wake(&self, _advances: &[klights_leader_api::PostCommitAdvance]) {}
 
     fn wake_namespace_contents(&self, _namespace: &str, _resource_version: i64) {}
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub(crate) fn raft_state_machine_store_ports_for_test(
     db: std::sync::Arc<crate::datastore::sqlite::Datastore>,
 ) -> klights_replication::state_machine::RaftStateMachineStorePorts {
@@ -144,7 +144,7 @@ pub(crate) fn raft_state_machine_store_ports_for_test(
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub(crate) fn raft_store_ports_for_test(
     db: std::sync::Arc<crate::datastore::sqlite::Datastore>,
 ) -> klights_replication::node::RaftStorePorts {

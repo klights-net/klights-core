@@ -1087,7 +1087,7 @@ impl ControllerEffectPort for RootControllerEffectPort {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub(crate) fn inject_resource_version(
     data: impl Into<Arc<serde_json::Value>>,
     resource_version: i64,

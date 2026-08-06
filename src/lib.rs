@@ -39,10 +39,6 @@ mod outbox_test_support;
 #[cfg(test)]
 mod pod_events_integration_tests;
 #[cfg(test)]
-mod raft_node_composition_tests;
-#[cfg(test)]
-mod raft_state_machine_composition_tests;
-#[cfg(test)]
 mod shutdown_test;
 
 pub use bootstrap::config::DbEncryption;
