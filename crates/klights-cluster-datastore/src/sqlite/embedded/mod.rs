@@ -4014,6 +4014,29 @@ impl Datastore {
         .await
     }
 
+    /// Focused test-support constructor with bootstrap ownership injected by
+    /// the external integration-test composition root.
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn new_for_gc_test_support(
+        supervisor: std::sync::Arc<TaskSupervisor>,
+    ) -> Result<Self> {
+        let executor =
+            crate::sqlite::open_in_memory(supervisor.clone(), "sqlite:memory:gc-test").await?;
+        let snapshot_factory = executor.snapshot_open_opts().map(|opts| {
+            crate::sqlite::recovery::SqliteSnapshotFactory::new(opts, supervisor.clone())
+        });
+        let read_executor = executor.read_lane_clone();
+        Self::from_executors(
+            executor,
+            read_executor,
+            snapshot_factory,
+            Some(crate::test_support::gc_commit_sink()),
+            crate::test_support::gc_outbox_codec(),
+            std::sync::Arc::new(klights_supervisor::SystemWallClock),
+        )
+        .await
+    }
+
     /// Production constructor for an externally-created `DbExecutor`.
     pub async fn new_in_memory_with_watch_and_executor(
         executor: DbExecutor,

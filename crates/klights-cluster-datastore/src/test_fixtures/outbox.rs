@@ -2,7 +2,8 @@
 
 use std::sync::Arc;
 
-use klights_cluster_core::{StorageCommand, StorageResponse};
+use klights_cluster_core::StorageCommand;
+use klights_cluster_core::StorageResponse;
 use klights_cluster_store::OutboxResponseCodec;
 
 pub(crate) struct JsonOutboxResponseCodec;
