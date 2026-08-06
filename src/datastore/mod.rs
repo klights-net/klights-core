@@ -36,7 +36,7 @@ pub use klights_cluster_core::{
 #[cfg(test)]
 pub use klights_cluster_datastore::sqlite::embedded::ReplicatedCreateOptions;
 pub use klights_cluster_store::StagedPostCommit;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub(crate) use klights_watch::WatchTopic;
 pub use types::{
     CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation, ListPageRequest,

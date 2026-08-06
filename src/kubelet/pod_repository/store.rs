@@ -14,7 +14,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use tokio::sync::broadcast;
 
 use super::PodResourceList;
@@ -23,7 +23,7 @@ use crate::datastore::DatastoreHandle;
 use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
 use klights_kubelet::unscheduled_deletion::EligibleUnscheduledPodDeletion;
 use klights_pod_api::PodRepositoryError;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use klights_watch::WatchEvent;
 
 /// Result of the root-private, actor-owned bound-Pod finalization primitive.
@@ -109,13 +109,9 @@ pub(crate) trait PodPersistence: Send + Sync {
         preconditions: ResourcePreconditions,
     ) -> Result<PodDeleteCasOutcome>;
     fn log_status_noop(&self, namespace: &str, name: &str, resource: &Resource);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn subscribe_watch(&self) -> tokio::sync::broadcast::Receiver<WatchEvent> {
         panic!("watch subscription is unavailable for this persistence adapter")
-    }
-    #[cfg(test)]
-    fn legacy_db(&self) -> DatastoreHandle {
-        panic!("legacy datastore access is unavailable for this persistence adapter")
     }
 }
 
@@ -145,11 +141,6 @@ impl PodStore {
 
     fn mark_sandbox_dirty(&self) {
         self.sandbox_gc_dirty.fetch_add(1, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn db(&self) -> DatastoreHandle {
-        self.persistence.legacy_db()
     }
 
     /// Borrow the underlying datastore handle. Reserved for the limited
@@ -182,6 +173,15 @@ impl PodStore {
 
     pub(super) async fn list_by_owner(&self, ns: &str, owner_uid: &str) -> Result<Vec<Resource>> {
         self.persistence.list_by_owner(ns, owner_uid).await
+    }
+
+    #[cfg(any(test, feature = "integration-test-harness"))]
+    pub(crate) async fn integration_list_by_owner(
+        &self,
+        namespace: &str,
+        owner_uid: &str,
+    ) -> Result<Vec<Resource>> {
+        self.list_by_owner(namespace, owner_uid).await
     }
 
     pub(crate) async fn create(&self, ns: &str, name: &str, body: Value) -> Result<Resource> {
@@ -256,6 +256,17 @@ impl PodStore {
             )
             .await?
             .ok_or_else(|| PodRepositoryError::not_found(ns, name).into())
+    }
+
+    #[cfg(any(test, feature = "integration-test-harness"))]
+    pub(crate) async fn integration_mark_deleting_latest(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        body: &Value,
+    ) -> Result<Resource> {
+        self.mark_deleting_latest(namespace, name, uid, body).await
     }
 
     pub(super) async fn mark_deleting_at_resource_version(
@@ -343,6 +354,17 @@ impl PodStore {
                 },
             )
             .await
+    }
+
+    #[cfg(any(test, feature = "integration-test-harness"))]
+    pub(crate) async fn integration_update_status(
+        &self,
+        ns: &str,
+        name: &str,
+        status: Value,
+        expected_rv: Option<i64>,
+    ) -> Result<Resource> {
+        self.update_status(ns, name, status, expected_rv).await
     }
 
     /// Remove a bound Pod only after revalidating actor-finalization state at
@@ -467,7 +489,7 @@ impl PodStore {
         Ok(outcome)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub(super) fn subscribe_watch(&self) -> broadcast::Receiver<WatchEvent> {
         self.persistence.subscribe_watch()
     }

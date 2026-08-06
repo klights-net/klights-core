@@ -23,7 +23,7 @@ use super::types::PodNetworkAssignment;
 // visibility under scheduler pressure, while avoiding retry-style polling.
 const ASSIGNMENT_WAIT: Duration = Duration::from_secs(30);
 
-pub(super) struct PodNetworkService {
+pub(crate) struct PodNetworkService {
     cache: Arc<dyn PodNetworkCache>,
     supervisor: Arc<TaskSupervisor>,
     assignment_waiter: Arc<dyn PodNetworkAssignmentWaiter>,
@@ -31,7 +31,7 @@ pub(super) struct PodNetworkService {
 }
 
 impl PodNetworkService {
-    pub(super) fn new(
+    pub(crate) fn new(
         cache: Arc<dyn PodNetworkCache>,
         supervisor: Arc<TaskSupervisor>,
         assignment_waiter: Arc<dyn PodNetworkAssignmentWaiter>,
@@ -54,7 +54,7 @@ impl PodNetworkService {
     /// during containerd `RunPodSandbox`. The read subscribes before checking
     /// the DB so a concurrent CNI write cannot publish between a miss and the
     /// wait registration.
-    pub(super) async fn read_pod_network_assignment(
+    pub(crate) async fn read_pod_network_assignment(
         &self,
         sandbox_id: &str,
         namespace: &str,

@@ -276,8 +276,8 @@ fn compose_leader_unscheduled_deletion(store: Arc<PodStore>) -> Arc<dyn Unschedu
     )))
 }
 
-#[cfg(test)]
-pub(super) fn test_leader_unscheduled_deletion(
+#[cfg(any(test, feature = "integration-test-harness"))]
+pub(crate) fn test_leader_unscheduled_deletion(
     store: Arc<PodStore>,
 ) -> Arc<dyn UnscheduledPodDeletion> {
     compose_leader_unscheduled_deletion(store)
@@ -380,7 +380,7 @@ impl PodWorkqueue {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub(super) fn start_called(&self) -> bool {
         self.start_called.load(Ordering::Acquire)
     }

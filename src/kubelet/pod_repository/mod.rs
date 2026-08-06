@@ -17,7 +17,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use tokio::sync::broadcast;
 
 #[cfg(test)]
@@ -35,7 +35,7 @@ use klights_pod_api::{PodDeleteOptions, PodRepositoryError};
 use klights_reconcile_api::{GcPodDeleteRequest, GcPodDeleteSink};
 use klights_supervisor::TaskSupervisor;
 use klights_types::{PodIdentity, ResourceKey};
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use klights_watch::WatchEvent;
 
 #[derive(Clone, Debug)]
@@ -270,10 +270,6 @@ pub(crate) mod store;
 pub mod types;
 pub mod watch;
 pub mod workqueue;
-
-#[cfg(test)]
-#[path = "../../pod_repository_integration_tests.rs"]
-mod tests;
 
 #[cfg(test)]
 pub(crate) use crate::pod_repository_composition::PodRepositoryBuildConfig;
@@ -666,7 +662,7 @@ pub trait PodNetworkReader: Send + Sync {
     ) -> Result<PodNetworkAssignment>;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub trait PodWatchSource: Send + Sync {
     fn subscribe_pod_watch(&self) -> broadcast::Receiver<WatchEvent>;
 }
@@ -747,6 +743,68 @@ pub struct PodRepository {
 }
 
 impl PodRepository {
+    #[cfg(any(test, feature = "integration-test-harness"))]
+    pub(crate) async fn integration_seed_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        pod: Value,
+    ) -> Result<Resource> {
+        self.store.create(namespace, name, pod).await
+    }
+
+    #[cfg(any(test, feature = "integration-test-harness"))]
+    pub(crate) async fn integration_read_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<Resource>> {
+        self.store.get(namespace, name).await
+    }
+
+    #[cfg(any(test, feature = "integration-test-harness"))]
+    pub(crate) async fn integration_update_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        pod: Value,
+        expected_resource_version: i64,
+    ) -> Result<Resource> {
+        self.store
+            .update(namespace, name, pod, expected_resource_version)
+            .await
+    }
+
+    #[cfg(any(test, feature = "integration-test-harness"))]
+    pub(crate) async fn integration_update_pod_status(
+        &self,
+        namespace: &str,
+        name: &str,
+        status: Value,
+        expected_resource_version: Option<i64>,
+    ) -> Result<Resource> {
+        self.store
+            .update_status(namespace, name, status, expected_resource_version)
+            .await
+    }
+
+    #[cfg(any(test, feature = "integration-test-harness"))]
+    pub(crate) async fn integration_finalize_bound_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+    ) -> Result<crate::kubelet::pod_repository::store::BoundPodDeleteOutcome> {
+        self.store
+            .finalize_bound_with_uid(namespace, name, uid)
+            .await
+    }
+
+    #[cfg(any(test, feature = "integration-test-harness"))]
+    pub(crate) fn integration_has_deferred_runtime_for_uid(&self, pod_uid: &str) -> bool {
+        self.status.has_deferred_runtime_for_uid(pod_uid)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_root_api_services(
         &self,
@@ -802,13 +860,13 @@ struct PodDeletionFinalizerDependencies {
 /// Finalizer decorator that releases repository-private deferred runtime state
 /// only after the actor-owned deletion boundary reports a terminal outcome.
 /// Pending finalizers and errors retain the observation for the actor retry.
-struct DeferredRuntimeCleanupFinalizer {
+pub(crate) struct DeferredRuntimeCleanupFinalizer {
     inner: Arc<dyn PodDeletionFinalizer>,
     deferred_runtime: status::DeferredRuntimeReducerHandle,
 }
 
 impl DeferredRuntimeCleanupFinalizer {
-    fn new(
+    pub(crate) fn new(
         inner: Arc<dyn PodDeletionFinalizer>,
         deferred_runtime: status::DeferredRuntimeReducerHandle,
     ) -> Self {
@@ -2072,7 +2130,7 @@ impl PodNetworkReader for PodRepository {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 impl PodWatchSource for PodRepository {
     fn subscribe_pod_watch(&self) -> broadcast::Receiver<WatchEvent> {
         self.store.subscribe_watch()

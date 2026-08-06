@@ -7,7 +7,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use tokio::sync::broadcast;
 
 use crate::datastore::backend::DatastoreBackend;
@@ -23,11 +23,11 @@ use klights_cluster_datastore::redb::read_core::RedbPositionedWatchRead;
 use klights_cluster_datastore::redb::read_core::RedbSnapshotRead;
 #[cfg(test)]
 use klights_cluster_datastore::redb::tables;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use klights_cluster_store::StagedPostCommit;
 use klights_types::HostPortRange;
 use klights_types::NodePeerMode;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use klights_watch::{WatchSignal, WatchTopic};
 
 use super::RedbDatastore;
@@ -155,7 +155,7 @@ impl DatastoreBackend for RedbDatastore {
         self.accessor.close();
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<klights_watch::WatchEvent> {
         crate::bootstrap::watch_commit_wiring::subscribe_test_events(
             klights_cluster_datastore::redb::embedded::RedbDatastore::commit_observation_sink(self)
@@ -165,7 +165,7 @@ impl DatastoreBackend for RedbDatastore {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> klights_watch::WatchReceiver {
         crate::bootstrap::watch_commit_wiring::subscribe_test_events_many(
             klights_cluster_datastore::redb::embedded::RedbDatastore::commit_observation_sink(self)
@@ -175,7 +175,7 @@ impl DatastoreBackend for RedbDatastore {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn broadcast_watch_event(&self, pending: StagedPostCommit) {
         let event = crate::datastore::staged_test_event(&pending).expect("staged test watch event");
         let _ = WatchSignal::from_event(&event);

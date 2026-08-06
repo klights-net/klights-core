@@ -10,12 +10,12 @@ use klights_cluster_core::{
     ResourcePatchRequest, ResourcePreconditions, StorageCommand, WatchReplayPosition,
 };
 use serde_json::Value;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use tokio::sync::broadcast;
 
 #[cfg(test)]
 use crate::datastore::ReplicatedCreateOptions;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use crate::datastore::WatchTopic;
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::types::{
@@ -23,7 +23,7 @@ use crate::datastore::types::{
     ResourceList, ResourceListQuery, SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
 };
 use klights_cluster_datastore::errors::DatastoreError;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use klights_cluster_store::StagedPostCommit;
 
 use super::SequencedDatastore;
@@ -96,17 +96,17 @@ impl DatastoreBackend for SequencedDatastore {
         self.passive.acquire_snapshot_mutation_fence().await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<klights_watch::WatchEvent> {
         self.passive.subscribe_watch(topic)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> klights_watch::WatchReceiver {
         self.passive.subscribe_watch_many(topics)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn broadcast_watch_event(&self, pending: StagedPostCommit) {
         self.passive.broadcast_watch_event(pending);
     }

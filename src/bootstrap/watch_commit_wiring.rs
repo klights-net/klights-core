@@ -147,7 +147,7 @@ impl klights_leader_api::PostCommitWakeup for ActivePostCommitWakeup {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub(crate) fn publish_test_events(
     sink: &dyn CommitObservationSink,
     events: Vec<klights_watch::WatchEvent>,
@@ -171,7 +171,7 @@ pub(crate) fn subscribe_test_events(
         .subscribe(topic)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub(crate) fn subscribe_test_events_many(
     sink: &dyn CommitObservationSink,
     topics: Vec<klights_watch::WatchTopic>,

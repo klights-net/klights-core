@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::Value;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use tokio::sync::broadcast;
 
 use crate::control_plane::client::{
@@ -287,7 +287,7 @@ fn worker_replay_boundaries(
 /// node-local runtime/network rows are served through focused node-store ports.
 pub trait WorkerWatchEvents: Send + Sync {
     fn subscribe_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn subscribe(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent>;
     fn publish_signal(&self, signal: WatchSignal);
     #[cfg(test)]
@@ -317,7 +317,7 @@ impl WorkerWatchEvents for WorkerWatchBus {
         self.bus.subscribe_signals(topic)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn subscribe(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
         self.bus.subscribe(topic)
     }
@@ -1026,7 +1026,7 @@ impl crate::datastore::CurrentResourceVersionStore for WorkerStoreAdapter {
 
 #[async_trait]
 impl WatchStore for WorkerStoreAdapter {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<klights_watch::WatchEvent> {
         self.watch_events.subscribe(topic)
     }

@@ -6,7 +6,7 @@ mod applier;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use tokio::sync::broadcast;
 
 #[cfg(any(test, feature = "integration-test-harness"))]
@@ -23,14 +23,13 @@ use klights_cluster_core::{
     ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
 };
 use klights_cluster_datastore::sqlite::embedded::Datastore as PassiveDatastore;
+#[cfg(test)]
+pub use klights_cluster_datastore::sqlite::embedded::ResourceMutationPauseOperation;
 use klights_cluster_store::ClusterMetadataRead;
 #[cfg(any(test, feature = "integration-test-harness"))]
 use klights_cluster_store::StagedPostCommit;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use klights_watch::WatchTopic;
-
-#[cfg(test)]
-pub use klights_cluster_datastore::sqlite::embedded::ResourceMutationPauseOperation;
 
 /// Root-owned composition identity around the passive SQLite implementation.
 ///
@@ -188,7 +187,7 @@ impl Datastore {
         .await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub fn subscribe_watch(
         &self,
         topic: klights_watch::WatchTopic,
@@ -196,7 +195,7 @@ impl Datastore {
         DatastoreBackend::subscribe_watch(self, topic)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub fn subscribe_watch_many(
         &self,
         topics: Vec<klights_watch::WatchTopic>,
@@ -204,7 +203,7 @@ impl Datastore {
         DatastoreBackend::subscribe_watch_many(self, topics)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub fn broadcast_watch_event(&self, pending: StagedPostCommit) {
         DatastoreBackend::broadcast_watch_event(self, pending)
     }
@@ -456,7 +455,7 @@ impl DatastoreBackend for Datastore {
             .expect("seed namespace for test");
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<klights_watch::WatchEvent> {
         crate::bootstrap::watch_commit_wiring::subscribe_test_events(
             PassiveDatastore::commit_observation_sink(self)
@@ -466,7 +465,7 @@ impl DatastoreBackend for Datastore {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> klights_watch::WatchReceiver {
         crate::bootstrap::watch_commit_wiring::subscribe_test_events_many(
             PassiveDatastore::commit_observation_sink(self)
@@ -476,7 +475,7 @@ impl DatastoreBackend for Datastore {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn broadcast_watch_event(&self, pending: StagedPostCommit) {
         let sink = PassiveDatastore::commit_observation_sink(self)
             .expect("test datastore must install a commit observation sink");

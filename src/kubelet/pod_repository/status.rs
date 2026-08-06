@@ -24,7 +24,7 @@ use super::state_only_writer::StateOnlyWriter;
 use super::store::PodStore;
 use super::types::{PodStatusUpdate, RuntimeReconcileStatus};
 
-pub(super) struct PodStatusService {
+pub(crate) struct PodStatusService {
     store: Arc<PodStore>,
     status_only: Arc<dyn StateOnlyWriter>,
     mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
@@ -65,7 +65,7 @@ struct DeferredRuntimeReducer {
 /// finalizer uses the same handle to forget a UID only after deletion has
 /// reached a terminal outcome.
 #[derive(Clone, Default)]
-pub(super) struct DeferredRuntimeReducerHandle {
+pub(crate) struct DeferredRuntimeReducerHandle {
     reducer: Arc<Mutex<DeferredRuntimeReducer>>,
 }
 
@@ -99,13 +99,13 @@ impl DeferredRuntimeReducerHandle {
         self.lock().consume_if_current(pod_uid, promoted);
     }
 
-    #[cfg(test)]
-    pub(super) fn contains(&self, pod_uid: &str) -> bool {
+    #[cfg(any(test, feature = "integration-test-harness"))]
+    pub(crate) fn contains(&self, pod_uid: &str) -> bool {
         self.lock().by_pod_uid.contains_key(pod_uid)
     }
 
-    #[cfg(test)]
-    pub(super) fn insert_marker(&self, pod_uid: &str) {
+    #[cfg(any(test, feature = "integration-test-harness"))]
+    pub(crate) fn insert_marker(&self, pod_uid: &str) {
         self.lock().by_pod_uid.insert(
             pod_uid.to_string(),
             DeferredRunningObservation {
@@ -182,7 +182,7 @@ impl PodStatusWriteResult {
 }
 
 impl PodStatusService {
-    pub(super) fn new(
+    pub(crate) fn new(
         store: Arc<PodStore>,
         status_only: Arc<dyn StateOnlyWriter>,
         mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
@@ -207,7 +207,7 @@ impl PodStatusService {
         self.deferred_runtime.clone()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     pub(super) fn has_deferred_runtime_for_uid(&self, pod_uid: &str) -> bool {
         self.deferred_runtime.contains(pod_uid)
     }
@@ -386,6 +386,19 @@ impl PodStatusService {
     ) -> Result<PodStatusWriteResult> {
         self.set_pod_status_checked(ns, name, None, update, expected_rv)
             .await
+    }
+
+    #[cfg(any(test, feature = "integration-test-harness"))]
+    pub(crate) async fn integration_set_pod_status(
+        &self,
+        ns: &str,
+        name: &str,
+        update: &PodStatusUpdate,
+        expected_rv: Option<i64>,
+    ) -> Result<Resource> {
+        self.set_pod_status(ns, name, update, expected_rv)
+            .await
+            .map(|result| result.resource)
     }
 
     /// UID-bound status write. Refuses to apply if the live pod's UID
@@ -1255,6 +1268,20 @@ impl PodStatusService {
     ) -> Result<PodStatusWriteResult> {
         self.set_probe_readiness_inner(ns, name, None, container_name, ready, expected_rv)
             .await
+    }
+
+    #[cfg(any(test, feature = "integration-test-harness"))]
+    pub(crate) async fn integration_set_probe_readiness(
+        &self,
+        ns: &str,
+        name: &str,
+        container_name: &str,
+        ready: bool,
+        expected_rv: Option<i64>,
+    ) -> Result<Resource> {
+        self.set_probe_readiness(ns, name, container_name, ready, expected_rv)
+            .await
+            .map(|result| result.resource)
     }
 
     pub(super) async fn set_probe_readiness_for_uid(

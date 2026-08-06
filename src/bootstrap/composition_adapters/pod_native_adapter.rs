@@ -18,14 +18,14 @@ use crate::kubelet::pod_repository::state_only_writer::StateOnlyWriter;
 use crate::kubelet::pod_repository::store::PodStore;
 use k8s_native_service::AdmissionResourceStore;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 pub(crate) struct SchedulerBindGateForTest {
     entered: std::sync::atomic::AtomicUsize,
     entered_notify: tokio::sync::Notify,
     release_notify: tokio::sync::Notify,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 impl SchedulerBindGateForTest {
     pub fn new() -> Self {
         Self {
@@ -62,7 +62,7 @@ pub(crate) struct RootPodNativeAdapter {
     delete_coordinator: Arc<PodDeleteCoordinator>,
     db: DatastoreHandle,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     scheduler_bind_gate: Option<Arc<SchedulerBindGateForTest>>,
 }
 
@@ -73,7 +73,9 @@ impl RootPodNativeAdapter {
         delete_coordinator: Arc<PodDeleteCoordinator>,
         db: DatastoreHandle,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
-        #[cfg(test)] scheduler_bind_gate: Option<Arc<SchedulerBindGateForTest>>,
+        #[cfg(any(test, feature = "integration-test-harness"))] scheduler_bind_gate: Option<
+            Arc<SchedulerBindGateForTest>,
+        >,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -81,7 +83,7 @@ impl RootPodNativeAdapter {
             delete_coordinator,
             db,
             wall_clock,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "integration-test-harness"))]
             scheduler_bind_gate,
         })
     }
@@ -154,10 +156,10 @@ impl PodPersistence for RootPodNativeAdapter {
         &self,
         request: PodPersistenceReplaceRequest,
     ) -> PodRepositoryFuture<'_, Resource> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "integration-test-harness"))]
         let scheduler_bind_gate = self.scheduler_bind_gate.clone();
         Box::pin(async move {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "integration-test-harness"))]
             if let Some(gate) = scheduler_bind_gate {
                 gate.enter_and_wait().await;
             }

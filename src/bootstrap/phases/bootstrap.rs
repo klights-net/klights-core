@@ -574,7 +574,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 controller_identity: controller_identity.clone(),
                 #[cfg(not(test))]
                 api_identity: api_identity.clone(),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "integration-test-harness"))]
                 scheduler_bind_gate: None,
                 #[cfg(not(test))]
                 gc_coordination: controller_coordination.clone(),
@@ -712,7 +712,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     controller_identity: controller_identity.clone(),
                     #[cfg(not(test))]
                     api_identity: api_identity.clone(),
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "integration-test-harness"))]
                     scheduler_bind_gate: None,
                     #[cfg(not(test))]
                     gc_coordination: controller_coordination.clone(),

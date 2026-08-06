@@ -65,13 +65,13 @@ where
         PodEndpointEffect::NotApplicable,
     ))
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use tokio::sync::broadcast;
 
 use klights_cluster_core::command::StorageCommand;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use klights_watch::WatchTopic;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use klights_watch::{WatchEvent, WatchReceiver};
 
 use super::types::{
@@ -87,7 +87,7 @@ use klights_cluster_core::{
     LogApplyAppliedOutboxRow, LogApplyPodCleanupIntentRow, PatchKind, Resource,
     ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-harness"))]
 use klights_cluster_store::StagedPostCommit;
 
 pub use klights_cluster_store::{SnapshotExclusiveFence, SnapshotMutationFence};
@@ -142,13 +142,13 @@ pub trait DatastoreBackend: Send + Sync {
     /// after graceful shutdown work is complete.  No-op by default.
     fn close(&self) {}
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent>;
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver;
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn broadcast_watch_event(&self, pending: StagedPostCommit);
 
     /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
@@ -1340,7 +1340,7 @@ pub trait RawWatchReplayStore: Send + Sync {
 /// Watch-event subscription, broadcast access, and replay queries.
 #[async_trait]
 pub trait WatchStore: Send + Sync {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration-test-harness"))]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent>;
     async fn list_watch_events_since(
         &self,
