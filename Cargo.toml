@@ -276,7 +276,10 @@ tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
 
 [profile.dev]
-debug = 1
+debug = 0
+
+[profile.test]
+debug = 0
 
 [dev-dependencies]
 k8s-native-service = { workspace = true, features = ["test-support"] }
