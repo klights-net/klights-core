@@ -20,7 +20,7 @@ pub(crate) async fn open_node_local(
     }
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(test)]
 pub(crate) async fn open_node_local_with_sqlite(
     kind: BackendKind,
     path: Option<&Path>,

@@ -700,10 +700,10 @@ mod tests {
     use futures::StreamExt as _;
     use serde_json::json;
 
+    use crate::bootstrap::composition_tests::support::OutboxPayload;
     use crate::control_plane::client::remote::RemoteApiClient;
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::backend::DatastoreHandle;
-    use crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload;
     use klights_cluster_core::Resource;
     use klights_cluster_core::command::StorageCommand;
     use klights_leader_api::JoinRole;
@@ -776,7 +776,7 @@ mod tests {
             .await
             .unwrap();
         let passive_reads =
-            crate::integration_test_harness::leader_rpc::IntegrationLeaderRpcComposition::passive_reads_for(
+            crate::bootstrap::composition_tests::leader_rpc::support::IntegrationLeaderRpcComposition::passive_reads_for(
                 &concrete_db,
             );
         let db: DatastoreHandle = Arc::new(concrete_db);
@@ -788,7 +788,7 @@ mod tests {
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let composition =
-            crate::integration_test_harness::leader_rpc::IntegrationLeaderRpcComposition::new(
+            crate::bootstrap::composition_tests::leader_rpc::support::IntegrationLeaderRpcComposition::new(
                 db.clone(),
             );
         let service = Arc::new(composition.replication_service(supervisor.clone()));
@@ -825,7 +825,7 @@ mod tests {
             },
         ));
         let (endpoint, handle) =
-            crate::integration_test_harness::leader_rpc::IntegrationLeaderRpcComposition::serve_tls_test_app(
+            crate::bootstrap::composition_tests::leader_rpc::support::IntegrationLeaderRpcComposition::serve_tls_test_app(
                 app,
             )
             .await;

@@ -25,10 +25,8 @@ pub async fn apply_outbox_transactionally(
 > {
     // Run UID-mismatch check here (allowed file for Pod DB calls)
     let decoded =
-        crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload::decode_protobuf(
-            payload,
-        )
-        .map_err(|e| klights_cluster_core::OutboxApplyError::Retryable(e.to_string()))?;
+        crate::bootstrap::composition_tests::support::OutboxPayload::decode_protobuf(payload)
+            .map_err(|e| klights_cluster_core::OutboxApplyError::Retryable(e.to_string()))?;
     reject_pod_uid_mismatch(db, &decoded.command)
         .await
         .map_err(|error| match error {
@@ -169,11 +167,9 @@ async fn apply_outbox_to_local_leader_with_node_operation(
     watermark: Option<OutboxStreamWatermark>,
 ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
     let command =
-        crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload::decode_protobuf(
-            &payload,
-        )
-        .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?
-        .command;
+        crate::bootstrap::composition_tests::support::OutboxPayload::decode_protobuf(&payload)
+            .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?
+            .command;
     crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
         db,
         idempotency_key,
@@ -672,6 +668,7 @@ fn resource_body_matches(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod delivery_authorization_tests {
     use klights_leader_api::{OutboxDeliveryError, OutboxDeliveryOperation};
     use serde_json::json;

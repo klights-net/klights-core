@@ -1,6 +1,6 @@
 //! Base-repository-only assembly for full-stack API integration tests.
 //!
-//! This module exists only behind `integration-test-harness`; normal builds
+//! This module exists only as a root-private base-owned test module; normal builds
 //! neither compile nor export it.
 
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use klights_reconcile_api::ControllerDispatcherPort as _;
 
 /// Opaque root datastore capability for base-repository integration fixtures.
 ///
-/// This alias is compiled only with `integration-test-harness`; production and
+/// This alias is compiled only by the root-private base-owned suite; production and
 /// native-service APIs do not expose a datastore surface.
 pub type IntegrationDatastoreHandle = DatastoreHandle;
 pub type IntegrationWatchEvent = klights_watch::WatchEvent;
@@ -715,6 +715,7 @@ pub struct NativeApiTestHarness {
     nodeport_alloc: Arc<klights_controllers::service::NodePortAllocator>,
     pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
     _node_local: Arc<crate::datastore::node_local::NodeLocalStores>,
+    #[allow(dead_code)]
     outbox_dispatcher: Arc<klights_kubelet::node_outbox::OutboxDispatcher>,
     controller_dispatcher: Arc<klights_controllers::ControllerDispatcher>,
     crd_registry: klights_controllers::crd::CrdRegistry,
@@ -1262,19 +1263,10 @@ impl NativeApiTestHarness {
             gc_coordination: gc_coordination.clone(),
             scheduler_bind_gate: None,
         };
-        #[cfg(not(test))]
         let root_pod_parts = crate::pod_repository_composition::build_pod_repository_parts(
             pod_repository_config,
             None,
         );
-        #[cfg(test)]
-        let root_pod_parts =
-            crate::pod_repository_composition::build_pod_repository_parts_with_test_support(
-                pod_repository_config,
-                None,
-                identity.clone(),
-                gc_coordination.clone(),
-            );
         let pod_api = root_pod_parts.api;
         let pod_subresource = root_pod_parts.subresource;
         let pod_repository = Arc::new(root_pod_parts.repository_parts.repository);
@@ -1655,11 +1647,13 @@ impl NativeApiTestHarness {
             .await?;
         Ok(matches!(
             outcome,
-            crate::kubelet::pod_repository::store::BoundPodDeleteOutcome::Removed
-                | crate::kubelet::pod_repository::store::BoundPodDeleteOutcome::IdentityChanged
+            klights_pod_api::BoundPodFinalizationOutcome::Removed
+                | klights_pod_api::BoundPodFinalizationOutcome::Accepted
+                | klights_pod_api::BoundPodFinalizationOutcome::IdentityChanged
         ))
     }
 
+    #[allow(dead_code)]
     pub async fn drain_node_outbox(&self) -> anyhow::Result<()> {
         for _ in 0..1024 {
             if matches!(

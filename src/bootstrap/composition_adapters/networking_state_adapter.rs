@@ -145,9 +145,11 @@ mod tests {
                     request.kind().to_string(),
                     request.consistency(),
                 ));
-                let items = (request.kind() == "Service")
-                    .then(|| vec![self.service.clone()])
-                    .unwrap_or_default();
+                let items = if request.kind() == "Service" {
+                    vec![self.service.clone()]
+                } else {
+                    Vec::new()
+                };
                 klights_leader_api::ResourceListResult::try_new(items, 91, None, None, None)
             })
         }

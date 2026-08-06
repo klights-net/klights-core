@@ -4,18 +4,17 @@
 //! ports remain the only delivery API. They preserve the old test vocabulary
 //! while exercising the extracted implementation through `klights-node-store`.
 
+#![cfg(test)]
+
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use klights_node_store::{
-    DeadLetterEntry, DeadLetterKey, DeadLetterMoveRequest, DeadLetterReplayRequest,
-    DeadLetterStore, OutboxAttemptFailure, OutboxBatchClaimRequest, OutboxClaimRequest,
-    OutboxCompletion, OutboxDispatcherStore, OutboxEnqueue, OutboxNow, OutboxProducerStore,
-    OutboxRecord, OutboxStatusStampStore, PodCheckpointKey, PodStatusCheckpointApplied,
-    PodStatusCheckpointStore, PodStatusCheckpointUpsert,
+    DeadLetterEntry, DeadLetterMoveRequest, DeadLetterStore, OutboxClaimRequest,
+    OutboxDispatcherStore, OutboxEnqueue, OutboxProducerStore, OutboxRecord,
 };
-use klights_types::{PodIdentity, ResourceKey};
+use klights_types::ResourceKey;
 
-use super::{DeadLetterRow, OutboxInsert, OutboxRow, OutboxStats, PodStatusCheckpoint};
+use super::{DeadLetterRow, OutboxInsert, OutboxRow};
 
 fn persistence(error: impl std::fmt::Display) -> anyhow::Error {
     anyhow!(error.to_string())
@@ -107,13 +106,7 @@ fn dead_letter_row(row: DeadLetterEntry) -> DeadLetterRow {
 
 #[async_trait]
 pub trait LegacyDeliveryTestStore:
-    OutboxProducerStore
-    + OutboxDispatcherStore
-    + OutboxStatusStampStore
-    + DeadLetterStore
-    + PodStatusCheckpointStore
-    + Send
-    + Sync
+    OutboxProducerStore + OutboxDispatcherStore + DeadLetterStore + Send + Sync
 {
     async fn legacy_enqueue_outbox(&self, row: OutboxInsert) -> Result<()> {
         OutboxProducerStore::enqueue_outbox(self, enqueue(row)?)
@@ -135,56 +128,6 @@ pub trait LegacyDeliveryTestStore:
             .map_err(persistence)
     }
 
-    async fn legacy_mark_outbox_attempt_failed(
-        &self,
-        id: i64,
-        lease_token: &str,
-        backoff_until_ms: i64,
-        error: &str,
-    ) -> Result<bool> {
-        let failure = OutboxAttemptFailure::try_new(id, lease_token, backoff_until_ms, error)
-            .map_err(persistence)?;
-        OutboxDispatcherStore::mark_outbox_attempt_failed(self, failure)
-            .await
-            .map_err(persistence)
-    }
-
-    async fn legacy_complete_outbox(&self, id: i64, lease_token: &str) -> Result<bool> {
-        let completion = OutboxCompletion::try_new(id, lease_token).map_err(persistence)?;
-        OutboxDispatcherStore::complete_outbox(self, completion)
-            .await
-            .map_err(persistence)
-    }
-
-    async fn legacy_claim_due_outbox_batch(
-        &self,
-        now_ms: i64,
-        limit: usize,
-        lease_ms: i64,
-        lease_token: &str,
-    ) -> Result<Vec<OutboxRow>> {
-        let request = OutboxBatchClaimRequest::try_new(now_ms, limit, lease_ms, lease_token)
-            .map_err(persistence)?;
-        OutboxDispatcherStore::claim_due_outbox_batch(self, request)
-            .await
-            .map(|rows| rows.into_iter().map(outbox_row).collect())
-            .map_err(persistence)
-    }
-
-    async fn legacy_requeue_expired_outbox_leases(&self, now_ms: i64) -> Result<usize> {
-        let now = OutboxNow::try_new(now_ms).map_err(persistence)?;
-        OutboxDispatcherStore::requeue_expired_outbox_leases(self, now)
-            .await
-            .map_err(persistence)
-    }
-
-    async fn legacy_next_outbox_wake_ms(&self, now_ms: i64) -> Result<Option<i64>> {
-        let now = OutboxNow::try_new(now_ms).map_err(persistence)?;
-        OutboxDispatcherStore::next_outbox_wake_ms(self, now)
-            .await
-            .map_err(persistence)
-    }
-
     async fn legacy_move_outbox_to_dead_letter_if_max_attempts(
         &self,
         idempotency_key: &str,
@@ -203,105 +146,9 @@ pub trait LegacyDeliveryTestStore:
             .map(|rows| rows.into_iter().map(dead_letter_row).collect())
             .map_err(persistence)
     }
-
-    async fn legacy_delete_dead_letter(&self, id: i64) -> Result<bool> {
-        let key = DeadLetterKey::try_new(id).map_err(persistence)?;
-        DeadLetterStore::delete_dead_letter(self, key)
-            .await
-            .map_err(persistence)
-    }
-
-    async fn legacy_replay_dead_letter(
-        &self,
-        id: i64,
-        classification: klights_node_store::OutboxClassification,
-    ) -> Result<bool> {
-        let key = DeadLetterKey::try_new(id).map_err(persistence)?;
-        DeadLetterStore::replay_dead_letter(self, DeadLetterReplayRequest::new(key, classification))
-            .await
-            .map_err(persistence)
-    }
-
-    async fn legacy_outbox_stats(&self) -> Result<OutboxStats> {
-        DeadLetterStore::outbox_stats(self)
-            .await
-            .map(|stats| OutboxStats {
-                pending: stats.pending(),
-                oldest_age_seconds: stats.oldest_age_seconds(),
-                dead_letter_count: stats.dead_letter_count(),
-                dispatch_total: stats.dispatch_total(),
-                dispatch_errors_total: stats.dispatch_errors_total(),
-            })
-            .map_err(persistence)
-    }
-
-    async fn legacy_upsert_pod_status_checkpoint(
-        &self,
-        pod_uid: &str,
-        namespace: &str,
-        pod_name: &str,
-        base_rv: i64,
-        status: serde_json::Value,
-        updated_ms: i64,
-    ) -> Result<()> {
-        let status_payload = serde_json::to_vec(&status)?;
-        let checkpoint = PodStatusCheckpointUpsert::try_new(
-            PodIdentity::new(namespace, pod_name, pod_uid),
-            base_rv,
-            status_payload,
-            updated_ms,
-        )
-        .map_err(persistence)?;
-        PodStatusCheckpointStore::upsert_pod_status_checkpoint(self, checkpoint)
-            .await
-            .map_err(persistence)
-    }
-
-    async fn legacy_get_pod_status_checkpoint(
-        &self,
-        pod_uid: &str,
-    ) -> Result<Option<PodStatusCheckpoint>> {
-        let key = PodCheckpointKey::try_new(pod_uid).map_err(persistence)?;
-        let checkpoint = PodStatusCheckpointStore::get_pod_status_checkpoint(self, key)
-            .await
-            .map_err(persistence)?;
-        checkpoint
-            .map(|checkpoint| {
-                Ok(PodStatusCheckpoint {
-                    pod_uid: checkpoint.pod().uid.clone(),
-                    namespace: checkpoint.pod().namespace.clone(),
-                    pod_name: checkpoint.pod().name.clone(),
-                    base_rv: checkpoint.base_position(),
-                    applied_rv: checkpoint.applied_position(),
-                    status: serde_json::from_slice(checkpoint.status_payload())?,
-                    updated_ms: checkpoint.updated_ms(),
-                })
-            })
-            .transpose()
-    }
-
-    async fn legacy_mark_pod_status_checkpoint_applied(
-        &self,
-        pod_uid: &str,
-        applied_rv: i64,
-        updated_ms: i64,
-    ) -> Result<()> {
-        let applied = PodStatusCheckpointApplied::try_new(pod_uid, applied_rv, updated_ms)
-            .map_err(persistence)?;
-        PodStatusCheckpointStore::mark_pod_status_checkpoint_applied(self, applied)
-            .await
-            .map_err(persistence)
-    }
 }
 
 impl<T> LegacyDeliveryTestStore for T where
-    T: OutboxProducerStore
-        + OutboxDispatcherStore
-        + OutboxStatusStampStore
-        + DeadLetterStore
-        + PodStatusCheckpointStore
-        + Send
-        + Sync
-        + ?Sized
+    T: OutboxProducerStore + OutboxDispatcherStore + DeadLetterStore + Send + Sync + ?Sized
 {
 }

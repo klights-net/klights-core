@@ -191,6 +191,7 @@ impl ClusterRuntimeView for RepositoryClusterRuntimeView {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use std::sync::Arc;
 
@@ -528,8 +529,6 @@ mod tests {
 }
 
 #[cfg(test)]
-// --- FakeNode ---
-
 /// Fake node implementing `NodeRuntimeView` for multi-node tests.
 pub(crate) struct FakeNode {
     node_name: String,

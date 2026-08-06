@@ -14,7 +14,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use tokio::sync::broadcast;
 
 use super::PodResourceList;
@@ -23,7 +23,7 @@ use crate::datastore::DatastoreHandle;
 use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
 use klights_kubelet::unscheduled_deletion::EligibleUnscheduledPodDeletion;
 use klights_pod_api::PodRepositoryError;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_watch::WatchEvent;
 
 /// Result of the root-private, actor-owned bound-Pod finalization primitive.
@@ -109,7 +109,7 @@ pub(crate) trait PodPersistence: Send + Sync {
         preconditions: ResourcePreconditions,
     ) -> Result<PodDeleteCasOutcome>;
     fn log_status_noop(&self, namespace: &str, name: &str, resource: &Resource);
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn subscribe_watch(&self) -> tokio::sync::broadcast::Receiver<WatchEvent> {
         panic!("watch subscription is unavailable for this persistence adapter")
     }
@@ -175,7 +175,7 @@ impl PodStore {
         self.persistence.list_by_owner(ns, owner_uid).await
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(feature = "pod-repository-test-support")]
     pub(crate) async fn integration_list_by_owner(
         &self,
         namespace: &str,
@@ -258,7 +258,7 @@ impl PodStore {
             .ok_or_else(|| PodRepositoryError::not_found(ns, name).into())
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(feature = "pod-repository-test-support")]
     pub(crate) async fn integration_mark_deleting_latest(
         &self,
         namespace: &str,
@@ -356,7 +356,7 @@ impl PodStore {
             .await
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(feature = "pod-repository-test-support")]
     pub(crate) async fn integration_update_status(
         &self,
         ns: &str,
@@ -489,7 +489,7 @@ impl PodStore {
         Ok(outcome)
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub(super) fn subscribe_watch(&self) -> broadcast::Receiver<WatchEvent> {
         self.persistence.subscribe_watch()
     }

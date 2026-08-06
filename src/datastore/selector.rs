@@ -70,13 +70,13 @@ impl PassiveReadPorts {
     }
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 const UNUSED_READ_DIAGNOSTIC: &str = "positioned watch is declared unused by this test fixture";
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 struct UnusedFailClosedPassiveRead;
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 impl klights_cluster_store::ClusterResourceRead for UnusedFailClosedPassiveRead {
     fn get_resource(
         &self,
@@ -102,7 +102,7 @@ impl klights_cluster_store::ClusterResourceRead for UnusedFailClosedPassiveRead 
     }
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 impl klights_cluster_store::DurableWatchHistoryRead for UnusedFailClosedPassiveRead {
     fn replay_watch_history(
         &self,
@@ -128,7 +128,7 @@ impl klights_cluster_store::DurableWatchHistoryRead for UnusedFailClosedPassiveR
     }
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 impl klights_cluster_store::DurableAllocatorRead for UnusedFailClosedPassiveRead {
     fn read_allocator_state(
         &self,
@@ -146,7 +146,7 @@ impl klights_cluster_store::DurableAllocatorRead for UnusedFailClosedPassiveRead
 
 /// Fail-closed datastore-free focused reads for tests that construct a local
 /// API client but declare its positioned-watch capability unused.
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub(crate) fn unused_fail_closed_passive_read_ports() -> PassiveReadPorts {
     let reads = Arc::new(UnusedFailClosedPassiveRead);
     PassiveReadPorts::new(reads.clone(), reads.clone(), reads)
@@ -154,7 +154,7 @@ pub(crate) fn unused_fail_closed_passive_read_ports() -> PassiveReadPorts {
 
 /// Build test-only passive read ports directly from the SQLite destination
 /// adapter before the concrete store is erased behind `DatastoreHandle`.
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub(crate) fn sqlite_passive_read_ports(db: &sqlite::Datastore) -> PassiveReadPorts {
     let focused_reads = db.focused_read_store();
     PassiveReadPorts::new(focused_reads.clone(), focused_reads.clone(), focused_reads)
@@ -188,7 +188,7 @@ pub(crate) struct OpenedPassiveStore {
 pub(crate) async fn open_with_sink(
     request: PassiveStoreOpenRequest<'_>,
     supervisor: Arc<TaskSupervisor>,
-    #[cfg(any(test, feature = "integration-test-harness"))] commit_sink: Arc<
+    #[cfg(any(test, feature = "pod-repository-test-support"))] commit_sink: Arc<
         dyn crate::datastore::CommitObservationSink,
     >,
     outbox_codec: Arc<dyn klights_cluster_store::OutboxResponseCodec>,
@@ -203,7 +203,7 @@ pub(crate) async fn open_with_sink(
             .await?;
             let ds = sqlite::Datastore::new_in_memory_with_watch_and_executor_with_sink(
                 executor,
-                #[cfg(any(test, feature = "integration-test-harness"))]
+                #[cfg(any(test, feature = "pod-repository-test-support"))]
                 commit_sink,
                 outbox_codec,
                 Arc::new(klights_supervisor::SystemWallClock),
@@ -232,7 +232,7 @@ pub(crate) async fn open_with_sink(
                 cluster_db_path,
                 supervisor,
                 db_key_file,
-                #[cfg(any(test, feature = "integration-test-harness"))]
+                #[cfg(any(test, feature = "pod-repository-test-support"))]
                 commit_sink,
                 outbox_codec,
                 Arc::new(klights_supervisor::SystemWallClock),
@@ -256,7 +256,7 @@ pub(crate) async fn open_with_sink(
             tracing::info!(backend = "redb", mode = "in-memory", "opening datastore");
             let ds = crate::datastore::redb::RedbDatastore::new_in_memory_with_supervisor_and_sink(
                 supervisor,
-                #[cfg(any(test, feature = "integration-test-harness"))]
+                #[cfg(any(test, feature = "pod-repository-test-support"))]
                 commit_sink,
                 Arc::new(klights_supervisor::SystemWallClock),
             )
@@ -279,7 +279,7 @@ pub(crate) async fn open_with_sink(
             let ds = crate::datastore::redb::RedbDatastore::new_persistent_with_sink(
                 cluster_db_path,
                 supervisor,
-                #[cfg(any(test, feature = "integration-test-harness"))]
+                #[cfg(any(test, feature = "pod-repository-test-support"))]
                 commit_sink,
                 Arc::new(klights_supervisor::SystemWallClock),
             )

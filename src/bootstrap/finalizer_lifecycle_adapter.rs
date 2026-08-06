@@ -368,13 +368,14 @@ mod tests {
             .await
             .expect("finalized effects should complete");
 
-        let requests = sink
-            .requests
-            .lock()
-            .expect("Pod delete request lock poisoned");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].uid, "child-uid");
-        drop(requests);
+        {
+            let requests = sink
+                .requests
+                .lock()
+                .expect("Pod delete request lock poisoned");
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].uid, "child-uid");
+        }
         assert!(
             db.get_resource("v1", "Pod", Some("default"), "child")
                 .await

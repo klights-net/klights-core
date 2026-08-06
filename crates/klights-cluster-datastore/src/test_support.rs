@@ -352,6 +352,228 @@ impl GcTestStore {
     }
 }
 
+/// Focused cluster-side fixture for node-delivery integration tests.
+#[derive(Clone)]
+pub struct NodeDeliveryTestCluster {
+    datastore: crate::sqlite::embedded::Datastore,
+    node_events: tokio::sync::broadcast::Sender<String>,
+}
+
+impl NodeDeliveryTestCluster {
+    pub async fn open(
+        supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
+    ) -> anyhow::Result<Self> {
+        let (node_events, _) = tokio::sync::broadcast::channel(32);
+        Ok(Self {
+            datastore: crate::sqlite::embedded::Datastore::new_for_gc_test_support(supervisor)
+                .await?,
+            node_events,
+        })
+    }
+
+    pub async fn create(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<Resource> {
+        let resource = self
+            .datastore
+            .create_resource(api_version, kind, namespace, name, value)
+            .await?;
+        if api_version == "v1" && kind == "Node" {
+            let _ = self.node_events.send(name.to_string());
+        }
+        Ok(resource)
+    }
+
+    pub async fn get(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> anyhow::Result<Option<Resource>> {
+        self.datastore
+            .get_resource(api_version, kind, namespace, name)
+            .await
+    }
+
+    pub async fn list(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+    ) -> anyhow::Result<Vec<Resource>> {
+        Ok(self
+            .datastore
+            .list_resources(api_version, kind, namespace, ResourceListOptions::all())
+            .await?
+            .items)
+    }
+
+    pub async fn update(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: serde_json::Value,
+        expected_resource_version: i64,
+    ) -> anyhow::Result<Resource> {
+        let resource = self
+            .datastore
+            .update_resource(
+                api_version,
+                kind,
+                namespace,
+                name,
+                value,
+                expected_resource_version,
+            )
+            .await?;
+        if api_version == "v1" && kind == "Node" {
+            let _ = self.node_events.send(name.to_string());
+        }
+        Ok(resource)
+    }
+
+    pub async fn replace_if_current(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: serde_json::Value,
+        current: &Resource,
+    ) -> anyhow::Result<Resource> {
+        let resource = self
+            .datastore
+            .update_resource_with_preconditions(
+                api_version,
+                kind,
+                namespace,
+                name,
+                value,
+                ResourcePreconditions::from_resource(current),
+            )
+            .await?;
+        if api_version == "v1" && kind == "Node" {
+            let _ = self.node_events.send(name.to_string());
+        }
+        Ok(resource)
+    }
+
+    pub async fn update_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: serde_json::Value,
+        preconditions: ResourcePreconditions,
+    ) -> anyhow::Result<Resource> {
+        let resource = self
+            .datastore
+            .update_resource_with_preconditions(
+                api_version,
+                kind,
+                namespace,
+                name,
+                value,
+                preconditions,
+            )
+            .await?;
+        if api_version == "v1" && kind == "Node" {
+            let _ = self.node_events.send(name.to_string());
+        }
+        Ok(resource)
+    }
+
+    pub async fn seed_namespace(&self, name: &str, value: serde_json::Value) -> anyhow::Result<()> {
+        self.datastore
+            .create_namespace(name, value)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn allocate_node_subnet(
+        &self,
+        node_name: &str,
+        cluster_cidr: &str,
+        node_ip: &str,
+    ) -> anyhow::Result<()> {
+        self.datastore
+            .allocate_node_subnet(node_name, cluster_cidr, node_ip)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn current_resource_version(&self) -> anyhow::Result<i64> {
+        self.datastore.get_current_resource_version().await
+    }
+
+    pub async fn watch_replay_position(
+        &self,
+    ) -> anyhow::Result<klights_cluster_core::WatchReplayPosition> {
+        self.datastore.current_watch_replay_position().await
+    }
+
+    pub async fn outbox_stream_watermarks(
+        &self,
+    ) -> anyhow::Result<Vec<klights_cluster_core::OutboxStreamWatermark>> {
+        self.datastore.list_outbox_stream_watermarks().await
+    }
+
+    pub fn subscribe_node_events(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.node_events.subscribe()
+    }
+
+    pub async fn stamp_node_routing_metadata(
+        &self,
+        node_name: &str,
+        node: &mut serde_json::Value,
+    ) -> anyhow::Result<bool> {
+        let mut changed = false;
+        if let Some(subnet) = self.datastore.get_node_subnet(node_name).await? {
+            changed |= klights_cluster_core::set_node_pod_cidr(node, &subnet.subnet.to_string());
+        }
+        if let Some(metadata) = self.datastore.get_node_dataplane(node_name).await? {
+            changed |= klights_types::set_node_dataplane_annotations(
+                node,
+                &metadata.endpoint.to_string(),
+                metadata.mode.as_str(),
+                metadata.encryption.as_str(),
+                metadata.public_key.as_ref().map(|key| key.as_str()),
+                metadata.port,
+            );
+        }
+        Ok(changed)
+    }
+
+    pub async fn apply_outbox(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        command: klights_cluster_core::StorageCommand,
+        authoring_node: &str,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
+    ) -> Result<klights_cluster_core::OutboxApplyOutcome, klights_cluster_core::OutboxApplyError>
+    {
+        self.datastore
+            .apply_outbox_transactionally_with_watermark(
+                idempotency_key,
+                operation,
+                command,
+                authoring_node,
+                watermark,
+            )
+            .await
+    }
+}
+
 /// Build the RV-zero live-apply template consumed by passive-store tests.
 ///
 /// Public resource versions are allocated by committed apply, so legacy

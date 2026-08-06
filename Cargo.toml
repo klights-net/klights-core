@@ -293,6 +293,7 @@ openraft = { workspace = true }
 rtnetlink = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+urlencoding = { workspace = true }
 
 [lints]
 workspace = true
@@ -304,7 +305,15 @@ sqlite = []
 redb = []
 linux-network = []
 containerd = []
-integration-test-harness = [
+pod-repository-test-support = [
+    "klights-cluster-datastore/test-support",
+    "klights-cluster-store/test-support",
+    "klights-kubelet/test-support",
+    "klights-node-datastore/test-support",
+    "klights-watch/integration-test-harness",
+]
+native-api-test-support = [
+    "pod-repository-test-support",
     "k8s-native-service/test-support",
     "klights-auth/test-support",
     "klights-cluster-datastore/test-support",

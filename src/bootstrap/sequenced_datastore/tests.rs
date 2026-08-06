@@ -899,11 +899,11 @@ mod cases {
             .map(|row| row.idempotency_key.as_str())
             .collect();
         assert!(
-            remaining_keys.iter().any(|key| *key == "recent-legacy-row"),
+            remaining_keys.contains(&"recent-legacy-row"),
             "recent legacy row should survive GC"
         );
         assert!(
-            !remaining_keys.iter().any(|key| *key == "old-legacy-row"),
+            !remaining_keys.contains(&"old-legacy-row"),
             "stale legacy row should be removed by raft-applied GC"
         );
         assert!(
@@ -2199,11 +2199,9 @@ mod cases {
             },
         };
         let payload =
-            crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload::from_command(
-                command,
-            )
-            .encode_protobuf()
-            .unwrap();
+            crate::bootstrap::composition_tests::support::OutboxPayload::from_command(command)
+                .encode_protobuf()
+                .unwrap();
 
         let result = ds
             .apply_outbox_transactionally(
@@ -2238,11 +2236,9 @@ mod cases {
             data: json!({"metadata": {"name": "from-outbox", "namespace": "default"}}),
         };
         let payload =
-            crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload::from_command(
-                command,
-            )
-            .encode_protobuf()
-            .unwrap();
+            crate::bootstrap::composition_tests::support::OutboxPayload::from_command(command)
+                .encode_protobuf()
+                .unwrap();
 
         let result = ds
             .apply_outbox_transactionally(
@@ -2573,18 +2569,17 @@ mod cases {
         let inner = proposer.inner.clone();
         let ds = SequencedDatastore::new(inner.clone(), proposer.clone());
 
-        let payload =
-            crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload::from_command(
-                StorageCommand::CreateResource {
-                    api_version: "v1".into(),
-                    kind: "ConfigMap".into(),
-                    namespace: Some("default".into()),
-                    name: "from-outbox".into(),
-                    data: json!({"metadata": {"name": "from-outbox", "namespace": "default"}}),
-                },
-            )
-            .encode_protobuf()
-            .unwrap();
+        let payload = crate::bootstrap::composition_tests::support::OutboxPayload::from_command(
+            StorageCommand::CreateResource {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: Some("default".into()),
+                name: "from-outbox".into(),
+                data: json!({"metadata": {"name": "from-outbox", "namespace": "default"}}),
+            },
+        )
+        .encode_protobuf()
+        .unwrap();
 
         let result = ds
             .apply_outbox_transactionally(
@@ -3158,18 +3153,17 @@ mod cases {
     #[tokio::test]
     async fn raft_mode_follower_proposer_rejects_outbox_apply_no_local_mutation() {
         let (ds, inner) = make_ds_with_follower_proposer().await;
-        let payload =
-            crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload::from_command(
-                StorageCommand::CreateResource {
-                    api_version: "v1".into(),
-                    kind: "ConfigMap".into(),
-                    namespace: Some("default".into()),
-                    name: "follower-outbox".into(),
-                    data: json!({"metadata": {"name": "follower-outbox"}}),
-                },
-            )
-            .encode_protobuf()
-            .unwrap();
+        let payload = crate::bootstrap::composition_tests::support::OutboxPayload::from_command(
+            StorageCommand::CreateResource {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: Some("default".into()),
+                name: "follower-outbox".into(),
+                data: json!({"metadata": {"name": "follower-outbox"}}),
+            },
+        )
+        .encode_protobuf()
+        .unwrap();
         let err = ds
             .apply_outbox_transactionally(
                 "key",

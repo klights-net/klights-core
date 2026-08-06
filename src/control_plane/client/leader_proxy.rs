@@ -1809,8 +1809,8 @@ mod tests {
     }
 
     fn pod_status_minimal_payload() -> Bytes {
+        use crate::bootstrap::composition_tests::support::OutboxPayload;
         use crate::datastore::ResourcePreconditions;
-        use crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload;
         use klights_cluster_core::command::StorageCommand;
         let command = StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),

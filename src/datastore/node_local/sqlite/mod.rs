@@ -1,24 +1,7 @@
 use anyhow::Result;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(test)]
 use anyhow::anyhow;
-#[cfg(any(test, feature = "integration-test-harness"))]
-use rusqlite::OptionalExtension;
-#[cfg(any(test, feature = "integration-test-harness"))]
-use serde_json::Value;
-
-#[cfg(any(test, feature = "integration-test-harness"))]
-#[derive(Debug, Clone, PartialEq)]
-pub struct PodStatusCheckpoint {
-    pub pod_uid: String,
-    pub namespace: String,
-    pub pod_name: String,
-    pub base_rv: i64,
-    pub applied_rv: Option<i64>,
-    pub status: Value,
-    pub updated_ms: i64,
-}
-
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxInsert {
     pub idempotency_key: String,
@@ -36,7 +19,7 @@ pub struct OutboxInsert {
     pub next_due_ms: i64,
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxRow {
     pub id: i64,
@@ -64,7 +47,7 @@ pub struct OutboxRow {
     pub last_error: Option<String>,
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DeadLetterRow {
     pub id: i64,
@@ -88,7 +71,7 @@ pub struct DeadLetterRow {
     pub moved_at_ms: i64,
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeadLetterTestInsert<'a> {
     pub idempotency_key: &'a str,
@@ -106,17 +89,7 @@ pub struct DeadLetterTestInsert<'a> {
     pub moved_at_ms: i64,
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
-pub struct OutboxStats {
-    pub pending: i64,
-    pub oldest_age_seconds: f64,
-    pub dead_letter_count: i64,
-    pub dispatch_total: i64,
-    pub dispatch_errors_total: i64,
-}
-
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(test)]
 impl super::NodeLocalStores {
     pub(crate) async fn with_test_connection<T, F>(
         &self,
@@ -130,71 +103,7 @@ impl super::NodeLocalStores {
         self.executor_for_test().call_raw(query_name, f).await
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
-    pub async fn outbox_stream_position_for_test(
-        &self,
-        idempotency_key: &str,
-    ) -> Result<Option<(i64, i64)>> {
-        let idempotency_key = idempotency_key.to_string();
-        self.with_test_connection("node_local:outbox_stream_position_test", move |conn| {
-            conn.query_row(
-                "SELECT stream_id, stream_seq FROM outbox WHERE idempotency_key = ?1",
-                [idempotency_key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|error| anyhow!("outbox stream-position test read failed: {error}"))
-    }
-
-    #[cfg(any(test, feature = "integration-test-harness"))]
-    pub async fn set_outbox_operation_for_test(
-        &self,
-        idempotency_key: &str,
-        operation: &str,
-    ) -> Result<()> {
-        let idempotency_key = idempotency_key.to_string();
-        let operation = operation.to_string();
-        self.with_test_connection("node_local:outbox_operation_test_update", move |conn| {
-            conn.execute_batch("PRAGMA ignore_check_constraints = ON")?;
-            let update = conn.execute(
-                "UPDATE outbox SET operation = ?2 WHERE idempotency_key = ?1",
-                rusqlite::params![idempotency_key, operation],
-            );
-            conn.execute_batch("PRAGMA ignore_check_constraints = OFF")?;
-            let changed = update?;
-            if changed != 1 {
-                return Err(tokio_rusqlite::Error::Other(Box::new(
-                    std::io::Error::other(format!(
-                        "test operation-only mutation changed {changed} rows instead of exactly one"
-                    )),
-                )));
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|error| anyhow!("outbox operation test update failed: {error}"))
-    }
-
-    #[cfg(any(test, feature = "integration-test-harness"))]
-    pub async fn outbox_operation_for_test(&self, idempotency_key: &str) -> Result<Option<String>> {
-        let idempotency_key = idempotency_key.to_string();
-        self.with_test_connection("node_local:outbox_operation_test_read", move |conn| {
-            conn.query_row(
-                "SELECT operation FROM outbox WHERE idempotency_key = ?1",
-                [idempotency_key],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|error| anyhow!("outbox operation test read failed: {error}"))
-    }
-
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(test)]
     pub async fn insert_dead_letter_test_only(&self, row: DeadLetterTestInsert<'_>) -> Result<()> {
         let idempotency_key = row.idempotency_key.to_string();
         let operation = row.operation.to_string();

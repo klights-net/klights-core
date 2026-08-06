@@ -3,12 +3,14 @@ pub mod cli;
 mod cluster_engine;
 pub mod control_plane;
 pub mod datastore;
-#[cfg(any(test, feature = "integration-test-harness"))]
-pub mod integration_test_harness;
 pub mod kubelet;
+#[cfg(feature = "native-api-test-support")]
+pub mod native_api_test_support;
 pub mod paths;
 pub mod pidfile;
 pub(crate) mod pod_repository_composition;
+#[cfg(feature = "pod-repository-test-support")]
+pub mod pod_repository_composition_test_support;
 pub mod shutdown;
 pub mod version;
 
@@ -18,6 +20,8 @@ mod cluster_engine_composition_tests;
 // as part of `./build.sh`.
 
 mod bootstrap;
+#[cfg(test)]
+extern crate self as klights;
 #[cfg(test)]
 mod shutdown_test;
 

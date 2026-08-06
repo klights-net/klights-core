@@ -18,14 +18,15 @@ use crate::kubelet::pod_repository::state_only_writer::StateOnlyWriter;
 use crate::kubelet::pod_repository::store::PodStore;
 use k8s_native_service::AdmissionResourceStore;
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub(crate) struct SchedulerBindGateForTest {
     entered: std::sync::atomic::AtomicUsize,
     entered_notify: tokio::sync::Notify,
     release_notify: tokio::sync::Notify,
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[allow(dead_code)]
 impl SchedulerBindGateForTest {
     pub fn new() -> Self {
         Self {
@@ -62,7 +63,7 @@ pub(crate) struct RootPodNativeAdapter {
     delete_coordinator: Arc<PodDeleteCoordinator>,
     db: DatastoreHandle,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     scheduler_bind_gate: Option<Arc<SchedulerBindGateForTest>>,
 }
 
@@ -73,7 +74,7 @@ impl RootPodNativeAdapter {
         delete_coordinator: Arc<PodDeleteCoordinator>,
         db: DatastoreHandle,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
-        #[cfg(any(test, feature = "integration-test-harness"))] scheduler_bind_gate: Option<
+        #[cfg(any(test, feature = "pod-repository-test-support"))] scheduler_bind_gate: Option<
             Arc<SchedulerBindGateForTest>,
         >,
     ) -> Arc<Self> {
@@ -83,7 +84,7 @@ impl RootPodNativeAdapter {
             delete_coordinator,
             db,
             wall_clock,
-            #[cfg(any(test, feature = "integration-test-harness"))]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             scheduler_bind_gate,
         })
     }
@@ -156,10 +157,10 @@ impl PodPersistence for RootPodNativeAdapter {
         &self,
         request: PodPersistenceReplaceRequest,
     ) -> PodRepositoryFuture<'_, Resource> {
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         let scheduler_bind_gate = self.scheduler_bind_gate.clone();
         Box::pin(async move {
-            #[cfg(any(test, feature = "integration-test-harness"))]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             if let Some(gate) = scheduler_bind_gate {
                 gate.enter_and_wait().await;
             }

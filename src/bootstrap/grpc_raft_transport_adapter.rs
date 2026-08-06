@@ -312,8 +312,7 @@ mod tests {
         let outcome: anyhow::Result<std::result::Result<Vec<u8>, String>> = Err(anyhow_err);
 
         let err = map_rpc_outcome("https://10.99.0.14:7679", outcome)
-            .err()
-            .expect("transport failure must map to a GrpcRaftRpcError");
+            .expect_err("transport failure must map to a GrpcRaftRpcError");
         match err {
             GrpcRaftRpcError::Unreachable(te) => {
                 assert_eq!(te.peer_addr, "https://10.99.0.14:7679");
@@ -338,8 +337,7 @@ mod tests {
         let anyhow_err: anyhow::Error = anyhow::anyhow!("connect tcp: connection refused");
         let outcome: anyhow::Result<std::result::Result<Vec<u8>, String>> = Err(anyhow_err);
         let err = map_rpc_outcome("https://10.99.0.10:7679", outcome)
-            .err()
-            .expect("transport failure must map");
+            .expect_err("transport failure must map");
         match err {
             GrpcRaftRpcError::Unreachable(te) => {
                 assert_eq!(te.peer_addr, "https://10.99.0.10:7679");

@@ -7,7 +7,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use tokio::sync::broadcast;
 
 use crate::datastore::backend::DatastoreBackend;
@@ -23,11 +23,11 @@ use klights_cluster_datastore::redb::read_core::RedbPositionedWatchRead;
 use klights_cluster_datastore::redb::read_core::RedbSnapshotRead;
 #[cfg(test)]
 use klights_cluster_datastore::redb::tables;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_cluster_store::StagedPostCommit;
 use klights_types::HostPortRange;
 use klights_types::NodePeerMode;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_watch::{WatchSignal, WatchTopic};
 
 use super::RedbDatastore;
@@ -88,7 +88,7 @@ use klights_cluster_datastore::redb::live_committed_apply::outbox_watermark_key;
 
 #[async_trait]
 impl DatastoreBackend for RedbDatastore {
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn commit_observation_sink(
         &self,
     ) -> std::sync::Arc<dyn crate::datastore::CommitObservationSink> {
@@ -155,7 +155,7 @@ impl DatastoreBackend for RedbDatastore {
         self.accessor.close();
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<klights_watch::WatchEvent> {
         crate::bootstrap::watch_commit_wiring::subscribe_test_events(
             klights_cluster_datastore::redb::embedded::RedbDatastore::commit_observation_sink(self)
@@ -165,7 +165,7 @@ impl DatastoreBackend for RedbDatastore {
         )
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> klights_watch::WatchReceiver {
         crate::bootstrap::watch_commit_wiring::subscribe_test_events_many(
             klights_cluster_datastore::redb::embedded::RedbDatastore::commit_observation_sink(self)
@@ -175,7 +175,7 @@ impl DatastoreBackend for RedbDatastore {
         )
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn broadcast_watch_event(&self, pending: StagedPostCommit) {
         let event = crate::datastore::staged_test_event(&pending).expect("staged test watch event");
         let _ = WatchSignal::from_event(&event);
@@ -1203,7 +1203,7 @@ impl crate::datastore::NamespaceStore for RedbDatastore {
         crate::datastore::DatastoreBackend::get_namespace(self, name).await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn seed_namespace_for_test(&self, name: &str) {
         crate::datastore::DatastoreBackend::seed_namespace_for_test(self, name).await
     }
@@ -1540,7 +1540,7 @@ impl crate::datastore::NetworkMetadataStore for RedbDatastore {
 
 #[async_trait]
 impl crate::datastore::ReplicationStore for RedbDatastore {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn apply_replicated_command(
         &self,
         command: klights_cluster_core::command::StorageCommand,
@@ -1589,7 +1589,7 @@ impl crate::datastore::ReplicationStore for RedbDatastore {
         crate::datastore::DatastoreBackend::apply_raft_log_apply_commit_receipt(self, commit).await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn apply_replicated_create_resource(
         &self,
         api_version: &str,
@@ -1655,7 +1655,7 @@ impl klights_cluster_store::BackendLifecycleStore for RedbDatastore {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 impl crate::datastore::TestWatchStore for RedbDatastore {
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> klights_watch::WatchReceiver {
         crate::datastore::DatastoreBackend::subscribe_watch_many(self, topics)

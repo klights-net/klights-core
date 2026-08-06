@@ -99,12 +99,12 @@ impl DeferredRuntimeReducerHandle {
         self.lock().consume_if_current(pod_uid, promoted);
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(feature = "pod-repository-test-support")]
     pub(crate) fn contains(&self, pod_uid: &str) -> bool {
         self.lock().by_pod_uid.contains_key(pod_uid)
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(feature = "pod-repository-test-support")]
     pub(crate) fn insert_marker(&self, pod_uid: &str) {
         self.lock().by_pod_uid.insert(
             pod_uid.to_string(),
@@ -207,7 +207,7 @@ impl PodStatusService {
         self.deferred_runtime.clone()
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(feature = "pod-repository-test-support")]
     pub(super) fn has_deferred_runtime_for_uid(&self, pod_uid: &str) -> bool {
         self.deferred_runtime.contains(pod_uid)
     }
@@ -388,7 +388,7 @@ impl PodStatusService {
             .await
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(feature = "pod-repository-test-support")]
     pub(crate) async fn integration_set_pod_status(
         &self,
         ns: &str,
@@ -1270,7 +1270,7 @@ impl PodStatusService {
             .await
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(feature = "pod-repository-test-support")]
     pub(crate) async fn integration_set_probe_readiness(
         &self,
         ns: &str,

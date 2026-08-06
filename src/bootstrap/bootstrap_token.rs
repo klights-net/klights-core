@@ -230,7 +230,7 @@ async fn write_scoped_bootstrap_token_secret(
     Ok(())
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "native-api-test-support"))]
 pub async fn create_scoped_bootstrap_token_secret_for_test(
     db: &dyn DatastoreBackend,
     scope: BootstrapTokenScope,
@@ -239,7 +239,7 @@ pub async fn create_scoped_bootstrap_token_secret_for_test(
     write_scoped_bootstrap_token_secret(db, scope, token, BOOTSTRAP_TOKEN_TTL).await
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "native-api-test-support"))]
 pub async fn create_scoped_bootstrap_token_secret_with_ttl_for_test(
     db: &dyn DatastoreBackend,
     scope: BootstrapTokenScope,

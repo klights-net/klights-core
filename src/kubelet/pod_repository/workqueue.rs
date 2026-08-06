@@ -22,7 +22,7 @@ use klights_reconcile_api::{
 use serde_json::{Map, Value, json};
 use tokio::sync::Notify;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use crate::datastore::node_local::PodWorkqueueEntry as LegacyPodWorkqueueEntry;
 use klights_reconcile_api::ReconcileFailureMetrics;
 use klights_supervisor::{TaskCategory, TaskSupervisor};
@@ -51,7 +51,7 @@ pub(crate) struct PodWorkqueueEntry {
     pub uid: String,
     pub payload: Value,
     pub attempt_count: i64,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub next_attempt_at_ms: i64,
 }
 
@@ -78,7 +78,7 @@ pub(crate) trait PodWorkqueuePersistence: Send + Sync {
     async fn dead_letter(&self, id: i64, error: &str) -> Result<()>;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 fn legacy_kind(kind: PodWorkqueueKind) -> crate::datastore::node_local::PodWorkqueueKind {
     match kind {
         PodWorkqueueKind::Pod => crate::datastore::node_local::PodWorkqueueKind::Pod,
@@ -86,7 +86,7 @@ fn legacy_kind(kind: PodWorkqueueKind) -> crate::datastore::node_local::PodWorkq
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 fn focused_entry(row: LegacyPodWorkqueueEntry) -> PodWorkqueueEntry {
     PodWorkqueueEntry {
         id: row.id,
@@ -105,7 +105,7 @@ fn focused_entry(row: LegacyPodWorkqueueEntry) -> PodWorkqueueEntry {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 fn legacy_entry(row: PodWorkqueueEntry) -> LegacyPodWorkqueueEntry {
     LegacyPodWorkqueueEntry {
         id: row.id,
@@ -119,7 +119,7 @@ fn legacy_entry(row: PodWorkqueueEntry) -> LegacyPodWorkqueueEntry {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 #[async_trait::async_trait]
 impl PodWorkqueuePersistence for std::sync::Arc<crate::datastore::node_local::NodeLocalStores> {
     async fn enqueue(
@@ -276,7 +276,7 @@ fn compose_leader_unscheduled_deletion(store: Arc<PodStore>) -> Arc<dyn Unschedu
     )))
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(feature = "pod-repository-test-support")]
 pub(crate) fn test_leader_unscheduled_deletion(
     store: Arc<PodStore>,
 ) -> Arc<dyn UnscheduledPodDeletion> {
@@ -380,7 +380,7 @@ impl PodWorkqueue {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub(super) fn start_called(&self) -> bool {
         self.start_called.load(Ordering::Acquire)
     }
@@ -1292,9 +1292,9 @@ mod tests {
             let state = *self.receiver.borrow();
             if !state.local {
                 Err(klights_leader_api::ControllerCoordinationError::Unavailable)
-            } else if !lease
+            } else if lease
                 .adapter_fence::<TestCoordinationFence>()
-                .is_some_and(|fence| fence.0 == state.generation)
+                .is_none_or(|fence| fence.0 != state.generation)
             {
                 Err(klights_leader_api::ControllerCoordinationError::StalePermit)
             } else {

@@ -2116,6 +2116,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "urlencoding",
  "uuid",
  "vergen",
  "x509-parser",
@@ -2437,11 +2438,13 @@ name = "klights-node-datastore"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "futures",
  "klights-node-store",
  "klights-supervisor",
  "klights-types",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",

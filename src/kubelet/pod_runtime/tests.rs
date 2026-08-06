@@ -1,4 +1,5 @@
 #![cfg(test)]
+#![allow(clippy::items_after_test_module)]
 
 use k8s_cri::v1::PodSandboxConfig;
 
@@ -8997,11 +8998,7 @@ async fn real_runtime_reconcile_preserves_terminal_container_state_after_stale_r
 #[tokio::test]
 async fn mocked_runtime_does_not_create_termination_log_file_directly() {
     let runtime_namespace = "klights-term-mock-create-test";
-    let _ = std::fs::remove_dir_all(
-        kubelet_runtime_paths_for_test(runtime_namespace)
-            .data_root()
-            .to_path_buf(),
-    );
+    let _ = std::fs::remove_dir_all(kubelet_runtime_paths_for_test(runtime_namespace).data_root());
     let harness = PodRuntimeHarness::new_with_runtime_config(
         crate::kubelet::pod_runtime::service::RuntimeConfig {
             node_name: "test-node".into(),
@@ -9056,11 +9053,7 @@ async fn mocked_runtime_does_not_create_termination_log_file_directly() {
         "RealPodRuntimeService must not create termination logs outside PodFilesystem"
     );
 
-    let _ = std::fs::remove_dir_all(
-        kubelet_runtime_paths_for_test(runtime_namespace)
-            .data_root()
-            .to_path_buf(),
-    );
+    let _ = std::fs::remove_dir_all(kubelet_runtime_paths_for_test(runtime_namespace).data_root());
 }
 
 #[tokio::test]
@@ -9070,11 +9063,7 @@ async fn mocked_runtime_does_not_read_termination_message_file_directly() {
     use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let runtime_namespace = "klights-term-mock-read-test";
-    let _ = std::fs::remove_dir_all(
-        kubelet_runtime_paths_for_test(runtime_namespace)
-            .data_root()
-            .to_path_buf(),
-    );
+    let _ = std::fs::remove_dir_all(kubelet_runtime_paths_for_test(runtime_namespace).data_root());
     let harness = PodRuntimeHarness::new_with_runtime_config(
         crate::kubelet::pod_runtime::service::RuntimeConfig {
             node_name: "test-node".into(),
@@ -9179,11 +9168,7 @@ async fn mocked_runtime_does_not_read_termination_message_file_directly() {
         "RealPodRuntimeService must read termination messages through PodFilesystem"
     );
 
-    let _ = std::fs::remove_dir_all(
-        kubelet_runtime_paths_for_test(runtime_namespace)
-            .data_root()
-            .to_path_buf(),
-    );
+    let _ = std::fs::remove_dir_all(kubelet_runtime_paths_for_test(runtime_namespace).data_root());
 }
 
 #[tokio::test]
@@ -9255,11 +9240,7 @@ async fn termination_message_mount_path_with_parity() {
         call == "ensure_termination_log:container-runtime/termination-message-pod/uid-termination-mount/termination-message-container"
     }));
 
-    let _ = std::fs::remove_dir_all(
-        kubelet_runtime_paths_for_test(runtime_namespace)
-            .data_root()
-            .to_path_buf(),
-    );
+    let _ = std::fs::remove_dir_all(kubelet_runtime_paths_for_test(runtime_namespace).data_root());
 }
 
 #[tokio::test]
@@ -9331,11 +9312,7 @@ async fn hosts_file_mount_path_with_parity() {
         "managed /etc/hosts must be mounted into containers so HostAliases are visible"
     );
 
-    let _ = std::fs::remove_dir_all(
-        kubelet_runtime_paths_for_test(runtime_namespace)
-            .data_root()
-            .to_path_buf(),
-    );
+    let _ = std::fs::remove_dir_all(kubelet_runtime_paths_for_test(runtime_namespace).data_root());
 }
 
 #[tokio::test]
@@ -9448,11 +9425,7 @@ async fn termination_message_file_handling_with_parity() {
         call == "read_termination_message:container-runtime/termination-message-pod/uid-termination-read/termination-message-container:FallbackToLogsOnError:0"
     }));
 
-    let _ = std::fs::remove_dir_all(
-        kubelet_runtime_paths_for_test(runtime_namespace)
-            .data_root()
-            .to_path_buf(),
-    );
+    let _ = std::fs::remove_dir_all(kubelet_runtime_paths_for_test(runtime_namespace).data_root());
 }
 
 // --- Task 23.4: Partial-State and Rollback Handling ---

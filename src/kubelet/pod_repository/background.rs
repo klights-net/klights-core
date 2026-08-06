@@ -48,7 +48,7 @@ impl PodRepositoryBackground {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub fn workqueue_start_called(&self) -> bool {
         self.workqueue.start_called()
     }

@@ -1,15 +1,15 @@
 //! Root composition adapter for the passive SQLite cluster datastore.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 mod applier;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use tokio::sync::broadcast;
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use super::backend::CommitObservationSink;
 use super::backend::DatastoreBackend;
 use super::types::{
@@ -23,12 +23,12 @@ use klights_cluster_core::{
     ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
 };
 use klights_cluster_datastore::sqlite::embedded::Datastore as PassiveDatastore;
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub use klights_cluster_datastore::sqlite::embedded::ResourceMutationPauseOperation;
 use klights_cluster_store::ClusterMetadataRead;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_cluster_store::StagedPostCommit;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_watch::WatchTopic;
 
 /// Root-owned composition identity around the passive SQLite implementation.
@@ -63,7 +63,7 @@ impl Datastore {
             cluster_db_path,
             supervisor,
             key_file,
-            #[cfg(any(test, feature = "integration-test-harness"))]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             crate::bootstrap::watch_commit_wiring::new_sink(),
             crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),
@@ -75,13 +75,13 @@ impl Datastore {
         cluster_db_path: &std::path::Path,
         supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
         key_file: Option<&std::path::Path>,
-        #[cfg(any(test, feature = "integration-test-harness"))] commit_sink: std::sync::Arc<
+        #[cfg(any(test, feature = "pod-repository-test-support"))] commit_sink: std::sync::Arc<
             dyn CommitObservationSink,
         >,
         outbox_codec: std::sync::Arc<dyn klights_cluster_store::OutboxResponseCodec>,
         wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         let passive = PassiveDatastore::new_persistent_paths_with_sink(
             cluster_db_path,
             supervisor,
@@ -91,7 +91,7 @@ impl Datastore {
             wall_clock,
         )
         .await?;
-        #[cfg(not(any(test, feature = "integration-test-harness")))]
+        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
         let passive = PassiveDatastore::new_persistent_paths(
             cluster_db_path,
             supervisor,
@@ -105,13 +105,13 @@ impl Datastore {
 
     pub async fn new_in_memory_with_watch_and_executor_with_sink(
         executor: klights_supervisor::DbExecutor,
-        #[cfg(any(test, feature = "integration-test-harness"))] commit_sink: std::sync::Arc<
+        #[cfg(any(test, feature = "pod-repository-test-support"))] commit_sink: std::sync::Arc<
             dyn CommitObservationSink,
         >,
         outbox_codec: std::sync::Arc<dyn klights_cluster_store::OutboxResponseCodec>,
         wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         let passive = PassiveDatastore::new_in_memory_with_watch_and_executor_with_sink(
             executor,
             commit_sink,
@@ -119,7 +119,7 @@ impl Datastore {
             wall_clock,
         )
         .await?;
-        #[cfg(not(any(test, feature = "integration-test-harness")))]
+        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
         let passive = PassiveDatastore::new_in_memory_with_watch_and_executor(
             executor,
             outbox_codec,
@@ -129,7 +129,7 @@ impl Datastore {
         Ok(Self(passive))
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub async fn new_in_memory() -> Result<Self> {
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
@@ -148,7 +148,7 @@ impl Datastore {
         .await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub async fn new_in_memory_with_handle() -> (Self, super::DatastoreHandle) {
         let datastore = Self::new_in_memory()
             .await
@@ -157,7 +157,7 @@ impl Datastore {
         (datastore, handle)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub async fn new_persistent(
         db_root: &std::path::Path,
         supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
@@ -174,7 +174,7 @@ impl Datastore {
         .await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub async fn new_in_memory_with_watch_and_executor(
         executor: klights_supervisor::DbExecutor,
     ) -> Result<Self> {
@@ -187,7 +187,7 @@ impl Datastore {
         .await
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub fn subscribe_watch(
         &self,
         topic: klights_watch::WatchTopic,
@@ -195,7 +195,7 @@ impl Datastore {
         DatastoreBackend::subscribe_watch(self, topic)
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub fn subscribe_watch_many(
         &self,
         topics: Vec<klights_watch::WatchTopic>,
@@ -203,12 +203,12 @@ impl Datastore {
         DatastoreBackend::subscribe_watch_many(self, topics)
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub fn broadcast_watch_event(&self, pending: StagedPostCommit) {
         DatastoreBackend::broadcast_watch_event(self, pending)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub fn install_list_resources_snapshot_pause_for_test(
         api_version: &str,
         kind: &str,
@@ -229,7 +229,7 @@ impl Datastore {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub async fn count_watch_events(&self) -> Result<i64> {
         PassiveDatastore::count_watch_events(self).await
     }
@@ -243,7 +243,7 @@ impl Datastore {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 #[async_trait::async_trait]
 impl klights_kubelet::volume_sources::VolumeSourceReader for Datastore {
     async fn config_map(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
@@ -322,7 +322,7 @@ fn focused_events_to_catchup(
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub fn create_staged_post_commit(
     api_version: &str,
     kind: &str,
@@ -340,7 +340,7 @@ pub fn create_staged_post_commit(
     )
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub fn staged_test_event(pending: &StagedPostCommit) -> Option<klights_watch::WatchEvent> {
     let staged = pending.test_event()?;
     let mut event = klights_watch::WatchEvent::from_type(
@@ -358,7 +358,7 @@ pub fn staged_test_event(pending: &StagedPostCommit) -> Option<klights_watch::Wa
     Some(event)
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub fn staged_post_commit_from_event(event: klights_watch::WatchEvent) -> StagedPostCommit {
     let resource = Resource::try_from_data(event.object.clone())
         .expect("test watch event must carry canonical resource identity");
@@ -378,7 +378,7 @@ pub fn staged_post_commit_from_event(event: klights_watch::WatchEvent) -> Staged
 
 #[async_trait]
 impl DatastoreBackend for Datastore {
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn commit_observation_sink(&self) -> std::sync::Arc<dyn CommitObservationSink> {
         PassiveDatastore::commit_observation_sink(self)
             .expect("test datastore must install a commit observation sink")
@@ -448,14 +448,14 @@ impl DatastoreBackend for Datastore {
         .map_err(anyhow::Error::from)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn seed_namespace_for_test(&self, name: &str) {
         PassiveDatastore::seed_namespace_no_rv(self, name)
             .await
             .expect("seed namespace for test");
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<klights_watch::WatchEvent> {
         crate::bootstrap::watch_commit_wiring::subscribe_test_events(
             PassiveDatastore::commit_observation_sink(self)
@@ -465,7 +465,7 @@ impl DatastoreBackend for Datastore {
         )
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> klights_watch::WatchReceiver {
         crate::bootstrap::watch_commit_wiring::subscribe_test_events_many(
             PassiveDatastore::commit_observation_sink(self)
@@ -475,14 +475,14 @@ impl DatastoreBackend for Datastore {
         )
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn broadcast_watch_event(&self, pending: StagedPostCommit) {
         let sink = PassiveDatastore::commit_observation_sink(self)
             .expect("test datastore must install a commit observation sink");
         sink.observe(&[pending]);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn apply_replicated_command(
         &self,
         command: klights_cluster_core::command::StorageCommand,
@@ -491,7 +491,7 @@ impl DatastoreBackend for Datastore {
         self.0.apply_legacy_test_command(command, meta).await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn apply_replicated_create_resource(
         &self,
         api_version: &str,

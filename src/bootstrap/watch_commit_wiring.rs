@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use crate::datastore::CommitObservationSink;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_cluster_store::StagedPostCommit;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_watch::WatchBus;
 
 pub(crate) struct WatchCommitWiring {
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub(crate) sink: Arc<dyn CommitObservationSink>,
     pub(crate) signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     pub(crate) wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>,
@@ -25,7 +25,7 @@ pub(crate) fn new_wiring() -> WatchCommitWiring {
         follower_progress: follower_progress.clone(),
     });
     WatchCommitWiring {
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         sink: Arc::new(WatchCommitObservationSink::new(
             wakeups.clone(),
             hub.clone(),
@@ -36,7 +36,7 @@ pub(crate) fn new_wiring() -> WatchCommitWiring {
     }
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub(crate) fn new_sink() -> Arc<WatchCommitObservationSink> {
     let hub = Arc::new(klights_watch::WatchSignalHub::new(1024));
     Arc::new(WatchCommitObservationSink::new(
@@ -45,7 +45,7 @@ pub(crate) fn new_sink() -> Arc<WatchCommitObservationSink> {
     ))
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub(crate) fn test_signal_source(
     db: &crate::datastore::DatastoreHandle,
 ) -> Arc<dyn klights_watch::WatchSignalSubscribe> {
@@ -63,16 +63,16 @@ pub(crate) fn subscribe(
     source.subscribe(topic)
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub(crate) struct WatchCommitObservationSink {
     wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>,
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     bus: WatchBus,
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 impl WatchCommitObservationSink {
     fn new(
         wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>,
@@ -80,20 +80,20 @@ impl WatchCommitObservationSink {
     ) -> Self {
         Self {
             wakeups,
-            #[cfg(any(test, feature = "integration-test-harness"))]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             signals,
-            #[cfg(any(test, feature = "integration-test-harness"))]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             bus: WatchBus::new(1024),
         }
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub(crate) fn signal_source(&self) -> Arc<dyn klights_watch::WatchSignalSubscribe> {
         self.signals.clone()
     }
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 impl CommitObservationSink for WatchCommitObservationSink {
     fn observe(&self, observations: &[StagedPostCommit]) {
         let advances = observations
@@ -108,7 +108,7 @@ impl CommitObservationSink for WatchCommitObservationSink {
             })
             .collect::<Vec<_>>();
         self.wakeups.wake(&advances);
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         for event in observations
             .iter()
             .filter_map(crate::datastore::staged_test_event)
@@ -117,7 +117,7 @@ impl CommitObservationSink for WatchCommitObservationSink {
         }
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -147,7 +147,7 @@ impl klights_leader_api::PostCommitWakeup for ActivePostCommitWakeup {
     }
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub(crate) fn publish_test_events(
     sink: &dyn CommitObservationSink,
     events: Vec<klights_watch::WatchEvent>,
@@ -159,7 +159,7 @@ pub(crate) fn publish_test_events(
     }
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub(crate) fn subscribe_test_events(
     sink: &dyn CommitObservationSink,
     topic: klights_watch::WatchTopic,
@@ -171,7 +171,7 @@ pub(crate) fn subscribe_test_events(
         .subscribe(topic)
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub(crate) fn subscribe_test_events_many(
     sink: &dyn CommitObservationSink,
     topics: Vec<klights_watch::WatchTopic>,

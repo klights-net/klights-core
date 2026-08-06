@@ -22,15 +22,15 @@
 use anyhow::Result;
 #[cfg(test)]
 use async_trait::async_trait;
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_cluster_core::CommandMeta;
 use klights_cluster_core::StorageCommand;
 use std::sync::Arc;
 
 use crate::datastore::DatastoreBackend;
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use crate::datastore::ReplicatedCreateOptions;
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_cluster_core::ResourcePatchRequest;
 use klights_replication::proposal::RaftProposal;
 
@@ -95,7 +95,7 @@ impl SequencedDatastore {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
 pub(crate) async fn apply_command_to_backend<B>(
     backend: &B,
@@ -431,7 +431,7 @@ where
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
 async fn align_resource_version_before_replicated_apply<B>(
     backend: &B,

@@ -793,9 +793,8 @@ mod tests {
         )
         .await
         .expect("open node-local test db");
-        let outbox = crate::integration_test_harness::node_delivery::node_delivery_support::outbox_from_node_db(
-            node_db.clone(),
-        );
+        let outbox =
+            crate::bootstrap::composition_tests::support::outbox_from_node_db(node_db.clone());
         let dataplane = klights_leader_rpc::client::JoinDataplaneMetadata {
             public_key: Some("worker-public-key".to_string()),
             endpoint: "192.0.2.55".to_string(),
@@ -817,11 +816,10 @@ mod tests {
         assert_eq!(row.subject_kind, "Node");
         assert_eq!(row.subject_name, "worker-a");
         assert_eq!(row.subject_key, "v1/Node/worker-a/dataplane");
-        let payload =
-            crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload::decode_protobuf(
-                &row.payload_proto,
-            )
-            .expect("decode dataplane outbox payload");
+        let payload = crate::bootstrap::composition_tests::support::OutboxPayload::decode_protobuf(
+            &row.payload_proto,
+        )
+        .expect("decode dataplane outbox payload");
         match payload.command {
             klights_cluster_core::command::StorageCommand::UpdateNodeDataplane {
                 node_name,

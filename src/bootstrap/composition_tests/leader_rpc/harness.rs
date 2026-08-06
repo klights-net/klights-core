@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use super::native_api::DeterministicControllerIdentity;
 use crate::datastore::DatastoreHandle as IntegrationDatastoreHandle;
 
 pub struct IntegrationPassiveReadPorts {
@@ -27,14 +26,6 @@ impl IntegrationLeaderRpcNodePorts {
     }
 
     pub fn lifecycle_status(&self) -> Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus> {
-        self.local.clone()
-    }
-
-    pub fn resource_command(&self) -> Arc<dyn klights_leader_api::LeaderResourceCommand> {
-        self.local.clone()
-    }
-
-    pub fn outbox_delivery(&self) -> Arc<dyn klights_leader_api::LeaderOutboxDelivery> {
         self.local.clone()
     }
 }
@@ -276,20 +267,6 @@ impl IntegrationLeaderRpcComposition {
         ))
     }
 
-    pub fn node_heartbeat_event_source(
-        passive_reads: &IntegrationPassiveReadPorts,
-        db: IntegrationDatastoreHandle,
-    ) -> Arc<dyn klights_kubelet::node_heartbeat::NodeHeartbeatEventSource> {
-        Arc::new(
-            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
-                crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
-                    &passive_reads.ports,
-                    db,
-                ),
-            )),
-        )
-    }
-
     pub async fn seed_namespace(db: &dyn crate::datastore::DatastoreBackend, name: &str) {
         let _ = db
             .create_namespace(name, serde_json::json!({"metadata": {"name": name}}))
@@ -362,12 +339,13 @@ impl IntegrationLeaderRpcComposition {
     }
 
     pub async fn initialize_default_namespaces(&self) -> anyhow::Result<()> {
+        let identity = crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity();
         klights_controllers::namespace::init_default_namespaces_with_ca_path(
             &Self::file_process_executor(),
             self.db.as_ref(),
             &crate::paths::ca_cert_path(&crate::paths::runtime_namespace()),
             chrono::DateTime::UNIX_EPOCH,
-            &DeterministicControllerIdentity::default(),
+            identity.as_ref(),
         )
         .await
     }
@@ -444,14 +422,17 @@ impl IntegrationLeaderRpcComposition {
         .await
     }
 
+    #[allow(dead_code)]
     pub async fn ensure_cluster_metadata(&self) -> anyhow::Result<()> {
         Self::ensure_cluster_metadata_for(self.db.as_ref()).await
     }
 
+    #[allow(dead_code)]
     pub async fn ensure_worker_bootstrap_token(&self) -> anyhow::Result<String> {
         Self::ensure_worker_bootstrap_token_for(self.db.as_ref()).await
     }
 
+    #[allow(dead_code)]
     pub async fn create_scoped_bootstrap_token(
         &self,
         token: &str,
@@ -594,6 +575,7 @@ impl IntegrationLeaderRpcComposition {
         )
     }
 
+    #[allow(clippy::type_complexity)]
     fn server_parts(
         &self,
         service: Arc<klights_replication::ReplicationService>,

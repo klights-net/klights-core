@@ -201,6 +201,7 @@ impl IntegrationPodWorkerComposition {
         .await
     }
 
+    #[allow(dead_code)]
     pub async fn update_pod_owner_references_for_uid(
         &self,
         namespace: &str,
@@ -218,6 +219,7 @@ impl IntegrationPodWorkerComposition {
         .await
     }
 
+    #[allow(dead_code)]
     pub async fn merge_pod_labels_for_uid(
         &self,
         namespace: &str,
@@ -832,6 +834,7 @@ pub async fn run_raft_delete_mark_status_race(
     })
 }
 
+#[allow(dead_code)]
 pub async fn run_api_delete_status_race(
     pod_name: &str,
     grace_period_seconds: Option<i64>,
@@ -1563,10 +1566,19 @@ impl IntegrationPodStoreFixture {
         name: &str,
         uid: &str,
     ) -> anyhow::Result<IntegrationBoundPodDeleteOutcome> {
-        let outcome = self
-            .store
-            .finalize_bound_with_uid(namespace, name, uid)
-            .await?;
+        let finalization =
+            crate::bootstrap::composition_adapters::bound_pod_finalization_adapter::new_for_root(
+                self.store.clone(),
+                None,
+                None,
+                Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+            );
+        let outcome = finalization
+            .finalize_bound_pod(klights_pod_api::BoundPodFinalizationRequest::try_new(
+                klights_types::PodIdentity::new(namespace, name, uid),
+            )?)
+            .await
+            .map_err(anyhow::Error::new)?;
         Ok(map_bound_delete_outcome(outcome))
     }
 
@@ -1591,19 +1603,20 @@ impl IntegrationPodStoreFixture {
 }
 
 fn map_bound_delete_outcome(
-    outcome: crate::kubelet::pod_repository::store::BoundPodDeleteOutcome,
+    outcome: klights_pod_api::BoundPodFinalizationOutcome,
 ) -> IntegrationBoundPodDeleteOutcome {
     match outcome {
-        crate::kubelet::pod_repository::store::BoundPodDeleteOutcome::Removed => {
+        klights_pod_api::BoundPodFinalizationOutcome::Removed
+        | klights_pod_api::BoundPodFinalizationOutcome::Accepted => {
             IntegrationBoundPodDeleteOutcome::Removed
         }
-        crate::kubelet::pod_repository::store::BoundPodDeleteOutcome::IdentityChanged => {
+        klights_pod_api::BoundPodFinalizationOutcome::IdentityChanged => {
             IntegrationBoundPodDeleteOutcome::IdentityChanged
         }
-        crate::kubelet::pod_repository::store::BoundPodDeleteOutcome::FinalizersPending => {
+        klights_pod_api::BoundPodFinalizationOutcome::FinalizersPending => {
             IntegrationBoundPodDeleteOutcome::FinalizersPending
         }
-        crate::kubelet::pod_repository::store::BoundPodDeleteOutcome::Retry => {
+        klights_pod_api::BoundPodFinalizationOutcome::Retry => {
             IntegrationBoundPodDeleteOutcome::Retry
         }
     }
@@ -1886,10 +1899,20 @@ pub async fn run_bound_pod_delete_cas_race(
             }),
         )
         .await?;
+    let finalization =
+        crate::bootstrap::composition_adapters::bound_pod_finalization_adapter::new_for_root(
+            store,
+            None,
+            None,
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        );
     let disposition = map_bound_delete_outcome(
-        store
-            .finalize_bound_with_uid("default", pod_name, pod_uid)
-            .await?,
+        finalization
+            .finalize_bound_pod(klights_pod_api::BoundPodFinalizationRequest::try_new(
+                klights_types::PodIdentity::new("default", pod_name, pod_uid),
+            )?)
+            .await
+            .map_err(anyhow::Error::new)?,
     );
     let live = datastore
         .get_resource("v1", "Pod", Some("default"), pod_name)
@@ -1988,6 +2011,7 @@ impl IntegrationPodRepositoryComposition {
         .await
     }
 
+    #[allow(dead_code)]
     pub async fn new_cluster_backed_with_node_outbox(
         resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     ) -> Self {

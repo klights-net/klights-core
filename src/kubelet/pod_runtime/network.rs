@@ -109,11 +109,12 @@ mod focused_datapath_tests {
 
     #[test]
     fn test_kubelet_caller_takes_only_datapath() {
-        let _constructor: fn(
+        type Constructor = fn(
             Arc<dyn klights_network_api::Datapath>,
             Arc<PodRepository>,
             Arc<dyn PodRuntimeStore>,
-        ) -> RealPodNetworkRuntime = RealPodNetworkRuntime::new;
+        ) -> RealPodNetworkRuntime;
+        let _constructor: Constructor = RealPodNetworkRuntime::new;
     }
 }
 

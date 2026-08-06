@@ -12,6 +12,9 @@ mod raft_durability;
 mod runtime_work;
 pub mod schema;
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 pub use identity::SqliteNodeIdentity;
 pub use network_state::SqliteNodeNetworkStateStore;
 pub use raft_durability::SqliteRaftDurability;

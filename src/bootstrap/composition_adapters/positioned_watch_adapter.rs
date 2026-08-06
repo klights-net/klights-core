@@ -19,7 +19,7 @@ pub(crate) fn datastore_positioned_watch_service(
     )
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub(crate) fn for_test(
     passive_reads: &PassiveReadPorts,
     db: DatastoreHandle,

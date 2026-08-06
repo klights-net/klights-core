@@ -579,8 +579,8 @@ mod tests {
             Err(klights_leader_api::NodeLifecycleStatusError::Conflict { .. })
         ));
     }
+    use crate::bootstrap::composition_tests::support::OutboxPayload;
     use crate::datastore::ResourcePreconditions;
-    use crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload;
     use klights_cluster_core::command::StorageCommand;
     use klights_cluster_store::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
     use klights_kubelet::node_outbox::payload::OutboxOperation;

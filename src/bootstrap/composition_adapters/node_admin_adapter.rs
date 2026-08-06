@@ -172,7 +172,7 @@ mod tests {
     }
 
     fn pod_status_payload() -> Vec<u8> {
-        crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload::from_command(
+        crate::bootstrap::composition_tests::support::OutboxPayload::from_command(
             klights_cluster_core::StorageCommand::UpdateStatus {
                 api_version: "v1".to_string(),
                 kind: "Pod".to_string(),

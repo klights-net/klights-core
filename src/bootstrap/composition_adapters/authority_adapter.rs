@@ -1,21 +1,21 @@
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(test)]
 use std::sync::Arc;
 
 use klights_leader_api::NodeRoleProjection;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(test)]
 use klights_leader_api::{
     AuthorityAcquireFuture, AuthorityError, AuthorityPermit, AuthorityPermitIssuer,
     AuthorityRevocationFuture, AuthorityRoute, LeaderAuthority,
 };
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(test)]
 pub(crate) struct TestBooleanWatchAuthority {
     receiver: std::sync::Mutex<tokio::sync::watch::Receiver<bool>>,
     generation: std::sync::atomic::AtomicU64,
     issuer: AuthorityPermitIssuer,
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(test)]
 impl TestBooleanWatchAuthority {
     pub(crate) fn new(receiver: tokio::sync::watch::Receiver<bool>) -> Arc<Self> {
         Arc::new(Self {
@@ -33,7 +33,7 @@ impl TestBooleanWatchAuthority {
     }
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(test)]
 impl LeaderAuthority for TestBooleanWatchAuthority {
     fn route(&self) -> AuthorityRoute {
         let (generation, local) = self.issue();

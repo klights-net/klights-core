@@ -6,7 +6,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use std::sync::Arc;
 
 fn snapshot_replay_floor_cursor_key(
@@ -65,13 +65,13 @@ where
         PodEndpointEffect::NotApplicable,
     ))
 }
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use tokio::sync::broadcast;
 
 use klights_cluster_core::command::StorageCommand;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_watch::WatchTopic;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_watch::{WatchEvent, WatchReceiver};
 
 use super::types::{
@@ -79,20 +79,20 @@ use super::types::{
     PositionedWatchReplayRead, ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery,
     SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use crate::datastore::ReplicatedCreateOptions;
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_cluster_core::command::CommandMeta;
 use klights_cluster_core::{
     LogApplyAppliedOutboxRow, LogApplyPodCleanupIntentRow, PatchKind, Resource,
     ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
 };
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_cluster_store::StagedPostCommit;
 
 pub use klights_cluster_store::{SnapshotExclusiveFence, SnapshotMutationFence};
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub use klights_cluster_store::CommitObservationSink;
 
 /// `DatastoreBackend` is the runtime contract. Every state operation goes
@@ -104,7 +104,7 @@ pub use klights_cluster_store::CommitObservationSink;
 /// exists.
 #[async_trait]
 pub trait DatastoreBackend: Send + Sync {
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn commit_observation_sink(&self) -> Arc<dyn CommitObservationSink>;
     /// Atomically observe both durable allocators and their persisted mode.
     async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {
@@ -142,13 +142,15 @@ pub trait DatastoreBackend: Send + Sync {
     /// after graceful shutdown work is complete.  No-op by default.
     fn close(&self) {}
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
-    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent>;
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    fn subscribe_watch(&self, _topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
+        panic!("watch event subscription is unavailable for this datastore adapter")
+    }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver;
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn broadcast_watch_event(&self, pending: StagedPostCommit);
 
     /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
@@ -156,7 +158,7 @@ pub trait DatastoreBackend: Send + Sync {
     /// Apply a replicated command locally without going through role-based
     /// public write admission.  Leaders use this for forwarded writes after
     /// bootstrap-token validation; replicas use it for snapshot and stream apply.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn apply_replicated_command(
         &self,
         command: StorageCommand,
@@ -247,7 +249,7 @@ pub trait DatastoreBackend: Send + Sync {
     /// rejecting existing names. Replicated creates converge a follower cache to
     /// the leader's object identity, including delete/recreate slots where the
     /// same name now has a different UID.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn apply_replicated_create_resource(
         &self,
         api_version: &str,
@@ -518,7 +520,7 @@ pub trait DatastoreBackend: Send + Sync {
     /// best-effort creates via `create_namespace`; backends may override with a
     /// cheaper path that does not advance the observed resourceVersion counter
     /// (so RV-asserting tests stay deterministic).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn seed_namespace_for_test(&self, name: &str) {
         let _ = self
             .create_namespace(name, serde_json::json!({"metadata": {"name": name}}))
@@ -1340,8 +1342,10 @@ pub trait RawWatchReplayStore: Send + Sync {
 /// Watch-event subscription, broadcast access, and replay queries.
 #[async_trait]
 pub trait WatchStore: Send + Sync {
-    #[cfg(any(test, feature = "integration-test-harness"))]
-    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent>;
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    fn subscribe_watch(&self, _topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
+        panic!("watch event subscription is unavailable for this datastore adapter")
+    }
     async fn list_watch_events_since(
         &self,
         targets: &[WatchTarget],
@@ -1473,7 +1477,7 @@ pub trait NetworkMetadataStore: Send + Sync {
 pub trait NamespaceStore: Send + Sync {
     async fn create_namespace(&self, name: &str, data: Value) -> Result<Resource>;
     async fn get_namespace(&self, name: &str) -> Result<Option<Resource>>;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn seed_namespace_for_test(&self, name: &str);
     async fn list_namespaces(
         &self,
@@ -1514,7 +1518,7 @@ pub trait NamespaceContentStore: Send + Sync {
 #[async_trait]
 pub trait ReplicationStore: Send + Sync {
     /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn apply_replicated_command(
         &self,
         command: StorageCommand,
@@ -1540,7 +1544,7 @@ pub trait ReplicationStore: Send + Sync {
         &self,
         commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<klights_cluster_store::CommittedRaftApplyReceipt>;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn apply_replicated_create_resource(
         &self,
         api_version: &str,
@@ -1554,7 +1558,7 @@ pub trait ReplicationStore: Send + Sync {
 
 #[async_trait]
 impl<T: ReplicationStore + ?Sized> ReplicationStore for std::sync::Arc<T> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn apply_replicated_command(
         &self,
         command: StorageCommand,
@@ -1605,7 +1609,7 @@ impl<T: ReplicationStore + ?Sized> ReplicationStore for std::sync::Arc<T> {
             .await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn apply_replicated_create_resource(
         &self,
         api_version: &str,
@@ -1680,7 +1684,7 @@ impl klights_cluster_store::BackendLifecycleStore for DatastoreBackendLifecycleP
 }
 
 /// Test-only watch bus controls.
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub trait TestWatchStore: Send + Sync {
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver;
     fn broadcast_watch_event(&self, pending: StagedPostCommit);

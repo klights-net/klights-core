@@ -17,7 +17,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use tokio::sync::broadcast;
 
 #[cfg(test)]
@@ -35,7 +35,7 @@ use klights_pod_api::{PodDeleteOptions, PodRepositoryError};
 use klights_reconcile_api::{GcPodDeleteRequest, GcPodDeleteSink};
 use klights_supervisor::TaskSupervisor;
 use klights_types::{PodIdentity, ResourceKey};
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_watch::WatchEvent;
 
 #[derive(Clone, Debug)]
@@ -46,7 +46,7 @@ pub struct PodResourceList {
     pub remaining_item_count: Option<i64>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 impl From<crate::datastore::ResourceList> for PodResourceList {
     fn from(list: crate::datastore::ResourceList) -> Self {
         Self {
@@ -300,11 +300,11 @@ pub(crate) struct PodRepositoryAdapters {
     pub namespace_bootstrap: Arc<dyn klights_reconcile_api::NamespaceBootstrapSink>,
     pub namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     pub mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub test_api: Option<Arc<dyn klights_pod_api::PodApiMutation>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub test_subresource: Option<Arc<dyn klights_pod_api::PodSubresourceMutation>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub test_scheduling: Option<Arc<dyn klights_pod_api::PodScheduling>>,
     #[cfg(test)]
     pub test_mark_terminating: Option<Arc<dyn klights_pod_api::PodMarkTerminating>>,
@@ -632,7 +632,7 @@ pub trait PodNetworkReader: Send + Sync {
     ) -> Result<PodNetworkAssignment>;
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub trait PodWatchSource: Send + Sync {
     fn subscribe_pod_watch(&self) -> broadcast::Receiver<WatchEvent>;
 }
@@ -688,13 +688,13 @@ pub struct PodRepository {
     store: Arc<PodStore>,
     status: PodStatusService,
     objects: PodObjectService,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     test_subresource: Option<Arc<dyn klights_pod_api::PodSubresourceMutation>>,
     network_svc: PodNetworkService,
     _watch: PodWatchService,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     test_api: Option<Arc<dyn klights_pod_api::PodApiMutation>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     test_scheduling: Option<Arc<dyn klights_pod_api::PodScheduling>>,
     #[cfg(test)]
     test_mark_terminating: Option<Arc<dyn klights_pod_api::PodMarkTerminating>>,
@@ -708,12 +708,12 @@ pub struct PodRepository {
     outbox: Option<Arc<klights_kubelet::outbox::Outbox>>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     host_ip: crate::kubelet::context::HostIpState,
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     deletion_finalizer: Arc<dyn PodDeletionFinalizer>,
 }
 
 impl PodRepository {
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(feature = "pod-repository-test-support")]
     pub(crate) async fn integration_seed_pod(
         &self,
         namespace: &str,
@@ -723,7 +723,7 @@ impl PodRepository {
         self.store.create(namespace, name, pod).await
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(feature = "pod-repository-test-support")]
     pub(crate) async fn integration_read_pod(
         &self,
         namespace: &str,
@@ -732,7 +732,7 @@ impl PodRepository {
         self.store.get(namespace, name).await
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(feature = "pod-repository-test-support")]
     pub(crate) async fn integration_update_pod(
         &self,
         namespace: &str,
@@ -745,7 +745,7 @@ impl PodRepository {
             .await
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(feature = "pod-repository-test-support")]
     pub(crate) async fn integration_update_pod_status(
         &self,
         namespace: &str,
@@ -758,19 +758,30 @@ impl PodRepository {
             .await
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(feature = "pod-repository-test-support")]
     pub(crate) async fn integration_finalize_bound_pod(
         &self,
         namespace: &str,
         name: &str,
         uid: &str,
-    ) -> Result<crate::kubelet::pod_repository::store::BoundPodDeleteOutcome> {
-        self.store
-            .finalize_bound_with_uid(namespace, name, uid)
+    ) -> Result<klights_pod_api::BoundPodFinalizationOutcome> {
+        let finalization =
+            crate::bootstrap::composition_adapters::bound_pod_finalization_adapter::new_for_root(
+                self.store.clone(),
+                None,
+                None,
+                Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+            );
+        let request = klights_pod_api::BoundPodFinalizationRequest::try_new(
+            klights_types::PodIdentity::new(namespace, name, uid),
+        )?;
+        finalization
+            .finalize_bound_pod(request)
             .await
+            .map_err(anyhow::Error::new)
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(feature = "pod-repository-test-support")]
     pub(crate) fn integration_has_deferred_runtime_for_uid(&self, pod_uid: &str) -> bool {
         self.status.has_deferred_runtime_for_uid(pod_uid)
     }
@@ -1036,11 +1047,16 @@ impl PodRepository {
             cluster_api: Some(cluster_api),
             controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(
             ),
+            #[cfg(not(test))]
+            api_identity: Arc::new(crate::bootstrap::controller_adapters::system_identity_adapter::SystemIdentityGenerator),
             scheduler_bind_gate: None,
+            #[cfg(not(test))]
+            gc_coordination: Arc::new(klights_controllers::ControllerCoordination::new()),
         })
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_network_events(
         db: DatastoreHandle,
         supervisor: Arc<TaskSupervisor>,
@@ -1064,7 +1080,11 @@ impl PodRepository {
             cluster_api: None,
             controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(
             ),
+            #[cfg(not(test))]
+            api_identity: Arc::new(crate::bootstrap::controller_adapters::system_identity_adapter::SystemIdentityGenerator),
             scheduler_bind_gate: None,
+            #[cfg(not(test))]
+            gc_coordination: Arc::new(klights_controllers::ControllerCoordination::new()),
         })
     }
 
@@ -1157,7 +1177,7 @@ impl PodRepository {
             supervisor: supervisor.clone(),
             deferred_runtime: status.deferred_runtime_handle(),
         };
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         let deletion_finalizer =
             compose_pod_deletion_finalizer(deletion_finalizer_dependencies.clone());
 
@@ -1165,13 +1185,13 @@ impl PodRepository {
             store,
             status,
             objects,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             test_subresource: adapters.test_subresource,
             network_svc,
             _watch: watch,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             test_api: adapters.test_api,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             test_scheduling: adapters.test_scheduling,
             #[cfg(test)]
             test_mark_terminating: adapters.test_mark_terminating,
@@ -1185,14 +1205,14 @@ impl PodRepository {
             outbox,
             cluster_api,
             host_ip,
-            #[cfg(any(test, feature = "integration-test-harness"))]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             deletion_finalizer,
         };
         let background = PodRepositoryBackground::new(workqueue);
         facade::PodRepositoryParts::new(repository, background, deletion_finalizer_dependencies)
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub async fn finalize_pod_deletion_after_actor_cleanup(
         &self,
         ns: &str,
@@ -1211,7 +1231,7 @@ impl PodRepository {
         }
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub fn deletion_finalizer(
         &self,
     ) -> Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer> {
@@ -1308,7 +1328,7 @@ impl PodRepository {
         resource
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub async fn schedule_pending_pod(
         &self,
         namespace: &str,
@@ -1322,7 +1342,7 @@ impl PodRepository {
             .map_err(|e| anyhow::anyhow!("{e:?}"))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub async fn bind_pod_from_api(
         &self,
         namespace: &str,
@@ -1343,7 +1363,7 @@ impl PodRepository {
             .map_err(|error| anyhow::anyhow!("{error:?}"))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub async fn schedule_all_unbound_pods(&self) -> Result<()> {
         self.test_scheduling
             .as_deref()
@@ -1757,7 +1777,7 @@ impl PodObjectWriter for PodRepository {
         _node_name: &str,
         pod: Value,
     ) -> Result<Resource> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         {
             let result = self
                 .test_api
@@ -1776,7 +1796,7 @@ impl PodObjectWriter for PodRepository {
             self.spawn_post_write_maintenance(ns).await;
             return Ok(created);
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
         {
             let _ = (ns, name, _node_name, pod);
             Err(anyhow::anyhow!(
@@ -1864,7 +1884,7 @@ impl PodObjectWriter for PodRepository {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 #[async_trait]
 impl PodSubresourceWriter for PodRepository {
     async fn replace_status_from_api(
@@ -1994,7 +2014,7 @@ impl PodSubresourceWriter for PodRepository {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 impl klights_pod_api::PodSubresourceMutation for PodRepository {
     fn replace_status(
         &self,
@@ -2100,14 +2120,14 @@ impl PodNetworkReader for PodRepository {
     }
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 impl PodWatchSource for PodRepository {
     fn subscribe_pod_watch(&self) -> broadcast::Receiver<WatchEvent> {
         self.store.subscribe_watch()
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 #[async_trait]
 #[allow(clippy::todo)]
 impl PodApiWriter for PodRepository {

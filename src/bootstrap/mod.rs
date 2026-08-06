@@ -22,7 +22,7 @@ pub(crate) mod node_registration_profile;
 pub mod node_role;
 pub mod observed_endpoint;
 pub(crate) mod operational_adapters;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub(crate) mod outbox_apply_adapter;
 pub mod phases;
 pub mod runtime;
@@ -35,6 +35,9 @@ pub(crate) mod watch_commit_wiring;
 pub mod worker_identity;
 pub mod worker_runtime;
 pub mod worker_store_adapter;
+
+#[cfg(test)]
+pub(crate) mod composition_tests;
 
 pub use node_mode::NodeMode;
 pub use node_role::NodeRole;

@@ -700,7 +700,7 @@ mod tests {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let composition =
-            crate::integration_test_harness::leader_rpc::IntegrationLeaderRpcComposition::new(
+            crate::bootstrap::composition_tests::leader_rpc::support::IntegrationLeaderRpcComposition::new(
                 db.clone(),
             );
         let service =

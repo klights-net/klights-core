@@ -842,9 +842,7 @@ mod tests {
         .await
         .expect("open worker node-local store");
         let outbox = std::sync::Arc::new(
-            crate::integration_test_harness::node_delivery::node_delivery_support::outbox_from_node_db(
-                node_local.clone(),
-            ),
+            crate::bootstrap::composition_tests::support::outbox_from_node_db(node_local.clone()),
         );
 
         let parts = compose_worker_pod_repository_parts(

@@ -58,6 +58,96 @@ pub use router::CurrentRouter;
 pub use state::ApiState;
 pub use streaming::StreamingDependencies;
 
+/// Encoding surface used only by the base-owned native API composition suite.
+/// Keeping this with the native-service owner avoids giving the root package a
+/// direct public-protobuf development edge.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_protobuf {
+    pub use prost::Message;
+
+    pub type Unknown = klights_kube_protobuf::Unknown;
+    pub type TypeMeta = klights_kube_protobuf::TypeMeta;
+
+    pub fn encode_protobuf(value: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
+        klights_kube_protobuf::encode_protobuf(value).map_err(anyhow::Error::new)
+    }
+
+    pub fn decode_protobuf(data: &[u8]) -> anyhow::Result<serde_json::Value> {
+        klights_kube_protobuf::decode_protobuf(data).map_err(anyhow::Error::new)
+    }
+
+    pub mod api {
+        pub mod admissionregistration {
+            pub mod v1 {
+                pub type ValidatingAdmissionPolicyBinding = klights_kube_protobuf::api::admissionregistration::v1::ValidatingAdmissionPolicyBinding;
+                pub type ValidatingAdmissionPolicyBindingSpec = klights_kube_protobuf::api::admissionregistration::v1::ValidatingAdmissionPolicyBindingSpec;
+            }
+        }
+        pub mod core {
+            pub mod v1 {
+                pub type ConfigMap = klights_kube_protobuf::api::core::v1::ConfigMap;
+                pub type Container = klights_kube_protobuf::api::core::v1::Container;
+                pub type Endpoints = klights_kube_protobuf::api::core::v1::Endpoints;
+                pub type ObjectReference = klights_kube_protobuf::api::core::v1::ObjectReference;
+                pub type PersistentVolume = klights_kube_protobuf::api::core::v1::PersistentVolume;
+                pub type PersistentVolumeClaim =
+                    klights_kube_protobuf::api::core::v1::PersistentVolumeClaim;
+                pub type PersistentVolumeClaimSpec =
+                    klights_kube_protobuf::api::core::v1::PersistentVolumeClaimSpec;
+                pub type PersistentVolumeSpec =
+                    klights_kube_protobuf::api::core::v1::PersistentVolumeSpec;
+                pub type PersistentVolumeStatus =
+                    klights_kube_protobuf::api::core::v1::PersistentVolumeStatus;
+                pub type Pod = klights_kube_protobuf::api::core::v1::Pod;
+                pub type PodSpec = klights_kube_protobuf::api::core::v1::PodSpec;
+                pub type VolumeResourceRequirements =
+                    klights_kube_protobuf::api::core::v1::VolumeResourceRequirements;
+            }
+        }
+        pub mod events {
+            pub mod v1 {
+                pub type Event = klights_kube_protobuf::api::events::v1::Event;
+            }
+        }
+        pub mod networking {
+            pub mod v1 {
+                pub type Ingress = klights_kube_protobuf::api::networking::v1::Ingress;
+            }
+        }
+        pub mod storage {
+            pub mod v1 {
+                pub type CSIStorageCapacityList =
+                    klights_kube_protobuf::api::storage::v1::CSIStorageCapacityList;
+            }
+        }
+    }
+
+    pub mod apimachinery {
+        pub mod pkg {
+            pub mod api {
+                pub mod resource {
+                    pub type Quantity =
+                        klights_kube_protobuf::apimachinery::pkg::api::resource::Quantity;
+                }
+            }
+            pub mod apis {
+                pub mod meta {
+                    pub mod v1 {
+                        pub type MicroTime =
+                            klights_kube_protobuf::apimachinery::pkg::apis::meta::v1::MicroTime;
+                        pub type ObjectMeta =
+                            klights_kube_protobuf::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+                        pub type Status =
+                            klights_kube_protobuf::apimachinery::pkg::apis::meta::v1::Status;
+                        pub type WatchEvent =
+                            klights_kube_protobuf::apimachinery::pkg::apis::meta::v1::WatchEvent;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Focused root-adapter contracts used to compose the current native service.
 pub mod ports {
     pub use crate::current::custom_resource_ports::{

@@ -8,7 +8,7 @@ use std::sync::Arc;
 mod backend_impl;
 mod snapshot;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 mod applier;
 /// Root composition identity around the destination-owned Redb store.
 #[derive(Clone)]
@@ -26,12 +26,12 @@ impl RedbDatastore {
     pub async fn new_persistent_with_sink(
         path: &std::path::Path,
         supervisor: Arc<TaskSupervisor>,
-        #[cfg(any(test, feature = "integration-test-harness"))] commit_sink: Arc<
+        #[cfg(any(test, feature = "pod-repository-test-support"))] commit_sink: Arc<
             dyn crate::datastore::CommitObservationSink,
         >,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         let passive = PassiveRedbDatastore::new_persistent_with_sink(
             path,
             supervisor,
@@ -39,32 +39,32 @@ impl RedbDatastore {
             wall_clock,
         )
         .await?;
-        #[cfg(not(any(test, feature = "integration-test-harness")))]
+        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
         let passive = PassiveRedbDatastore::new_persistent(path, supervisor, wall_clock).await?;
         Ok(Self(passive))
     }
 
     pub async fn new_in_memory_with_supervisor_and_sink(
         supervisor: Arc<TaskSupervisor>,
-        #[cfg(any(test, feature = "integration-test-harness"))] commit_sink: Arc<
+        #[cfg(any(test, feature = "pod-repository-test-support"))] commit_sink: Arc<
             dyn crate::datastore::CommitObservationSink,
         >,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         let passive = PassiveRedbDatastore::new_in_memory_with_supervisor_and_sink(
             supervisor,
             commit_sink,
             wall_clock,
         )
         .await?;
-        #[cfg(not(any(test, feature = "integration-test-harness")))]
+        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
         let passive =
             PassiveRedbDatastore::new_in_memory_with_supervisor(supervisor, wall_clock).await?;
         Ok(Self(passive))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub async fn new_in_memory() -> Result<Self> {
         Self::new_in_memory_with_supervisor_and_sink(
             Arc::new(TaskSupervisor::new(Default::default())),

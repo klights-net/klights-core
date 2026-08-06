@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::Value;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(test)]
 use tokio::sync::broadcast;
 
 use crate::control_plane::client::{
@@ -18,7 +18,7 @@ use crate::datastore::{
     WatchStore, WatchTarget, WatchTargetScope,
 };
 use klights_cluster_core::LogApplyPodCleanupIntentRow;
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_cluster_core::command::{CommandMeta, StorageCommand};
 use klights_cluster_store::{ReplayAvailability, ReplayRetentionBoundary};
 use klights_kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
@@ -287,7 +287,7 @@ fn worker_replay_boundaries(
 /// node-local runtime/network rows are served through focused node-store ports.
 pub trait WorkerWatchEvents: Send + Sync {
     fn subscribe_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver;
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(test)]
     fn subscribe(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent>;
     fn publish_signal(&self, signal: WatchSignal);
     #[cfg(test)]
@@ -317,7 +317,7 @@ impl WorkerWatchEvents for WorkerWatchBus {
         self.bus.subscribe_signals(topic)
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(test)]
     fn subscribe(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
         self.bus.subscribe(topic)
     }
@@ -1026,7 +1026,7 @@ impl crate::datastore::CurrentResourceVersionStore for WorkerStoreAdapter {
 
 #[async_trait]
 impl WatchStore for WorkerStoreAdapter {
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(test)]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<klights_watch::WatchEvent> {
         self.watch_events.subscribe(topic)
     }
@@ -1254,7 +1254,7 @@ impl crate::datastore::ResourceListStore for WorkerStoreAdapter {
 
 #[async_trait]
 impl crate::datastore::ReplicationStore for WorkerStoreAdapter {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn apply_replicated_command(
         &self,
         _command: StorageCommand,
@@ -1295,7 +1295,7 @@ impl crate::datastore::ReplicationStore for WorkerStoreAdapter {
         self.unsupported("apply_raft_log_apply_commit_receipt")
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn apply_replicated_create_resource(
         &self,
         _api_version: &str,
@@ -2581,9 +2581,8 @@ mod tests {
         .await
         .expect("open node-local");
         let adapter = WorkerStoreAdapter::new(Arc::new(HandoffLeaderApi), "worker-a".to_string());
-        let outbox = crate::integration_test_harness::node_delivery::node_delivery_support::outbox_from_node_db(
-            node_local.clone(),
-        );
+        let outbox =
+            crate::bootstrap::composition_tests::support::outbox_from_node_db(node_local.clone());
         let pod = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",

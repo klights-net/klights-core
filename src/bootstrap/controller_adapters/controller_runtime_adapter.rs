@@ -1087,7 +1087,7 @@ impl ControllerEffectPort for RootControllerEffectPort {
     }
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "native-api-test-support"))]
 pub(crate) fn inject_resource_version(
     data: impl Into<Arc<serde_json::Value>>,
     resource_version: i64,
@@ -1193,7 +1193,7 @@ pub(crate) fn dispatcher_for_test(
     ))
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(test)]
 pub(crate) fn queue_only_dispatcher_for_test(
     service_ipam: Arc<klights_controllers::service::ServiceIpam>,
 ) -> klights_controllers::ControllerDispatcher {
@@ -1205,7 +1205,7 @@ pub(crate) fn queue_only_dispatcher_for_test(
     )
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(test)]
 pub(crate) fn default_queue_only_dispatcher_for_test() -> klights_controllers::ControllerDispatcher
 {
     queue_only_dispatcher_for_test(Arc::new(klights_controllers::service::ServiceIpam::new(

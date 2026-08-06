@@ -16,7 +16,7 @@ use klights_leader_api::{
     ProjectedServiceAccountTokenFuture, ProjectedServiceAccountTokenRequest, ResourceGetRequest,
     ResourceListRequest, ResourceListResult, ResourceQueryFuture, WatchRequest,
 };
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_leader_api::{
     LeaderResourceCommand, ResourceCommandFuture, ResourceCommandRequest, ResourceCommandResult,
 };
@@ -38,14 +38,14 @@ use klights_controllers::ControllerDispatcher;
 #[cfg(test)]
 use klights_kubelet::node_outbox::payload::OutboxOperationExt as _;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 type ProjectedTokenAsyncBoundary = Arc<
     dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
         + Send
         + Sync,
 >;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 #[derive(Clone)]
 struct ProjectedTokenIssueTestProbe {
     async_boundary: ProjectedTokenAsyncBoundary,
@@ -76,7 +76,7 @@ impl Drop for ProjectedTokenIssueTestRegistration {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 fn projected_token_issue_test_probes()
 -> &'static std::sync::Mutex<std::collections::HashMap<String, ProjectedTokenIssueTestProbe>> {
     static PROBES: std::sync::OnceLock<
@@ -108,7 +108,7 @@ fn install_projected_token_issue_test_probe(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 fn projected_token_issue_test_probe(namespace: &str) -> Option<ProjectedTokenIssueTestProbe> {
     projected_token_issue_test_probes()
         .lock()
@@ -120,7 +120,7 @@ fn projected_token_issue_test_probe(namespace: &str) -> Option<ProjectedTokenIss
 #[cfg(test)]
 use klights_leader_api::{ResourceQueryConsistency, pod_get_request};
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 fn test_watch_signals(db: &DatastoreHandle) -> Arc<dyn klights_watch::WatchSignalSubscribe> {
     let sink = db.commit_observation_sink();
     sink.as_any()
@@ -135,7 +135,7 @@ pub(crate) struct LocalApiPersistencePorts {
 }
 
 impl LocalApiPersistencePorts {
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub(crate) fn new(
         db: DatastoreHandle,
         passive_reads: crate::datastore::selector::PassiveReadPorts,
@@ -362,9 +362,9 @@ impl RootCommittedOutboxDelivery {
                     as &dyn klights_reconcile_api::ControllerReconcileSink),
                 Some(controller_dispatcher.as_ref()
                     as &dyn klights_reconcile_api::ServiceReconcileSink),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "pod-repository-test-support"))]
                 gc_pod_delete_sink,
-                #[cfg(not(test))]
+                #[cfg(not(any(test, feature = "pod-repository-test-support")))]
                 gc_pod_delete_sink,
                 self.side_effects
                     .non_pod_finalization
@@ -405,7 +405,7 @@ impl LeaderOutboxDelivery for RootCommittedOutboxDelivery {
     }
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 #[derive(Clone)]
 struct LocalApiTestServices {
     resource_command: Arc<dyn LeaderResourceCommand>,
@@ -417,7 +417,7 @@ pub struct LocalApiClient {
     db: DatastoreHandle,
     positioned_watch: klights_watch::PositionedWatchService,
     pod_store: Arc<PodStore>,
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     test_services: LocalApiTestServices,
     authoring_node: String,
     containerd_namespace: String,
@@ -486,7 +486,7 @@ impl LocalApiClient {
     ) -> ProjectedServiceAccountTokenFuture<'_> {
         Box::pin(async move {
             let leadership = LeadershipGenerationFence::sample(self.is_leader_rx.clone())?;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             if let Some(probe) = projected_token_issue_test_probe(&self.containerd_namespace) {
                 (probe.async_boundary)().await;
             }
@@ -510,7 +510,7 @@ impl LocalApiClient {
             let claims = authorize_projected_service_account_token(&resources, &request).await;
             leadership.ensure_unchanged()?;
             let claims = claims?;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             if let Some(probe) = projected_token_issue_test_probe(&self.containerd_namespace) {
                 probe
                     .sign_attempts
@@ -536,7 +536,7 @@ impl LocalApiClient {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub(crate) fn new(
         db: DatastoreHandle,
         authoring_node: String,
@@ -570,7 +570,7 @@ impl LocalApiClient {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub(crate) fn new_with_file_process(
         db: DatastoreHandle,
         authoring_node: String,
@@ -605,7 +605,7 @@ impl LocalApiClient {
         )
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub(crate) fn new_with_node_lease_tracker_and_passive_reads(
         db: DatastoreHandle,
         passive_reads: crate::datastore::selector::PassiveReadPorts,
@@ -643,7 +643,7 @@ impl LocalApiClient {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub(crate) fn new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
         db: DatastoreHandle,
         authoring_node: String,
@@ -663,7 +663,7 @@ impl LocalApiClient {
         )
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn new_with_node_lease_tracker_and_containerd_namespace_and_file_process_with_reads(
         db: DatastoreHandle,
         passive_reads: crate::datastore::selector::PassiveReadPorts,
@@ -702,7 +702,7 @@ impl LocalApiClient {
         let pod_store = Arc::new(crate::pod_repository_composition::new_pod_store(db.clone()));
         let crypto = file_process.crypto_executor();
         let outbox_side_effects = Arc::new(RootOutboxSideEffectState::new(db.clone()));
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         let test_services = {
             let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
                 crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()),
@@ -739,7 +739,7 @@ impl LocalApiClient {
             }
         };
         Self {
-            #[cfg(any(test, feature = "integration-test-harness"))]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             test_services,
             db: db.clone(),
             positioned_watch,
@@ -883,7 +883,7 @@ impl LeaderResourceQuery for LocalApiClient {
     }
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 impl LeaderResourceCommand for LocalApiClient {
     fn submit_resource_command(
         &self,
@@ -895,14 +895,14 @@ impl LeaderResourceCommand for LocalApiClient {
     }
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 impl LeaderOutboxDelivery for LocalApiClient {
     fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
         self.test_services.outbox_delivery.deliver_outbox(request)
     }
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 impl LeaderAuthenticatedOutboxDelivery for LocalApiClient {
     fn deliver_authenticated_outbox(
         &self,
@@ -1271,10 +1271,10 @@ mod inner_gate_tests {
     //! writes the moment the receiver observes `true`.
 
     use super::*;
+    use crate::bootstrap::composition_tests::support::OutboxPayload;
     use crate::datastore::ReplicatedCreateOptions;
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::{DatastoreBackend, ResourceListQuery};
-    use crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload;
     use futures::StreamExt as _;
     use klights_cluster_core::command::StorageCommand;
     use klights_kubelet::node_outbox::payload::OutboxOperation;

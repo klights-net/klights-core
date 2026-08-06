@@ -1,16 +1,16 @@
 //! Test-only compatibility DTOs retained for legacy root regression coverage.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use serde_json::Value;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PodWorkqueueKind {
     Pod,
     Namespace,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PodWorkqueueEntry {
     pub id: i64,
@@ -23,13 +23,13 @@ pub struct PodWorkqueueEntry {
     pub next_attempt_at_ms: i64,
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(test)]
 pub use super::sqlite::DeadLetterTestInsert;
-#[cfg(any(test, feature = "integration-test-harness"))]
-pub use super::sqlite::{DeadLetterRow, OutboxInsert, OutboxRow, OutboxStats, PodStatusCheckpoint};
+#[cfg(test)]
+pub use super::sqlite::{DeadLetterRow, OutboxInsert, OutboxRow};
 
 impl super::NodeLocalStores {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub async fn enqueue_workqueue(
         &self,
         kind: PodWorkqueueKind,
@@ -58,7 +58,7 @@ impl super::NodeLocalStores {
             .map_err(anyhow::Error::from)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub async fn peek_workqueue_next_due(&self) -> anyhow::Result<Option<i64>> {
         self.pod_workqueue()
             .peek_next_due_ms()
@@ -66,7 +66,7 @@ impl super::NodeLocalStores {
             .map_err(anyhow::Error::from)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub async fn claim_workqueue_due(
         &self,
         now_ms: i64,
@@ -95,7 +95,7 @@ impl super::NodeLocalStores {
         .transpose()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub async fn complete_workqueue(&self, _id: i64) -> anyhow::Result<()> {
         Ok(())
     }

@@ -69,7 +69,7 @@ pub struct PodRepositoryBuildConfig {
     pub controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     #[cfg(not(test))]
     pub api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub(crate) scheduler_bind_gate: Option<
         Arc<crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest>,
     >,
@@ -97,7 +97,7 @@ struct RootPodRepositoryComposition {
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
     controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     scheduler_bind_gate: Option<
         Arc<crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest>,
     >,
@@ -113,15 +113,15 @@ pub(crate) struct RootPodRepositoryParts {
 #[derive(Clone)]
 struct RootPodWorkqueuePersistence {
     node_local: Option<Arc<dyn klights_node_store::PodWorkqueueStore>>,
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     test_rows: Arc<std::sync::Mutex<Vec<RootInMemoryPodWorkqueueEntry>>>,
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     test_next_id: Arc<std::sync::atomic::AtomicI64>,
 }
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 #[derive(Clone)]
 struct RootInMemoryPodWorkqueueEntry {
     id: i64,
@@ -242,11 +242,11 @@ impl WorkerPodAdapters {
             namespace_bootstrap: adapter.clone(),
             namespace_termination: adapter.clone(),
             mutation_reconcile: adapter,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             test_api: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             test_subresource: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             test_scheduling: None,
             #[cfg(test)]
             test_mark_terminating: None,
@@ -690,7 +690,7 @@ impl crate::kubelet::pod_repository::store::PodPersistence for RootPodPersistenc
         });
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn subscribe_watch(&self) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
         self.db
             .subscribe_watch(klights_watch::WatchTopic::new("v1", "Pod"))
@@ -731,7 +731,7 @@ fn focused_workqueue_entry(
             uid: pod.uid,
             payload: serde_json::from_slice(&payload)?,
             attempt_count,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             next_attempt_at_ms: _next_due_ms.get(),
         },
     )
@@ -771,11 +771,11 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
                 .await
                 .map_err(anyhow::Error::from);
         }
-        #[cfg(not(any(test, feature = "integration-test-harness")))]
+        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
         return Err(anyhow::anyhow!(
             "production Pod workqueue persistence requires node-local storage"
         ));
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         {
             let id = self
                 .test_next_id
@@ -806,11 +806,11 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
                 .await
                 .map_err(anyhow::Error::from);
         }
-        #[cfg(not(any(test, feature = "integration-test-harness")))]
+        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
         return Err(anyhow::anyhow!(
             "production Pod workqueue persistence requires node-local storage"
         ));
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         {
             Ok(self
                 .test_rows
@@ -833,11 +833,11 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
                 .map(focused_workqueue_entry)
                 .transpose();
         }
-        #[cfg(not(any(test, feature = "integration-test-harness")))]
+        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
         return Err(anyhow::anyhow!(
             "production Pod workqueue persistence requires node-local storage"
         ));
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         {
             let mut rows = self.test_rows.lock().unwrap();
             let candidate = rows
@@ -856,7 +856,7 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
                     uid: row.uid,
                     payload: row.payload,
                     attempt_count: row.attempt_count,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "pod-repository-test-support"))]
                     next_attempt_at_ms: row.next_attempt_at_ms,
                 }
             }))
@@ -869,11 +869,11 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
             // preserving the existing node.db claim semantics.
             return Ok(());
         }
-        #[cfg(not(any(test, feature = "integration-test-harness")))]
+        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
         return Err(anyhow::anyhow!(
             "production Pod workqueue persistence requires node-local storage"
         ));
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         {
             self.test_rows.lock().unwrap().retain(|row| row.id != _id);
             Ok(())
@@ -932,7 +932,7 @@ impl RootPodRepositoryComposition {
                 dependencies.delete_coordinator.clone(),
                 self.db.clone(),
                 self.wall_clock.clone(),
-                #[cfg(any(test, feature = "integration-test-harness"))]
+                #[cfg(any(test, feature = "pod-repository-test-support"))]
                 self.scheduler_bind_gate.clone(),
             );
         let pod_query: Arc<dyn klights_pod_api::PodQuery> = native.clone();
@@ -1009,11 +1009,11 @@ impl RootPodRepositoryComposition {
             namespace_bootstrap: pod_reconcile.clone(),
             namespace_termination: pod_reconcile.clone(),
             mutation_reconcile: pod_reconcile,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             test_api: Some(api.clone()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             test_subresource: Some(subresource.clone()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             test_scheduling: Some(scheduling.clone()),
             #[cfg(test)]
             test_mark_terminating: Some(mark_terminating),
@@ -1022,7 +1022,7 @@ impl RootPodRepositoryComposition {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "pod-repository-test-support")))]
 pub(crate) fn build_pod_repository_parts(
     config: PodRepositoryBuildConfig,
     leader_coordination: Option<Arc<dyn klights_leader_api::ControllerCoordination>>,
@@ -1030,7 +1030,7 @@ pub(crate) fn build_pod_repository_parts(
     build_pod_repository_parts_inner(config, leader_coordination, None)
 }
 
-#[cfg(all(not(test), feature = "integration-test-harness"))]
+#[cfg(any())]
 pub(crate) fn build_integration_pod_repository_parts(
     config: PodRepositoryBuildConfig,
     resource_query: Arc<dyn LeaderResourceQuery>,
@@ -1038,7 +1038,7 @@ pub(crate) fn build_integration_pod_repository_parts(
     build_pod_repository_parts_inner(config, None, Some(resource_query))
 }
 
-#[cfg(test)]
+#[cfg(feature = "pod-repository-test-support")]
 pub(crate) fn build_integration_pod_repository_parts(
     config: PodRepositoryBuildConfig,
     resource_query: Arc<dyn LeaderResourceQuery>,
@@ -1056,7 +1056,7 @@ pub(crate) fn build_integration_pod_repository_parts(
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub(crate) fn build_pod_repository_parts(
     config: PodRepositoryBuildConfig,
     leader_coordination: Option<Arc<dyn klights_leader_api::ControllerCoordination>>,
@@ -1064,26 +1064,11 @@ pub(crate) fn build_pod_repository_parts(
     build_pod_repository_parts_inner(config, leader_coordination, None, None)
 }
 
-#[cfg(test)]
-pub(crate) fn build_pod_repository_parts_with_test_support(
-    config: PodRepositoryBuildConfig,
-    leader_coordination: Option<Arc<dyn klights_leader_api::ControllerCoordination>>,
-    api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
-    gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
-) -> RootPodRepositoryParts {
-    build_pod_repository_parts_inner(
-        config,
-        leader_coordination,
-        None,
-        Some((api_identity, gc_coordination)),
-    )
-}
-
 fn build_pod_repository_parts_inner(
     config: PodRepositoryBuildConfig,
     leader_coordination: Option<Arc<dyn klights_leader_api::ControllerCoordination>>,
     resource_query_override: Option<Arc<dyn LeaderResourceQuery>>,
-    #[cfg(test)] test_support: Option<(
+    #[cfg(any(test, feature = "pod-repository-test-support"))] test_support: Option<(
         Arc<dyn k8s_native_service::ApiIdentityGenerator>,
         Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
     )>,
@@ -1102,7 +1087,7 @@ fn build_pod_repository_parts_inner(
         controller_identity,
         #[cfg(not(test))]
         api_identity,
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         scheduler_bind_gate,
         #[cfg(not(test))]
         gc_coordination,
@@ -1117,14 +1102,16 @@ fn build_pod_repository_parts_inner(
                 as Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
         )
     });
+    #[cfg(all(feature = "pod-repository-test-support", not(test)))]
+    let _ = test_support;
     let _ = scheduling_mode;
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "pod-repository-test-support")))]
     let resource_query = resource_query_override
         .or_else(|| cluster_api.clone())
         .expect("production Pod repository requires a leader resource query");
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     let _ = resource_query_override;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     let resource_query = cluster_api.clone().unwrap_or_else(|| {
         Arc::new(crate::control_plane::client::local::LocalApiClient::new(
             db.clone(),
@@ -1140,11 +1127,11 @@ fn build_pod_repository_parts_inner(
     ));
     let workqueue_persistence = RootPodWorkqueuePersistence {
         node_local: pod_workqueue_store,
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         wall_clock: wall_clock.clone(),
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         test_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         test_next_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
     };
     let workqueue = if let Some(leader_coordination) = leader_coordination {
@@ -1183,7 +1170,7 @@ fn build_pod_repository_parts_inner(
         wall_clock: Arc::new(klights_supervisor::SystemWallClock),
         controller_identity,
         api_identity,
-        #[cfg(any(test, feature = "integration-test-harness"))]
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
         scheduler_bind_gate,
     }
     .build(PodRepositoryAdapterDependencies {
@@ -1245,11 +1232,11 @@ pub(crate) fn build_worker_pod_repository_parts(
         store.clone(),
         RootPodWorkqueuePersistence {
             node_local: Some(config.pod_workqueue_store),
-            #[cfg(any(test, feature = "integration-test-harness"))]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             wall_clock: wall_clock.clone(),
-            #[cfg(any(test, feature = "integration-test-harness"))]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             test_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
-            #[cfg(any(test, feature = "integration-test-harness"))]
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
             test_next_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
         },
         config.supervisor.clone(),

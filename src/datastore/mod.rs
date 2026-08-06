@@ -16,10 +16,10 @@ pub(crate) mod snapshot_export;
 pub mod sqlite;
 pub mod types;
 
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub use backend::CommitObservationSink;
 pub(crate) use backend::DatastoreBackendLifecyclePort;
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub use backend::TestWatchStore;
 pub use backend::{
     AppliedOutboxStore, ClusterResourceQueryStore, CommittedOutboxApply,
@@ -33,10 +33,10 @@ pub use klights_cluster_core::{
     PatchKind, PositionedWatchEvent, Resource, ResourceBatchOperation, ResourceBatchPutMode,
     ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub use klights_cluster_datastore::sqlite::embedded::ReplicatedCreateOptions;
 pub use klights_cluster_store::StagedPostCommit;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub(crate) use klights_watch::WatchTopic;
 pub use types::{
     CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation, ListPageRequest,
@@ -47,5 +47,5 @@ pub use types::{
 
 #[cfg(test)]
 pub use sqlite::create_staged_post_commit;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub use sqlite::{staged_post_commit_from_event, staged_test_event};

@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_cluster_core::CommandMeta;
 use klights_cluster_core::{
     LogApplyAppliedOutboxRow, LogApplyPodCleanupIntentRow, OutboxApplyError as OutboxDeliveryError,
@@ -10,12 +10,12 @@ use klights_cluster_core::{
     ResourcePatchRequest, ResourcePreconditions, StorageCommand, WatchReplayPosition,
 };
 use serde_json::Value;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use tokio::sync::broadcast;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use crate::datastore::ReplicatedCreateOptions;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use crate::datastore::WatchTopic;
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::types::{
@@ -23,11 +23,11 @@ use crate::datastore::types::{
     ResourceList, ResourceListQuery, SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
 };
 use klights_cluster_datastore::errors::DatastoreError;
-#[cfg(any(test, feature = "integration-test-harness"))]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_cluster_store::StagedPostCommit;
 
 use super::SequencedDatastore;
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use super::apply_command_to_backend;
 
 const NODE_LEASE_RENEW_OPERATION: &str = "LeaseRenew";
@@ -66,7 +66,7 @@ fn reject_application_committed_apply<T>(operation: &'static str) -> Result<T> {
 
 #[async_trait]
 impl DatastoreBackend for SequencedDatastore {
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn commit_observation_sink(
         &self,
     ) -> std::sync::Arc<dyn crate::datastore::CommitObservationSink> {
@@ -96,17 +96,17 @@ impl DatastoreBackend for SequencedDatastore {
         self.passive.acquire_snapshot_mutation_fence().await
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<klights_watch::WatchEvent> {
         self.passive.subscribe_watch(topic)
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> klights_watch::WatchReceiver {
         self.passive.subscribe_watch_many(topics)
     }
 
-    #[cfg(any(test, feature = "integration-test-harness"))]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn broadcast_watch_event(&self, pending: StagedPostCommit) {
         self.passive.broadcast_watch_event(pending);
     }
@@ -1255,7 +1255,7 @@ impl DatastoreBackend for SequencedDatastore {
     }
 
     /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn apply_replicated_command(
         &self,
         command: StorageCommand,
@@ -1432,7 +1432,7 @@ impl crate::datastore::NamespaceStore for SequencedDatastore {
         crate::datastore::DatastoreBackend::get_namespace(self, name).await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn seed_namespace_for_test(&self, name: &str) {
         crate::datastore::DatastoreBackend::seed_namespace_for_test(self, name).await
     }
@@ -1769,7 +1769,7 @@ impl crate::datastore::NetworkMetadataStore for SequencedDatastore {
 
 #[async_trait]
 impl crate::datastore::ReplicationStore for SequencedDatastore {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn apply_replicated_command(
         &self,
         command: StorageCommand,
@@ -1810,7 +1810,7 @@ impl crate::datastore::ReplicationStore for SequencedDatastore {
         reject_application_committed_apply("apply_raft_log_apply_commit_receipt")
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
     async fn apply_replicated_create_resource(
         &self,
         api_version: &str,
@@ -1876,7 +1876,7 @@ impl klights_cluster_store::BackendLifecycleStore for SequencedDatastore {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 impl crate::datastore::TestWatchStore for SequencedDatastore {
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> klights_watch::WatchReceiver {
         crate::datastore::DatastoreBackend::subscribe_watch_many(self, topics)
