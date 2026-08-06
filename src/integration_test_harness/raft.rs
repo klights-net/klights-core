@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::IntegrationDatastoreHandle;
+use crate::datastore::DatastoreHandle as IntegrationDatastoreHandle;
 
 /// Opaque feature-gated capability for the root's exact Raft composition.
 ///

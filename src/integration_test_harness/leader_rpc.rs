@@ -2,7 +2,8 @@
 
 use std::sync::Arc;
 
-use super::{DeterministicControllerIdentity, IntegrationDatastoreHandle};
+use super::native_api::DeterministicControllerIdentity;
+use crate::datastore::DatastoreHandle as IntegrationDatastoreHandle;
 
 pub struct IntegrationPassiveReadPorts {
     ports: crate::datastore::selector::PassiveReadPorts,

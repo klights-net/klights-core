@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::IntegrationResourceMutationPauseOperation;
+use klights_cluster_datastore::sqlite::embedded::ResourceMutationPauseOperation as IntegrationResourceMutationPauseOperation;
 use klights_pod_api::PodSubresourceMutation as _;
 use klights_reconcile_api::ControllerDispatcherPort as _;
 
