@@ -5003,6 +5003,32 @@ struct IntegrationHarnessOptions {
         Option<Arc<dyn klights_leader_api::LeaderBootstrapTokenAuthentication>>,
 }
 
+#[derive(Clone, Copy)]
+enum EndpointFixtureKind {
+    Pod,
+    Service,
+    Endpoints,
+    EndpointSlice,
+}
+
+impl EndpointFixtureKind {
+    const fn api_version(self) -> &'static str {
+        match self {
+            Self::Pod | Self::Service | Self::Endpoints => "v1",
+            Self::EndpointSlice => "discovery.k8s.io/v1",
+        }
+    }
+
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::Pod => "Pod",
+            Self::Service => "Service",
+            Self::Endpoints => "Endpoints",
+            Self::EndpointSlice => "EndpointSlice",
+        }
+    }
+}
+
 /// Opaque full-stack API fixture owned by the base integration-test package.
 #[derive(Clone)]
 pub struct NativeApiTestHarness {
@@ -6019,6 +6045,254 @@ impl NativeApiTestHarness {
             namespace,
             selector,
             ports,
+        )
+        .await
+    }
+
+    async fn seed_endpoint_fixture(
+        &self,
+        kind: EndpointFixtureKind,
+        namespace: Option<&str>,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<klights_cluster_core::Resource> {
+        self.datastore
+            .create_resource(kind.api_version(), kind.kind(), namespace, name, value)
+            .await
+    }
+
+    pub async fn seed_endpoint_namespace(
+        &self,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<klights_cluster_core::Resource> {
+        self.sqlite.create_namespace(name, value).await
+    }
+
+    pub async fn seed_endpoint_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<klights_cluster_core::Resource> {
+        self.seed_endpoint_fixture(EndpointFixtureKind::Pod, Some(namespace), name, value)
+            .await
+    }
+
+    pub async fn seed_endpoint_service(
+        &self,
+        namespace: &str,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<klights_cluster_core::Resource> {
+        self.seed_endpoint_fixture(EndpointFixtureKind::Service, Some(namespace), name, value)
+            .await
+    }
+
+    pub async fn seed_endpoints(
+        &self,
+        namespace: &str,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<klights_cluster_core::Resource> {
+        self.seed_endpoint_fixture(EndpointFixtureKind::Endpoints, Some(namespace), name, value)
+            .await
+    }
+
+    pub async fn seed_endpoint_slice(
+        &self,
+        namespace: &str,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<klights_cluster_core::Resource> {
+        self.seed_endpoint_fixture(
+            EndpointFixtureKind::EndpointSlice,
+            Some(namespace),
+            name,
+            value,
+        )
+        .await
+    }
+
+    async fn observe_endpoint_fixture(
+        &self,
+        kind: EndpointFixtureKind,
+        namespace: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
+        self.datastore
+            .get_resource(kind.api_version(), kind.kind(), Some(namespace), name)
+            .await
+    }
+
+    pub async fn observe_endpoints(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
+        self.observe_endpoint_fixture(EndpointFixtureKind::Endpoints, namespace, name)
+            .await
+    }
+
+    pub async fn observe_endpoint_slice(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
+        self.observe_endpoint_fixture(EndpointFixtureKind::EndpointSlice, namespace, name)
+            .await
+    }
+
+    pub async fn observe_endpoint_slices(
+        &self,
+        namespace: &str,
+        label_selector: Option<&str>,
+    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>> {
+        Ok(self
+            .datastore
+            .list_resources(
+                EndpointFixtureKind::EndpointSlice.api_version(),
+                EndpointFixtureKind::EndpointSlice.kind(),
+                Some(namespace),
+                crate::datastore::ResourceListQuery::new(label_selector, None, None, None),
+            )
+            .await?
+            .items)
+    }
+
+    pub async fn replace_endpoints(
+        &self,
+        namespace: &str,
+        name: &str,
+        value: serde_json::Value,
+        expected_rv: i64,
+    ) -> anyhow::Result<klights_cluster_core::Resource> {
+        self.datastore
+            .update_resource("v1", "Endpoints", Some(namespace), name, value, expected_rv)
+            .await
+    }
+
+    pub async fn remove_endpoints(&self, namespace: &str, name: &str) -> anyhow::Result<()> {
+        self.datastore
+            .delete_resource("v1", "Endpoints", Some(namespace), name)
+            .await
+    }
+
+    pub async fn remove_endpoint_slice(&self, namespace: &str, name: &str) -> anyhow::Result<()> {
+        self.datastore
+            .delete_resource(
+                "discovery.k8s.io/v1",
+                "EndpointSlice",
+                Some(namespace),
+                name,
+            )
+            .await
+    }
+
+    pub async fn endpoint_fixture_resource_version(&self) -> anyhow::Result<i64> {
+        self.datastore.get_current_resource_version().await
+    }
+
+    pub fn endpoint_fixture_value_with_resource_version(
+        value: impl Into<Arc<serde_json::Value>>,
+        resource_version: i64,
+    ) -> serde_json::Value {
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::inject_resource_version(
+            value,
+            resource_version,
+        )
+    }
+
+    pub async fn reconcile_endpoints(
+        &self,
+        service_name: &str,
+        namespace: &str,
+        selector: Option<&serde_json::Value>,
+        ports: Option<&serde_json::Value>,
+        publish_not_ready: bool,
+    ) -> anyhow::Result<()> {
+        klights_controllers::endpoints::reconcile_endpoints(
+            self.datastore.as_ref(),
+            self.pod_repository.as_ref(),
+            service_name,
+            namespace,
+            selector,
+            ports,
+            publish_not_ready,
+        )
+        .await
+    }
+
+    pub async fn reconcile_service_endpoint_batch(
+        &self,
+        service_name: &str,
+        service_uid: &str,
+        namespace: &str,
+        selector: Option<&serde_json::Value>,
+        ports: Option<&serde_json::Value>,
+        publish_not_ready: bool,
+    ) -> anyhow::Result<()> {
+        klights_controllers::endpoints::reconcile_service_endpoints_batch(
+            self.datastore.as_ref(),
+            self.pod_repository.as_ref(),
+            klights_controllers::endpoints::ServiceEndpointBatchReconcileRequest {
+                service_name,
+                service_uid,
+                namespace,
+                selector,
+                service_ports: ports,
+                publish_not_ready,
+            },
+        )
+        .await
+    }
+
+    pub async fn mirror_endpoint_fixture(
+        &self,
+        endpoints: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        klights_controllers::endpoints::mirror_endpoints_to_endpointslice_at(
+            self.datastore.as_ref(),
+            endpoints,
+            chrono::Utc::now(),
+            crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity().as_ref(),
+        )
+        .await
+    }
+
+    pub async fn cascade_delete_endpoint_service(
+        &self,
+        owner_uid: &str,
+        owner_name: &str,
+        owner_namespace: &str,
+    ) -> anyhow::Result<()> {
+        struct FailClosedGcPodDeleteSink;
+
+        impl klights_reconcile_api::GcPodDeleteSink for FailClosedGcPodDeleteSink {
+            fn request_gc_pod_delete(
+                &self,
+                _request: klights_reconcile_api::GcPodDeleteRequest,
+            ) -> klights_reconcile_api::GcPodDeleteFuture<'_> {
+                Box::pin(async {
+                    Err(klights_reconcile_api::GcPodDeleteError::unavailable(
+                        "endpoint owner-cascade fixture must not request Pod deletion",
+                    ))
+                })
+            }
+        }
+
+        klights_controllers::gc::cascade_delete_with_uid(
+            self.datastore.as_ref(),
+            owner_uid,
+            "v1",
+            owner_name,
+            "Service",
+            Some(owner_namespace.to_owned()),
+            &FailClosedGcPodDeleteSink,
+            &crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
+                self.datastore.clone(),
+            ),
+            &klights_controllers::ControllerCoordination::new(),
         )
         .await
     }

@@ -4,7 +4,6 @@ mod cluster_engine;
 pub mod control_plane;
 pub mod datastore;
 #[cfg(test)]
-mod endpoint_reconcile_integration_tests;
 #[cfg(test)]
 mod gc_ownership_integration_tests;
 #[cfg(any(test, feature = "integration-test-harness"))]
