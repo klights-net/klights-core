@@ -2581,7 +2581,7 @@ mod tests {
         .await
         .expect("open node-local");
         let adapter = WorkerStoreAdapter::new(Arc::new(HandoffLeaderApi), "worker-a".to_string());
-        let outbox = crate::integration_test_harness::node_delivery_support::outbox_from_node_db(
+        let outbox = crate::integration_test_harness::node_delivery::node_delivery_support::outbox_from_node_db(
             node_local.clone(),
         );
         let pod = serde_json::json!({

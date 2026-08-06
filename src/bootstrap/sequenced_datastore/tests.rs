@@ -2199,7 +2199,7 @@ mod cases {
             },
         };
         let payload =
-            crate::integration_test_harness::node_delivery_support::OutboxPayload::from_command(
+            crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload::from_command(
                 command,
             )
             .encode_protobuf()
@@ -2238,7 +2238,7 @@ mod cases {
             data: json!({"metadata": {"name": "from-outbox", "namespace": "default"}}),
         };
         let payload =
-            crate::integration_test_harness::node_delivery_support::OutboxPayload::from_command(
+            crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload::from_command(
                 command,
             )
             .encode_protobuf()
@@ -2574,7 +2574,7 @@ mod cases {
         let ds = SequencedDatastore::new(inner.clone(), proposer.clone());
 
         let payload =
-            crate::integration_test_harness::node_delivery_support::OutboxPayload::from_command(
+            crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload::from_command(
                 StorageCommand::CreateResource {
                     api_version: "v1".into(),
                     kind: "ConfigMap".into(),
@@ -3159,7 +3159,7 @@ mod cases {
     async fn raft_mode_follower_proposer_rejects_outbox_apply_no_local_mutation() {
         let (ds, inner) = make_ds_with_follower_proposer().await;
         let payload =
-            crate::integration_test_harness::node_delivery_support::OutboxPayload::from_command(
+            crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload::from_command(
                 StorageCommand::CreateResource {
                     api_version: "v1".into(),
                     kind: "ConfigMap".into(),

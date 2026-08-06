@@ -793,7 +793,7 @@ mod tests {
         )
         .await
         .expect("open node-local test db");
-        let outbox = crate::integration_test_harness::node_delivery_support::outbox_from_node_db(
+        let outbox = crate::integration_test_harness::node_delivery::node_delivery_support::outbox_from_node_db(
             node_db.clone(),
         );
         let dataplane = klights_leader_rpc::client::JoinDataplaneMetadata {
@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(row.subject_name, "worker-a");
         assert_eq!(row.subject_key, "v1/Node/worker-a/dataplane");
         let payload =
-            crate::integration_test_harness::node_delivery_support::OutboxPayload::decode_protobuf(
+            crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload::decode_protobuf(
                 &row.payload_proto,
             )
             .expect("decode dataplane outbox payload");

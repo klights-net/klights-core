@@ -703,7 +703,7 @@ mod tests {
     use crate::control_plane::client::remote::RemoteApiClient;
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::backend::DatastoreHandle;
-    use crate::integration_test_harness::node_delivery_support::OutboxPayload;
+    use crate::integration_test_harness::node_delivery::node_delivery_support::OutboxPayload;
     use klights_cluster_core::Resource;
     use klights_cluster_core::command::StorageCommand;
     use klights_leader_api::JoinRole;
