@@ -760,13 +760,14 @@ impl PodNativeOrchestration {
         } else {
             Value::Null
         };
-        let options = serde_json::from_value(json!({
+        let options: DeleteOptions = serde_json::from_value(json!({
             "propagationPolicy": propagation_policy,
             "orphanDependents": orphan_dependents,
             "gracePeriodSeconds": grace_period_seconds,
             "preconditions": preconditions,
         }))
         .map_err(|error| PodRepositoryError::invalid_request("deleteOptions", error.to_string()))?;
+        debug_assert_eq!(options._grace_period_seconds, grace_period_seconds);
         self.api_delete_pod(ns, name, options, dry_run)
             .await
             .map_err(|error| map_api_error_to_pod_repository(error, ns, name))
@@ -839,6 +840,9 @@ impl PodNativeOrchestration {
         let updated = delete_outcome.updated;
         let previous = delete_outcome.previous;
         let uid = delete_outcome.uid;
+        if !delete_outcome.changed {
+            return Ok(PodApiDeleteOutcome::GracefulSet(updated));
+        }
         if let Err(err) = self
             .service_reconcile
             .enqueue_after_pod_update(previous.clone(), updated.clone())

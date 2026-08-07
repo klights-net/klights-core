@@ -4,9 +4,12 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_pod_api::PodRepositoryError;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_kubelet::pod_repository::delete_deadline::{
+    PodDeleteDeadlineDisposition, plan_pod_delete_deadline,
+};
 use klights_reconcile_api::ReconcileFailureMetrics;
 use klights_supervisor::TaskSupervisor;
 
@@ -20,19 +23,12 @@ pub(crate) struct PodDeleteMarkOutcome {
     pub updated: Resource,
     pub previous: Resource,
     pub uid: String,
+    pub changed: bool,
 }
 
 #[async_trait]
 pub(crate) trait PodDeleteStorePort: Send + Sync {
     async fn get(&self, ns: &str, name: &str) -> Result<Option<Resource>>;
-
-    async fn mark_deleting_latest(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-        body: &Value,
-    ) -> Result<Resource>;
 
     async fn mark_deleting_at_resource_version(
         &self,
@@ -48,16 +44,6 @@ pub(crate) trait PodDeleteStorePort: Send + Sync {
 impl PodDeleteStorePort for PodStore {
     async fn get(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
         PodStore::get(self, ns, name).await
-    }
-
-    async fn mark_deleting_latest(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-        body: &Value,
-    ) -> Result<Resource> {
-        PodStore::mark_deleting_latest(self, ns, name, uid, body).await
     }
 
     async fn mark_deleting_at_resource_version(
@@ -166,13 +152,13 @@ impl PodDeleteCoordinator {
         resource: &Resource,
         requested_grace_period_seconds: Option<i64>,
     ) -> Value {
-        let grace_period_seconds =
-            pod_delete_grace_period_seconds(&resource.data, requested_grace_period_seconds);
-        let mut data = pod_data_with_deletion_metadata(
+        let mut data = plan_pod_delete_deadline(
             &resource.data,
-            grace_period_seconds,
+            requested_grace_period_seconds,
             self.wall_clock.now_utc(),
-        );
+        )
+        .map(|plan| plan.body)
+        .unwrap_or_else(|_| (*resource.data).clone());
         if let Some(obj) = data.as_object_mut()
             && let Some(meta) = obj.get_mut("metadata").and_then(|m| m.as_object_mut())
         {
@@ -234,8 +220,9 @@ impl PodDeleteCoordinator {
     ) -> Result<PodDeleteMarkOutcome, PodRepositoryError> {
         let mut current = initial_resource;
         let mut attempt = 0u32;
+        let operation_now = self.wall_clock.now_utc();
 
-        let (updated, previous, grace_period_seconds) = loop {
+        let (updated, previous, plan) = loop {
             let delete_base = if delete_preconditions.resource_version.is_some() {
                 current.clone()
             } else {
@@ -246,32 +233,39 @@ impl PodDeleteCoordinator {
                     .ok_or_else(|| PodRepositoryError::not_found(ns, name))?
             };
             ensure_resource_preconditions_match(&delete_base, delete_preconditions)?;
-            let grace_period_seconds =
-                pod_delete_grace_period_seconds(&delete_base.data, requested_grace_period_seconds);
-            let data = pod_data_with_deletion_metadata(
+            let plan = plan_pod_delete_deadline(
                 &delete_base.data,
-                grace_period_seconds,
-                self.wall_clock.now_utc(),
+                requested_grace_period_seconds,
+                operation_now,
+            )
+            .map_err(|error| PodRepositoryError::internal(error.to_string()))?;
+            debug_assert!(
+                !requested_grace_period_seconds.is_some_and(|requested| {
+                    delete_base
+                        .data
+                        .pointer("/metadata/deletionGracePeriodSeconds")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|existing| requested >= 0 && requested < existing)
+                }) || plan.disposition == PodDeleteDeadlineDisposition::Shorten,
+                "a shorter explicit Pod grace must produce a shortening plan"
             );
-            let mark_result = if delete_preconditions.resource_version.is_some() {
-                self.store
-                    .mark_deleting_at_resource_version(
-                        ns,
-                        name,
-                        &delete_base.uid,
-                        data,
-                        delete_base.resource_version,
-                    )
-                    .await
-            } else {
-                self.store
-                    .mark_deleting_latest(ns, name, &delete_base.uid, &data)
-                    .await
-            };
+            if plan.disposition == PodDeleteDeadlineDisposition::Unchanged {
+                break (delete_base.clone(), delete_base, plan);
+            }
+            let mark_result = self
+                .store
+                .mark_deleting_at_resource_version(
+                    ns,
+                    name,
+                    &delete_base.uid,
+                    plan.body.clone(),
+                    delete_base.resource_version,
+                )
+                .await;
 
             match mark_result {
                 Ok(updated) => {
-                    break (updated, delete_base, grace_period_seconds);
+                    break (updated, delete_base, plan);
                 }
                 Err(e)
                     if is_repository_conflict(&e) && attempt + 1 < MAX_DELETE_CONFLICT_RETRIES =>
@@ -296,23 +290,17 @@ impl PodDeleteCoordinator {
             }
         };
 
-        let uid = updated
-            .data
-            .get("metadata")
-            .and_then(|m| m.get("uid"))
-            .and_then(|u| u.as_str())
-            .unwrap_or("")
-            .to_string();
-        let deferred_delete_delay = Duration::from_secs(grace_period_seconds as u64);
-        if let Err(e) = self
-            .enqueue_marked_pod_retry(
-                ns.to_string(),
-                name.to_string(),
-                uid.clone(),
-                deferred_delete_delay,
-                &updated.data,
-            )
-            .await
+        let uid = updated.uid.clone();
+        if plan.queue_actor_reminder
+            && let Err(e) = self
+                .enqueue_marked_pod_retry(
+                    ns.to_string(),
+                    name.to_string(),
+                    uid.clone(),
+                    plan.remaining_delay,
+                    &updated.data,
+                )
+                .await
         {
             self.metrics.record_cascade_delete_failure();
             tracing::error!(
@@ -331,6 +319,7 @@ impl PodDeleteCoordinator {
             updated,
             previous,
             uid,
+            changed: plan.disposition != PodDeleteDeadlineDisposition::Unchanged,
         })
     }
 
@@ -393,52 +382,6 @@ fn is_repository_conflict(error: &anyhow::Error) -> bool {
     )
 }
 
-pub(super) fn pod_data_with_deletion_metadata(
-    data: &Value,
-    grace_period_seconds: i64,
-    operation_now: chrono::DateTime<chrono::Utc>,
-) -> Value {
-    let mut data = data.clone();
-    if let Some(meta) = data.get_mut("metadata").and_then(|m| m.as_object_mut())
-        && meta
-            .get("deletionTimestamp")
-            .is_none_or(|timestamp| timestamp.is_null())
-    {
-        meta.insert(
-            "deletionTimestamp".to_string(),
-            Value::String(klights_cluster_core::k8s_time::format_legacy_timestamp(
-                operation_now,
-            )),
-        );
-        meta.insert(
-            "deletionGracePeriodSeconds".to_string(),
-            json!(grace_period_seconds),
-        );
-    }
-    if data
-        .pointer("/metadata/deletionTimestamp")
-        .is_some_and(|timestamp| !timestamp.is_null())
-    {
-        let transition_time =
-            klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now);
-        klights_types::mark_terminating_pod_unready_at(&mut data, &transition_time);
-    }
-    data
-}
-
-pub(super) fn pod_delete_grace_period_seconds(
-    data: &Value,
-    requested_grace_period_seconds: Option<i64>,
-) -> i64 {
-    requested_grace_period_seconds
-        .or_else(|| {
-            data.pointer("/spec/terminationGracePeriodSeconds")
-                .and_then(|value| value.as_i64())
-        })
-        .unwrap_or(30)
-        .max(0)
-}
-
 pub(super) fn pod_target_node_from_pod_data(pod: &Value) -> Option<String> {
     pod.pointer("/spec/nodeName")
         .and_then(|node| node.as_str())
@@ -450,17 +393,30 @@ pub(super) fn pod_target_node_from_pod_data(pod: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use klights_controllers::side_effects::SideEffectMetrics;
+    use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
     struct FakeDeleteStore {
         current: Mutex<Resource>,
+        writes: AtomicUsize,
+        conflicts_remaining: AtomicUsize,
     }
 
     impl FakeDeleteStore {
         fn new(resource: Resource) -> Self {
             Self {
                 current: Mutex::new(resource),
+                writes: AtomicUsize::new(0),
+                conflicts_remaining: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_conflicts(resource: Resource, conflicts: usize) -> Self {
+            Self {
+                current: Mutex::new(resource),
+                writes: AtomicUsize::new(0),
+                conflicts_remaining: AtomicUsize::new(conflicts),
             }
         }
     }
@@ -471,30 +427,32 @@ mod tests {
             Ok(Some(self.current.lock().await.clone()))
         }
 
-        async fn mark_deleting_latest(
+        async fn mark_deleting_at_resource_version(
             &self,
             _ns: &str,
             _name: &str,
             _uid: &str,
-            body: &Value,
-        ) -> Result<Resource> {
-            let mut guard = self.current.lock().await;
-            let mut updated = guard.clone();
-            updated.resource_version += 1;
-            updated.data = Arc::new(body.clone());
-            *guard = updated.clone();
-            Ok(updated)
-        }
-
-        async fn mark_deleting_at_resource_version(
-            &self,
-            ns: &str,
-            name: &str,
-            uid: &str,
             body: Value,
             _expected_rv: i64,
         ) -> Result<Resource> {
-            self.mark_deleting_latest(ns, name, uid, &body).await
+            if self
+                .conflicts_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(anyhow::Error::new(PodRepositoryError::conflict(
+                    "injected delete CAS conflict",
+                )));
+            }
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            let mut guard = self.current.lock().await;
+            let mut updated = guard.clone();
+            updated.resource_version += 1;
+            updated.data = Arc::new(body);
+            *guard = updated.clone();
+            Ok(updated)
         }
     }
 
@@ -522,6 +480,45 @@ mod tests {
     #[async_trait]
     impl PodDeleteSleeperPort for NoopDeleteSleeper {
         async fn sleep(&self, _name: &'static str, _duration: Duration) {}
+    }
+
+    #[derive(Default)]
+    struct RecordingDeleteQueue {
+        delays: Mutex<Vec<Duration>>,
+    }
+
+    #[async_trait]
+    impl PodDeleteQueuePort for RecordingDeleteQueue {
+        async fn enqueue_deferred_delete_with_target_node(
+            &self,
+            _ns: String,
+            _name: String,
+            _uid: String,
+            run_after: Duration,
+            _target_node: Option<String>,
+        ) -> Result<()> {
+            self.delays.lock().await.push(run_after);
+            Ok(())
+        }
+    }
+
+    struct FixedDeleteClock;
+
+    impl klights_kubelet::runtime_clock::RuntimeClock for FixedDeleteClock {
+        fn now_ms(&self) -> i64 {
+            1_786_190_400_000
+        }
+    }
+
+    #[derive(Default)]
+    struct AdvancingDeleteClock {
+        calls: AtomicUsize,
+    }
+
+    impl klights_kubelet::runtime_clock::RuntimeClock for AdvancingDeleteClock {
+        fn now_ms(&self) -> i64 {
+            1_786_190_400_000 + self.calls.fetch_add(1, Ordering::SeqCst) as i64 * 10_000
+        }
     }
 
     fn pod_resource() -> Resource {
@@ -582,21 +579,255 @@ mod tests {
     }
 
     #[test]
-    fn delete_grace_policy_prefers_request_then_spec_then_default_and_clamps_zero() {
-        let mut pod = (*pod_resource().data).clone();
-        let cases = [(Some(5), 5), (Some(-1), 0), (None, 0)];
-        for (requested, expected) in cases {
+    fn dry_run_delete_uses_the_absolute_future_deadline() {
+        let coordinator = PodDeleteCoordinator::new_with_ports(
+            Arc::new(FakeDeleteStore::new(pod_resource())),
+            Arc::new(RecordingDeleteQueue::default()),
+            Arc::new(NoopDeleteSleeper),
+            SideEffectMetrics::new(),
+            Arc::new(FixedDeleteClock),
+        );
+        let body = coordinator.dry_run_delete_body(&pod_resource(), Some(5));
+        assert_eq!(
+            body.pointer("/metadata/deletionTimestamp")
+                .and_then(Value::as_str),
+            Some("2026-08-08T12:00:05.000000000Z")
+        );
+        assert_eq!(
+            body.pointer("/metadata/deletionGracePeriodSeconds")
+                .and_then(Value::as_i64),
+            Some(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_equal_delete_is_a_zero_write_zero_queue_noop() {
+        let mut resource = pod_resource();
+        let mut body = (*resource.data).clone();
+        body["metadata"]["deletionTimestamp"] = json!("2026-08-08T12:00:30.000000000Z");
+        body["metadata"]["deletionGracePeriodSeconds"] = json!(30);
+        resource.data = Arc::new(body);
+        let store = Arc::new(FakeDeleteStore::new(resource.clone()));
+        let queue = Arc::new(RecordingDeleteQueue::default());
+        let coordinator = PodDeleteCoordinator::new_with_ports(
+            store.clone(),
+            queue.clone(),
+            Arc::new(NoopDeleteSleeper),
+            SideEffectMetrics::new(),
+            Arc::new(FixedDeleteClock),
+        );
+
+        let outcome = coordinator
+            .mark_and_queue_api_delete(
+                "default",
+                "pod-a",
+                Some(30),
+                &ResourcePreconditions::default(),
+                resource.clone(),
+            )
+            .await
+            .expect("repeated delete");
+
+        assert_eq!(outcome.updated.resource_version, resource.resource_version);
+        assert!(!outcome.changed);
+        assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+        assert!(queue.delays.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminating_pod_without_positive_stored_grace_queues_immediately_without_rewrite() {
+        for stored_grace in [None, Some(0)] {
+            let mut resource = pod_resource();
+            let mut body = (*resource.data).clone();
+            body["metadata"]["deletionTimestamp"] = json!("2026-08-08T12:00:30.000000000Z");
+            if let Some(stored_grace) = stored_grace {
+                body["metadata"]["deletionGracePeriodSeconds"] = json!(stored_grace);
+            }
+            resource.data = Arc::new(body);
+            let store = Arc::new(FakeDeleteStore::new(resource.clone()));
+            let queue = Arc::new(RecordingDeleteQueue::default());
+            let coordinator = PodDeleteCoordinator::new_with_ports(
+                store.clone(),
+                queue.clone(),
+                Arc::new(NoopDeleteSleeper),
+                SideEffectMetrics::new(),
+                Arc::new(FixedDeleteClock),
+            );
+
+            let outcome = coordinator
+                .mark_and_queue_api_delete(
+                    "default",
+                    "pod-a",
+                    None,
+                    &ResourcePreconditions::default(),
+                    resource,
+                )
+                .await
+                .expect("existing terminating Pod reminder");
+
+            assert!(!outcome.changed, "stored grace {stored_grace:?}");
+            assert_eq!(store.writes.load(Ordering::SeqCst), 0);
             assert_eq!(
-                pod_delete_grace_period_seconds(&pod, requested),
-                expected,
-                "requested grace {requested:?}"
+                queue.delays.lock().await.as_slice(),
+                &[Duration::ZERO],
+                "stored grace {stored_grace:?}"
             );
         }
+    }
 
-        pod.pointer_mut("/spec/terminationGracePeriodSeconds")
-            .expect("fixture termination grace")
-            .take();
-        assert_eq!(pod_delete_grace_period_seconds(&pod, None), 30);
+    #[tokio::test]
+    async fn failed_delete_precondition_has_zero_writes_and_zero_queue_effects() {
+        let store = Arc::new(FakeDeleteStore::new(pod_resource()));
+        let queue = Arc::new(RecordingDeleteQueue::default());
+        let coordinator = PodDeleteCoordinator::new_with_ports(
+            store.clone(),
+            queue.clone(),
+            Arc::new(NoopDeleteSleeper),
+            SideEffectMetrics::new(),
+            Arc::new(FixedDeleteClock),
+        );
+
+        let error = coordinator
+            .mark_and_queue_api_delete(
+                "default",
+                "pod-a",
+                Some(5),
+                &ResourcePreconditions {
+                    uid: Some("wrong-uid".to_string()),
+                    resource_version: None,
+                },
+                pod_resource(),
+            )
+            .await
+            .expect_err("UID precondition must fail");
+
+        assert_eq!(
+            error,
+            PodRepositoryError::conflict("UID precondition failed")
+        );
+        assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+        assert!(queue.delays.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dry_run_matches_real_delete_body_without_writes_or_queue_effects() {
+        let store = Arc::new(FakeDeleteStore::new(pod_resource()));
+        let queue = Arc::new(RecordingDeleteQueue::default());
+        let coordinator = PodDeleteCoordinator::new_with_ports(
+            store.clone(),
+            queue.clone(),
+            Arc::new(NoopDeleteSleeper),
+            SideEffectMetrics::new(),
+            Arc::new(FixedDeleteClock),
+        );
+
+        let mut dry_run = coordinator.dry_run_delete_body(&pod_resource(), Some(5));
+        assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+        assert!(queue.delays.lock().await.is_empty());
+
+        let outcome = coordinator
+            .mark_and_queue_api_delete(
+                "default",
+                "pod-a",
+                Some(5),
+                &ResourcePreconditions::default(),
+                pod_resource(),
+            )
+            .await
+            .expect("real delete");
+        dry_run["metadata"]
+            .as_object_mut()
+            .expect("metadata object")
+            .remove("resourceVersion");
+        assert_eq!(dry_run, *outcome.updated.data);
+        assert_eq!(store.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            queue.delays.lock().await.as_slice(),
+            &[Duration::from_secs(5)]
+        );
+    }
+
+    #[tokio::test]
+    async fn shorter_delete_recomputes_from_original_start_and_queues_remaining_deadline() {
+        let mut resource = pod_resource();
+        let mut body = (*resource.data).clone();
+        body["metadata"]["deletionTimestamp"] = json!("2026-08-08T12:00:30.000000000Z");
+        body["metadata"]["deletionGracePeriodSeconds"] = json!(30);
+        resource.data = Arc::new(body);
+        let store = Arc::new(FakeDeleteStore::new(resource.clone()));
+        let queue = Arc::new(RecordingDeleteQueue::default());
+        let coordinator = PodDeleteCoordinator::new_with_ports(
+            store.clone(),
+            queue.clone(),
+            Arc::new(NoopDeleteSleeper),
+            SideEffectMetrics::new(),
+            Arc::new(FixedDeleteClock),
+        );
+
+        let outcome = coordinator
+            .mark_and_queue_api_delete(
+                "default",
+                "pod-a",
+                Some(5),
+                &ResourcePreconditions::default(),
+                resource,
+            )
+            .await
+            .expect("shorter delete");
+
+        assert!(outcome.changed);
+        assert_eq!(store.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            outcome
+                .updated
+                .data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(Value::as_str),
+            Some("2026-08-08T12:00:05.000000000Z")
+        );
+        assert_eq!(
+            queue.delays.lock().await.as_slice(),
+            &[Duration::from_secs(5)]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_cas_retries_reuse_one_operation_clock_sample() {
+        let store = Arc::new(FakeDeleteStore::with_conflicts(pod_resource(), 1));
+        let queue = Arc::new(RecordingDeleteQueue::default());
+        let clock = Arc::new(AdvancingDeleteClock::default());
+        let coordinator = PodDeleteCoordinator::new_with_ports(
+            store,
+            queue.clone(),
+            Arc::new(NoopDeleteSleeper),
+            SideEffectMetrics::new(),
+            clock.clone(),
+        );
+
+        let outcome = coordinator
+            .mark_and_queue_api_delete(
+                "default",
+                "pod-a",
+                Some(5),
+                &ResourcePreconditions::default(),
+                pod_resource(),
+            )
+            .await
+            .expect("delete after one CAS conflict");
+
+        assert_eq!(clock.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            outcome
+                .updated
+                .data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(Value::as_str),
+            Some("2026-08-08T12:00:05.000000000Z")
+        );
+        assert_eq!(
+            queue.delays.lock().await.as_slice(),
+            &[Duration::from_secs(5)]
+        );
     }
 
     #[test]

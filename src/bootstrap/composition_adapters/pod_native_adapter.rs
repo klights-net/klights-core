@@ -238,6 +238,7 @@ impl PodDeleteOrchestration for RootPodNativeAdapter {
                 updated: outcome.updated,
                 previous: outcome.previous,
                 uid: outcome.uid,
+                changed: outcome.changed,
             })
         })
     }

@@ -5,6 +5,7 @@
 //! nor its public surface can remove a Pod row: bound-Pod actor finalization
 //! and the leader-only unscheduled-Pod CAS remain separate capabilities.
 
+pub mod delete_deadline;
 pub mod status;
 pub mod workqueue;
 pub use status::PodStatusWriter;

@@ -69,6 +69,14 @@ pub fn preserve_status_subresource_on_main_update(
     if !proposed.is_object() {
         return;
     }
+    let terminating_transition_time = (api_version == "v1"
+        && kind == "Pod"
+        && proposed
+            .pointer("/metadata/deletionTimestamp")
+            .is_some_and(|timestamp| !timestamp.is_null()))
+    .then(|| pod_delete_mark_transition_time(proposed))
+    .flatten()
+    .map(str::to_string);
     if let Some(mut status) = current.get("status").cloned() {
         // Carry scheduler-owned Pod conditions (DisruptionTarget, ...) that the
         // main write was setting into the preserved live status. The central
@@ -95,6 +103,9 @@ pub fn preserve_status_subresource_on_main_update(
         );
         if let Some(obj) = proposed.as_object_mut() {
             obj.insert("status".to_string(), status);
+        }
+        if let Some(transition_time) = terminating_transition_time.as_deref() {
+            mark_terminating_pod_unready_at(proposed, transition_time);
         }
     } else if let Some(obj) = proposed.as_object_mut() {
         obj.remove("status");
@@ -194,9 +205,22 @@ pub fn is_pod_delete_mark_patch(api_version: &str, kind: &str, patch: &Value) ->
     metadata.keys().all(|key| {
         matches!(
             key.as_str(),
-            "deletionTimestamp" | "deletionGracePeriodSeconds"
+            "deletionTimestamp" | "deletionGracePeriodSeconds" | "generation"
         )
     })
+}
+
+pub fn pod_delete_mark_transition_time(patch: &Value) -> Option<&str> {
+    patch
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .and_then(|conditions| {
+            conditions.iter().find(|condition| {
+                condition.pointer("/type").and_then(Value::as_str) == Some("Ready")
+            })
+        })
+        .and_then(|condition| condition.pointer("/lastTransitionTime"))
+        .and_then(Value::as_str)
 }
 
 pub fn is_zero_grace_pod_delete_mark_patch(api_version: &str, kind: &str, patch: &Value) -> bool {

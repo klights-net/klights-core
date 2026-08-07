@@ -71,7 +71,7 @@ pub use quantity::{
 pub use resource_semantics::{
     has_builtin_status_subresource, is_pod_delete_mark_patch, is_zero_grace_pod_delete_mark_patch,
     mark_terminating_pod_unready_at, pod_delete_mark_patch_without_status,
-    preserve_status_subresource_on_main_update,
+    pod_delete_mark_transition_time, preserve_status_subresource_on_main_update,
 };
 pub use rtt_estimator::{RTT_DEFAULT_MS, RttEstimator};
 
@@ -138,7 +138,8 @@ mod tests {
     use super::{
         PodIdentity, PodStatusOwner, ResourceKey, apply_merge_patch,
         is_zero_grace_pod_delete_mark_patch, mark_terminating_pod_unready_at,
-        merge_pod_status_for_update,
+        merge_pod_status_for_update, pod_delete_mark_transition_time,
+        preserve_status_subresource_on_main_update,
     };
 
     #[test]
@@ -225,11 +226,13 @@ mod tests {
         let patch = json!({
             "metadata": {
                 "deletionTimestamp": "2026-07-15T00:00:00Z",
-                "deletionGracePeriodSeconds": 0
+                "deletionGracePeriodSeconds": 0,
+                "generation": 8
             },
             "status": {"phase": "Running"}
         });
         assert!(is_zero_grace_pod_delete_mark_patch("v1", "Pod", &patch));
+        assert_eq!(pod_delete_mark_transition_time(&patch), None);
 
         let mut pod = json!({"status": {"conditions": [], "containerStatuses": [{"ready": true}]}});
         mark_terminating_pod_unready_at(&mut pod, "2026-07-15T00:00:00Z");
@@ -240,6 +243,45 @@ mod tests {
         assert_eq!(
             pod.pointer("/status/conditions/0/lastTransitionTime"),
             Some(&json!("2026-07-15T00:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn main_update_preserves_live_status_while_applying_planned_delete_readiness() {
+        let current = json!({"status": {
+            "phase": "Running",
+            "raceBump": 1,
+            "conditions": [{"type": "Ready", "status": "True"}],
+            "containerStatuses": [{"name": "app", "ready": true}]
+        }});
+        let mut proposed = json!({
+            "metadata": {
+                "deletionTimestamp": "2026-07-15T00:00:30Z",
+                "deletionGracePeriodSeconds": 30
+            },
+            "status": {"conditions": [{
+                "type": "Ready",
+                "status": "False",
+                "reason": "PodTerminating",
+                "lastTransitionTime": "2026-07-15T00:00:00Z"
+            }]}
+        });
+
+        preserve_status_subresource_on_main_update("v1", "Pod", &current, &mut proposed);
+
+        assert_eq!(proposed.pointer("/status/phase"), Some(&json!("Running")));
+        assert_eq!(proposed.pointer("/status/raceBump"), Some(&json!(1)));
+        assert_eq!(
+            proposed.pointer("/status/conditions/0/status"),
+            Some(&json!("False"))
+        );
+        assert_eq!(
+            proposed.pointer("/status/conditions/0/lastTransitionTime"),
+            Some(&json!("2026-07-15T00:00:00Z"))
+        );
+        assert_eq!(
+            proposed.pointer("/status/containerStatuses/0/ready"),
+            Some(&json!(false))
         );
     }
 

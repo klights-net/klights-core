@@ -52,7 +52,6 @@ pub struct PodStore {
     writes: Arc<dyn PodRepositoryWritePersistence>,
     #[cfg(any(test, feature = "pod-repository-test-support"))]
     watches: Option<Arc<dyn PodRepositoryWatchPersistence>>,
-    wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     /// Incremented on every pod create/delete to signal sandbox GC that a sweep may be needed.
     pub(super) sandbox_gc_dirty: Arc<AtomicUsize>,
 }
@@ -61,7 +60,6 @@ impl PodStore {
     pub(crate) fn from_persistence(
         reads: Arc<dyn PodRepositoryReadPersistence>,
         writes: Arc<dyn PodRepositoryWritePersistence>,
-        wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
         sandbox_gc_dirty: Arc<AtomicUsize>,
         #[cfg(any(test, feature = "pod-repository-test-support"))] watches: Option<
             Arc<dyn PodRepositoryWatchPersistence>,
@@ -72,7 +70,6 @@ impl PodStore {
             writes,
             #[cfg(any(test, feature = "pod-repository-test-support"))]
             watches,
-            wall_clock,
             sandbox_gc_dirty,
         }
     }
@@ -214,6 +211,7 @@ impl PodStore {
             .ok_or_else(|| PodRepositoryError::not_found(ns, name).into())
     }
 
+    #[cfg(feature = "pod-repository-test-support")]
     pub(super) async fn mark_deleting_latest(
         &self,
         ns: &str,
@@ -226,11 +224,9 @@ impl PodStore {
             .and_then(|m| m.get("deletionTimestamp"))
             .filter(|value| !value.is_null())
             .cloned()
-            .unwrap_or_else(|| {
-                Value::String(klights_cluster_core::k8s_time::format_legacy_timestamp(
-                    self.wall_clock.now_utc(),
-                ))
-            });
+            .ok_or_else(|| {
+                anyhow::anyhow!("planned Pod delete body is missing deletionTimestamp")
+            })?;
         let deletion_grace_period_seconds = metadata
             .and_then(|m| m.get("deletionGracePeriodSeconds"))
             .cloned()
@@ -276,19 +272,21 @@ impl PodStore {
         body: Value,
         expected_rv: i64,
     ) -> Result<Resource> {
+        let patch = planned_delete_mark_patch(&body)?;
         self.mark_sandbox_dirty();
         self.writes
-            .replace_persisted_pod(PodRepositoryReplaceRequest {
+            .patch_persisted_pod(PodRepositoryPatchRequest {
                 namespace: ns.to_string(),
                 name: name.to_string(),
-                body,
+                patch_kind: PatchKind::Merge,
+                patch,
                 preconditions: ResourcePreconditions {
                     uid: Some(uid.to_string()),
                     resource_version: Some(expected_rv),
                 },
             })
-            .await
-            .map_err(Into::into)
+            .await?
+            .ok_or_else(|| PodRepositoryError::not_found(ns, name).into())
     }
 
     /// Internal scheduler path: bind `spec.nodeName` and update the
@@ -404,6 +402,37 @@ impl PodStore {
             .expect("watch subscription is unavailable for this persistence adapter")
             .pod_watch_receiver()
     }
+}
+
+fn planned_delete_mark_patch(body: &Value) -> Result<Value> {
+    let metadata = body
+        .get("metadata")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("planned Pod delete body is missing metadata"))?;
+    let mut planned_metadata = serde_json::Map::new();
+    for field in [
+        "deletionTimestamp",
+        "deletionGracePeriodSeconds",
+        "generation",
+    ] {
+        if let Some(value) = metadata.get(field) {
+            planned_metadata.insert(field.to_string(), value.clone());
+        }
+    }
+    let mut planned_status = serde_json::Map::new();
+    if let Some(status) = body.get("status").and_then(Value::as_object) {
+        for field in ["conditions", "containerStatuses", "initContainerStatuses"] {
+            if let Some(value) = status.get(field) {
+                planned_status.insert(field.to_string(), value.clone());
+            }
+        }
+    }
+    let mut patch = serde_json::Map::new();
+    patch.insert("metadata".to_string(), Value::Object(planned_metadata));
+    if !planned_status.is_empty() {
+        patch.insert("status".to_string(), Value::Object(planned_status));
+    }
+    Ok(Value::Object(patch))
 }
 
 pub(crate) fn classify_bound_finalization(

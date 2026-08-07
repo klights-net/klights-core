@@ -110,31 +110,40 @@ impl RootBoundPodFinalization {
         uid: &str,
         live: &klights_cluster_core::Resource,
         operation_now: chrono::DateTime<chrono::Utc>,
-    ) -> StorageCommand {
-        let grace_period_seconds = live
-            .data
-            .pointer("/spec/terminationGracePeriodSeconds")
-            .and_then(|value| value.as_i64())
-            .unwrap_or(30)
-            .max(0);
-        StorageCommand::PatchResource {
+    ) -> Result<
+        StorageCommand,
+        klights_kubelet::pod_repository::delete_deadline::PodDeleteDeadlineError,
+    > {
+        let plan = klights_kubelet::pod_repository::delete_deadline::plan_pod_delete_deadline(
+            &live.data,
+            None,
+            operation_now,
+        )?;
+        let mut metadata = serde_json::Map::new();
+        for field in [
+            "deletionTimestamp",
+            "deletionGracePeriodSeconds",
+            "generation",
+        ] {
+            if let Some(value) = plan.body.pointer(&format!("/metadata/{field}")) {
+                metadata.insert(field.to_string(), value.clone());
+            }
+        }
+        Ok(StorageCommand::PatchResource {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some(namespace.to_string()),
             name: name.to_string(),
             patch_kind: klights_cluster_core::PatchKind::Merge,
             patch: serde_json::json!({
-                "metadata": {
-                    "deletionTimestamp": klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now),
-                    "deletionGracePeriodSeconds": grace_period_seconds,
-                }
+                "metadata": metadata
             }),
             preconditions: klights_cluster_core::ResourcePreconditions {
                 uid: Some(uid.to_string()),
                 resource_version: None,
             },
             strict_resource_version: false,
-        }
+        })
     }
 }
 
@@ -273,7 +282,8 @@ impl GcPodDeleteSink for RootBoundPodFinalization {
                 &identity.uid,
                 &live,
                 self.wall_clock.now_utc(),
-            );
+            )
+            .map_err(|error| GcPodDeleteError::unavailable(error.to_string()))?;
             OutboxSendPlanner::new(Some(outbox.as_ref()))
                 .route(self.outbox_command(
                     &identity.namespace,
@@ -286,5 +296,87 @@ impl GcPodDeleteSink for RootBoundPodFinalization {
                 .map(|_| ())
                 .map_err(|error| GcPodDeleteError::unavailable(error.to_string()))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use serde_json::{Value, json};
+
+    #[test]
+    fn worker_delete_mark_command_uses_the_canonical_deadline_plan() {
+        let operation_now = Utc
+            .with_ymd_and_hms(2026, 8, 8, 12, 0, 0)
+            .single()
+            .expect("fixed operation time");
+        let live = klights_cluster_core::Resource {
+            id: 1,
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "pod-a".to_string(),
+            uid: "uid-a".to_string(),
+            resource_version: 41,
+            data: Arc::new(json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "pod-a",
+                    "namespace": "default",
+                    "uid": "uid-a",
+                    "generation": 7,
+                    "finalizers": ["example.test/finalizer"]
+                },
+                "spec": {
+                    "nodeName": "node-a",
+                    "terminationGracePeriodSeconds": 30,
+                    "containers": [{"name": "app", "image": "busybox"}]
+                }
+            })),
+        };
+
+        let command = RootBoundPodFinalization::delete_mark_command(
+            "default",
+            "pod-a",
+            "uid-a",
+            &live,
+            operation_now,
+        )
+        .expect("canonical Pod delete mark command");
+        let StorageCommand::PatchResource {
+            patch,
+            preconditions,
+            ..
+        } = command
+        else {
+            panic!("delete mark must use a merge patch");
+        };
+
+        assert_eq!(
+            patch
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(Value::as_str),
+            Some("2026-08-08T12:00:30.000000000Z")
+        );
+        assert_eq!(
+            patch
+                .pointer("/metadata/deletionGracePeriodSeconds")
+                .and_then(Value::as_i64),
+            Some(30)
+        );
+        assert_eq!(
+            patch
+                .pointer("/metadata/generation")
+                .and_then(Value::as_i64),
+            Some(8)
+        );
+        assert_eq!(preconditions.uid.as_deref(), Some("uid-a"));
+        assert_eq!(preconditions.resource_version, None);
+        assert!(
+            patch.pointer("/metadata/finalizers").is_none(),
+            "the deadline patch must preserve finalizers by omission"
+        );
     }
 }

@@ -519,12 +519,9 @@ fn apply_latest_patch_to_current_resource(
     let current: serde_json::Value =
         serde_json::from_slice(current_bytes).map_err(serde_to_sqlite_error)?;
     let mut patched = current.clone();
-    let zero_grace_pod_delete = klights_types::is_zero_grace_pod_delete_mark_patch(
-        &patch.api_version,
-        &patch.kind,
-        &patch.patch,
-    );
-    let effective_patch = if zero_grace_pod_delete {
+    let pod_delete_mark =
+        klights_types::is_pod_delete_mark_patch(&patch.api_version, &patch.kind, &patch.patch);
+    let effective_patch = if pod_delete_mark {
         klights_types::pod_delete_mark_patch_without_status(&patch.patch)
     } else {
         patch.patch.clone()
@@ -534,10 +531,11 @@ fn apply_latest_patch_to_current_resource(
             klights_types::apply_merge_patch(&mut patched, &effective_patch);
         }
     }
-    if zero_grace_pod_delete {
+    if pod_delete_mark {
         let transition_time = patch
             .terminating_pod_unready_timestamp
             .as_deref()
+            .or_else(|| klights_types::pod_delete_mark_transition_time(&patch.patch))
             .or_else(|| deterministic_terminating_unready_timestamp(&patched, Some(&current)))
             .unwrap_or("1970-01-01T00:00:00Z")
             .to_string();

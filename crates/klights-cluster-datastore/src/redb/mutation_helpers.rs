@@ -125,17 +125,28 @@ pub fn preserve_server_metadata_fields_from_existing(data: &mut Value, existing:
         meta_obj.insert("creationTimestamp".to_string(), ts.clone());
     }
 
-    if let Some(deletion_ts) = existing_meta
-        .get("deletionTimestamp")
-        .filter(|value| !value.is_null())
-    {
-        meta_obj.insert("deletionTimestamp".to_string(), deletion_ts.clone());
-    }
-    if let Some(grace) = existing_meta
+    let carries_shorter_delete_grace = meta_obj
         .get("deletionGracePeriodSeconds")
-        .filter(|value| !value.is_null())
-    {
-        meta_obj.insert("deletionGracePeriodSeconds".to_string(), grace.clone());
+        .and_then(Value::as_i64)
+        .zip(
+            existing_meta
+                .get("deletionGracePeriodSeconds")
+                .and_then(Value::as_i64),
+        )
+        .is_some_and(|(incoming, existing)| incoming >= 0 && incoming < existing);
+    if !carries_shorter_delete_grace {
+        if let Some(deletion_ts) = existing_meta
+            .get("deletionTimestamp")
+            .filter(|value| !value.is_null())
+        {
+            meta_obj.insert("deletionTimestamp".to_string(), deletion_ts.clone());
+        }
+        if let Some(grace) = existing_meta
+            .get("deletionGracePeriodSeconds")
+            .filter(|value| !value.is_null())
+        {
+            meta_obj.insert("deletionGracePeriodSeconds".to_string(), grace.clone());
+        }
     }
 }
 
@@ -421,6 +432,36 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn server_metadata_allows_only_strictly_shorter_nonnegative_delete_grace() {
+        let existing = json!({"metadata": {
+            "deletionTimestamp": "2026-08-08T12:00:30Z",
+            "deletionGracePeriodSeconds": 30
+        }});
+        for (incoming_grace, expected_timestamp, expected_grace) in [
+            (5, "2026-08-08T12:00:05Z", 5),
+            (30, "2026-08-08T12:00:30Z", 30),
+            (60, "2026-08-08T12:00:30Z", 30),
+            (-1, "2026-08-08T12:00:30Z", 30),
+        ] {
+            let mut incoming = json!({"metadata": {
+                "deletionTimestamp": "2026-08-08T12:00:05Z",
+                "deletionGracePeriodSeconds": incoming_grace
+            }});
+            preserve_server_metadata_fields_from_existing(&mut incoming, &existing);
+            assert_eq!(
+                incoming.pointer("/metadata/deletionTimestamp"),
+                Some(&json!(expected_timestamp)),
+                "incoming grace {incoming_grace}"
+            );
+            assert_eq!(
+                incoming.pointer("/metadata/deletionGracePeriodSeconds"),
+                Some(&json!(expected_grace)),
+                "incoming grace {incoming_grace}"
+            );
+        }
+    }
 
     #[test]
     fn resolve_field_path_simple() {

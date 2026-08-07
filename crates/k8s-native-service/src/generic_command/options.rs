@@ -336,8 +336,9 @@ mod tests {
 
     #[test]
     fn delete_options_json_and_protobuf_preserve_preconditions() {
-        let json = br#"{"preconditions":{"uid":"u1","resourceVersion":"9"},"propagationPolicy":"Foreground"}"#;
+        let json = br#"{"gracePeriodSeconds":-5,"preconditions":{"uid":"u1","resourceVersion":"9"},"propagationPolicy":"Foreground"}"#;
         let protobuf = klights_kube_protobuf::apimachinery::pkg::apis::meta::v1::DeleteOptions {
+            grace_period_seconds: Some(-5),
             preconditions: Some(
                 klights_kube_protobuf::apimachinery::pkg::apis::meta::v1::Preconditions {
                     uid: Some("u1".to_string()),
@@ -355,6 +356,7 @@ mod tests {
             assert_eq!(preconditions.uid.as_deref(), Some("u1"));
             assert_eq!(preconditions.resource_version, Some(9));
             assert_eq!(options.propagation_policy.as_deref(), Some("Foreground"));
+            assert_eq!(options._grace_period_seconds, Some(-5));
         }
     }
 

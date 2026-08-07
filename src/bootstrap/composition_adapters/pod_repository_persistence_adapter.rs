@@ -483,14 +483,13 @@ fn concrete_adapter(
 
 pub(crate) fn new_root_parts(
     db: DatastoreHandle,
-    wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+    _wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 ) -> RootPodRepositoryPersistenceParts {
     let sandbox_gc_dirty = Arc::new(AtomicUsize::new(1));
     let concrete = concrete_adapter(db, sandbox_gc_dirty.clone());
     let store = Arc::new(PodStore::from_persistence(
         concrete.clone(),
         concrete.clone(),
-        wall_clock,
         sandbox_gc_dirty,
         #[cfg(any(test, feature = "pod-repository-test-support"))]
         Some(concrete.clone()),
@@ -510,7 +509,6 @@ pub(crate) fn new_store(db: DatastoreHandle) -> PodStore {
     PodStore::from_persistence(
         concrete.clone(),
         concrete.clone(),
-        Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         sandbox_gc_dirty,
         #[cfg(any(test, feature = "pod-repository-test-support"))]
         Some(concrete),

@@ -191,9 +191,12 @@ pub fn patch_resource_in_conn(
     })?;
 
     let mut patched: Value = current.data.clone();
-    let zero_grace_pod_delete =
-        klights_types::is_zero_grace_pod_delete_mark_patch(&key.api_version, &key.kind, &patch);
-    let effective_patch = if zero_grace_pod_delete {
+    let pod_delete_mark =
+        klights_types::is_pod_delete_mark_patch(&key.api_version, &key.kind, &patch);
+    let delete_transition_time = klights_types::pod_delete_mark_transition_time(&patch)
+        .unwrap_or(&transition_time)
+        .to_string();
+    let effective_patch = if pod_delete_mark {
         klights_types::pod_delete_mark_patch_without_status(&patch)
     } else {
         patch
@@ -215,8 +218,8 @@ pub fn patch_resource_in_conn(
         &current.data,
         &mut patched,
     );
-    if zero_grace_pod_delete {
-        klights_types::mark_terminating_pod_unready_at(&mut patched, &transition_time);
+    if pod_delete_mark {
+        klights_types::mark_terminating_pod_unready_at(&mut patched, &delete_transition_time);
     }
     resource_shape::preserve_server_metadata_fields_from_existing(&mut patched, &current.data);
     resource_shape::ensure_metadata_identity(&mut patched, key.namespace.as_deref(), &key.name);

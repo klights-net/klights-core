@@ -495,6 +495,7 @@ pub struct PodDeleteMarkOutcome {
     pub updated: Resource,
     pub previous: Resource,
     pub uid: String,
+    pub changed: bool,
 }
 
 #[derive(Clone, Debug)]

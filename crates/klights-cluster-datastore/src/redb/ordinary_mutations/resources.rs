@@ -887,7 +887,23 @@ impl RedbOrdinaryResourceStore {
             let mut current_data: Value =
                 serde_json::from_slice(&current.1).unwrap_or(Value::Null);
             let before_patch = current_data.clone();
-            klights_types::apply_merge_patch(&mut current_data, &patch);
+            let pod_delete_mark = klights_types::is_pod_delete_mark_patch(av, kind, &patch);
+            let delete_transition_time =
+                klights_types::pod_delete_mark_transition_time(&patch).map(str::to_string);
+            let effective_patch = if pod_delete_mark {
+                klights_types::pod_delete_mark_patch_without_status(&patch)
+            } else {
+                patch
+            };
+            klights_types::apply_merge_patch(&mut current_data, &effective_patch);
+            if pod_delete_mark
+                && let Some(delete_transition_time) = delete_transition_time.as_deref()
+            {
+                klights_types::mark_terminating_pod_unready_at(
+                    &mut current_data,
+                    delete_transition_time,
+                );
+            }
             helpers::validate_uid_immutable(&current_data, &before_patch)?;
             if klights_cluster_core::resource_bodies_equal_ignoring_metadata_field(
                 &before_patch,

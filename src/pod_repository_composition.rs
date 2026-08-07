@@ -1107,7 +1107,6 @@ pub(crate) fn build_worker_pod_repository_parts(
     let store = Arc::new(PodStore::from_persistence(
         worker_persistence.clone(),
         worker_persistence.clone(),
-        wall_clock.clone(),
         Arc::new(std::sync::atomic::AtomicUsize::new(1)),
         #[cfg(any(test, feature = "pod-repository-test-support"))]
         None,
