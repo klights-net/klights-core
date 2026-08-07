@@ -46,6 +46,7 @@ pub mod pod_startup_error;
 pub mod pod_status_builders;
 pub mod pod_status_logic;
 pub mod pod_volume_manager;
+pub mod pod_watch_source;
 pub mod probe_manager;
 pub mod probes;
 pub mod projected_sa_token_refresh;

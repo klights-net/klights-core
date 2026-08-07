@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 
-use crate::kubelet::context::HostIpState;
+use klights_kubelet::context::HostIpState;
 use klights_kubelet::pod_startup_error::PodStartupErrorKind;
 use klights_network_api::{PodNetworkAssignmentKey, PodNetworkAssignmentWaiter};
 use klights_node_store::{PodNetworkCache, SandboxKey};

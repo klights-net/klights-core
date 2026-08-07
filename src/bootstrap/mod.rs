@@ -11,7 +11,7 @@ pub(crate) mod finalizer_lifecycle_adapter;
 pub(crate) mod grpc_raft_transport_adapter;
 pub(crate) mod grpc_runtime_adapter;
 pub mod init;
-pub mod kubelet_ports;
+pub(crate) mod kubelet_ports;
 pub mod logging;
 pub(crate) mod maintenance;
 pub(crate) mod network_adapters;

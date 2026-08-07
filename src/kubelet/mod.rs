@@ -10,7 +10,6 @@ pub mod pod_status_writer;
 pub mod pod_subsystem;
 pub mod pod_termination;
 pub mod pod_watch_handlers;
-pub mod pod_watch_source;
 pub mod reconciler;
 
 pub mod pod_runtime;

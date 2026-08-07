@@ -1318,7 +1318,7 @@ async fn integration_status_race_service(
         Arc::new(IntegrationNoopPodMutationReconcile),
         None,
         None,
-        crate::kubelet::context::HostIpState::default(),
+        klights_kubelet::context::HostIpState::default(),
         Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
     );
     (service, writer, created)
@@ -1404,7 +1404,7 @@ impl IntegrationPodNetworkFixture {
                     klights_supervisor::TaskCategoryConfig::default(),
                 )),
                 waiter,
-                crate::kubelet::context::HostIpState::default(),
+                klights_kubelet::context::HostIpState::default(),
             ),
         }
     }
@@ -1430,7 +1430,7 @@ impl IntegrationPodNetworkFixture {
             stores.pod_network_cache(),
             supervisor,
             waiter,
-            crate::kubelet::context::HostIpState::default(),
+            klights_kubelet::context::HostIpState::default(),
         );
         Self {
             stores: Some(stores),

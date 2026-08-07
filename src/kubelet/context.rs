@@ -1,37 +1,7 @@
-use std::sync::Arc;
-
 use crate::kubelet::pod_repository::PodRepository;
 use klights_kubelet::outbox::Outbox;
 use klights_kubelet::pod_creation_state::PodStartRetryTracker;
 use klights_kubelet::pod_lifecycle_router::PodLifecycleRouter;
-
-pub(crate) type PodLifecycleReceiver = Arc<
-    tokio::sync::Mutex<
-        Option<tokio::sync::mpsc::Receiver<klights_kubelet::lifecycle::LifecycleCommand>>,
-    >,
->;
-
-#[derive(Clone, Default)]
-pub(crate) struct HostIpState {
-    value: Arc<std::sync::RwLock<Option<Arc<str>>>>,
-}
-
-impl HostIpState {
-    pub(crate) fn publish(&self, value: String) {
-        *self
-            .value
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::from(value));
-    }
-
-    pub(crate) fn current(&self) -> Arc<str> {
-        self.value
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .unwrap_or_else(|| Arc::from("127.0.0.1"))
-    }
-}
 
 pub(crate) type KubeletConfig = klights_kubelet::context::KubeletConfig<
     klights_kubelet::log_rotation::LogRotationPolicy,
@@ -42,7 +12,7 @@ pub(crate) type KubeletConfig = klights_kubelet::context::KubeletConfig<
 pub(crate) type KubeletLifecycleServices = klights_kubelet::context::LifecycleServices<
     PodRepository,
     PodLifecycleRouter,
-    PodLifecycleReceiver,
+    klights_kubelet::context::PodLifecycleReceiver,
     PodStartRetryTracker,
 >;
 
@@ -62,26 +32,3 @@ pub(crate) type KubeletContext = klights_kubelet::context::KubeletContext<
     KubeletStatusDeliveryServices,
     KubeletLocalExecutionServices,
 >;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn host_ip_state_is_instance_owned_and_defaults_to_loopback() {
-        let first = HostIpState::default();
-        let first_clone = first.clone();
-        let second = HostIpState::default();
-
-        assert_eq!(&*first.current(), "127.0.0.1");
-        first.publish("192.0.2.10".to_string());
-
-        assert_eq!(&*first.current(), "192.0.2.10");
-        assert_eq!(
-            &*first_clone.current(),
-            "192.0.2.10",
-            "clones of one injected instance must observe the same publication"
-        );
-        assert_eq!(&*second.current(), "127.0.0.1");
-    }
-}

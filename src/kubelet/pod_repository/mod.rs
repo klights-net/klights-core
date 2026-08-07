@@ -707,7 +707,7 @@ pub struct PodRepository {
     supervisor: Arc<TaskSupervisor>,
     outbox: Option<Arc<klights_kubelet::outbox::Outbox>>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
-    host_ip: crate::kubelet::context::HostIpState,
+    host_ip: klights_kubelet::context::HostIpState,
     #[cfg(any(test, feature = "pod-repository-test-support"))]
     deletion_finalizer: Arc<dyn PodDeletionFinalizer>,
 }
@@ -973,7 +973,7 @@ impl PodRepository {
         self.store.sandbox_gc_dirty.clone()
     }
 
-    pub(crate) fn host_ip_state(&self) -> crate::kubelet::context::HostIpState {
+    pub(crate) fn host_ip_state(&self) -> klights_kubelet::context::HostIpState {
         self.host_ip.clone()
     }
 
@@ -1136,7 +1136,7 @@ impl PodRepository {
         let namespace_bootstrap = adapters.namespace_bootstrap;
         let namespace_termination = adapters.namespace_termination;
         let mutation_reconcile = adapters.mutation_reconcile;
-        let host_ip = crate::kubelet::context::HostIpState::default();
+        let host_ip = klights_kubelet::context::HostIpState::default();
         let status = PodStatusService::new(
             store.clone(),
             status_only.clone(),

@@ -1,7 +1,7 @@
 use super::*;
-use crate::kubelet::pod_watch_source::PodWatchEvent as WatchEvent;
 #[cfg(test)]
 use klights_kubelet::pod_status_logic::ContainerInfo;
+use klights_kubelet::pod_watch_source::PodWatchEvent as WatchEvent;
 use klights_leader_api::WatchEventType as EventType;
 
 pub(super) async fn enqueue_job_reconcile_for_terminal_watch_pod(

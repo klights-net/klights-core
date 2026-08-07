@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
-use crate::kubelet::context::HostIpState;
 use klights_cluster_core::Resource;
+use klights_kubelet::context::HostIpState;
 use klights_kubelet::outbox::OutboxOperation;
 use klights_kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
 use klights_kubelet::pod_status_logic::{

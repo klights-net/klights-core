@@ -1,3 +1,5 @@
+//! Kubelet-owned positioned Pod-manager watch contracts.
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -157,7 +159,7 @@ impl PodWatchEvent {
             .and_then(|value| value.parse().ok())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn added(object: Value) -> Self {
         Self {
             scope: PodWatchScope::Pod,
@@ -167,7 +169,7 @@ impl PodWatchEvent {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn modified(object: Value) -> Self {
         Self {
             scope: PodWatchScope::Pod,
@@ -177,7 +179,7 @@ impl PodWatchEvent {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn deleted(object: Value) -> Self {
         Self {
             scope: PodWatchScope::Pod,

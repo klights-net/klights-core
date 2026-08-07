@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crate::datastore::{DatastoreBackend, DatastoreHandle};
-use crate::kubelet::pod_watch_source::PodWatchEvent;
+use klights_kubelet::pod_watch_source::PodWatchEvent;
 #[cfg(test)]
 use klights_leader_api::WatchEventType;
 #[cfg(test)]

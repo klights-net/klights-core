@@ -1306,7 +1306,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     // Spawn pod watcher
     let pod_watcher_handle = if let Some(runtime_ports) = pod_watcher_runtime_ports {
         let ctx = kubelet_services.clone();
-        let watch_source: Arc<dyn crate::kubelet::pod_watch_source::PodWatchSource> =
+        let watch_source: Arc<dyn klights_kubelet::pod_watch_source::PodWatchSource> =
             if let Some(worker_store) = worker_store_adapter.as_ref() {
                 Arc::new(
                     crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(

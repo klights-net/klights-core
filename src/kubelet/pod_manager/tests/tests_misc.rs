@@ -83,7 +83,7 @@ async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_awar
     // a PV event must not originate a binding write.
     persistent_volume_event_handler
         .handle_pv_event(
-            &crate::kubelet::pod_watch_source::PodWatchEvent::added((*pv.data).clone()),
+            &klights_kubelet::pod_watch_source::PodWatchEvent::added((*pv.data).clone()),
             "ctx-pv",
         )
         .await;
@@ -104,7 +104,7 @@ async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_awar
     is_leader_tx.send(true).unwrap();
     persistent_volume_event_handler
         .handle_pvc_event(
-            &crate::kubelet::pod_watch_source::PodWatchEvent::added((*pvc.data).clone()),
+            &klights_kubelet::pod_watch_source::PodWatchEvent::added((*pvc.data).clone()),
             "ctx-pvc",
         )
         .await;

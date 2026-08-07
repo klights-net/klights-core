@@ -1,10 +1,6 @@
 #[cfg(test)]
 use crate::kubelet::pod_watch_handlers::NoopPersistentVolumeEventHandler;
 use crate::kubelet::pod_watch_handlers::PersistentVolumeEventHandler;
-use crate::kubelet::pod_watch_source::{
-    PodWatchCheckpoint, PodWatchDisconnect, PodWatchEvent, PodWatchRecoveryPlan, PodWatchSession,
-    PodWatchSource, PodWatchStream,
-};
 use anyhow::Result;
 #[cfg(test)]
 use event_handlers::{PodPhaseUpdateRequest, apply_pod_phase_update};
@@ -30,6 +26,10 @@ use klights_kubelet::pod_status_builders::{
 };
 #[cfg(test)]
 use klights_kubelet::pod_status_logic::{ContainerInfo, compute_pod_phase, should_restart};
+use klights_kubelet::pod_watch_source::{
+    PodWatchCheckpoint, PodWatchDisconnect, PodWatchEvent, PodWatchRecoveryPlan, PodWatchSession,
+    PodWatchSource, PodWatchStream,
+};
 use klights_leader_api::{LeaderWatchError, WatchEventType};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -79,7 +79,7 @@ struct PodWatcherRuntimeContext {
     lifecycle: crate::kubelet::context::KubeletLifecycleServices,
     status_delivery: crate::kubelet::context::KubeletStatusDeliveryServices,
     local_execution: crate::kubelet::context::KubeletLocalExecutionServices,
-    host_ip: crate::kubelet::context::HostIpState,
+    host_ip: klights_kubelet::context::HostIpState,
     persistent_volume_event_handler: Arc<dyn PersistentVolumeEventHandler>,
     deadline_timers: deadline_timers::DeadlineTimerRegistry,
 }
@@ -175,7 +175,7 @@ fn pod_watch_reconnect_future(
 
 async fn next_pod_watch_event(
     stream: &mut Option<PodWatchStream>,
-) -> Option<Result<PodWatchEvent, crate::kubelet::pod_watch_source::PodWatchStreamError>> {
+) -> Option<Result<PodWatchEvent, klights_kubelet::pod_watch_source::PodWatchStreamError>> {
     match stream {
         Some(stream) => stream.next().await,
         None => std::future::pending().await,

@@ -9,6 +9,34 @@
 use std::fmt;
 use std::sync::Arc;
 
+/// Single-consumer lifecycle command receiver shared by kubelet composition.
+pub type PodLifecycleReceiver = Arc<
+    tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::lifecycle::LifecycleCommand>>>,
+>;
+
+/// Instance-owned publication of the host IP used by Pod status projection.
+#[derive(Clone, Default)]
+pub struct HostIpState {
+    value: Arc<std::sync::RwLock<Option<Arc<str>>>>,
+}
+
+impl HostIpState {
+    pub fn publish(&self, value: String) {
+        *self
+            .value
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::from(value));
+    }
+
+    pub fn current(&self) -> Arc<str> {
+        self.value
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| Arc::from("127.0.0.1"))
+    }
+}
+
 /// Runtime facts validated once before any kubelet task starts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KubeletConfig<LogRotation, NodeCapacity, RuntimePaths> {

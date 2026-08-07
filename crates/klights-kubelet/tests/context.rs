@@ -1,4 +1,4 @@
-use klights_kubelet::context::{KubeletConfig, KubeletConfigError};
+use klights_kubelet::context::{HostIpState, KubeletConfig, KubeletConfigError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RotationPolicy;
@@ -8,6 +8,24 @@ struct NodeCapacity;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RuntimePaths;
+
+#[test]
+fn host_ip_state_is_instance_owned_and_defaults_to_loopback() {
+    let first = HostIpState::default();
+    let first_clone = first.clone();
+    let second = HostIpState::default();
+
+    assert_eq!(&*first.current(), "127.0.0.1");
+    first.publish("192.0.2.10".to_string());
+
+    assert_eq!(&*first.current(), "192.0.2.10");
+    assert_eq!(
+        &*first_clone.current(),
+        "192.0.2.10",
+        "clones of one injected instance must observe the same publication"
+    );
+    assert_eq!(&*second.current(), "127.0.0.1");
+}
 
 #[test]
 fn kubelet_config_accepts_validated_facts() {

@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use crate::kubelet::pod_watch_source::{PodWatchEvent, PodWatchSource, PodWatchStream};
 use futures::StreamExt as _;
 use klights_kubelet::node_heartbeat::{
     NodeHeartbeatClock, NodeHeartbeatEvent, NodeHeartbeatEventFuture, NodeHeartbeatEventSource,
 };
+use klights_kubelet::pod_watch_source::{PodWatchEvent, PodWatchSource, PodWatchStream};
 
-pub struct SystemNodeHeartbeatClock {
+pub(crate) struct SystemNodeHeartbeatClock {
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
@@ -22,7 +22,7 @@ impl NodeHeartbeatClock for SystemNodeHeartbeatClock {
     }
 }
 
-pub struct LeaderPersistentVolumeEventHandler {
+pub(crate) struct LeaderPersistentVolumeEventHandler {
     db: crate::datastore::DatastoreHandle,
     is_leader_rx: tokio::sync::watch::Receiver<bool>,
     file_process: klights_supervisor::FileProcessExecutor,
@@ -164,7 +164,7 @@ impl klights_node_store::PodSlotAdmissionEventSource for DatastorePodSlotAdapter
     }
 }
 
-pub struct DatastorePodWatchSource {
+pub(crate) struct DatastorePodWatchSource {
     leader_watch: Arc<dyn klights_leader_api::LeaderWatch>,
     heartbeat_watch: tokio::sync::Mutex<HeartbeatWatchState>,
 }
@@ -189,10 +189,10 @@ impl PodWatchSource for DatastorePodWatchSource {
     fn open_pod_manager_watch(
         &self,
         node_name: String,
-        recovery: crate::kubelet::pod_watch_source::PodWatchRecoveryPlan,
-    ) -> crate::kubelet::pod_watch_source::PodWatchFuture<'_> {
+        recovery: klights_kubelet::pod_watch_source::PodWatchRecoveryPlan,
+    ) -> klights_kubelet::pod_watch_source::PodWatchFuture<'_> {
         Box::pin(async move {
-            use crate::kubelet::pod_watch_source::{
+            use klights_kubelet::pod_watch_source::{
                 PodWatchCheckpoint, PodWatchScope, PodWatchSession, scope_watch_stream,
             };
             let requests = [
@@ -374,7 +374,7 @@ impl NodeHeartbeatEventSource for DatastorePodWatchSource {
         })
     }
 }
-pub struct RootPodEventSink {
+pub(crate) struct RootPodEventSink {
     outbox: Option<Arc<klights_kubelet::node_outbox::Outbox>>,
     datastore: crate::datastore::DatastoreHandle,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
@@ -437,7 +437,7 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for RootPodEventSink {
     }
 }
 
-pub struct WorkerPodEventSink {
+pub(crate) struct WorkerPodEventSink {
     outbox: Arc<klights_kubelet::node_outbox::Outbox>,
     resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
