@@ -64,6 +64,7 @@ pub struct PodRepositoryBuildConfig {
     pub scheduling_mode: PodSchedulingMode,
     pub outbox: Option<Arc<klights_kubelet::node_outbox::Outbox>>,
     pub cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
+    pub remote_delivery_required: bool,
     pub controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     #[cfg(not(test))]
     pub api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
@@ -846,6 +847,7 @@ fn build_pod_repository_parts_inner(
         scheduling_mode,
         outbox,
         cluster_api,
+        remote_delivery_required,
         controller_identity,
         #[cfg(not(test))]
         api_identity,
@@ -981,7 +983,7 @@ fn build_pod_repository_parts_inner(
         PodRepositoryDeliveryDependencies {
             outbox: delivery_outbox,
             cluster_api,
-            remote_metadata_delivery_required: false,
+            remote_delivery_required,
             bound_pod_finalization,
             #[cfg(feature = "pod-repository-test-support")]
             test_local_bound_finalization: Some(test_local_bound_finalization),
@@ -1076,7 +1078,7 @@ pub(crate) fn build_worker_pod_repository_parts(
         PodRepositoryDeliveryDependencies {
             outbox: Some(outbox),
             cluster_api: Some(config.resource_query),
-            remote_metadata_delivery_required: true,
+            remote_delivery_required: true,
             bound_pod_finalization,
             #[cfg(feature = "pod-repository-test-support")]
             test_local_bound_finalization: None,

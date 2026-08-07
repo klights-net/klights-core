@@ -241,10 +241,10 @@ impl IntegrationPodWorkerComposition {
         namespace: &str,
         name: &str,
         uid: &str,
-        update: crate::kubelet::pod_repository::PodStatusUpdate,
+        update: klights_kubelet::pod_repository::PodStatusUpdate,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::set_pod_status_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::set_pod_status_for_uid(
             self.repository.as_ref(),
             namespace,
             name,
@@ -260,10 +260,10 @@ impl IntegrationPodWorkerComposition {
         namespace: &str,
         name: &str,
         uid: &str,
-        update: crate::kubelet::pod_repository::RuntimeReconcileStatus,
+        update: klights_kubelet::pod_repository::RuntimeReconcileStatus,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::apply_runtime_reconcile_status_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::apply_runtime_reconcile_status_for_uid(
             self.repository.as_ref(),
             namespace,
             name,
@@ -714,6 +714,16 @@ pub struct IntegrationStatusRaceOutcome {
     pub conflict: bool,
 }
 
+pub struct IntegrationSameNameStatusRaceOutcome {
+    pub old_uid: String,
+    pub replacement: crate::datastore::Resource,
+    pub persisted_after: crate::datastore::Resource,
+    pub persistence_attempts: usize,
+    pub reconcile_effects: usize,
+    pub outbox_enqueues: usize,
+    pub conflict: bool,
+}
+
 pub struct IntegrationApiDeleteStatusRaceOutcome {
     pub created: crate::datastore::Resource,
     pub deleted: crate::datastore::Resource,
@@ -887,6 +897,7 @@ pub async fn run_raft_delete_mark_status_race(
             db: db.clone(), pod_workqueue_store: None, supervisor, side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
             metrics: klights_controllers::side_effects::SideEffectMetrics::new(), pod_network_cache: Arc::new(IntegrationEmptyPodNetworkCache), assignment_waiter: Arc::new(klights_networking::PodNetworkAssignmentBus::new()),
             scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode, outbox: None, cluster_api: None,
+            remote_delivery_required: false,
             controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
             #[cfg(not(test))]
             api_identity: Arc::new(crate::bootstrap::controller_adapters::system_identity_adapter::SystemIdentityGenerator),
@@ -1228,7 +1239,7 @@ pub async fn run_deferred_runtime_cleanup_case(
     outcome: IntegrationDeferredRuntimeFinalizerOutcome,
 ) -> (bool, bool) {
     use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer as _;
-    let deferred = crate::kubelet::pod_repository::status::DeferredRuntimeReducerHandle::default();
+    let deferred = klights_kubelet::pod_repository::status::DeferredRuntimeReducerHandle::default();
     deferred.insert_marker(uid);
     let finalizer = crate::kubelet::pod_repository::DeferredRuntimeCleanupFinalizer::new(
         Arc::new(IntegrationFixedDeletionFinalizer { outcome }),
@@ -1342,12 +1353,155 @@ impl klights_reconcile_api::PodMutationReconcileSink for IntegrationNoopPodMutat
     }
 }
 
+struct IntegrationCountingPodMutationReconcile {
+    effects: std::sync::atomic::AtomicUsize,
+}
+
+impl klights_reconcile_api::PodMutationReconcileSink for IntegrationCountingPodMutationReconcile {
+    fn reconcile_pod_mutation(
+        &self,
+        _request: klights_reconcile_api::PodMutationReconcileRequest,
+    ) -> klights_reconcile_api::ReconcileSinkFuture<'_> {
+        self.effects
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct IntegrationPausedStatusWriter {
+    store: Arc<crate::kubelet::pod_repository::store::PodStore>,
+    entered: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Barrier>,
+    requested_status: std::sync::Mutex<Option<serde_json::Value>>,
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+impl klights_pod_api::PodStatusPersistence for IntegrationPausedStatusWriter {
+    fn write_pod_status(
+        &self,
+        request: klights_pod_api::PodStatusWriteRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, crate::datastore::Resource> {
+        Box::pin(async move {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.requested_status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .replace(request.status.clone());
+            self.entered.wait().await;
+            self.release.wait().await;
+            self.store
+                .update_status_typed(
+                    &request.namespace,
+                    &request.name,
+                    request.status,
+                    request.expected_resource_version,
+                )
+                .await
+        })
+    }
+}
+
+pub async fn run_same_name_replacement_status_race(
+    mut pod: serde_json::Value,
+    update: klights_kubelet::pod_repository::PodStatusUpdate,
+) -> IntegrationSameNameStatusRaceOutcome {
+    let pod_name = "same-name-status-race";
+    pod["metadata"]["name"] = serde_json::json!(pod_name);
+    let sqlite = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
+    let db: crate::datastore::DatastoreHandle = Arc::new(sqlite);
+    let store = Arc::new(crate::pod_repository_composition::new_pod_store(db.clone()));
+    let created = store.create("default", pod_name, pod).await.unwrap();
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    let writer = Arc::new(IntegrationPausedStatusWriter {
+        store: store.clone(),
+        entered: entered.clone(),
+        release: release.clone(),
+        requested_status: std::sync::Mutex::new(None),
+        attempts: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let reconcile = Arc::new(IntegrationCountingPodMutationReconcile {
+        effects: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let service = klights_kubelet::pod_repository::status::PodStatusService::new(
+        store.clone(),
+        writer.clone(),
+        reconcile.clone(),
+        None,
+        false,
+        None,
+        klights_kubelet::context::HostIpState::default(),
+        Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+    );
+
+    let write = service.integration_set_pod_status(
+        "default",
+        pod_name,
+        &update,
+        Some(created.resource_version),
+    );
+    let replace = async {
+        entered.wait().await;
+        let requested_status = writer
+            .requested_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("paused status request");
+        let mut replacement_body = created.data.as_ref().clone();
+        let metadata = replacement_body["metadata"]
+            .as_object_mut()
+            .expect("Pod metadata object");
+        metadata.remove("uid");
+        metadata.remove("resourceVersion");
+        replacement_body["status"] = requested_status;
+        // This test-only datastore replacement models the exact interval
+        // between the status service's read and persistence CAS. Production
+        // Pod deletion remains actor-owned; no production path reaches this
+        // characterization fixture.
+        db.delete_resource("v1", "Pod", Some("default"), pod_name)
+            .await
+            .expect("remove old Pod in paused race fixture");
+        let replacement = db
+            .create_resource("v1", "Pod", Some("default"), pod_name, replacement_body)
+            .await
+            .expect("install same-name replacement while status write is paused");
+        release.wait().await;
+        replacement
+    };
+    let (result, replacement) = tokio::join!(write, replace);
+    let conflict = result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.to_string().contains("409"));
+    let persisted_after = store
+        .get("default", pod_name)
+        .await
+        .unwrap()
+        .expect("replacement remains persisted");
+
+    IntegrationSameNameStatusRaceOutcome {
+        old_uid: created.uid,
+        replacement,
+        persisted_after,
+        persistence_attempts: writer.attempts.load(std::sync::atomic::Ordering::SeqCst),
+        reconcile_effects: reconcile.effects.load(std::sync::atomic::Ordering::SeqCst),
+        // This fixture deliberately supplies neither an outbox nor a remote
+        // leader query, so the local CAS path has no outbox route to invoke.
+        outbox_enqueues: 0,
+        conflict,
+    }
+}
+
 async fn integration_status_race_service(
     pod_name: &str,
     pod: serde_json::Value,
     mode: IntegrationStatusRaceMode,
 ) -> (
-    crate::kubelet::pod_repository::status::PodStatusService,
+    klights_kubelet::pod_repository::status::PodStatusService,
     Arc<IntegrationStatusRaceWriter>,
     crate::datastore::Resource,
 ) {
@@ -1362,11 +1516,12 @@ async fn integration_status_race_service(
         attempts: std::sync::atomic::AtomicUsize::new(0),
         mode,
     });
-    let service = crate::kubelet::pod_repository::status::PodStatusService::new(
+    let service = klights_kubelet::pod_repository::status::PodStatusService::new(
         store,
         writer.clone(),
         Arc::new(IntegrationNoopPodMutationReconcile),
         None,
+        false,
         None,
         klights_kubelet::context::HostIpState::default(),
         Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
@@ -1376,7 +1531,7 @@ async fn integration_status_race_service(
 
 pub async fn run_scheduler_status_race(
     pod: serde_json::Value,
-    update: crate::kubelet::pod_repository::PodStatusUpdate,
+    update: klights_kubelet::pod_repository::PodStatusUpdate,
 ) -> IntegrationStatusRaceOutcome {
     let (service, writer, _) = integration_status_race_service(
         "scheduled-race",
@@ -2054,6 +2209,7 @@ impl IntegrationPodRepositoryComposition {
             false,
             false,
             false,
+            false,
             crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             None,
             None,
@@ -2067,6 +2223,7 @@ impl IntegrationPodRepositoryComposition {
             false,
             false,
             false,
+            false,
             crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
             None,
             None,
@@ -2077,6 +2234,7 @@ impl IntegrationPodRepositoryComposition {
     pub async fn new_deferred_leader_with_node_outbox() -> Self {
         Self::new_exact(
             None,
+            false,
             false,
             true,
             false,
@@ -2096,6 +2254,7 @@ impl IntegrationPodRepositoryComposition {
             false,
             false,
             false,
+            false,
             crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
             Some(gate.clone()),
             None,
@@ -2109,6 +2268,7 @@ impl IntegrationPodRepositoryComposition {
     ) -> Self {
         Self::new_exact(
             Some(resource_query),
+            true,
             false,
             false,
             false,
@@ -2122,6 +2282,7 @@ impl IntegrationPodRepositoryComposition {
     pub async fn new_with_node_outbox() -> Self {
         Self::new_exact(
             None,
+            false,
             false,
             true,
             false,
@@ -2138,6 +2299,7 @@ impl IntegrationPodRepositoryComposition {
     ) -> Self {
         Self::new_exact(
             Some(resource_query),
+            true,
             false,
             true,
             false,
@@ -2151,6 +2313,7 @@ impl IntegrationPodRepositoryComposition {
     pub async fn new_with_status_dispatcher() -> Self {
         Self::new_exact(
             None,
+            false,
             true,
             false,
             false,
@@ -2164,6 +2327,7 @@ impl IntegrationPodRepositoryComposition {
     pub async fn new_with_gc_workqueue() -> Self {
         Self::new_exact(
             None,
+            false,
             false,
             false,
             true,
@@ -2181,6 +2345,7 @@ impl IntegrationPodRepositoryComposition {
             false,
             false,
             false,
+            false,
             crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             None,
             Some(observation),
@@ -2190,6 +2355,7 @@ impl IntegrationPodRepositoryComposition {
 
     async fn new_exact(
         repository_cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
+        remote_delivery_required: bool,
         with_dispatcher: bool,
         with_outbox: bool,
         with_workqueue: bool,
@@ -2200,6 +2366,7 @@ impl IntegrationPodRepositoryComposition {
         Self::new_exact_on(
             None,
             repository_cluster_api,
+            remote_delivery_required,
             with_dispatcher,
             with_outbox,
             with_workqueue,
@@ -2213,6 +2380,7 @@ impl IntegrationPodRepositoryComposition {
     async fn new_exact_on(
         sqlite: Option<crate::datastore::sqlite::Datastore>,
         repository_cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
+        remote_delivery_required: bool,
         with_dispatcher: bool,
         with_outbox: bool,
         with_workqueue: bool,
@@ -2318,6 +2486,7 @@ impl IntegrationPodRepositoryComposition {
                 scheduling_mode,
                 outbox,
                 cluster_api: repository_cluster_api,
+                remote_delivery_required,
                 controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
                 #[cfg(not(test))]
                 api_identity: Arc::new(
@@ -3030,15 +3199,15 @@ impl klights_kubelet::pod_repository::PodNetworkAssignmentQuery
 }
 
 #[async_trait::async_trait]
-impl crate::kubelet::pod_repository::PodStatusWriter for IntegrationPodRepositoryComposition {
+impl klights_kubelet::pod_repository::PodStatusWriter for IntegrationPodRepositoryComposition {
     async fn set_pod_status(
         &self,
         ns: &str,
         name: &str,
-        update: crate::kubelet::pod_repository::PodStatusUpdate,
+        update: klights_kubelet::pod_repository::PodStatusUpdate,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::set_pod_status(
+        klights_kubelet::pod_repository::PodStatusWriter::set_pod_status(
             self.repository.as_ref(),
             ns,
             name,
@@ -3052,10 +3221,10 @@ impl crate::kubelet::pod_repository::PodStatusWriter for IntegrationPodRepositor
         ns: &str,
         name: &str,
         uid: &str,
-        update: crate::kubelet::pod_repository::PodStatusUpdate,
+        update: klights_kubelet::pod_repository::PodStatusUpdate,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::set_pod_status_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::set_pod_status_for_uid(
             self.repository.as_ref(),
             ns,
             name,
@@ -3069,10 +3238,10 @@ impl crate::kubelet::pod_repository::PodStatusWriter for IntegrationPodRepositor
         &self,
         ns: &str,
         name: &str,
-        update: crate::kubelet::pod_repository::RuntimeReconcileStatus,
+        update: klights_kubelet::pod_repository::RuntimeReconcileStatus,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::apply_runtime_reconcile_status(
+        klights_kubelet::pod_repository::PodStatusWriter::apply_runtime_reconcile_status(
             self.repository.as_ref(),
             ns,
             name,
@@ -3086,10 +3255,10 @@ impl crate::kubelet::pod_repository::PodStatusWriter for IntegrationPodRepositor
         ns: &str,
         name: &str,
         uid: &str,
-        update: crate::kubelet::pod_repository::RuntimeReconcileStatus,
+        update: klights_kubelet::pod_repository::RuntimeReconcileStatus,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::apply_runtime_reconcile_status_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::apply_runtime_reconcile_status_for_uid(
             self.repository.as_ref(),
             ns,
             name,
@@ -3106,7 +3275,7 @@ impl crate::kubelet::pod_repository::PodStatusWriter for IntegrationPodRepositor
         uid: &str,
         error_message: &str,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::mark_start_pending_for_retry_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::mark_start_pending_for_retry_for_uid(
             self.repository.as_ref(),
             ns,
             name,
@@ -3123,7 +3292,7 @@ impl crate::kubelet::pod_repository::PodStatusWriter for IntegrationPodRepositor
         ready: bool,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::set_probe_readiness(
+        klights_kubelet::pod_repository::PodStatusWriter::set_probe_readiness(
             self.repository.as_ref(),
             ns,
             name,
@@ -3142,7 +3311,7 @@ impl crate::kubelet::pod_repository::PodStatusWriter for IntegrationPodRepositor
         ready: bool,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::set_probe_readiness_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::set_probe_readiness_for_uid(
             self.repository.as_ref(),
             ns,
             name,
@@ -3160,7 +3329,7 @@ impl crate::kubelet::pod_repository::PodStatusWriter for IntegrationPodRepositor
         message: String,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::set_deadline_exceeded(
+        klights_kubelet::pod_repository::PodStatusWriter::set_deadline_exceeded(
             self.repository.as_ref(),
             ns,
             name,
@@ -3177,7 +3346,7 @@ impl crate::kubelet::pod_repository::PodStatusWriter for IntegrationPodRepositor
         message: String,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::set_deadline_exceeded_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::set_deadline_exceeded_for_uid(
             self.repository.as_ref(),
             ns,
             name,
@@ -3194,7 +3363,7 @@ impl crate::kubelet::pod_repository::PodStatusWriter for IntegrationPodRepositor
         statuses: Vec<serde_json::Value>,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::apply_ephemeral_container_statuses(
+        klights_kubelet::pod_repository::PodStatusWriter::apply_ephemeral_container_statuses(
             self.repository.as_ref(),
             ns,
             name,
@@ -3211,7 +3380,7 @@ impl crate::kubelet::pod_repository::PodStatusWriter for IntegrationPodRepositor
         statuses: Vec<serde_json::Value>,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::apply_ephemeral_container_statuses_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::apply_ephemeral_container_statuses_for_uid(
             self.repository.as_ref(),
             ns,
             name,
@@ -3229,7 +3398,7 @@ impl crate::kubelet::pod_repository::PodStatusWriter for IntegrationPodRepositor
         terminated: serde_json::Value,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        crate::kubelet::pod_repository::PodStatusWriter::note_container_restart(
+        klights_kubelet::pod_repository::PodStatusWriter::note_container_restart(
             self.repository.as_ref(),
             ns,
             name,
@@ -3248,7 +3417,7 @@ impl crate::kubelet::pod_repository::PodStatusWriter for IntegrationPodRepositor
         terminated: serde_json::Value,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        crate::kubelet::pod_repository::PodStatusWriter::note_container_restart_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::note_container_restart_for_uid(
             self.repository.as_ref(),
             ns,
             name,

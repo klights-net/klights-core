@@ -1,37 +1,37 @@
 //! `PodStatusService` — owns standard, runtime-reconcile, probe-readiness,
 //! and deadline-exceeded status writes.
 //!
-//! Holds `Arc<PodStore>` only — does not hold a `DatastoreHandle`.
-//! Implementations land in Tasks 4, 5, 7, 8.
+//! Depends only on focused Pod query/persistence, reconciliation, outbox,
+//! host-IP, leader-query, and clock capabilities. Concrete root persistence
+//! remains private to bootstrap composition.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
+use async_trait::async_trait;
 use serde_json::{Value, json};
 
+use crate::context::HostIpState;
+use crate::outbox::OutboxOperation;
+use crate::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
+use crate::pod_status_logic::{compute_initialized_condition, get_condition_last_transition_time};
 use klights_cluster_core::Resource;
-use klights_kubelet::context::HostIpState;
-use klights_kubelet::outbox::OutboxOperation;
-use klights_kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
-use klights_kubelet::pod_status_logic::{
-    compute_initialized_condition, get_condition_last_transition_time,
-};
 use klights_leader_api::LeaderResourceQuery;
-use klights_pod_api::{PodStatusPersistence, PodStatusWriteRequest};
+use klights_pod_api::{PodGetRequest, PodQuery, PodStatusPersistence, PodStatusWriteRequest};
 use klights_reconcile_api::{PodMutationReconcileRequest, PodMutationReconcileSink};
 
-use super::store::PodStore;
-use klights_kubelet::pod_repository::{PodStatusUpdate, RuntimeReconcileStatus};
+use super::{PodStatusUpdate, RuntimeReconcileStatus};
 
-pub(crate) struct PodStatusService {
-    store: Arc<PodStore>,
+pub struct PodStatusService {
+    pod_query: Arc<dyn PodQuery>,
     status_persistence: Arc<dyn PodStatusPersistence>,
     mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
     outbox: Option<Arc<Outbox>>,
+    remote_delivery_required: bool,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     host_ip: HostIpState,
-    wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+    wall_clock: Arc<dyn crate::runtime_clock::RuntimeClock>,
     deferred_runtime: DeferredRuntimeReducerHandle,
 }
 
@@ -65,7 +65,7 @@ struct DeferredRuntimeReducer {
 /// finalizer uses the same handle to forget a UID only after deletion has
 /// reached a terminal outcome.
 #[derive(Clone, Default)]
-pub(crate) struct DeferredRuntimeReducerHandle {
+pub struct DeferredRuntimeReducerHandle {
     reducer: Arc<Mutex<DeferredRuntimeReducer>>,
 }
 
@@ -81,7 +81,7 @@ impl DeferredRuntimeReducerHandle {
             .observe_deferred_running(pod_uid, pod, container_statuses);
     }
 
-    pub(super) fn forget(&self, pod_uid: &str) {
+    pub fn forget(&self, pod_uid: &str) {
         self.lock().clear(pod_uid);
     }
 
@@ -99,13 +99,13 @@ impl DeferredRuntimeReducerHandle {
         self.lock().consume_if_current(pod_uid, promoted);
     }
 
-    #[cfg(feature = "pod-repository-test-support")]
-    pub(crate) fn contains(&self, pod_uid: &str) -> bool {
+    #[cfg(feature = "test-support")]
+    pub fn contains(&self, pod_uid: &str) -> bool {
         self.lock().by_pod_uid.contains_key(pod_uid)
     }
 
-    #[cfg(feature = "pod-repository-test-support")]
-    pub(crate) fn insert_marker(&self, pod_uid: &str) {
+    #[cfg(feature = "test-support")]
+    pub fn insert_marker(&self, pod_uid: &str) {
         self.lock().by_pod_uid.insert(
             pod_uid.to_string(),
             DeferredRunningObservation {
@@ -165,10 +165,10 @@ impl DeferredRuntimeReducer {
     }
 }
 
-pub(super) struct PodStatusWriteResult {
-    pub(super) resource: Resource,
-    pub(super) changed: bool,
-    pub(super) endpoint_state_changed: bool,
+pub struct PodStatusWriteResult {
+    pub resource: Resource,
+    pub changed: bool,
+    pub endpoint_state_changed: bool,
 }
 
 impl PodStatusWriteResult {
@@ -181,21 +181,188 @@ impl PodStatusWriteResult {
     }
 }
 
+/// Kubelet-owned status-writing capability. Production callers use the
+/// UID-qualified variants so stale runtime observations cannot reach a
+/// same-name replacement Pod.
+#[async_trait]
+pub trait PodStatusWriter: Send + Sync {
+    async fn set_pod_status(
+        &self,
+        ns: &str,
+        name: &str,
+        update: PodStatusUpdate,
+        expected_rv: Option<i64>,
+    ) -> Result<Resource>;
+
+    async fn set_pod_status_for_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+        update: PodStatusUpdate,
+        expected_rv: Option<i64>,
+    ) -> Result<Resource>;
+
+    async fn apply_runtime_reconcile_status(
+        &self,
+        ns: &str,
+        name: &str,
+        update: RuntimeReconcileStatus,
+        expected_rv: Option<i64>,
+    ) -> Result<Resource>;
+
+    async fn apply_runtime_reconcile_status_for_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+        update: RuntimeReconcileStatus,
+        expected_rv: Option<i64>,
+    ) -> Result<Resource>;
+
+    async fn mark_start_pending_for_retry_for_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+        error_message: &str,
+    ) -> Result<Resource>;
+
+    async fn set_probe_readiness(
+        &self,
+        ns: &str,
+        name: &str,
+        container_name: &str,
+        ready: bool,
+        expected_rv: Option<i64>,
+    ) -> Result<Resource>;
+
+    async fn set_probe_readiness_for_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+        container_name: &str,
+        ready: bool,
+        expected_rv: Option<i64>,
+    ) -> Result<Resource>;
+
+    async fn set_deadline_exceeded(
+        &self,
+        ns: &str,
+        name: &str,
+        message: String,
+        expected_rv: Option<i64>,
+    ) -> Result<Resource>;
+
+    async fn set_deadline_exceeded_for_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+        message: String,
+        expected_rv: Option<i64>,
+    ) -> Result<Resource>;
+
+    async fn apply_ephemeral_container_statuses(
+        &self,
+        ns: &str,
+        name: &str,
+        statuses: Vec<Value>,
+        expected_rv: Option<i64>,
+    ) -> Result<Resource>;
+
+    async fn apply_ephemeral_container_statuses_for_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+        statuses: Vec<Value>,
+        expected_rv: Option<i64>,
+    ) -> Result<Resource>;
+
+    async fn note_container_restart(
+        &self,
+        ns: &str,
+        name: &str,
+        container_name: &str,
+        terminated: Value,
+        expected_rv: Option<i64>,
+    ) -> Result<Option<Resource>>;
+
+    async fn note_container_restart_for_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+        container_name: &str,
+        terminated: Value,
+        expected_rv: Option<i64>,
+    ) -> Result<Option<Resource>>;
+}
+
+#[derive(Debug)]
+struct PodUidMismatch {
+    expected: String,
+    actual: String,
+    namespace: String,
+    name: String,
+}
+
+impl std::fmt::Display for PodUidMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Pod {}/{} UID mismatch: expected {}, found {}",
+            self.namespace,
+            self.name,
+            self.expected,
+            if self.actual.is_empty() {
+                "<empty>"
+            } else {
+                &self.actual
+            }
+        )
+    }
+}
+
+impl std::error::Error for PodUidMismatch {}
+
+fn ensure_pod_uid_matches(data: &Value, expected_uid: &str, ns: &str, name: &str) -> Result<()> {
+    let live_uid = data
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if live_uid == expected_uid {
+        return Ok(());
+    }
+
+    Err(PodUidMismatch {
+        expected: expected_uid.to_string(),
+        actual: live_uid.to_string(),
+        namespace: ns.to_string(),
+        name: name.to_string(),
+    }
+    .into())
+}
+
 impl PodStatusService {
-    pub(crate) fn new(
-        store: Arc<PodStore>,
+    pub fn new(
+        pod_query: Arc<dyn PodQuery>,
         status_persistence: Arc<dyn PodStatusPersistence>,
         mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
         outbox: Option<Arc<Outbox>>,
+        remote_delivery_required: bool,
         cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
         host_ip: HostIpState,
-        wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+        wall_clock: Arc<dyn crate::runtime_clock::RuntimeClock>,
     ) -> Self {
         Self {
-            store,
+            pod_query,
             status_persistence,
             mutation_reconcile,
             outbox,
+            remote_delivery_required,
             cluster_api,
             host_ip,
             wall_clock,
@@ -203,27 +370,24 @@ impl PodStatusService {
         }
     }
 
-    pub(super) fn deferred_runtime_handle(&self) -> DeferredRuntimeReducerHandle {
+    pub fn deferred_runtime_handle(&self) -> DeferredRuntimeReducerHandle {
         self.deferred_runtime.clone()
     }
 
-    #[cfg(feature = "pod-repository-test-support")]
-    pub(super) fn has_deferred_runtime_for_uid(&self, pod_uid: &str) -> bool {
+    #[cfg(feature = "test-support")]
+    pub fn has_deferred_runtime_for_uid(&self, pod_uid: &str) -> bool {
         self.deferred_runtime.contains(pod_uid)
     }
 
     async fn send_status_command(&self, command: OutboxCommand) -> Result<bool> {
-        if self.outbox.is_some() {
-            OutboxSendPlanner::new(self.outbox.as_deref())
-                .route(command)
-                .await?;
+        if self.remote_delivery_required {
+            let Some(outbox) = self.outbox.as_deref() else {
+                return Err(anyhow!(
+                    "outbox is unavailable for node-local queueing; caller must retry after outbox initialization"
+                ));
+            };
+            OutboxSendPlanner::new(Some(outbox)).route(command).await?;
             return Ok(true);
-        }
-
-        if self.cluster_api.is_some() {
-            return Err(anyhow!(
-                "outbox is unavailable for node-local queueing; caller must retry after outbox initialization"
-            ));
         }
 
         Ok(false)
@@ -244,7 +408,9 @@ impl PodStatusService {
                 )?)
                 .await?
         } else {
-            self.store.get(ns, name).await?
+            self.pod_query
+                .get_pod(PodGetRequest::try_by_name(ns, name)?)
+                .await?
         }
         .ok_or_else(|| anyhow!("Pod not found"))?;
         if self.cluster_api.is_some()
@@ -253,7 +419,7 @@ impl PodStatusService {
             pod_resource = outbox.merge_pod_status_checkpoint(pod_resource).await?;
         }
         if let Some(uid) = expected_uid {
-            super::ensure_pod_uid_matches(&pod_resource.data, uid, ns, name)?;
+            ensure_pod_uid_matches(&pod_resource.data, uid, ns, name)?;
         }
         Ok(pod_resource)
     }
@@ -272,13 +438,20 @@ impl PodStatusService {
             namespace, pod_resource.name, pod_resource.uid
         );
         // The stamp is only consumed by the leader's outbox-apply lost-update
-        // gate, so it is issued only when an outbox is present (worker / outbox
-        // leader). It must come from the durable per-node allocator so it stays
-        // monotonic across worker restarts. Direct (outbox-less) writes never
-        // reach the gate, so they carry no stamp.
-        let observed_status_stamp = match self.outbox.as_deref() {
-            Some(outbox) => Some(outbox.next_status_stamp().await?),
-            None => None,
+        // gate, so it is issued only for the explicit remote-delivery role.
+        // It must come from the durable per-node allocator so it stays monotonic
+        // across worker restarts. Local writes never reach the gate, even when
+        // an outbox is available for unrelated work, so they carry no stamp.
+        let observed_status_stamp = if self.remote_delivery_required {
+            Some(
+                self.outbox
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("outbox is unavailable for status stamp allocation"))?
+                    .next_status_stamp()
+                    .await?,
+            )
+        } else {
+            None
         };
         let command = klights_cluster_core::StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
@@ -366,7 +539,7 @@ impl PodStatusService {
     ///
     /// Reads the current pod (for `lastTransitionTime` continuity, restart
     /// preservation, and qosClass), builds the full status object, and
-    /// persists status-only via `PodStore::update_status` with CAS.
+    /// persists status-only through `PodStatusPersistence` with CAS.
     ///
     /// `expected_rv` semantics:
     /// - `Some(rv)` → use that as the CAS value. Caller is asserting they
@@ -377,7 +550,7 @@ impl PodStatusService {
     ///
     /// LEGACY no-UID variant. Kept for test scaffolding only — production
     /// must use `set_pod_status_for_uid`.
-    pub(super) async fn set_pod_status(
+    pub async fn set_pod_status(
         &self,
         ns: &str,
         name: &str,
@@ -388,8 +561,8 @@ impl PodStatusService {
             .await
     }
 
-    #[cfg(feature = "pod-repository-test-support")]
-    pub(crate) async fn integration_set_pod_status(
+    #[cfg(feature = "test-support")]
+    pub async fn integration_set_pod_status(
         &self,
         ns: &str,
         name: &str,
@@ -404,7 +577,7 @@ impl PodStatusService {
     /// UID-bound status write. Refuses to apply if the live pod's UID
     /// has changed since the caller's snapshot — prevents stale events
     /// for a deleted pod from folding into a same-name recreated pod.
-    pub(super) async fn set_pod_status_for_uid(
+    pub async fn set_pod_status_for_uid(
         &self,
         ns: &str,
         name: &str,
@@ -669,7 +842,7 @@ impl PodStatusService {
     /// `hostIPs`, `conditions`, `qosClass`, `initContainerStatuses`).
     /// The runtime reconciler does not own those fields, so it must not
     /// erase them when it observes a CRI state change.
-    pub(super) async fn apply_runtime_reconcile_status(
+    pub async fn apply_runtime_reconcile_status(
         &self,
         ns: &str,
         name: &str,
@@ -680,7 +853,7 @@ impl PodStatusService {
             .await
     }
 
-    pub(super) async fn apply_runtime_reconcile_status_for_uid(
+    pub async fn apply_runtime_reconcile_status_for_uid(
         &self,
         ns: &str,
         name: &str,
@@ -703,20 +876,18 @@ impl PodStatusService {
     /// controllers do not count the pod as permanently failed.
     ///
     /// UID-bound: stale-UID writes are rejected by `read_current_pod`.
-    pub(super) async fn mark_start_pending_for_retry_for_uid(
+    pub async fn mark_start_pending_for_retry_for_uid(
         &self,
         ns: &str,
         name: &str,
         pod_uid: &str,
         error_message: &str,
     ) -> Result<PodStatusWriteResult> {
-        use klights_kubelet::pod_status_builders::{
+        use crate::pod_status_builders::{
             build_creation_error_statuses, build_image_pull_error_statuses,
             build_retrying_init_container_statuses,
         };
-        use klights_kubelet::pod_status_logic::{
-            is_image_pull_error_msg, parse_init_container_failure,
-        };
+        use crate::pod_status_logic::{is_image_pull_error_msg, parse_init_container_failure};
 
         let pod_resource = self.read_current_pod(ns, name, Some(pod_uid)).await?;
         let pod = pod_resource.data.as_ref();
@@ -1043,7 +1214,7 @@ impl PodStatusService {
     /// kubelet's lifecycle command path restarts it. No-op if the
     /// container is not in `containerStatuses` yet (the next runtime
     /// reconcile will fill it in). Preserves every other status field.
-    pub(super) async fn note_container_restart(
+    pub async fn note_container_restart(
         &self,
         ns: &str,
         name: &str,
@@ -1055,7 +1226,7 @@ impl PodStatusService {
             .await
     }
 
-    pub(super) async fn note_container_restart_for_uid(
+    pub async fn note_container_restart_for_uid(
         &self,
         ns: &str,
         name: &str,
@@ -1174,7 +1345,7 @@ impl PodStatusService {
     /// `/ephemeralcontainers` subresource. Mirrors
     /// `apply_runtime_reconcile_status`'s "overlay one slice, keep the
     /// rest" contract.
-    pub(super) async fn apply_ephemeral_container_statuses(
+    pub async fn apply_ephemeral_container_statuses(
         &self,
         ns: &str,
         name: &str,
@@ -1185,7 +1356,7 @@ impl PodStatusService {
             .await
     }
 
-    pub(super) async fn apply_ephemeral_container_statuses_for_uid(
+    pub async fn apply_ephemeral_container_statuses_for_uid(
         &self,
         ns: &str,
         name: &str,
@@ -1278,7 +1449,7 @@ impl PodStatusService {
     /// `lastTransitionTime` only changes on an actual status flip — a
     /// no-op call (matching status) preserves the existing timestamp so
     /// downstream watchers don't see spurious MODIFIED events.
-    pub(super) async fn set_probe_readiness(
+    pub async fn set_probe_readiness(
         &self,
         ns: &str,
         name: &str,
@@ -1290,8 +1461,8 @@ impl PodStatusService {
             .await
     }
 
-    #[cfg(feature = "pod-repository-test-support")]
-    pub(crate) async fn integration_set_probe_readiness(
+    #[cfg(feature = "test-support")]
+    pub async fn integration_set_probe_readiness(
         &self,
         ns: &str,
         name: &str,
@@ -1304,7 +1475,7 @@ impl PodStatusService {
             .map(|result| result.resource)
     }
 
-    pub(super) async fn set_probe_readiness_for_uid(
+    pub async fn set_probe_readiness_for_uid(
         &self,
         ns: &str,
         name: &str,
@@ -1544,7 +1715,7 @@ impl PodStatusService {
     /// today's behavior at `src/kubelet/pod_manager.rs:685-718`). Every
     /// other status field — `podIP`, `podIPs`, `hostIP`, `hostIPs`,
     /// `containerStatuses`, `qosClass` — is preserved.
-    pub(super) async fn set_deadline_exceeded(
+    pub async fn set_deadline_exceeded(
         &self,
         ns: &str,
         name: &str,
@@ -1555,7 +1726,7 @@ impl PodStatusService {
             .await
     }
 
-    pub(super) async fn set_deadline_exceeded_for_uid(
+    pub async fn set_deadline_exceeded_for_uid(
         &self,
         ns: &str,
         name: &str,

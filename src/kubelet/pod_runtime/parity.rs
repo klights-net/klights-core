@@ -272,6 +272,7 @@ impl ParityFixture {
             scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
+            remote_delivery_required: false,
             controller_identity: Arc::new(ParityControllerIdentity),
             scheduler_bind_gate: None,
         });
@@ -543,7 +544,7 @@ mod tests {
 
     #[tokio::test]
     async fn parity_fixture_snapshots_repository_status_payloads() {
-        use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+        use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
 
         let fixture = ParityFixture::new().await;
         let pod = pod_json("default", "repo-pod", "uid-2", "nginx:1.25");

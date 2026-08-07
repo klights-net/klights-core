@@ -598,7 +598,7 @@ fn test_watch_startup_reconciliation_skips_realized_pod_with_pod_ip() {
 
 #[tokio::test]
 async fn test_mark_pod_start_pending_for_retry_keeps_image_pull_non_terminal() {
-    use crate::kubelet::pod_repository::PodStatusWriter;
+    use klights_kubelet::pod_repository::PodStatusWriter;
     let db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
@@ -655,7 +655,7 @@ async fn test_mark_pod_start_pending_for_retry_keeps_image_pull_non_terminal() {
 
 #[tokio::test]
 async fn test_mark_pod_start_pending_for_retry_replaces_existing_pull_status_with_image_error() {
-    use crate::kubelet::pod_repository::PodStatusWriter;
+    use klights_kubelet::pod_repository::PodStatusWriter;
     let db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
@@ -732,7 +732,7 @@ async fn test_mark_pod_start_pending_for_retry_replaces_existing_pull_status_wit
 
 #[tokio::test]
 async fn test_mark_pod_start_pending_for_retry_rebuilds_status_for_retrying_init_failure() {
-    use crate::kubelet::pod_repository::PodStatusWriter;
+    use klights_kubelet::pod_repository::PodStatusWriter;
     let db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();

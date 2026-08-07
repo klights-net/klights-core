@@ -454,7 +454,7 @@ pub(super) async fn apply_pod_phase_update(
     use klights_kubelet::pod_status_builders::build_container_statuses;
     use klights_kubelet::pod_status_logic::extract_ready_containers_from_pod_condition;
 
-    use crate::kubelet::pod_repository::{PodStatusWriter, RuntimeReconcileStatus};
+    use klights_kubelet::pod_repository::{PodStatusWriter, RuntimeReconcileStatus};
     tracing::info!(
         namespace, pod_name,
         current_phase = current_phase.unwrap_or("None"),
@@ -724,6 +724,7 @@ mod tests {
                         crate::kubelet::pod_repository::PodSchedulingMode::InlineSingleNode,
                     outbox: None,
                     cluster_api: None,
+                    remote_delivery_required: false,
                     controller_identity:
                         crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
                     scheduler_bind_gate: None,

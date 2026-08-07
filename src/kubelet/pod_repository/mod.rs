@@ -213,7 +213,6 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
 pub mod background;
 pub mod delete_coordinator;
 pub mod facade;
-pub mod status;
 pub(crate) mod store;
 pub mod watch;
 pub mod workqueue;
@@ -222,7 +221,7 @@ pub mod workqueue;
 pub(crate) use crate::pod_repository_composition::PodRepositoryBuildConfig;
 #[cfg(test)]
 pub(crate) use crate::pod_repository_composition::PodSchedulingMode;
-pub(crate) use klights_kubelet::pod_repository::{
+use klights_kubelet::pod_repository::{
     PodNetworkAssignmentQuery, PodNetworkAssignmentRequest, PodStatusUpdate, RuntimeReconcileStatus,
 };
 
@@ -244,8 +243,8 @@ impl<T> PodQueryTestExt for T where T: klights_pod_api::PodQuery + ?Sized {}
 
 use background::PodRepositoryBackground;
 use delete_coordinator::PodDeleteCoordinator;
+use klights_kubelet::pod_repository::status;
 use klights_reconcile_api::{PodEvictionAdmissionSink, PodGcReconcileSink, PodPdbReconcileSink};
-use status::PodStatusService;
 use store::PodStore;
 use watch::PodWatchService;
 use workqueue::PodWorkqueue;
@@ -277,7 +276,7 @@ pub(crate) struct PodRepositoryNetworkDependencies {
 pub(crate) struct PodRepositoryDeliveryDependencies {
     pub outbox: Option<Arc<klights_kubelet::outbox::Outbox>>,
     pub cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
-    pub remote_metadata_delivery_required: bool,
+    pub remote_delivery_required: bool,
     pub bound_pod_finalization: Arc<dyn klights_pod_api::BoundPodFinalization>,
     #[cfg(feature = "pod-repository-test-support")]
     pub test_local_bound_finalization: Option<Arc<dyn klights_pod_api::BoundPodFinalization>>,
@@ -299,152 +298,6 @@ pub(crate) struct PodRepositoryAdapters {
     pub test_scheduling: Option<Arc<dyn klights_pod_api::PodScheduling>>,
 }
 
-#[async_trait]
-pub trait PodStatusWriter: Send + Sync {
-    /// LEGACY: prefer `set_pod_status_for_uid`. This variant does not
-    /// gate the write on pod UID. Production code MUST NOT use this —
-    /// stale events for a deleted pod can fold into a same-name
-    /// recreated pod and corrupt its status. Retained for legacy test
-    /// scaffolding that doesn't have a stable UID at construction time.
-    async fn set_pod_status(
-        &self,
-        ns: &str,
-        name: &str,
-        update: PodStatusUpdate,
-        expected_rv: Option<i64>,
-    ) -> Result<Resource>;
-
-    /// UID-bound status write. All production callers MUST use this.
-    async fn set_pod_status_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        pod_uid: &str,
-        update: PodStatusUpdate,
-        expected_rv: Option<i64>,
-    ) -> Result<Resource>;
-
-    /// LEGACY no-UID variant. Tests call this. Production MUST use
-    /// `apply_runtime_reconcile_status_for_uid` to gate stale CRI
-    /// events.
-    async fn apply_runtime_reconcile_status(
-        &self,
-        ns: &str,
-        name: &str,
-        update: RuntimeReconcileStatus,
-        expected_rv: Option<i64>,
-    ) -> Result<Resource>;
-
-    async fn apply_runtime_reconcile_status_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        pod_uid: &str,
-        update: RuntimeReconcileStatus,
-        expected_rv: Option<i64>,
-    ) -> Result<Resource>;
-
-    /// UID-bound retry-status write for retryable StartPod failures
-    /// (image pull, CNI readiness, transient CRI connectivity).
-    ///
-    /// Writes `containerStatuses[].state.waiting.reason` (escalating
-    /// `ErrImagePull` → `ImagePullBackOff` for repeated pull failures) and
-    /// `waiting.message` (the underlying error). Phase stays `Pending` so
-    /// controller-owned pods are not counted as terminal.
-    async fn mark_start_pending_for_retry_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        pod_uid: &str,
-        error_message: &str,
-    ) -> Result<Resource>;
-
-    /// LEGACY no-UID variant. Production MUST use
-    /// `set_probe_readiness_for_uid`.
-    async fn set_probe_readiness(
-        &self,
-        ns: &str,
-        name: &str,
-        container_name: &str,
-        ready: bool,
-        expected_rv: Option<i64>,
-    ) -> Result<Resource>;
-
-    async fn set_probe_readiness_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        pod_uid: &str,
-        container_name: &str,
-        ready: bool,
-        expected_rv: Option<i64>,
-    ) -> Result<Resource>;
-
-    /// LEGACY no-UID variant. Production MUST use
-    /// `set_deadline_exceeded_for_uid`.
-    async fn set_deadline_exceeded(
-        &self,
-        ns: &str,
-        name: &str,
-        message: String,
-        expected_rv: Option<i64>,
-    ) -> Result<Resource>;
-
-    async fn set_deadline_exceeded_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        pod_uid: &str,
-        message: String,
-        expected_rv: Option<i64>,
-    ) -> Result<Resource>;
-
-    /// Replace `status.ephemeralContainerStatuses` with the given slice
-    /// while preserving the rest of `status`. Used by the runtime
-    /// reconciler when CRI reports state for `kubectl debug`'s ephemeral
-    /// containers. LEGACY no-UID; production uses `_for_uid` variant.
-    async fn apply_ephemeral_container_statuses(
-        &self,
-        ns: &str,
-        name: &str,
-        statuses: Vec<Value>,
-        expected_rv: Option<i64>,
-    ) -> Result<Resource>;
-
-    async fn apply_ephemeral_container_statuses_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        pod_uid: &str,
-        statuses: Vec<Value>,
-        expected_rv: Option<i64>,
-    ) -> Result<Resource>;
-
-    /// Bump `containerStatuses[name=container].restartCount` by 1 and
-    /// stamp `lastState` with the supplied terminated descriptor.
-    /// Returns `Ok(None)` if the container is not yet present in
-    /// `containerStatuses` (next runtime reconcile will create it).
-    /// LEGACY no-UID; production uses `note_container_restart_for_uid`.
-    async fn note_container_restart(
-        &self,
-        ns: &str,
-        name: &str,
-        container_name: &str,
-        terminated: Value,
-        expected_rv: Option<i64>,
-    ) -> Result<Option<Resource>>;
-
-    async fn note_container_restart_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        pod_uid: &str,
-        container_name: &str,
-        terminated: Value,
-        expected_rv: Option<i64>,
-    ) -> Result<Option<Resource>>;
-}
-
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 pub trait PodWatchSource: Send + Sync {
     fn subscribe_pod_watch(&self) -> broadcast::Receiver<WatchEvent>;
@@ -455,7 +308,7 @@ pub trait PodWatchSource: Send + Sync {
 /// trait references.
 pub struct PodRepository {
     store: Arc<PodStore>,
-    status: PodStatusService,
+    status: status::PodStatusService,
     metadata: klights_kubelet::pod_repository::PodMetadataService,
     #[cfg(any(test, feature = "pod-repository-test-support"))]
     test_subresource: Option<Arc<dyn klights_pod_api::PodSubresourceMutation>>,
@@ -705,56 +558,6 @@ impl PodDeletionFinalizer for DeferredRuntimeCleanupFinalizer {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct PodUidMismatch {
-    pub(crate) expected: String,
-    pub(crate) actual: String,
-    namespace: String,
-    name: String,
-}
-
-impl std::fmt::Display for PodUidMismatch {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "Pod {}/{} UID mismatch: expected {}, found {}",
-            self.namespace,
-            self.name,
-            self.expected,
-            if self.actual.is_empty() {
-                "<empty>"
-            } else {
-                &self.actual
-            }
-        )
-    }
-}
-
-impl std::error::Error for PodUidMismatch {}
-
-pub(crate) fn ensure_pod_uid_matches(
-    data: &Value,
-    expected_uid: &str,
-    ns: &str,
-    name: &str,
-) -> Result<()> {
-    let live_uid = data
-        .pointer("/metadata/uid")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    if live_uid == expected_uid {
-        return Ok(());
-    }
-
-    Err(PodUidMismatch {
-        expected: expected_uid.to_string(),
-        actual: live_uid.to_string(),
-        namespace: ns.to_string(),
-        name: name.to_string(),
-    }
-    .into())
-}
-
 impl PodRepository {
     #[cfg(test)]
     pub fn new(
@@ -848,6 +651,7 @@ impl PodRepository {
             scheduling_mode,
             outbox,
             cluster_api: Some(cluster_api),
+            remote_delivery_required: true,
             controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(
             ),
             #[cfg(not(test))]
@@ -881,6 +685,7 @@ impl PodRepository {
             scheduling_mode,
             outbox,
             cluster_api: None,
+            remote_delivery_required: false,
             controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(
             ),
             #[cfg(not(test))]
@@ -931,7 +736,7 @@ impl PodRepository {
         let PodRepositoryDeliveryDependencies {
             outbox,
             cluster_api,
-            remote_metadata_delivery_required,
+            remote_delivery_required,
             bound_pod_finalization,
             #[cfg(feature = "pod-repository-test-support")]
             test_local_bound_finalization,
@@ -943,11 +748,12 @@ impl PodRepository {
         let namespace_bootstrap = adapters.namespace_bootstrap;
         let namespace_termination = adapters.namespace_termination;
         let mutation_reconcile = adapters.mutation_reconcile;
-        let status = PodStatusService::new(
+        let status = status::PodStatusService::new(
             store.clone(),
             status_persistence,
             mutation_reconcile.clone(),
             outbox.clone(),
+            remote_delivery_required,
             cluster_api.clone(),
             host_ip.clone(),
             wall_clock.clone(),
@@ -956,7 +762,7 @@ impl PodRepository {
             klights_kubelet::pod_repository::PodMetadataDependencies {
                 persistence: metadata_persistence,
                 outbox: outbox.clone(),
-                remote_delivery_required: remote_metadata_delivery_required,
+                remote_delivery_required,
                 mutation_reconcile: mutation_reconcile.clone(),
                 wall_clock: wall_clock.clone(),
             },
@@ -1390,7 +1196,7 @@ fn pod_has_owner_uid(pod: &Value, owner_uid: &str) -> bool {
 }
 
 #[async_trait]
-impl PodStatusWriter for PodRepository {
+impl status::PodStatusWriter for PodRepository {
     async fn set_pod_status(
         &self,
         ns: &str,

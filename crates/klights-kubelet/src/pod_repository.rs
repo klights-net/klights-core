@@ -5,6 +5,9 @@
 //! nor its public surface can remove a Pod row: bound-Pod actor finalization
 //! and the leader-only unscheduled-Pod CAS remain separate capabilities.
 
+pub mod status;
+pub use status::PodStatusWriter;
+
 use std::sync::Arc;
 use std::time::Duration;
 

@@ -534,6 +534,7 @@ async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_matc
             scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
+            remote_delivery_required: false,
             controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(
             ),
             scheduler_bind_gate: None,
@@ -1134,6 +1135,7 @@ async fn fixture_pod_repository() -> std::sync::Arc<crate::kubelet::pod_reposito
             scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
+            remote_delivery_required: false,
             controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(
             ),
             scheduler_bind_gate: None,
@@ -1249,10 +1251,10 @@ impl crate::kubelet::pod_runtime::repository::PodRuntimeRepository for SnapshotO
         ns: &str,
         name: &str,
         pod_uid: &str,
-        update: crate::kubelet::pod_repository::PodStatusUpdate,
+        update: klights_kubelet::pod_repository::PodStatusUpdate,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::set_pod_status_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::set_pod_status_for_uid(
             self.inner.as_ref(),
             ns,
             name,
@@ -1268,10 +1270,10 @@ impl crate::kubelet::pod_runtime::repository::PodRuntimeRepository for SnapshotO
         ns: &str,
         name: &str,
         pod_uid: &str,
-        update: crate::kubelet::pod_repository::RuntimeReconcileStatus,
+        update: klights_kubelet::pod_repository::RuntimeReconcileStatus,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::apply_runtime_reconcile_status_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::apply_runtime_reconcile_status_for_uid(
             self.inner.as_ref(),
             ns,
             name,
@@ -1289,7 +1291,7 @@ impl crate::kubelet::pod_runtime::repository::PodRuntimeRepository for SnapshotO
         pod_uid: &str,
         error_message: &str,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::mark_start_pending_for_retry_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::mark_start_pending_for_retry_for_uid(
             self.inner.as_ref(),
             ns,
             name,
@@ -1308,7 +1310,7 @@ impl crate::kubelet::pod_runtime::repository::PodRuntimeRepository for SnapshotO
         ready: bool,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::set_probe_readiness_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::set_probe_readiness_for_uid(
             self.inner.as_ref(),
             ns,
             name,
@@ -1328,7 +1330,7 @@ impl crate::kubelet::pod_runtime::repository::PodRuntimeRepository for SnapshotO
         message: String,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::set_deadline_exceeded_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::set_deadline_exceeded_for_uid(
             self.inner.as_ref(),
             ns,
             name,
@@ -1347,7 +1349,7 @@ impl crate::kubelet::pod_runtime::repository::PodRuntimeRepository for SnapshotO
         statuses: Vec<serde_json::Value>,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::apply_ephemeral_container_statuses_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::apply_ephemeral_container_statuses_for_uid(
             self.inner.as_ref(),
             ns,
             name,
@@ -1367,7 +1369,7 @@ impl crate::kubelet::pod_runtime::repository::PodRuntimeRepository for SnapshotO
         terminated: serde_json::Value,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        crate::kubelet::pod_repository::PodStatusWriter::note_container_restart_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::note_container_restart_for_uid(
             self.inner.as_ref(),
             ns,
             name,
@@ -2647,7 +2649,7 @@ async fn real_runtime_start_pod_uses_mock_cri_network_store_and_events() {
 
 #[tokio::test]
 async fn hostport_admission_failure_marks_pod_failed_with_parity() {
-    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+    use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
 
     let harness = PodRuntimeHarness::new().await;
     let holder = serde_json::json!({
@@ -2785,7 +2787,7 @@ async fn hostport_admission_failure_marks_pod_failed_with_parity() {
 
 #[tokio::test]
 async fn mid_lifecycle_status_writes_preserve_host_ip_with_parity() {
-    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+    use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
 
     let conflict_cluster = std::sync::Arc::new(FakeCluster::new());
     let (_cri, conflict_runtime, conflict_repo, conflict_cluster, conflict_hostports) =
@@ -5079,7 +5081,7 @@ async fn real_runtime_finalize_deletion_routes_through_deletion_finalizer_with_p
 
 #[tokio::test]
 async fn readiness_lifecycle_command_persists_probe_result_with_parity() {
-    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+    use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
 
     let harness = PodRuntimeHarness::new().await;
     let pod = serde_json::json!({
@@ -5201,8 +5203,8 @@ async fn real_runtime_handle_lifecycle_command_startup_passed() {
 
 #[tokio::test]
 async fn liveness_restart_uses_runtime_container_id_with_parity() {
-    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use klights_kubelet::lifecycle::{LifecycleCommand, RestartReason};
+    use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
@@ -5348,8 +5350,8 @@ async fn liveness_restart_uses_runtime_container_id_with_parity() {
 
 #[tokio::test]
 async fn liveness_restart_publishes_replacement_container_status_immediately() {
-    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use klights_kubelet::lifecycle::{LifecycleCommand, RestartReason};
+    use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
@@ -5701,7 +5703,7 @@ async fn real_runtime_reconcile_runtime_noop_when_no_sandbox() {
 
 #[tokio::test]
 async fn real_runtime_reconcile_runtime_restarts_exited_restart_policy_always_container() {
-    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+    use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
@@ -5847,7 +5849,7 @@ async fn real_runtime_reconcile_runtime_restarts_exited_restart_policy_always_co
 
 #[tokio::test]
 async fn real_runtime_reconcile_restart_policy_always_publishes_replacement_running_status() {
-    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+    use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
@@ -5985,8 +5987,8 @@ async fn real_runtime_reconcile_restart_policy_always_publishes_replacement_runn
 
 #[tokio::test]
 async fn reconcile_runtime_writes_pod_and_host_ips_with_parity() {
-    use crate::kubelet::pod_repository::PodStatusWriter;
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+    use klights_kubelet::pod_repository::PodStatusWriter;
     use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
@@ -6407,8 +6409,8 @@ async fn real_runtime_finalize_startup_unconfirmed_when_pod_not_found_or_pending
 
 #[tokio::test]
 async fn real_runtime_finalize_startup_returns_confirmed_sandbox_id_when_running_with_podip() {
-    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+    use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
 
     let harness = PodRuntimeHarness::new().await;
     let key = PodRuntimeKey::new("ns", "confirmed-pod", "uid-confirmed");
@@ -8183,7 +8185,7 @@ async fn post_start_hook_failure_event_and_stop_with_parity() {
 
 // --- Task 22.5: Probe Registration on Start ---
 
-use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
 
 #[tokio::test]
 async fn real_runtime_start_pod_does_not_register_readiness_probes_before_finalize_startup() {
@@ -8647,7 +8649,7 @@ async fn pod_stop_sandbox_identity_fallback_with_parity() {
 
 #[tokio::test]
 async fn real_runtime_reconcile_does_not_preserve_ready_started_for_missing_containers() {
-    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+    use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
 
     let harness = PodRuntimeHarness::new().await;
     let pod = serde_json::json!({
@@ -8760,8 +8762,8 @@ async fn real_runtime_reconcile_does_not_preserve_ready_started_for_missing_cont
 
 #[tokio::test]
 async fn real_runtime_reconcile_reports_exited_restart_never_container_as_succeeded() {
-    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+    use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
@@ -8866,8 +8868,8 @@ async fn real_runtime_reconcile_reports_exited_restart_never_container_as_succee
 
 #[tokio::test]
 async fn real_runtime_reconcile_preserves_terminal_container_state_after_stale_running_snapshot() {
-    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+    use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
@@ -9052,8 +9054,8 @@ async fn mocked_runtime_does_not_create_termination_log_file_directly() {
 
 #[tokio::test]
 async fn mocked_runtime_does_not_read_termination_message_file_directly() {
-    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+    use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let runtime_namespace = "klights-term-mock-read-test";
@@ -9311,8 +9313,8 @@ async fn hosts_file_mount_path_with_parity() {
 
 #[tokio::test]
 async fn termination_message_file_handling_with_parity() {
-    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+    use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let runtime_namespace = "klights-term-read-test";
@@ -10390,6 +10392,7 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
             scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
+            remote_delivery_required: false,
             controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(
             ),
             scheduler_bind_gate: None,
@@ -10493,9 +10496,9 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
 
 #[tokio::test]
 async fn real_runtime_reconcile_uses_cri_event_container_id_when_list_is_empty() {
-    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use crate::kubelet::pod_runtime::service::RuntimeReconcileHint;
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+    use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
@@ -10595,10 +10598,10 @@ async fn real_runtime_reconcile_uses_cri_event_container_id_when_list_is_empty()
 
 #[tokio::test]
 async fn started_cri_event_overrides_lagging_created_status_snapshot() {
-    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use crate::kubelet::pod_runtime::service::RuntimeReconcileHint;
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
     use klights_kubelet::cri_events::KubeletEventKind;
+    use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
     let harness = PodRuntimeHarness::new().await;
@@ -10810,7 +10813,7 @@ mod task4_runtime_observations {
             ]}
         });
         harness.create_runtime_pod(pod.clone()).await;
-        use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+        use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
         harness
             .repo
             .set_pod_status_for_uid(
@@ -10889,7 +10892,7 @@ mod task4_runtime_observations {
             "status":{"phase":"Succeeded","containerStatuses":[{"name":"app","image":image,"imageID":image,"ready":false,"started":false,"restartCount":0,"state":{"terminated":{"exitCode":0,"reason":"Completed"}}}]}
         });
         harness.create_runtime_pod(pod.clone()).await;
-        use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+        use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
         harness
             .repo
             .set_pod_status_for_uid(
@@ -10954,7 +10957,7 @@ mod task4_runtime_observations {
             ]}
         });
         harness.create_runtime_pod(pod.clone()).await;
-        use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+        use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
         harness
             .repo
             .set_pod_status_for_uid(
@@ -11139,6 +11142,7 @@ impl PodRuntimeHarness {
                     crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
                 outbox: None,
                 cluster_api: None,
+                remote_delivery_required: false,
                 controller_identity:
                     crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
                 scheduler_bind_gate: None,

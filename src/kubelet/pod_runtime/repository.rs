@@ -127,7 +127,7 @@ impl PodRuntimeRepository for PodRepository {
         update: PodStatusUpdate,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::set_pod_status_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::set_pod_status_for_uid(
             self,
             ns,
             name,
@@ -146,7 +146,7 @@ impl PodRuntimeRepository for PodRepository {
         update: RuntimeReconcileStatus,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::apply_runtime_reconcile_status_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::apply_runtime_reconcile_status_for_uid(
             self,
             ns,
             name,
@@ -164,7 +164,7 @@ impl PodRuntimeRepository for PodRepository {
         pod_uid: &str,
         error_message: &str,
     ) -> anyhow::Result<Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::mark_start_pending_for_retry_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::mark_start_pending_for_retry_for_uid(
             self,
             ns,
             name,
@@ -183,7 +183,7 @@ impl PodRuntimeRepository for PodRepository {
         ready: bool,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::set_probe_readiness_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::set_probe_readiness_for_uid(
             self,
             ns,
             name,
@@ -203,7 +203,7 @@ impl PodRuntimeRepository for PodRepository {
         message: String,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::set_deadline_exceeded_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::set_deadline_exceeded_for_uid(
             self,
             ns,
             name,
@@ -222,7 +222,7 @@ impl PodRuntimeRepository for PodRepository {
         statuses: Vec<serde_json::Value>,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Resource> {
-        crate::kubelet::pod_repository::PodStatusWriter::apply_ephemeral_container_statuses_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::apply_ephemeral_container_statuses_for_uid(
             self,
             ns,
             name,
@@ -242,7 +242,7 @@ impl PodRuntimeRepository for PodRepository {
         terminated: serde_json::Value,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Option<Resource>> {
-        crate::kubelet::pod_repository::PodStatusWriter::note_container_restart_for_uid(
+        klights_kubelet::pod_repository::PodStatusWriter::note_container_restart_for_uid(
             self,
             ns,
             name,

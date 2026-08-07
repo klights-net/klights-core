@@ -773,7 +773,7 @@ async fn persist_runtime_restart_status(
     container_name: &str,
     info: &ContainerInfo,
 ) -> Result<Option<i32>> {
-    use crate::kubelet::pod_repository::PodStatusWriter;
+    use klights_kubelet::pod_repository::PodStatusWriter;
 
     let updated = pod_repo
         .note_container_restart_for_uid(

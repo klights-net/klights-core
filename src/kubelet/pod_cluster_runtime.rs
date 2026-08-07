@@ -7,7 +7,8 @@
 
 use std::sync::Arc;
 
-use crate::kubelet::pod_repository::{PodRepository, PodStatusWriter};
+use crate::kubelet::pod_repository::PodRepository;
+use klights_kubelet::pod_repository::PodStatusWriter;
 use klights_kubelet::pod_repository::{PodStatusUpdate, RuntimeReconcileStatus};
 use klights_pod_api::{PodGetRequest, PodQuery};
 

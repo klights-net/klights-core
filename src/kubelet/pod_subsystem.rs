@@ -417,6 +417,7 @@ mod tests {
                 scheduling_mode,
                 outbox: None,
                 cluster_api: Some(cluster_api.clone()),
+                remote_delivery_required: false,
                 controller_identity:
                     crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
                 scheduler_bind_gate: None,
