@@ -1,9 +1,5 @@
-//! `PodStore` — the only file in the crate allowed to call
-//! [`crate::datastore::DatastoreBackend`] methods with `("v1","Pod",...)`
-//! literals. All other `pod_repository` services depend on
-//! `Arc<PodStore>` rather than `DatastoreHandle`, which keeps the
-//! pod-shaped DB boundary localized to a single file (enforced by
-//! tests/source_guard_tests.py).
+//! Policy-aware Pod repository facade. Concrete datastore access is owned by
+//! the private root composition persistence adapter.
 //!
 //! `pod_network` and `sandbox` table access is intentionally NOT routed
 //! through this hub — those are network-runtime / GC concerns owned by
@@ -18,22 +14,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::broadcast;
 
 use super::PodResourceList;
-#[cfg(test)]
-use crate::datastore::DatastoreHandle;
 use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
-use klights_kubelet::unscheduled_deletion::EligibleUnscheduledPodDeletion;
-use klights_pod_api::PodRepositoryError;
+use klights_pod_api::{
+    PodRepositoryCreateRequest, PodRepositoryError, PodRepositoryGetRequest,
+    PodRepositoryListRequest, PodRepositoryOwnerListRequest, PodRepositoryPatchRequest,
+    PodRepositoryReadPersistence, PodRepositoryReplaceRequest, PodRepositoryStatusNoop,
+    PodRepositoryStatusRequest, PodRepositoryWritePersistence,
+};
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_watch::WatchEvent;
-
-/// Result of the root-private, actor-owned bound-Pod finalization primitive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BoundPodDeleteOutcome {
-    Removed,
-    IdentityChanged,
-    FinalizersPending,
-    Retry,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ActorPodDeleteObservation {
@@ -54,69 +43,16 @@ fn pod_is_terminating_or_node_lost(pod: &Value) -> bool {
             && pod.pointer("/status/reason").and_then(Value::as_str) == Some("NodeLost"))
 }
 
-/// A hard-delete that reports the row already vanished concurrently, rather
-/// than a precondition conflict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PodDeleteCasOutcome {
-    Removed,
-    Conflict,
-    Gone,
-}
-
-#[async_trait::async_trait]
-pub(crate) trait PodPersistence: Send + Sync {
-    async fn get(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
-    async fn list(
-        &self,
-        namespace: Option<&str>,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        limit: Option<i64>,
-        continue_token: Option<&str>,
-    ) -> Result<PodResourceList>;
-    async fn snapshot_list(
-        &self,
-        request: klights_pod_api::PodSnapshotListRequest,
-    ) -> Result<klights_pod_api::PodSnapshotListOutcome>;
-    async fn list_by_owner(&self, namespace: &str, owner_uid: &str) -> Result<Vec<Resource>>;
-    async fn create(&self, namespace: &str, name: &str, body: Value) -> Result<Resource>;
-    async fn update(
-        &self,
-        namespace: &str,
-        name: &str,
-        body: Value,
-        preconditions: ResourcePreconditions,
-    ) -> Result<Resource>;
-    async fn patch_latest(
-        &self,
-        namespace: &str,
-        name: &str,
-        patch_kind: PatchKind,
-        patch: Value,
-        preconditions: ResourcePreconditions,
-    ) -> Result<Option<Resource>>;
-    async fn update_status(
-        &self,
-        namespace: &str,
-        name: &str,
-        status: Value,
-        preconditions: ResourcePreconditions,
-    ) -> Result<Resource>;
-    async fn delete(
-        &self,
-        namespace: &str,
-        name: &str,
-        preconditions: ResourcePreconditions,
-    ) -> Result<PodDeleteCasOutcome>;
-    fn log_status_noop(&self, namespace: &str, name: &str, resource: &Resource);
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
-    fn subscribe_watch(&self) -> tokio::sync::broadcast::Receiver<WatchEvent> {
-        panic!("watch subscription is unavailable for this persistence adapter")
-    }
+#[cfg(any(test, feature = "pod-repository-test-support"))]
+pub(crate) trait PodRepositoryWatchPersistence: Send + Sync {
+    fn pod_watch_receiver(&self) -> tokio::sync::broadcast::Receiver<WatchEvent>;
 }
 
 pub struct PodStore {
-    persistence: Arc<dyn PodPersistence>,
+    reads: Arc<dyn PodRepositoryReadPersistence>,
+    writes: Arc<dyn PodRepositoryWritePersistence>,
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    watches: Option<Arc<dyn PodRepositoryWatchPersistence>>,
     wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     /// Incremented on every pod create/delete to signal sandbox GC that a sweep may be needed.
     pub(super) sandbox_gc_dirty: Arc<AtomicUsize>,
@@ -124,19 +60,22 @@ pub struct PodStore {
 
 impl PodStore {
     pub(crate) fn from_persistence(
-        persistence: Arc<dyn PodPersistence>,
+        reads: Arc<dyn PodRepositoryReadPersistence>,
+        writes: Arc<dyn PodRepositoryWritePersistence>,
         wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+        sandbox_gc_dirty: Arc<AtomicUsize>,
+        #[cfg(any(test, feature = "pod-repository-test-support"))] watches: Option<
+            Arc<dyn PodRepositoryWatchPersistence>,
+        >,
     ) -> Self {
         Self {
-            persistence,
+            reads,
+            writes,
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            watches,
             wall_clock,
-            sandbox_gc_dirty: Arc::new(AtomicUsize::new(1)),
+            sandbox_gc_dirty,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new(db: DatastoreHandle) -> Self {
-        crate::pod_repository_composition::new_pod_store(db)
     }
 
     fn mark_sandbox_dirty(&self) {
@@ -148,7 +87,13 @@ impl PodStore {
     /// surface (see `mod.rs` doc comment). Outside `pod_repository/`,
     /// callers must always go through the typed methods.
     pub(crate) async fn get(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
-        self.persistence.get(ns, name).await
+        self.reads
+            .get_persisted_pod(PodRepositoryGetRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
+            })
+            .await
+            .map_err(Into::into)
     }
 
     pub(crate) async fn list(
@@ -159,20 +104,43 @@ impl PodStore {
         limit: Option<i64>,
         continue_token: Option<&str>,
     ) -> Result<PodResourceList> {
-        self.persistence
-            .list(ns, label_selector, field_selector, limit, continue_token)
-            .await
+        let result = self
+            .reads
+            .list_persisted_pods(PodRepositoryListRequest {
+                namespace: ns.map(str::to_string),
+                label_selector: label_selector.map(str::to_string),
+                field_selector: field_selector.map(str::to_string),
+                limit,
+                continue_token: continue_token.map(str::to_string),
+            })
+            .await?;
+        let (items, resource_version, continue_token, remaining_item_count) = result.into_parts();
+        Ok(PodResourceList {
+            items,
+            resource_version,
+            continue_token,
+            remaining_item_count,
+        })
     }
 
     pub(crate) async fn snapshot_list(
         &self,
         request: klights_pod_api::PodSnapshotListRequest,
     ) -> Result<klights_pod_api::PodSnapshotListOutcome> {
-        self.persistence.snapshot_list(request).await
+        self.reads
+            .snapshot_persisted_pods(request)
+            .await
+            .map_err(Into::into)
     }
 
     pub(super) async fn list_by_owner(&self, ns: &str, owner_uid: &str) -> Result<Vec<Resource>> {
-        self.persistence.list_by_owner(ns, owner_uid).await
+        self.reads
+            .list_persisted_pods_by_owner(PodRepositoryOwnerListRequest {
+                namespace: ns.to_string(),
+                owner_uid: owner_uid.to_string(),
+            })
+            .await
+            .map_err(Into::into)
     }
 
     #[cfg(feature = "pod-repository-test-support")]
@@ -186,7 +154,14 @@ impl PodStore {
 
     pub(crate) async fn create(&self, ns: &str, name: &str, body: Value) -> Result<Resource> {
         self.mark_sandbox_dirty();
-        self.persistence.create(ns, name, body).await
+        self.writes
+            .create_persisted_pod(PodRepositoryCreateRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
+                body,
+            })
+            .await
+            .map_err(Into::into)
     }
 
     pub(crate) async fn update(
@@ -202,17 +177,18 @@ impl PodStore {
             .ok_or_else(|| PodRepositoryError::not_found(ns, name))?;
         preserve_status_from_current(&current.data, &mut body);
         self.mark_sandbox_dirty();
-        self.persistence
-            .update(
-                ns,
-                name,
+        self.writes
+            .replace_persisted_pod(PodRepositoryReplaceRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
                 body,
-                ResourcePreconditions {
+                preconditions: ResourcePreconditions {
                     uid: Some(current.uid),
                     resource_version: Some(expected_rv),
                 },
-            )
+            })
             .await
+            .map_err(Into::into)
     }
 
     pub(super) async fn mark_deleting_latest(
@@ -243,17 +219,17 @@ impl PodStore {
             }
         });
         self.mark_sandbox_dirty();
-        self.persistence
-            .patch_latest(
-                ns,
-                name,
-                PatchKind::Merge,
+        self.writes
+            .patch_persisted_pod(PodRepositoryPatchRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
+                patch_kind: PatchKind::Merge,
                 patch,
-                ResourcePreconditions {
+                preconditions: ResourcePreconditions {
                     uid: Some(uid.to_string()),
                     resource_version: None,
                 },
-            )
+            })
             .await?
             .ok_or_else(|| PodRepositoryError::not_found(ns, name).into())
     }
@@ -278,17 +254,18 @@ impl PodStore {
         expected_rv: i64,
     ) -> Result<Resource> {
         self.mark_sandbox_dirty();
-        self.persistence
-            .update(
-                ns,
-                name,
+        self.writes
+            .replace_persisted_pod(PodRepositoryReplaceRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
                 body,
-                ResourcePreconditions {
+                preconditions: ResourcePreconditions {
                     uid: Some(uid.to_string()),
                     resource_version: Some(expected_rv),
                 },
-            )
+            })
             .await
+            .map_err(Into::into)
     }
 
     /// Internal scheduler path: bind `spec.nodeName` and update the
@@ -306,17 +283,18 @@ impl PodStore {
             .await?
             .ok_or_else(|| PodRepositoryError::not_found(ns, name))?;
         self.mark_sandbox_dirty();
-        self.persistence
-            .update(
-                ns,
-                name,
+        self.writes
+            .replace_persisted_pod(PodRepositoryReplaceRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
                 body,
-                ResourcePreconditions {
+                preconditions: ResourcePreconditions {
                     uid: Some(current.uid),
                     resource_version: Some(expected_rv),
                 },
-            )
+            })
             .await
+            .map_err(Into::into)
     }
 
     pub(super) async fn update_status(
@@ -340,20 +318,26 @@ impl PodStore {
                 ))
                 .into());
             }
-            self.persistence.log_status_noop(ns, name, &current);
+            self.writes
+                .log_persisted_pod_status_noop(PodRepositoryStatusNoop {
+                    namespace: ns,
+                    name,
+                    resource: &current,
+                });
             return Ok(current);
         }
-        self.persistence
-            .update_status(
-                ns,
-                name,
+        self.writes
+            .write_persisted_pod_status(PodRepositoryStatusRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
                 status,
-                ResourcePreconditions {
+                preconditions: ResourcePreconditions {
                     uid: Some(current.uid),
                     resource_version: expected_rv,
                 },
-            )
+            })
             .await
+            .map_err(Into::into)
     }
 
     #[cfg(feature = "pod-repository-test-support")]
@@ -367,131 +351,55 @@ impl PodStore {
         self.update_status(ns, name, status, expected_rv).await
     }
 
-    /// Remove a bound Pod only after revalidating actor-finalization state at
-    /// the datastore boundary.
-    ///
-    /// The observed resourceVersion CAS closes the race between this
-    /// validation read and row removal. Any concurrent bind, finalizer, or
-    /// lifecycle write forces the actor to retry from a fresh observation.
-    pub(crate) async fn finalize_bound_with_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-    ) -> Result<BoundPodDeleteOutcome> {
-        let observed_resource_version = match self.observe_bound_finalization(ns, name, uid).await?
-        {
-            ActorPodDeleteObservation::Ready {
-                resource_version, ..
-            } => resource_version,
-            ActorPodDeleteObservation::IdentityChanged => {
-                return Ok(BoundPodDeleteOutcome::IdentityChanged);
-            }
-            ActorPodDeleteObservation::FinalizersPending => {
-                return Ok(BoundPodDeleteOutcome::FinalizersPending);
-            }
-            ActorPodDeleteObservation::Retry => return Ok(BoundPodDeleteOutcome::Retry),
-        };
-
-        match self
-            .persistence
-            .delete(
-                ns,
-                name,
-                ResourcePreconditions {
-                    uid: Some(uid.to_string()),
-                    resource_version: Some(observed_resource_version),
-                },
-            )
-            .await?
-        {
-            PodDeleteCasOutcome::Removed => {
-                self.mark_sandbox_dirty();
-                Ok(BoundPodDeleteOutcome::Removed)
-            }
-            PodDeleteCasOutcome::Conflict => Ok(BoundPodDeleteOutcome::Retry),
-            PodDeleteCasOutcome::Gone => Ok(BoundPodDeleteOutcome::IdentityChanged),
-        }
-    }
-
-    pub(crate) async fn observe_bound_finalization(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-    ) -> Result<ActorPodDeleteObservation> {
-        let current = self.get(ns, name).await?;
-        Ok(self.classify_bound_finalization(current.as_ref(), uid))
-    }
-
     pub(crate) fn classify_bound_finalization(
         &self,
         current: Option<&Resource>,
         uid: &str,
     ) -> ActorPodDeleteObservation {
-        let Some(current) = current else {
-            return ActorPodDeleteObservation::IdentityChanged;
-        };
-        if current.uid != uid {
-            return ActorPodDeleteObservation::IdentityChanged;
-        }
-        let Some(node_name) = current
-            .data
-            .pointer("/spec/nodeName")
-            .and_then(Value::as_str)
-            .filter(|node| !node.trim().is_empty())
-        else {
-            return ActorPodDeleteObservation::Retry;
-        };
-        if !pod_is_terminating_or_node_lost(&current.data) {
-            return ActorPodDeleteObservation::Retry;
-        }
-        if current
-            .data
-            .pointer("/metadata/finalizers")
-            .and_then(Value::as_array)
-            .is_some_and(|finalizers| !finalizers.is_empty())
-        {
-            return ActorPodDeleteObservation::FinalizersPending;
-        }
-        ActorPodDeleteObservation::Ready {
-            resource_version: current.resource_version,
-            node_name: node_name.to_string(),
-        }
-    }
-
-    /// Execute the HR#11 exact UID/resourceVersion CAS authorized by the
-    /// kubelet-owned unscheduled-deletion policy.
-    ///
-    /// The opaque token can be constructed only after a fresh observation
-    /// proves the same UID/RV is terminating, finalizer-free, and unbound.
-    /// Persistence still performs the exact CAS, so an intervening bind,
-    /// resourceVersion change, or same-name replacement cannot be deleted.
-    pub(super) async fn delete_unscheduled_with_uid(
-        &self,
-        eligible: EligibleUnscheduledPodDeletion,
-    ) -> Result<PodDeleteCasOutcome> {
-        let identity = eligible.identity();
-        let outcome = self
-            .persistence
-            .delete(
-                &identity.namespace,
-                &identity.name,
-                ResourcePreconditions {
-                    uid: Some(identity.uid.clone()),
-                    resource_version: Some(eligible.observed_resource_version()),
-                },
-            )
-            .await?;
-        if outcome == PodDeleteCasOutcome::Removed {
-            self.mark_sandbox_dirty();
-        }
-        Ok(outcome)
+        classify_bound_finalization(current, uid)
     }
 
     #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub(super) fn subscribe_watch(&self) -> broadcast::Receiver<WatchEvent> {
-        self.persistence.subscribe_watch()
+        self.watches
+            .as_ref()
+            .expect("watch subscription is unavailable for this persistence adapter")
+            .pod_watch_receiver()
+    }
+}
+
+pub(crate) fn classify_bound_finalization(
+    current: Option<&Resource>,
+    uid: &str,
+) -> ActorPodDeleteObservation {
+    let Some(current) = current else {
+        return ActorPodDeleteObservation::IdentityChanged;
+    };
+    if current.uid != uid {
+        return ActorPodDeleteObservation::IdentityChanged;
+    }
+    let Some(node_name) = current
+        .data
+        .pointer("/spec/nodeName")
+        .and_then(Value::as_str)
+        .filter(|node| !node.trim().is_empty())
+    else {
+        return ActorPodDeleteObservation::Retry;
+    };
+    if !pod_is_terminating_or_node_lost(&current.data) {
+        return ActorPodDeleteObservation::Retry;
+    }
+    if current
+        .data
+        .pointer("/metadata/finalizers")
+        .and_then(Value::as_array)
+        .is_some_and(|finalizers| !finalizers.is_empty())
+    {
+        return ActorPodDeleteObservation::FinalizersPending;
+    }
+    ActorPodDeleteObservation::Ready {
+        resource_version: current.resource_version,
+        node_name: node_name.to_string(),
     }
 }
 

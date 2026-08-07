@@ -15,15 +15,15 @@ use klights_reconcile_api::{
     GcPodDeleteError, GcPodDeleteFuture, GcPodDeleteRequest, GcPodDeleteSink,
 };
 
-use crate::kubelet::pod_repository::store::{
-    ActorPodDeleteObservation, BoundPodDeleteOutcome, PodStore,
-};
+use crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::LocalBoundPodFinalizationPersistence;
+use crate::kubelet::pod_repository::store::{ActorPodDeleteObservation, PodStore};
 use klights_kubelet::outbox::{
     Outbox, OutboxCommand, OutboxOperation, OutboxSendPlanner, OutboxSubject,
 };
 
 pub(crate) struct RootBoundPodFinalization {
     store: Arc<PodStore>,
+    local_persistence: Option<Arc<dyn LocalBoundPodFinalizationPersistence>>,
     cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     outbox: Option<Arc<Outbox>>,
     wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
@@ -32,12 +32,14 @@ pub(crate) struct RootBoundPodFinalization {
 impl RootBoundPodFinalization {
     pub(crate) fn new(
         store: Arc<PodStore>,
+        local_persistence: Option<Arc<dyn LocalBoundPodFinalizationPersistence>>,
         cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
         outbox: Option<Arc<Outbox>>,
         wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
+            local_persistence,
             cluster_api,
             outbox,
             wall_clock,
@@ -122,11 +124,18 @@ impl RootBoundPodFinalization {
 
 pub(crate) fn new_for_root(
     store: Arc<PodStore>,
+    local_persistence: Arc<dyn LocalBoundPodFinalizationPersistence>,
     cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     outbox: Option<Arc<Outbox>>,
     wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 ) -> Arc<dyn BoundPodFinalization> {
-    RootBoundPodFinalization::new(store, cluster_api, outbox, wall_clock)
+    RootBoundPodFinalization::new(
+        store,
+        Some(local_persistence),
+        cluster_api,
+        outbox,
+        wall_clock,
+    )
 }
 
 impl BoundPodFinalization for RootBoundPodFinalization {
@@ -187,21 +196,17 @@ impl BoundPodFinalization for RootBoundPodFinalization {
                 return Ok(BoundPodFinalizationOutcome::Accepted);
             }
 
-            match self
-                .store
-                .finalize_bound_with_uid(&namespace, &name, &uid)
+            self.local_persistence
+                .as_ref()
+                .ok_or_else(|| {
+                    BoundPodFinalizationError::unavailable(
+                        "local bound-Pod persistence capability is unavailable",
+                    )
+                })?
+                .finalize_bound_pod(BoundPodFinalizationRequest::try_new(
+                    klights_types::PodIdentity::new(&namespace, &name, &uid),
+                )?)
                 .await
-            {
-                Ok(BoundPodDeleteOutcome::Removed) => Ok(BoundPodFinalizationOutcome::Removed),
-                Ok(BoundPodDeleteOutcome::IdentityChanged) => {
-                    Ok(BoundPodFinalizationOutcome::IdentityChanged)
-                }
-                Ok(BoundPodDeleteOutcome::FinalizersPending) => {
-                    Ok(BoundPodFinalizationOutcome::FinalizersPending)
-                }
-                Ok(BoundPodDeleteOutcome::Retry) => Ok(BoundPodFinalizationOutcome::Retry),
-                Err(error) => Err(BoundPodFinalizationError::unavailable(error.to_string())),
-            }
         })
     }
 }

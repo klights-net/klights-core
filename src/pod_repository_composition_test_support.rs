@@ -1531,6 +1531,10 @@ impl IntegrationDeadlineTimerRunnerFixture {
 pub struct IntegrationPodStoreFixture {
     _sqlite: crate::datastore::sqlite::Datastore,
     store: Arc<crate::kubelet::pod_repository::store::PodStore>,
+    bound_finalization: Arc<
+        dyn crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::LocalBoundPodFinalizationPersistence,
+    >,
+    unscheduled_deletion: Arc<dyn klights_pod_api::UnscheduledPodDeletion>,
 }
 
 impl IntegrationPodStoreFixture {
@@ -1539,10 +1543,15 @@ impl IntegrationPodStoreFixture {
             .await
             .expect("Pod store integration fixture");
         let datastore: crate::datastore::DatastoreHandle = Arc::new(sqlite.clone());
-        let store = Arc::new(crate::pod_repository_composition::new_pod_store(datastore));
+        let persistence = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
+            datastore,
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        );
         Self {
             _sqlite: sqlite,
-            store,
+            store: persistence.store,
+            bound_finalization: persistence.bound_finalization,
+            unscheduled_deletion: persistence.unscheduled_deletion,
         }
     }
 
@@ -1625,14 +1634,8 @@ impl IntegrationPodStoreFixture {
         name: &str,
         uid: &str,
     ) -> anyhow::Result<IntegrationBoundPodDeleteOutcome> {
-        let finalization =
-            crate::bootstrap::composition_adapters::bound_pod_finalization_adapter::new_for_root(
-                self.store.clone(),
-                None,
-                None,
-                Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
-            );
-        let outcome = finalization
+        let outcome = self
+            .bound_finalization
             .finalize_bound_pod(klights_pod_api::BoundPodFinalizationRequest::try_new(
                 klights_types::PodIdentity::new(namespace, name, uid),
             )?)
@@ -1648,10 +1651,7 @@ impl IntegrationPodStoreFixture {
         uid: &str,
         observed_resource_version: i64,
     ) -> anyhow::Result<klights_pod_api::UnscheduledPodDeletionOutcome> {
-        let deletion = crate::kubelet::pod_repository::workqueue::test_leader_unscheduled_deletion(
-            self.store.clone(),
-        );
-        deletion
+        self.unscheduled_deletion
             .delete_unscheduled_pod(klights_pod_api::UnscheduledPodDeletionRequest::try_new(
                 klights_types::PodIdentity::new(namespace, name, uid),
                 observed_resource_version,
@@ -1853,10 +1853,10 @@ async fn integration_pod_delete_cas_race_store(
     pod_name: &str,
     race: IntegrationPodDeleteCasRaceKind,
 ) -> (
-    Arc<crate::kubelet::pod_repository::store::PodStore>,
+    crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::RootPodRepositoryPersistenceParts,
     crate::datastore::DatastoreHandle,
     Arc<std::sync::atomic::AtomicBool>,
-) {
+){
     let sqlite = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .expect("delete CAS race datastore");
@@ -1875,13 +1875,12 @@ async fn integration_pod_delete_cas_race_store(
             Arc::new(klights_supervisor::SystemWallClock),
         ),
     );
-    (
-        Arc::new(crate::pod_repository_composition::new_pod_store(
+    let persistence =
+        crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
             datastore.clone(),
-        )),
-        datastore,
-        raced,
-    )
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        );
+    (persistence, datastore, raced)
 }
 
 pub async fn run_unscheduled_pod_delete_cas_race(
@@ -1889,7 +1888,9 @@ pub async fn run_unscheduled_pod_delete_cas_race(
     pod_uid: &str,
     race: IntegrationPodDeleteCasRaceKind,
 ) -> anyhow::Result<IntegrationUnscheduledPodDeleteCasRaceOutcome> {
-    let (store, datastore, raced) = integration_pod_delete_cas_race_store(pod_name, race).await;
+    let (persistence, datastore, raced) =
+        integration_pod_delete_cas_race_store(pod_name, race).await;
+    let store = persistence.store.clone();
     let created = store
         .create(
             "default",
@@ -1909,9 +1910,8 @@ pub async fn run_unscheduled_pod_delete_cas_race(
             }),
         )
         .await?;
-    let deletion =
-        crate::kubelet::pod_repository::workqueue::test_leader_unscheduled_deletion(store);
-    let disposition = deletion
+    let disposition = persistence
+        .unscheduled_deletion
         .delete_unscheduled_pod(klights_pod_api::UnscheduledPodDeletionRequest::try_new(
             klights_types::PodIdentity::new("default", pod_name, pod_uid),
             created.resource_version,
@@ -1934,11 +1934,12 @@ pub async fn run_bound_pod_delete_cas_race(
     pod_name: &str,
     pod_uid: &str,
 ) -> anyhow::Result<IntegrationBoundPodDeleteCasRaceOutcome> {
-    let (store, datastore, raced) = integration_pod_delete_cas_race_store(
+    let (persistence, datastore, raced) = integration_pod_delete_cas_race_store(
         pod_name,
         IntegrationPodDeleteCasRaceKind::StatusUpdate,
     )
     .await;
+    let store = persistence.store.clone();
     let created = store
         .create(
             "default",
@@ -1961,6 +1962,7 @@ pub async fn run_bound_pod_delete_cas_race(
     let finalization =
         crate::bootstrap::composition_adapters::bound_pod_finalization_adapter::new_for_root(
             store,
+            persistence.bound_finalization,
             None,
             None,
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),

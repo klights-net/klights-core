@@ -290,6 +290,8 @@ pub(crate) struct PodRepositoryDeliveryDependencies {
     pub outbox: Option<Arc<klights_kubelet::outbox::Outbox>>,
     pub cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     pub bound_pod_finalization: Arc<dyn klights_pod_api::BoundPodFinalization>,
+    #[cfg(feature = "pod-repository-test-support")]
+    pub test_local_bound_finalization: Option<Arc<dyn klights_pod_api::BoundPodFinalization>>,
 }
 
 pub(crate) struct PodRepositoryAdapters {
@@ -710,6 +712,8 @@ pub struct PodRepository {
     host_ip: klights_kubelet::context::HostIpState,
     #[cfg(any(test, feature = "pod-repository-test-support"))]
     deletion_finalizer: Arc<dyn PodDeletionFinalizer>,
+    #[cfg(feature = "pod-repository-test-support")]
+    test_local_bound_finalization: Option<Arc<dyn klights_pod_api::BoundPodFinalization>>,
 }
 
 impl PodRepository {
@@ -765,17 +769,12 @@ impl PodRepository {
         name: &str,
         uid: &str,
     ) -> Result<klights_pod_api::BoundPodFinalizationOutcome> {
-        let finalization =
-            crate::bootstrap::composition_adapters::bound_pod_finalization_adapter::new_for_root(
-                self.store.clone(),
-                None,
-                None,
-                Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
-            );
         let request = klights_pod_api::BoundPodFinalizationRequest::try_new(
             klights_types::PodIdentity::new(namespace, name, uid),
         )?;
-        finalization
+        self.test_local_bound_finalization
+            .as_ref()
+            .expect("test-support root repository requires local bound finalization")
             .finalize_bound_pod(request)
             .await
             .map_err(anyhow::Error::new)
@@ -1128,6 +1127,8 @@ impl PodRepository {
             outbox,
             cluster_api,
             bound_pod_finalization,
+            #[cfg(feature = "pod-repository-test-support")]
+            test_local_bound_finalization,
         } = delivery;
         workqueue.set_namespace_termination_sink(adapters.namespace_termination.clone());
         let gc_reconcile = adapters.gc_reconcile;
@@ -1171,7 +1172,7 @@ impl PodRepository {
             namespace_termination: namespace_termination.clone(),
             cluster_api: cluster_api.clone(),
             outbox: outbox.clone(),
-            bound_pod_finalization,
+            bound_pod_finalization: bound_pod_finalization.clone(),
             mutation_reconcile: mutation_reconcile.clone(),
             metrics: metrics.clone(),
             supervisor: supervisor.clone(),
@@ -1207,6 +1208,8 @@ impl PodRepository {
             host_ip,
             #[cfg(any(test, feature = "pod-repository-test-support"))]
             deletion_finalizer,
+            #[cfg(feature = "pod-repository-test-support")]
+            test_local_bound_finalization,
         };
         let background = PodRepositoryBackground::new(workqueue);
         facade::PodRepositoryParts::new(repository, background, deletion_finalizer_dependencies)

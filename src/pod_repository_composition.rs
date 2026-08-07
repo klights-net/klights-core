@@ -41,7 +41,6 @@ use k8s_native_service::{
     PodApiService, PodApiServiceDependencies, PodNativeOrchestration,
     PodNativeOrchestrationDependencies, PodSubresourceService,
 };
-use klights_cluster_datastore::diagnostics::{NoopResourceWrite, log_noop_resource_write};
 use klights_controllers::side_effects::SideEffectMetrics;
 use klights_controllers::side_effects::SideEffectRegistry;
 use klights_leader_api::LeaderResourceQuery;
@@ -132,10 +131,6 @@ struct RootInMemoryPodWorkqueueEntry {
     payload: serde_json::Value,
     attempt_count: i64,
     next_attempt_at_ms: i64,
-}
-
-struct RootPodPersistence {
-    db: DatastoreHandle,
 }
 
 struct WorkerPodPersistence {
@@ -254,447 +249,174 @@ impl WorkerPodAdapters {
     }
 }
 
-fn worker_persistence_unavailable(operation: &str) -> anyhow::Error {
-    anyhow::Error::new(klights_pod_api::PodRepositoryError::unavailable(format!(
+fn worker_persistence_unavailable(operation: &str) -> klights_pod_api::PodRepositoryError {
+    klights_pod_api::PodRepositoryError::unavailable(format!(
         "worker Pod persistence cannot perform leader-owned {operation}"
-    )))
+    ))
 }
 
-#[async_trait::async_trait]
-impl crate::kubelet::pod_repository::store::PodPersistence for WorkerPodPersistence {
-    async fn get(
+impl klights_pod_api::PodRepositoryReadPersistence for WorkerPodPersistence {
+    fn get_persisted_pod(
         &self,
-        namespace: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
-        self.resource_query
-            .get_resource(klights_leader_api::ResourceGetRequest::try_new(
-                klights_types::ResourceKey::new("v1", "Pod", Some(namespace.to_string()), name),
-                klights_leader_api::ResourceQueryConsistency::Cached,
-            )?)
-            .await
-            .map_err(anyhow::Error::new)
-    }
-
-    async fn list(
-        &self,
-        namespace: Option<&str>,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        limit: Option<i64>,
-        continue_token: Option<&str>,
-    ) -> anyhow::Result<crate::kubelet::pod_repository::PodResourceList> {
-        let result = self
-            .resource_query
-            .list_resources(klights_leader_api::ResourceListRequest::try_new(
-                "v1",
-                "Pod",
-                namespace.map(str::to_owned),
-                label_selector.map(str::to_owned),
-                field_selector.map(str::to_owned),
-                limit,
-                continue_token.map(str::to_owned),
-                klights_leader_api::ResourceQueryConsistency::Cached,
-            )?)
-            .await
-            .map_err(anyhow::Error::new)?;
-        let (items, resource_version, _, continue_token, remaining_item_count) =
-            result.into_parts();
-        Ok(crate::kubelet::pod_repository::PodResourceList {
-            items,
-            resource_version,
-            continue_token,
-            remaining_item_count,
+        request: klights_pod_api::PodRepositoryGetRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Option<klights_cluster_core::Resource>> {
+        Box::pin(async move {
+            self.resource_query
+                .get_resource(
+                    klights_leader_api::ResourceGetRequest::try_new(
+                        klights_types::ResourceKey::new(
+                            "v1",
+                            "Pod",
+                            Some(request.namespace),
+                            request.name,
+                        ),
+                        klights_leader_api::ResourceQueryConsistency::Cached,
+                    )
+                    .map_err(|error| {
+                        klights_pod_api::PodRepositoryError::internal(error.to_string())
+                    })?,
+                )
+                .await
+                .map_err(|error| {
+                    klights_pod_api::PodRepositoryError::unavailable(error.to_string())
+                })
         })
     }
 
-    async fn snapshot_list(
+    fn list_persisted_pods(
+        &self,
+        request: klights_pod_api::PodRepositoryListRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodListResult> {
+        Box::pin(async move {
+            let result = self
+                .resource_query
+                .list_resources(
+                    klights_leader_api::ResourceListRequest::try_new(
+                        "v1",
+                        "Pod",
+                        request.namespace,
+                        request.label_selector,
+                        request.field_selector,
+                        request.limit,
+                        request.continue_token,
+                        klights_leader_api::ResourceQueryConsistency::Cached,
+                    )
+                    .map_err(|error| {
+                        klights_pod_api::PodRepositoryError::internal(error.to_string())
+                    })?,
+                )
+                .await
+                .map_err(|error| {
+                    klights_pod_api::PodRepositoryError::unavailable(error.to_string())
+                })?;
+            let (items, resource_version, _, continue_token, remaining_item_count) =
+                result.into_parts();
+            klights_pod_api::PodListResult::try_new(
+                items,
+                resource_version,
+                continue_token,
+                remaining_item_count,
+            )
+        })
+    }
+
+    fn snapshot_persisted_pods(
         &self,
         request: klights_pod_api::PodSnapshotListRequest,
-    ) -> anyhow::Result<klights_pod_api::PodSnapshotListOutcome> {
-        let list = request.list;
-        let result = self
-            .list(
-                list.namespace(),
-                list.label_selector(),
-                list.field_selector(),
-                list.limit(),
-                list.continue_token(),
-            )
-            .await?;
-        if result.resource_version < request.snapshot_resource_version {
-            return Ok(klights_pod_api::PodSnapshotListOutcome::Current);
-        }
-        Ok(klights_pod_api::PodSnapshotListOutcome::List(
-            klights_pod_api::PodListResult::try_new(
-                result.items,
-                result.resource_version,
-                result.continue_token,
-                result.remaining_item_count,
-            )?,
-        ))
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodSnapshotListOutcome> {
+        Box::pin(async move {
+            let list = request.list;
+            let result = self
+                .list_persisted_pods(klights_pod_api::PodRepositoryListRequest {
+                    namespace: list.namespace().map(str::to_string),
+                    label_selector: list.label_selector().map(str::to_string),
+                    field_selector: list.field_selector().map(str::to_string),
+                    limit: list.limit(),
+                    continue_token: list.continue_token().map(str::to_string),
+                })
+                .await?;
+            if result.resource_version() < request.snapshot_resource_version {
+                return Ok(klights_pod_api::PodSnapshotListOutcome::Current);
+            }
+            Ok(klights_pod_api::PodSnapshotListOutcome::List(result))
+        })
     }
 
-    async fn list_by_owner(
+    fn list_persisted_pods_by_owner(
         &self,
-        namespace: &str,
-        owner_uid: &str,
-    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>> {
-        Ok(self
-            .list(Some(namespace), None, None, None, None)
-            .await?
-            .items
-            .into_iter()
-            .filter(|pod| {
-                pod.data
-                    .pointer("/metadata/ownerReferences")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|owners| {
-                        owners.iter().any(|owner| {
-                            owner.get("uid").and_then(serde_json::Value::as_str) == Some(owner_uid)
+        request: klights_pod_api::PodRepositoryOwnerListRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Vec<klights_cluster_core::Resource>> {
+        Box::pin(async move {
+            let pods = self
+                .list_persisted_pods(klights_pod_api::PodRepositoryListRequest {
+                    namespace: Some(request.namespace),
+                    label_selector: None,
+                    field_selector: None,
+                    limit: None,
+                    continue_token: None,
+                })
+                .await?;
+            Ok(pods
+                .into_parts()
+                .0
+                .into_iter()
+                .filter(|pod| {
+                    pod.data
+                        .pointer("/metadata/ownerReferences")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|owners| {
+                            owners.iter().any(|owner| {
+                                owner.get("uid").and_then(serde_json::Value::as_str)
+                                    == Some(request.owner_uid.as_str())
+                            })
                         })
-                    })
-            })
-            .collect())
+                })
+                .collect())
+        })
+    }
+}
+
+impl klights_pod_api::PodRepositoryWritePersistence for WorkerPodPersistence {
+    fn create_persisted_pod(
+        &self,
+        _request: klights_pod_api::PodRepositoryCreateRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_cluster_core::Resource> {
+        Box::pin(async { Err(worker_persistence_unavailable("create")) })
     }
 
-    async fn create(
+    fn replace_persisted_pod(
         &self,
-        _namespace: &str,
-        _name: &str,
-        _body: serde_json::Value,
-    ) -> anyhow::Result<klights_cluster_core::Resource> {
-        Err(worker_persistence_unavailable("create"))
+        _request: klights_pod_api::PodRepositoryReplaceRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_cluster_core::Resource> {
+        Box::pin(async { Err(worker_persistence_unavailable("update")) })
     }
 
-    async fn update(
+    fn patch_persisted_pod(
         &self,
-        _namespace: &str,
-        _name: &str,
-        _body: serde_json::Value,
-        _preconditions: klights_cluster_core::ResourcePreconditions,
-    ) -> anyhow::Result<klights_cluster_core::Resource> {
-        Err(worker_persistence_unavailable("update"))
+        _request: klights_pod_api::PodRepositoryPatchRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Option<klights_cluster_core::Resource>> {
+        Box::pin(async { Err(worker_persistence_unavailable("patch")) })
     }
 
-    async fn patch_latest(
+    fn write_persisted_pod_status(
         &self,
-        _namespace: &str,
-        _name: &str,
-        _patch_kind: crate::datastore::PatchKind,
-        _patch: serde_json::Value,
-        _preconditions: klights_cluster_core::ResourcePreconditions,
-    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
-        Err(worker_persistence_unavailable("patch"))
+        _request: klights_pod_api::PodRepositoryStatusRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_cluster_core::Resource> {
+        Box::pin(async { Err(worker_persistence_unavailable("status update")) })
     }
 
-    async fn update_status(
-        &self,
-        _namespace: &str,
-        _name: &str,
-        _status: serde_json::Value,
-        _preconditions: klights_cluster_core::ResourcePreconditions,
-    ) -> anyhow::Result<klights_cluster_core::Resource> {
-        Err(worker_persistence_unavailable("status update"))
-    }
-
-    async fn delete(
-        &self,
-        _namespace: &str,
-        _name: &str,
-        _preconditions: klights_cluster_core::ResourcePreconditions,
-    ) -> anyhow::Result<crate::kubelet::pod_repository::store::PodDeleteCasOutcome> {
-        Err(worker_persistence_unavailable("delete"))
-    }
-
-    fn log_status_noop(
-        &self,
-        namespace: &str,
-        name: &str,
-        resource: &klights_cluster_core::Resource,
-    ) {
+    fn log_persisted_pod_status_noop(&self, request: klights_pod_api::PodRepositoryStatusNoop<'_>) {
         tracing::debug!(
-            namespace,
-            name,
-            resource_version = resource.resource_version,
+            namespace = request.namespace,
+            name = request.name,
+            resource_version = request.resource.resource_version,
             "worker Pod status write was already current"
         );
     }
 }
 
-pub(crate) fn new_pod_store(
-    db: DatastoreHandle,
-) -> crate::kubelet::pod_repository::store::PodStore {
-    crate::kubelet::pod_repository::store::PodStore::from_persistence(
-        Arc::new(RootPodPersistence { db }),
-        Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
-    )
-}
-
-fn pod_persistence_error(error: anyhow::Error, namespace: &str, name: &str) -> anyhow::Error {
-    if let Some(error) = error.downcast_ref::<klights_cluster_core::StorageMutationError>() {
-        use klights_cluster_core::StorageCommandRejectionCode;
-
-        let message = error.message().to_string();
-        return match error.rejection_code() {
-            Some(StorageCommandRejectionCode::AlreadyExists) => {
-                anyhow::Error::new(klights_pod_api::PodRepositoryError::already_exists(message))
-            }
-            Some(StorageCommandRejectionCode::Conflict) => {
-                anyhow::Error::new(klights_pod_api::PodRepositoryError::conflict(message))
-            }
-            Some(StorageCommandRejectionCode::NotFound) => anyhow::Error::new(
-                klights_pod_api::PodRepositoryError::not_found(namespace, name),
-            ),
-            Some(StorageCommandRejectionCode::InvalidCommit) => {
-                anyhow::Error::new(klights_pod_api::PodRepositoryError::internal(message))
-            }
-            None => anyhow::Error::new(klights_pod_api::PodRepositoryError::unavailable(message)),
-        };
-    }
-    if let Some(error) = error.downcast_ref::<klights_cluster_datastore::errors::DatastoreError>() {
-        return match error {
-            klights_cluster_datastore::errors::DatastoreError::AlreadyExists { message } => {
-                anyhow::Error::new(klights_pod_api::PodRepositoryError::already_exists(message))
-            }
-            klights_cluster_datastore::errors::DatastoreError::Conflict { message } => {
-                anyhow::Error::new(klights_pod_api::PodRepositoryError::conflict(message))
-            }
-            klights_cluster_datastore::errors::DatastoreError::NotFound { .. } => {
-                anyhow::Error::new(klights_pod_api::PodRepositoryError::not_found(
-                    namespace, name,
-                ))
-            }
-        };
-    }
-    anyhow::Error::new(klights_pod_api::PodRepositoryError::unavailable(
-        error.to_string(),
-    ))
-}
-
-#[async_trait::async_trait]
-impl crate::kubelet::pod_repository::store::PodPersistence for RootPodPersistence {
-    async fn get(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
-        self.db
-            .get_resource("v1", "Pod", Some(namespace), name)
-            .await
-            .map_err(|error| pod_persistence_error(error, namespace, name))
-    }
-
-    async fn list(
-        &self,
-        namespace: Option<&str>,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        limit: Option<i64>,
-        continue_token: Option<&str>,
-    ) -> anyhow::Result<crate::kubelet::pod_repository::PodResourceList> {
-        let list = self
-            .db
-            .list_resources(
-                "v1",
-                "Pod",
-                namespace,
-                crate::datastore::ResourceListQuery::new(
-                    label_selector,
-                    field_selector,
-                    limit,
-                    continue_token,
-                ),
-            )
-            .await
-            .map_err(|error| {
-                pod_persistence_error(error, namespace.unwrap_or_default(), "Pod list")
-            })?;
-        Ok(crate::kubelet::pod_repository::PodResourceList {
-            items: list.items,
-            resource_version: list.resource_version,
-            continue_token: list.continue_token,
-            remaining_item_count: list.remaining_item_count,
-        })
-    }
-
-    async fn snapshot_list(
-        &self,
-        request: klights_pod_api::PodSnapshotListRequest,
-    ) -> anyhow::Result<klights_pod_api::PodSnapshotListOutcome> {
-        let list = request.list;
-        let snapshot = self
-            .db
-            .snapshot_resources_at_rv(
-                "v1",
-                "Pod",
-                list.namespace(),
-                crate::datastore::ResourceListQuery::new(
-                    list.label_selector(),
-                    list.field_selector(),
-                    list.limit(),
-                    list.continue_token(),
-                ),
-                request.snapshot_resource_version,
-            )
-            .await?;
-        Ok(match snapshot {
-            crate::datastore::SnapshotAtRv::List(list) => {
-                klights_pod_api::PodSnapshotListOutcome::List(
-                    klights_pod_api::PodListResult::try_new(
-                        list.items,
-                        list.resource_version,
-                        list.continue_token,
-                        list.remaining_item_count,
-                    )?,
-                )
-            }
-            crate::datastore::SnapshotAtRv::Current => {
-                klights_pod_api::PodSnapshotListOutcome::Current
-            }
-            crate::datastore::SnapshotAtRv::Expired => {
-                klights_pod_api::PodSnapshotListOutcome::Expired
-            }
-        })
-    }
-
-    async fn list_by_owner(
-        &self,
-        namespace: &str,
-        owner_uid: &str,
-    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>> {
-        self.db
-            .list_resources_by_owner_uid("v1", "Pod", Some(namespace), owner_uid)
-            .await
-            .map_err(|error| pod_persistence_error(error, namespace, "Pod owner list"))
-    }
-
-    async fn create(
-        &self,
-        namespace: &str,
-        name: &str,
-        body: serde_json::Value,
-    ) -> anyhow::Result<klights_cluster_core::Resource> {
-        self.db
-            .create_resource("v1", "Pod", Some(namespace), name, body)
-            .await
-            .map_err(|error| pod_persistence_error(error, namespace, name))
-    }
-
-    async fn update(
-        &self,
-        namespace: &str,
-        name: &str,
-        body: serde_json::Value,
-        preconditions: klights_cluster_core::ResourcePreconditions,
-    ) -> anyhow::Result<klights_cluster_core::Resource> {
-        self.db
-            .update_resource_with_preconditions(
-                "v1",
-                "Pod",
-                Some(namespace),
-                name,
-                body,
-                preconditions,
-            )
-            .await
-            .map_err(|error| pod_persistence_error(error, namespace, name))
-    }
-
-    async fn patch_latest(
-        &self,
-        namespace: &str,
-        name: &str,
-        patch_kind: klights_cluster_core::PatchKind,
-        patch: serde_json::Value,
-        preconditions: klights_cluster_core::ResourcePreconditions,
-    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
-        self.db
-            .patch_resource_latest_with_preconditions(
-                "v1",
-                "Pod",
-                Some(namespace),
-                name,
-                crate::datastore::ResourcePatchRequest::new(patch_kind, patch, preconditions),
-            )
-            .await
-            .map_err(|error| pod_persistence_error(error, namespace, name))
-    }
-
-    async fn update_status(
-        &self,
-        namespace: &str,
-        name: &str,
-        status: serde_json::Value,
-        preconditions: klights_cluster_core::ResourcePreconditions,
-    ) -> anyhow::Result<klights_cluster_core::Resource> {
-        self.db
-            .update_status_only_with_preconditions(
-                "v1",
-                "Pod",
-                Some(namespace),
-                name,
-                status,
-                preconditions,
-            )
-            .await
-            .map_err(|error| pod_persistence_error(error, namespace, name))
-    }
-
-    async fn delete(
-        &self,
-        namespace: &str,
-        name: &str,
-        preconditions: klights_cluster_core::ResourcePreconditions,
-    ) -> anyhow::Result<crate::kubelet::pod_repository::store::PodDeleteCasOutcome> {
-        match self
-            .db
-            .delete_resource_with_preconditions("v1", "Pod", Some(namespace), name, preconditions)
-            .await
-        {
-            Ok(()) => Ok(crate::kubelet::pod_repository::store::PodDeleteCasOutcome::Removed),
-            Err(error) if klights_cluster_datastore::errors::is_conflict_error(&error) => {
-                Ok(crate::kubelet::pod_repository::store::PodDeleteCasOutcome::Conflict)
-            }
-            Err(error)
-                if error
-                    .downcast_ref::<klights_cluster_datastore::errors::DatastoreError>()
-                    .is_some_and(|error| {
-                        matches!(
-                            error,
-                            klights_cluster_datastore::errors::DatastoreError::NotFound { .. }
-                        )
-                    }) =>
-            {
-                Ok(crate::kubelet::pod_repository::store::PodDeleteCasOutcome::Gone)
-            }
-            Err(error) => Err(pod_persistence_error(error, namespace, name)),
-        }
-    }
-
-    fn log_status_noop(
-        &self,
-        namespace: &str,
-        name: &str,
-        resource: &klights_cluster_core::Resource,
-    ) {
-        log_noop_resource_write(NoopResourceWrite {
-            operation: "pod_store_update_status",
-            api_version: "v1",
-            kind: "Pod",
-            namespace: Some(namespace),
-            name,
-            uid: &resource.uid,
-            resource_version: resource.resource_version,
-            reason: "pod status unchanged",
-        });
-    }
-
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
-    fn subscribe_watch(&self) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
-        self.db
-            .subscribe_watch(klights_watch::WatchTopic::new("v1", "Pod"))
-    }
+pub(crate) fn new_pod_store(db: DatastoreHandle) -> PodStore {
+    crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_store(db)
 }
 
 fn legacy_workqueue_kind(
@@ -1121,10 +843,16 @@ fn build_pod_repository_parts_inner(
     });
     let wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock> =
         Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock);
-    let store = Arc::new(PodStore::from_persistence(
-        Arc::new(RootPodPersistence { db: db.clone() }),
-        wall_clock.clone(),
-    ));
+    let persistence_parts =
+        crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
+            db.clone(),
+            wall_clock.clone(),
+        );
+    let store = persistence_parts.store.clone();
+    let local_bound_finalization = persistence_parts.bound_finalization;
+    let unscheduled_deletion = persistence_parts.unscheduled_deletion;
+    #[cfg(feature = "pod-repository-test-support")]
+    let test_local_bound_finalization = persistence_parts.test_local_bound_finalization;
     let workqueue_persistence = RootPodWorkqueuePersistence {
         node_local: pod_workqueue_store,
         #[cfg(any(test, feature = "pod-repository-test-support"))]
@@ -1140,6 +868,7 @@ fn build_pod_repository_parts_inner(
             workqueue_persistence,
             supervisor.clone(),
             metrics.clone(),
+            unscheduled_deletion,
             leader_coordination,
             wall_clock.clone(),
         )
@@ -1183,6 +912,7 @@ fn build_pod_repository_parts_inner(
     let bound_pod_finalization =
         crate::bootstrap::composition_adapters::bound_pod_finalization_adapter::new_for_root(
             store.clone(),
+            local_bound_finalization,
             cluster_api.clone(),
             delivery_outbox.clone(),
             wall_clock.clone(),
@@ -1206,6 +936,8 @@ fn build_pod_repository_parts_inner(
             outbox: delivery_outbox,
             cluster_api,
             bound_pod_finalization,
+            #[cfg(feature = "pod-repository-test-support")]
+            test_local_bound_finalization: Some(test_local_bound_finalization),
         },
         adapters,
     );
@@ -1222,11 +954,16 @@ pub(crate) fn build_worker_pod_repository_parts(
 ) -> crate::kubelet::pod_repository::facade::PodRepositoryParts {
     let wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock> =
         Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock);
+    let worker_persistence = Arc::new(WorkerPodPersistence {
+        resource_query: config.resource_query.clone(),
+    });
     let store = Arc::new(PodStore::from_persistence(
-        Arc::new(WorkerPodPersistence {
-            resource_query: config.resource_query.clone(),
-        }),
+        worker_persistence.clone(),
+        worker_persistence,
         wall_clock.clone(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        None,
     ));
     let workqueue = PodWorkqueue::new(
         store.clone(),
@@ -1248,6 +985,7 @@ pub(crate) fn build_worker_pod_repository_parts(
     let outbox: Arc<dyn klights_leader_api::NodeOutbox> = config.outbox;
     let root_deletion = crate::bootstrap::composition_adapters::bound_pod_finalization_adapter::RootBoundPodFinalization::new(
         store.clone(),
+        None,
         Some(config.resource_query.clone()),
         Some(outbox.clone()),
         wall_clock.clone(),
@@ -1287,51 +1025,9 @@ pub(crate) fn build_worker_pod_repository_parts(
             outbox: Some(outbox),
             cluster_api: Some(config.resource_query),
             bound_pod_finalization,
+            #[cfg(feature = "pod-repository-test-support")]
+            test_local_bound_finalization: None,
         },
         adapters,
     )
-}
-
-#[cfg(test)]
-mod pod_persistence_error_tests {
-    use klights_cluster_core::{StorageCommandRejectionCode, StorageMutationError};
-    use klights_pod_api::PodRepositoryError;
-
-    use super::pod_persistence_error;
-
-    #[test]
-    fn neutral_already_exists_rejection_preserves_pod_repository_category() {
-        let mapped = pod_persistence_error(
-            StorageMutationError::rejected(
-                StorageCommandRejectionCode::AlreadyExists,
-                "Resource already exists (409 Conflict)",
-            )
-            .into(),
-            "default",
-            "duplicate",
-        );
-
-        assert!(matches!(
-            mapped.downcast_ref::<PodRepositoryError>(),
-            Some(PodRepositoryError::AlreadyExists { .. })
-        ));
-    }
-
-    #[test]
-    fn neutral_conflict_rejection_preserves_pod_repository_category() {
-        let mapped = pod_persistence_error(
-            StorageMutationError::rejected(
-                StorageCommandRejectionCode::Conflict,
-                "resourceVersion precondition failed (409 Conflict)",
-            )
-            .into(),
-            "default",
-            "stale",
-        );
-
-        assert!(matches!(
-            mapped.downcast_ref::<PodRepositoryError>(),
-            Some(PodRepositoryError::Conflict { .. })
-        ));
-    }
 }

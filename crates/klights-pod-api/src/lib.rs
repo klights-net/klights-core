@@ -281,6 +281,120 @@ pub trait PodQuery: Send + Sync {
     ) -> PodRepositoryFuture<'_, Vec<Resource>>;
 }
 
+/// Persistence-only reads used by the root Pod repository facade.
+///
+/// This capability is Pod-shaped and cannot select a datastore, address an
+/// arbitrary Kubernetes kind, subscribe to watches, or remove rows.
+pub trait PodRepositoryReadPersistence: Send + Sync {
+    fn get_persisted_pod(
+        &self,
+        request: PodRepositoryGetRequest,
+    ) -> PodRepositoryFuture<'_, Option<Resource>>;
+
+    fn list_persisted_pods(
+        &self,
+        request: PodRepositoryListRequest,
+    ) -> PodRepositoryFuture<'_, PodListResult>;
+
+    fn snapshot_persisted_pods(
+        &self,
+        request: PodSnapshotListRequest,
+    ) -> PodRepositoryFuture<'_, PodSnapshotListOutcome>;
+
+    fn list_persisted_pods_by_owner(
+        &self,
+        request: PodRepositoryOwnerListRequest,
+    ) -> PodRepositoryFuture<'_, Vec<Resource>>;
+}
+
+/// Persistence-only writes used by the root Pod repository facade.
+///
+/// Hard deletion is intentionally absent. Bound and never-bound Pod deletion
+/// use their separate opaque capabilities.
+pub trait PodRepositoryWritePersistence: Send + Sync {
+    fn create_persisted_pod(
+        &self,
+        request: PodRepositoryCreateRequest,
+    ) -> PodRepositoryFuture<'_, Resource>;
+
+    fn replace_persisted_pod(
+        &self,
+        request: PodRepositoryReplaceRequest,
+    ) -> PodRepositoryFuture<'_, Resource>;
+
+    fn patch_persisted_pod(
+        &self,
+        request: PodRepositoryPatchRequest,
+    ) -> PodRepositoryFuture<'_, Option<Resource>>;
+
+    fn write_persisted_pod_status(
+        &self,
+        request: PodRepositoryStatusRequest,
+    ) -> PodRepositoryFuture<'_, Resource>;
+
+    fn log_persisted_pod_status_noop(&self, request: PodRepositoryStatusNoop<'_>);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodRepositoryGetRequest {
+    pub namespace: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodRepositoryListRequest {
+    pub namespace: Option<String>,
+    pub label_selector: Option<String>,
+    pub field_selector: Option<String>,
+    pub limit: Option<i64>,
+    pub continue_token: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodRepositoryOwnerListRequest {
+    pub namespace: String,
+    pub owner_uid: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PodRepositoryCreateRequest {
+    pub namespace: String,
+    pub name: String,
+    pub body: serde_json::Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct PodRepositoryReplaceRequest {
+    pub namespace: String,
+    pub name: String,
+    pub body: serde_json::Value,
+    pub preconditions: klights_cluster_core::ResourcePreconditions,
+}
+
+#[derive(Clone, Debug)]
+pub struct PodRepositoryPatchRequest {
+    pub namespace: String,
+    pub name: String,
+    pub patch_kind: klights_cluster_core::PatchKind,
+    pub patch: serde_json::Value,
+    pub preconditions: klights_cluster_core::ResourcePreconditions,
+}
+
+#[derive(Clone, Debug)]
+pub struct PodRepositoryStatusRequest {
+    pub namespace: String,
+    pub name: String,
+    pub status: serde_json::Value,
+    pub preconditions: klights_cluster_core::ResourcePreconditions,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PodRepositoryStatusNoop<'a> {
+    pub namespace: &'a str,
+    pub name: &'a str,
+    pub resource: &'a Resource,
+}
+
 /// Focused persistence capability consumed by Kubernetes-native Pod
 /// orchestration. It deliberately exposes only Pod create/replace operations;
 /// datastore selection, watches, generic resources, and row deletion are not

@@ -15,6 +15,7 @@ pub(crate) mod outbox_payload_codec_adapter;
 pub(crate) mod outbox_response_codec_adapter;
 pub(crate) mod pod_event_adapter;
 pub(crate) mod pod_native_adapter;
+pub(crate) mod pod_repository_persistence_adapter;
 pub(crate) mod positioned_watch_adapter;
 pub(crate) mod projected_token_resource_adapter;
 pub(crate) mod remote_informer_cache_adapter;

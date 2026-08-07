@@ -5,15 +5,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
-use klights_kubelet::unscheduled_deletion::{
-    EligibleUnscheduledPodDeletion, UnscheduledPodDeleteCasOutcome,
-    UnscheduledPodDeletionObservation, UnscheduledPodDeletionPort,
-    UnscheduledPodDeletionPortFuture, UnscheduledPodDeletionService,
-};
 use klights_leader_api::{ControllerCoordination, ControllerLease, ControllerScope};
+#[cfg(test)]
+use klights_pod_api::UnscheduledPodDeletionError;
 use klights_pod_api::{
     PodLifecycleWakeup, PodLifecycleWakeupRequest, UnscheduledPodDeletion,
-    UnscheduledPodDeletionError, UnscheduledPodDeletionOutcome, UnscheduledPodDeletionRequest,
+    UnscheduledPodDeletionOutcome, UnscheduledPodDeletionRequest,
 };
 use klights_reconcile_api::{
     GcPodDeleteRequest, GcPodDeleteSink, NamespaceTerminationOutcome, NamespaceTerminationRequest,
@@ -29,7 +26,7 @@ use klights_supervisor::{TaskCategory, TaskSupervisor};
 use klights_types::PodIdentity;
 
 use super::delete_coordinator::PodDeleteCoordinator;
-use super::store::{PodDeleteCasOutcome, PodStore};
+use super::store::PodStore;
 const MAX_ATTEMPTS: i64 = 720;
 const MIN_DELAY_MS: i64 = 5_000;
 const POD_DELETE_TARGET_NODE_PAYLOAD_KEY: &str = "target_node";
@@ -185,104 +182,6 @@ impl PodWorkqueuePersistence for std::sync::Arc<crate::datastore::node_local::No
     }
 }
 
-/// Root-private adapter carrying the leader deferred-delete worker's narrow
-/// unscheduled-Pod row-removal authority.
-///
-/// Construction remains in this module, and the capability is stored only by
-/// `PodWorkqueue`; repository callers and lifecycle finalization never receive
-/// it.
-struct LeaderDeferredUnscheduledPodDeletionPort {
-    store: Arc<PodStore>,
-}
-
-impl LeaderDeferredUnscheduledPodDeletionPort {
-    fn validate_lease() -> Result<(), UnscheduledPodDeletionError> {
-        klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
-            UnscheduledPodDeletionError::unavailable(format!(
-                "controller authority rejected unscheduled Pod deletion: {error}"
-            ))
-        })
-    }
-}
-
-impl UnscheduledPodDeletionPort for LeaderDeferredUnscheduledPodDeletionPort {
-    fn observe_pod<'a>(
-        &'a self,
-        identity: &'a PodIdentity,
-    ) -> UnscheduledPodDeletionPortFuture<'a, Option<UnscheduledPodDeletionObservation>> {
-        Box::pin(async move {
-            Self::validate_lease()?;
-            let Some(resource) = self
-                .store
-                .get(&identity.namespace, &identity.name)
-                .await
-                .map_err(|error| UnscheduledPodDeletionError::unavailable(error.to_string()))?
-            else {
-                return Ok(None);
-            };
-            let node_name = resource
-                .data
-                .pointer("/spec/nodeName")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let terminating = resource
-                .data
-                .pointer("/metadata/deletionTimestamp")
-                .and_then(Value::as_str)
-                .is_some_and(|timestamp| !timestamp.is_empty());
-            let has_finalizers = resource
-                .data
-                .pointer("/metadata/finalizers")
-                .and_then(Value::as_array)
-                .is_some_and(|finalizers| !finalizers.is_empty());
-            UnscheduledPodDeletionObservation::try_new(
-                PodIdentity::new(
-                    resource.namespace.as_deref().unwrap_or_default(),
-                    &resource.name,
-                    &resource.uid,
-                ),
-                resource.resource_version,
-                node_name,
-                terminating,
-                has_finalizers,
-            )
-            .map(Some)
-        })
-    }
-
-    fn compare_and_swap_delete(
-        &self,
-        eligible: EligibleUnscheduledPodDeletion,
-    ) -> UnscheduledPodDeletionPortFuture<'_, UnscheduledPodDeleteCasOutcome> {
-        Box::pin(async move {
-            Self::validate_lease()?;
-            let outcome = self
-                .store
-                .delete_unscheduled_with_uid(eligible)
-                .await
-                .map_err(|error| UnscheduledPodDeletionError::unavailable(error.to_string()))?;
-            Ok(match outcome {
-                PodDeleteCasOutcome::Removed => UnscheduledPodDeleteCasOutcome::Removed,
-                PodDeleteCasOutcome::Conflict => UnscheduledPodDeleteCasOutcome::Conflict,
-                PodDeleteCasOutcome::Gone => UnscheduledPodDeleteCasOutcome::Gone,
-            })
-        })
-    }
-}
-
-fn compose_leader_unscheduled_deletion(store: Arc<PodStore>) -> Arc<dyn UnscheduledPodDeletion> {
-    Arc::new(UnscheduledPodDeletionService::new(Arc::new(
-        LeaderDeferredUnscheduledPodDeletionPort { store },
-    )))
-}
-
-#[cfg(feature = "pod-repository-test-support")]
-pub(crate) fn test_leader_unscheduled_deletion(
-    store: Arc<PodStore>,
-) -> Arc<dyn UnscheduledPodDeletion> {
-    compose_leader_unscheduled_deletion(store)
-}
-
 pub(crate) struct PodWorkqueue {
     store: Arc<PodStore>,
     unscheduled_deletion: Option<Arc<dyn UnscheduledPodDeletion>>,
@@ -326,10 +225,10 @@ impl PodWorkqueue {
         persistence: impl PodWorkqueuePersistence + 'static,
         supervisor: Arc<TaskSupervisor>,
         metrics: Arc<dyn ReconcileFailureMetrics>,
+        unscheduled_deletion: Arc<dyn UnscheduledPodDeletion>,
         leader_coordination: Arc<dyn ControllerCoordination>,
         wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     ) -> Arc<Self> {
-        let unscheduled_deletion = compose_leader_unscheduled_deletion(store.clone());
         Self::new_with_unscheduled_deletion(
             store,
             persistence,
@@ -1403,7 +1302,11 @@ mod tests {
         std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
     ) {
         let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-        let store = Arc::new(PodStore::new(db.clone()));
+        let persistence = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
+            db.clone(),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        );
+        let store = persistence.store;
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
@@ -1415,6 +1318,7 @@ mod tests {
             node_local.clone(),
             supervisor,
             metrics,
+            persistence.unscheduled_deletion,
             coordination,
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
@@ -1428,7 +1332,7 @@ mod tests {
         std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
     ) {
         let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-        let store = Arc::new(PodStore::new(db.clone()));
+        let store = Arc::new(crate::pod_repository_composition::new_pod_store(db.clone()));
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
@@ -1448,7 +1352,11 @@ mod tests {
     #[tokio::test]
     async fn leadership_gain_discovers_terminating_unbound_pod_without_local_queue_row() {
         let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-        let store = Arc::new(PodStore::new(db.clone()));
+        let persistence = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
+            db.clone(),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        );
+        let store = persistence.store;
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
@@ -1459,6 +1367,7 @@ mod tests {
             node_local.clone(),
             supervisor.clone(),
             SideEffectMetrics::new(),
+            persistence.unscheduled_deletion,
             coordination,
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
@@ -1625,8 +1534,11 @@ mod tests {
     async fn stale_lease_cannot_delete_unscheduled_pod_after_demote_promote_aba() {
         let (_datastore, db) =
             crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-        let store = Arc::new(PodStore::new(db.clone()));
-        let deletion = compose_leader_unscheduled_deletion(store.clone());
+        let persistence = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
+            db.clone(),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        );
+        let deletion = persistence.unscheduled_deletion;
         let created = db
             .create_resource(
                 "v1",
@@ -1840,14 +1752,25 @@ mod tests {
             .await
             .expect("durable workqueue reminder should wake the actor without a live watch event");
 
-        let outcome = workqueue
-            .store
-            .finalize_bound_with_uid("default", "watch-dropped", "uid-old")
+        let finalization = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
+            db.clone(),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        );
+        let outcome = finalization
+            .bound_finalization
+            .finalize_bound_pod(
+                klights_pod_api::BoundPodFinalizationRequest::try_new(PodIdentity::new(
+                    "default",
+                    "watch-dropped",
+                    "uid-old",
+                ))
+                .unwrap(),
+            )
             .await
             .expect("actor-owned UID finalization should remove the row");
         assert_eq!(
             outcome,
-            crate::kubelet::pod_repository::store::BoundPodDeleteOutcome::Removed
+            klights_pod_api::BoundPodFinalizationOutcome::Removed
         );
         workqueue
             .run_pod_delete_full_with_target_node(
@@ -2529,14 +2452,25 @@ mod tests {
             .await
             .expect("running worker must consume durable intent and wake its actor");
 
-        let outcome = workqueue
-            .store
-            .finalize_bound_with_uid("default", "worker-pod", "uid-old")
+        let finalization = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
+            db.clone(),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        );
+        let outcome = finalization
+            .bound_finalization
+            .finalize_bound_pod(
+                klights_pod_api::BoundPodFinalizationRequest::try_new(PodIdentity::new(
+                    "default",
+                    "worker-pod",
+                    "uid-old",
+                ))
+                .unwrap(),
+            )
             .await
             .expect("worker actor-owned finalization should remove the row");
         assert_eq!(
             outcome,
-            crate::kubelet::pod_repository::store::BoundPodDeleteOutcome::Removed
+            klights_pod_api::BoundPodFinalizationOutcome::Removed
         );
         workqueue
             .run_pod_delete_full_with_target_node(
@@ -2769,7 +2703,7 @@ mod tests {
     #[tokio::test]
     async fn reconciler_exits_on_root_cancellation() {
         let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-        let store = Arc::new(PodStore::new(db.clone()));
+        let store = Arc::new(crate::pod_repository_composition::new_pod_store(db.clone()));
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));

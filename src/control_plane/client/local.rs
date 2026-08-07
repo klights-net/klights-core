@@ -1414,7 +1414,7 @@ mod inner_gate_tests {
                 .count(),
             1
         );
-        let pod_store = crate::kubelet::pod_repository::store::PodStore::new(db.clone());
+        let pod_store = crate::pod_repository_composition::new_pod_store(db.clone());
         klights_controllers::endpoints::reconcile_service_endpoints_batch(
             db.as_ref(),
             &pod_store,
