@@ -6,6 +6,7 @@
 //! and the leader-only unscheduled-Pod CAS remain separate capabilities.
 
 pub mod status;
+pub mod workqueue;
 pub use status::PodStatusWriter;
 
 use std::sync::Arc;

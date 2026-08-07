@@ -5,11 +5,13 @@ use std::sync::Arc;
 use crate::datastore::DatastoreHandle;
 use crate::kubelet::pod_repository::delete_coordinator::PodDeleteCoordinator;
 use crate::kubelet::pod_repository::store::PodStore;
-use crate::kubelet::pod_repository::workqueue::PodWorkqueue;
 use crate::kubelet::pod_repository::{
     PodRepository, PodRepositoryAdapterDependencies, PodRepositoryAdapters,
     PodRepositoryCoreDependencies, PodRepositoryDeliveryDependencies,
     PodRepositoryNetworkDependencies, PodRepositoryRuntimeDependencies,
+};
+use klights_kubelet::pod_repository::workqueue::{
+    PodWorkqueue, PodWorkqueueEntry, PodWorkqueueKind, PodWorkqueuePersistence,
 };
 
 impl klights_cluster_store::PodUidPreconditionRead for dyn crate::datastore::DatastoreBackend + '_ {
@@ -120,11 +122,24 @@ struct RootPodWorkqueuePersistence {
     test_next_id: Arc<std::sync::atomic::AtomicI64>,
 }
 
+#[cfg(test)]
+pub(crate) fn test_workqueue_persistence(
+    node_local: Arc<crate::datastore::node_local::NodeLocalStores>,
+    wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+) -> impl PodWorkqueuePersistence + 'static {
+    RootPodWorkqueuePersistence {
+        node_local: Some(node_local),
+        wall_clock,
+        test_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
+        test_next_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
+    }
+}
+
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 #[derive(Clone)]
 struct RootInMemoryPodWorkqueueEntry {
     id: i64,
-    kind: crate::kubelet::pod_repository::workqueue::PodWorkqueueKind,
+    kind: PodWorkqueueKind,
     namespace: String,
     name: String,
     uid: String,
@@ -143,13 +158,13 @@ fn in_memory_row_matches_token(
     }
     match token.identity() {
         klights_node_store::PodWorkIdentity::Pod(pod) => {
-            row.kind == crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Pod
+            row.kind == PodWorkqueueKind::Pod
                 && row.namespace == pod.namespace
                 && row.name == pod.name
                 && row.uid == pod.uid
         }
         klights_node_store::PodWorkIdentity::Namespace { name, uid } => {
-            row.kind == crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Namespace
+            row.kind == PodWorkqueueKind::Namespace
                 && row.namespace.is_empty()
                 && row.name == *name
                 && row.uid == *uid
@@ -480,53 +495,39 @@ pub(crate) fn new_pod_store(db: DatastoreHandle) -> PodStore {
     crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_store(db)
 }
 
-fn legacy_workqueue_kind(
-    kind: crate::kubelet::pod_repository::workqueue::PodWorkqueueKind,
-) -> klights_node_store::PodWorkqueueKind {
+fn legacy_workqueue_kind(kind: PodWorkqueueKind) -> klights_node_store::PodWorkqueueKind {
     match kind {
-        crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Pod => {
-            klights_node_store::PodWorkqueueKind::Pod
-        }
-        crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Namespace => {
-            klights_node_store::PodWorkqueueKind::Namespace
-        }
+        PodWorkqueueKind::Pod => klights_node_store::PodWorkqueueKind::Pod,
+        PodWorkqueueKind::Namespace => klights_node_store::PodWorkqueueKind::Namespace,
     }
 }
 
 fn focused_workqueue_entry(
     lease: klights_node_store::PodWorkqueueLease,
-) -> anyhow::Result<crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry> {
+) -> anyhow::Result<PodWorkqueueEntry> {
     let (row, lease_token) = lease.into_parts();
     let (id, identity, payload, attempt_count, _next_due_ms) = row.into_parts();
     let (kind, pod) = identity.into_persisted();
-    Ok(
-        crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry {
-            id: id.get(),
-            kind: match kind {
-                klights_node_store::PodWorkqueueKind::Pod => {
-                    crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Pod
-                }
-                klights_node_store::PodWorkqueueKind::Namespace => {
-                    crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Namespace
-                }
-            },
-            namespace: pod.namespace,
-            name: pod.name,
-            uid: pod.uid,
-            payload: serde_json::from_slice(&payload)?,
-            attempt_count,
-            lease_token,
+    Ok(PodWorkqueueEntry {
+        id: id.get(),
+        kind: match kind {
+            klights_node_store::PodWorkqueueKind::Pod => PodWorkqueueKind::Pod,
+            klights_node_store::PodWorkqueueKind::Namespace => PodWorkqueueKind::Namespace,
         },
-    )
+        namespace: pod.namespace,
+        name: pod.name,
+        uid: pod.uid,
+        payload: serde_json::from_slice(&payload)?,
+        attempt_count,
+        lease_token,
+    })
 }
 
 #[async_trait::async_trait]
-impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
-    for RootPodWorkqueuePersistence
-{
+impl PodWorkqueuePersistence for RootPodWorkqueuePersistence {
     async fn enqueue(
         &self,
-        kind: crate::kubelet::pod_repository::workqueue::PodWorkqueueKind,
+        kind: PodWorkqueueKind,
         pod: &PodIdentity,
         payload: serde_json::Value,
         attempt_count: i64,
@@ -619,7 +620,7 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
         &self,
         now_ms: i64,
         lease_duration_ms: i64,
-    ) -> anyhow::Result<Option<crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry>> {
+    ) -> anyhow::Result<Option<PodWorkqueueEntry>> {
         if let Some(node_local) = &self.node_local {
             return node_local
                 .claim_due_work_with_lease(klights_node_store::PodWorkqueueClaimRequest::try_new(
@@ -662,7 +663,7 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
                     }
                 }
                 .expect("in-memory workqueue row identity was validated on enqueue");
-                crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry {
+                PodWorkqueueEntry {
                     id: row.id,
                     kind: row.kind,
                     namespace: row.namespace.clone(),
@@ -710,7 +711,7 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
 
     async fn requeue(
         &self,
-        row: crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry,
+        row: PodWorkqueueEntry,
         attempt_count: i64,
         min_delay_ms: i64,
         error: &str,

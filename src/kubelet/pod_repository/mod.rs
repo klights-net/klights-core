@@ -38,6 +38,9 @@ use klights_types::ResourceKey;
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_watch::WatchEvent;
 
+#[cfg(test)]
+mod workqueue_tests;
+
 fn resource_list_from_leader(
     result: klights_leader_api::ResourceListResult,
 ) -> std::result::Result<klights_pod_api::PodListResult, PodRepositoryError> {
@@ -215,7 +218,6 @@ pub mod delete_coordinator;
 pub mod facade;
 pub(crate) mod store;
 pub mod watch;
-pub mod workqueue;
 
 #[cfg(test)]
 pub(crate) use crate::pod_repository_composition::PodRepositoryBuildConfig;
@@ -244,10 +246,10 @@ impl<T> PodQueryTestExt for T where T: klights_pod_api::PodQuery + ?Sized {}
 use background::PodRepositoryBackground;
 use delete_coordinator::PodDeleteCoordinator;
 use klights_kubelet::pod_repository::status;
+use klights_kubelet::pod_repository::workqueue::PodWorkqueue;
 use klights_reconcile_api::{PodEvictionAdmissionSink, PodGcReconcileSink, PodPdbReconcileSink};
 use store::PodStore;
 use watch::PodWatchService;
-use workqueue::PodWorkqueue;
 
 pub(crate) struct PodRepositoryAdapterDependencies {
     pub store: Arc<PodStore>,

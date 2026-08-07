@@ -11,7 +11,7 @@ use klights_reconcile_api::ReconcileFailureMetrics;
 use klights_supervisor::TaskSupervisor;
 
 use super::store::PodStore;
-use super::workqueue::PodWorkqueue;
+use klights_kubelet::pod_repository::workqueue::PodWorkqueue;
 
 const MAX_DELETE_CONFLICT_RETRIES: u32 = 8;
 
@@ -82,14 +82,6 @@ pub(crate) trait PodDeleteQueuePort: Send + Sync {
         run_after: Duration,
         target_node: Option<String>,
     ) -> Result<()>;
-
-    async fn enqueue_namespace_termination_pod(
-        &self,
-        ns: String,
-        name: String,
-        uid: String,
-        target_node: Option<String>,
-    ) -> Result<()>;
 }
 
 struct WorkqueuePodDeleteQueue {
@@ -108,24 +100,6 @@ impl PodDeleteQueuePort for WorkqueuePodDeleteQueue {
     ) -> Result<()> {
         self.workqueue
             .enqueue_deferred_delete_with_target_node(ns, name, uid, run_after, target_node)
-            .await
-    }
-
-    async fn enqueue_namespace_termination_pod(
-        &self,
-        ns: String,
-        name: String,
-        uid: String,
-        target_node: Option<String>,
-    ) -> Result<()> {
-        self.workqueue
-            .enqueue_deferred_delete_row_with_target_node(
-                ns,
-                name,
-                uid,
-                Duration::ZERO,
-                target_node,
-            )
             .await
     }
 }
@@ -378,39 +352,6 @@ impl PodDeleteCoordinator {
             )
             .await
     }
-
-    pub(super) async fn enqueue_terminating_namespace_pod(
-        &self,
-        namespace: &str,
-        resource: &Resource,
-    ) -> Result<bool> {
-        if resource
-            .data
-            .pointer("/metadata/deletionTimestamp")
-            .and_then(|value| value.as_str())
-            .is_none()
-        {
-            return Ok(false);
-        }
-        if resource.uid.is_empty() {
-            tracing::warn!(
-                namespace = %namespace,
-                pod = %resource.name,
-                "namespace termination cannot enqueue actor-owned Pod delete without UID"
-            );
-            return Ok(false);
-        }
-
-        self.queue
-            .enqueue_namespace_termination_pod(
-                namespace.to_string(),
-                resource.name.clone(),
-                resource.uid.clone(),
-                pod_target_node_from_pod_data(&resource.data),
-            )
-            .await?;
-        Ok(true)
-    }
 }
 
 fn ensure_resource_preconditions_match(
@@ -573,16 +514,6 @@ mod tests {
         ) -> Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Err(anyhow::anyhow!("node-local workqueue write failed"))
-        }
-
-        async fn enqueue_namespace_termination_pod(
-            &self,
-            _ns: String,
-            _name: String,
-            _uid: String,
-            _target_node: Option<String>,
-        ) -> Result<()> {
-            unreachable!("not used by this test")
         }
     }
 

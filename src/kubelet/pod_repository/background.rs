@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use super::workqueue::PodWorkqueue;
+use klights_kubelet::pod_repository::workqueue::PodWorkqueue;
 use klights_supervisor::TaskSupervisor;
 
 /// Services that must be started after repository construction.
