@@ -35,6 +35,18 @@ pub struct PodStatusService {
     deferred_runtime: DeferredRuntimeReducerHandle,
 }
 
+/// Focused capabilities and local state required by [`PodStatusService`].
+pub struct PodStatusServiceDependencies {
+    pub pod_query: Arc<dyn PodQuery>,
+    pub status_persistence: Arc<dyn PodStatusPersistence>,
+    pub mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
+    pub outbox: Option<Arc<Outbox>>,
+    pub remote_delivery_required: bool,
+    pub cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
+    pub host_ip: HostIpState,
+    pub wall_clock: Arc<dyn crate::runtime_clock::RuntimeClock>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DeferredContainerGeneration {
     container_id: String,
@@ -347,16 +359,17 @@ fn ensure_pod_uid_matches(data: &Value, expected_uid: &str, ns: &str, name: &str
 }
 
 impl PodStatusService {
-    pub fn new(
-        pod_query: Arc<dyn PodQuery>,
-        status_persistence: Arc<dyn PodStatusPersistence>,
-        mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
-        outbox: Option<Arc<Outbox>>,
-        remote_delivery_required: bool,
-        cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
-        host_ip: HostIpState,
-        wall_clock: Arc<dyn crate::runtime_clock::RuntimeClock>,
-    ) -> Self {
+    pub fn new(dependencies: PodStatusServiceDependencies) -> Self {
+        let PodStatusServiceDependencies {
+            pod_query,
+            status_persistence,
+            mutation_reconcile,
+            outbox,
+            remote_delivery_required,
+            cluster_api,
+            host_ip,
+            wall_clock,
+        } = dependencies;
         Self {
             pod_query,
             status_persistence,

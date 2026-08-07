@@ -1427,14 +1427,16 @@ pub async fn run_same_name_replacement_status_race(
         effects: std::sync::atomic::AtomicUsize::new(0),
     });
     let service = klights_kubelet::pod_repository::status::PodStatusService::new(
-        store.clone(),
-        writer.clone(),
-        reconcile.clone(),
-        None,
-        false,
-        None,
-        klights_kubelet::context::HostIpState::default(),
-        Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        klights_kubelet::pod_repository::status::PodStatusServiceDependencies {
+            pod_query: store.clone(),
+            status_persistence: writer.clone(),
+            mutation_reconcile: reconcile.clone(),
+            outbox: None,
+            remote_delivery_required: false,
+            cluster_api: None,
+            host_ip: klights_kubelet::context::HostIpState::default(),
+            wall_clock: Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        },
     );
 
     let write = service.integration_set_pod_status(
@@ -1517,14 +1519,16 @@ async fn integration_status_race_service(
         mode,
     });
     let service = klights_kubelet::pod_repository::status::PodStatusService::new(
-        store,
-        writer.clone(),
-        Arc::new(IntegrationNoopPodMutationReconcile),
-        None,
-        false,
-        None,
-        klights_kubelet::context::HostIpState::default(),
-        Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        klights_kubelet::pod_repository::status::PodStatusServiceDependencies {
+            pod_query: store,
+            status_persistence: writer.clone(),
+            mutation_reconcile: Arc::new(IntegrationNoopPodMutationReconcile),
+            outbox: None,
+            remote_delivery_required: false,
+            cluster_api: None,
+            host_ip: klights_kubelet::context::HostIpState::default(),
+            wall_clock: Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        },
     );
     (service, writer, created)
 }

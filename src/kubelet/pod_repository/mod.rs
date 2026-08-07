@@ -748,16 +748,16 @@ impl PodRepository {
         let namespace_bootstrap = adapters.namespace_bootstrap;
         let namespace_termination = adapters.namespace_termination;
         let mutation_reconcile = adapters.mutation_reconcile;
-        let status = status::PodStatusService::new(
-            store.clone(),
+        let status = status::PodStatusService::new(status::PodStatusServiceDependencies {
+            pod_query: store.clone(),
             status_persistence,
-            mutation_reconcile.clone(),
-            outbox.clone(),
+            mutation_reconcile: mutation_reconcile.clone(),
+            outbox: outbox.clone(),
             remote_delivery_required,
-            cluster_api.clone(),
-            host_ip.clone(),
-            wall_clock.clone(),
-        );
+            cluster_api: cluster_api.clone(),
+            host_ip: host_ip.clone(),
+            wall_clock: wall_clock.clone(),
+        });
         let metadata = klights_kubelet::pod_repository::PodMetadataService::new(
             klights_kubelet::pod_repository::PodMetadataDependencies {
                 persistence: metadata_persistence,
