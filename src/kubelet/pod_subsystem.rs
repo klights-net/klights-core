@@ -146,7 +146,8 @@ impl PodSubsystem {
                 config.pod_actor_idle_grace,
                 lifecycle_wall_clock.clone(),
             )
-            .with_runtime_observation_store(outbox.clone()),
+            .with_runtime_observation_store(outbox.clone())
+            .with_local_node_name(node_name.clone()),
         );
         let lifecycle_router = match config.lifecycle_route_mode {
             PodLifecycleRouteMode::Actor => Arc::new(PodLifecycleRouter::new_actor(registry)),

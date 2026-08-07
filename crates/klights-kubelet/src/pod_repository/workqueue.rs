@@ -17,6 +17,7 @@ use klights_reconcile_api::{
 use serde_json::{Map, Value, json};
 use tokio::sync::Notify;
 
+use crate::pod_repository::delete_deadline::remaining_pod_delete_deadline;
 use klights_node_store::{PodWorkqueueLeaseToken, PodWorkqueueMutationOutcome};
 use klights_reconcile_api::ReconcileFailureMetrics;
 use klights_supervisor::{TaskCategory, TaskSupervisor};
@@ -1118,11 +1119,25 @@ impl PodWorkqueue {
                 .and_then(Value::as_str)
                 .filter(|node| !node.trim().is_empty())
                 .map(ToString::to_string);
+            let reminder_delay = remaining_pod_delete_deadline(
+                &resource.data,
+                self.wall_clock.now_utc(),
+            )
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    namespace = %namespace,
+                    pod = %resource.name,
+                    uid = %resource.uid,
+                    "malformed Pod deletion deadline; enqueueing immediate actor reminder: {error}"
+                );
+                Some(Duration::default())
+            })
+            .unwrap_or_default();
             self.enqueue_deferred_delete_row_with_target_node(
                 namespace.to_string(),
                 resource.name,
                 resource.uid,
-                Duration::ZERO,
+                reminder_delay,
                 target_node,
             )
             .await?;

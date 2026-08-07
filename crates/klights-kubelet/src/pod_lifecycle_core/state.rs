@@ -4,7 +4,17 @@
 //! and sandbox identity so both actor and multiplex can share state-machine logic.
 
 use super::message::{PodLifecycleKey, PodLifecycleWorkKind};
+use crate::runtime::PodStopMode;
 use crate::runtime_observations::RuntimeReconcileObservations;
+
+#[derive(Clone, Debug)]
+pub struct PodDeletionDeadlineState {
+    pub uid: String,
+    pub deadline: chrono::DateTime<chrono::Utc>,
+    pub generation: u64,
+    pub fired: bool,
+    pub forced: bool,
+}
 
 /// Phases a pod transitions through during its lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +47,8 @@ pub struct PendingStopPod {
     pub key: PodLifecycleKey,
     pub pod: Option<serde_json::Value>,
     pub sandbox_id: String,
+    pub deletion_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    pub mode: PodStopMode,
 }
 
 #[derive(Debug)]
@@ -96,6 +108,8 @@ pub struct PodLifecycleState {
     /// Delete finalization observed pending finalizers or a transient dispatch
     /// error and has a retry timer or deferred-delete wake outstanding.
     pub pending_delete_finalization_retry: bool,
+    pub deletion_deadline: Option<PodDeletionDeadlineState>,
+    pub deletion_deadline_generation: u64,
 }
 
 impl Default for PodLifecycleState {
@@ -121,6 +135,8 @@ impl Default for PodLifecycleState {
             runtime_reconcile_observations: RuntimeReconcileObservations::default(),
             pending_startup_finalization_retry: false,
             pending_delete_finalization_retry: false,
+            deletion_deadline: None,
+            deletion_deadline_generation: 0,
         }
     }
 }
@@ -157,7 +173,49 @@ impl PodLifecycleState {
         self.runtime_reconcile_observations = RuntimeReconcileObservations::new(uid.to_string());
         self.pending_startup_finalization_retry = false;
         self.pending_delete_finalization_retry = false;
+        self.deletion_deadline = None;
         self.phase = PodPhase::Created;
+    }
+
+    pub fn observe_deletion_deadline(
+        &mut self,
+        uid: &str,
+        deadline: chrono::DateTime<chrono::Utc>,
+    ) -> u64 {
+        if let Some(current) = self
+            .deletion_deadline
+            .as_ref()
+            .filter(|current| current.uid == uid)
+            && deadline >= current.deadline
+        {
+            return current.generation;
+        }
+        self.deletion_deadline_generation = self.deletion_deadline_generation.wrapping_add(1);
+        let generation = self.deletion_deadline_generation;
+        self.deletion_deadline = Some(PodDeletionDeadlineState {
+            uid: uid.to_string(),
+            deadline,
+            generation,
+            fired: false,
+            forced: false,
+        });
+        generation
+    }
+
+    pub fn clear_deletion_deadline(&mut self) {
+        self.deletion_deadline = None;
+    }
+
+    pub fn fire_deletion_deadline(&mut self, uid: &str, generation: u64) -> bool {
+        let Some(deadline) = self.deletion_deadline.as_mut() else {
+            return false;
+        };
+        if deadline.uid != uid || deadline.generation != generation || deadline.fired {
+            return false;
+        }
+        deadline.fired = true;
+        deadline.forced = true;
+        true
     }
 
     pub fn set_pending_start_pod(

@@ -308,30 +308,45 @@ async fn dispatch_via_runtime(
             key,
             pod,
             sandbox_id,
+            deletion_deadline,
+            mode,
             operation_id,
             ..
         } => {
             let kind = PodLifecycleWorkKind::StopPod;
             let runtime_key = PodRuntimeKey::from(&key);
-            match runtime
-                .stop_pod(
-                    runtime_key.clone(),
-                    pod,
-                    if sandbox_id.is_empty() {
-                        None
-                    } else {
-                        Some(sandbox_id.clone())
-                    },
-                )
-                .await
-            {
-                Ok(()) => {
+            let request = crate::runtime::PodStopRequest {
+                key: runtime_key.clone(),
+                pod,
+                sandbox_id: if sandbox_id.is_empty() {
+                    None
+                } else {
+                    Some(sandbox_id.clone())
+                },
+                deletion_deadline,
+                mode,
+                operation_id,
+                cancel,
+            };
+            match runtime.stop_pod(request).await {
+                Ok(crate::runtime::PodStopResult::Completed) => {
                     let _ = reply_to
                         .route(LifecycleMessage::PodWorkCompleted {
                             key,
                             operation_id,
                             kind,
                             sandbox_id: Some(sandbox_id),
+                        })
+                        .await;
+                }
+                Ok(crate::runtime::PodStopResult::Cancelled) => {
+                    let _ = reply_to
+                        .route(LifecycleMessage::PodWorkFailed {
+                            key,
+                            operation_id,
+                            kind,
+                            retryable: false,
+                            failure: PodLifecycleWorkFailure::Cancelled,
                         })
                         .await;
                 }
@@ -629,6 +644,8 @@ mod tests {
                     key: key.clone(),
                     pod: None,
                     sandbox_id: "sandbox-a".into(),
+                    deletion_deadline: None,
+                    mode: crate::runtime::PodStopMode::Forced,
                     operation_id: 2,
                     permit: None,
                 },
@@ -768,6 +785,8 @@ mod tests {
                 key: PodLifecycleKey::new("ns", "stop-pod", "uid-stop"),
                 pod: None,
                 sandbox_id: "sandbox-1".into(),
+                deletion_deadline: None,
+                mode: crate::runtime::PodStopMode::Forced,
                 operation_id: 2,
                 permit: None,
             },
@@ -816,6 +835,7 @@ mod tests {
                 name,
                 uid,
                 sandbox_id,
+                ..
             } if namespace == "ns" && name == "stop-pod" && uid == "uid-stop" && *sandbox_id == Some("sandbox-1".to_string())
         ));
         assert!(matches!(
@@ -834,6 +854,56 @@ mod tests {
                 name,
                 uid,
             } if namespace == "ns" && name == "delete-pod" && uid == "uid-del"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_executor_threads_deadline_mode_cancel_and_operation_correlation() {
+        let mock = std::sync::Arc::new(MockPodRuntimeService::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<LifecycleMessage>(4);
+        let deadline = chrono::DateTime::parse_from_rfc3339("2026-08-08T01:02:03Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        dispatch_via_runtime(
+            mock.as_ref(),
+            PodAction::StopPod {
+                key: PodLifecycleKey::new("ns", "pod", "uid-stop"),
+                pod: Some(serde_json::json!({"metadata": {"uid": "uid-stop"}})),
+                sandbox_id: "sandbox-stop".to_string(),
+                deletion_deadline: Some(deadline),
+                mode: crate::runtime::PodStopMode::Graceful,
+                operation_id: 77,
+                permit: None,
+            },
+            LifecycleReplyHandle::direct(tx),
+            cancel,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            mock.recorded_calls().as_slice(),
+            [crate::runtime::test_support::MockRuntimeCall::StopPod {
+                has_pod: true,
+                sandbox_id: Some(sandbox_id),
+                deletion_deadline: Some(actual_deadline),
+                mode: crate::runtime::PodStopMode::Graceful,
+                operation_id: 77,
+                cancelled: true,
+                ..
+            }] if sandbox_id == "sandbox-stop" && *actual_deadline == deadline
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(LifecycleMessage::PodWorkFailed {
+                operation_id: 77,
+                kind: crate::pod_lifecycle_core::message::PodLifecycleWorkKind::StopPod,
+                retryable: false,
+                failure: crate::pod_lifecycle_core::message::PodLifecycleWorkFailure::Cancelled,
+                ..
+            })
         ));
     }
 
@@ -893,6 +963,8 @@ mod tests {
                 key: PodLifecycleKey::new("ns", "p", test_uid),
                 pod: None,
                 sandbox_id: "s".into(),
+                deletion_deadline: None,
+                mode: crate::runtime::PodStopMode::Forced,
                 operation_id: 2,
                 permit: None,
             },
@@ -1320,6 +1392,8 @@ mod tests {
                     "metadata": {"name": "unscheduled-pod", "namespace": "ns", "uid": "uid-unsched"}
                 })),
                 sandbox_id: String::new(),
+                deletion_deadline: None,
+                mode: crate::runtime::PodStopMode::Forced,
                 operation_id: 1,
                 permit: None,
             },
@@ -1358,6 +1432,8 @@ mod tests {
                     "spec": {"nodeName": "other-node"}
                 })),
                 sandbox_id: String::new(),
+                deletion_deadline: None,
+                mode: crate::runtime::PodStopMode::Forced,
                 operation_id: 2,
                 permit: None,
             },

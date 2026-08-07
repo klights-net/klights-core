@@ -2,7 +2,7 @@
 use k8s_cri::v1::{ContainerConfig, PodSandboxConfig};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::cri::{CriRuntimeContainerEvent, CriRuntimeContainerEventKind};
@@ -801,7 +801,12 @@ pub enum MockRuntimeCall {
         namespace: String,
         name: String,
         uid: String,
+        has_pod: bool,
         sandbox_id: Option<String>,
+        deletion_deadline: Option<chrono::DateTime<chrono::Utc>>,
+        mode: crate::runtime::PodStopMode,
+        operation_id: u64,
+        cancelled: bool,
     },
     FinalizeStartup {
         namespace: String,
@@ -875,7 +880,12 @@ impl MockRuntimeCall {
                 namespace,
                 name,
                 uid,
+                has_pod: false,
                 sandbox_id: None,
+                deletion_deadline: None,
+                mode: crate::runtime::PodStopMode::Forced,
+                operation_id: 0,
+                cancelled: false,
             },
             "finalize_startup" => MockRuntimeCall::FinalizeStartup {
                 namespace,
@@ -1015,16 +1025,29 @@ impl PodRuntimeService for MockPodRuntimeService {
 
     async fn stop_pod(
         &self,
-        key: PodRuntimeKey,
-        _pod: Option<serde_json::Value>,
-        sandbox_id: Option<String>,
-    ) -> anyhow::Result<()> {
+        request: crate::runtime::PodStopRequest,
+    ) -> anyhow::Result<crate::runtime::PodStopResult> {
+        let crate::runtime::PodStopRequest {
+            key,
+            pod,
+            sandbox_id,
+            deletion_deadline,
+            mode,
+            operation_id,
+            cancel,
+            ..
+        } = request;
         if let Some(own) = self.stop_ownership_error.lock().unwrap().take() {
             self.calls.lock().unwrap().push(MockRuntimeCall::StopPod {
                 namespace: key.namespace.clone(),
                 name: key.name.clone(),
                 uid: key.uid.clone(),
+                has_pod: pod.is_some(),
                 sandbox_id,
+                deletion_deadline,
+                mode,
+                operation_id,
+                cancelled: cancel.is_cancelled(),
             });
             return Err(anyhow::Error::new(own));
         }
@@ -1033,9 +1056,18 @@ impl PodRuntimeService for MockPodRuntimeService {
             namespace: key.namespace.clone(),
             name: key.name.clone(),
             uid: key.uid.clone(),
+            has_pod: pod.is_some(),
             sandbox_id,
+            deletion_deadline,
+            mode,
+            operation_id,
+            cancelled: cancel.is_cancelled(),
         });
-        Ok(())
+        if cancel.is_cancelled() {
+            Ok(crate::runtime::PodStopResult::Cancelled)
+        } else {
+            Ok(crate::runtime::PodStopResult::Completed)
+        }
     }
 
     async fn finalize_startup(
@@ -1415,6 +1447,7 @@ pub struct MockHookCall {
 pub struct MockPodHookRuntime {
     calls: Mutex<Vec<MockHookCall>>,
     outcome: Mutex<crate::runtime::hooks::HookOutcome>,
+    pre_stop_wait: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl Default for MockPodHookRuntime {
@@ -1428,6 +1461,7 @@ impl MockPodHookRuntime {
         Self {
             calls: Mutex::new(Vec::new()),
             outcome: Mutex::new(crate::runtime::hooks::HookOutcome::Succeeded),
+            pre_stop_wait: Mutex::new(None),
         }
     }
 
@@ -1437,6 +1471,10 @@ impl MockPodHookRuntime {
 
     pub fn recorded_calls(&self) -> Vec<MockHookCall> {
         self.calls.lock().unwrap().clone()
+    }
+
+    pub fn block_pre_stop_until(&self, release: Arc<tokio::sync::Notify>) {
+        *self.pre_stop_wait.lock().unwrap() = Some(release);
     }
 }
 
@@ -1469,6 +1507,10 @@ impl crate::runtime::hooks::PodHookRuntime for MockPodHookRuntime {
             container_id: container_id.to_string(),
             pod_ip: pod_ip.to_string(),
         });
+        let wait = self.pre_stop_wait.lock().unwrap().clone();
+        if let Some(wait) = wait {
+            wait.notified().await;
+        }
         Ok(self.outcome.lock().unwrap().clone())
     }
 }

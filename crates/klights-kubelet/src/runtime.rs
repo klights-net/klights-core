@@ -20,6 +20,86 @@ pub use crate::runtime_types::{
     PodStartResult,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PodStopMode {
+    Graceful,
+    Forced,
+}
+
+#[derive(Clone, Debug)]
+pub struct PodStopRequest {
+    pub key: PodRuntimeKey,
+    pub pod: Option<serde_json::Value>,
+    pub sandbox_id: Option<String>,
+    pub deletion_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    pub mode: PodStopMode,
+    pub operation_id: u64,
+    pub cancel: CancellationToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PodStopResult {
+    Completed,
+    Cancelled,
+}
+
+pub fn remaining_stop_grace(
+    deletion_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    mode: PodStopMode,
+) -> std::time::Duration {
+    if mode == PodStopMode::Forced {
+        return std::time::Duration::ZERO;
+    }
+    deletion_deadline
+        .and_then(|deadline| (deadline - now).to_std().ok())
+        .unwrap_or_default()
+}
+
+pub fn remaining_stop_grace_seconds(
+    deletion_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    mode: PodStopMode,
+) -> i64 {
+    let remaining = remaining_stop_grace(deletion_deadline, now, mode);
+    if remaining.is_zero() {
+        return 0;
+    }
+    let rounded_up = remaining
+        .as_secs()
+        .saturating_add(u64::from(remaining.subsec_nanos() != 0));
+    rounded_up.min(i64::MAX as u64) as i64
+}
+
+#[cfg(test)]
+mod stop_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn remaining_grace_rounds_up_and_forced_or_elapsed_are_zero() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-08T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let half_second = now + chrono::Duration::milliseconds(500);
+        assert_eq!(
+            remaining_stop_grace_seconds(Some(half_second), now, PodStopMode::Graceful),
+            1
+        );
+        assert_eq!(
+            remaining_stop_grace_seconds(Some(now), now, PodStopMode::Graceful),
+            0
+        );
+        assert_eq!(
+            remaining_stop_grace_seconds(Some(half_second), now, PodStopMode::Forced),
+            0
+        );
+        assert_eq!(
+            remaining_stop_grace_seconds(None, now, PodStopMode::Graceful),
+            0
+        );
+    }
+}
+
 /// Request object for UID-qualified pod slot admission checks.
 #[derive(Clone, Debug)]
 pub struct PodSlotAdmissionRequest {
@@ -43,12 +123,7 @@ pub trait PodRuntimeService: Send + Sync {
         cancel: CancellationToken,
     ) -> anyhow::Result<PodStartResult>;
 
-    async fn stop_pod(
-        &self,
-        key: PodRuntimeKey,
-        pod: Option<serde_json::Value>,
-        sandbox_id: Option<String>,
-    ) -> anyhow::Result<()>;
+    async fn stop_pod(&self, request: PodStopRequest) -> anyhow::Result<PodStopResult>;
 
     async fn finalize_startup(
         &self,

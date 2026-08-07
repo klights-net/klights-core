@@ -133,6 +133,7 @@ pub struct PodLifecycleRegistry {
     idle_grace: Duration,
     runtime_observation_store: Option<Arc<dyn NodeOutbox>>,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
+    local_node_name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -183,6 +184,7 @@ impl PodLifecycleRegistry {
             idle_grace,
             runtime_observation_store: None,
             wall_clock,
+            local_node_name: None,
         }
     }
 
@@ -191,6 +193,11 @@ impl PodLifecycleRegistry {
         runtime_observation_store: Option<Arc<dyn NodeOutbox>>,
     ) -> Self {
         self.runtime_observation_store = runtime_observation_store;
+        self
+    }
+
+    pub fn with_local_node_name(mut self, node_name: impl Into<String>) -> Self {
+        self.local_node_name = Some(node_name.into());
         self
     }
 
@@ -278,6 +285,7 @@ impl PodLifecycleRegistry {
                     idle_grace: self.idle_grace,
                     runtime_observation_store: self.runtime_observation_store.clone(),
                     wall_clock: self.wall_clock.clone(),
+                    local_node_name: self.local_node_name.clone(),
                 })
                 .run(rx),
             )

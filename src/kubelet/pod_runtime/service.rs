@@ -159,6 +159,17 @@ fn append_managed_hosts_mount(mounts: &mut Vec<k8s_cri::v1::Mount>, hosts_file_p
         recursive_read_only: false,
     });
 }
+
+async fn stop_step_until_cancelled<T>(
+    cancel: &CancellationToken,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        result = future => Some(result),
+    }
+}
 /// Production `PodRuntimeService` orchestrating CRI, CNI, volumes,
 /// filesystem, probes, hostports, events, and actor-owned deletion.
 pub struct RealPodRuntimeService {
@@ -764,6 +775,49 @@ impl RealPodRuntimeService {
             &status,
             self.clock.now_ms().div_euclid(1_000),
         ))
+    }
+}
+
+#[cfg(test)]
+impl RealPodRuntimeService {
+    pub(super) async fn stop_pod(
+        &self,
+        key: PodRuntimeKey,
+        pod: Option<serde_json::Value>,
+        sandbox_id: Option<String>,
+    ) -> anyhow::Result<()> {
+        let deletion_deadline = pod.as_ref().map(|pod| {
+            let grace = pod
+                .pointer("/spec/terminationGracePeriodSeconds")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(30)
+                .max(0);
+            self.clock.now_utc() + chrono::Duration::seconds(grace)
+        });
+        let mode = if deletion_deadline.is_some() {
+            klights_kubelet::runtime::PodStopMode::Graceful
+        } else {
+            klights_kubelet::runtime::PodStopMode::Forced
+        };
+        let result = <Self as PodRuntimeService>::stop_pod(
+            self,
+            klights_kubelet::runtime::PodStopRequest {
+                key,
+                pod,
+                sandbox_id,
+                deletion_deadline,
+                mode,
+                operation_id: 0,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await?;
+        match result {
+            klights_kubelet::runtime::PodStopResult::Completed => Ok(()),
+            klights_kubelet::runtime::PodStopResult::Cancelled => {
+                anyhow::bail!("test Pod stop unexpectedly cancelled")
+            }
+        }
     }
 }
 
@@ -1808,18 +1862,48 @@ impl PodRuntimeService for RealPodRuntimeService {
 
     async fn stop_pod(
         &self,
-        key: PodRuntimeKey,
-        pod: Option<serde_json::Value>,
-        sandbox_id: Option<String>,
-    ) -> anyhow::Result<()> {
+        request: klights_kubelet::runtime::PodStopRequest,
+    ) -> anyhow::Result<klights_kubelet::runtime::PodStopResult> {
+        let klights_kubelet::runtime::PodStopRequest {
+            key,
+            pod,
+            sandbox_id,
+            deletion_deadline,
+            mode,
+            operation_id,
+            cancel,
+        } = request;
+        if cancel.is_cancelled() {
+            return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
+        }
+        tracing::debug!(
+            namespace = %key.namespace,
+            pod = %key.name,
+            uid = %key.uid,
+            operation_id,
+            ?mode,
+            ?deletion_deadline,
+            "starting correlated Pod stop"
+        );
         // Stop probes by UID.
-        let _ = self.probes.stop_probes(&key).await;
+        if stop_step_until_cancelled(&cancel, self.probes.stop_probes(&key))
+            .await
+            .is_none()
+        {
+            return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
+        }
 
         // Orphan cleanup may not have a deleted Pod snapshot. Delegate to the
         // focused helper, which resolves the sandbox(es) via hint → store →
         // CRI-by-UID and tears them down before clearing the slot (HR #11).
         if pod.is_none() {
-            return self.stop_orphan_pod(&key, sandbox_id).await;
+            let Some(result) =
+                stop_step_until_cancelled(&cancel, self.stop_orphan_pod(&key, sandbox_id)).await
+            else {
+                return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
+            };
+            result?;
+            return Ok(klights_kubelet::runtime::PodStopResult::Completed);
         }
 
         let pod = pod.unwrap();
@@ -1888,29 +1972,28 @@ impl PodRuntimeService for RealPodRuntimeService {
             .unwrap_or_default();
         let status_name_by_id = pod_status_container_name_by_id(&pod);
 
-        let grace_period_seconds = pod
-            .pointer("/spec/terminationGracePeriodSeconds")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(30);
-
         let mut container_ids: Vec<String> = Vec::new();
         let mut prestop_container_ids: Vec<String> = Vec::new();
         if let Some(sandbox_id) = sandbox_id.as_deref() {
-            let containers = self
-                .container_control
-                .list_containers(Some(sandbox_id))
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(
-                        namespace = key.namespace,
-                        name = key.name,
-                        uid = key.uid,
-                        sandbox_id = sandbox_id,
-                        "failed to list containers for pod stop: {:#}",
-                        e
-                    );
-                    Vec::new()
-                });
+            let Some(containers) = stop_step_until_cancelled(
+                &cancel,
+                self.container_control.list_containers(Some(sandbox_id)),
+            )
+            .await
+            else {
+                return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
+            };
+            let containers = containers.unwrap_or_else(|e| {
+                tracing::warn!(
+                    namespace = key.namespace,
+                    name = key.name,
+                    uid = key.uid,
+                    sandbox_id = sandbox_id,
+                    "failed to list containers for pod stop: {:#}",
+                    e
+                );
+                Vec::new()
+            });
             if containers.is_empty() {
                 container_ids.extend(status_name_by_id.keys().cloned());
             } else {
@@ -1931,10 +2014,13 @@ impl PodRuntimeService for RealPodRuntimeService {
         {
             let mut container_name = status_name_by_id.get(container_id).cloned();
             if container_name.is_none() {
-                container_name = self
-                    .cri
-                    .container_status(container_id)
-                    .await
+                let Some(status) =
+                    stop_step_until_cancelled(&cancel, self.cri.container_status(container_id))
+                        .await
+                else {
+                    return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
+                };
+                container_name = status
                     .ok()
                     .and_then(|response| response.status)
                     .and_then(|status| status.metadata.map(|metadata| metadata.name))
@@ -1951,14 +2037,39 @@ impl PodRuntimeService for RealPodRuntimeService {
             let Some(hook) = container.pointer("/lifecycle/preStop") else {
                 continue;
             };
-            match self
-                .hooks
-                .execute_pre_stop(container_id, pod_ip, hook, container)
-                .await
-            {
-                Ok(HookOutcome::Succeeded) | Ok(HookOutcome::Failed(_)) => {}
-                Err(e) => {
-                    tracing::warn!(container = container_name, "preStop hook error: {:#}", e);
+            let remaining = klights_kubelet::runtime::remaining_stop_grace(
+                deletion_deadline,
+                self.clock.now_utc(),
+                mode,
+            );
+            if remaining.is_zero() {
+                break;
+            }
+            let hook = self.supervisor.timeout(
+                "pod_pre_stop_deadline",
+                remaining,
+                self.hooks
+                    .execute_pre_stop(container_id, pod_ip, hook, container),
+            );
+            let Some(result) = stop_step_until_cancelled(&cancel, hook).await else {
+                return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
+            };
+            match result {
+                Ok(Ok(Ok(HookOutcome::Succeeded) | Ok(HookOutcome::Failed(_)))) => {}
+                Ok(Ok(Err(error))) => {
+                    tracing::warn!(container = container_name, "preStop hook error: {error:#}");
+                }
+                Ok(Err(_elapsed)) => {
+                    tracing::warn!(
+                        container = container_name,
+                        "preStop hook reached Pod deletion deadline"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        container = container_name,
+                        "preStop supervision failed: {error:#}"
+                    );
                 }
             }
         }
@@ -1969,24 +2080,62 @@ impl PodRuntimeService for RealPodRuntimeService {
                 .iter()
                 .filter(|id| seen_container_ids.insert((*id).clone()))
             {
-                let _ = self
-                    .cri
-                    .stop_container(container_id, grace_period_seconds)
-                    .await;
-                let _ = self.cri.remove_container(container_id).await;
+                let grace_period_seconds = klights_kubelet::runtime::remaining_stop_grace_seconds(
+                    deletion_deadline,
+                    self.clock.now_utc(),
+                    mode,
+                );
+                if stop_step_until_cancelled(
+                    &cancel,
+                    self.cri.stop_container(container_id, grace_period_seconds),
+                )
+                .await
+                .is_none()
+                {
+                    return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
+                }
+                if stop_step_until_cancelled(&cancel, self.cri.remove_container(container_id))
+                    .await
+                    .is_none()
+                {
+                    return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
+                }
             }
 
             // Stop and remove sandbox.
-            let _ = self.cri.stop_pod_sandbox(sandbox_id).await;
-            let _ = self.cri.remove_pod_sandbox(sandbox_id).await;
+            if stop_step_until_cancelled(&cancel, self.cri.stop_pod_sandbox(sandbox_id))
+                .await
+                .is_none()
+            {
+                return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
+            }
+            if stop_step_until_cancelled(&cancel, self.cri.remove_pod_sandbox(sandbox_id))
+                .await
+                .is_none()
+            {
+                return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
+            }
 
             // Release CNI network. (cgroup teardown is UID-keyed and runs
             // unconditionally in cleanup_pod_local_artifacts below.)
-            let _ = self.network.release_sandbox_network(&key, sandbox_id).await;
+            if stop_step_until_cancelled(
+                &cancel,
+                self.network.release_sandbox_network(&key, sandbox_id),
+            )
+            .await
+            .is_none()
+            {
+                return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
+            }
 
             // Delete the sandbox row after CNI release. Real network cleanup
             // uses the UID-qualified row as the authorization witness.
-            let _ = self.store.delete_sandbox(&key).await;
+            if stop_step_until_cancelled(&cancel, self.store.delete_sandbox(&key))
+                .await
+                .is_none()
+            {
+                return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
+            }
         } else {
             tracing::warn!(
                 namespace = %key.namespace,
@@ -1998,14 +2147,29 @@ impl PodRuntimeService for RealPodRuntimeService {
 
         // Remove hostPort rules.
         let pod_host_ports = super::hostports::pod_host_ports_from_resource(&key, &pod)?;
-        let _ = self.hostports.remove_host_ports(&pod_host_ports).await;
+        if stop_step_until_cancelled(&cancel, self.hostports.remove_host_ports(&pod_host_ports))
+            .await
+            .is_none()
+        {
+            return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
+        }
 
-        self.cleanup_pod_local_artifacts(&key).await;
+        if stop_step_until_cancelled(&cancel, self.cleanup_pod_local_artifacts(&key))
+            .await
+            .is_none()
+        {
+            return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
+        }
 
         // Clear pod slot by UID.
-        let _ = self.slot_admission.clear_slot(&key).await;
+        if stop_step_until_cancelled(&cancel, self.slot_admission.clear_slot(&key))
+            .await
+            .is_none()
+        {
+            return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
+        }
 
-        Ok(())
+        Ok(klights_kubelet::runtime::PodStopResult::Completed)
     }
 
     async fn finalize_startup(

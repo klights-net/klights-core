@@ -13,6 +13,7 @@ use super::message::{
     LifecycleMessage, PodLifecycleKey, PodLifecycleWorkFailure, PodLifecycleWorkKind,
 };
 use crate::lifecycle::LifecycleCommand;
+pub use crate::runtime::PodStopMode;
 
 /// Synthesizes a `PodWorkFailed` message from an executor dispatch error.
 /// Shared by actor backend, multiplex adapter, and `PodDemuxEngine::spawn_work`.
@@ -46,6 +47,8 @@ pub enum PodAction {
         /// means the executor must re-fetch by key.
         pod: Option<serde_json::Value>,
         sandbox_id: String,
+        deletion_deadline: Option<chrono::DateTime<chrono::Utc>>,
+        mode: PodStopMode,
         operation_id: u64,
         permit: Option<WorkPermit>,
     },
@@ -248,6 +251,8 @@ mod tests {
             key: test_key(),
             pod: Some(json!({"kind": "Pod"})),
             sandbox_id: "sbox-1".into(),
+            deletion_deadline: None,
+            mode: PodStopMode::Forced,
             operation_id: 43,
             permit: None,
         };
@@ -464,6 +469,8 @@ mod tests {
             key: test_key(),
             pod: None,
             sandbox_id: "s".into(),
+            deletion_deadline: None,
+            mode: PodStopMode::Forced,
             operation_id: 1,
             permit: None,
         };

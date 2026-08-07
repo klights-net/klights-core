@@ -40,6 +40,60 @@ struct BlockingStartExecutor {
     release_start: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
+struct DeadlineStopExecutor {
+    calls: std::sync::Mutex<Vec<(crate::runtime::PodStopMode, u64)>>,
+    graceful_seen: tokio::sync::Notify,
+    graceful_cancelled: tokio::sync::Notify,
+    forced_seen: tokio::sync::Notify,
+}
+
+impl DeadlineStopExecutor {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            calls: std::sync::Mutex::new(Vec::new()),
+            graceful_seen: tokio::sync::Notify::new(),
+            graceful_cancelled: tokio::sync::Notify::new(),
+            forced_seen: tokio::sync::Notify::new(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::pod_lifecycle_router::executor::PodWorkExecutor for DeadlineStopExecutor {
+    async fn dispatch(
+        &self,
+        action: crate::pod_lifecycle_core::action::PodAction,
+        reply_to: LifecycleReplyHandle,
+    ) -> Result<(), crate::pod_lifecycle_router::executor::ExecutorError> {
+        self.dispatch_with_cancel(action, reply_to, tokio_util::sync::CancellationToken::new())
+            .await
+    }
+
+    async fn dispatch_with_cancel(
+        &self,
+        action: crate::pod_lifecycle_core::action::PodAction,
+        _reply_to: LifecycleReplyHandle,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), crate::pod_lifecycle_router::executor::ExecutorError> {
+        let crate::pod_lifecycle_core::action::PodAction::StopPod {
+            mode, operation_id, ..
+        } = action
+        else {
+            return Ok(());
+        };
+        self.calls.lock().unwrap().push((mode, operation_id));
+        match mode {
+            crate::runtime::PodStopMode::Graceful => {
+                self.graceful_seen.notify_one();
+                cancel.cancelled().await;
+                self.graceful_cancelled.notify_one();
+            }
+            crate::runtime::PodStopMode::Forced => self.forced_seen.notify_one(),
+        }
+        Ok(())
+    }
+}
+
 impl BlockingStartExecutor {
     fn new() -> (Arc<Self>, tokio::sync::oneshot::Sender<()>) {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -756,6 +810,403 @@ fn direct_test_actor() -> super::actor::PodLifecycleActor {
         test_executor_holder(),
         dummy_reply_handle(),
     )
+}
+
+#[test]
+fn deletion_deadline_due_is_uid_and_generation_qualified() {
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+    let message = LifecycleMessage::DeletionDeadlineDue {
+        key: key.clone(),
+        generation: 7,
+    };
+
+    assert_eq!(message.key(), &key);
+    assert_eq!(message.deletion_deadline_generation(), Some(7));
+    assert_eq!(message.event_name(), "deletion_deadline_due");
+}
+
+#[test]
+fn matching_deletion_deadline_replaces_graceful_stop_with_forced_stop() {
+    use crate::pod_lifecycle_core::action::{PodAction, PodStopMode};
+
+    let mut actor = direct_test_actor();
+    actor.set_local_node_name_for_test("node-a");
+    actor.set_wall_clock_for_test(std::time::UNIX_EPOCH + Duration::from_secs(100));
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+    let mut pod = test_pod("default", "pod-a", "uid-a");
+    pod["spec"]["nodeName"] = serde_json::json!("node-a");
+    pod["metadata"]["deletionTimestamp"] = serde_json::json!("1970-01-01T00:01:50Z");
+    pod["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(10);
+
+    let graceful = actor.handle_for_test(LifecycleMessage::WatchModified {
+        key: key.clone(),
+        resource_version: Some(2),
+        pod,
+    });
+    let graceful_operation = match graceful {
+        PodAction::StopPod {
+            mode: PodStopMode::Graceful,
+            operation_id,
+            ..
+        } => operation_id,
+        other => panic!("expected graceful StopPod, got {other:?}"),
+    };
+    let generation = actor
+        .deletion_deadline_generation_for_test()
+        .expect("deadline generation");
+
+    let forced = actor.handle_for_test(LifecycleMessage::DeletionDeadlineDue {
+        key: key.clone(),
+        generation,
+    });
+    match forced {
+        PodAction::StopPod {
+            mode: PodStopMode::Forced,
+            operation_id,
+            ..
+        } => assert!(operation_id > graceful_operation),
+        other => panic!("expected forced StopPod, got {other:?}"),
+    }
+}
+
+fn deadline_test_actor() -> super::actor::PodLifecycleActor {
+    let mut actor = direct_test_actor();
+    actor.set_local_node_name_for_test("node-a");
+    actor.set_wall_clock_for_test(std::time::UNIX_EPOCH + Duration::from_secs(100));
+    actor
+}
+
+fn terminating_test_pod(uid: &str, timestamp: serde_json::Value) -> serde_json::Value {
+    let mut pod = test_pod("default", "pod-a", uid);
+    pod["spec"]["nodeName"] = serde_json::json!("node-a");
+    pod["metadata"]["deletionTimestamp"] = timestamp;
+    pod["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(30);
+    pod
+}
+
+#[test]
+fn deletion_deadline_only_rearms_for_an_earlier_absolute_deadline() {
+    let mut actor = deadline_test_actor();
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+    let initial = terminating_test_pod("uid-a", serde_json::json!("1970-01-01T00:02:10Z"));
+    let _ = actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key: key.clone(),
+        resource_version: Some(1),
+        pod: initial,
+    });
+    let (_, initial_generation, _, _) = actor.deletion_deadline_for_test().unwrap();
+
+    let later = terminating_test_pod("uid-a", serde_json::json!("1970-01-01T00:02:20Z"));
+    let _ = actor.handle_for_test(LifecycleMessage::WatchModified {
+        key: key.clone(),
+        resource_version: Some(2),
+        pod: later,
+    });
+    assert_eq!(
+        actor.deletion_deadline_generation_for_test(),
+        Some(initial_generation)
+    );
+
+    let earlier = terminating_test_pod("uid-a", serde_json::json!("1970-01-01T00:01:50Z"));
+    let _ = actor.handle_for_test(LifecycleMessage::WatchModified {
+        key,
+        resource_version: Some(3),
+        pod: earlier,
+    });
+    let (deadline, generation, fired, forced) = actor.deletion_deadline_for_test().unwrap();
+    assert_eq!(deadline.timestamp(), 110);
+    assert!(generation > initial_generation);
+    assert!(!fired);
+    assert!(!forced);
+}
+
+#[test]
+fn malformed_deadline_is_immediate_and_absent_deadline_has_no_timer_state() {
+    let mut malformed_actor = deadline_test_actor();
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+    let malformed = terminating_test_pod("uid-a", serde_json::json!("not-a-time"));
+    let _ = malformed_actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key,
+        resource_version: Some(1),
+        pod: malformed,
+    });
+    assert_eq!(
+        malformed_actor
+            .deletion_deadline_for_test()
+            .unwrap()
+            .0
+            .timestamp(),
+        100
+    );
+
+    let mut absent_actor = deadline_test_actor();
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-b");
+    let mut absent = test_pod("default", "pod-a", "uid-b");
+    absent["spec"]["nodeName"] = serde_json::json!("node-a");
+    let _ = absent_actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key,
+        resource_version: Some(1),
+        pod: absent,
+    });
+    assert!(absent_actor.deletion_deadline_for_test().is_none());
+}
+
+#[test]
+fn stale_deadline_generation_and_replacement_uid_cannot_force_stop() {
+    use crate::pod_lifecycle_core::action::PodAction;
+
+    let mut actor = deadline_test_actor();
+    let old_key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+    let pod = terminating_test_pod("uid-a", serde_json::json!("1970-01-01T00:01:50Z"));
+    let old_stop = actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key: old_key.clone(),
+        resource_version: Some(1),
+        pod,
+    });
+    let old_stop_operation = match old_stop {
+        PodAction::StopPod { operation_id, .. } => operation_id,
+        other => panic!("expected old UID stop, got {other:?}"),
+    };
+    let generation = actor.deletion_deadline_generation_for_test().unwrap();
+    assert!(matches!(
+        actor.handle_for_test(LifecycleMessage::DeletionDeadlineDue {
+            key: old_key.clone(),
+            generation: generation.wrapping_add(1),
+        }),
+        PodAction::Noop
+    ));
+
+    let new_key = PodLifecycleKey::new("default", "pod-a", "uid-b");
+    let replacement = test_pod("default", "pod-a", "uid-b");
+    let _ = actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key: new_key.clone(),
+        resource_version: Some(2),
+        pod: replacement,
+    });
+    let finalize = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: old_key.clone(),
+        operation_id: old_stop_operation,
+        kind: super::message::PodLifecycleWorkKind::StopPod,
+        sandbox_id: None,
+    });
+    let finalize_operation = match finalize {
+        PodAction::FinalizePodDeletion { operation_id, .. } => operation_id,
+        other => panic!("expected actor-owned finalization, got {other:?}"),
+    };
+    let _ = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: old_key.clone(),
+        operation_id: finalize_operation,
+        kind: super::message::PodLifecycleWorkKind::FinalizePodDeletion,
+        sandbox_id: None,
+    });
+    assert_eq!(actor.active_uid_for_test(), Some(new_key.uid.as_str()));
+    assert!(matches!(
+        actor.handle_for_test(LifecycleMessage::DeletionDeadlineDue {
+            key: old_key,
+            generation,
+        }),
+        PodAction::Noop
+    ));
+}
+
+#[test]
+fn unscheduled_and_other_node_terminating_pods_do_not_arm_local_deadlines() {
+    for node_name in [None, Some("node-b")] {
+        let mut actor = deadline_test_actor();
+        let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+        let mut pod = terminating_test_pod("uid-a", serde_json::json!("1970-01-01T00:01:50Z"));
+        match node_name {
+            Some(node) => pod["spec"]["nodeName"] = serde_json::json!(node),
+            None => {
+                pod["spec"].as_object_mut().unwrap().remove("nodeName");
+            }
+        }
+        let _ = actor.handle_for_test(LifecycleMessage::WatchAdded {
+            key,
+            resource_version: Some(1),
+            pod,
+        });
+        assert!(actor.deletion_deadline_for_test().is_none());
+    }
+}
+
+#[test]
+fn relist_reconstructs_deadline_and_late_graceful_completion_is_ignored() {
+    use crate::pod_lifecycle_core::action::{PodAction, PodStopMode};
+
+    let mut actor = deadline_test_actor();
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+    let pod = terminating_test_pod("uid-a", serde_json::json!("1970-01-01T00:01:50Z"));
+    let graceful = actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key: key.clone(),
+        resource_version: Some(8),
+        pod,
+    });
+    let graceful_operation = match graceful {
+        PodAction::StopPod {
+            operation_id,
+            mode: PodStopMode::Graceful,
+            ..
+        } => operation_id,
+        other => panic!("expected relist graceful stop, got {other:?}"),
+    };
+    let generation = actor.deletion_deadline_generation_for_test().unwrap();
+    let forced = actor.handle_for_test(LifecycleMessage::DeletionDeadlineDue {
+        key: key.clone(),
+        generation,
+    });
+    let forced_operation = match forced {
+        PodAction::StopPod {
+            operation_id,
+            mode: PodStopMode::Forced,
+            ..
+        } => operation_id,
+        other => panic!("expected forced stop, got {other:?}"),
+    };
+    assert!(matches!(
+        actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+            key: key.clone(),
+            operation_id: graceful_operation,
+            kind: super::message::PodLifecycleWorkKind::StopPod,
+            sandbox_id: None,
+        }),
+        PodAction::Noop
+    ));
+    assert_eq!(
+        actor.in_flight_for_test().map(|(_, _, op)| op),
+        Some(forced_operation)
+    );
+}
+
+#[test]
+fn forced_stop_retry_remains_forced_and_finalizers_still_gate_hard_delete() {
+    use crate::pod_lifecycle_core::action::{PodAction, PodStopMode};
+
+    let mut actor = deadline_test_actor();
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+    let pod = terminating_test_pod("uid-a", serde_json::json!("1970-01-01T00:01:40Z"));
+    let _ = actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key: key.clone(),
+        resource_version: Some(1),
+        pod,
+    });
+    let generation = actor.deletion_deadline_generation_for_test().unwrap();
+    let forced_operation = match actor.handle_for_test(LifecycleMessage::DeletionDeadlineDue {
+        key: key.clone(),
+        generation,
+    }) {
+        PodAction::StopPod { operation_id, .. } => operation_id,
+        other => panic!("expected forced stop, got {other:?}"),
+    };
+    assert!(matches!(
+        actor.handle_for_test(LifecycleMessage::PodWorkFailed {
+            key: key.clone(),
+            operation_id: forced_operation,
+            kind: super::message::PodLifecycleWorkKind::StopPod,
+            retryable: true,
+            failure: super::message::PodLifecycleWorkFailure::DeadlineExceeded,
+        }),
+        PodAction::ScheduleRetry { .. }
+    ));
+    let retried_operation =
+        match actor.handle_for_test(LifecycleMessage::RetryDue { key: key.clone() }) {
+            PodAction::StopPod {
+                mode: PodStopMode::Forced,
+                operation_id,
+                ..
+            } => operation_id,
+            other => panic!("expected forced StopPod retry, got {other:?}"),
+        };
+    let finalize_operation = match actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: key.clone(),
+        operation_id: retried_operation,
+        kind: super::message::PodLifecycleWorkKind::StopPod,
+        sandbox_id: None,
+    }) {
+        PodAction::FinalizePodDeletion { operation_id, .. } => operation_id,
+        other => panic!("expected actor-owned finalization after StopPod, got {other:?}"),
+    };
+    assert!(matches!(
+        actor.handle_for_test(LifecycleMessage::PodWorkFailed {
+            key,
+            operation_id: finalize_operation,
+            kind: super::message::PodLifecycleWorkKind::FinalizePodDeletion,
+            retryable: true,
+            failure: super::message::PodLifecycleWorkFailure::FinalizersPending,
+        }),
+        PodAction::ScheduleRetry { .. }
+    ));
+}
+
+#[tokio::test]
+async fn supervised_deadline_shortening_cancels_graceful_and_dispatches_forced_stop() {
+    let executor = DeadlineStopExecutor::new();
+    let holder =
+        Arc::new(std::sync::Mutex::new(executor.clone()
+            as Arc<
+                dyn crate::pod_lifecycle_router::executor::PodWorkExecutor,
+            >));
+    let (seen_tx, _seen_rx) = tokio::sync::mpsc::channel(8);
+    let mut actor = super::actor::PodLifecycleActor::new_with_event_sink_for_test(
+        8,
+        seen_tx,
+        holder,
+        dummy_reply_handle(),
+    );
+    actor.set_local_node_name_for_test("node-a");
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let actor_task = tokio::spawn(actor.run(rx));
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+    let initial_deadline = chrono::Utc::now() + chrono::Duration::seconds(2);
+    let initial = terminating_test_pod(
+        "uid-a",
+        serde_json::json!(klights_cluster_core::k8s_time::format_legacy_timestamp(
+            initial_deadline,
+        )),
+    );
+    tx.send(LifecycleMessage::WatchAdded {
+        key: key.clone(),
+        resource_version: Some(1),
+        pod: initial,
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), executor.graceful_seen.notified())
+        .await
+        .expect("graceful stop dispatch");
+
+    let shortened_deadline = chrono::Utc::now() + chrono::Duration::milliseconds(100);
+    let shortened = terminating_test_pod(
+        "uid-a",
+        serde_json::json!(klights_cluster_core::k8s_time::format_legacy_timestamp(
+            shortened_deadline,
+        )),
+    );
+    tx.send(LifecycleMessage::WatchModified {
+        key,
+        resource_version: Some(2),
+        pod: shortened,
+    })
+    .await
+    .unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        executor.graceful_cancelled.notified(),
+    )
+    .await
+    .expect("shortened deadline cancels graceful stop");
+    tokio::time::timeout(Duration::from_secs(1), executor.forced_seen.notified())
+        .await
+        .expect("shortened deadline dispatches forced stop");
+    let calls = executor.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].0, crate::runtime::PodStopMode::Graceful);
+    assert_eq!(calls[1].0, crate::runtime::PodStopMode::Forced);
+    assert!(calls[1].1 > calls[0].1);
+
+    drop(tx);
+    actor_task.await.unwrap();
 }
 
 #[test]

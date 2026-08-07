@@ -127,6 +127,10 @@ pub enum LifecycleMessage {
     ActiveDeadlineDue {
         key: PodLifecycleKey,
     },
+    DeletionDeadlineDue {
+        key: PodLifecycleKey,
+        generation: u64,
+    },
     ActorIdleGraceExpired {
         key: PodLifecycleKey,
         generation: u64,
@@ -151,6 +155,7 @@ impl LifecycleMessage {
             | Self::RetryDue { key }
             | Self::OrphanFinalize { key, .. }
             | Self::ActiveDeadlineDue { key }
+            | Self::DeletionDeadlineDue { key, .. }
             | Self::ActorIdleGraceExpired { key, .. } => key,
         }
     }
@@ -172,6 +177,7 @@ impl LifecycleMessage {
             Self::RetryDue { .. } => "retry_due",
             Self::OrphanFinalize { .. } => "orphan_finalize",
             Self::ActiveDeadlineDue { .. } => "active_deadline_due",
+            Self::DeletionDeadlineDue { .. } => "deletion_deadline_due",
             Self::ActorIdleGraceExpired { .. } => "actor_idle_grace_expired",
         }
     }
@@ -198,6 +204,7 @@ impl LifecycleMessage {
             | Self::RetryDue { .. }
             | Self::OrphanFinalize { .. }
             | Self::ActiveDeadlineDue { .. }
+            | Self::DeletionDeadlineDue { .. }
             | Self::ActorIdleGraceExpired { .. } => None,
             Self::SlotAdmissionGranted {
                 resource_version, ..
@@ -228,6 +235,7 @@ impl LifecycleMessage {
             | Self::RetryDue { .. }
             | Self::OrphanFinalize { .. }
             | Self::ActiveDeadlineDue { .. }
+            | Self::DeletionDeadlineDue { .. }
             | Self::ActorIdleGraceExpired { .. } => None,
         }
     }
@@ -235,6 +243,13 @@ impl LifecycleMessage {
     pub fn idle_grace_generation(&self) -> Option<u64> {
         match self {
             Self::ActorIdleGraceExpired { generation, .. } => Some(*generation),
+            _ => None,
+        }
+    }
+
+    pub fn deletion_deadline_generation(&self) -> Option<u64> {
+        match self {
+            Self::DeletionDeadlineDue { generation, .. } => Some(*generation),
             _ => None,
         }
     }

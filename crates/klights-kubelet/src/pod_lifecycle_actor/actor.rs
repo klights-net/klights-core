@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::pod_lifecycle_core::action::PodAction;
+use crate::pod_lifecycle_core::action::PodStopMode;
 use crate::pod_lifecycle_core::message::{
     LifecycleMessage, PodLifecycleKey, PodLifecycleWorkFailure, PodLifecycleWorkKind, PodSlotKey,
 };
@@ -94,6 +95,7 @@ pub struct PodLifecycleActorRuntime {
     pub idle_grace: Duration,
     pub runtime_observation_store: Option<Arc<dyn NodeOutbox>>,
     pub wall_clock: Arc<dyn klights_supervisor::WallClock>,
+    pub local_node_name: Option<String>,
 }
 
 fn pod_has_ephemeral_containers(pod: &serde_json::Value) -> bool {
@@ -212,6 +214,8 @@ pub struct PodLifecycleActor {
     last_key: Option<PodLifecycleKey>,
     runtime_observation_store: Option<Arc<dyn NodeOutbox>>,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
+    local_node_name: Option<String>,
+    deletion_deadline_timer: Option<(String, u64, SupervisedJoinHandle<()>)>,
     runtime_observation_checkpoint_loaded_for: Option<String>,
     #[cfg(test)]
     event_sink: Option<mpsc::Sender<&'static str>>,
@@ -250,6 +254,8 @@ impl PodLifecycleActor {
             last_key: None,
             runtime_observation_store: None,
             wall_clock: Arc::new(klights_supervisor::SystemWallClock),
+            local_node_name: None,
+            deletion_deadline_timer: None,
             runtime_observation_checkpoint_loaded_for: None,
             event_sink: Some(event_sink),
             uid_mismatch_warnings: Vec::new(),
@@ -279,6 +285,8 @@ impl PodLifecycleActor {
             last_key: None,
             runtime_observation_store: runtime.runtime_observation_store,
             wall_clock: runtime.wall_clock,
+            local_node_name: runtime.local_node_name,
+            deletion_deadline_timer: None,
             runtime_observation_checkpoint_loaded_for: None,
             #[cfg(test)]
             event_sink: None,
@@ -332,6 +340,7 @@ impl PodLifecycleActor {
                 }
                 _ = shutdown.cancelled() => {
                     self.state.cancel_in_flight();
+                    self.abort_deletion_deadline_timer();
                     for handle in &spawned_work {
                         handle.abort();
                     }
@@ -339,6 +348,8 @@ impl PodLifecycleActor {
                 }
             }
         }
+
+        self.abort_deletion_deadline_timer();
 
         for handle in spawned_work {
             let _ = handle.join().await;
@@ -483,6 +494,7 @@ impl PodLifecycleActor {
 
         self.load_runtime_observation_checkpoint_once(&key).await;
         let action = self.handle(message);
+        self.reconcile_deletion_deadline_timer(completion_tx).await;
         self.load_runtime_observation_checkpoint_once(&key).await;
         if let Some(key) = checkpoint_after_defer_candidate {
             self.persist_pending_runtime_observation_checkpoint(&key)
@@ -704,6 +716,115 @@ impl PodLifecycleActor {
         self.state.active_uid_matches(&key.uid)
     }
 
+    fn abort_deletion_deadline_timer(&mut self) {
+        if let Some((_, _, handle)) = self.deletion_deadline_timer.take() {
+            handle.abort();
+        }
+    }
+
+    async fn reconcile_deletion_deadline_timer(
+        &mut self,
+        completion_tx: &mpsc::Sender<LifecycleMessage>,
+    ) {
+        let desired = self.state.deletion_deadline.as_ref().and_then(|deadline| {
+            (!deadline.fired && !deadline.forced)
+                .then(|| (deadline.uid.clone(), deadline.generation, deadline.deadline))
+        });
+        if let (Some((armed_uid, armed_generation, _)), Some((uid, generation, _))) =
+            (&self.deletion_deadline_timer, &desired)
+            && armed_uid == uid
+            && armed_generation == generation
+        {
+            return;
+        }
+        self.abort_deletion_deadline_timer();
+        let Some((uid, generation, deadline)) = desired else {
+            return;
+        };
+        let key = self
+            .last_key
+            .as_ref()
+            .filter(|key| key.uid == uid)
+            .cloned()
+            .or_else(|| {
+                self.slot.as_ref().map(|slot| PodLifecycleKey {
+                    namespace: slot.namespace.clone(),
+                    name: slot.name.clone(),
+                    uid: uid.clone(),
+                })
+            });
+        let Some(key) = key else { return };
+        let now: chrono::DateTime<chrono::Utc> = self.wall_clock.now().into();
+        let delay = (deadline - now).to_std().unwrap_or_default();
+        let tx = completion_tx.clone();
+        match self
+            .supervisor
+            .spawn_delay("pod_deletion_deadline", delay, async move {
+                let _ = tx
+                    .send(LifecycleMessage::DeletionDeadlineDue { key, generation })
+                    .await;
+            })
+            .await
+        {
+            Ok(handle) => {
+                self.deletion_deadline_timer = Some((uid, generation, handle));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    uid,
+                    generation,
+                    "failed to arm Pod deletion deadline: {error:#}"
+                );
+            }
+        }
+    }
+
+    fn observe_local_deletion_deadline(&mut self, key: &PodLifecycleKey, pod: &serde_json::Value) {
+        let assigned_node = pod
+            .pointer("/spec/nodeName")
+            .and_then(serde_json::Value::as_str)
+            .filter(|node| !node.trim().is_empty());
+        if assigned_node.is_none()
+            || self.local_node_name.as_deref().is_none()
+            || assigned_node != self.local_node_name.as_deref()
+        {
+            self.state.clear_deletion_deadline();
+            return;
+        }
+        let Some(timestamp) = pod.pointer("/metadata/deletionTimestamp") else {
+            self.state.clear_deletion_deadline();
+            return;
+        };
+        let now: chrono::DateTime<chrono::Utc> = self.wall_clock.now().into();
+        let deadline = timestamp
+            .as_str()
+            .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+            .map(|parsed| parsed.with_timezone(&chrono::Utc))
+            .unwrap_or(now);
+        self.state.observe_deletion_deadline(&key.uid, deadline);
+    }
+
+    fn current_stop_context(
+        &self,
+        key: &PodLifecycleKey,
+    ) -> (Option<chrono::DateTime<chrono::Utc>>, PodStopMode) {
+        self.state
+            .deletion_deadline
+            .as_ref()
+            .filter(|deadline| deadline.uid == key.uid)
+            .map(|deadline| {
+                (
+                    Some(deadline.deadline),
+                    if deadline.forced {
+                        PodStopMode::Forced
+                    } else {
+                        PodStopMode::Graceful
+                    },
+                )
+            })
+            .unwrap_or((None, PodStopMode::Forced))
+    }
+
     fn ensure_active_uid(&mut self, key: &PodLifecycleKey) {
         if self.state.active_uid.is_none() {
             self.state.admit_uid(&key.uid);
@@ -766,17 +887,23 @@ impl PodLifecycleActor {
         key: PodLifecycleKey,
         pod: Option<serde_json::Value>,
         sandbox_id: String,
+        deletion_deadline: Option<chrono::DateTime<chrono::Utc>>,
+        mode: PodStopMode,
     ) -> PodAction {
         self.state.pending_stop_pod = Some(crate::pod_lifecycle_core::state::PendingStopPod {
             key: key.clone(),
             pod: pod.clone(),
             sandbox_id: sandbox_id.clone(),
+            deletion_deadline,
+            mode,
         });
         let operation_id = self.next_work_operation(&key, PodLifecycleWorkKind::StopPod);
         PodAction::StopPod {
             key,
             pod,
             sandbox_id,
+            deletion_deadline,
+            mode,
             operation_id,
             permit: None,
         }
@@ -801,6 +928,7 @@ impl PodLifecycleActor {
         self.state.active_uid = None;
         self.state.admitted_slot_uid = None;
         self.state.active_sandbox_id = None;
+        self.state.clear_deletion_deadline();
         self.finalize_pod_deletion_action(key)
     }
 
@@ -1213,6 +1341,45 @@ impl PodLifecycleActor {
     }
 
     #[cfg(test)]
+    pub fn set_local_node_name_for_test(&mut self, node_name: &str) {
+        self.local_node_name = Some(node_name.to_string());
+    }
+
+    #[cfg(test)]
+    pub fn set_wall_clock_for_test(&mut self, now: std::time::SystemTime) {
+        #[derive(Debug)]
+        struct FixedWallClock(std::time::SystemTime);
+        impl klights_supervisor::WallClock for FixedWallClock {
+            fn now(&self) -> std::time::SystemTime {
+                self.0
+            }
+        }
+        self.wall_clock = Arc::new(FixedWallClock(now));
+    }
+
+    #[cfg(test)]
+    pub fn deletion_deadline_generation_for_test(&self) -> Option<u64> {
+        self.state
+            .deletion_deadline
+            .as_ref()
+            .map(|deadline| deadline.generation)
+    }
+
+    #[cfg(test)]
+    pub fn deletion_deadline_for_test(
+        &self,
+    ) -> Option<(chrono::DateTime<chrono::Utc>, u64, bool, bool)> {
+        self.state.deletion_deadline.as_ref().map(|deadline| {
+            (
+                deadline.deadline,
+                deadline.generation,
+                deadline.fired,
+                deadline.forced,
+            )
+        })
+    }
+
+    #[cfg(test)]
     pub fn pending_replacement_uid_for_test(&self) -> Option<&str> {
         self.state
             .pending_replacement
@@ -1316,6 +1483,7 @@ impl PodLifecycleActor {
                     }
                     self.admit_replacement_uid(&key);
                 }
+                self.observe_local_deletion_deadline(&key, &pod);
                 if is_terminating || is_node_lost_terminal {
                     self.state.drop_pending_ephemeral_reconcile_if_uid(&key.uid);
                     if self.state.in_flight_kind_for_uid(&key.uid)
@@ -1333,7 +1501,8 @@ impl PodLifecycleActor {
                             self.state.cancel_in_flight();
                         }
                         self.state.phase = PodPhase::Stopping;
-                        self.stop_pod_action(key, Some(pod), String::new())
+                        let (deadline, mode) = self.current_stop_context(&key);
+                        self.stop_pod_action(key, Some(pod), String::new(), deadline, mode)
                     }
                 } else if self.state.phase == PodPhase::Created {
                     self.state.phase = PodPhase::PendingStart;
@@ -1428,6 +1597,8 @@ impl PodLifecycleActor {
                     return PodAction::Noop;
                 }
 
+                self.observe_local_deletion_deadline(&key, pod);
+
                 if is_terminating || is_node_lost_terminal {
                     self.state.drop_pending_ephemeral_reconcile_if_uid(&key.uid);
                     if self.state.in_flight_kind_for_uid(&key.uid)
@@ -1445,7 +1616,8 @@ impl PodLifecycleActor {
                             self.state.cancel_in_flight();
                         }
                         self.state.phase = PodPhase::Stopping;
-                        self.stop_pod_action(key, Some(pod.clone()), String::new())
+                        let (deadline, mode) = self.current_stop_context(&key);
+                        self.stop_pod_action(key, Some(pod.clone()), String::new(), deadline, mode)
                     }
                 } else if let Some(sandbox_id) = running_sandbox_id {
                     let has_ephemeral = pod_has_ephemeral_containers(pod);
@@ -1609,7 +1781,8 @@ impl PodLifecycleActor {
                         self.state.cancel_in_flight();
                     }
                     self.state.phase = PodPhase::Stopping;
-                    self.stop_pod_action(key, Some(pod), String::new())
+                    let (deadline, mode) = self.current_stop_context(&key);
+                    self.stop_pod_action(key, Some(pod), String::new(), deadline, mode)
                 }
             }
 
@@ -1629,20 +1802,28 @@ impl PodLifecycleActor {
                 }
                 if self.state.phase == PodPhase::Stopping
                     && self.state.in_flight.is_none()
-                    && let Some((pending_key, pending_pod, pending_sandbox_id)) = self
-                        .state
-                        .pending_stop_pod
-                        .as_ref()
-                        .filter(|pending| pending.key.uid == key.uid)
-                        .map(|pending| {
-                            (
-                                pending.key.clone(),
-                                pending.pod.clone(),
-                                pending.sandbox_id.clone(),
-                            )
-                        })
+                    && let Some((pending_key, pending_pod, pending_sandbox_id, deadline, mode)) =
+                        self.state
+                            .pending_stop_pod
+                            .as_ref()
+                            .filter(|pending| pending.key.uid == key.uid)
+                            .map(|pending| {
+                                (
+                                    pending.key.clone(),
+                                    pending.pod.clone(),
+                                    pending.sandbox_id.clone(),
+                                    pending.deletion_deadline,
+                                    pending.mode,
+                                )
+                            })
                 {
-                    return self.stop_pod_action(pending_key, pending_pod, pending_sandbox_id);
+                    return self.stop_pod_action(
+                        pending_key,
+                        pending_pod,
+                        pending_sandbox_id,
+                        deadline,
+                        mode,
+                    );
                 }
                 self.ensure_active_uid(&key);
                 if !self.active_uid_is(&key) {
@@ -1699,7 +1880,7 @@ impl PodLifecycleActor {
                     self.state.admit_uid(&key.uid);
                 }
                 self.state.phase = PodPhase::Stopping;
-                self.stop_pod_action(key, None, String::new())
+                self.stop_pod_action(key, None, String::new(), None, PodStopMode::Forced)
             }
 
             LifecycleMessage::PodWorkFailed {
@@ -2132,6 +2313,47 @@ impl PodLifecycleActor {
                 }
                 self.ensure_active_uid(&key);
                 self.runtime_reconcile_action_or_defer(key, None, None)
+            }
+            LifecycleMessage::DeletionDeadlineDue { key, generation } => {
+                if !self.active_uid_is(&key)
+                    || !self.state.fire_deletion_deadline(&key.uid, generation)
+                {
+                    return PodAction::Noop;
+                }
+                let graceful_stop_in_flight =
+                    self.state.pending_stop_pod.as_ref().is_some_and(|pending| {
+                        pending.key.uid == key.uid && pending.mode == PodStopMode::Graceful
+                    }) && self.state.in_flight_kind_for_uid(&key.uid)
+                        == Some(PodLifecycleWorkKind::StopPod);
+                if graceful_stop_in_flight {
+                    self.state.cancel_in_flight();
+                } else if self.state.in_flight.is_some() {
+                    return PodAction::Noop;
+                }
+                let (pod, sandbox_id, deadline) = self
+                    .state
+                    .pending_stop_pod
+                    .as_ref()
+                    .filter(|pending| pending.key.uid == key.uid)
+                    .map(|pending| {
+                        (
+                            pending.pod.clone(),
+                            pending.sandbox_id.clone(),
+                            pending.deletion_deadline,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            None,
+                            self.state.sandbox_id.clone().unwrap_or_default(),
+                            self.state
+                                .deletion_deadline
+                                .as_ref()
+                                .map(|deadline| deadline.deadline),
+                        )
+                    });
+                self.state.phase = PodPhase::Stopping;
+                self.stop_pod_action(key, pod, sandbox_id, deadline, PodStopMode::Forced)
             }
 
             // ── Commands ──

@@ -388,10 +388,20 @@ mod tests {
         crate::datastore::DatastoreHandle,
         std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
     ) {
+        test_workqueue_at(Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock)).await
+    }
+
+    async fn test_workqueue_at(
+        clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+    ) -> (
+        Arc<PodWorkqueue>,
+        crate::datastore::DatastoreHandle,
+        std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
+    ) {
         let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let persistence = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
             db.clone(),
-            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+            clock.clone(),
         );
         let store = persistence.store;
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
@@ -404,13 +414,13 @@ mod tests {
             store,
             crate::pod_repository_composition::test_workqueue_persistence(
                 node_local.clone(),
-                Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+                clock.clone(),
             ),
             supervisor,
             metrics,
             persistence.unscheduled_deletion,
             coordination,
-            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+            clock,
         );
         workqueue.set_local_node_name_for_tests(Some("node-a".to_string()));
         (workqueue, db, node_local)
@@ -1680,6 +1690,49 @@ mod tests {
             claimed_rows.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains("local-pod"));
         assert!(names.contains("remote-pod"));
+    }
+
+    #[tokio::test]
+    async fn namespace_actor_reminder_preserves_absolute_pod_deadline() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-08T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let fixed_now_ms = now.timestamp_millis();
+        let (workqueue, db, node_local) =
+            test_workqueue_at(Arc::new(FixedRuntimeClock(fixed_now_ms))).await;
+        let mut pod = pod_with_uid_on_node("deadline-pod", "deadline-uid", true, "node-a");
+        pod["metadata"]["deletionTimestamp"] =
+            json!(klights_cluster_core::k8s_time::format_legacy_timestamp(
+                now + chrono::Duration::seconds(17),
+            ));
+        db.create_resource("v1", "Pod", Some("terminating-ns"), "deadline-pod", pod)
+            .await
+            .unwrap();
+
+        let system_before_ms = now_ms();
+        workqueue
+            .enqueue_actor_deletes_for_terminating_namespace_pods_for_tests("terminating-ns")
+            .await
+            .unwrap();
+        let system_after_ms = now_ms();
+
+        let due_ms = node_local
+            .peek_workqueue_next_due()
+            .await
+            .unwrap()
+            .expect("namespace cleanup must enqueue a durable reminder");
+        assert!(
+            (system_before_ms + 17_000..=system_after_ms + 17_000).contains(&due_ms),
+            "namespace cleanup must retain the Pod's 17-second remaining deletion deadline"
+        );
+        assert!(
+            node_local
+                .claim_workqueue_due(due_ms - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "durable reminder is a backstop, not an immediate replacement for the actor timer"
+        );
     }
 
     #[tokio::test]

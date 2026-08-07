@@ -153,6 +153,24 @@ pub fn plan_pod_delete_deadline(
     })
 }
 
+pub fn remaining_pod_delete_deadline(
+    pod: &Value,
+    operation_now: DateTime<Utc>,
+) -> Result<Option<Duration>, PodDeleteDeadlineError> {
+    let Some(timestamp) = pod.pointer("/metadata/deletionTimestamp") else {
+        return Ok(None);
+    };
+    let raw = timestamp.as_str().ok_or_else(|| PodDeleteDeadlineError {
+        message: "Pod deletionTimestamp must be a string".to_string(),
+    })?;
+    let deadline = DateTime::parse_from_rfc3339(raw)
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .map_err(|error| PodDeleteDeadlineError {
+            message: format!("invalid Pod deletionTimestamp: {error}"),
+        })?;
+    Ok(Some(duration_until(deadline, operation_now)))
+}
+
 fn normalize_grace(grace_period_seconds: i64) -> i64 {
     if grace_period_seconds < 0 {
         1
@@ -183,6 +201,24 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 8, 8, 12, 0, 0)
             .single()
             .expect("fixed operation time")
+    }
+
+    #[test]
+    fn remaining_deadline_is_absolute_and_malformed_fails_closed() {
+        let future = json!({"metadata": {"deletionTimestamp": "2026-08-08T12:00:03.500Z"}});
+        assert_eq!(
+            remaining_pod_delete_deadline(&future, now()).unwrap(),
+            Some(Duration::from_millis(3_500))
+        );
+        let elapsed = json!({"metadata": {"deletionTimestamp": "2026-08-08T11:59:59Z"}});
+        assert_eq!(
+            remaining_pod_delete_deadline(&elapsed, now()).unwrap(),
+            Some(Duration::ZERO)
+        );
+        let absent = json!({"metadata": {}});
+        assert_eq!(remaining_pod_delete_deadline(&absent, now()).unwrap(), None);
+        let malformed = json!({"metadata": {"deletionTimestamp": "not-time"}});
+        assert!(remaining_pod_delete_deadline(&malformed, now()).is_err());
     }
 
     fn pod(spec_grace: Option<i64>, generation: Option<i64>) -> Value {

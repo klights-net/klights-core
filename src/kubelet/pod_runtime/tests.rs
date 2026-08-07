@@ -960,9 +960,17 @@ async fn mock_pod_runtime_service_records_all_methods() {
     mock.start_pod(key.clone(), None, cancel.clone())
         .await
         .unwrap();
-    mock.stop_pod(key.clone(), None, Some("sandbox-1".into()))
-        .await
-        .unwrap();
+    mock.stop_pod(klights_kubelet::runtime::PodStopRequest {
+        key: key.clone(),
+        pod: None,
+        sandbox_id: Some("sandbox-1".into()),
+        deletion_deadline: None,
+        mode: klights_kubelet::runtime::PodStopMode::Forced,
+        operation_id: 1,
+        cancel: cancel.clone(),
+    })
+    .await
+    .unwrap();
     mock.finalize_startup(key.clone(), None, None)
         .await
         .unwrap();
@@ -1044,6 +1052,7 @@ async fn mock_pod_runtime_service_records_all_methods() {
                 name,
                 uid,
                 sandbox_id,
+                ..
             } => {
                 assert_eq!(namespace, "ns");
                 assert_eq!(name, "pod");
@@ -8278,6 +8287,212 @@ async fn real_runtime_start_pod_does_not_register_readiness_probes_before_finali
 
 // --- Task 23.1: PreStop Hooks ---
 
+struct AdvancingStopClock {
+    now_ms: std::sync::atomic::AtomicI64,
+    step_ms: i64,
+}
+
+impl AdvancingStopClock {
+    fn new(now_ms: i64, step_ms: i64) -> Self {
+        Self {
+            now_ms: std::sync::atomic::AtomicI64::new(now_ms),
+            step_ms,
+        }
+    }
+}
+
+impl klights_kubelet::runtime_clock::RuntimeClock for AdvancingStopClock {
+    fn now_ms(&self) -> i64 {
+        self.now_ms
+            .fetch_add(self.step_ms, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+async fn stop_with_deadline_request(
+    harness: &PodRuntimeHarness,
+    key: PodRuntimeKey,
+    pod: serde_json::Value,
+    sandbox_id: &str,
+    deadline: chrono::DateTime<chrono::Utc>,
+    mode: klights_kubelet::runtime::PodStopMode,
+    operation_id: u64,
+    cancel: CancellationToken,
+) -> anyhow::Result<klights_kubelet::runtime::PodStopResult> {
+    <crate::kubelet::pod_runtime::service::RealPodRuntimeService as PodRuntimeService>::stop_pod(
+        harness.runtime.as_ref(),
+        klights_kubelet::runtime::PodStopRequest {
+            key,
+            pod: Some(pod),
+            sandbox_id: Some(sandbox_id.to_string()),
+            deletion_deadline: Some(deadline),
+            mode,
+            operation_id,
+            cancel,
+        },
+    )
+    .await
+}
+
+fn deadline_runtime_pod(name: &str, uid: &str, with_pre_stop: bool) -> serde_json::Value {
+    let mut container = serde_json::json!({"name": "app", "image": "nginx"});
+    if with_pre_stop {
+        container["lifecycle"] = serde_json::json!({
+            "preStop": {"exec": {"command": ["true"]}}
+        });
+    }
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"namespace": "ns", "name": name, "uid": uid},
+        "spec": {"nodeName": "test-node", "containers": [container]},
+        "status": {
+            "phase": "Running",
+            "podIP": "10.0.0.8",
+            "containerStatuses": [{
+                "name": "app",
+                "containerID": "containerd://ctr-deadline",
+                "state": {"running": {"startedAt": "2026-01-01T00:00:00Z"}}
+            }]
+        }
+    })
+}
+
+#[tokio::test]
+async fn runtime_stop_uses_absolute_remaining_grace_and_recomputes_per_container() {
+    let base_ms = 2_000_000_i64;
+    let clock = Arc::new(AdvancingStopClock::new(base_ms, 2_000));
+    let harness = PodRuntimeHarness::new_with_clock(clock).await;
+    let key = PodRuntimeKey::new("ns", "deadline-pod", "uid-deadline");
+    let mut pod = deadline_runtime_pod("deadline-pod", "uid-deadline", false);
+    pod["spec"]["containers"] = serde_json::json!([
+        {"name": "app", "image": "nginx"},
+        {"name": "sidecar", "image": "busybox"}
+    ]);
+    harness.container_control.set_containers(vec![
+        ("ctr-deadline".into(), "running".into()),
+        ("ctr-sidecar".into(), "running".into()),
+    ]);
+    let deadline = chrono::DateTime::from_timestamp_millis(base_ms + 5_500).unwrap();
+    let result = stop_with_deadline_request(
+        &harness,
+        key,
+        pod,
+        "sb-deadline",
+        deadline,
+        klights_kubelet::runtime::PodStopMode::Graceful,
+        41,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, klights_kubelet::runtime::PodStopResult::Completed);
+    let stop_graces = harness
+        .cri
+        .recorded_calls()
+        .into_iter()
+        .filter_map(|call| match call.operation {
+            MockCriOperation::StopContainer(_, grace) => Some(grace),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(stop_graces, vec![6, 4]);
+}
+
+#[tokio::test]
+async fn runtime_stop_elapsed_or_forced_deadline_passes_zero_and_skips_prestop() {
+    for (mode, deadline_offset_ms) in [
+        (klights_kubelet::runtime::PodStopMode::Graceful, -1),
+        (klights_kubelet::runtime::PodStopMode::Forced, 30_000),
+    ] {
+        let base_ms = 3_000_000_i64;
+        let harness = PodRuntimeHarness::new_with_clock(Arc::new(FixedRuntimeClock(base_ms))).await;
+        let key = PodRuntimeKey::new("ns", "expired-pod", "uid-expired");
+        let pod = deadline_runtime_pod("expired-pod", "uid-expired", true);
+        harness
+            .container_control
+            .set_containers(vec![("ctr-deadline".into(), "running".into())]);
+        let deadline =
+            chrono::DateTime::from_timestamp_millis(base_ms + deadline_offset_ms).unwrap();
+        let result = stop_with_deadline_request(
+            &harness,
+            key,
+            pod,
+            "sb-expired",
+            deadline,
+            mode,
+            42,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, klights_kubelet::runtime::PodStopResult::Completed);
+        assert!(harness.hooks.recorded_calls().is_empty());
+        assert!(
+            harness
+                .cri
+                .recorded_calls()
+                .iter()
+                .any(|call| { matches!(call.operation, MockCriOperation::StopContainer(_, 0)) })
+        );
+    }
+}
+
+#[tokio::test]
+async fn runtime_stop_bounds_prestop_by_deadline_and_honors_cancellation() {
+    let harness = PodRuntimeHarness::new().await;
+    let key = PodRuntimeKey::new("ns", "bounded-hook", "uid-hook");
+    let pod = deadline_runtime_pod("bounded-hook", "uid-hook", true);
+    harness
+        .container_control
+        .set_containers(vec![("ctr-deadline".into(), "running".into())]);
+    harness
+        .hooks
+        .block_pre_stop_until(Arc::new(tokio::sync::Notify::new()));
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        stop_with_deadline_request(
+            &harness,
+            key,
+            pod,
+            "sb-hook",
+            chrono::Utc::now() + chrono::Duration::milliseconds(50),
+            klights_kubelet::runtime::PodStopMode::Graceful,
+            43,
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("preStop must be bounded by the absolute deadline")
+    .unwrap();
+    assert_eq!(result, klights_kubelet::runtime::PodStopResult::Completed);
+    assert_eq!(harness.hooks.recorded_calls().len(), 1);
+    assert!(
+        harness
+            .cri
+            .recorded_calls()
+            .iter()
+            .any(|call| { matches!(call.operation, MockCriOperation::StopContainer(_, 0)) })
+    );
+
+    let cancelled_harness = PodRuntimeHarness::new().await;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let result = stop_with_deadline_request(
+        &cancelled_harness,
+        PodRuntimeKey::new("ns", "cancelled", "uid-cancelled"),
+        deadline_runtime_pod("cancelled", "uid-cancelled", false),
+        "sb-cancelled",
+        chrono::Utc::now() + chrono::Duration::seconds(30),
+        klights_kubelet::runtime::PodStopMode::Graceful,
+        44,
+        cancel,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, klights_kubelet::runtime::PodStopResult::Cancelled);
+    assert!(cancelled_harness.cri.recorded_calls().is_empty());
+}
+
 #[tokio::test]
 async fn real_runtime_stop_pod_runs_pre_stop_hooks_before_container_stop_with_parity() {
     let harness = PodRuntimeHarness::new().await;
@@ -11092,9 +11307,8 @@ struct PodRuntimeHarness {
 }
 
 impl PodRuntimeHarness {
-    /// Construct with all-default mocks and an in-memory repository.
-    async fn new() -> Self {
-        Self::new_with_runtime_config(crate::kubelet::pod_runtime::service::RuntimeConfig {
+    fn default_runtime_config() -> crate::kubelet::pod_runtime::service::RuntimeConfig {
+        crate::kubelet::pod_runtime::service::RuntimeConfig {
             node_name: "test-node".into(),
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: "klights-test".into(),
@@ -11104,12 +11318,33 @@ impl PodRuntimeHarness {
                 std::path::PathBuf::from("/tmp/klights-runtime-test"),
             )
             .unwrap(),
-        })
-        .await
+        }
+    }
+
+    /// Construct with all-default mocks and an in-memory repository.
+    async fn new() -> Self {
+        Self::new_with_runtime_config(Self::default_runtime_config()).await
+    }
+
+    async fn new_with_clock(
+        clock: std::sync::Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+    ) -> Self {
+        Self::new_with_runtime_config_and_clock(Self::default_runtime_config(), clock).await
     }
 
     async fn new_with_runtime_config(
         config: crate::kubelet::pod_runtime::service::RuntimeConfig,
+    ) -> Self {
+        Self::new_with_runtime_config_and_clock(
+            config,
+            std::sync::Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        )
+        .await
+    }
+
+    async fn new_with_runtime_config_and_clock(
+        config: crate::kubelet::pod_runtime::service::RuntimeConfig,
+        clock: std::sync::Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     ) -> Self {
         let (ds, handle) = crate::datastore::selector::sqlite_in_memory_store_for_test().await;
         // The API create path enforces the upstream NamespaceLifecycle rule
@@ -11175,7 +11410,7 @@ impl PodRuntimeHarness {
                     container_control: container_control.clone(),
                     network: network.clone(),
                     store: store.clone(),
-                    clock: std::sync::Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+                    clock,
                     slot_admission: slot_admission.clone(),
                     repository: repo.clone(),
                     filesystem: filesystem.clone(),
