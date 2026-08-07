@@ -13,11 +13,11 @@ use serde_json::{Value, json};
 
 use crate::{
     AdmissionContextRequest, AdmissionResourceStore, apply_limitrange_defaults_to_pod, apply_patch,
-    apply_pod_runtimeclass_admission, apply_pod_service_account_defaults,
-    apply_pod_spec_create_defaults, build_admission_context, check_resource_quota_for_creation,
-    check_resource_quota_for_pod_update, compute_qos_class, enforce_limitrange_constraints_for_pod,
-    enforce_pod_security_admission, normalize_resource_for_storage, resolve_resource_name,
-    run_admission_for_request, validate_builtin_resource_spec, validate_dns_subdomain,
+    apply_pod_runtimeclass_admission, apply_pod_spec_create_defaults, build_admission_context,
+    check_resource_quota_for_creation, check_resource_quota_for_pod_update, compute_qos_class,
+    enforce_limitrange_constraints_for_pod, enforce_pod_security_admission,
+    normalize_resource_for_storage, resolve_resource_name, run_admission_for_request,
+    validate_builtin_resource_spec, validate_dns_subdomain,
     validate_pod_resource_requirements_immutable, validate_pod_sysctls,
 };
 use crate::{AppError, DeleteOptions};
@@ -71,59 +71,6 @@ fn pod_list_request(
         None,
     )
     .map_err(AppError::from)
-}
-
-async fn apply_pod_service_account_admission(
-    resources: &(impl AdmissionResourceStore + ?Sized),
-    namespace: &str,
-    body: &mut Value,
-) -> Result<(), AppError> {
-    let Some(spec_obj) = body.pointer_mut("/spec").and_then(|v| v.as_object_mut()) else {
-        return Ok(());
-    };
-
-    apply_pod_service_account_defaults(spec_obj);
-
-    let image_pull_secrets_empty = spec_obj
-        .get("imagePullSecrets")
-        .and_then(|v| v.as_array())
-        .is_none_or(Vec::is_empty);
-    if !image_pull_secrets_empty {
-        return Ok(());
-    }
-
-    let service_account_name = spec_obj
-        .get("serviceAccountName")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("default")
-        .to_string();
-    let Some(service_account) = resources
-        .get_admission_resource(
-            "v1",
-            "ServiceAccount",
-            Some(namespace),
-            &service_account_name,
-        )
-        .await?
-    else {
-        return Ok(());
-    };
-    let Some(image_pull_secrets) = service_account
-        .data
-        .get("imagePullSecrets")
-        .and_then(|v| v.as_array())
-        .filter(|secrets| !secrets.is_empty())
-        .cloned()
-    else {
-        return Ok(());
-    };
-
-    spec_obj.insert(
-        "imagePullSecrets".to_string(),
-        Value::Array(image_pull_secrets),
-    );
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,8 +226,9 @@ impl PodNativeOrchestration {
         )
         .await?;
         validate_builtin_resource_spec("Pod", &body)?;
-        apply_pod_service_account_admission(
+        super::pod_service_account_defaulting::apply_pod_service_account_defaulting(
             self.admission_resources.as_ref(),
+            self.identity.as_ref(),
             &namespace,
             &mut body,
         )

@@ -42,6 +42,9 @@ mod pod_handlers;
 mod pod_native_orchestration;
 pub mod pod_repository_ports;
 mod pod_security;
+mod pod_service_account_defaulting;
+#[cfg(test)]
+mod pod_service_account_defaulting_tests;
 mod pod_subresource_service;
 pub mod pod_subresources;
 mod policy_input_adapters;

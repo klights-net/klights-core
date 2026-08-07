@@ -579,7 +579,7 @@ async fn test_refresh_downward_api_skips_projected_volumes() {
     let tmp_dir = TempDir::new().unwrap();
     let volumes_root = tmp_dir.path().to_str().unwrap();
 
-    // Create pod with SA projected volume (same structure as inject_serviceaccount_volume)
+    // Create a Pod with the native-admission ServiceAccount projection shape.
     let pod_json = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",

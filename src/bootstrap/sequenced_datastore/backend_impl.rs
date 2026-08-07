@@ -149,19 +149,8 @@ impl DatastoreBackend for SequencedDatastore {
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-        mut data: Value,
+        data: Value,
     ) -> Result<Resource> {
-        if api_version == "v1"
-            && kind == "Pod"
-            && crate::datastore::pod_serviceaccount::should_inject_serviceaccount_volume(
-                self.passive.as_ref(),
-                &data,
-                namespace,
-            )
-            .await
-        {
-            crate::datastore::pod_serviceaccount::inject_serviceaccount_volume(&mut data);
-        }
         let command = StorageCommand::CreateResource {
             api_version: api_version.to_string(),
             kind: kind.to_string(),

@@ -81,8 +81,8 @@ fn test_build_mounts_readonly() {
 
 #[test]
 fn test_build_mounts_sa_volume_via_volume_mount() {
-    // SA volume is mounted via inject_serviceaccount_volume which adds both
-    // the volume and volumeMount to the pod spec. build_mounts processes it
+    // Native Pod admission adds the ServiceAccount projected volume and its
+    // volumeMount to the Pod spec. build_mounts processes it
     // like any other volumeMount — no special-casing needed.
     let container = serde_json::json!({
         "volumeMounts": [{
