@@ -489,6 +489,7 @@ struct PodDeletionFinalizerDependencies {
     namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     outbox: Option<Arc<klights_kubelet::outbox::Outbox>>,
+    remote_delivery_required: bool,
     bound_pod_finalization: Arc<dyn klights_pod_api::BoundPodFinalization>,
     mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
@@ -531,6 +532,7 @@ fn compose_pod_deletion_finalizer(
                 outbox: dependencies
                     .outbox
                     .map(|outbox| outbox as Arc<dyn klights_leader_api::NodeOutbox>),
+                remote_delivery_required: dependencies.remote_delivery_required,
                 bound_pod_finalization: dependencies.bound_pod_finalization,
                 mutation_reconcile: dependencies.mutation_reconcile,
                 metrics: dependencies.metrics,
@@ -781,6 +783,7 @@ impl PodRepository {
             namespace_termination: namespace_termination.clone(),
             cluster_api: cluster_api.clone(),
             outbox: outbox.clone(),
+            remote_delivery_required,
             bound_pod_finalization: bound_pod_finalization.clone(),
             mutation_reconcile: mutation_reconcile.clone(),
             metrics: metrics.clone(),

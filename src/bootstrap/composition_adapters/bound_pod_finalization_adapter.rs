@@ -26,6 +26,7 @@ pub(crate) struct RootBoundPodFinalization {
     local_persistence: Option<Arc<dyn LocalBoundPodFinalizationPersistence>>,
     cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     outbox: Option<Arc<Outbox>>,
+    remote_delivery_required: bool,
     wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 }
 
@@ -35,6 +36,7 @@ impl RootBoundPodFinalization {
         local_persistence: Option<Arc<dyn LocalBoundPodFinalizationPersistence>>,
         cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
         outbox: Option<Arc<Outbox>>,
+        remote_delivery_required: bool,
         wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -42,26 +44,40 @@ impl RootBoundPodFinalization {
             local_persistence,
             cluster_api,
             outbox,
+            remote_delivery_required,
             wall_clock,
         })
     }
 
-    async fn read_live(
+    async fn read_remote_live(
         &self,
         namespace: &str,
         name: &str,
     ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
-        if let Some(cluster_api) = &self.cluster_api {
-            return cluster_api
-                .get_resource(klights_leader_api::pod_get_request(
-                    namespace,
-                    name,
-                    klights_leader_api::ResourceQueryConsistency::LeaderFresh,
-                )?)
-                .await
-                .map_err(anyhow::Error::new);
+        self.cluster_api
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("leader Pod query is unavailable for remote bound-Pod finalization")
+            })?
+            .get_resource(klights_leader_api::pod_get_request(
+                namespace,
+                name,
+                klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+            )?)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    async fn read_live_for_role(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
+        if self.remote_delivery_required {
+            self.read_remote_live(namespace, name).await
+        } else {
+            self.store.get(namespace, name).await
         }
-        self.store.get(namespace, name).await
     }
 
     fn outbox_command(
@@ -127,6 +143,7 @@ pub(crate) fn new_for_root(
     local_persistence: Arc<dyn LocalBoundPodFinalizationPersistence>,
     cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     outbox: Option<Arc<Outbox>>,
+    remote_delivery_required: bool,
     wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 ) -> Arc<dyn BoundPodFinalization> {
     RootBoundPodFinalization::new(
@@ -134,6 +151,7 @@ pub(crate) fn new_for_root(
         Some(local_persistence),
         cluster_api,
         outbox,
+        remote_delivery_required,
         wall_clock,
     )
 }
@@ -149,15 +167,14 @@ impl BoundPodFinalization for RootBoundPodFinalization {
             let name = identity.name;
             let uid = identity.uid;
 
-            if self.cluster_api.is_some() && self.outbox.is_none() {
-                return Err(BoundPodFinalizationError::unavailable(
-                    "outbox is unavailable for node-local queueing; caller must retry after outbox initialization",
-                ));
-            }
-
-            if let Some(outbox) = &self.outbox {
+            if self.remote_delivery_required {
+                let outbox = self.outbox.as_ref().ok_or_else(|| {
+                    BoundPodFinalizationError::unavailable(
+                        "outbox is unavailable for node-local queueing; caller must retry after outbox initialization",
+                    )
+                })?;
                 let live = self
-                    .read_live(&namespace, &name)
+                    .read_remote_live(&namespace, &name)
                     .await
                     .map_err(|error| BoundPodFinalizationError::unavailable(error.to_string()))?;
                 let observation = self.store.classify_bound_finalization(live.as_ref(), &uid);
@@ -232,7 +249,7 @@ impl GcPodDeleteSink for RootBoundPodFinalization {
         Box::pin(async move {
             let identity = request.into_identity();
             let live = self
-                .read_live(&identity.namespace, &identity.name)
+                .read_live_for_role(&identity.namespace, &identity.name)
                 .await
                 .map_err(|error| GcPodDeleteError::unavailable(error.to_string()))?
                 .ok_or_else(|| GcPodDeleteError::not_found("Pod is already absent"))?;

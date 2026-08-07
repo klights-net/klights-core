@@ -47,6 +47,7 @@ pub struct RealPodDeletionFinalizer {
     namespace_termination: Arc<dyn NamespaceTerminationSink>,
     cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     outbox: Option<Arc<dyn NodeOutbox>>,
+    remote_delivery_required: bool,
     bound_pod_finalization: Arc<dyn BoundPodFinalization>,
     mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
@@ -61,6 +62,7 @@ pub struct RealPodDeletionFinalizerDependencies {
     pub namespace_termination: Arc<dyn NamespaceTerminationSink>,
     pub cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     pub outbox: Option<Arc<dyn NodeOutbox>>,
+    pub remote_delivery_required: bool,
     pub bound_pod_finalization: Arc<dyn BoundPodFinalization>,
     pub mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     pub metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
@@ -77,6 +79,7 @@ impl RealPodDeletionFinalizer {
             namespace_termination,
             cluster_api,
             outbox,
+            remote_delivery_required,
             bound_pod_finalization,
             mutation_reconcile,
             metrics,
@@ -90,6 +93,7 @@ impl RealPodDeletionFinalizer {
             namespace_termination,
             cluster_api,
             outbox,
+            remote_delivery_required,
             bound_pod_finalization,
             mutation_reconcile,
             metrics,
@@ -161,8 +165,12 @@ impl PodDeletionFinalizer for RealPodDeletionFinalizer {
         let name = &key.name;
         let uid = &key.uid;
 
-        let live = if let Some(cluster_api) = &self.cluster_api {
-            cluster_api
+        let live = if self.remote_delivery_required {
+            self.cluster_api
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("leader Pod query is unavailable for remote actor finalization")
+                })?
                 .get_resource(klights_leader_api::pod_get_request(
                     ns,
                     name,
@@ -469,6 +477,7 @@ mod policy_tests {
             namespace_termination: Arc::new(NoopNamespaceTermination),
             cluster_api: None,
             outbox: None,
+            remote_delivery_required: false,
             bound_pod_finalization: Arc::new(RecordingBoundFinalization {
                 events: events.clone(),
             }),

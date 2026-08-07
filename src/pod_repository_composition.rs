@@ -1052,6 +1052,7 @@ fn build_pod_repository_parts_inner(
             local_bound_finalization,
             cluster_api.clone(),
             delivery_outbox.clone(),
+            remote_delivery_required,
             wall_clock.clone(),
         );
     let host_ip = klights_kubelet::context::HostIpState::default();
@@ -1132,6 +1133,7 @@ pub(crate) fn build_worker_pod_repository_parts(
         None,
         Some(config.resource_query.clone()),
         Some(outbox.clone()),
+        true,
         wall_clock.clone(),
     );
     let adapters = WorkerPodAdapters::build(

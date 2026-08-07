@@ -2184,6 +2184,7 @@ pub async fn run_bound_pod_delete_cas_race(
             persistence.bound_finalization,
             None,
             None,
+            false,
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
     let disposition = map_bound_delete_outcome(
@@ -3478,4 +3479,231 @@ impl klights_pod_api::PodSubresourceMutation for IntegrationPodRepositoryComposi
     ) -> klights_pod_api::PodRepositoryFuture<'_, crate::datastore::Resource> {
         self.pod_subresource.update_ephemeral_containers(request)
     }
+}
+
+struct BoundFinalizationHostileLeaderQuery {
+    pod: crate::datastore::Resource,
+}
+
+impl klights_leader_api::LeaderResourceQuery for BoundFinalizationHostileLeaderQuery {
+    fn get_resource(
+        &self,
+        request: klights_leader_api::ResourceGetRequest,
+    ) -> klights_leader_api::ResourceQueryFuture<'_, Option<crate::datastore::Resource>> {
+        Box::pin(async move {
+            let key = request.into_key();
+            Ok((key.api_version == "v1"
+                && key.kind == "Pod"
+                && key.namespace.as_deref() == self.pod.namespace.as_deref()
+                && key.name == self.pod.name)
+                .then(|| self.pod.clone()))
+        })
+    }
+
+    fn list_resources(
+        &self,
+        request: klights_leader_api::ResourceListRequest,
+    ) -> klights_leader_api::ResourceQueryFuture<'_, klights_leader_api::ResourceListResult> {
+        Box::pin(async move {
+            let items = (request.api_version() == "v1"
+                && request.kind() == "Pod"
+                && request.namespace() == self.pod.namespace.as_deref())
+            .then(|| self.pod.clone())
+            .into_iter()
+            .collect();
+            klights_leader_api::ResourceListResult::try_new(
+                items,
+                self.pod.resource_version,
+                None,
+                None,
+                None,
+            )
+        })
+    }
+}
+
+/// Runs the PR-BOUND real-composition regression without extending the frozen historical harness.
+pub async fn run_local_bound_finalization_with_incidental_delivery_handles() -> anyhow::Result<()> {
+    let incidental_remote = crate::datastore::Resource {
+        id: 99,
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some("default".to_string()),
+        name: "local-finalize-child".to_string(),
+        uid: "hostile-remote-replacement-uid".to_string(),
+        resource_version: 99,
+        data: Arc::new(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": "local-finalize-child",
+                "uid": "hostile-remote-replacement-uid",
+                "resourceVersion": "99"
+            },
+            "spec": {
+                "nodeName": "remote-worker",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        })),
+    };
+    let repository = IntegrationPodRepositoryComposition::new_exact(
+        Some(Arc::new(BoundFinalizationHostileLeaderQuery {
+            pod: incidental_remote,
+        })),
+        false,
+        true,
+        true,
+        false,
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+        None,
+        None,
+    )
+    .await;
+    repository
+        .seed_scheduling_resource(
+            "v1",
+            "Service",
+            Some("default"),
+            "local-finalize-service",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {"name": "local-finalize-service", "namespace": "default"},
+                "spec": {
+                    "selector": {"app": "local-finalize"},
+                    "ports": [{"port": 80}]
+                }
+            }),
+        )
+        .await?;
+    repository
+        .seed_scheduling_resource(
+            "v1",
+            "ReplicationController",
+            Some("default"),
+            "local-finalize-owner",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ReplicationController",
+                "metadata": {
+                    "name": "local-finalize-owner",
+                    "namespace": "default",
+                    "uid": "local-finalize-owner-uid",
+                    "deletionTimestamp": "2026-08-08T00:00:00Z",
+                    "finalizers": ["foregroundDeletion"]
+                },
+                "spec": {"replicas": 1, "selector": {"app": "local-finalize"}}
+            }),
+        )
+        .await?;
+    repository
+        .seed_pod(
+            "default",
+            "local-finalize-child",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "local-finalize-child",
+                    "namespace": "default",
+                    "uid": "local-finalize-child-uid",
+                    "labels": {"app": "local-finalize"},
+                    "deletionTimestamp": "2026-08-08T00:00:00Z",
+                    "deletionGracePeriodSeconds": 0,
+                    "ownerReferences": [{
+                        "apiVersion": "v1",
+                        "kind": "ReplicationController",
+                        "name": "local-finalize-owner",
+                        "uid": "local-finalize-owner-uid",
+                        "controller": true,
+                        "blockOwnerDeletion": true
+                    }]
+                },
+                "spec": {
+                    "nodeName": "local-node",
+                    "containers": [{"name": "app", "image": "nginx"}]
+                },
+                "status": {"phase": "Running"}
+            }),
+        )
+        .await?;
+    let checkpoint = klights_node_store::PodStatusCheckpointUpsert::try_new(
+        klights_types::PodIdentity::new(
+            "default",
+            "local-finalize-child",
+            "local-finalize-child-uid",
+        ),
+        1,
+        serde_json::to_vec(&serde_json::json!({"phase": "Running"}))?,
+        100,
+    )?;
+    let node_local = repository
+        .node_local
+        .as_ref()
+        .expect("scenario requires incidental node-local delivery handles");
+    node_local
+        .pod_status_checkpoints()
+        .upsert_pod_status_checkpoint(checkpoint)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+    let outcome = repository
+        .finalize_pod_deletion_after_actor_cleanup(
+            "default",
+            "local-finalize-child",
+            "local-finalize-child-uid",
+        )
+        .await?;
+
+    anyhow::ensure!(
+        outcome == IntegrationPodFinalizationOutcome::DeletedOrAlreadyGone,
+        "explicit local role did not complete finalization synchronously"
+    );
+    anyhow::ensure!(
+        repository
+            .read_pod("default", "local-finalize-child")
+            .await?
+            .is_none(),
+        "local persistence retained the finalized Pod"
+    );
+    let checkpoint_key = klights_node_store::PodCheckpointKey::try_new("local-finalize-child-uid")?;
+    anyhow::ensure!(
+        node_local
+            .pod_status_checkpoints()
+            .get_pod_status_checkpoint(checkpoint_key)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            .is_none(),
+        "local finalization retained the UID-scoped status checkpoint"
+    );
+    anyhow::ensure!(
+        repository
+            .read_non_pod_resource(
+                "v1",
+                "ReplicationController",
+                "default",
+                "local-finalize-owner",
+            )
+            .await?
+            .is_none(),
+        "local finalization did not complete the unblocked foreground owner"
+    );
+    anyhow::ensure!(
+        repository.pending_reconcile_keys().await.iter().any(|key| {
+            key.api_version() == "v1"
+                && key.kind() == "Service"
+                && key.namespace() == Some("default")
+                && key.name() == "local-finalize-service"
+        }),
+        "local finalization did not enqueue matching Service maintenance"
+    );
+    anyhow::ensure!(
+        repository
+            .claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
+            .await?
+            .is_none(),
+        "local finalization emitted an incidental FinalizeBoundPod outbox command"
+    );
+    Ok(())
 }
