@@ -198,13 +198,11 @@ mod tests {
             .map(|secret| secret.name.as_str())
             .collect::<std::collections::BTreeSet<_>>();
         assert!(
-            names.contains(crate::bootstrap::bootstrap_token::WORKER_BOOTSTRAP_TOKEN_SECRET_NAME),
+            names.contains(klights_auth::bootstrap_token::WORKER_BOOTSTRAP_TOKEN_SECRET_NAME),
             "first boot must create the worker bootstrap token Secret"
         );
         assert!(
-            names.contains(
-                crate::bootstrap::bootstrap_token::CONTROLPLANE_BOOTSTRAP_TOKEN_SECRET_NAME
-            ),
+            names.contains(klights_auth::bootstrap_token::CONTROLPLANE_BOOTSTRAP_TOKEN_SECRET_NAME),
             "first boot must create the controlplane bootstrap token Secret"
         );
         assert!(

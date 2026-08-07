@@ -167,9 +167,9 @@ impl IntegrationLeaderRpcComposition {
         controlplane: bool,
     ) -> anyhow::Result<()> {
         let scope = if controlplane {
-            crate::bootstrap::bootstrap_token::BootstrapTokenScope::Controlplane
+            klights_auth::bootstrap_token::BootstrapTokenScope::Controlplane
         } else {
-            crate::bootstrap::bootstrap_token::BootstrapTokenScope::Worker
+            klights_auth::bootstrap_token::BootstrapTokenScope::Worker
         };
         crate::bootstrap::bootstrap_token::create_scoped_bootstrap_token_secret_for_test(
             db, scope, token,

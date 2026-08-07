@@ -41,23 +41,6 @@ impl klights_leader_api::LeaderBootstrapTokenAuthentication
         Box::pin(async move {
             crate::bootstrap::bootstrap_token::validate_bootstrap_token(self.db.as_ref(), token)
                 .await
-                .map_err(|error| match error {
-                    crate::bootstrap::bootstrap_token::BootstrapTokenAuthenticationError::Rejected {
-                        message,
-                    } => klights_leader_api::ClusterIdentityError::rejected(message),
-                    crate::bootstrap::bootstrap_token::BootstrapTokenAuthenticationError::DependencyFailure {
-                        message,
-                    } => klights_leader_api::ClusterIdentityError::dependency_failure(message),
-                    crate::bootstrap::bootstrap_token::BootstrapTokenAuthenticationError::InternalFailure {
-                        message,
-                    } => klights_leader_api::ClusterIdentityError::internal_failure(message),
-                })
-                .and_then(|identity| {
-                    klights_leader_api::BootstrapTokenIdentity::try_new(
-                        identity.token_id,
-                        identity.extra_groups,
-                    )
-                })
         })
     }
 }

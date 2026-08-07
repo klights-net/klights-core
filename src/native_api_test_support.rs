@@ -198,10 +198,10 @@ pub async fn validate_sa_token_bindings_for_integration(
 pub async fn create_worker_bootstrap_token_for_integration(
     db: &IntegrationDatastoreHandle,
 ) -> anyhow::Result<String> {
-    let token = crate::bootstrap::bootstrap_token::generate_bootstrap_token();
+    let token = crate::bootstrap::bootstrap_token::generate_random_bootstrap_token();
     crate::bootstrap::bootstrap_token::create_scoped_bootstrap_token_secret_for_test(
         db.as_ref(),
-        crate::bootstrap::bootstrap_token::BootstrapTokenScope::Worker,
+        klights_auth::bootstrap_token::BootstrapTokenScope::Worker,
         &token,
     )
     .await?;
@@ -217,7 +217,7 @@ pub async fn create_worker_bootstrap_token_with_ttl_for_integration(
 ) -> anyhow::Result<()> {
     crate::bootstrap::bootstrap_token::create_scoped_bootstrap_token_secret_with_ttl_for_test(
         db.as_ref(),
-        crate::bootstrap::bootstrap_token::BootstrapTokenScope::Worker,
+        klights_auth::bootstrap_token::BootstrapTokenScope::Worker,
         token,
         ttl,
     )
@@ -233,7 +233,7 @@ pub async fn create_controlplane_bootstrap_token_with_ttl_for_integration(
 ) -> anyhow::Result<()> {
     crate::bootstrap::bootstrap_token::create_scoped_bootstrap_token_secret_with_ttl_for_test(
         db.as_ref(),
-        crate::bootstrap::bootstrap_token::BootstrapTokenScope::Controlplane,
+        klights_auth::bootstrap_token::BootstrapTokenScope::Controlplane,
         token,
         ttl,
     )

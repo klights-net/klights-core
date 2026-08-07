@@ -4,6 +4,7 @@ use std::{error::Error, fmt};
 pub mod authentication;
 pub mod authorizer;
 pub mod bootstrap_authorizer;
+pub mod bootstrap_token;
 pub mod ca_transport;
 pub mod cert;
 pub mod clock;
