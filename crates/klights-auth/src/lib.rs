@@ -25,6 +25,7 @@ pub mod request_attributes;
 pub mod service_account;
 pub mod user;
 pub mod webhook_auth;
+pub mod worker_credential;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

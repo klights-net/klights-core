@@ -315,9 +315,8 @@ async fn load_local_node_client_identity(
     node_name: &str,
     supervisor: Arc<TaskSupervisor>,
 ) -> Result<ClientIdentity> {
-    use crate::bootstrap::worker_identity::{
-        CredentialSource, SupervisedFilesystemWorkerCredentialStore, resolve_credential_async,
-    };
+    use crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore;
+    use klights_auth::worker_credential::{WorkerCredentialSource, resolve_worker_credential};
 
     let store = SupervisedFilesystemWorkerCredentialStore::for_namespace(
         namespace,
@@ -325,12 +324,16 @@ async fn load_local_node_client_identity(
         supervisor.clone(),
     );
     let crypto = klights_supervisor::CryptoExecutor::new(supervisor);
-    match resolve_credential_async(&store, &crypto).await? {
-        CredentialSource::ExistingCert(cred) => Ok(ClientIdentity {
-            client_cert_pem: cred.certificate_pem,
-            client_key_pem: cred.private_key_pem,
-        }),
-        CredentialSource::BootstrapRequired => {
+    let credential_now = klights_auth::clock::Clock::now(&klights_auth::clock::SystemClock);
+    match resolve_worker_credential(&store, &crypto, credential_now).await? {
+        WorkerCredentialSource::Existing(cred) => {
+            let (client_cert_pem, client_key_pem) = cred.into_tls_parts();
+            Ok(ClientIdentity {
+                client_cert_pem,
+                client_key_pem,
+            })
+        }
+        WorkerCredentialSource::BootstrapRequired => {
             anyhow::bail!("local node client certificate is required for peer endpoint observation")
         }
     }

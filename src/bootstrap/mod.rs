@@ -32,7 +32,6 @@ pub(crate) mod sequenced_datastore;
 pub(crate) mod service_adapters;
 pub(crate) mod side_effects;
 pub(crate) mod watch_commit_wiring;
-pub mod worker_identity;
 pub mod worker_runtime;
 pub mod worker_store_adapter;
 

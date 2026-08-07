@@ -21,3 +21,5 @@ pub(crate) mod remote_informer_cache_adapter;
 pub(crate) mod resource_admission_adapter;
 pub(crate) mod signing_key_state_adapter;
 pub(crate) mod watch_stream_adapter;
+pub(crate) mod worker_credential_store_adapter;
+pub(crate) mod worker_csr_http_adapter;

@@ -79,9 +79,12 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     // Resolve worker credential: use persisted node client cert when available,
     // otherwise bootstrap one via CSR before creating steady-state clients.
     let (client_cert_pem, client_key_pem) = {
-        use crate::bootstrap::worker_identity::{
-            CredentialSource, HttpCsrBootstrapClient, SupervisedFilesystemWorkerCredentialStore,
-            bootstrap_with_csr_async_store, resolve_credential_async,
+        use crate::bootstrap::composition_adapters::{
+            worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore,
+            worker_csr_http_adapter::HttpCsrBootstrapClient,
+        };
+        use klights_auth::worker_credential::{
+            WorkerCredentialSource, bootstrap_worker_credential, resolve_worker_credential,
         };
         let store = SupervisedFilesystemWorkerCredentialStore::for_namespace(
             &config.containerd_namespace,
@@ -89,15 +92,17 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             task_supervisor.clone(),
         );
         let crypto = klights_supervisor::CryptoExecutor::new(task_supervisor.clone());
-        match resolve_credential_async(&store, &crypto).await {
-            Ok(CredentialSource::ExistingCert(cred)) => {
+        let credential_now = klights_auth::clock::Clock::now(&klights_auth::clock::SystemClock);
+        match resolve_worker_credential(&store, &crypto, credential_now).await {
+            Ok(WorkerCredentialSource::Existing(cred)) => {
                 tracing::info!(
                     node = %config.node_name,
                     "using persisted node client certificate for leader connection"
                 );
-                (Some(cred.certificate_pem), Some(cred.private_key_pem))
+                let (certificate_pem, private_key_pem) = cred.into_tls_parts();
+                (Some(certificate_pem), Some(private_key_pem))
             }
-            Ok(CredentialSource::BootstrapRequired) => {
+            Ok(WorkerCredentialSource::BootstrapRequired) => {
                 let csr_token = token.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "no persisted node certificate and no token source provided; \
@@ -117,9 +122,10 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                 )
                 .await?;
                 let cred =
-                    bootstrap_with_csr_async_store(&config.node_name, &csr_client, &store, &crypto)
+                    bootstrap_worker_credential(&config.node_name, &csr_client, &store, &crypto)
                         .await?;
-                (Some(cred.certificate_pem), Some(cred.private_key_pem))
+                let (certificate_pem, private_key_pem) = cred.into_tls_parts();
+                (Some(certificate_pem), Some(private_key_pem))
             }
             Err(e) => {
                 let csr_token = token.as_ref().ok_or_else(|| {
@@ -143,9 +149,10 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                 )
                 .await?;
                 let cred =
-                    bootstrap_with_csr_async_store(&config.node_name, &csr_client, &store, &crypto)
+                    bootstrap_worker_credential(&config.node_name, &csr_client, &store, &crypto)
                         .await?;
-                (Some(cred.certificate_pem), Some(cred.private_key_pem))
+                let (certificate_pem, private_key_pem) = cred.into_tls_parts();
+                (Some(certificate_pem), Some(private_key_pem))
             }
         }
     };

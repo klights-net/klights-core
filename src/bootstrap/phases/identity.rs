@@ -284,9 +284,8 @@ async fn controlplane_rpc_client_identity_for_token(
         return Ok((None, None));
     }
 
-    use crate::bootstrap::worker_identity::{
-        CredentialSource, SupervisedFilesystemWorkerCredentialStore, resolve_credential_async,
-    };
+    use crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore;
+    use klights_auth::worker_credential::{WorkerCredentialSource, resolve_worker_credential};
 
     let store = SupervisedFilesystemWorkerCredentialStore::new(
         etc_dir.to_path_buf(),
@@ -294,22 +293,25 @@ async fn controlplane_rpc_client_identity_for_token(
         supervisor.clone(),
     );
     let crypto = klights_supervisor::CryptoExecutor::new(supervisor.clone());
-    match resolve_credential_async(&store, &crypto).await? {
-        CredentialSource::ExistingCert(cred) => {
-            Ok((Some(cred.certificate_pem), Some(cred.private_key_pem)))
+    let credential_now = klights_auth::clock::Clock::now(&klights_auth::clock::SystemClock);
+    match resolve_worker_credential(&store, &crypto, credential_now).await? {
+        WorkerCredentialSource::Existing(cred) => {
+            let (certificate_pem, private_key_pem) = cred.into_tls_parts();
+            Ok((Some(certificate_pem), Some(private_key_pem)))
         }
-        CredentialSource::BootstrapRequired => Err(anyhow!(
+        WorkerCredentialSource::BootstrapRequired => Err(anyhow!(
             "no persisted node client certificate and no token source provided; join with --token-file first"
         )),
     }
 }
 
 async fn ensure_local_node_client_certificate(cfg: &ConfigPhase) -> Result<()> {
-    use crate::bootstrap::worker_identity::{
-        AsyncWorkerCredentialStore, CredentialSource, SupervisedFilesystemWorkerCredentialStore,
-        WorkerCredential, credential_has_group, resolve_credential_async,
-    };
+    use crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore;
     use klights_auth::csr_signer::CsrSigner;
+    use klights_auth::worker_credential::{
+        WorkerCredential, WorkerCredentialSource, WorkerCredentialStore, resolve_worker_credential,
+        worker_credential_has_group,
+    };
 
     let etc_dir = std::path::Path::new(&cfg.etc_dir);
     let store = SupervisedFilesystemWorkerCredentialStore::new(
@@ -318,8 +320,9 @@ async fn ensure_local_node_client_certificate(cfg: &ConfigPhase) -> Result<()> {
         cfg.supervisor.clone(),
     );
     let crypto = klights_supervisor::CryptoExecutor::new(cfg.supervisor.clone());
-    if let Ok(CredentialSource::ExistingCert(existing)) =
-        resolve_credential_async(&store, &crypto).await
+    let credential_now = klights_auth::clock::Clock::now(&klights_auth::clock::SystemClock);
+    if let Ok(WorkerCredentialSource::Existing(existing)) =
+        resolve_worker_credential(&store, &crypto, credential_now).await
     {
         // Reuse the persisted cert only if it already carries the
         // `system:controlplanes` group. A cert minted before that group existed
@@ -329,7 +332,7 @@ async fn ensure_local_node_client_certificate(cfg: &ConfigPhase) -> Result<()> {
         let credential_for_group_check = existing.clone();
         let has_controlplane_group = crypto
             .run_blocking("check-controlplane-client-certificate-group", move || {
-                credential_has_group(
+                worker_credential_has_group(
                     &credential_for_group_check,
                     klights_auth::cert::CONTROLPLANE_NODES_GROUP,
                 )
@@ -404,12 +407,12 @@ async fn ensure_local_node_client_certificate(cfg: &ConfigPhase) -> Result<()> {
         .context("local controlplane client certificate worker failed")??;
 
     store
-        .save(&WorkerCredential {
-            certificate_pem: signed.certificate_pem,
-            private_key_pem: csr.private_key_pem,
-            node_name: cfg.config.node_name.clone(),
-            kubeconfig_yaml: String::new(),
-        })
+        .save(&WorkerCredential::try_new(
+            signed.certificate_pem,
+            csr.private_key_pem,
+            cfg.config.node_name.clone(),
+            String::new(),
+        )?)
         .await
         .context("failed to persist local node client certificate")?;
     tracing::info!("persisted local controlplane node client certificate");
@@ -622,20 +625,21 @@ mod tests {
         .await
         .expect("seed controlplane identity setup");
 
-        let store =
-            crate::bootstrap::worker_identity::SupervisedFilesystemWorkerCredentialStore::new(
+        let store = crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore::new(
                 data_root.path().join("etc"),
                 "mn-controlplane1",
                 supervisor.clone(),
             );
         let crypto = klights_supervisor::CryptoExecutor::new(cfg.supervisor.clone());
-        let source = crate::bootstrap::worker_identity::resolve_credential_async(&store, &crypto)
-            .await
-            .expect("load persisted node credential");
+        let now = klights_auth::clock::Clock::now(&klights_auth::clock::SystemClock);
+        let source =
+            klights_auth::worker_credential::resolve_worker_credential(&store, &crypto, now)
+                .await
+                .expect("load persisted node credential");
         assert!(
             matches!(
                 source,
-                crate::bootstrap::worker_identity::CredentialSource::ExistingCert(_)
+                klights_auth::worker_credential::WorkerCredentialSource::Existing(_)
             ),
             "seed controlplane must persist a valid system:node client cert for tokenless rejoin"
         );
@@ -780,20 +784,21 @@ mod tests {
         .await
         .expect("controlplane token join should persist node client cert from leader CA");
 
-        let store =
-            crate::bootstrap::worker_identity::SupervisedFilesystemWorkerCredentialStore::new(
+        let store = crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore::new(
                 joiner_etc_dir.clone(),
                 "mn-controlplane2",
                 joiner_supervisor.clone(),
             );
         let crypto = klights_supervisor::CryptoExecutor::new(cfg.supervisor.clone());
-        let source = crate::bootstrap::worker_identity::resolve_credential_async(&store, &crypto)
-            .await
-            .expect("load persisted controlplane node credential");
+        let now = klights_auth::clock::Clock::now(&klights_auth::clock::SystemClock);
+        let source =
+            klights_auth::worker_credential::resolve_worker_credential(&store, &crypto, now)
+                .await
+                .expect("load persisted controlplane node credential");
         assert!(
             matches!(
                 source,
-                crate::bootstrap::worker_identity::CredentialSource::ExistingCert(_)
+                klights_auth::worker_credential::WorkerCredentialSource::Existing(_)
             ),
             "joining controlplane must persist a node client cert without generic CSR bootstrap"
         );

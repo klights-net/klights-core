@@ -35,6 +35,8 @@ impl CsrValidationResult {
 
 pub const MIN_CSR_EXPIRATION_SECONDS: u32 = 600;
 pub const DEFAULT_CSR_EXPIRATION_SECONDS: u32 = 31_536_000;
+pub const KUBELET_CLIENT_SIGNER_NAME: &str = "kubernetes.io/kube-apiserver-client-kubelet";
+pub const KUBELET_CLIENT_AUTH_USAGE: &str = "client auth";
 
 /// Full validation input for a kubelet client CSR request.
 pub struct KubeletClientCsrValidationInput<'a> {
@@ -77,7 +79,7 @@ pub fn validate_kubelet_client_csr(
 pub fn validate_kubelet_client_csr_request(
     input: KubeletClientCsrValidationInput<'_>,
 ) -> CsrValidationResult {
-    if input.signer_name != "kubernetes.io/kube-apiserver-client-kubelet" {
+    if input.signer_name != KUBELET_CLIENT_SIGNER_NAME {
         return CsrValidationResult::invalid(
             format!("wrong signerName: {}", input.signer_name),
             None,

@@ -1201,7 +1201,7 @@ async fn controlplane_join_client_identity_for_token(
     node_name: &str,
     supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> anyhow::Result<ControlplaneJoinClientIdentity> {
-    use crate::bootstrap::worker_identity::SupervisedFilesystemWorkerCredentialStore;
+    use crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore;
 
     let store = SupervisedFilesystemWorkerCredentialStore::for_namespace(
         namespace,
@@ -1213,21 +1213,25 @@ async fn controlplane_join_client_identity_for_token(
 
 async fn controlplane_join_client_identity_for_token_from_store(
     token: &str,
-    store: &dyn crate::bootstrap::worker_identity::AsyncWorkerCredentialStore,
+    store: &dyn klights_auth::worker_credential::WorkerCredentialStore,
     supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> anyhow::Result<ControlplaneJoinClientIdentity> {
-    use crate::bootstrap::worker_identity::{CredentialSource, resolve_credential_async};
+    use klights_auth::worker_credential::{WorkerCredentialSource, resolve_worker_credential};
 
     let crypto = klights_supervisor::CryptoExecutor::new(supervisor);
-    match resolve_credential_async(store, &crypto).await {
-        Ok(CredentialSource::ExistingCert(cred)) => Ok(ControlplaneJoinClientIdentity {
-            client_cert_pem: Some(cred.certificate_pem),
-            client_key_pem: Some(cred.private_key_pem),
-        }),
-        Ok(CredentialSource::BootstrapRequired) if !token.is_empty() => Err(anyhow::anyhow!(
+    let credential_now = klights_auth::clock::Clock::now(&klights_auth::clock::SystemClock);
+    match resolve_worker_credential(store, &crypto, credential_now).await {
+        Ok(WorkerCredentialSource::Existing(cred)) => {
+            let (client_cert_pem, client_key_pem) = cred.into_tls_parts();
+            Ok(ControlplaneJoinClientIdentity {
+                client_cert_pem: Some(client_cert_pem),
+                client_key_pem: Some(client_key_pem),
+            })
+        }
+        Ok(WorkerCredentialSource::BootstrapRequired) if !token.is_empty() => Err(anyhow::anyhow!(
             "bootstrap token may only request a certificate with CSR; no persisted node client certificate is available"
         )),
-        Ok(CredentialSource::BootstrapRequired) => Err(anyhow::anyhow!(
+        Ok(WorkerCredentialSource::BootstrapRequired) => Err(anyhow::anyhow!(
             "no persisted node client certificate and no token source provided; join with --token-file first"
         )),
         Err(err) if !token.is_empty() => Err(err).context(
@@ -1416,9 +1420,8 @@ mod tests {
 
     #[tokio::test]
     async fn tokenless_controlplane_join_uses_persisted_node_client_cert() {
-        use crate::bootstrap::worker_identity::{
-            AsyncWorkerCredentialStore, SupervisedFilesystemWorkerCredentialStore, WorkerCredential,
-        };
+        use crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore;
+        use klights_auth::worker_credential::{WorkerCredential, WorkerCredentialStore};
         use tempfile::TempDir;
 
         let data_root = TempDir::new().expect("create isolated controlplane credential root");
@@ -1431,12 +1434,15 @@ mod tests {
         );
         let (certificate_pem, private_key_pem) = generate_test_node_cert(node_name);
         store
-            .save(&WorkerCredential {
-                certificate_pem: certificate_pem.clone(),
-                private_key_pem: private_key_pem.clone(),
-                node_name: node_name.to_string(),
-                kubeconfig_yaml: String::new(),
-            })
+            .save(
+                &WorkerCredential::try_new(
+                    certificate_pem.clone(),
+                    private_key_pem.clone(),
+                    node_name.to_string(),
+                    String::new(),
+                )
+                .expect("valid test credential"),
+            )
             .await
             .expect("persist test credential");
 
@@ -1461,9 +1467,8 @@ mod tests {
 
     #[tokio::test]
     async fn token_controlplane_join_prefers_persisted_node_client_cert_for_steady_state_rpcs() {
-        use crate::bootstrap::worker_identity::{
-            AsyncWorkerCredentialStore, SupervisedFilesystemWorkerCredentialStore, WorkerCredential,
-        };
+        use crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore;
+        use klights_auth::worker_credential::{WorkerCredential, WorkerCredentialStore};
 
         let namespace = format!("cp-token-join-node-cert-{}", uuid::Uuid::new_v4());
         let node_name = "mn-controlplane2";
@@ -1475,12 +1480,15 @@ mod tests {
         );
         let (certificate_pem, private_key_pem) = generate_test_node_cert(node_name);
         store
-            .save(&WorkerCredential {
-                certificate_pem: certificate_pem.clone(),
-                private_key_pem: private_key_pem.clone(),
-                node_name: node_name.to_string(),
-                kubeconfig_yaml: String::new(),
-            })
+            .save(
+                &WorkerCredential::try_new(
+                    certificate_pem.clone(),
+                    private_key_pem.clone(),
+                    node_name.to_string(),
+                    String::new(),
+                )
+                .expect("valid test credential"),
+            )
             .await
             .expect("persist test credential");
 
@@ -1531,9 +1539,8 @@ mod tests {
 
     #[tokio::test]
     async fn seed_leader_remote_identity_uses_persisted_node_client_cert() {
-        use crate::bootstrap::worker_identity::{
-            AsyncWorkerCredentialStore, SupervisedFilesystemWorkerCredentialStore, WorkerCredential,
-        };
+        use crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore;
+        use klights_auth::worker_credential::{WorkerCredential, WorkerCredentialStore};
 
         let namespace = format!("leader-seed-node-cert-{}", uuid::Uuid::new_v4());
         let node_name = "mn-controlplane1";
@@ -1545,12 +1552,15 @@ mod tests {
         );
         let (certificate_pem, private_key_pem) = generate_test_node_cert(node_name);
         store
-            .save(&WorkerCredential {
-                certificate_pem: certificate_pem.clone(),
-                private_key_pem: private_key_pem.clone(),
-                node_name: node_name.to_string(),
-                kubeconfig_yaml: String::new(),
-            })
+            .save(
+                &WorkerCredential::try_new(
+                    certificate_pem.clone(),
+                    private_key_pem.clone(),
+                    node_name.to_string(),
+                    String::new(),
+                )
+                .expect("valid test credential"),
+            )
             .await
             .expect("persist test credential");
         let mut config = crate::KlightsConfig::test_default();
@@ -1580,9 +1590,8 @@ mod tests {
 
     #[tokio::test]
     async fn seed_controlplane_remote_identity_uses_persisted_node_client_cert() {
-        use crate::bootstrap::worker_identity::{
-            AsyncWorkerCredentialStore, SupervisedFilesystemWorkerCredentialStore, WorkerCredential,
-        };
+        use crate::bootstrap::composition_adapters::worker_credential_store_adapter::SupervisedFilesystemWorkerCredentialStore;
+        use klights_auth::worker_credential::{WorkerCredential, WorkerCredentialStore};
 
         let namespace = format!("cp-seed-node-cert-{}", uuid::Uuid::new_v4());
         let node_name = "mn-controlplane1";
@@ -1594,12 +1603,15 @@ mod tests {
         );
         let (certificate_pem, private_key_pem) = generate_test_node_cert(node_name);
         store
-            .save(&WorkerCredential {
-                certificate_pem: certificate_pem.clone(),
-                private_key_pem: private_key_pem.clone(),
-                node_name: node_name.to_string(),
-                kubeconfig_yaml: String::new(),
-            })
+            .save(
+                &WorkerCredential::try_new(
+                    certificate_pem.clone(),
+                    private_key_pem.clone(),
+                    node_name.to_string(),
+                    String::new(),
+                )
+                .expect("valid test credential"),
+            )
             .await
             .expect("persist test credential");
         let mut config = crate::KlightsConfig::test_default();
