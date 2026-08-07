@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use axum::http::HeaderMap;

@@ -348,10 +348,10 @@ mod tests {
 
     use super::PodSubresourceService;
     use klights_pod_api::{
-        PodGetRequest, PodListRequest, PodListResult, PodOwnerListRequest, PodPersistence,
-        PodPersistenceCreateRequest, PodPersistenceReplaceRequest, PodQuery, PodRepositoryError,
-        PodRepositoryFuture, PodStatusPatchKind, PodStatusPersistence, PodStatusWriteRequest,
-        PodSubresourceMutation,
+        PodGetRequest, PodListRequest, PodListResult, PodMetadataPatchRequest, PodOwnerListRequest,
+        PodPersistence, PodPersistenceCreateRequest, PodPersistenceReplaceRequest, PodQuery,
+        PodRepositoryError, PodRepositoryFuture, PodStatusPatchKind, PodStatusPersistence,
+        PodStatusWriteRequest, PodSubresourceMutation,
     };
 
     struct TestPodStore {
@@ -453,6 +453,99 @@ mod tests {
         ) -> PodRepositoryFuture<'_, klights_cluster_core::Resource> {
             Box::pin(async move { self.replace(request.body, request.expected_resource_version) })
         }
+
+        fn patch_pod_metadata(
+            &self,
+            request: PodMetadataPatchRequest,
+        ) -> PodRepositoryFuture<'_, klights_cluster_core::Resource> {
+            Box::pin(async move {
+                let mut current = self.current.lock().unwrap();
+                if current.namespace.as_deref() != Some(request.namespace.as_str())
+                    || current.name != request.name
+                {
+                    return Err(PodRepositoryError::not_found(
+                        request.namespace,
+                        request.name,
+                    ));
+                }
+                if current.uid != request.expected_uid {
+                    return Err(PodRepositoryError::uid_mismatch(
+                        request.expected_uid,
+                        current.uid.clone(),
+                    ));
+                }
+                if current.resource_version != request.expected_resource_version {
+                    return Err(PodRepositoryError::conflict(
+                        "the Pod resourceVersion does not match the current object",
+                    ));
+                }
+
+                let mut body = Arc::unwrap_or_clone(current.data.clone());
+                json_patch::merge(&mut body, &request.patch);
+                body.pointer_mut("/metadata/resourceVersion")
+                    .expect("test Pod has metadata.resourceVersion")
+                    .clone_from(&json!((request.expected_resource_version + 1).to_string()));
+                let updated = klights_cluster_core::Resource::try_from_data(Arc::new(body))
+                    .map_err(|error| PodRepositoryError::internal(error.to_string()))?;
+                *current = updated.clone();
+                Ok(updated)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pod_store_metadata_patch_enforces_uid_and_resource_version_cas() {
+        let store = TestPodStore::new(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "fixture-pod",
+                "namespace": "default",
+                "uid": "fixture-uid",
+                "resourceVersion": "9",
+                "labels": {"existing": "kept"}
+            },
+            "spec": {"containers": [{"name": "main", "image": "busybox"}]}
+        }));
+
+        let updated = store
+            .patch_pod_metadata(PodMetadataPatchRequest {
+                namespace: "default".to_string(),
+                name: "fixture-pod".to_string(),
+                expected_uid: "fixture-uid".to_string(),
+                expected_resource_version: 9,
+                patch: json!({"metadata": {"labels": {"added": "value"}}}),
+            })
+            .await
+            .unwrap();
+        assert_eq!(updated.resource_version, 10);
+        assert_eq!(updated.data["metadata"]["labels"]["existing"], "kept");
+        assert_eq!(updated.data["metadata"]["labels"]["added"], "value");
+        assert_eq!(updated.data["spec"]["containers"][0]["name"], "main");
+
+        let uid_error = store
+            .patch_pod_metadata(PodMetadataPatchRequest {
+                namespace: "default".to_string(),
+                name: "fixture-pod".to_string(),
+                expected_uid: "replacement-uid".to_string(),
+                expected_resource_version: 10,
+                patch: json!({"metadata": {"labels": {"wrong": "uid"}}}),
+            })
+            .await
+            .expect_err("a replacement UID must fail the metadata CAS");
+        assert!(matches!(uid_error, PodRepositoryError::UidMismatch { .. }));
+
+        let rv_error = store
+            .patch_pod_metadata(PodMetadataPatchRequest {
+                namespace: "default".to_string(),
+                name: "fixture-pod".to_string(),
+                expected_uid: "fixture-uid".to_string(),
+                expected_resource_version: 9,
+                patch: json!({"metadata": {"labels": {"wrong": "rv"}}}),
+            })
+            .await
+            .expect_err("a stale resourceVersion must fail the metadata CAS");
+        assert!(matches!(rv_error, PodRepositoryError::Conflict { .. }));
     }
 
     impl PodStatusPersistence for TestPodStore {

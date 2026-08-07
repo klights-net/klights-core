@@ -97,8 +97,6 @@ use custom_resources::{
     update_custom_resource,
 };
 pub(in crate::current) use debug::pod_lifecycle_debug_dump;
-#[cfg(test)]
-pub use defaulting::{apply_pod_create_defaults, inject_create_metadata, set_deletion_timestamp};
 pub use defaulting::{
     apply_pod_create_defaults_at, apply_pod_service_account_defaults,
     apply_pod_spec_create_defaults, apply_pv_create_defaults, apply_pvc_create_defaults,
