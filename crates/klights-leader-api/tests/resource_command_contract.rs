@@ -47,6 +47,16 @@ fn request_admits_exact_generic_resource_commands_without_rewriting_them() {
             preconditions: ResourcePreconditions::uid("uid-a"),
             strict_resource_version: true,
         },
+        StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: "node-a".to_string(),
+            status: json!({"phase": "Ready"}),
+            expected_rv: Some(8),
+            preconditions: ResourcePreconditions::default(),
+            observed_status_stamp: None,
+        },
         StorageCommand::DeleteResource {
             api_version: "v1".to_string(),
             kind: "ConfigMap".to_string(),
@@ -72,7 +82,7 @@ fn request_admits_exact_generic_resource_commands_without_rewriting_them() {
 }
 
 #[test]
-fn request_rejects_pod_hard_delete_and_non_generic_commands() {
+fn request_rejects_pod_hard_delete_commands() {
     for command in [
         StorageCommand::DeleteResource {
             api_version: "v1".to_string(),
@@ -95,21 +105,6 @@ fn request_rejects_pod_hard_delete_and_non_generic_commands() {
             Err(ResourceCommandError::PodDeletionForbidden)
         ));
     }
-
-    let status = StorageCommand::UpdateStatus {
-        api_version: "v1".to_string(),
-        kind: "Node".to_string(),
-        namespace: None,
-        name: "node-a".to_string(),
-        status: json!({"phase": "Ready"}),
-        expected_rv: Some(8),
-        preconditions: ResourcePreconditions::default(),
-        observed_status_stamp: None,
-    };
-    assert!(matches!(
-        ResourceCommandRequest::try_new(status),
-        Err(ResourceCommandError::UnsupportedCommand { .. })
-    ));
 }
 
 #[test]
