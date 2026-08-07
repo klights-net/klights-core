@@ -504,17 +504,6 @@ pub(in crate::current) fn build_router_parts(
     )
 }
 
-#[cfg(test)]
-pub(in crate::current) fn build_router_inner(state: ApiState) -> Router {
-    let (router, outer_layers) = build_router_parts(state);
-    outer_layers.finish(router.into_router())
-}
-
-#[cfg(test)]
-pub(crate) fn build_router(state: ApiState) -> Router {
-    build_router_inner(state)
-}
-
 /// 404 for any path the router does not recognise, shaped as a metav1.Status.
 async fn not_found_fallback() -> crate::current::AppError {
     crate::current::AppError::NotFound(

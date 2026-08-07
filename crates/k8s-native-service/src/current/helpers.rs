@@ -150,23 +150,6 @@ pub fn set_namespace_terminating_status_at(
     }
 }
 
-#[cfg(test)]
-fn test_namespace_operation_time() -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("fixed namespace test timestamp")
-}
-
-#[cfg(test)]
-pub fn set_namespace_terminating_status(
-    namespace: &mut Value,
-    with_content_failure_condition: bool,
-) {
-    set_namespace_terminating_status_at(
-        namespace,
-        with_content_failure_condition,
-        test_namespace_operation_time(),
-    );
-}
-
 pub async fn reconcile_namespace_termination_at(
     db: &(impl klights_reconcile_api::NamespaceLifecycleStore + ?Sized),
     namespace: &str,
@@ -174,16 +157,6 @@ pub async fn reconcile_namespace_termination_at(
     operation_now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), AppError> {
     reconcile_namespace_termination_inner(db, namespace, None, metrics, operation_now).await
-}
-
-#[cfg(test)]
-pub async fn reconcile_namespace_termination(
-    db: &(impl klights_reconcile_api::NamespaceLifecycleStore + ?Sized),
-    namespace: &str,
-    metrics: &(impl klights_reconcile_api::ReconcileFailureMetrics + ?Sized),
-) -> Result<(), AppError> {
-    reconcile_namespace_termination_at(db, namespace, metrics, test_namespace_operation_time())
-        .await
 }
 
 // `reconcile_namespace_termination_for_uid` (the legacy variant without an
@@ -256,23 +229,6 @@ pub async fn reconcile_namespace_termination_for_uid_with_outcome_at(
 
     reconcile_result?;
     Ok(outcome)
-}
-
-#[cfg(test)]
-pub async fn reconcile_namespace_termination_for_uid_with_outcome(
-    db: &(impl klights_reconcile_api::NamespaceLifecycleStore + ?Sized),
-    namespace: &str,
-    expected_uid: &str,
-    metrics: &(impl klights_reconcile_api::ReconcileFailureMetrics + ?Sized),
-) -> Result<NamespaceTerminationOutcome, AppError> {
-    reconcile_namespace_termination_for_uid_with_outcome_at(
-        db,
-        namespace,
-        expected_uid,
-        metrics,
-        test_namespace_operation_time(),
-    )
-    .await
 }
 
 async fn reconcile_namespace_termination_inner(
