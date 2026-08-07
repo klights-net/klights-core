@@ -4,7 +4,66 @@ use std::sync::Arc;
 
 use klights_cluster_datastore::sqlite::embedded::ResourceMutationPauseOperation as IntegrationResourceMutationPauseOperation;
 use klights_pod_api::PodSubresourceMutation as _;
-use klights_reconcile_api::ControllerDispatcherPort as _;
+
+#[derive(Default)]
+struct PodRepositoryRecordingReconcileSink {
+    keys: tokio::sync::Mutex<Vec<klights_reconcile_api::ReconcileKey>>,
+}
+
+impl PodRepositoryRecordingReconcileSink {
+    async fn record(&self, keys: impl IntoIterator<Item = klights_reconcile_api::ReconcileKey>) {
+        let mut recorded = self.keys.lock().await;
+        for key in keys {
+            if !recorded.contains(&key) {
+                recorded.push(key);
+            }
+        }
+    }
+
+    async fn enqueue_key(&self, key: klights_reconcile_api::ReconcileKey) {
+        self.record([key]).await;
+    }
+
+    async fn pending_keys(&self) -> Vec<klights_reconcile_api::ReconcileKey> {
+        self.keys.lock().await.clone()
+    }
+}
+
+impl klights_reconcile_api::ControllerReconcileSink for PodRepositoryRecordingReconcileSink {
+    fn enqueue_reconcile_batch(
+        &self,
+        keys: Vec<klights_reconcile_api::ReconcileKey>,
+    ) -> klights_reconcile_api::ReconcileSinkFuture<'_> {
+        Box::pin(async move {
+            if keys
+                .iter()
+                .any(|key| key.api_version() == "v1" && key.kind() == "Service")
+            {
+                return Err(klights_reconcile_api::ReconcileSinkError::unsupported_key(
+                    "Service reconcile keys must use ServiceReconcileSink",
+                ));
+            }
+            self.record(keys).await;
+            Ok(())
+        })
+    }
+}
+
+impl klights_reconcile_api::ServiceReconcileSink for PodRepositoryRecordingReconcileSink {
+    fn enqueue_service_reconcile_batch(
+        &self,
+        keys: Vec<klights_reconcile_api::ServiceReconcileKey>,
+    ) -> klights_reconcile_api::ReconcileSinkFuture<'_> {
+        Box::pin(async move {
+            self.record(
+                keys.into_iter()
+                    .map(klights_reconcile_api::ServiceReconcileKey::into_reconcile_key),
+            )
+            .await;
+            Ok(())
+        })
+    }
+}
 
 pub struct IntegrationSchedulerBindGate {
     gate: Arc<crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest>,
@@ -538,7 +597,7 @@ pub struct IntegrationPodRepositoryComposition {
     pod_scheduling: Arc<dyn klights_pod_api::PodScheduling>,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
     background: crate::kubelet::pod_repository::background::PodRepositoryBackground,
-    controller_dispatcher: Option<Arc<klights_controllers::ControllerDispatcher>>,
+    controller_dispatcher: Option<Arc<PodRepositoryRecordingReconcileSink>>,
     node_local: Option<Arc<crate::datastore::node_local::NodeLocalStores>>,
     outbox_delivery: Option<Arc<dyn klights_leader_api::LeaderOutboxDelivery>>,
     delete_observation: Option<Arc<tokio::sync::Mutex<Option<(bool, bool)>>>>,
@@ -2124,16 +2183,8 @@ impl IntegrationPodRepositoryComposition {
         let local_query: Arc<dyn klights_leader_api::LeaderResourceQuery> = local_client.clone();
         let native_resource_query = repository_cluster_api.clone().unwrap_or(local_query);
         let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-        let controller_dispatcher = with_dispatcher.then(|| {
-            Arc::new(
-                klights_controllers::ControllerDispatcher::with_task_supervisor(
-                    Arc::new(klights_controllers::service::ServiceIpam::new(
-                        "10.43.128.0/17",
-                    )),
-                    supervisor.clone(),
-                ),
-            )
-        });
+        let controller_dispatcher =
+            with_dispatcher.then(|| Arc::new(PodRepositoryRecordingReconcileSink::default()));
         let mut side_effect_registry = if with_dispatcher {
             crate::bootstrap::side_effects::default_registry(
                 metrics.clone(),
@@ -2253,19 +2304,16 @@ impl IntegrationPodRepositoryComposition {
         self.controller_dispatcher
             .as_ref()
             .expect("status dispatcher fixture")
-            .pending_reconcile_keys()
+            .pending_keys()
             .await
     }
 
     pub async fn enqueue_reconcile_key(&self, key: klights_reconcile_api::ReconcileKey) {
-        klights_reconcile_api::ControllerDispatcherPort::enqueue_reconcile(
-            self.controller_dispatcher
-                .as_ref()
-                .expect("status dispatcher fixture")
-                .as_ref(),
-            key,
-        )
-        .await;
+        self.controller_dispatcher
+            .as_ref()
+            .expect("status dispatcher fixture")
+            .enqueue_key(key)
+            .await;
     }
 
     pub async fn claim_next_due_outbox(

@@ -3942,11 +3942,10 @@ async fn accepted_controlplane_join_uses_observed_peer_ip_for_dataplane_and_raft
 
 #[tokio::test]
 async fn apply_outbox_pod_status_enqueues_matching_service() {
-    let db: DatastoreHandle = Arc::new(
-        klights::datastore::sqlite::Datastore::new_in_memory()
-            .await
-            .unwrap(),
-    );
+    let sqlite = klights::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
+    let db: DatastoreHandle = Arc::new(sqlite.clone());
     let _token = {
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
             db.as_ref(),
@@ -3997,7 +3996,9 @@ async fn apply_outbox_pod_status_enqueues_matching_service() {
     .await
     .unwrap();
     let dispatcher =
-        Arc::new(crate::bootstrap::composition_tests::leader_rpc::support::default_queue_only_dispatcher_for_test());
+        crate::bootstrap::composition_tests::leader_rpc::support::controller_dispatcher_for_test(
+            &sqlite,
+        );
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let service = Arc::new(
         crate::bootstrap::composition_tests::leader_rpc::support::replication_service(
@@ -4060,7 +4061,10 @@ async fn apply_outbox_pod_status_enqueues_matching_service() {
         "unexpected apply error: {response:?}"
     );
     assert!(!response.already_applied);
-    let keys = dispatcher.queued_reconcile_keys_for_test().await;
+    let keys = klights_reconcile_api::ControllerDispatcherPort::pending_reconcile_keys(
+        dispatcher.as_ref(),
+    )
+    .await;
     assert!(
         keys.iter().any(|key| {
             key.api_version() == "v1"

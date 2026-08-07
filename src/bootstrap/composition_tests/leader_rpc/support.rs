@@ -75,9 +75,10 @@ pub(crate) fn sqlite_passive_read_ports(
     IntegrationLeaderRpcComposition::passive_reads_for(db)
 }
 
-pub(crate) fn default_queue_only_dispatcher_for_test() -> klights_controllers::ControllerDispatcher
-{
-    IntegrationLeaderRpcComposition::default_queue_only_dispatcher()
+pub(crate) fn controller_dispatcher_for_test(
+    db: &klights::datastore::sqlite::Datastore,
+) -> Arc<klights_controllers::ControllerDispatcher> {
+    IntegrationLeaderRpcComposition::controller_dispatcher(db)
 }
 
 pub(crate) fn test_file_process_executor() -> klights_supervisor::FileProcessExecutor {

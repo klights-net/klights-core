@@ -1325,11 +1325,10 @@ mod inner_gate_tests {
 
     #[tokio::test]
     async fn local_protobuf_pod_status_reconciles_json_endpoint_tables() {
-        let db: DatastoreHandle = Arc::new(
-            crate::datastore::sqlite::Datastore::new_in_memory()
-                .await
-                .unwrap(),
-        );
+        let sqlite = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let db: DatastoreHandle = Arc::new(sqlite.clone());
         let service = db
             .create_resource(
                 "v1",
@@ -1366,7 +1365,12 @@ mod inner_gate_tests {
             crate::control_plane::client::local::always_leader_watch(),
         );
         let dispatcher =
-            Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::default_queue_only_dispatcher_for_test());
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::dispatcher_for_test(
+                &sqlite,
+                Arc::new(klights_controllers::service::ServiceIpam::new(
+                    "10.43.128.0/17",
+                )),
+            );
         client.set_controller_dispatcher(dispatcher.clone());
         let command = StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
@@ -1400,7 +1404,10 @@ mod inner_gate_tests {
             .await
             .expect("apply local Pod status");
 
-        let keys = dispatcher.queued_reconcile_keys_for_test().await;
+        let keys = klights_reconcile_api::ControllerDispatcherPort::pending_reconcile_keys(
+            dispatcher.as_ref(),
+        )
+        .await;
         assert_eq!(
             keys.iter()
                 .filter(|key| key.kind() == "Service" && key.name() == "web")
@@ -2307,10 +2314,15 @@ mod inner_gate_tests {
             .unwrap();
         make_pod(&db).await;
         let (tx, rx) = watch::channel(false);
-        let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
-        client.set_controller_dispatcher(Arc::new(
-            crate::bootstrap::controller_adapters::controller_runtime_adapter::default_queue_only_dispatcher_for_test(),
-        ));
+        let client = LocalApiClient::new(Arc::new(db.clone()), "node-a".to_string(), rx);
+        client.set_controller_dispatcher(
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::dispatcher_for_test(
+                &db,
+                Arc::new(klights_controllers::service::ServiceIpam::new(
+                    "10.43.128.0/17",
+                )),
+            ),
+        );
 
         // Pre-promotion: write refused.
         let pre = client
@@ -2355,10 +2367,15 @@ mod inner_gate_tests {
             .unwrap();
         make_pod(&db).await;
         let (tx, rx) = watch::channel(true);
-        let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
-        client.set_controller_dispatcher(Arc::new(
-            crate::bootstrap::controller_adapters::controller_runtime_adapter::default_queue_only_dispatcher_for_test(),
-        ));
+        let client = LocalApiClient::new(Arc::new(db.clone()), "node-a".to_string(), rx);
+        client.set_controller_dispatcher(
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::dispatcher_for_test(
+                &db,
+                Arc::new(klights_controllers::service::ServiceIpam::new(
+                    "10.43.128.0/17",
+                )),
+            ),
+        );
 
         // Pre-demotion: write succeeds.
         let pre = client

@@ -82,11 +82,10 @@ mod tests {
         let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
-            "10.43.128.0/17",
-        ));
-        let dispatcher =
-            Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::queue_only_dispatcher_for_test(service_ipam));
+        let dispatcher = Arc::new(
+            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
+            ),
+        );
         let registry = default_registry(
             SideEffectMetrics::new(),
             None,
@@ -140,7 +139,7 @@ mod tests {
         registry.run_hooks(&node.data).await.unwrap();
 
         assert_eq!(
-            dispatcher.queued_reconcile_keys_for_test().await,
+            dispatcher.pending_keys().await,
             vec![klights_reconcile_api::ReconcileKey::namespaced(
                 "apps/v1",
                 "DaemonSet",
@@ -176,11 +175,10 @@ mod tests {
             Some(db_handle.clone()),
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         );
-        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
-            "10.43.128.0/17",
-        ));
-        let dispatcher =
-            Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::queue_only_dispatcher_for_test(service_ipam));
+        let dispatcher = Arc::new(
+            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
+            ),
+        );
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(
@@ -258,7 +256,7 @@ mod tests {
         registry.run_hooks(&pod.data).await.unwrap();
 
         assert_eq!(
-            dispatcher.queued_reconcile_keys_for_test().await,
+            dispatcher.pending_keys().await,
             vec![klights_reconcile_api::ReconcileKey::namespaced(
                 "batch/v1",
                 "Job",
@@ -295,11 +293,10 @@ mod tests {
             Some(db_handle.clone()),
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         );
-        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
-            "10.43.128.0/17",
-        ));
-        let dispatcher =
-            Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::queue_only_dispatcher_for_test(service_ipam));
+        let dispatcher = Arc::new(
+            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
+            ),
+        );
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(
@@ -364,7 +361,7 @@ mod tests {
 
         registry.run_hooks(&pod.data).await.unwrap();
 
-        let keys = dispatcher.queued_reconcile_keys_for_test().await;
+        let keys = dispatcher.pending_keys().await;
         assert!(
             keys.is_empty(),
             "Pod generic side effects must not enqueue Service reconciles directly"
@@ -383,11 +380,10 @@ mod tests {
             Some(db_handle.clone()),
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         );
-        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
-            "10.43.128.0/17",
-        ));
-        let dispatcher =
-            Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::queue_only_dispatcher_for_test(service_ipam));
+        let dispatcher = Arc::new(
+            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
+            ),
+        );
         registry.set_controller_dispatcher(dispatcher.clone());
 
         let endpoints = json!({
@@ -411,7 +407,7 @@ mod tests {
         registry.run_hooks(&endpoints).await.unwrap();
 
         assert!(
-            dispatcher.queued_reconcile_keys_for_test().await.is_empty(),
+            dispatcher.pending_keys().await.is_empty(),
             "Endpoints and EndpointSlice side effects must not feed back into Service reconcile"
         );
     }
@@ -428,11 +424,10 @@ mod tests {
             Some(db_handle.clone()),
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         );
-        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
-            "10.43.128.0/17",
-        ));
-        let dispatcher =
-            Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::queue_only_dispatcher_for_test(service_ipam));
+        let dispatcher = Arc::new(
+            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
+            ),
+        );
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(
@@ -513,7 +508,7 @@ mod tests {
         registry.run_hooks(&pod.data).await.unwrap();
 
         assert_eq!(
-            dispatcher.queued_reconcile_keys_for_test().await,
+            dispatcher.pending_keys().await,
             vec![klights_reconcile_api::ReconcileKey::namespaced(
                 "v1",
                 "ReplicationController",
@@ -550,11 +545,10 @@ mod tests {
             Some(db_handle.clone()),
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         );
-        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
-            "10.43.128.0/17",
-        ));
-        let dispatcher =
-            Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::queue_only_dispatcher_for_test(service_ipam));
+        let dispatcher = Arc::new(
+            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
+            ),
+        );
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(
@@ -618,7 +612,7 @@ mod tests {
         registry.run_hooks(&pod.data).await.unwrap();
 
         assert_eq!(
-            dispatcher.queued_reconcile_keys_for_test().await,
+            dispatcher.pending_keys().await,
             vec![klights_reconcile_api::ReconcileKey::namespaced(
                 "apps/v1",
                 "ReplicaSet",
@@ -641,11 +635,10 @@ mod tests {
             Some(db_handle.clone()),
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         );
-        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
-            "10.43.128.0/17",
-        ));
-        let dispatcher =
-            Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::queue_only_dispatcher_for_test(service_ipam));
+        let dispatcher = Arc::new(
+            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
+            ),
+        );
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(
@@ -729,7 +722,7 @@ mod tests {
 
         registry.run_hooks(&pod.data).await.unwrap();
 
-        let keys = dispatcher.queued_reconcile_keys_for_test().await;
+        let keys = dispatcher.pending_keys().await;
         assert!(
             keys.iter().any(|key| {
                 key.api_version() == "apps/v1"
@@ -762,11 +755,10 @@ mod tests {
             Some(db_handle.clone()),
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         );
-        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
-            "10.43.128.0/17",
-        ));
-        let dispatcher =
-            Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::queue_only_dispatcher_for_test(service_ipam));
+        let dispatcher = Arc::new(
+            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
+            ),
+        );
         registry.set_controller_dispatcher(dispatcher.clone());
 
         db.create_resource(
@@ -831,7 +823,7 @@ mod tests {
         registry.run_hooks(&pod.data).await.unwrap();
 
         assert!(
-            dispatcher.queued_reconcile_keys_for_test().await.contains(
+            dispatcher.pending_keys().await.contains(
                 &klights_reconcile_api::ReconcileKey::namespaced(
                     "batch/v1",
                     "Job",

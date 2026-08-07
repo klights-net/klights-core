@@ -124,17 +124,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
-            klights_supervisor::TaskCategoryConfig::default(),
-        ));
-        let dispatcher = Arc::new(
-            klights_controllers::ControllerDispatcher::with_task_supervisor(
+        let dispatcher =
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::dispatcher_for_test(
+                &db,
                 Arc::new(klights_controllers::service::ServiceIpam::new(
                     "10.43.128.0/17",
                 )),
-                supervisor,
-            ),
-        );
+            );
         let runtime = LeaderCronJobSchedulerRuntime {
             positioned_watch:
                 crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(

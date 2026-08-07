@@ -29,24 +29,6 @@ pub struct ControllerDispatcher {
 }
 
 impl ControllerDispatcher {
-    /// Transitional queue-only constructor for root real-adapter tests.
-    ///
-    /// P2g removes this public test-support debt after those suites migrate to
-    /// the base integration surface. The caller must inject its test-owned
-    /// supervisor; production composition uses [`Self::new_complete`].
-    #[doc(hidden)]
-    pub fn with_task_supervisor(
-        _service_ipam: Arc<crate::service::ServiceIpam>,
-        task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    ) -> Self {
-        Self {
-            controllers: HashMap::new(),
-            runtime: Arc::new(DispatcherRuntime::new(task_supervisor)),
-            dependencies: None,
-            coordination: Arc::new(crate::ControllerCoordination::new()),
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn new_complete(
         service_ipam: Arc<crate::service::ServiceIpam>,
@@ -162,25 +144,6 @@ impl ControllerDispatcher {
 
     async fn enqueue_reconcile_batch(&self, keys: Vec<ReconcileKey>) {
         self.runtime.enqueue_batch(keys).await;
-    }
-
-    #[doc(hidden)]
-    pub async fn queued_reconcile_keys_for_test(&self) -> Vec<ReconcileKey> {
-        self.runtime.pending_keys().await
-    }
-
-    #[doc(hidden)]
-    pub async fn take_reconcile_key_for_test(&self) -> ReconcileKey {
-        self.runtime.take_next().await
-    }
-
-    #[doc(hidden)]
-    pub async fn dispatch_next_key_for_test(&self) -> ReconcileKey {
-        let key = self.runtime.take_next().await;
-        self.runtime.wait_for_key_dispatch_slot(&key).await;
-        self.dispatch_key(&key).await;
-        self.runtime.finish_key_dispatch(key.clone()).await;
-        key
     }
 
     pub async fn run_worker_pool(

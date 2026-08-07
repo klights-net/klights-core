@@ -1677,27 +1677,42 @@ impl NativeApiTestHarness {
     ) -> anyhow::Result<Vec<klights_reconcile_api::ReconcileKey>> {
         let mut drained = Vec::new();
         for _ in 0..1024 {
-            if self
-                .controller_dispatcher
-                .pending_reconcile_keys()
-                .await
-                .is_empty()
-            {
+            let queued = self.controller_dispatcher.pending_reconcile_keys().await;
+            if queued.is_empty() {
                 return Ok(drained);
             }
-            drained.push(
-                self.controller_dispatcher
-                    .dispatch_next_key_for_test()
-                    .await,
-            );
-        }
-        anyhow::bail!("controller reconcile drain exceeded 1024 operations")
-    }
+            for key in queued {
+                if !drained.contains(&key) {
+                    drained.push(key);
+                }
+            }
 
-    pub async fn dispatch_next_controller_reconcile(&self) -> klights_reconcile_api::ReconcileKey {
-        self.controller_dispatcher
-            .dispatch_next_key_for_test()
-            .await
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let worker = self.spawn_controller_worker(cancel.clone()).await?;
+            let ready_queue_drained =
+                tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                    loop {
+                        if self
+                            .controller_dispatcher
+                            .pending_reconcile_keys()
+                            .await
+                            .is_empty()
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+            cancel.cancel();
+            let worker_result = worker.join().await;
+            if ready_queue_drained.is_err() {
+                worker_result?;
+                anyhow::bail!("controller reconcile ready-queue drain timed out");
+            }
+            worker_result?;
+        }
+        anyhow::bail!("controller reconcile drain exceeded 1024 worker rounds")
     }
 
     pub async fn reconcile_endpointslice(
@@ -1968,12 +1983,19 @@ impl NativeApiTestHarness {
         .await
     }
 
-    pub fn spawn_controller_worker(
+    pub async fn spawn_controller_worker(
         &self,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Result<klights_supervisor::SupervisedJoinHandle<()>, klights_supervisor::TaskAdmissionError>
+    {
         let dispatcher = self.controller_dispatcher.clone();
-        tokio::spawn(dispatcher.run_worker_pool(1, cancel))
+        self.task_supervisor
+            .spawn_async(
+                klights_supervisor::TaskCategory::Background,
+                "native_api_controller_worker",
+                async move { dispatcher.run_worker_pool(1, cancel).await },
+            )
+            .await
     }
 
     pub async fn register_crd_value(&self, crd: &serde_json::Value) -> anyhow::Result<()> {

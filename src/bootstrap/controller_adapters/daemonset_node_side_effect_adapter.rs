@@ -36,11 +36,10 @@ mod tests {
             .await
             .unwrap();
         let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
-        let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
-            "10.43.128.0/17",
-        ));
-        let dispatcher =
-            Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::queue_only_dispatcher_for_test(service_ipam));
+        let dispatcher = Arc::new(
+            crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
+            ),
+        );
         let slot = klights_controllers::side_effects::ControllerDispatcherSlot::new();
         slot.set(dispatcher.clone());
 
@@ -84,7 +83,7 @@ mod tests {
         );
         effect.apply(&node.data).await.unwrap();
         assert_eq!(
-            dispatcher.queued_reconcile_keys_for_test().await,
+            dispatcher.pending_keys().await,
             vec![klights_reconcile_api::ReconcileKey::namespaced(
                 "apps/v1",
                 "DaemonSet",
@@ -119,7 +118,7 @@ mod tests {
             .unwrap();
         assert_eq!(pods.items.len(), 0);
         assert_eq!(
-            dispatcher.queued_reconcile_keys_for_test().await,
+            dispatcher.pending_keys().await,
             vec![klights_reconcile_api::ReconcileKey::namespaced(
                 "apps/v1",
                 "DaemonSet",

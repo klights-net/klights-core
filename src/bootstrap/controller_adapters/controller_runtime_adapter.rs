@@ -1192,23 +1192,3 @@ pub(crate) fn dispatcher_for_test(
         super::system_identity_adapter::deterministic_controller_identity(),
     ))
 }
-
-#[cfg(test)]
-pub(crate) fn queue_only_dispatcher_for_test(
-    service_ipam: Arc<klights_controllers::service::ServiceIpam>,
-) -> klights_controllers::ControllerDispatcher {
-    klights_controllers::ControllerDispatcher::with_task_supervisor(
-        service_ipam,
-        Arc::new(klights_supervisor::TaskSupervisor::new(
-            klights_supervisor::TaskCategoryConfig::default(),
-        )),
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn default_queue_only_dispatcher_for_test() -> klights_controllers::ControllerDispatcher
-{
-    queue_only_dispatcher_for_test(Arc::new(klights_controllers::service::ServiceIpam::new(
-        "10.43.128.0/17",
-    )))
-}

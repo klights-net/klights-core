@@ -1119,11 +1119,10 @@ mod cases {
         DatastoreHandle,
         tokio::task::JoinHandle<()>,
     ) {
-        let db: DatastoreHandle = Arc::new(
-            klights::datastore::sqlite::Datastore::new_in_memory()
-                .await
-                .unwrap(),
-        );
+        let sqlite = klights::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let db: DatastoreHandle = Arc::new(sqlite.clone());
         crate::bootstrap::composition_tests::leader_rpc::support::ensure_cluster_metadata(
             db.as_ref(),
         )
@@ -1140,9 +1139,10 @@ mod cases {
                 supervisor.clone(),
             ),
         );
-        let controller_dispatcher = Arc::new(
-            crate::bootstrap::composition_tests::leader_rpc::support::default_queue_only_dispatcher_for_test(),
-        );
+        let controller_dispatcher =
+            crate::bootstrap::composition_tests::leader_rpc::support::controller_dispatcher_for_test(
+                &sqlite,
+            );
         let app = crate::bootstrap::composition_tests::leader_rpc::support::mount_service_with_controller_dispatcher(
             axum::Router::new(),
             service.clone(),

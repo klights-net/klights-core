@@ -177,8 +177,15 @@ impl IntegrationLeaderRpcComposition {
         .await
     }
 
-    pub fn default_queue_only_dispatcher() -> klights_controllers::ControllerDispatcher {
-        crate::bootstrap::controller_adapters::controller_runtime_adapter::default_queue_only_dispatcher_for_test()
+    pub fn controller_dispatcher(
+        db: &crate::datastore::sqlite::Datastore,
+    ) -> Arc<klights_controllers::ControllerDispatcher> {
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::dispatcher_for_test(
+            db,
+            Arc::new(klights_controllers::service::ServiceIpam::new(
+                "10.43.128.0/17",
+            )),
+        )
     }
 
     pub fn file_process_executor() -> klights_supervisor::FileProcessExecutor {

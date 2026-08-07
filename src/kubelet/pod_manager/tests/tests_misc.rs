@@ -2183,11 +2183,8 @@ async fn test_enqueue_job_reconcile_non_job_owner_is_noop() {
 #[tokio::test]
 async fn test_enqueue_job_reconcile_enqueues_job_key_via_dispatcher() {
     let (db, db_handle) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-    let service_ipam = std::sync::Arc::new(klights_controllers::service::ServiceIpam::new(
-        "10.43.128.0/17",
-    ));
     let dispatcher = std::sync::Arc::new(
-        crate::bootstrap::controller_adapters::controller_runtime_adapter::queue_only_dispatcher_for_test(service_ipam),
+        crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(),
     );
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
@@ -2246,19 +2243,17 @@ async fn test_enqueue_job_reconcile_enqueues_job_key_via_dispatcher() {
         .await
         .unwrap();
 
-    klights_reconcile_api::ControllerDispatcherPort::enqueue_reconcile(
-        dispatcher.as_ref(),
-        klights_reconcile_api::ReconcileKey::namespaced(
+    dispatcher
+        .enqueue_key(klights_reconcile_api::ReconcileKey::namespaced(
             "apps/v1",
             "Deployment",
             "default",
             "normal-backlog",
-        ),
-    )
-    .await;
+        ))
+        .await;
     pod_repo.enqueue_job_reconcile_for_pod(&pod).await;
 
-    let keys = dispatcher.queued_reconcile_keys_for_test().await;
+    let keys = dispatcher.pending_keys().await;
     assert!(
         keys.contains(&klights_reconcile_api::ReconcileKey::namespaced(
             "batch/v1", "Job", "default", "my-job"
@@ -2279,11 +2274,8 @@ async fn test_enqueue_job_reconcile_enqueues_job_key_via_dispatcher() {
 #[tokio::test]
 async fn test_terminal_watch_modified_pod_enqueues_job_reconcile() {
     let (db, db_handle) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-    let service_ipam = std::sync::Arc::new(klights_controllers::service::ServiceIpam::new(
-        "10.43.128.0/17",
-    ));
     let dispatcher = std::sync::Arc::new(
-        crate::bootstrap::controller_adapters::controller_runtime_adapter::queue_only_dispatcher_for_test(service_ipam),
+        crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(),
     );
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
@@ -2340,20 +2332,18 @@ async fn test_terminal_watch_modified_pod_enqueues_job_reconcile() {
         "status": {"phase": "Succeeded"}
     });
 
-    klights_reconcile_api::ControllerDispatcherPort::enqueue_reconcile(
-        dispatcher.as_ref(),
-        klights_reconcile_api::ReconcileKey::namespaced(
+    dispatcher
+        .enqueue_key(klights_reconcile_api::ReconcileKey::namespaced(
             "apps/v1",
             "Deployment",
             "default",
             "normal-backlog",
-        ),
-    )
-    .await;
+        ))
+        .await;
     event_handlers::enqueue_job_reconcile_for_terminal_watch_pod(&pod_repo, &terminal_watch_pod)
         .await;
 
-    let keys = dispatcher.queued_reconcile_keys_for_test().await;
+    let keys = dispatcher.pending_keys().await;
     assert!(
         keys.contains(&klights_reconcile_api::ReconcileKey::namespaced(
             "batch/v1",

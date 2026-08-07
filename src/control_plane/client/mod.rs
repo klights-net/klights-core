@@ -807,9 +807,14 @@ mod tests {
             "node-a".to_string(),
             crate::control_plane::client::local::always_leader_watch(),
         );
-        client.set_controller_dispatcher(Arc::new(
-            crate::bootstrap::controller_adapters::controller_runtime_adapter::default_queue_only_dispatcher_for_test(),
-        ));
+        client.set_controller_dispatcher(
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::dispatcher_for_test(
+                &db,
+                Arc::new(klights_controllers::service::ServiceIpam::new(
+                    "10.43.128.0/17",
+                )),
+            ),
+        );
 
         let first = client
             .deliver_test_outbox(
@@ -925,13 +930,18 @@ mod tests {
         .await
         .expect("create pod");
         let client = LocalApiClient::new(
-            Arc::new(db),
+            Arc::new(db.clone()),
             "node-a".to_string(),
             crate::control_plane::client::local::always_leader_watch(),
         );
-        client.set_controller_dispatcher(Arc::new(
-            crate::bootstrap::controller_adapters::controller_runtime_adapter::default_queue_only_dispatcher_for_test(),
-        ));
+        client.set_controller_dispatcher(
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::dispatcher_for_test(
+                &db,
+                Arc::new(klights_controllers::service::ServiceIpam::new(
+                    "10.43.128.0/17",
+                )),
+            ),
+        );
 
         let applied = client
             .deliver_test_outbox(
