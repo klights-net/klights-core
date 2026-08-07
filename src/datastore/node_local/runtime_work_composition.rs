@@ -1,11 +1,12 @@
 //! Root composition for the passive node runtime-work implementation.
 
 use klights_node_store::{
-    DueTimeMs, OwnedPodSandbox, PodRuntimeAdmission, PodRuntimeCgroup, PodRuntimeRecord,
-    PodRuntimeStore, PodSlotAdmissionEventSource, PodSlotAdmissionRequest, PodSlotAdmissionResult,
+    OwnedPodSandbox, PodRuntimeAdmission, PodRuntimeCgroup, PodRuntimeRecord, PodRuntimeStore,
+    PodSlotAdmissionEventSource, PodSlotAdmissionRequest, PodSlotAdmissionResult,
     PodSlotAdmissionStore, PodSlotClearResult, PodSlotEventSubscription, PodSlotMutationResult,
-    PodWorkqueueEnqueue, PodWorkqueueEntry, PodWorkqueueStore, ProbeKey, ProbeResult, ProbeState,
-    ProbeStateStore, RuntimeNamespace, RuntimePodUid, RuntimeWorkFuture,
+    PodWorkqueueClaimRequest, PodWorkqueueEnqueue, PodWorkqueueLease, PodWorkqueueLeaseToken,
+    PodWorkqueueMutationOutcome, PodWorkqueueRequeue, PodWorkqueueStore, ProbeKey, ProbeResult,
+    ProbeState, ProbeStateStore, RuntimeNamespace, RuntimePodUid, RuntimeWorkFuture,
 };
 
 use super::NodeLocalStores;
@@ -66,8 +67,25 @@ impl PodWorkqueueStore for NodeLocalStores {
         self.runtime_work_ref().peek_next_due_ms()
     }
 
-    fn claim_due_work(&self, now: DueTimeMs) -> RuntimeWorkFuture<'_, Option<PodWorkqueueEntry>> {
-        self.runtime_work_ref().claim_due_work(now)
+    fn claim_due_work_with_lease(
+        &self,
+        request: PodWorkqueueClaimRequest,
+    ) -> RuntimeWorkFuture<'_, Option<PodWorkqueueLease>> {
+        self.runtime_work_ref().claim_due_work_with_lease(request)
+    }
+
+    fn acknowledge_work(
+        &self,
+        token: PodWorkqueueLeaseToken,
+    ) -> RuntimeWorkFuture<'_, PodWorkqueueMutationOutcome> {
+        self.runtime_work_ref().acknowledge_work(token)
+    }
+
+    fn requeue_work(
+        &self,
+        request: PodWorkqueueRequeue,
+    ) -> RuntimeWorkFuture<'_, PodWorkqueueMutationOutcome> {
+        self.runtime_work_ref().requeue_work(request)
     }
 }
 

@@ -1,16 +1,16 @@
 //! Test-only compatibility DTOs retained for legacy root regression coverage.
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 use serde_json::Value;
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PodWorkqueueKind {
     Pod,
     Namespace,
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PodWorkqueueEntry {
     pub id: i64,
@@ -21,6 +21,7 @@ pub struct PodWorkqueueEntry {
     pub payload: Value,
     pub attempt_count: i64,
     pub next_attempt_at_ms: i64,
+    pub lease_token: klights_node_store::PodWorkqueueLeaseToken,
 }
 
 #[cfg(test)]
@@ -29,7 +30,7 @@ pub use super::sqlite::DeadLetterTestInsert;
 pub use super::sqlite::{DeadLetterRow, OutboxInsert, OutboxRow};
 
 impl super::NodeLocalStores {
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     pub async fn enqueue_workqueue(
         &self,
         kind: PodWorkqueueKind,
@@ -58,7 +59,7 @@ impl super::NodeLocalStores {
             .map_err(anyhow::Error::from)
     }
 
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     pub async fn peek_workqueue_next_due(&self) -> anyhow::Result<Option<i64>> {
         self.pod_workqueue()
             .peek_next_due_ms()
@@ -66,37 +67,41 @@ impl super::NodeLocalStores {
             .map_err(anyhow::Error::from)
     }
 
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     pub async fn claim_workqueue_due(
         &self,
         now_ms: i64,
     ) -> anyhow::Result<Option<PodWorkqueueEntry>> {
-        let row = self
+        let claim_now_ms = now_ms.min(i64::MAX - 1);
+        let lease = self
             .pod_workqueue()
-            .claim_due_work(klights_node_store::DueTimeMs::try_new(now_ms)?)
+            .claim_due_work_with_lease(klights_node_store::PodWorkqueueClaimRequest::try_new(
+                claim_now_ms,
+                1,
+            )?)
             .await?;
-        row.map(|row| {
-            let (id, identity, payload, attempt_count, next_due_ms) = row.into_parts();
-            let (kind, pod) = identity.into_persisted();
-            Ok(PodWorkqueueEntry {
-                id: id.get(),
-                kind: match kind {
-                    klights_node_store::PodWorkqueueKind::Pod => PodWorkqueueKind::Pod,
-                    klights_node_store::PodWorkqueueKind::Namespace => PodWorkqueueKind::Namespace,
-                },
-                namespace: pod.namespace,
-                name: pod.name,
-                uid: pod.uid,
-                payload: serde_json::from_slice(&payload)?,
-                attempt_count,
-                next_attempt_at_ms: next_due_ms.get(),
+        lease
+            .map(|lease| {
+                let (row, lease_token) = lease.into_parts();
+                let (id, identity, payload, attempt_count, next_due_ms) = row.into_parts();
+                let (kind, pod) = identity.into_persisted();
+                Ok(PodWorkqueueEntry {
+                    id: id.get(),
+                    kind: match kind {
+                        klights_node_store::PodWorkqueueKind::Pod => PodWorkqueueKind::Pod,
+                        klights_node_store::PodWorkqueueKind::Namespace => {
+                            PodWorkqueueKind::Namespace
+                        }
+                    },
+                    namespace: pod.namespace,
+                    name: pod.name,
+                    uid: pod.uid,
+                    payload: serde_json::from_slice(&payload)?,
+                    attempt_count,
+                    next_attempt_at_ms: next_due_ms.get(),
+                    lease_token,
+                })
             })
-        })
-        .transpose()
-    }
-
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
-    pub async fn complete_workqueue(&self, _id: i64) -> anyhow::Result<()> {
-        Ok(())
+            .transpose()
     }
 }

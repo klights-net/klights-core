@@ -133,6 +133,30 @@ struct RootInMemoryPodWorkqueueEntry {
     next_attempt_at_ms: i64,
 }
 
+#[cfg(any(test, feature = "pod-repository-test-support"))]
+fn in_memory_row_matches_token(
+    row: &RootInMemoryPodWorkqueueEntry,
+    token: &klights_node_store::PodWorkqueueLeaseToken,
+) -> bool {
+    if row.id != token.id().get() || row.next_attempt_at_ms != token.leased_next_due_ms().get() {
+        return false;
+    }
+    match token.identity() {
+        klights_node_store::PodWorkIdentity::Pod(pod) => {
+            row.kind == crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Pod
+                && row.namespace == pod.namespace
+                && row.name == pod.name
+                && row.uid == pod.uid
+        }
+        klights_node_store::PodWorkIdentity::Namespace { name, uid } => {
+            row.kind == crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Namespace
+                && row.namespace.is_empty()
+                && row.name == *name
+                && row.uid == *uid
+        }
+    }
+}
+
 struct WorkerPodPersistence {
     resource_query: Arc<dyn LeaderResourceQuery>,
 }
@@ -470,8 +494,9 @@ fn legacy_workqueue_kind(
 }
 
 fn focused_workqueue_entry(
-    row: klights_node_store::PodWorkqueueEntry,
+    lease: klights_node_store::PodWorkqueueLease,
 ) -> anyhow::Result<crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry> {
+    let (row, lease_token) = lease.into_parts();
     let (id, identity, payload, attempt_count, _next_due_ms) = row.into_parts();
     let (kind, pod) = identity.into_persisted();
     Ok(
@@ -490,8 +515,7 @@ fn focused_workqueue_entry(
             uid: pod.uid,
             payload: serde_json::from_slice(&payload)?,
             attempt_count,
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
-            next_attempt_at_ms: _next_due_ms.get(),
+            lease_token,
         },
     )
 }
@@ -540,19 +564,29 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
                 .test_next_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let now_ms = self.wall_clock.now_ms();
-            self.test_rows
-                .lock()
-                .unwrap()
-                .push(RootInMemoryPodWorkqueueEntry {
-                    id,
-                    kind,
-                    namespace: pod.namespace.clone(),
-                    name: pod.name.clone(),
-                    uid: pod.uid.clone(),
-                    payload,
-                    attempt_count,
-                    next_attempt_at_ms: now_ms.saturating_add(min_delay_ms),
-                });
+            let floor = now_ms
+                .checked_add(min_delay_ms)
+                .ok_or_else(|| anyhow::anyhow!("workqueue enqueue due time overflow"))?;
+            let mut rows = self.test_rows.lock().unwrap();
+            let tail_next =
+                rows.iter()
+                    .map(|row| row.next_attempt_at_ms)
+                    .max()
+                    .map_or(Ok(floor), |tail| {
+                        tail.checked_add(1)
+                            .map(|next| floor.max(next))
+                            .ok_or_else(|| anyhow::anyhow!("workqueue enqueue tail overflow"))
+                    })?;
+            rows.push(RootInMemoryPodWorkqueueEntry {
+                id,
+                kind,
+                namespace: pod.namespace.clone(),
+                name: pod.name.clone(),
+                uid: pod.uid.clone(),
+                payload,
+                attempt_count,
+                next_attempt_at_ms: tail_next,
+            });
             let _ = last_error;
             Ok(())
         }
@@ -584,10 +618,14 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
     async fn claim_due(
         &self,
         now_ms: i64,
+        lease_duration_ms: i64,
     ) -> anyhow::Result<Option<crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry>> {
         if let Some(node_local) = &self.node_local {
             return node_local
-                .claim_due_work(klights_node_store::DueTimeMs::try_new(now_ms)?)
+                .claim_due_work_with_lease(klights_node_store::PodWorkqueueClaimRequest::try_new(
+                    now_ms,
+                    lease_duration_ms,
+                )?)
                 .await?
                 .map(focused_workqueue_entry)
                 .transpose();
@@ -606,27 +644,52 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
                 .min_by_key(|(_, row)| (row.next_attempt_at_ms, row.id))
                 .map(|(index, _)| index);
             Ok(candidate.map(|index| {
-                let row = rows.remove(index);
+                let row = &mut rows[index];
+                let lease_deadline_ms = now_ms
+                    .checked_add(lease_duration_ms)
+                    .expect("validated workqueue lease must not overflow");
+                row.next_attempt_at_ms = lease_deadline_ms;
+                let identity = match legacy_workqueue_kind(row.kind) {
+                    klights_node_store::PodWorkqueueKind::Pod => {
+                        klights_node_store::PodWorkIdentity::try_pod(PodIdentity::new(
+                            &row.namespace,
+                            &row.name,
+                            &row.uid,
+                        ))
+                    }
+                    klights_node_store::PodWorkqueueKind::Namespace => {
+                        klights_node_store::PodWorkIdentity::try_namespace(&row.name, &row.uid)
+                    }
+                }
+                .expect("in-memory workqueue row identity was validated on enqueue");
                 crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry {
                     id: row.id,
                     kind: row.kind,
-                    namespace: row.namespace,
-                    name: row.name,
-                    uid: row.uid,
-                    payload: row.payload,
+                    namespace: row.namespace.clone(),
+                    name: row.name.clone(),
+                    uid: row.uid.clone(),
+                    payload: row.payload.clone(),
                     attempt_count: row.attempt_count,
-                    #[cfg(any(test, feature = "pod-repository-test-support"))]
-                    next_attempt_at_ms: row.next_attempt_at_ms,
+                    lease_token: klights_node_store::PodWorkqueueLeaseToken::try_new(
+                        row.id,
+                        identity,
+                        lease_deadline_ms,
+                    )
+                    .expect("in-memory lease values were validated"),
                 }
             }))
         }
     }
 
-    async fn complete(&self, _id: i64) -> anyhow::Result<()> {
-        if self.node_local.is_some() {
-            // The durable port atomically removes the row when it is claimed,
-            // preserving the existing node.db claim semantics.
-            return Ok(());
+    async fn acknowledge(
+        &self,
+        token: klights_node_store::PodWorkqueueLeaseToken,
+    ) -> anyhow::Result<klights_node_store::PodWorkqueueMutationOutcome> {
+        if let Some(node_local) = &self.node_local {
+            return node_local
+                .acknowledge_work(token)
+                .await
+                .map_err(anyhow::Error::from);
         }
         #[cfg(not(any(test, feature = "pod-repository-test-support")))]
         return Err(anyhow::anyhow!(
@@ -634,32 +697,65 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
         ));
         #[cfg(any(test, feature = "pod-repository-test-support"))]
         {
-            self.test_rows.lock().unwrap().retain(|row| row.id != _id);
-            Ok(())
+            let mut rows = self.test_rows.lock().unwrap();
+            let before = rows.len();
+            rows.retain(|row| !in_memory_row_matches_token(row, &token));
+            Ok(if rows.len() < before {
+                klights_node_store::PodWorkqueueMutationOutcome::Applied
+            } else {
+                klights_node_store::PodWorkqueueMutationOutcome::Stale
+            })
         }
     }
 
-    async fn record_failure(
+    async fn requeue(
         &self,
         row: crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry,
+        attempt_count: i64,
         min_delay_ms: i64,
         error: &str,
-    ) -> anyhow::Result<()> {
-        let pod = PodIdentity::new(&row.namespace, &row.name, &row.uid);
-        self.enqueue(
-            row.kind,
-            &pod,
-            row.payload,
-            row.attempt_count.saturating_add(1),
-            min_delay_ms,
-            Some(error),
-        )
-        .await
-    }
-
-    async fn dead_letter(&self, id: i64, error: &str) -> anyhow::Result<()> {
-        let _ = error;
-        self.complete(id).await
+    ) -> anyhow::Result<klights_node_store::PodWorkqueueMutationOutcome> {
+        if let Some(node_local) = &self.node_local {
+            let request = klights_node_store::PodWorkqueueRequeue::try_new(
+                row.lease_token,
+                serde_json::to_vec(&row.payload)?,
+                attempt_count,
+                min_delay_ms,
+                Some(error.to_string()),
+            )?;
+            return node_local
+                .requeue_work(request)
+                .await
+                .map_err(anyhow::Error::from);
+        }
+        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+        return Err(anyhow::anyhow!(
+            "production Pod workqueue persistence requires node-local storage"
+        ));
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        {
+            let mut rows = self.test_rows.lock().unwrap();
+            let Some(stored) = rows
+                .iter_mut()
+                .find(|stored| in_memory_row_matches_token(stored, &row.lease_token))
+            else {
+                return Ok(klights_node_store::PodWorkqueueMutationOutcome::Stale);
+            };
+            let due = self
+                .wall_clock
+                .now_ms()
+                .checked_add(min_delay_ms)
+                .ok_or_else(|| anyhow::anyhow!("workqueue requeue due time overflow"))?;
+            stored.payload = row.payload;
+            stored.attempt_count = attempt_count;
+            stored.next_attempt_at_ms = if due == row.lease_token.leased_next_due_ms().get() {
+                due.checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("workqueue requeue due time overflow"))?
+            } else {
+                due
+            };
+            Ok(klights_node_store::PodWorkqueueMutationOutcome::Applied)
+        }
     }
 }
 

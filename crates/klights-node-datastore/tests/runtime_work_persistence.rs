@@ -3,11 +3,11 @@ use std::time::{Duration, SystemTime};
 
 use klights_node_datastore::{SqliteRuntimeWorkStore, open};
 use klights_node_store::{
-    DueTimeMs, OwnedPodSandbox, PodRuntimeAdmission, PodRuntimeCgroup, PodRuntimeStore,
-    PodSlotAdmissionEvent, PodSlotAdmissionEventSource, PodSlotAdmissionRequest,
-    PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotAdmissionStore, PodSlotClearResult,
-    PodSlotMutationResult, PodWorkIdentity, PodWorkqueueEnqueue, PodWorkqueueStore, ProbeKey,
-    ProbeResult, ProbeStateStore, RuntimePodUid, RuntimeWorkError,
+    OwnedPodSandbox, PodRuntimeAdmission, PodRuntimeCgroup, PodRuntimeStore, PodSlotAdmissionEvent,
+    PodSlotAdmissionEventSource, PodSlotAdmissionRequest, PodSlotAdmissionResult,
+    PodSlotAdmissionState, PodSlotAdmissionStore, PodSlotClearResult, PodSlotMutationResult,
+    PodWorkIdentity, PodWorkqueueClaimRequest, PodWorkqueueEnqueue, PodWorkqueueMutationOutcome,
+    PodWorkqueueStore, ProbeKey, ProbeResult, ProbeStateStore, RuntimePodUid, RuntimeWorkError,
 };
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor, WallClock};
 use klights_types::PodIdentity;
@@ -145,25 +145,41 @@ async fn runtime_probe_and_workqueue_preserve_existing_bytes_and_ordering() {
         .unwrap();
 
     assert_eq!(store.peek_next_due_ms().await.unwrap(), Some(100));
-    let first = store
-        .claim_due_work(DueTimeMs::try_new(101).unwrap())
+    let first_lease = store
+        .claim_due_work_with_lease(PodWorkqueueClaimRequest::try_new(101, 100).unwrap())
         .await
         .unwrap()
         .unwrap();
+    let first = first_lease.entry();
     assert_eq!(first.payload(), first_payload);
     assert_eq!(first.attempt_count(), 2);
-    assert_eq!(first.next_due_ms().get(), 100);
-    let second = store
-        .claim_due_work(DueTimeMs::try_new(101).unwrap())
+    assert_eq!(first.next_due_ms().get(), 201);
+    let second_lease = store
+        .claim_due_work_with_lease(PodWorkqueueClaimRequest::try_new(101, 100).unwrap())
         .await
         .unwrap()
         .unwrap();
+    let second = second_lease.entry();
     assert!(matches!(
         second.identity(),
         PodWorkIdentity::Namespace { name, uid }
             if name == "default" && uid == "namespace-uid"
     ));
-    assert_eq!(second.next_due_ms().get(), 101);
+    assert_eq!(second.next_due_ms().get(), 201);
+    assert_eq!(
+        store
+            .acknowledge_work(first_lease.token().clone())
+            .await
+            .unwrap(),
+        PodWorkqueueMutationOutcome::Applied
+    );
+    assert_eq!(
+        store
+            .acknowledge_work(second_lease.token().clone())
+            .await
+            .unwrap(),
+        PodWorkqueueMutationOutcome::Applied
+    );
     assert!(store.peek_next_due_ms().await.unwrap().is_none());
 }
 

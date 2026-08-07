@@ -7,13 +7,14 @@
 use std::sync::Arc;
 
 use klights_node_store::{
-    DueTimeMs, ObservedPodVersion, OwnedPodSandbox, PodRuntimeAdmission, PodRuntimeCgroup,
-    PodRuntimeRecord, PodRuntimeStore, PodSlotAdmissionEvent, PodSlotAdmissionEventSource,
-    PodSlotAdmissionRequest, PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotAdmissionStore,
-    PodSlotClearResult, PodSlotEventSubscription, PodSlotMutationResult, PodWorkIdentity,
-    PodWorkqueueEnqueue, PodWorkqueueEntry, PodWorkqueueKind, PodWorkqueueStore, ProbeKey,
-    ProbeResult, ProbeState, ProbeStateStore, RuntimeNamespace, RuntimePodUid, RuntimeWorkError,
-    RuntimeWorkFuture,
+    ObservedPodVersion, OwnedPodSandbox, PodRuntimeAdmission, PodRuntimeCgroup, PodRuntimeRecord,
+    PodRuntimeStore, PodSlotAdmissionEvent, PodSlotAdmissionEventSource, PodSlotAdmissionRequest,
+    PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotAdmissionStore, PodSlotClearResult,
+    PodSlotEventSubscription, PodSlotMutationResult, PodWorkIdentity, PodWorkqueueClaimRequest,
+    PodWorkqueueEnqueue, PodWorkqueueEntry, PodWorkqueueKind, PodWorkqueueLease,
+    PodWorkqueueLeaseToken, PodWorkqueueMutationOutcome, PodWorkqueueRequeue, PodWorkqueueStore,
+    ProbeKey, ProbeResult, ProbeState, ProbeStateStore, RuntimeNamespace, RuntimePodUid,
+    RuntimeWorkError, RuntimeWorkFuture,
 };
 use klights_supervisor::{DbExecutor, WallClock};
 use klights_types::PodIdentity;
@@ -329,15 +330,34 @@ impl PodWorkqueueStore for SqliteRuntimeWorkStore {
             let (kind, pod) = identity.into_persisted();
             let kind = workqueue_kind(kind);
             let now = self.now_ms();
-            let floor = now.saturating_add(minimum_delay_ms);
-            self.db_call("node_local:workqueue_enqueue", move |conn| {
+            let floor = now.checked_add(minimum_delay_ms).ok_or_else(|| {
+                RuntimeWorkError::invalid_input("next_due_ms", "enqueue delay overflow")
+            })?;
+            let result = self.db_call("node_local:workqueue_enqueue", move |conn| {
                 let tail_other: i64 = conn.query_row(
                     "SELECT COALESCE(MAX(next_due_ms), 0) FROM pod_workqueue \
                      WHERE NOT (kind = ?1 AND namespace = ?2 AND pod_name = ?3 AND pod_uid = ?4)",
                     rusqlite::params![kind, pod.namespace, pod.name, pod.uid],
                     |row| row.get(0),
                 )?;
-                let next_due_ms = floor.max(tail_other.saturating_add(1));
+                let current_due: Option<i64> = conn
+                    .query_row(
+                        "SELECT next_due_ms FROM pod_workqueue WHERE kind = ?1 AND namespace = ?2 AND pod_name = ?3 AND pod_uid = ?4",
+                        rusqlite::params![kind, pod.namespace, pod.name, pod.uid],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let tail_next = match tail_other.checked_add(1) {
+                    Some(value) => value,
+                    None => return Ok(Err("workqueue tail ordering overflow".to_string())),
+                };
+                let mut next_due_ms = floor.max(tail_next);
+                if current_due == Some(next_due_ms) {
+                    next_due_ms = match next_due_ms.checked_add(1) {
+                        Some(value) => value,
+                        None => return Ok(Err("workqueue lease invalidation overflow".to_string())),
+                    };
+                }
                 conn.execute(
                     "INSERT INTO pod_workqueue \
                      (kind, namespace, pod_name, pod_uid, payload, attempt_count, next_due_ms, last_error, enqueued_ms) \
@@ -360,10 +380,11 @@ impl PodWorkqueueStore for SqliteRuntimeWorkStore {
                         now
                     ],
                 )?;
-                Ok(())
+                Ok(Ok(()))
             })
             .await
-            .map_err(|error| persistence_error("pod_workqueue enqueue", error))
+            .map_err(|error| persistence_error("pod_workqueue enqueue", error))?;
+            result.map_err(|message| RuntimeWorkError::invalid_input("next_due_ms", message))
         })
     }
 
@@ -382,15 +403,22 @@ impl PodWorkqueueStore for SqliteRuntimeWorkStore {
         })
     }
 
-    fn claim_due_work(&self, now: DueTimeMs) -> RuntimeWorkFuture<'_, Option<PodWorkqueueEntry>> {
+    fn claim_due_work_with_lease(
+        &self,
+        request: PodWorkqueueClaimRequest,
+    ) -> RuntimeWorkFuture<'_, Option<PodWorkqueueLease>> {
         Box::pin(async move {
             self.db_call("node_local:workqueue_claim", move |conn| {
-                let transaction = conn.transaction()?;
-                let row = transaction
+                let row = conn
                     .query_row(
-                        "SELECT id, kind, namespace, pod_name, pod_uid, payload, attempt_count, next_due_ms \
-                         FROM pod_workqueue WHERE next_due_ms <= ?1 ORDER BY next_due_ms ASC, id ASC LIMIT 1",
-                        [now.get()],
+                        "WITH candidate AS (\
+                           SELECT id FROM pod_workqueue WHERE next_due_ms <= ?1 \
+                           ORDER BY next_due_ms ASC, id ASC LIMIT 1\
+                         ) \
+                         UPDATE pod_workqueue SET next_due_ms = ?2 \
+                         WHERE id = (SELECT id FROM candidate) AND next_due_ms <= ?1 \
+                         RETURNING id, kind, namespace, pod_name, pod_uid, payload, attempt_count, next_due_ms",
+                        rusqlite::params![request.now_ms().get(), request.lease_deadline_ms().get()],
                         |row| {
                             Ok(WorkqueueRow {
                                 id: row.get(0)?,
@@ -406,20 +434,110 @@ impl PodWorkqueueStore for SqliteRuntimeWorkStore {
                     )
                     .optional()?;
                 let Some(row) = row else {
-                    transaction.commit()?;
                     return Ok(Ok(None));
                 };
-                let id = row.id;
                 let entry = match workqueue_entry(row) {
                     Ok(entry) => entry,
                     Err(error) => return Ok(Err(error)),
                 };
-                transaction.execute("DELETE FROM pod_workqueue WHERE id = ?1", [id])?;
-                transaction.commit()?;
-                Ok(Ok(Some(entry)))
+                let token = match PodWorkqueueLeaseToken::try_new(
+                    entry.id().get(),
+                    entry.identity().clone(),
+                    request.lease_deadline_ms().get(),
+                ) {
+                    Ok(token) => token,
+                    Err(error) => return Ok(Err(error)),
+                };
+                match PodWorkqueueLease::try_new(entry, token) {
+                    Ok(lease) => Ok(Ok(Some(lease))),
+                    Err(error) => Ok(Err(error)),
+                }
             })
             .await
             .map_err(|error| persistence_error("pod_workqueue claim", error))?
+        })
+    }
+
+    fn acknowledge_work(
+        &self,
+        token: PodWorkqueueLeaseToken,
+    ) -> RuntimeWorkFuture<'_, PodWorkqueueMutationOutcome> {
+        Box::pin(async move {
+            let (id, identity, leased_next_due_ms) = token.into_parts();
+            let (kind, pod) = identity.into_persisted();
+            let kind = workqueue_kind(kind);
+            let updated = self
+                .db_call("node_local:workqueue_ack", move |conn| {
+                    conn.execute(
+                        "DELETE FROM pod_workqueue WHERE id = ?1 AND kind = ?2 AND namespace = ?3 AND pod_name = ?4 AND pod_uid = ?5 AND next_due_ms = ?6",
+                        rusqlite::params![id.get(), kind, pod.namespace, pod.name, pod.uid, leased_next_due_ms.get()],
+                    )
+                    .map_err(tokio_rusqlite::Error::from)
+                })
+                .await
+                .map_err(|error| persistence_error("pod_workqueue acknowledge", error))?;
+            Ok(if updated == 1 {
+                PodWorkqueueMutationOutcome::Applied
+            } else {
+                PodWorkqueueMutationOutcome::Stale
+            })
+        })
+    }
+
+    fn requeue_work(
+        &self,
+        request: PodWorkqueueRequeue,
+    ) -> RuntimeWorkFuture<'_, PodWorkqueueMutationOutcome> {
+        Box::pin(async move {
+            let (token, payload, attempt_count, minimum_delay_ms, last_error) =
+                request.into_parts();
+            let (id, identity, leased_next_due_ms) = token.into_parts();
+            let (kind, pod) = identity.into_persisted();
+            let kind = workqueue_kind(kind);
+            let now = self.now_ms();
+            let floor = now.checked_add(minimum_delay_ms).ok_or_else(|| {
+                RuntimeWorkError::invalid_input("next_due_ms", "requeue delay overflow")
+            })?;
+            let result = self
+                .db_call("node_local:workqueue_requeue", move |conn| {
+                    let transaction = conn.transaction()?;
+                    let tail_other: i64 = transaction.query_row(
+                        "SELECT COALESCE(MAX(next_due_ms), 0) FROM pod_workqueue WHERE id != ?1",
+                        [id.get()],
+                        |row| row.get(0),
+                    )?;
+                    let tail_next = match tail_other.checked_add(1) {
+                        Some(value) => value,
+                        None => return Ok(Err("workqueue tail ordering overflow".to_string())),
+                    };
+                    let mut next_due_ms = floor.max(tail_next);
+                    if next_due_ms == leased_next_due_ms.get() {
+                        next_due_ms = match next_due_ms.checked_add(1) {
+                            Some(value) => value,
+                            None => return Ok(Err("workqueue lease invalidation overflow".to_string())),
+                        };
+                    }
+                    let updated = transaction.execute(
+                        "UPDATE pod_workqueue SET payload = ?7, attempt_count = ?8, next_due_ms = ?9, last_error = ?10, enqueued_ms = ?11 \
+                         WHERE id = ?1 AND kind = ?2 AND namespace = ?3 AND pod_name = ?4 AND pod_uid = ?5 AND next_due_ms = ?6",
+                        rusqlite::params![
+                            id.get(), kind, pod.namespace, pod.name, pod.uid,
+                            leased_next_due_ms.get(), payload, attempt_count, next_due_ms,
+                            last_error, now,
+                        ],
+                    )?;
+                    transaction.commit()?;
+                    Ok(Ok(updated))
+                })
+                .await
+                .map_err(|error| persistence_error("pod_workqueue requeue", error))?;
+            let updated = result
+                .map_err(|message| RuntimeWorkError::invalid_input("next_due_ms", message))?;
+            Ok(if updated == 1 {
+                PodWorkqueueMutationOutcome::Applied
+            } else {
+                PodWorkqueueMutationOutcome::Stale
+            })
         })
     }
 }

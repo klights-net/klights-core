@@ -21,7 +21,7 @@ pub(crate) use test_delivery_compat::LegacyDeliveryTestStore;
 pub(crate) use test_runtime_work_compat::{
     DeadLetterRow, DeadLetterTestInsert, OutboxInsert, OutboxRow,
 };
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub(crate) use test_runtime_work_compat::{PodWorkqueueEntry, PodWorkqueueKind};
 
 pub use klights_node_datastore::schema;

@@ -45,6 +45,10 @@ pub enum RuntimeWorkError {
 }
 
 impl RuntimeWorkError {
+    pub fn invalid_input(field: &'static str, message: impl Into<String>) -> Self {
+        Self::invalid(field, message)
+    }
+
     pub fn persistence_failed(message: impl Into<String>) -> Self {
         Self::PersistenceFailed {
             message: message.into(),
@@ -211,6 +215,42 @@ impl DueTimeMs {
 
     pub const fn get(self) -> i64 {
         self.0
+    }
+}
+
+/// One bounded lease claim against the durable workqueue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PodWorkqueueClaimRequest {
+    now_ms: DueTimeMs,
+    lease_duration_ms: i64,
+    lease_deadline_ms: DueTimeMs,
+}
+
+impl PodWorkqueueClaimRequest {
+    pub fn try_new(now_ms: i64, lease_duration_ms: i64) -> Result<Self, RuntimeWorkError> {
+        let now_ms = DueTimeMs::try_new(now_ms)?;
+        require_positive(lease_duration_ms, "lease_duration_ms")?;
+        let lease_deadline_ms = now_ms
+            .get()
+            .checked_add(lease_duration_ms)
+            .ok_or_else(|| RuntimeWorkError::invalid("lease_deadline_ms", "must not overflow"))?;
+        Ok(Self {
+            now_ms,
+            lease_duration_ms,
+            lease_deadline_ms: DueTimeMs::try_new(lease_deadline_ms)?,
+        })
+    }
+
+    pub const fn now_ms(&self) -> DueTimeMs {
+        self.now_ms
+    }
+
+    pub const fn lease_duration_ms(&self) -> i64 {
+        self.lease_duration_ms
+    }
+
+    pub const fn lease_deadline_ms(&self) -> DueTimeMs {
+        self.lease_deadline_ms
     }
 }
 
@@ -743,6 +783,129 @@ pub struct PodWorkqueueEntry {
     next_due_ms: DueTimeMs,
 }
 
+/// Exact ownership token for one retained workqueue row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodWorkqueueLeaseToken {
+    id: WorkItemId,
+    identity: PodWorkIdentity,
+    leased_next_due_ms: DueTimeMs,
+}
+
+impl PodWorkqueueLeaseToken {
+    pub fn try_new(
+        id: i64,
+        identity: PodWorkIdentity,
+        leased_next_due_ms: i64,
+    ) -> Result<Self, RuntimeWorkError> {
+        Ok(Self {
+            id: WorkItemId::try_new(id)?,
+            identity,
+            leased_next_due_ms: DueTimeMs::try_new(leased_next_due_ms)?,
+        })
+    }
+
+    pub const fn id(&self) -> WorkItemId {
+        self.id
+    }
+
+    pub const fn identity(&self) -> &PodWorkIdentity {
+        &self.identity
+    }
+
+    pub const fn leased_next_due_ms(&self) -> DueTimeMs {
+        self.leased_next_due_ms
+    }
+
+    pub fn into_parts(self) -> (WorkItemId, PodWorkIdentity, DueTimeMs) {
+        (self.id, self.identity, self.leased_next_due_ms)
+    }
+}
+
+/// A retained workqueue row and the exact token which owns its current lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodWorkqueueLease {
+    entry: PodWorkqueueEntry,
+    token: PodWorkqueueLeaseToken,
+}
+
+impl PodWorkqueueLease {
+    pub fn try_new(
+        entry: PodWorkqueueEntry,
+        token: PodWorkqueueLeaseToken,
+    ) -> Result<Self, RuntimeWorkError> {
+        if entry.id() != token.id() || entry.identity() != token.identity() {
+            return Err(RuntimeWorkError::invalid(
+                "lease_token",
+                "must match the claimed row identity",
+            ));
+        }
+        Ok(Self { entry, token })
+    }
+
+    pub const fn entry(&self) -> &PodWorkqueueEntry {
+        &self.entry
+    }
+
+    pub const fn token(&self) -> &PodWorkqueueLeaseToken {
+        &self.token
+    }
+
+    pub fn into_parts(self) -> (PodWorkqueueEntry, PodWorkqueueLeaseToken) {
+        (self.entry, self.token)
+    }
+}
+
+/// Result of an exact lease-token mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PodWorkqueueMutationOutcome {
+    Applied,
+    Stale,
+}
+
+/// Exact-token requeue of one retained work item.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodWorkqueueRequeue {
+    token: PodWorkqueueLeaseToken,
+    payload: Vec<u8>,
+    attempt_count: i64,
+    minimum_delay_ms: i64,
+    last_error: Option<String>,
+}
+
+impl PodWorkqueueRequeue {
+    pub fn try_new(
+        token: PodWorkqueueLeaseToken,
+        payload: Vec<u8>,
+        attempt_count: i64,
+        minimum_delay_ms: i64,
+        last_error: Option<String>,
+    ) -> Result<Self, RuntimeWorkError> {
+        require_nonnegative(attempt_count, "attempt_count")?;
+        require_nonnegative(minimum_delay_ms, "minimum_delay_ms")?;
+        Ok(Self {
+            token,
+            payload,
+            attempt_count,
+            minimum_delay_ms,
+            last_error,
+        })
+    }
+
+    pub const fn token(&self) -> &PodWorkqueueLeaseToken {
+        &self.token
+    }
+
+    pub fn into_parts(self) -> (PodWorkqueueLeaseToken, Vec<u8>, i64, i64, Option<String>) {
+        (
+            self.token,
+            self.payload,
+            self.attempt_count,
+            self.minimum_delay_ms,
+            self.last_error,
+        )
+    }
+}
+
 impl PodWorkqueueEntry {
     pub fn try_new(
         id: i64,
@@ -952,8 +1115,21 @@ pub trait PodWorkqueueStore: Send + Sync {
     /// the current tail of every other key while honoring the minimum delay.
     fn enqueue_work(&self, entry: PodWorkqueueEnqueue) -> RuntimeWorkFuture<'_, ()>;
     fn peek_next_due_ms(&self) -> RuntimeWorkFuture<'_, Option<i64>>;
-    /// Atomically claims and removes the due row ordered by `(next_due_ms, id)`.
-    fn claim_due_work(&self, now: DueTimeMs) -> RuntimeWorkFuture<'_, Option<PodWorkqueueEntry>>;
+    /// Atomically leases and retains the due row ordered by `(next_due_ms, id)`.
+    fn claim_due_work_with_lease(
+        &self,
+        request: PodWorkqueueClaimRequest,
+    ) -> RuntimeWorkFuture<'_, Option<PodWorkqueueLease>>;
+    /// Removes only the exact currently leased row and reports stale ownership.
+    fn acknowledge_work(
+        &self,
+        token: PodWorkqueueLeaseToken,
+    ) -> RuntimeWorkFuture<'_, PodWorkqueueMutationOutcome>;
+    /// Requeues only the exact currently leased row and reports stale ownership.
+    fn requeue_work(
+        &self,
+        request: PodWorkqueueRequeue,
+    ) -> RuntimeWorkFuture<'_, PodWorkqueueMutationOutcome>;
 }
 
 /// Exact node-local Pod slot admission and UID-CAS persistence.

@@ -41,9 +41,10 @@ pub use runtime_work::{
     PodRuntimeRecord, PodRuntimeStore, PodSlotAdmissionEvent, PodSlotAdmissionEventSource,
     PodSlotAdmissionRequest, PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotAdmissionStore,
     PodSlotClearResult, PodSlotEventSubscription, PodSlotMutationResult, PodWorkIdentity,
-    PodWorkqueueEnqueue, PodWorkqueueEntry, PodWorkqueueKind, PodWorkqueueStore, ProbeKey,
-    ProbeResult, ProbeState, ProbeStateStore, RuntimeNamespace, RuntimePodUid, RuntimeWorkError,
-    RuntimeWorkFuture, WorkItemId,
+    PodWorkqueueClaimRequest, PodWorkqueueEnqueue, PodWorkqueueEntry, PodWorkqueueKind,
+    PodWorkqueueLease, PodWorkqueueLeaseToken, PodWorkqueueMutationOutcome, PodWorkqueueRequeue,
+    PodWorkqueueStore, ProbeKey, ProbeResult, ProbeState, ProbeStateStore, RuntimeNamespace,
+    RuntimePodUid, RuntimeWorkError, RuntimeWorkFuture, WorkItemId,
 };
 
 #[cfg(test)]

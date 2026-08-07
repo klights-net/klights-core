@@ -2661,26 +2661,41 @@ impl IntegrationPodRepositoryComposition {
         &self,
     ) -> anyhow::Result<Option<IntegrationPodWorkqueueEntry>> {
         let stores = self.node_local.as_ref().expect("GC workqueue fixture");
-        let row = stores
+        let lease = stores
             .pod_workqueue()
-            .claim_due_work(klights_node_store::DueTimeMs::try_new(i64::MAX)?)
+            .claim_due_work_with_lease(klights_node_store::PodWorkqueueClaimRequest::try_new(
+                i64::MAX - 1,
+                1,
+            )?)
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        Ok(row.and_then(|row| {
-            let klights_node_store::PodWorkIdentity::Pod(identity) = row.identity() else {
-                return None;
-            };
-            let payload: serde_json::Value = serde_json::from_slice(row.payload()).ok()?;
-            Some(IntegrationPodWorkqueueEntry {
-                namespace: identity.namespace.clone(),
-                name: identity.name.clone(),
-                uid: identity.uid.clone(),
-                target_node: payload
-                    .get("target_node")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string),
-            })
-        }))
+        let Some(lease) = lease else {
+            return Ok(None);
+        };
+        let result = {
+            let row = lease.entry();
+            match row.identity() {
+                klights_node_store::PodWorkIdentity::Pod(identity) => {
+                    let payload: serde_json::Value = serde_json::from_slice(row.payload())?;
+                    Some(IntegrationPodWorkqueueEntry {
+                        namespace: identity.namespace.clone(),
+                        name: identity.name.clone(),
+                        uid: identity.uid.clone(),
+                        target_node: payload
+                            .get("target_node")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                    })
+                }
+                klights_node_store::PodWorkIdentity::Namespace { .. } => None,
+            }
+        };
+        stores
+            .pod_workqueue()
+            .acknowledge_work(lease.token().clone())
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        Ok(result)
     }
 
     pub async fn run_gc_cascade(

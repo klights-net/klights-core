@@ -19,8 +19,9 @@ use klights_reconcile_api::{
 use serde_json::{Map, Value, json};
 use tokio::sync::Notify;
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
-use crate::datastore::node_local::PodWorkqueueEntry as LegacyPodWorkqueueEntry;
+#[cfg(test)]
+use klights_node_store::{PodWorkqueueClaimRequest, PodWorkqueueLease, PodWorkqueueRequeue};
+use klights_node_store::{PodWorkqueueLeaseToken, PodWorkqueueMutationOutcome};
 use klights_reconcile_api::ReconcileFailureMetrics;
 use klights_supervisor::{TaskCategory, TaskSupervisor};
 use klights_types::PodIdentity;
@@ -32,6 +33,7 @@ const MIN_DELAY_MS: i64 = 5_000;
 const POD_DELETE_TARGET_NODE_PAYLOAD_KEY: &str = "target_node";
 const POD_DELETE_LAST_RESIGNAL_MS_PAYLOAD_KEY: &str = "last_resignal_ms";
 const REMOTE_POD_DELETE_RESIGNAL_MIN_INTERVAL_MS: i64 = 30_000;
+const WORK_LEASE_MS: i64 = 30_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PodWorkqueueKind {
@@ -48,8 +50,7 @@ pub(crate) struct PodWorkqueueEntry {
     pub uid: String,
     pub payload: Value,
     pub attempt_count: i64,
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
-    pub next_attempt_at_ms: i64,
+    pub lease_token: PodWorkqueueLeaseToken,
 }
 
 #[async_trait::async_trait]
@@ -64,18 +65,25 @@ pub(crate) trait PodWorkqueuePersistence: Send + Sync {
         last_error: Option<&str>,
     ) -> Result<()>;
     async fn peek_next_due(&self) -> Result<Option<i64>>;
-    async fn claim_due(&self, now_ms: i64) -> Result<Option<PodWorkqueueEntry>>;
-    async fn complete(&self, id: i64) -> Result<()>;
-    async fn record_failure(
+    async fn claim_due(
+        &self,
+        now_ms: i64,
+        lease_duration_ms: i64,
+    ) -> Result<Option<PodWorkqueueEntry>>;
+    async fn acknowledge(
+        &self,
+        token: PodWorkqueueLeaseToken,
+    ) -> Result<PodWorkqueueMutationOutcome>;
+    async fn requeue(
         &self,
         row: PodWorkqueueEntry,
+        attempt_count: i64,
         min_delay_ms: i64,
         error: &str,
-    ) -> Result<()>;
-    async fn dead_letter(&self, id: i64, error: &str) -> Result<()>;
+    ) -> Result<PodWorkqueueMutationOutcome>;
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 fn legacy_kind(kind: PodWorkqueueKind) -> crate::datastore::node_local::PodWorkqueueKind {
     match kind {
         PodWorkqueueKind::Pod => crate::datastore::node_local::PodWorkqueueKind::Pod,
@@ -83,8 +91,28 @@ fn legacy_kind(kind: PodWorkqueueKind) -> crate::datastore::node_local::PodWorkq
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
-fn focused_entry(row: LegacyPodWorkqueueEntry) -> PodWorkqueueEntry {
+#[cfg(test)]
+fn focused_lease_entry(lease: PodWorkqueueLease) -> Result<PodWorkqueueEntry> {
+    let (row, lease_token) = lease.into_parts();
+    let (id, identity, payload, attempt_count, _next_due_ms) = row.into_parts();
+    let (kind, pod) = identity.into_persisted();
+    Ok(PodWorkqueueEntry {
+        id: id.get(),
+        kind: match kind {
+            klights_node_store::PodWorkqueueKind::Pod => PodWorkqueueKind::Pod,
+            klights_node_store::PodWorkqueueKind::Namespace => PodWorkqueueKind::Namespace,
+        },
+        namespace: pod.namespace,
+        name: pod.name,
+        uid: pod.uid,
+        payload: serde_json::from_slice(&payload)?,
+        attempt_count,
+        lease_token,
+    })
+}
+
+#[cfg(test)]
+fn focused_test_entry(row: crate::datastore::node_local::PodWorkqueueEntry) -> PodWorkqueueEntry {
     PodWorkqueueEntry {
         id: row.id,
         kind: match row.kind {
@@ -98,25 +126,11 @@ fn focused_entry(row: LegacyPodWorkqueueEntry) -> PodWorkqueueEntry {
         uid: row.uid,
         payload: row.payload,
         attempt_count: row.attempt_count,
-        next_attempt_at_ms: row.next_attempt_at_ms,
+        lease_token: row.lease_token,
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
-fn legacy_entry(row: PodWorkqueueEntry) -> LegacyPodWorkqueueEntry {
-    LegacyPodWorkqueueEntry {
-        id: row.id,
-        kind: legacy_kind(row.kind),
-        namespace: row.namespace,
-        name: row.name,
-        uid: row.uid,
-        payload: row.payload,
-        attempt_count: row.attempt_count,
-        next_attempt_at_ms: row.next_attempt_at_ms,
-    }
-}
-
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 #[async_trait::async_trait]
 impl PodWorkqueuePersistence for std::sync::Arc<crate::datastore::node_local::NodeLocalStores> {
     async fn enqueue(
@@ -144,41 +158,48 @@ impl PodWorkqueuePersistence for std::sync::Arc<crate::datastore::node_local::No
         self.as_ref().peek_workqueue_next_due().await
     }
 
-    async fn claim_due(&self, now_ms: i64) -> Result<Option<PodWorkqueueEntry>> {
+    async fn claim_due(
+        &self,
+        now_ms: i64,
+        lease_duration_ms: i64,
+    ) -> Result<Option<PodWorkqueueEntry>> {
+        self.as_ref()
+            .pod_workqueue()
+            .claim_due_work_with_lease(PodWorkqueueClaimRequest::try_new(
+                now_ms,
+                lease_duration_ms,
+            )?)
+            .await?
+            .map(focused_lease_entry)
+            .transpose()
+    }
+
+    async fn acknowledge(
+        &self,
+        token: PodWorkqueueLeaseToken,
+    ) -> Result<PodWorkqueueMutationOutcome> {
         Ok(self
             .as_ref()
-            .claim_workqueue_due(now_ms)
-            .await?
-            .map(focused_entry))
+            .pod_workqueue()
+            .acknowledge_work(token)
+            .await?)
     }
 
-    async fn complete(&self, id: i64) -> Result<()> {
-        self.as_ref().complete_workqueue(id).await
-    }
-
-    async fn record_failure(
+    async fn requeue(
         &self,
         row: PodWorkqueueEntry,
+        attempt_count: i64,
         min_delay_ms: i64,
         error: &str,
-    ) -> Result<()> {
-        let row = legacy_entry(row);
-        let pod = PodIdentity::new(&row.namespace, &row.name, &row.uid);
-        self.as_ref()
-            .enqueue_workqueue(
-                row.kind,
-                &pod,
-                row.payload,
-                row.attempt_count.saturating_add(1),
-                min_delay_ms,
-                Some(error),
-            )
-            .await
-    }
-
-    async fn dead_letter(&self, id: i64, error: &str) -> Result<()> {
-        let _ = error;
-        self.as_ref().complete_workqueue(id).await
+    ) -> Result<PodWorkqueueMutationOutcome> {
+        let request = PodWorkqueueRequeue::try_new(
+            row.lease_token,
+            serde_json::to_vec(&row.payload)?,
+            attempt_count,
+            min_delay_ms,
+            Some(error.to_string()),
+        )?;
+        Ok(self.as_ref().pod_workqueue().requeue_work(request).await?)
     }
 }
 
@@ -367,6 +388,7 @@ impl PodWorkqueue {
     /// pod_workqueue. The reconciler loop picks it up immediately
     /// (notify_one), runs `run_namespace_termination`, and on Err
     /// re-schedules with `MIN_DELAY_MS` backoff up to `MAX_ATTEMPTS`.
+    /// Pod work is never subject to that namespace-only attempt ceiling.
     /// Each retry is short-lived so the PodDeleteWorkqueue slot
     /// churns naturally between many concurrent namespace deletes.
     pub(super) async fn enqueue_namespace_termination(
@@ -421,6 +443,9 @@ impl PodWorkqueue {
         let mut leader_lease: Option<ControllerLease> = None;
         let mut scan_on_gain = false;
         loop {
+            if cancel.is_cancelled() {
+                return;
+            }
             if let Some(coordination) = self.leader_coordination.as_ref()
                 && leader_lease.is_none()
             {
@@ -517,11 +542,26 @@ impl PodWorkqueue {
             // runs on Background (unlimited) so a slow ns retry cannot
             // block pod cleanup, and many concurrent ns deletes can each
             // make progress without serializing through the limit.
-            let row = match self.persistence.claim_due(self.wall_clock.now_ms()).await {
+            let row = match self
+                .persistence
+                .claim_due(self.wall_clock.now_ms(), WORK_LEASE_MS)
+                .await
+            {
                 Ok(Some(row)) => row,
                 Ok(None) => continue,
                 Err(e) => {
                     tracing::error!(error = %e, "pod_workqueue: claim_due failed");
+                    tokio::select! {
+                        _ = self.supervisor.sleep(
+                            "pod_workqueue_claim_error_backoff",
+                            Duration::from_millis(250),
+                        ) => {}
+                        _ = coordination_revoked(
+                            &self.leader_coordination,
+                            &leader_lease,
+                        ) => leader_lease = None,
+                        _ = cancel.cancelled() => return,
+                    }
                     continue;
                 }
             };
@@ -542,21 +582,72 @@ impl PodWorkqueue {
                 && !self.supervisor.is_category_free(category)
             {
                 let free = self.supervisor.category_free_notify(category);
-                tokio::select! {
-                    _ = free.notified() => {}
-                    _ = self.wake.notified() => {}
-                    _ = cancel.cancelled() => return,
+                enum WaitOutcome {
+                    Ready,
+                    Wake,
+                    Revoked,
+                    Cancelled,
+                    LeaseDeadline,
+                }
+                let lease_remaining_ms = row
+                    .lease_token
+                    .leased_next_due_ms()
+                    .get()
+                    .saturating_sub(self.wall_clock.now_ms())
+                    .max(0) as u64;
+                let outcome = tokio::select! {
+                    _ = free.notified() => WaitOutcome::Ready,
+                    _ = self.wake.notified() => WaitOutcome::Wake,
+                    _ = coordination_revoked(
+                        &self.leader_coordination,
+                        &leader_lease,
+                    ) => WaitOutcome::Revoked,
+                    _ = cancel.cancelled() => WaitOutcome::Cancelled,
+                    _ = self.supervisor.sleep(
+                        "pod_workqueue_claim_lease_deadline",
+                        Duration::from_millis(lease_remaining_ms),
+                    ) => WaitOutcome::LeaseDeadline,
+                };
+                match outcome {
+                    WaitOutcome::Ready => {}
+                    WaitOutcome::Wake => {
+                        self.park_claimed_row(row, "deferred delete category wait interrupted")
+                            .await;
+                        continue;
+                    }
+                    WaitOutcome::Revoked => {
+                        leader_lease = None;
+                        self.park_claimed_row(row, "leadership lost during category wait")
+                            .await;
+                        continue;
+                    }
+                    WaitOutcome::Cancelled => {
+                        self.park_claimed_row(row, "shutdown during deferred delete category wait")
+                            .await;
+                        return;
+                    }
+                    WaitOutcome::LeaseDeadline => {
+                        self.park_claimed_row(row, "deferred delete claim lease reached deadline")
+                            .await;
+                        continue;
+                    }
                 }
             }
 
             let this = self.clone();
             let task_lease = leader_lease.clone();
-            let _ = self
+            let task_row = row.clone();
+            if let Err(error) = self
                 .supervisor
                 .spawn_async(category, "pod_workqueue_retry", async move {
-                    this.run_retry(row, task_lease).await;
+                    this.run_retry(task_row, task_lease).await;
                 })
-                .await;
+                .await
+            {
+                tracing::warn!(?error, "pod_workqueue: retry spawn refused");
+                self.park_claimed_row(row, "deferred delete retry spawn refused")
+                    .await;
+            }
         }
     }
 
@@ -565,6 +656,7 @@ impl PodWorkqueue {
         mut row: PodWorkqueueEntry,
         leader_lease: Option<ControllerLease>,
     ) {
+        let _work_id = row.id;
         let target_node = row
             .payload
             .get(POD_DELETE_TARGET_NODE_PAYLOAD_KEY)
@@ -613,16 +705,29 @@ impl PodWorkqueue {
             return;
         }
         if result.is_ok() {
-            let _ = self.persistence.complete(row.id).await;
+            match self.persistence.acknowledge(row.lease_token).await {
+                Ok(PodWorkqueueMutationOutcome::Applied) => {}
+                Ok(PodWorkqueueMutationOutcome::Stale) => {
+                    tracing::debug!(
+                        "pod_workqueue: success acknowledge lost stale lease ownership"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(%error, "pod_workqueue: success acknowledge failed");
+                }
+            }
             return;
         }
 
         let err = result.expect_err("error is present");
-        if row.attempt_count >= MAX_ATTEMPTS {
-            let _ = self
-                .persistence
-                .dead_letter(row.id, &format!("{err:#}"))
-                .await;
+        if row.kind == PodWorkqueueKind::Namespace && row.attempt_count >= MAX_ATTEMPTS {
+            match self.persistence.acknowledge(row.lease_token).await {
+                Ok(PodWorkqueueMutationOutcome::Applied | PodWorkqueueMutationOutcome::Stale) => {}
+                Err(error) => {
+                    tracing::error!(%error, "pod_workqueue: namespace dead-letter acknowledge failed");
+                    return;
+                }
+            }
             self.bump_dead_letter_metric(row.kind);
             tracing::error!(
                 kind = ?row.kind,
@@ -635,32 +740,43 @@ impl PodWorkqueue {
             return;
         }
 
-        if let Err(enq_err) = self
+        let next_attempt = match row.attempt_count.checked_add(1) {
+            Some(attempt) => attempt,
+            None => {
+                tracing::error!("pod_workqueue: attempt count overflow; parking without increment");
+                row.attempt_count
+            }
+        };
+        match self
             .persistence
-            .record_failure(row, MIN_DELAY_MS, &format!("{err:#}"))
+            .requeue(row, next_attempt, MIN_DELAY_MS, &format!("{err:#}"))
             .await
         {
-            tracing::error!(error = %enq_err, "pod_workqueue: record_failure failed");
-            return;
+            Ok(PodWorkqueueMutationOutcome::Applied) => {}
+            Ok(PodWorkqueueMutationOutcome::Stale) => {
+                tracing::debug!("pod_workqueue: retry requeue lost stale lease ownership");
+                return;
+            }
+            Err(enq_err) => {
+                tracing::error!(error = %enq_err, "pod_workqueue: record_failure failed");
+                return;
+            }
         }
         self.wake.notify_one();
     }
 
     async fn park_claimed_row(&self, row: PodWorkqueueEntry, reason: &str) {
-        let pod = PodIdentity::new(&row.namespace, &row.name, &row.uid);
-        if let Err(error) = self
+        let attempt_count = row.attempt_count;
+        match self
             .persistence
-            .enqueue(
-                row.kind,
-                &pod,
-                row.payload,
-                row.attempt_count,
-                0,
-                Some(reason),
-            )
+            .requeue(row, attempt_count, 0, reason)
             .await
         {
-            tracing::error!(%error, "pod_workqueue: failed to park work after leadership loss");
+            Ok(PodWorkqueueMutationOutcome::Applied) => self.wake.notify_one(),
+            Ok(PodWorkqueueMutationOutcome::Stale) => {}
+            Err(error) => {
+                tracing::error!(%error, "pod_workqueue: failed to park work after leadership loss");
+            }
         }
     }
 
@@ -1133,6 +1249,160 @@ mod tests {
     use klights_kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleWorkKind};
     use klights_kubelet::pod_lifecycle_router::LifecycleReplyHandle;
     use klights_kubelet::pod_lifecycle_router::executor::{ExecutorError, PodWorkExecutor};
+    use std::sync::atomic::AtomicUsize;
+
+    struct FixedRuntimeClock(i64);
+
+    impl klights_kubelet::runtime_clock::RuntimeClock for FixedRuntimeClock {
+        fn now_ms(&self) -> i64 {
+            self.0
+        }
+    }
+
+    struct ProbePersistence {
+        peeks: AtomicUsize,
+        claims: AtomicUsize,
+        claim_error: bool,
+    }
+
+    struct SpawnRefusalPersistence {
+        claim_entered: Notify,
+        release_claim: Notify,
+        requeued: Notify,
+        requeue_count: AtomicUsize,
+    }
+
+    impl SpawnRefusalPersistence {
+        fn claimed_row() -> PodWorkqueueEntry {
+            let identity = klights_node_store::PodWorkIdentity::try_namespace(
+                "spawn-refusal",
+                "uid-spawn-refusal",
+            )
+            .unwrap();
+            PodWorkqueueEntry {
+                id: 1,
+                kind: PodWorkqueueKind::Namespace,
+                namespace: String::new(),
+                name: "spawn-refusal".to_string(),
+                uid: "uid-spawn-refusal".to_string(),
+                payload: json!({}),
+                attempt_count: 0,
+                lease_token: PodWorkqueueLeaseToken::try_new(1, identity, WORK_LEASE_MS).unwrap(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PodWorkqueuePersistence for Arc<SpawnRefusalPersistence> {
+        async fn enqueue(
+            &self,
+            _kind: PodWorkqueueKind,
+            _pod: &PodIdentity,
+            _payload: Value,
+            _attempt_count: i64,
+            _min_delay_ms: i64,
+            _last_error: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn peek_next_due(&self) -> Result<Option<i64>> {
+            Ok(Some(0))
+        }
+
+        async fn claim_due(
+            &self,
+            _now_ms: i64,
+            _lease_duration_ms: i64,
+        ) -> Result<Option<PodWorkqueueEntry>> {
+            self.claim_entered.notify_one();
+            self.release_claim.notified().await;
+            Ok(Some(SpawnRefusalPersistence::claimed_row()))
+        }
+
+        async fn acknowledge(
+            &self,
+            _token: PodWorkqueueLeaseToken,
+        ) -> Result<PodWorkqueueMutationOutcome> {
+            unreachable!("spawn refusal must park, not acknowledge")
+        }
+
+        async fn requeue(
+            &self,
+            _row: PodWorkqueueEntry,
+            _attempt_count: i64,
+            _min_delay_ms: i64,
+            _error: &str,
+        ) -> Result<PodWorkqueueMutationOutcome> {
+            self.requeue_count.fetch_add(1, Ordering::Relaxed);
+            self.requeued.notify_one();
+            Ok(PodWorkqueueMutationOutcome::Applied)
+        }
+    }
+
+    impl ProbePersistence {
+        fn idle() -> Self {
+            Self {
+                peeks: AtomicUsize::new(0),
+                claims: AtomicUsize::new(0),
+                claim_error: false,
+            }
+        }
+
+        fn failing_claim() -> Self {
+            Self {
+                peeks: AtomicUsize::new(0),
+                claims: AtomicUsize::new(0),
+                claim_error: true,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PodWorkqueuePersistence for Arc<ProbePersistence> {
+        async fn enqueue(
+            &self,
+            _kind: PodWorkqueueKind,
+            _pod: &PodIdentity,
+            _payload: Value,
+            _attempt_count: i64,
+            _min_delay_ms: i64,
+            _last_error: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn peek_next_due(&self) -> Result<Option<i64>> {
+            self.peeks.fetch_add(1, Ordering::Relaxed);
+            Ok(self.claim_error.then_some(0))
+        }
+
+        async fn claim_due(
+            &self,
+            _now_ms: i64,
+            _lease_duration_ms: i64,
+        ) -> Result<Option<PodWorkqueueEntry>> {
+            self.claims.fetch_add(1, Ordering::Relaxed);
+            Err(anyhow::anyhow!("injected claim failure"))
+        }
+
+        async fn acknowledge(
+            &self,
+            _token: PodWorkqueueLeaseToken,
+        ) -> Result<PodWorkqueueMutationOutcome> {
+            unreachable!("probe persistence never yields a claimed row")
+        }
+
+        async fn requeue(
+            &self,
+            _row: PodWorkqueueEntry,
+            _attempt_count: i64,
+            _min_delay_ms: i64,
+            _error: &str,
+        ) -> Result<PodWorkqueueMutationOutcome> {
+            unreachable!("probe persistence never yields a claimed row")
+        }
+    }
 
     #[derive(Clone, Copy)]
     struct TestCoordinationState {
@@ -1347,6 +1617,330 @@ mod tests {
         );
         *workqueue.local_node_name.lock().unwrap() = Some("node-a".to_string());
         (workqueue, db, node_local)
+    }
+
+    async fn probe_workqueue(persistence: Arc<ProbePersistence>) -> Arc<PodWorkqueue> {
+        probe_workqueue_for_persistence(persistence).await
+    }
+
+    async fn probe_workqueue_for_persistence(
+        persistence: impl PodWorkqueuePersistence + 'static,
+    ) -> Arc<PodWorkqueue> {
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let store = Arc::new(crate::pod_repository_composition::new_pod_store(db));
+        PodWorkqueue::new(
+            store,
+            persistence,
+            Arc::new(klights_supervisor::TaskSupervisor::new(
+                klights_supervisor::TaskCategoryConfig::default(),
+            )),
+            SideEffectMetrics::new(),
+            Arc::new(FixedRuntimeClock(0)),
+        )
+    }
+
+    async fn wait_for_claimed_due(
+        node_local: &Arc<crate::datastore::node_local::NodeLocalStores>,
+        initial_due: i64,
+    ) -> i64 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let due = node_local.peek_workqueue_next_due().await.unwrap().unwrap();
+            if due > initial_due + 1_000 {
+                return due;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "workqueue row was not claimed with a lease"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn wait_for_parked_due(
+        node_local: &Arc<crate::datastore::node_local::NodeLocalStores>,
+        leased_due: i64,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if node_local
+                .peek_workqueue_next_due()
+                .await
+                .unwrap()
+                .is_some_and(|due| due != leased_due)
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "claimed workqueue row was not parked"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn capacity_blocked_workqueue(
+        coordination: Option<Arc<dyn ControllerCoordination>>,
+    ) -> (
+        Arc<PodWorkqueue>,
+        Arc<crate::datastore::node_local::NodeLocalStores>,
+        Arc<klights_supervisor::TaskSupervisor>,
+        Arc<Notify>,
+    ) {
+        let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let persistence = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
+            db,
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        );
+        let mut config = klights_supervisor::TaskCategoryConfig::default();
+        config.pod_delete_workqueue = 1;
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(config));
+        let persistence_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let node_local = super::super::test_node_local_store(persistence_supervisor).await;
+        let release = Arc::new(Notify::new());
+        let task_release = release.clone();
+        supervisor
+            .spawn_async(
+                TaskCategory::PodDeleteWorkqueue,
+                "pod_workqueue_capacity_blocker",
+                async move { task_release.notified().await },
+            )
+            .await
+            .unwrap();
+        let workqueue = match coordination {
+            Some(coordination) => PodWorkqueue::new_leader(
+                persistence.store,
+                node_local.clone(),
+                supervisor.clone(),
+                SideEffectMetrics::new(),
+                persistence.unscheduled_deletion,
+                coordination,
+                Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+            ),
+            None => PodWorkqueue::new(
+                persistence.store,
+                node_local.clone(),
+                supervisor.clone(),
+                SideEffectMetrics::new(),
+                Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+            ),
+        };
+        (workqueue, node_local, supervisor, release)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_reconciler_waits_for_notification_without_polling() {
+        let persistence = Arc::new(ProbePersistence::idle());
+        let workqueue = probe_workqueue(persistence.clone()).await;
+        workqueue.ensure_reconciler_started().await.unwrap();
+        for _ in 0..20 {
+            if persistence.peeks.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(persistence.peeks.load(Ordering::Relaxed), 1);
+        assert_eq!(persistence.claims.load(Ordering::Relaxed), 0);
+        tokio::time::advance(Duration::from_secs(3_600)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            persistence.peeks.load(Ordering::Relaxed),
+            1,
+            "an idle queue must remain notification-driven even as time advances"
+        );
+        workqueue.supervisor.root_cancellation_token().cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn claim_errors_use_supervised_one_shot_backoff() {
+        let persistence = Arc::new(ProbePersistence::failing_claim());
+        let workqueue = probe_workqueue(persistence.clone()).await;
+        workqueue.ensure_reconciler_started().await.unwrap();
+        for _ in 0..20 {
+            if persistence.claims.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(persistence.claims.load(Ordering::Relaxed), 1);
+        tokio::time::advance(Duration::from_millis(249)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(persistence.claims.load(Ordering::Relaxed), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        for _ in 0..20 {
+            if persistence.claims.load(Ordering::Relaxed) >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(persistence.claims.load(Ordering::Relaxed), 2);
+        workqueue.supervisor.root_cancellation_token().cancel();
+    }
+
+    #[tokio::test]
+    async fn category_capacity_wake_parks_exact_claim_and_notifies_retry() {
+        let (workqueue, node_local, supervisor, release) = capacity_blocked_workqueue(None).await;
+        workqueue
+            .enqueue_deferred_delete(
+                "default".to_string(),
+                "capacity-wait".to_string(),
+                "uid-capacity".to_string(),
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        let initial_due = node_local.peek_workqueue_next_due().await.unwrap().unwrap();
+        let leased_due = wait_for_claimed_due(&node_local, initial_due).await;
+        workqueue.wake.notify_one();
+        wait_for_parked_due(&node_local, leased_due).await;
+        assert!(
+            node_local
+                .claim_workqueue_due(i64::MAX)
+                .await
+                .unwrap()
+                .is_some(),
+            "category interruption must preserve the exact durable row"
+        );
+        release.notify_waiters();
+        supervisor.root_cancellation_token().cancel();
+    }
+
+    #[tokio::test]
+    async fn leadership_loss_during_category_wait_parks_exact_claim() {
+        let (coordination, publisher) = test_coordination(true);
+        let (workqueue, node_local, supervisor, release) =
+            capacity_blocked_workqueue(Some(coordination)).await;
+        workqueue.start().await.unwrap();
+        workqueue
+            .enqueue_deferred_delete(
+                "default".to_string(),
+                "leadership-wait".to_string(),
+                "uid-leadership".to_string(),
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        let initial_due = node_local.peek_workqueue_next_due().await.unwrap().unwrap();
+        let leased_due = wait_for_claimed_due(&node_local, initial_due).await;
+        publisher.send_replace(TestCoordinationState {
+            local: false,
+            generation: 2,
+        });
+        wait_for_parked_due(&node_local, leased_due).await;
+        assert!(
+            node_local
+                .claim_workqueue_due(i64::MAX)
+                .await
+                .unwrap()
+                .is_some(),
+            "leadership loss must preserve the exact durable row"
+        );
+        release.notify_waiters();
+        supervisor.root_cancellation_token().cancel();
+    }
+
+    #[tokio::test]
+    async fn spawn_refusal_parks_claimed_row_before_reconciler_exits() {
+        let persistence = Arc::new(SpawnRefusalPersistence {
+            claim_entered: Notify::new(),
+            release_claim: Notify::new(),
+            requeued: Notify::new(),
+            requeue_count: AtomicUsize::new(0),
+        });
+        let workqueue = probe_workqueue_for_persistence(persistence.clone()).await;
+        workqueue.ensure_reconciler_started().await.unwrap();
+        persistence.claim_entered.notified().await;
+
+        let supervisor = workqueue.supervisor.clone();
+        let shutdown =
+            tokio::spawn(async move { supervisor.shutdown(Duration::from_secs(2)).await });
+        tokio::task::yield_now().await;
+        persistence.release_claim.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), persistence.requeued.notified())
+            .await
+            .expect("spawn refusal must park the claimed row");
+        assert_eq!(persistence.requeue_count.load(Ordering::Relaxed), 1);
+        let report = shutdown.await.unwrap();
+        assert!(!report.timed_out);
+    }
+
+    #[tokio::test]
+    async fn namespace_attempt_ceiling_acks_but_pod_attempt_ceiling_requeues() {
+        let (workqueue, db, node_local) = test_workqueue().await;
+
+        node_local
+            .enqueue_workqueue(
+                crate::datastore::node_local::PodWorkqueueKind::Namespace,
+                &PodIdentity::new("", "terminating", "uid-namespace"),
+                json!({}),
+                MAX_ATTEMPTS,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        let due = node_local.peek_workqueue_next_due().await.unwrap().unwrap();
+        let namespace = node_local.claim_workqueue_due(due).await.unwrap().unwrap();
+        workqueue
+            .clone()
+            .run_retry(
+                focused_test_entry(namespace),
+                workqueue.current_test_leader_lease(),
+            )
+            .await;
+        assert!(
+            node_local
+                .peek_workqueue_next_due()
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "never-dead-letter",
+            pod_with_uid("never-dead-letter", "uid-pod", true),
+        )
+        .await
+        .unwrap();
+        node_local
+            .enqueue_workqueue(
+                crate::datastore::node_local::PodWorkqueueKind::Pod,
+                &PodIdentity::new("default", "never-dead-letter", "uid-pod"),
+                json!({}),
+                MAX_ATTEMPTS,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        let due = node_local.peek_workqueue_next_due().await.unwrap().unwrap();
+        let pod = node_local.claim_workqueue_due(due).await.unwrap().unwrap();
+        workqueue
+            .clone()
+            .run_retry(
+                focused_test_entry(pod),
+                workqueue.current_test_leader_lease(),
+            )
+            .await;
+        let retried = node_local
+            .claim_workqueue_due(i64::MAX)
+            .await
+            .unwrap()
+            .expect("Pod work must remain durable beyond the namespace attempt ceiling");
+        assert_eq!(
+            retried.kind,
+            crate::datastore::node_local::PodWorkqueueKind::Pod
+        );
+        assert_eq!(retried.attempt_count, MAX_ATTEMPTS + 1);
     }
 
     #[tokio::test]
@@ -2369,7 +2963,10 @@ mod tests {
             .unwrap();
         let row = _node_local.claim_workqueue_due(due).await.unwrap().unwrap();
         let lease = workqueue.current_test_leader_lease();
-        workqueue.clone().run_retry(focused_entry(row), lease).await;
+        workqueue
+            .clone()
+            .run_retry(focused_test_entry(row), lease)
+            .await;
 
         // The local actor must NOT be woken for a remote pod.
         assert!(
@@ -2669,7 +3266,10 @@ mod tests {
             .unwrap();
         let row = _node_local.claim_workqueue_due(due).await.unwrap().unwrap();
         let lease = workqueue.current_test_leader_lease();
-        workqueue.clone().run_retry(focused_entry(row), lease).await;
+        workqueue
+            .clone()
+            .run_retry(focused_test_entry(row), lease)
+            .await;
 
         // The pod must STILL exist in the datastore — remote leader workqueue
         // retries are actor wakeup/reminder state only.
@@ -2707,7 +3307,10 @@ mod tests {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let node_local = super::super::test_node_local_store(supervisor.clone()).await;
+        let persistence_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let node_local = super::super::test_node_local_store(persistence_supervisor).await;
         let cancel = supervisor.root_cancellation_token();
         let metrics = SideEffectMetrics::new();
         let workqueue = PodWorkqueue::new(
@@ -2766,5 +3369,14 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        assert!(
+            workqueue
+                .persistence
+                .peek_next_due()
+                .await
+                .unwrap()
+                .is_some(),
+            "root cancellation must leave delayed durable work pending"
+        );
     }
 }

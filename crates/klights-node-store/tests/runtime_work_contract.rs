@@ -3,9 +3,10 @@ use klights_node_store::{
     PodRuntimeRecord, PodRuntimeStore, PodSlotAdmissionEvent, PodSlotAdmissionEventSource,
     PodSlotAdmissionRequest, PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotAdmissionStore,
     PodSlotClearResult, PodSlotEventSubscription, PodSlotMutationResult, PodWorkIdentity,
-    PodWorkqueueEnqueue, PodWorkqueueEntry, PodWorkqueueKind, PodWorkqueueStore, ProbeKey,
-    ProbeResult, ProbeState, ProbeStateStore, RuntimeNamespace, RuntimePodUid, RuntimeWorkError,
-    RuntimeWorkFuture, WorkItemId,
+    PodWorkqueueClaimRequest, PodWorkqueueEnqueue, PodWorkqueueEntry, PodWorkqueueKind,
+    PodWorkqueueLease, PodWorkqueueLeaseToken, PodWorkqueueMutationOutcome, PodWorkqueueRequeue,
+    PodWorkqueueStore, ProbeKey, ProbeResult, ProbeState, ProbeStateStore, RuntimeNamespace,
+    RuntimePodUid, RuntimeWorkError, RuntimeWorkFuture, WorkItemId,
 };
 use klights_types::PodIdentity;
 use std::future::Future;
@@ -69,11 +70,25 @@ impl PodWorkqueueStore for EmptyRuntimeWorkStore {
         Box::pin(async { Ok(None) })
     }
 
-    fn claim_due_work(
+    fn claim_due_work_with_lease(
         &self,
-        _now_ms: DueTimeMs,
-    ) -> RuntimeWorkFuture<'_, Option<PodWorkqueueEntry>> {
+        _request: PodWorkqueueClaimRequest,
+    ) -> RuntimeWorkFuture<'_, Option<PodWorkqueueLease>> {
         Box::pin(async { Ok(None) })
+    }
+
+    fn acknowledge_work(
+        &self,
+        _token: PodWorkqueueLeaseToken,
+    ) -> RuntimeWorkFuture<'_, PodWorkqueueMutationOutcome> {
+        Box::pin(async { Ok(PodWorkqueueMutationOutcome::Stale) })
+    }
+
+    fn requeue_work(
+        &self,
+        _request: PodWorkqueueRequeue,
+    ) -> RuntimeWorkFuture<'_, PodWorkqueueMutationOutcome> {
+        Box::pin(async { Ok(PodWorkqueueMutationOutcome::Stale) })
     }
 }
 
@@ -542,22 +557,70 @@ impl PodWorkqueueStore for ModelWorkqueue {
         })
     }
 
-    fn claim_due_work(&self, now: DueTimeMs) -> RuntimeWorkFuture<'_, Option<PodWorkqueueEntry>> {
+    fn claim_due_work_with_lease(
+        &self,
+        request: PodWorkqueueClaimRequest,
+    ) -> RuntimeWorkFuture<'_, Option<PodWorkqueueLease>> {
         Box::pin(async move {
             let mut rows = self.state.lock().unwrap();
             let selected = rows
                 .iter()
                 .enumerate()
-                .filter(|(_, row)| row.next_due_ms().get() <= now.get())
+                .filter(|(_, row)| row.next_due_ms().get() <= request.now_ms().get())
                 .min_by_key(|(_, row)| (row.next_due_ms(), row.id()))
                 .map(|(index, _)| index);
-            Ok(selected.map(|index| rows.remove(index)))
+            let Some(index) = selected else {
+                return Ok(None);
+            };
+            let row = rows[index].clone();
+            let token = PodWorkqueueLeaseToken::try_new(
+                row.id().get(),
+                row.identity().clone(),
+                request.lease_deadline_ms().get(),
+            )?;
+            let leased = PodWorkqueueEntry::try_new(
+                row.id().get(),
+                row.identity().clone(),
+                row.payload().to_vec(),
+                row.attempt_count(),
+                request.lease_deadline_ms().get(),
+            )?;
+            rows[index] = leased.clone();
+            Ok(Some(PodWorkqueueLease::try_new(leased, token)?))
         })
+    }
+
+    fn acknowledge_work(
+        &self,
+        token: PodWorkqueueLeaseToken,
+    ) -> RuntimeWorkFuture<'_, PodWorkqueueMutationOutcome> {
+        Box::pin(async move {
+            let mut rows = self.state.lock().unwrap();
+            let selected = rows.iter().position(|row| {
+                row.id() == token.id()
+                    && row.identity() == token.identity()
+                    && row.next_due_ms() == token.leased_next_due_ms()
+            });
+            Ok(match selected {
+                Some(index) => {
+                    rows.remove(index);
+                    PodWorkqueueMutationOutcome::Applied
+                }
+                None => PodWorkqueueMutationOutcome::Stale,
+            })
+        })
+    }
+
+    fn requeue_work(
+        &self,
+        _request: PodWorkqueueRequeue,
+    ) -> RuntimeWorkFuture<'_, PodWorkqueueMutationOutcome> {
+        Box::pin(async { Ok(PodWorkqueueMutationOutcome::Stale) })
     }
 }
 
 #[test]
-fn reference_workqueue_claim_is_destructive_and_orders_by_due_then_id() {
+fn reference_workqueue_claim_retains_rows_and_orders_by_due_then_id() {
     let store = ModelWorkqueue::default();
     let identity = PodWorkIdentity::try_pod(pod()).unwrap();
     store.seed(PodWorkqueueEntry::try_new(3, identity.clone(), vec![3], 0, 8).unwrap());
@@ -565,23 +628,25 @@ fn reference_workqueue_claim_is_destructive_and_orders_by_due_then_id() {
     store.seed(PodWorkqueueEntry::try_new(1, identity, vec![1], 0, 9).unwrap());
     assert_eq!(ready(store.peek_next_due_ms()).unwrap(), Some(8));
     assert_eq!(
-        ready(store.claim_due_work(DueTimeMs::try_new(8).unwrap()))
+        ready(store.claim_due_work_with_lease(PodWorkqueueClaimRequest::try_new(8, 10).unwrap()))
             .unwrap()
             .unwrap()
+            .entry()
             .id()
             .get(),
         2
     );
     assert_eq!(
-        ready(store.claim_due_work(DueTimeMs::try_new(8).unwrap()))
+        ready(store.claim_due_work_with_lease(PodWorkqueueClaimRequest::try_new(8, 10).unwrap()))
             .unwrap()
             .unwrap()
+            .entry()
             .id()
             .get(),
         3
     );
     assert!(
-        ready(store.claim_due_work(DueTimeMs::try_new(8).unwrap()))
+        ready(store.claim_due_work_with_lease(PodWorkqueueClaimRequest::try_new(8, 10).unwrap()))
             .unwrap()
             .is_none()
     );
