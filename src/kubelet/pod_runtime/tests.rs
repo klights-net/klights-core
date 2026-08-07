@@ -156,8 +156,6 @@ async fn real_runtime_schedule_retry_emits_retry_due_after_delay() {
 
 #[tokio::test]
 async fn real_runtime_schedule_start_pod_retry_writes_status_event_and_wakeup() {
-    use crate::kubelet::pod_repository::PodReader;
-
     let harness = PodRuntimeHarness::new().await;
     let pod = serde_json::json!({
         "apiVersion": "v1",
@@ -232,8 +230,6 @@ async fn real_runtime_schedule_start_pod_retry_writes_status_event_and_wakeup() 
 
 #[tokio::test]
 async fn real_runtime_schedule_start_pod_retry_rejects_stale_uid_but_wakes() {
-    use crate::kubelet::pod_repository::PodReader;
-
     let harness = PodRuntimeHarness::new().await;
     let pod = serde_json::json!({
         "apiVersion": "v1",
@@ -1231,7 +1227,7 @@ async fn real_pod_runtime_service_constructs_from_mock_dependencies() {
 
 // --- Task 8.2: RealPodRuntimeService::start_pod identity/admission/status ---
 
-use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
+use crate::kubelet::pod_repository::PodQueryTestExt;
 
 struct SnapshotOnlyStartRepository {
     inner: Arc<crate::kubelet::pod_repository::PodRepository>,
@@ -1406,7 +1402,7 @@ async fn real_runtime_start_pod_rejects_uid_mismatch_before_cri() {
     // Create pod with correct-uid in the repository.
     harness
         .repo
-        .create_controller_pod("ns", "test-pod", "test-node", pod.clone())
+        .test_create_pod("ns", "test-pod", "test-node", pod.clone())
         .await
         .unwrap();
 
@@ -1442,7 +1438,7 @@ async fn real_runtime_start_pod_writes_pending_status_before_pull() {
     // Create pod in the repository.
     harness
         .repo
-        .create_controller_pod("ns", "test-pod", "test-node", pod.clone())
+        .test_create_pod("ns", "test-pod", "test-node", pod.clone())
         .await
         .unwrap();
 
@@ -1493,7 +1489,7 @@ async fn real_runtime_start_pod_uses_provided_snapshot_without_fresh_liveness_re
     );
     harness
         .repo
-        .create_controller_pod("ns", "cached-pod", "test-node", pod.clone())
+        .test_create_pod("ns", "cached-pod", "test-node", pod.clone())
         .await
         .unwrap();
 
@@ -1563,14 +1559,14 @@ async fn real_runtime_start_pod_does_not_write_status_to_replacement_uid() {
     // Create pod with old-uid.
     harness
         .repo
-        .create_controller_pod("ns", "test-pod", "test-node", old_pod.clone())
+        .test_create_pod("ns", "test-pod", "test-node", old_pod.clone())
         .await
         .unwrap();
 
     // Read the live pod to capture its initial resourceVersion.
     let before = harness
         .repo
-        .get_pod_for_uid("ns", "test-pod", "old-uid")
+        .test_get_pod_for_uid("ns", "test-pod", "old-uid")
         .await
         .unwrap()
         .unwrap();
@@ -1599,7 +1595,7 @@ async fn real_runtime_start_pod_does_not_write_status_to_replacement_uid() {
     // The live pod (old-uid) must NOT have been modified.
     let after = harness
         .repo
-        .get_pod_for_uid("ns", "test-pod", "old-uid")
+        .test_get_pod_for_uid("ns", "test-pod", "old-uid")
         .await
         .unwrap()
         .unwrap();
@@ -1634,7 +1630,7 @@ async fn real_runtime_start_pod_image_pull_policy_matrix() {
         let pod = pod_with_pull_policy("ns", "pod", "uid-a", "nginx", "Always");
         harness
             .repo
-            .create_controller_pod("ns", "pod", "test-node", pod.clone())
+            .test_create_pod("ns", "pod", "test-node", pod.clone())
             .await
             .unwrap();
         let key = PodRuntimeKey::new("ns", "pod", "uid-a");
@@ -1658,7 +1654,7 @@ async fn real_runtime_start_pod_image_pull_policy_matrix() {
         let pod = pod_with_pull_policy("ns", "pod2", "uid-b", "nginx", "Never");
         harness
             .repo
-            .create_controller_pod("ns", "pod2", "test-node", pod.clone())
+            .test_create_pod("ns", "pod2", "test-node", pod.clone())
             .await
             .unwrap();
         let key = PodRuntimeKey::new("ns", "pod2", "uid-b");
@@ -1681,7 +1677,7 @@ async fn real_runtime_start_pod_image_pull_policy_matrix() {
         let pod = pod_with_pull_policy("ns", "pod3", "uid-c", "nginx", "IfNotPresent");
         harness
             .repo
-            .create_controller_pod("ns", "pod3", "test-node", pod.clone())
+            .test_create_pod("ns", "pod3", "test-node", pod.clone())
             .await
             .unwrap();
         let key = PodRuntimeKey::new("ns", "pod3", "uid-c");
@@ -1704,7 +1700,7 @@ async fn real_runtime_start_pod_image_pull_policy_matrix() {
         let pod = pod_with_pull_policy("ns", "pod4", "uid-d", "nginx", "IfNotPresent");
         harness
             .repo
-            .create_controller_pod("ns", "pod4", "test-node", pod.clone())
+            .test_create_pod("ns", "pod4", "test-node", pod.clone())
             .await
             .unwrap();
         let key = PodRuntimeKey::new("ns", "pod4", "uid-d");
@@ -1729,7 +1725,7 @@ async fn real_runtime_start_pod_image_pull_failure_emits_failed_event() {
     let pod = pod_with_pull_policy("ns", "pod", "uid-1", "nginx", "Always");
     harness
         .repo
-        .create_controller_pod("ns", "pod", "test-node", pod.clone())
+        .test_create_pod("ns", "pod", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "pod", "uid-1");
@@ -1761,7 +1757,7 @@ async fn real_runtime_start_pod_failed_event_uses_verified_uid() {
     let old_pod = pod_with_pull_policy("ns", "pod", "old-uid", "nginx", "Always");
     harness
         .repo
-        .create_controller_pod("ns", "pod", "test-node", old_pod.clone())
+        .test_create_pod("ns", "pod", "test-node", old_pod.clone())
         .await
         .unwrap();
 
@@ -1800,7 +1796,7 @@ async fn real_runtime_start_pod_records_sandbox_and_reads_assignment() {
     let pod = pod_with_pull_policy("ns", "pod", "uid-sb", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "pod", "test-node", pod.clone())
+        .test_create_pod("ns", "pod", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "pod", "uid-sb");
@@ -2064,7 +2060,7 @@ async fn network_assignment_timeout_rolls_back_sandbox_with_parity() {
     let pod = pod_with_pull_policy("ns", "net-timeout", "uid-net-timeout", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "net-timeout", "test-node", pod.clone())
+        .test_create_pod("ns", "net-timeout", "test-node", pod.clone())
         .await
         .unwrap();
     harness.network.set_network_assignment_timeout();
@@ -2130,7 +2126,7 @@ async fn hung_hostport_setup_times_out_and_rolls_back_sandbox() {
     }]);
     harness
         .repo
-        .create_controller_pod("ns", "hostport-hang", "test-node", pod.clone())
+        .test_create_pod("ns", "hostport-hang", "test-node", pod.clone())
         .await
         .unwrap();
     harness.hostports.hang_add_host_ports();
@@ -2164,7 +2160,7 @@ async fn hung_volume_setup_times_out_and_rolls_back_sandbox() {
     let pod = pod_with_pull_policy("ns", "volume-hang", "uid-volume-hang", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "volume-hang", "test-node", pod.clone())
+        .test_create_pod("ns", "volume-hang", "test-node", pod.clone())
         .await
         .unwrap();
     harness.volumes.hang_process_volumes();
@@ -2206,7 +2202,7 @@ async fn start_pod_partial_container_create_failure_rolls_back_sandbox_with_pari
         }));
     harness
         .repo
-        .create_controller_pod("ns", "partial-create", "test-node", pod.clone())
+        .test_create_pod("ns", "partial-create", "test-node", pod.clone())
         .await
         .unwrap();
     harness
@@ -2303,7 +2299,7 @@ async fn real_runtime_start_pod_propagates_uid_qualified_sandbox_record_failure(
     let pod = pod_with_pull_policy("ns", "pod", "uid-fb", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "pod", "test-node", pod.clone())
+        .test_create_pod("ns", "pod", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "pod", "uid-fb");
@@ -2345,7 +2341,7 @@ async fn real_runtime_start_pod_fails_closed_when_sandbox_lookup_fails() {
     let pod = pod_with_pull_policy("ns", "pod", "uid-lookup", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "pod", "test-node", pod.clone())
+        .test_create_pod("ns", "pod", "test-node", pod.clone())
         .await
         .unwrap();
     harness
@@ -2394,7 +2390,7 @@ async fn real_runtime_start_pod_sandbox_rows_are_uid_qualified() {
     let new_pod = pod_with_pull_policy("ns", "pod", "uid-new", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "pod", "test-node", new_pod.clone())
+        .test_create_pod("ns", "pod", "test-node", new_pod.clone())
         .await
         .unwrap();
     let new_key = PodRuntimeKey::new("ns", "pod", "uid-new");
@@ -2435,7 +2431,7 @@ async fn real_runtime_start_pod_uses_hostport_admission_port_before_side_effects
     let pod = pod_with_pull_policy("ns", "hp-admit", "uid-hp-admit", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "hp-admit", "test-node", pod.clone())
+        .test_create_pod("ns", "hp-admit", "test-node", pod.clone())
         .await
         .unwrap();
     harness.hostports.reject_next_check("reserved host port");
@@ -2476,7 +2472,7 @@ async fn real_runtime_start_pod_stops_before_containers_when_volume_processing_f
     let pod = pod_with_pull_policy("ns", "volume-fail", "uid-volume-fail", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "volume-fail", "test-node", pod.clone())
+        .test_create_pod("ns", "volume-fail", "test-node", pod.clone())
         .await
         .unwrap();
     harness
@@ -2520,7 +2516,7 @@ async fn real_runtime_start_pod_passes_verified_identity_to_hostport_filesystem_
     let pod = pod_with_pull_policy("ns", "iden-pod", "uid-iden", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "iden-pod", "test-node", pod.clone())
+        .test_create_pod("ns", "iden-pod", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "iden-pod", "uid-iden");
@@ -2601,7 +2597,7 @@ async fn real_runtime_start_pod_uses_mock_cri_network_store_and_events() {
     let pod = pod_with_pull_policy("ns", "all-ports", "uid-ap", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "all-ports", "test-node", pod.clone())
+        .test_create_pod("ns", "all-ports", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "all-ports", "uid-ap");
@@ -2677,7 +2673,7 @@ async fn hostport_admission_failure_marks_pod_failed_with_parity() {
     });
     harness
         .repo
-        .create_controller_pod("statefulset", "test-pod", "test-node", holder)
+        .test_create_pod("statefulset", "test-pod", "test-node", holder)
         .await
         .unwrap();
     harness
@@ -2722,7 +2718,7 @@ async fn hostport_admission_failure_marks_pod_failed_with_parity() {
     });
     harness
         .repo
-        .create_controller_pod("statefulset", "ss-0", "test-node", claimant.clone())
+        .test_create_pod("statefulset", "ss-0", "test-node", claimant.clone())
         .await
         .unwrap();
     harness
@@ -2789,7 +2785,7 @@ async fn hostport_admission_failure_marks_pod_failed_with_parity() {
 
 #[tokio::test]
 async fn mid_lifecycle_status_writes_preserve_host_ip_with_parity() {
-    use crate::kubelet::pod_repository::{PodObjectWriter, PodStatusUpdate, PodStatusWriter};
+    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
 
     let conflict_cluster = std::sync::Arc::new(FakeCluster::new());
     let (_cri, conflict_runtime, conflict_repo, conflict_cluster, conflict_hostports) =
@@ -2816,7 +2812,7 @@ async fn mid_lifecycle_status_writes_preserve_host_ip_with_parity() {
         "status": {"phase": "Running"}
     });
     conflict_repo
-        .create_controller_pod("statefulset", "test-pod", "test-node", holder)
+        .test_create_pod("statefulset", "test-pod", "test-node", holder)
         .await
         .unwrap();
     conflict_repo
@@ -2858,7 +2854,7 @@ async fn mid_lifecycle_status_writes_preserve_host_ip_with_parity() {
         "status": {"phase": "Pending"}
     });
     conflict_repo
-        .create_controller_pod("statefulset", "ss-0", "test-node", claimant.clone())
+        .test_create_pod("statefulset", "ss-0", "test-node", claimant.clone())
         .await
         .unwrap();
     conflict_hostports.reject_next_check("hostPort 21017/TCP is already allocated");
@@ -2919,7 +2915,7 @@ async fn mid_lifecycle_status_writes_preserve_host_ip_with_parity() {
         "status": {"phase": "Pending"}
     });
     init_repo
-        .create_controller_pod("ns", "init-fail-hostip", "test-node", init_pod.clone())
+        .test_create_pod("ns", "init-fail-hostip", "test-node", init_pod.clone())
         .await
         .unwrap();
     let init_key = PodRuntimeKey::new("ns", "init-fail-hostip", "uid-init-fail-hostip");
@@ -2950,7 +2946,7 @@ async fn real_runtime_start_pod_runs_filesystem_volume_hostport_and_containers()
     let pod = pod_with_pull_policy("ns", "order-pod", "uid-ord", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "order-pod", "test-node", pod.clone())
+        .test_create_pod("ns", "order-pod", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "order-pod", "uid-ord");
@@ -3017,7 +3013,7 @@ async fn real_runtime_start_pod_cancel_before_sandbox_does_not_call_cri() {
     let pod = pod_with_pull_policy("ns", "cancel-early", "uid-ce", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "cancel-early", "test-node", pod.clone())
+        .test_create_pod("ns", "cancel-early", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "cancel-early", "uid-ce");
@@ -3061,7 +3057,7 @@ async fn real_runtime_start_pod_cancel_after_sandbox_rolls_back_uid_bound_state(
     let pod = pod_with_pull_policy("ns", "cancel-sb", "uid-csb", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "cancel-sb", "test-node", pod.clone())
+        .test_create_pod("ns", "cancel-sb", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "cancel-sb", "uid-csb");
@@ -3108,7 +3104,7 @@ async fn real_runtime_start_pod_cancel_after_sandbox_rolls_back() {
     let pod = pod_with_pull_policy("ns", "cancel-rb", "uid-crb", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "cancel-rb", "test-node", pod.clone())
+        .test_create_pod("ns", "cancel-rb", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "cancel-rb", "uid-crb");
@@ -3326,7 +3322,7 @@ async fn real_runtime_stop_pod_uses_deleted_snapshot_not_replacement() {
     let pod = pod_with_pull_policy("ns", "stop-del", "uid-del", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "stop-del", "test-node", pod.clone())
+        .test_create_pod("ns", "stop-del", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "stop-del", "uid-del");
@@ -3394,7 +3390,7 @@ async fn real_runtime_stop_pod_stops_and_removes_containers_idempotently() {
     let pod = pod_with_pull_policy("ns", "stop-idem", "uid-idem", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "stop-idem", "test-node", pod.clone())
+        .test_create_pod("ns", "stop-idem", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "stop-idem", "uid-idem");
@@ -3497,7 +3493,7 @@ async fn real_runtime_stop_pod_cleans_up_by_uid_and_releases_network() {
     let pod = pod_with_pull_policy("ns", "stop-clean", "uid-sc", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "stop-clean", "test-node", pod.clone())
+        .test_create_pod("ns", "stop-clean", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "stop-clean", "uid-sc");
@@ -3568,7 +3564,7 @@ async fn real_runtime_stop_pod_confirms_cri_absence_before_success() {
     let pod = pod_with_pull_policy("ns", "stop-abs", "uid-sa", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "stop-abs", "test-node", pod.clone())
+        .test_create_pod("ns", "stop-abs", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "stop-abs", "uid-sa");
@@ -3615,7 +3611,7 @@ async fn real_runtime_stop_pod_releases_hostports_and_cleans_volumes() {
     let pod = pod_with_pull_policy("ns", "stop-hv", "uid-hv", "nginx", "Never");
     harness
         .repo
-        .create_controller_pod("ns", "stop-hv", "test-node", pod.clone())
+        .test_create_pod("ns", "stop-hv", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "stop-hv", "uid-hv");
@@ -3957,7 +3953,7 @@ async fn worker_runtime_starts_local_pod_and_does_not_touch_leader_cri() {
 
     // Pod scheduled to a different node (leader) — must be rejected.
     let leader_pod = scheduled_pod_json("ns", "leader-pod", "uid-leader", "leader-node");
-    repo.create_controller_pod("ns", "leader-pod", "leader-node", leader_pod.clone())
+    repo.test_create_pod("ns", "leader-pod", "leader-node", leader_pod.clone())
         .await
         .unwrap();
     let leader_key = PodRuntimeKey::new("ns", "leader-pod", "uid-leader");
@@ -3977,7 +3973,7 @@ async fn worker_runtime_starts_local_pod_and_does_not_touch_leader_cri() {
 
     // Pod scheduled to this worker — must be started.
     let local_pod = scheduled_pod_json("ns", "local-pod", "uid-local", "worker-1");
-    repo.create_controller_pod("ns", "local-pod", "worker-1", local_pod.clone())
+    repo.test_create_pod("ns", "local-pod", "worker-1", local_pod.clone())
         .await
         .unwrap();
     let local_key = PodRuntimeKey::new("ns", "local-pod", "uid-local");
@@ -4002,7 +3998,7 @@ async fn worker_runtime_does_not_start_same_name_replacement_for_stale_uid() {
 
     // Create a pod with new-uid (simulating same-name replacement).
     let new_pod = scheduled_pod_json("ns", "test-pod", "new-uid", "worker-1");
-    repo.create_controller_pod("ns", "test-pod", "worker-1", new_pod.clone())
+    repo.test_create_pod("ns", "test-pod", "worker-1", new_pod.clone())
         .await
         .unwrap();
 
@@ -4042,7 +4038,7 @@ async fn worker_runtime_rejects_same_name_replacement_without_snapshot() {
     // Live pod has the NEW uid (the replacement); the start request carries the
     // OLD uid via the key and no snapshot.
     let new_pod = scheduled_pod_json("ns", "test-pod", "new-uid", "worker-1");
-    repo.create_controller_pod("ns", "test-pod", "worker-1", new_pod)
+    repo.test_create_pod("ns", "test-pod", "worker-1", new_pod)
         .await
         .unwrap();
 
@@ -4142,7 +4138,7 @@ async fn worker_runtime_forwards_status_to_leader() {
         fixture_runtime_with_cluster("worker-1", cluster).await;
 
     let pod = scheduled_pod_json("ns", "fwd-pod", "uid-fwd", "worker-1");
-    repo.create_controller_pod("ns", "fwd-pod", "worker-1", pod.clone())
+    repo.test_create_pod("ns", "fwd-pod", "worker-1", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "fwd-pod", "uid-fwd");
@@ -4172,7 +4168,7 @@ async fn leader_runtime_writes_status_locally() {
     let pod = scheduled_pod_json("ns", "local-pod", "uid-local", "test-node");
     harness
         .repo
-        .create_controller_pod("ns", "local-pod", "test-node", pod.clone())
+        .test_create_pod("ns", "local-pod", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "local-pod", "uid-local");
@@ -4186,7 +4182,7 @@ async fn leader_runtime_writes_status_locally() {
     // Verify the pod status was written to the local repository.
     let resource = harness
         .repo
-        .get_pod_for_uid("ns", "local-pod", "uid-local")
+        .test_get_pod_for_uid("ns", "local-pod", "uid-local")
         .await
         .unwrap()
         .expect("pod must exist");
@@ -4205,7 +4201,7 @@ async fn worker_runtime_forwarded_status_is_uid_preconditioned() {
         fixture_runtime_with_cluster("worker-1", cluster).await;
 
     let pod = scheduled_pod_json("ns", "uid-pod", "uid-chk", "worker-1");
-    repo.create_controller_pod("ns", "uid-pod", "worker-1", pod.clone())
+    repo.test_create_pod("ns", "uid-pod", "worker-1", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "uid-pod", "uid-chk");
@@ -4236,7 +4232,7 @@ async fn cross_node_delete_is_rejected_on_non_owner_node() {
     // cleanup and must not report success, because success lets the lifecycle
     // actor finalize a Pod row whose owning node never cleaned its resources.
     let cross_pod = scheduled_pod_json("ns", "cross-pod", "uid-cross", "worker-2");
-    repo.create_controller_pod("ns", "cross-pod", "worker-2", cross_pod.clone())
+    repo.test_create_pod("ns", "cross-pod", "worker-2", cross_pod.clone())
         .await
         .unwrap();
     let cross_key = PodRuntimeKey::new("ns", "cross-pod", "uid-cross");
@@ -4266,7 +4262,7 @@ async fn cross_node_delete_is_rejected_on_non_owner_node() {
 
     // Pod scheduled to this node — stop_pod must release network and clean up CRI.
     let local_pod = scheduled_pod_json("ns", "local-pod", "uid-local", "worker-1");
-    repo.create_controller_pod("ns", "local-pod", "worker-1", local_pod.clone())
+    repo.test_create_pod("ns", "local-pod", "worker-1", local_pod.clone())
         .await
         .unwrap();
     let local_key = PodRuntimeKey::new("ns", "local-pod", "uid-local");
@@ -4290,7 +4286,7 @@ async fn cri_leftover_cleanup_is_node_local() {
 
     // Pod scheduled to a different node — reconcile must return Ok without CRI work.
     let cross_pod = scheduled_pod_json("ns", "cross-pod", "uid-cross", "worker-2");
-    repo.create_controller_pod("ns", "cross-pod", "worker-2", cross_pod)
+    repo.test_create_pod("ns", "cross-pod", "worker-2", cross_pod)
         .await
         .unwrap();
     let cross_key = PodRuntimeKey::new("ns", "cross-pod", "uid-cross");
@@ -4303,7 +4299,7 @@ async fn cri_leftover_cleanup_is_node_local() {
 
     // Pod scheduled to this node — reconcile must proceed.
     let local_pod = scheduled_pod_json("ns", "local-pod", "uid-local", "worker-1");
-    repo.create_controller_pod("ns", "local-pod", "worker-1", local_pod)
+    repo.test_create_pod("ns", "local-pod", "worker-1", local_pod)
         .await
         .unwrap();
     let local_key = PodRuntimeKey::new("ns", "local-pod", "uid-local");
@@ -6169,7 +6165,6 @@ async fn reconcile_runtime_writes_pod_and_host_ips_with_parity() {
 
 #[tokio::test]
 async fn reconcile_runtime_duplicate_status_does_not_emit_second_watch_event() {
-    use crate::kubelet::pod_repository::PodReader;
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
     use klights_kubelet::runtime::cri::ContainerRuntimeState;
 
@@ -6251,7 +6246,7 @@ async fn reconcile_runtime_duplicate_status_does_not_emit_second_watch_event() {
     );
     let first_rv = harness
         .repo
-        .get_pod_for_uid("pods", "dedup-pod", "uid-dedup-pod")
+        .test_get_pod_for_uid("pods", "dedup-pod", "uid-dedup-pod")
         .await
         .unwrap()
         .expect("pod must exist")
@@ -6271,7 +6266,7 @@ async fn reconcile_runtime_duplicate_status_does_not_emit_second_watch_event() {
     );
     let second_rv = harness
         .repo
-        .get_pod_for_uid("pods", "dedup-pod", "uid-dedup-pod")
+        .test_get_pod_for_uid("pods", "dedup-pod", "uid-dedup-pod")
         .await
         .unwrap()
         .expect("pod must exist")
@@ -6412,7 +6407,6 @@ async fn real_runtime_finalize_startup_unconfirmed_when_pod_not_found_or_pending
 
 #[tokio::test]
 async fn real_runtime_finalize_startup_returns_confirmed_sandbox_id_when_running_with_podip() {
-    use crate::kubelet::pod_repository::PodObjectWriter;
     use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
 
@@ -6432,7 +6426,7 @@ async fn real_runtime_finalize_startup_returns_confirmed_sandbox_id_when_running
     });
     harness
         .repo
-        .create_controller_pod("ns", "confirmed-pod", "test-node", pod)
+        .test_create_pod("ns", "confirmed-pod", "test-node", pod)
         .await
         .unwrap();
     harness
@@ -6781,7 +6775,7 @@ async fn real_runtime_start_pod_runs_init_containers_in_order_with_parity() {
     });
     harness
         .repo
-        .create_controller_pod("ns", "init-pod", "test-node", pod.clone())
+        .test_create_pod("ns", "init-pod", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "init-pod", "uid-init");
@@ -7182,7 +7176,7 @@ async fn real_runtime_start_pod_init_container_exit_code_aborts_start() {
     });
     harness
         .repo
-        .create_controller_pod("ns", "init-fail", "test-node", pod.clone())
+        .test_create_pod("ns", "init-fail", "test-node", pod.clone())
         .await
         .unwrap();
 
@@ -7370,7 +7364,7 @@ async fn worker_init_retry_never_forwards_phase_only_pending_status() {
         "pod-init-stale-retry",
         "uid-pod-init-stale-retry",
     );
-    repo.create_controller_pod(
+    repo.test_create_pod(
         "init-container",
         "pod-init-stale-retry",
         "worker-1",
@@ -7862,7 +7856,7 @@ async fn real_runtime_start_pod_materializes_full_container_config_with_parity()
     });
     harness
         .repo
-        .create_controller_pod("ns", "config-pod", "test-node", pod.clone())
+        .test_create_pod("ns", "config-pod", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "config-pod", "uid-cfg");
@@ -7987,7 +7981,7 @@ async fn real_runtime_start_pod_classifies_retryable_vs_terminal_with_parity() {
         });
         harness
             .repo
-            .create_controller_pod("ns", "terminal-pod", "test-node", pod.clone())
+            .test_create_pod("ns", "terminal-pod", "test-node", pod.clone())
             .await
             .unwrap();
         let key = PodRuntimeKey::new("ns", "terminal-pod", "uid-term");
@@ -8021,7 +8015,7 @@ async fn real_runtime_start_pod_classifies_retryable_vs_terminal_with_parity() {
         });
         harness
             .repo
-            .create_controller_pod("ns", "retry-pod", "test-node", pod.clone())
+            .test_create_pod("ns", "retry-pod", "test-node", pod.clone())
             .await
             .unwrap();
         let key = PodRuntimeKey::new("ns", "retry-pod", "uid-retry");
@@ -8053,7 +8047,7 @@ async fn real_runtime_start_pod_classifies_retryable_vs_terminal_with_parity() {
         });
         harness
             .repo
-            .create_controller_pod("ns", "imgfail-pod", "test-node", pod.clone())
+            .test_create_pod("ns", "imgfail-pod", "test-node", pod.clone())
             .await
             .unwrap();
         let key = PodRuntimeKey::new("ns", "imgfail-pod", "uid-img");
@@ -8096,7 +8090,7 @@ async fn real_runtime_start_pod_runs_post_start_hook_with_parity() {
     });
     harness
         .repo
-        .create_controller_pod("ns", "poststart-pod", "test-node", pod.clone())
+        .test_create_pod("ns", "poststart-pod", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "poststart-pod", "uid-ps");
@@ -8148,7 +8142,7 @@ async fn post_start_hook_failure_event_and_stop_with_parity() {
     });
     harness
         .repo
-        .create_controller_pod("ns", "psfail-pod", "test-node", pod.clone())
+        .test_create_pod("ns", "psfail-pod", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "psfail-pod", "uid-psf");
@@ -8214,7 +8208,7 @@ async fn real_runtime_start_pod_does_not_register_readiness_probes_before_finali
     });
     harness
         .repo
-        .create_controller_pod("ns", "probe-pod", "test-node", pod.clone())
+        .test_create_pod("ns", "probe-pod", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "probe-pod", "uid-probe");
@@ -8315,7 +8309,7 @@ async fn real_runtime_stop_pod_runs_pre_stop_hooks_before_container_stop_with_pa
     });
     harness
         .repo
-        .create_controller_pod("ns", "prestop-pod", "test-node", pod.clone())
+        .test_create_pod("ns", "prestop-pod", "test-node", pod.clone())
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "prestop-pod", "uid-prestop");
@@ -8372,7 +8366,7 @@ async fn real_runtime_stop_pod_passes_termination_grace_period_to_cri_with_parit
         });
         harness
             .repo
-            .create_controller_pod("ns", "grace-5", "test-node", pod.clone())
+            .test_create_pod("ns", "grace-5", "test-node", pod.clone())
             .await
             .unwrap();
         let key = PodRuntimeKey::new("ns", "grace-5", "uid-g5");
@@ -8422,7 +8416,7 @@ async fn real_runtime_stop_pod_passes_termination_grace_period_to_cri_with_parit
         });
         harness
             .repo
-            .create_controller_pod("ns", "grace-default", "test-node", pod.clone())
+            .test_create_pod("ns", "grace-default", "test-node", pod.clone())
             .await
             .unwrap();
         let key = PodRuntimeKey::new("ns", "grace-default", "uid-gd");
@@ -8477,7 +8471,7 @@ async fn real_runtime_stop_pod_resolves_sandbox_id_through_row_annotation_then_c
         });
         harness
             .repo
-            .create_controller_pod("ns", "dir-pod", "test-node", pod.clone())
+            .test_create_pod("ns", "dir-pod", "test-node", pod.clone())
             .await
             .unwrap();
         let key = PodRuntimeKey::new("ns", "dir-pod", "uid-dir");
@@ -8519,7 +8513,7 @@ async fn real_runtime_stop_pod_resolves_sandbox_id_through_row_annotation_then_c
         });
         harness
             .repo
-            .create_controller_pod("ns", "store-pod", "test-node", pod.clone())
+            .test_create_pod("ns", "store-pod", "test-node", pod.clone())
             .await
             .unwrap();
         let key = PodRuntimeKey::new("ns", "store-pod", "uid-store");
@@ -8566,7 +8560,7 @@ async fn real_runtime_stop_pod_resolves_sandbox_id_through_row_annotation_then_c
         });
         harness
             .repo
-            .create_controller_pod("ns", "annot-pod", "test-node", pod.clone())
+            .test_create_pod("ns", "annot-pod", "test-node", pod.clone())
             .await
             .unwrap();
         let key = PodRuntimeKey::new("ns", "annot-pod", "uid-annot");
@@ -8610,7 +8604,7 @@ async fn pod_stop_sandbox_identity_fallback_with_parity() {
     let key = PodRuntimeKey::new("deleted-ns", "deleted-pod", "uid-deleted");
     harness
         .repo
-        .create_controller_pod("deleted-ns", "deleted-pod", "test-node", pod.clone())
+        .test_create_pod("deleted-ns", "deleted-pod", "test-node", pod.clone())
         .await
         .unwrap();
     harness.cri.set_pod_sandboxes(vec![(
@@ -8700,7 +8694,7 @@ async fn real_runtime_reconcile_does_not_preserve_ready_started_for_missing_cont
     });
     harness
         .repo
-        .create_controller_pod("sonobuoy", "e2e", "test-node", pod.clone())
+        .test_create_pod("sonobuoy", "e2e", "test-node", pod.clone())
         .await
         .unwrap();
     harness
@@ -8743,7 +8737,7 @@ async fn real_runtime_reconcile_does_not_preserve_ready_started_for_missing_cont
 
     let updated = harness
         .repo
-        .get_pod_for_uid("sonobuoy", "e2e", "uid-e2e")
+        .test_get_pod_for_uid("sonobuoy", "e2e", "uid-e2e")
         .await
         .unwrap()
         .unwrap();
@@ -9447,7 +9441,7 @@ async fn real_runtime_stop_pod_handles_partial_state_idempotently_with_parity() 
         });
         harness
             .repo
-            .create_controller_pod("ns", "nocont-pod", "test-node", pod.clone())
+            .test_create_pod("ns", "nocont-pod", "test-node", pod.clone())
             .await
             .unwrap();
         let key = PodRuntimeKey::new("ns", "nocont-pod", "uid-nc");
@@ -9487,7 +9481,7 @@ async fn real_runtime_stop_pod_handles_partial_state_idempotently_with_parity() 
         });
         harness
             .repo
-            .create_controller_pod("ns", "crlfail-pod", "test-node", pod.clone())
+            .test_create_pod("ns", "crlfail-pod", "test-node", pod.clone())
             .await
             .unwrap();
         let key = PodRuntimeKey::new("ns", "crlfail-pod", "uid-cf");
@@ -9523,7 +9517,7 @@ async fn real_runtime_stop_pod_handles_partial_state_idempotently_with_parity() 
         });
         harness
             .repo
-            .create_controller_pod("ns", "nosb-pod", "test-node", pod.clone())
+            .test_create_pod("ns", "nosb-pod", "test-node", pod.clone())
             .await
             .unwrap();
         let key = PodRuntimeKey::new("ns", "nosb-pod", "uid-ns");
@@ -10374,8 +10368,6 @@ async fn production_wired_runtime_reconcile_uses_oo_ports() {
 
 #[tokio::test]
 async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finalization() {
-    use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
-
     let (ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
     db.seed_namespace_for_test("sonobuoy").await;
     std::mem::forget(ds);
@@ -10421,7 +10413,7 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
         },
         "status": {"phase": "Pending", "containerStatuses": []}
     });
-    repo.create_controller_pod("sonobuoy", "sonobuoy", "test-node", pod.clone())
+    repo.test_create_pod("sonobuoy", "sonobuoy", "test-node", pod.clone())
         .await
         .unwrap();
     let cluster_api: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery> =
@@ -10482,7 +10474,7 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
         PodDeletionFinalizeResult::DeletedOrAlreadyGone
     );
     assert!(
-        repo.get_pod_for_uid("sonobuoy", "sonobuoy", "uid-sonobuoy")
+        repo.test_get_pod_for_uid("sonobuoy", "sonobuoy", "uid-sonobuoy")
             .await
             .unwrap()
             .is_none(),
@@ -11221,8 +11213,6 @@ impl PodRuntimeHarness {
     }
 
     async fn create_runtime_pod(&self, pod: serde_json::Value) {
-        use crate::kubelet::pod_repository::PodObjectWriter;
-
         let namespace = pod
             .pointer("/metadata/namespace")
             .and_then(|v| v.as_str())
@@ -11245,7 +11235,7 @@ impl PodRuntimeHarness {
         self.db_handle.seed_namespace_for_test(&namespace).await;
 
         self.repo
-            .create_controller_pod(&namespace, &name, &node_name, pod)
+            .test_create_pod(&namespace, &name, &node_name, pod)
             .await
             .expect("create runtime test pod");
     }
@@ -11254,10 +11244,8 @@ impl PodRuntimeHarness {
         &self,
         key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
     ) -> serde_json::Value {
-        use crate::kubelet::pod_repository::PodReader;
-
         self.repo
-            .get_pod_for_uid(&key.namespace, &key.name, &key.uid)
+            .test_get_pod_for_uid(&key.namespace, &key.name, &key.uid)
             .await
             .expect("read runtime test pod")
             .expect("runtime test pod should exist")

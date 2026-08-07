@@ -389,7 +389,7 @@ fn pod_matches_selector_or_pending_hash_stamp(
     }
 
     // Deployment adoption stamps pod-template-hash onto existing RS pods via
-    // PodObjectWriter. In leader multinode mode that metadata write is queued
+    // The canonical Pod update port queues this metadata write in leader
     // through the outbox, so an immediate scale-down reconcile can see the
     // ownerRef before the label. Treat only this missing injected hash as a
     // temporary match; all other selector drift still releases the pod.

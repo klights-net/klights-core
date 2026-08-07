@@ -4,12 +4,267 @@ use async_trait::async_trait;
 use klights_cluster_core::Resource;
 use serde_json::Value;
 
+fn map_pod_repository_error(
+    error: klights_pod_api::PodRepositoryError,
+) -> klights_reconcile_api::ControllerStoreError {
+    use klights_pod_api::PodRepositoryError;
+    let message = error.to_string();
+    match error {
+        PodRepositoryError::NotFound { .. } => {
+            klights_reconcile_api::ControllerStoreError::not_found(message)
+        }
+        PodRepositoryError::AlreadyExists { .. } => {
+            klights_reconcile_api::ControllerStoreError::already_exists(message)
+        }
+        PodRepositoryError::UidMismatch { .. } | PodRepositoryError::Conflict { .. } => {
+            klights_reconcile_api::ControllerStoreError::conflict(message)
+        }
+        PodRepositoryError::Unavailable { .. }
+        | PodRepositoryError::Timeout
+        | PodRepositoryError::Cancelled => {
+            klights_reconcile_api::ControllerStoreError::unavailable(message)
+        }
+        PodRepositoryError::InvalidRequest { .. }
+        | PodRepositoryError::Forbidden { .. }
+        | PodRepositoryError::Unprocessable { .. }
+        | PodRepositoryError::Internal { .. }
+        | PodRepositoryError::CorruptResponse { .. } => {
+            klights_reconcile_api::ControllerStoreError::internal(message)
+        }
+    }
+}
+
+pub(crate) async fn create_pod_via_api(
+    api: &dyn klights_pod_api::PodApiMutation,
+    namespace: &str,
+    name: &str,
+    pod: Value,
+) -> klights_reconcile_api::ControllerStoreResult<Resource> {
+    api.create_pod(klights_pod_api::PodApiCreateRequest {
+        namespace: namespace.to_string(),
+        body: pod,
+        dry_run: false,
+    })
+    .await
+    .map_err(map_pod_repository_error)?
+    .resource
+    .ok_or_else(|| {
+        klights_reconcile_api::ControllerStoreError::unavailable(format!(
+            "controller Pod {namespace}/{name} create returned dry-run"
+        ))
+    })
+}
+
+pub(crate) async fn replace_pod_owner_references_via_update(
+    update: &dyn klights_pod_api::PodUpdate,
+    namespace: &str,
+    name: &str,
+    owner_references: Vec<Value>,
+) -> klights_reconcile_api::ControllerStoreResult<Resource> {
+    let owner_references = owner_references
+        .into_iter()
+        .map(|owner| {
+            klights_pod_api::PodOwnerReference::try_new(
+                owner
+                    .get("apiVersion")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                owner
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                owner
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                owner.get("uid").and_then(Value::as_str).unwrap_or_default(),
+                owner.get("controller").and_then(Value::as_bool),
+                owner.get("blockOwnerDeletion").and_then(Value::as_bool),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            klights_reconcile_api::ControllerStoreError::internal(error.to_string())
+        })?;
+    let target =
+        klights_pod_api::PodMutationTarget::try_by_name(namespace, name).map_err(|error| {
+            klights_reconcile_api::ControllerStoreError::internal(error.to_string())
+        })?;
+    update
+        .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
+            target,
+            owner_references,
+        ))
+        .await
+        .map_err(map_pod_repository_error)
+}
+
+pub(crate) async fn merge_pod_labels_via_update(
+    update: &dyn klights_pod_api::PodUpdate,
+    namespace: &str,
+    name: &str,
+    labels: Vec<(String, String)>,
+) -> klights_reconcile_api::ControllerStoreResult<Resource> {
+    let labels = labels
+        .into_iter()
+        .map(|(key, value)| klights_pod_api::PodLabel::try_new(key, value))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            klights_reconcile_api::ControllerStoreError::internal(error.to_string())
+        })?;
+    let target =
+        klights_pod_api::PodMutationTarget::try_by_name(namespace, name).map_err(|error| {
+            klights_reconcile_api::ControllerStoreError::internal(error.to_string())
+        })?;
+    update
+        .update_pod(klights_pod_api::PodUpdateRequest::merge_labels(
+            target, labels,
+        ))
+        .await
+        .map_err(map_pod_repository_error)
+}
+
+pub struct ControllerPodMutationAdapter {
+    api: Arc<dyn klights_pod_api::PodApiMutation>,
+    update: Arc<dyn klights_pod_api::PodUpdate>,
+}
+
+impl ControllerPodMutationAdapter {
+    pub fn new(
+        api: Arc<dyn klights_pod_api::PodApiMutation>,
+        update: Arc<dyn klights_pod_api::PodUpdate>,
+    ) -> Self {
+        Self { api, update }
+    }
+}
+
+macro_rules! impl_create_mutation {
+    ($trait:path, $method:ident) => {
+        #[async_trait]
+        impl $trait for ControllerPodMutationAdapter {
+            async fn $method(
+                &self,
+                namespace: &str,
+                name: &str,
+                _node_name: &str,
+                pod: Value,
+            ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
+                create_pod_via_api(self.api.as_ref(), namespace, name, pod).await
+            }
+        }
+    };
+}
+
+impl_create_mutation!(crate::daemonset::DaemonSetPodMutation, create_daemonset_pod);
+impl_create_mutation!(
+    crate::statefulset::StatefulSetPodMutation,
+    create_statefulset_pod
+);
+
+#[async_trait]
+impl crate::job::JobPodMutation for ControllerPodMutationAdapter {
+    async fn create_job_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        _node_name: &str,
+        pod: Value,
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
+        create_pod_via_api(self.api.as_ref(), namespace, name, pod).await
+    }
+
+    async fn replace_job_pod_owner_references(
+        &self,
+        namespace: &str,
+        name: &str,
+        owner_references: Vec<Value>,
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
+        replace_pod_owner_references_via_update(
+            self.update.as_ref(),
+            namespace,
+            name,
+            owner_references,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl crate::replicaset::ReplicaSetPodMutation for ControllerPodMutationAdapter {
+    async fn create_replicaset_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        _node_name: &str,
+        pod: Value,
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
+        create_pod_via_api(self.api.as_ref(), namespace, name, pod).await
+    }
+
+    async fn replace_replicaset_pod_owner_references(
+        &self,
+        namespace: &str,
+        name: &str,
+        owner_references: Vec<Value>,
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
+        replace_pod_owner_references_via_update(
+            self.update.as_ref(),
+            namespace,
+            name,
+            owner_references,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl crate::replicationcontroller::ReplicationControllerPodMutation
+    for ControllerPodMutationAdapter
+{
+    async fn create_replication_controller_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        _node_name: &str,
+        pod: Value,
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
+        create_pod_via_api(self.api.as_ref(), namespace, name, pod).await
+    }
+
+    async fn replace_replication_controller_pod_owner_references(
+        &self,
+        namespace: &str,
+        name: &str,
+        owner_references: Vec<Value>,
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
+        replace_pod_owner_references_via_update(
+            self.update.as_ref(),
+            namespace,
+            name,
+            owner_references,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl crate::deployment::DeploymentPodMutation for ControllerPodMutationAdapter {
+    async fn merge_deployment_pod_labels(
+        &self,
+        namespace: &str,
+        name: &str,
+        labels: Vec<(String, String)>,
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
+        merge_pod_labels_via_update(self.update.as_ref(), namespace, name, labels).await
+    }
+}
+
 use crate::service::ServiceControllerStore;
 use crate::{
     apiservice::ApiServiceStore,
     csr_signer::CsrStatusStore,
     daemonset::{DaemonSetPodMutation, DaemonSetStore},
-    deployment::{DeploymentPodMutation, DeploymentPodReader, DeploymentStore},
+    deployment::{DeploymentPodMutation, DeploymentStore},
     job::{JobPodMutation, JobStore},
     pdb::PdbStore,
     pvc::PvcStore,
@@ -37,16 +292,6 @@ pub trait ControllerResourceQuery: Send + Sync {
 
 pub trait DeploymentControllerPodMutation:
     DeploymentPodMutation + ReplicaSetPodMutation + Send + Sync
-{
-}
-
-pub trait DeploymentControllerPodReader:
-    DeploymentPodReader + klights_pod_api::PodQuery + Send + Sync
-{
-}
-
-impl<T> DeploymentControllerPodReader for T where
-    T: DeploymentPodReader + klights_pod_api::PodQuery + Send + Sync + ?Sized
 {
 }
 
@@ -85,8 +330,6 @@ pub struct ControllerRuntimeDependencies {
     pub apiservice_store: Arc<dyn ApiServiceStore>,
     pub csr_status_store: Arc<dyn CsrStatusStore>,
     pub pod_query: Arc<dyn klights_pod_api::PodQuery>,
-    pub pdb_pod_reader: Arc<dyn crate::pdb::PdbPodReader>,
-    pub deployment_pod_reader: Arc<dyn DeploymentControllerPodReader>,
     pub deployment_pod_mutation: Arc<dyn DeploymentControllerPodMutation>,
     pub replicaset_pod_mutation: Arc<dyn ReplicaSetPodMutation>,
     pub statefulset_pod_mutation: Arc<dyn StatefulSetPodMutation>,
@@ -140,5 +383,38 @@ mod tests {
 
         let missing_uid = inject_resource_version(serde_json::json!({"metadata": {}}), 43);
         assert!(missing_uid["metadata"].get("uid").is_none());
+    }
+
+    #[test]
+    fn pod_repository_errors_map_to_structural_controller_categories() {
+        use klights_pod_api::PodRepositoryError as PodError;
+        use klights_reconcile_api::ControllerStoreError as StoreError;
+
+        let cases = [
+            (PodError::not_found("default", "web"), "not_found"),
+            (PodError::already_exists("exists"), "already_exists"),
+            (PodError::uid_mismatch("old", "new"), "conflict"),
+            (PodError::conflict("stale"), "conflict"),
+            (PodError::unavailable("offline"), "unavailable"),
+            (PodError::Timeout, "unavailable"),
+            (PodError::Cancelled, "unavailable"),
+            (PodError::invalid_request("pod.name", "empty"), "internal"),
+            (PodError::forbidden("denied"), "internal"),
+            (PodError::unprocessable("invalid"), "internal"),
+            (PodError::internal("bug"), "internal"),
+            (PodError::corrupt_response("broken"), "internal"),
+        ];
+
+        for (error, expected) in cases {
+            let actual = map_pod_repository_error(error);
+            let category = match actual {
+                StoreError::NotFound(_) => "not_found",
+                StoreError::AlreadyExists(_) => "already_exists",
+                StoreError::Conflict(_) => "conflict",
+                StoreError::Unavailable(_) => "unavailable",
+                StoreError::Internal(_) => "internal",
+            };
+            assert_eq!(category, expected);
+        }
     }
 }

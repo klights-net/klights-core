@@ -2,7 +2,6 @@
 
 pub(crate) mod apiservice_side_effect_adapter;
 pub(crate) mod applied_pod_side_effect_adapter;
-pub(crate) mod controller_pod_adapters;
 pub(crate) mod controller_runtime_adapter;
 pub(crate) mod controller_store_adapters;
 pub(crate) mod controller_store_error_adapter;

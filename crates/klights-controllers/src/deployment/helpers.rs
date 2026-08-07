@@ -1,22 +1,7 @@
 use anyhow::Result;
-use async_trait::async_trait;
-use klights_reconcile_api::ControllerStoreResult;
+use klights_pod_api::{PodListRequest, PodOwnerListRequest, PodQuery};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-
-#[async_trait]
-pub trait DeploymentPodReader: Send + Sync {
-    async fn list_pods_by_owner_uid(
-        &self,
-        namespace: &str,
-        owner_uid: &str,
-    ) -> ControllerStoreResult<Vec<klights_cluster_core::Resource>>;
-
-    async fn list_namespace_pods(
-        &self,
-        namespace: &str,
-    ) -> ControllerStoreResult<Vec<klights_cluster_core::Resource>>;
-}
 
 /// Compute a deterministic pod-template-hash from the pod template spec.
 /// K8s uses this as the RS name suffix, and adds it to RS labels, RS selector,
@@ -124,7 +109,7 @@ pub(super) fn get_next_revision(owned_rs_list: &[klights_cluster_core::Resource]
 
 /// Count pods owned by deployment (via its ReplicaSets)
 /// Returns (total_pods, ready_pods, updated_pods, available_pods)
-pub(super) async fn count_deployment_pods<R: DeploymentPodReader + ?Sized>(
+pub(super) async fn count_deployment_pods<R: PodQuery + ?Sized>(
     pod_reader: &R,
     namespace: &str,
     owned_rs_list: &[klights_cluster_core::Resource],
@@ -154,7 +139,9 @@ pub(super) async fn count_deployment_pods<R: DeploymentPodReader + ?Sized>(
 
         // Primary path: owner-reference fetch must match the RS UID at any
         // ownerReferences position.
-        let mut owned_pods = pod_reader.list_pods_by_owner_uid(namespace, rs_uid).await?;
+        let mut owned_pods = pod_reader
+            .list_pods_by_owner_uid(PodOwnerListRequest::try_new(namespace, rs_uid)?)
+            .await?;
         // Fallback for conformance: if owner refs are temporarily absent on a
         // pod, count by RS selector labels so Deployment availability does not
         // collapse to zero during rollout math.
@@ -162,8 +149,16 @@ pub(super) async fn count_deployment_pods<R: DeploymentPodReader + ?Sized>(
             && let Some(selector_obj) = rs.data.get("spec").and_then(|s| s.get("selector"))
         {
             owned_pods = pod_reader
-                .list_namespace_pods(namespace)
+                .list_pods(PodListRequest::try_new(
+                    Some(namespace.to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                )?)
                 .await?
+                .into_parts()
+                .0
                 .into_iter()
                 .filter(|pod| {
                     pod.data

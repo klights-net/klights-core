@@ -63,8 +63,9 @@ pub use dispatcher_runtime::DispatcherRuntime;
 pub use identity::ControllerIdentityGenerator;
 pub use lease_loop::run_under_lease;
 pub use ports::{
-    ControllerEffectPort, ControllerNetworkPort, ControllerReconcilePort, ControllerResourceQuery,
-    ControllerRuntimeDependencies, DeploymentControllerPodMutation, DeploymentControllerPodReader,
+    ControllerEffectPort, ControllerNetworkPort, ControllerPodMutationAdapter,
+    ControllerReconcilePort, ControllerResourceQuery, ControllerRuntimeDependencies,
+    DeploymentControllerPodMutation,
 };
 pub(crate) use runtime::controller_wrapper;
 pub(crate) use runtime::{Context, Controller};

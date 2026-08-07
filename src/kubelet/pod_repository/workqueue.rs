@@ -666,7 +666,7 @@ impl PodWorkqueue {
 
     async fn enqueue_terminating_unbound_pods_on_leadership_gain(&self) -> Result<()> {
         let pods = self.store.list(None, None, None, None, None).await?;
-        for pod in pods.items {
+        for pod in pods.into_parts().0 {
             let terminating = pod
                 .data
                 .pointer("/metadata/deletionTimestamp")
@@ -1043,7 +1043,7 @@ impl PodWorkqueue {
             self.wall_clock.clone(),
         );
         let mut enqueued_any = false;
-        for resource in pods.items {
+        for resource in pods.into_parts().0 {
             enqueued_any |= coordinator
                 .enqueue_terminating_namespace_pod(namespace, &resource)
                 .await?;

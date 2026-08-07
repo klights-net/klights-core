@@ -4,6 +4,38 @@ use std::sync::Arc;
 
 use klights_cluster_datastore::sqlite::embedded::ResourceMutationPauseOperation as IntegrationResourceMutationPauseOperation;
 use klights_pod_api::PodSubresourceMutation as _;
+use klights_pod_api::{PodQuery as _, PodUpdate as _};
+
+fn integration_owner_references(
+    values: Vec<serde_json::Value>,
+) -> Result<Vec<klights_pod_api::PodOwnerReference>, klights_pod_api::PodRepositoryError> {
+    values
+        .into_iter()
+        .map(|value| {
+            let required = |field: &'static str| {
+                value
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        klights_pod_api::PodRepositoryError::invalid_request(
+                            "owner_reference",
+                            format!("missing {field}"),
+                        )
+                    })
+            };
+            klights_pod_api::PodOwnerReference::try_new(
+                required("apiVersion")?,
+                required("kind")?,
+                required("name")?,
+                required("uid")?,
+                value.get("controller").and_then(serde_json::Value::as_bool),
+                value
+                    .get("blockOwnerDeletion")
+                    .and_then(serde_json::Value::as_bool),
+            )
+        })
+        .collect()
+}
 
 #[derive(Default)]
 struct PodRepositoryRecordingReconcileSink {
@@ -182,12 +214,12 @@ impl IntegrationPodWorkerComposition {
         namespace: &str,
         name: &str,
     ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        crate::kubelet::pod_repository::PodReader::get_pod(
-            self.repository.as_ref(),
-            namespace,
-            name,
-        )
-        .await
+        self.repository
+            .get_pod(klights_pod_api::PodGetRequest::try_by_name(
+                namespace, name,
+            )?)
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     pub async fn get_pod_for_uid(
@@ -196,13 +228,12 @@ impl IntegrationPodWorkerComposition {
         name: &str,
         uid: &str,
     ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        crate::kubelet::pod_repository::PodReader::get_pod_for_uid(
-            self.repository.as_ref(),
-            namespace,
-            name,
-            uid,
-        )
-        .await
+        self.repository
+            .get_pod(klights_pod_api::PodGetRequest::try_by_identity(
+                klights_types::PodIdentity::new(namespace, name, uid),
+            )?)
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     pub async fn set_pod_status_for_uid(
@@ -250,14 +281,15 @@ impl IntegrationPodWorkerComposition {
         uid: &str,
         sandbox_id: &str,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodMetadataWriter::record_sandbox_id_for_uid(
-            self.repository.as_ref(),
-            namespace,
-            name,
-            uid,
-            sandbox_id,
-        )
-        .await
+        self.repository
+            .update_pod(klights_pod_api::PodUpdateRequest::try_record_sandbox_id(
+                klights_pod_api::PodMutationTarget::try_by_identity(
+                    klights_types::PodIdentity::new(namespace, name, uid),
+                )?,
+                sandbox_id,
+            )?)
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     #[allow(dead_code)]
@@ -268,14 +300,15 @@ impl IntegrationPodWorkerComposition {
         uid: &str,
         owner_references: Vec<serde_json::Value>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodObjectWriter::update_pod_owner_references_for_uid(
-            self.repository.as_ref(),
-            namespace,
-            name,
-            uid,
-            owner_references,
-        )
-        .await
+        self.repository
+            .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
+                klights_pod_api::PodMutationTarget::try_by_identity(
+                    klights_types::PodIdentity::new(namespace, name, uid),
+                )?,
+                integration_owner_references(owner_references)?,
+            ))
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     #[allow(dead_code)]
@@ -286,14 +319,18 @@ impl IntegrationPodWorkerComposition {
         uid: &str,
         labels: Vec<(String, String)>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodObjectWriter::merge_pod_labels_for_uid(
-            self.repository.as_ref(),
-            namespace,
-            name,
-            uid,
-            labels,
-        )
-        .await
+        self.repository
+            .update_pod(klights_pod_api::PodUpdateRequest::merge_labels(
+                klights_pod_api::PodMutationTarget::try_by_identity(
+                    klights_types::PodIdentity::new(namespace, name, uid),
+                )?,
+                labels
+                    .into_iter()
+                    .map(|(key, value)| klights_pod_api::PodLabel::try_new(key, value))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     pub async fn seed_status_checkpoint(
@@ -900,9 +937,8 @@ pub async fn run_api_delete_status_race(
 ) -> anyhow::Result<IntegrationApiDeleteStatusRaceOutcome> {
     let repo = IntegrationPodRepositoryComposition::new_inline().await;
     let created = repo
-        .api_create_pod(crate::kubelet::pod_repository::PodApiCreateRequest {
+        .api_create_pod(klights_pod_api::PodApiCreateRequest {
             namespace: "default".to_string(),
-            name: String::new(),
             body: serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Pod",
@@ -910,7 +946,6 @@ pub async fn run_api_delete_status_race(
                 "spec": {"containers": [{"name": "c", "image": "busybox"}]}
             }),
             dry_run: false,
-            run_admission: false,
         })
         .await
         .map_err(anyhow::Error::new)?
@@ -953,8 +988,8 @@ pub async fn run_api_delete_status_race(
     let (deleted, raced) = tokio::join!(delete, race);
     raced?;
     let deleted = match deleted.map_err(anyhow::Error::new)? {
-        crate::kubelet::pod_repository::PodApiDeleteOutcome::GracefulSet(resource) => resource,
-        crate::kubelet::pod_repository::PodApiDeleteOutcome::DryRun(_) => {
+        klights_pod_api::PodApiDeleteOutcome::GracefulSet(resource) => resource,
+        klights_pod_api::PodApiDeleteOutcome::DryRun(_) => {
             anyhow::bail!("delete race unexpectedly dry-ran")
         }
     };
@@ -1222,62 +1257,77 @@ struct IntegrationStatusRaceWriter {
     mode: IntegrationStatusRaceMode,
 }
 
-#[async_trait::async_trait]
-impl crate::kubelet::pod_repository::state_only_writer::StateOnlyWriter
-    for IntegrationStatusRaceWriter
-{
-    async fn write_status(
+impl klights_pod_api::PodStatusPersistence for IntegrationStatusRaceWriter {
+    fn write_pod_status(
         &self,
-        namespace: &str,
-        name: &str,
-        status: serde_json::Value,
-        expected_resource_version: Option<i64>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        let attempt = self
-            .attempts
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        let inject = match &self.mode {
-            IntegrationStatusRaceMode::Scheduler => attempt == 1,
-            IntegrationStatusRaceMode::Probe {
-                conflicts_remaining,
-            } => conflicts_remaining
-                .fetch_update(
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                    |remaining| remaining.checked_sub(1),
-                )
-                .is_ok(),
-        };
-        if inject {
-            let current = self.store.get(namespace, name).await?.expect("race pod");
-            let mut raced = current.data.as_ref().clone();
-            match self.mode {
-                IntegrationStatusRaceMode::Scheduler => {
-                    raced["spec"]["nodeName"] = serde_json::json!("dp")
-                }
-                IntegrationStatusRaceMode::Probe { .. } => {
-                    if raced
-                        .pointer("/metadata/annotations")
-                        .and_then(serde_json::Value::as_object)
-                        .is_none()
-                    {
-                        raced["metadata"]["annotations"] = serde_json::json!({});
+        request: klights_pod_api::PodStatusWriteRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, crate::datastore::Resource> {
+        Box::pin(async move {
+            let klights_pod_api::PodStatusWriteRequest {
+                namespace,
+                name,
+                status,
+                expected_resource_version,
+            } = request;
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let inject = match &self.mode {
+                IntegrationStatusRaceMode::Scheduler => attempt == 1,
+                IntegrationStatusRaceMode::Probe {
+                    conflicts_remaining,
+                } => conflicts_remaining
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |remaining| remaining.checked_sub(1),
+                    )
+                    .is_ok(),
+            };
+            if inject {
+                let current = self
+                    .store
+                    .get(&namespace, &name)
+                    .await
+                    .map_err(|error| {
+                        klights_pod_api::PodRepositoryError::unavailable(error.to_string())
+                    })?
+                    .expect("race pod");
+                let mut raced = current.data.as_ref().clone();
+                match self.mode {
+                    IntegrationStatusRaceMode::Scheduler => {
+                        raced["spec"]["nodeName"] = serde_json::json!("dp")
                     }
-                    raced["metadata"]["annotations"]["klights.dev/probe-readiness-race-attempt"] =
-                        serde_json::json!(attempt.to_string());
+                    IntegrationStatusRaceMode::Probe { .. } => {
+                        if raced
+                            .pointer("/metadata/annotations")
+                            .and_then(serde_json::Value::as_object)
+                            .is_none()
+                        {
+                            raced["metadata"]["annotations"] = serde_json::json!({});
+                        }
+                        raced["metadata"]["annotations"]["klights.dev/probe-readiness-race-attempt"] =
+                            serde_json::json!(attempt.to_string());
+                    }
                 }
+                self.store
+                    .update(&namespace, &name, raced, current.resource_version)
+                    .await
+                    .map_err(|error| {
+                        klights_pod_api::PodRepositoryError::unavailable(error.to_string())
+                    })?;
+                return Err(klights_pod_api::PodRepositoryError::conflict(
+                    "injected status race",
+                ));
             }
             self.store
-                .update(namespace, name, raced, current.resource_version)
-                .await?;
-            return Err(anyhow::Error::new(
-                klights_pod_api::PodRepositoryError::conflict("injected status race"),
-            ));
-        }
-        self.store
-            .integration_update_status(namespace, name, status, expected_resource_version)
-            .await
+                .integration_update_status(&namespace, &name, status, expected_resource_version)
+                .await
+                .map_err(|error| {
+                    klights_pod_api::PodRepositoryError::unavailable(error.to_string())
+                })
+        })
     }
 }
 
@@ -1388,7 +1438,7 @@ pub struct IntegrationPodWatchRunnerFixture {
 
 pub struct IntegrationPodNetworkFixture {
     stores: Option<Arc<crate::datastore::node_local::NodeLocalStores>>,
-    service: crate::kubelet::pod_repository::network::PodNetworkService,
+    service: klights_kubelet::pod_repository::PodNetworkService,
 }
 
 impl IntegrationPodNetworkFixture {
@@ -1398,7 +1448,7 @@ impl IntegrationPodNetworkFixture {
     ) -> Self {
         Self {
             stores: None,
-            service: crate::kubelet::pod_repository::network::PodNetworkService::new(
+            service: klights_kubelet::pod_repository::PodNetworkService::new(
                 cache,
                 Arc::new(klights_supervisor::TaskSupervisor::new(
                     klights_supervisor::TaskCategoryConfig::default(),
@@ -1426,7 +1476,7 @@ impl IntegrationPodNetworkFixture {
             .await
             .expect("Pod network integration store"),
         );
-        let service = crate::kubelet::pod_repository::network::PodNetworkService::new(
+        let service = klights_kubelet::pod_repository::PodNetworkService::new(
             stores.pod_network_cache(),
             supervisor,
             waiter,
@@ -1471,9 +1521,19 @@ impl IntegrationPodNetworkFixture {
         pod_name: &str,
         pod_uid: &str,
         host_network: bool,
-    ) -> anyhow::Result<crate::kubelet::pod_repository::PodNetworkAssignment> {
+    ) -> Result<
+        klights_kubelet::pod_repository::PodNetworkAssignment,
+        klights_kubelet::pod_repository::PodNetworkAssignmentError,
+    > {
+        use klights_kubelet::pod_repository::PodNetworkAssignmentQuery as _;
         self.service
-            .read_pod_network_assignment(sandbox_id, namespace, pod_name, pod_uid, host_network)
+            .read_pod_network_assignment(
+                klights_kubelet::pod_repository::PodNetworkAssignmentRequest::try_new(
+                    sandbox_id,
+                    klights_types::PodIdentity::new(namespace, pod_name, pod_uid),
+                    host_network,
+                )?,
+            )
             .await
     }
 }
@@ -1576,7 +1636,7 @@ impl IntegrationPodStoreFixture {
         &self,
         namespace: Option<&str>,
         label_selector: Option<&str>,
-    ) -> anyhow::Result<crate::kubelet::pod_repository::PodResourceList> {
+    ) -> anyhow::Result<klights_pod_api::PodListResult> {
         self.store
             .list(namespace, label_selector, None, None, None)
             .await
@@ -2405,12 +2465,21 @@ impl IntegrationPodRepositoryComposition {
             }),
         )
         .await?;
-        crate::kubelet::pod_repository::PodObjectWriter::delete_pod(
-            self.repository.as_ref(),
-            "default",
-            "side-effect-pod",
-        )
-        .await?;
+        match self
+            .api_delete_pod(
+                "default",
+                "side-effect-pod",
+                klights_pod_api::PodDeleteOptions::default(),
+                false,
+            )
+            .await
+            .map_err(anyhow::Error::new)?
+        {
+            klights_pod_api::PodApiDeleteOutcome::GracefulSet(_) => {}
+            klights_pod_api::PodApiDeleteOutcome::DryRun(_) => {
+                anyhow::bail!("side-effect delete unexpectedly dry-ran")
+            }
+        }
         let value = *observed.lock().await;
         Ok(value)
     }
@@ -2594,24 +2663,10 @@ impl IntegrationPodRepositoryComposition {
 
     pub async fn api_create_pod(
         &self,
-        request: crate::kubelet::pod_repository::PodApiCreateRequest,
-    ) -> Result<
-        crate::kubelet::pod_repository::PodApiCreateResult,
-        klights_pod_api::PodRepositoryError,
-    > {
+        request: klights_pod_api::PodApiCreateRequest,
+    ) -> Result<klights_pod_api::PodApiCreateResult, klights_pod_api::PodRepositoryError> {
         use klights_pod_api::PodApiMutation as _;
-        let result = self
-            .pod_api
-            .create_pod(klights_pod_api::PodApiCreateRequest {
-                namespace: request.namespace,
-                body: request.body,
-                dry_run: request.dry_run,
-            })
-            .await?;
-        Ok(crate::kubelet::pod_repository::PodApiCreateResult {
-            resource: result.resource,
-            body: result.body,
-        })
+        self.pod_api.create_pod(request).await
     }
 
     pub async fn api_update_pod(
@@ -2621,13 +2676,9 @@ impl IntegrationPodRepositoryComposition {
         body: serde_json::Value,
         current: crate::datastore::Resource,
         dry_run: bool,
-    ) -> Result<
-        crate::kubelet::pod_repository::PodApiUpdateOutcome,
-        klights_pod_api::PodRepositoryError,
-    > {
+    ) -> Result<klights_pod_api::PodApiWriteOutcome, klights_pod_api::PodRepositoryError> {
         use klights_pod_api::PodApiMutation as _;
-        match self
-            .pod_api
+        self.pod_api
             .update_pod(klights_pod_api::PodApiUpdateRequest {
                 namespace: namespace.to_string(),
                 name: name.to_string(),
@@ -2635,15 +2686,7 @@ impl IntegrationPodRepositoryComposition {
                 current,
                 dry_run,
             })
-            .await?
-        {
-            klights_pod_api::PodApiWriteOutcome::Persisted(resource) => {
-                Ok(crate::kubelet::pod_repository::PodApiUpdateOutcome::Persisted(resource))
-            }
-            klights_pod_api::PodApiWriteOutcome::DryRun(value) => Ok(
-                crate::kubelet::pod_repository::PodApiUpdateOutcome::DryRun(value),
-            ),
-        }
+            .await
     }
 
     pub async fn api_patch_pod(
@@ -2651,31 +2694,19 @@ impl IntegrationPodRepositoryComposition {
         namespace: &str,
         name: &str,
         patch: serde_json::Value,
-        patch_type: crate::kubelet::pod_repository::PodStatusPatchType,
+        patch_type: klights_pod_api::PodStatusPatchKind,
         dry_run: bool,
-    ) -> Result<
-        crate::kubelet::pod_repository::PodApiUpdateOutcome,
-        klights_pod_api::PodRepositoryError,
-    > {
+    ) -> Result<klights_pod_api::PodApiWriteOutcome, klights_pod_api::PodRepositoryError> {
         use klights_pod_api::PodApiMutation as _;
-        match self
-            .pod_api
+        self.pod_api
             .patch_pod(klights_pod_api::PodApiPatchRequest {
                 namespace: namespace.to_string(),
                 name: name.to_string(),
                 patch,
-                patch_kind: integration_pod_patch_kind(patch_type),
+                patch_kind: patch_type,
                 dry_run,
             })
-            .await?
-        {
-            klights_pod_api::PodApiWriteOutcome::Persisted(resource) => {
-                Ok(crate::kubelet::pod_repository::PodApiUpdateOutcome::Persisted(resource))
-            }
-            klights_pod_api::PodApiWriteOutcome::DryRun(value) => Ok(
-                crate::kubelet::pod_repository::PodApiUpdateOutcome::DryRun(value),
-            ),
-        }
+            .await
     }
 
     pub async fn api_delete_pod<O>(
@@ -2684,31 +2715,19 @@ impl IntegrationPodRepositoryComposition {
         name: &str,
         options: O,
         dry_run: bool,
-    ) -> Result<
-        crate::kubelet::pod_repository::PodApiDeleteOutcome,
-        klights_pod_api::PodRepositoryError,
-    >
+    ) -> Result<klights_pod_api::PodApiDeleteOutcome, klights_pod_api::PodRepositoryError>
     where
         O: Into<klights_pod_api::PodDeleteOptions> + Send,
     {
         use klights_pod_api::PodApiMutation as _;
-        match self
-            .pod_api
+        self.pod_api
             .delete_pod(klights_pod_api::PodApiDeleteRequest {
                 namespace: namespace.to_string(),
                 name: name.to_string(),
                 options: options.into(),
                 dry_run,
             })
-            .await?
-        {
-            klights_pod_api::PodApiDeleteOutcome::GracefulSet(resource) => {
-                Ok(crate::kubelet::pod_repository::PodApiDeleteOutcome::GracefulSet(resource))
-            }
-            klights_pod_api::PodApiDeleteOutcome::DryRun(value) => Ok(
-                crate::kubelet::pod_repository::PodApiDeleteOutcome::DryRun(value),
-            ),
-        }
+            .await
     }
 
     pub async fn api_delete_collection_pods(
@@ -2742,10 +2761,8 @@ impl IntegrationPodRepositoryComposition {
             .api_delete_pod(target.namespace(), target.name(), options, false)
             .await?
         {
-            crate::kubelet::pod_repository::PodApiDeleteOutcome::GracefulSet(resource) => {
-                Ok(resource)
-            }
-            crate::kubelet::pod_repository::PodApiDeleteOutcome::DryRun(_) => {
+            klights_pod_api::PodApiDeleteOutcome::GracefulSet(resource) => Ok(resource),
+            klights_pod_api::PodApiDeleteOutcome::DryRun(_) => {
                 unreachable!("ordinary mark is never dry-run")
             }
         }
@@ -2801,7 +2818,7 @@ impl IntegrationPodRepositoryComposition {
         namespace: &str,
         name: &str,
         patch: serde_json::Value,
-        patch_type: crate::kubelet::pod_repository::PodStatusPatchType,
+        patch_type: klights_pod_api::PodStatusPatchKind,
         expected_resource_version: i64,
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.pod_subresource
@@ -2809,7 +2826,7 @@ impl IntegrationPodRepositoryComposition {
                 namespace: namespace.to_string(),
                 name: name.to_string(),
                 patch,
-                patch_kind: integration_pod_patch_kind(patch_type),
+                patch_kind: patch_type,
                 expected_resource_version: Some(expected_resource_version),
             })
             .await
@@ -2966,83 +2983,6 @@ impl IntegrationPodRepositoryComposition {
     }
 }
 
-fn integration_pod_patch_kind(
-    patch_type: crate::kubelet::pod_repository::PodStatusPatchType,
-) -> klights_pod_api::PodStatusPatchKind {
-    match patch_type {
-        crate::kubelet::pod_repository::PodStatusPatchType::JsonPatch => {
-            klights_pod_api::PodStatusPatchKind::JsonPatch
-        }
-        crate::kubelet::pod_repository::PodStatusPatchType::MergePatch => {
-            klights_pod_api::PodStatusPatchKind::MergePatch
-        }
-        crate::kubelet::pod_repository::PodStatusPatchType::StrategicMerge => {
-            klights_pod_api::PodStatusPatchKind::StrategicMerge
-        }
-        crate::kubelet::pod_repository::PodStatusPatchType::ApplyPatch => {
-            klights_pod_api::PodStatusPatchKind::ApplyPatch
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::kubelet::pod_repository::PodReader for IntegrationPodRepositoryComposition {
-    async fn get_pod(
-        &self,
-        ns: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        crate::kubelet::pod_repository::PodReader::get_pod(self.repository.as_ref(), ns, name).await
-    }
-
-    async fn get_pod_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        crate::kubelet::pod_repository::PodReader::get_pod_for_uid(
-            self.repository.as_ref(),
-            ns,
-            name,
-            uid,
-        )
-        .await
-    }
-
-    async fn list_pods(
-        &self,
-        ns: Option<&str>,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        limit: Option<i64>,
-        continue_token: Option<&str>,
-    ) -> anyhow::Result<crate::kubelet::pod_repository::PodResourceList> {
-        crate::kubelet::pod_repository::PodReader::list_pods(
-            self.repository.as_ref(),
-            ns,
-            label_selector,
-            field_selector,
-            limit,
-            continue_token,
-        )
-        .await
-    }
-
-    async fn list_pods_by_owner_uid(
-        &self,
-        ns: &str,
-        owner_uid: &str,
-    ) -> anyhow::Result<Vec<crate::datastore::Resource>> {
-        crate::kubelet::pod_repository::PodReader::list_pods_by_owner_uid(
-            self.repository.as_ref(),
-            ns,
-            owner_uid,
-        )
-        .await
-    }
-}
-
 impl klights_pod_api::PodQuery for IntegrationPodRepositoryComposition {
     fn get_pod(
         &self,
@@ -3072,6 +3012,20 @@ impl klights_pod_api::PodUpdate for IntegrationPodRepositoryComposition {
         request: klights_pod_api::PodUpdateRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, crate::datastore::Resource> {
         klights_pod_api::PodUpdate::update_pod(self.repository.as_ref(), request)
+    }
+}
+
+impl klights_kubelet::pod_repository::PodNetworkAssignmentQuery
+    for IntegrationPodRepositoryComposition
+{
+    fn read_pod_network_assignment(
+        &self,
+        request: klights_kubelet::pod_repository::PodNetworkAssignmentRequest,
+    ) -> klights_kubelet::pod_repository::PodNetworkAssignmentFuture<'_> {
+        klights_kubelet::pod_repository::PodNetworkAssignmentQuery::read_pod_network_assignment(
+            self.repository.as_ref(),
+            request,
+        )
     }
 }
 
@@ -3307,256 +3261,11 @@ impl crate::kubelet::pod_repository::PodStatusWriter for IntegrationPodRepositor
     }
 }
 
-#[async_trait::async_trait]
-impl crate::kubelet::pod_repository::PodMetadataWriter for IntegrationPodRepositoryComposition {
-    async fn record_sandbox_id(
-        &self,
-        ns: &str,
-        name: &str,
-        sandbox_id: &str,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodMetadataWriter::record_sandbox_id(
-            self.repository.as_ref(),
-            ns,
-            name,
-            sandbox_id,
-        )
-        .await
-    }
-    async fn record_sandbox_id_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-        sandbox_id: &str,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodMetadataWriter::record_sandbox_id_for_uid(
-            self.repository.as_ref(),
-            ns,
-            name,
-            uid,
-            sandbox_id,
-        )
-        .await
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::kubelet::pod_repository::PodObjectWriter for IntegrationPodRepositoryComposition {
-    async fn create_controller_pod(
-        &self,
-        ns: &str,
-        name: &str,
-        _node_name: &str,
-        pod: serde_json::Value,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.api_create_pod(crate::kubelet::pod_repository::PodApiCreateRequest {
-            namespace: ns.to_string(),
-            name: name.to_string(),
-            body: pod,
-            dry_run: false,
-            run_admission: true,
-        })
-        .await
-        .map_err(anyhow::Error::new)?
-        .resource
-        .ok_or_else(|| anyhow::anyhow!("controller pod {ns}/{name} create returned dry-run"))
-    }
-    async fn delete_pod(&self, ns: &str, name: &str) -> anyhow::Result<()> {
-        crate::kubelet::pod_repository::PodObjectWriter::delete_pod(
-            self.repository.as_ref(),
-            ns,
-            name,
-        )
-        .await
-    }
-    async fn update_pod_owner_references(
-        &self,
-        ns: &str,
-        name: &str,
-        owner_refs: Vec<serde_json::Value>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodObjectWriter::update_pod_owner_references(
-            self.repository.as_ref(),
-            ns,
-            name,
-            owner_refs,
-        )
-        .await
-    }
-    async fn update_pod_owner_references_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-        owner_refs: Vec<serde_json::Value>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodObjectWriter::update_pod_owner_references_for_uid(
-            self.repository.as_ref(),
-            ns,
-            name,
-            uid,
-            owner_refs,
-        )
-        .await
-    }
-    async fn merge_pod_labels(
-        &self,
-        ns: &str,
-        name: &str,
-        labels: Vec<(String, String)>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodObjectWriter::merge_pod_labels(
-            self.repository.as_ref(),
-            ns,
-            name,
-            labels,
-        )
-        .await
-    }
-    async fn merge_pod_labels_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-        labels: Vec<(String, String)>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        crate::kubelet::pod_repository::PodObjectWriter::merge_pod_labels_for_uid(
-            self.repository.as_ref(),
-            ns,
-            name,
-            uid,
-            labels,
-        )
-        .await
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::kubelet::pod_repository::PodNetworkReader for IntegrationPodRepositoryComposition {
-    async fn read_pod_network_assignment(
-        &self,
-        sandbox_id: &str,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        host_network: bool,
-    ) -> anyhow::Result<crate::kubelet::pod_repository::PodNetworkAssignment> {
-        crate::kubelet::pod_repository::PodNetworkReader::read_pod_network_assignment(
-            self.repository.as_ref(),
-            sandbox_id,
-            namespace,
-            pod_name,
-            pod_uid,
-            host_network,
-        )
-        .await
-    }
-}
-
 impl crate::kubelet::pod_repository::PodWatchSource for IntegrationPodRepositoryComposition {
     fn subscribe_pod_watch(&self) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
         crate::kubelet::pod_repository::PodWatchSource::subscribe_pod_watch(
             self.repository.as_ref(),
         )
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::kubelet::pod_repository::PodSubresourceWriter for IntegrationPodRepositoryComposition {
-    async fn replace_status_from_api(
-        &self,
-        ns: &str,
-        name: &str,
-        status: serde_json::Value,
-        expected_rv: i64,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        IntegrationPodRepositoryComposition::replace_status_from_api(
-            self,
-            ns,
-            name,
-            status,
-            expected_rv,
-        )
-        .await
-    }
-
-    async fn replace_status_from_api_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-        status: serde_json::Value,
-        expected_rv: i64,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        IntegrationPodRepositoryComposition::replace_status_from_api_for_uid(
-            self,
-            ns,
-            name,
-            uid,
-            status,
-            expected_rv,
-        )
-        .await
-    }
-
-    async fn patch_status_from_api(
-        &self,
-        ns: &str,
-        name: &str,
-        patch: serde_json::Value,
-        patch_type: crate::kubelet::pod_repository::PodStatusPatchType,
-        expected_rv: i64,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        IntegrationPodRepositoryComposition::patch_status_from_api(
-            self,
-            ns,
-            name,
-            patch,
-            patch_type,
-            expected_rv,
-        )
-        .await
-    }
-
-    async fn update_ephemeral_containers(
-        &self,
-        ns: &str,
-        name: &str,
-        containers: Vec<serde_json::Value>,
-        expected_rv: i64,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        IntegrationPodRepositoryComposition::update_ephemeral_containers(
-            self,
-            ns,
-            name,
-            containers,
-            expected_rv,
-        )
-        .await
-    }
-
-    async fn update_ephemeral_containers_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-        containers: Vec<serde_json::Value>,
-        expected_rv: i64,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        let current = self
-            .read_pod(ns, name)
-            .await?
-            .ok_or_else(|| klights_pod_api::PodRepositoryError::not_found(ns, name))?;
-        crate::kubelet::pod_repository::ensure_pod_uid_matches(&current.data, uid, ns, name)?;
-        IntegrationPodRepositoryComposition::update_ephemeral_containers(
-            self,
-            ns,
-            name,
-            containers,
-            expected_rv,
-        )
-        .await
     }
 }
 
@@ -3580,25 +3289,5 @@ impl klights_pod_api::PodSubresourceMutation for IntegrationPodRepositoryComposi
         request: klights_pod_api::PodEphemeralContainersRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, crate::datastore::Resource> {
         self.pod_subresource.update_ephemeral_containers(request)
-    }
-}
-
-#[async_trait::async_trait]
-impl klights_controllers::pdb::PdbPodReader for IntegrationPodRepositoryComposition {
-    async fn list_namespace_pods(
-        &self,
-        namespace: &str,
-    ) -> klights_reconcile_api::ControllerStoreResult<Vec<crate::datastore::Resource>> {
-        crate::kubelet::pod_repository::PodReader::list_pods(
-            self,
-            Some(namespace),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .map(|list| list.items)
-        .map_err(|error| klights_reconcile_api::ControllerStoreError::internal(error.to_string()))
     }
 }

@@ -9,6 +9,6 @@ controller_wrapper!(
     with_node,
     with_pod_repository,
     store = deployment_store,
-    reader = deployment_reader,
+    reader = pod_query,
     mutation = deployment_mutation
 );

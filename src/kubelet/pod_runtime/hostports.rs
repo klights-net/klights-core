@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use crate::kubelet::pod_repository::PodReader;
 use crate::kubelet::pod_runtime::service::PodRuntimeKey;
+use klights_pod_api::{PodListRequest, PodQuery};
 use serde_json::Value;
 
 pub fn pod_host_ports_from_resource(
@@ -44,14 +44,14 @@ pub trait HostPortRuntime: Send + Sync {
 /// Production hostPort adapter over ServiceRouter + PodRepository.
 pub struct RealHostPortRuntime {
     service_router: Arc<dyn klights_network_api::ServiceRouter>,
-    repository: Arc<dyn PodReader>,
+    repository: Arc<dyn PodQuery>,
     node_name: String,
 }
 
 impl RealHostPortRuntime {
     pub fn new(
         service_router: Arc<dyn klights_network_api::ServiceRouter>,
-        repository: Arc<dyn PodReader>,
+        repository: Arc<dyn PodQuery>,
         node_name: String,
     ) -> Self {
         Self {
@@ -142,7 +142,7 @@ fn pod_is_active_for_hostport_admission(pod: &Value) -> bool {
 }
 
 pub async fn reject_hostport_conflicts(
-    pod_reader: &dyn PodReader,
+    pod_reader: &dyn PodQuery,
     requested_pod: &klights_network_api::PodHostPorts,
     node_name: &str,
 ) -> anyhow::Result<()> {
@@ -152,9 +152,11 @@ pub async fn reject_hostport_conflicts(
     }
 
     let identity = requested_pod.pod();
-    let pods = pod_reader.list_pods(None, None, None, None, None).await?;
+    let pods = pod_reader
+        .list_pods(PodListRequest::try_new(None, None, None, None, None)?)
+        .await?;
 
-    for existing in pods.items {
+    for existing in pods.into_parts().0 {
         let existing_pod = &existing.data;
         if !pod_is_active_for_hostport_admission(existing_pod) {
             continue;

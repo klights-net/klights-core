@@ -18,17 +18,23 @@ impl<'a> PodRecovery<'a> {
     }
 
     pub(super) async fn recover_existing_pods(&mut self) -> Result<()> {
-        // Route through PodReader so the v1/Pod read boundary stays
+        // Route through PodQuery so the v1/Pod read boundary stays
         // inside `PodStore`.
-        use crate::kubelet::pod_repository::PodReader;
         use klights_kubelet::pod_lifecycle_core::message::LifecycleMessage;
+        use klights_pod_api::{PodListRequest, PodQuery};
         let field_selector = super::pod_watcher_node_field_selector(self.node_name);
         let pod_list = self
             .pod_repo
-            .list_pods(None, None, Some(field_selector.as_str()), None, None)
+            .list_pods(PodListRequest::try_new(
+                None,
+                None,
+                Some(field_selector),
+                None,
+                None,
+            )?)
             .await?;
 
-        for pod_resource in pod_list.items {
+        for pod_resource in pod_list.into_parts().0 {
             let namespace = pod_resource
                 .data
                 .pointer("/metadata/namespace")
@@ -59,7 +65,7 @@ impl<'a> PodRecovery<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kubelet::pod_repository::PodObjectWriter;
+
     use klights_kubelet::pod_lifecycle_core::action::PodAction;
     use klights_kubelet::pod_lifecycle_router::PodLifecycleRouter;
     use klights_kubelet::pod_lifecycle_router::executor::RecordingExecutor;
@@ -119,7 +125,7 @@ mod tests {
             "status": {"phase": "Pending"}
         });
         pod_repo
-            .create_controller_pod("kube-system", "coredns", "test-node", pod)
+            .test_create_pod("kube-system", "coredns", "test-node", pod)
             .await
             .expect("create recovery pod");
 

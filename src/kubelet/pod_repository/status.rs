@@ -18,15 +18,15 @@ use klights_kubelet::pod_status_logic::{
     compute_initialized_condition, get_condition_last_transition_time,
 };
 use klights_leader_api::LeaderResourceQuery;
+use klights_pod_api::{PodStatusPersistence, PodStatusWriteRequest};
 use klights_reconcile_api::{PodMutationReconcileRequest, PodMutationReconcileSink};
 
-use super::state_only_writer::StateOnlyWriter;
 use super::store::PodStore;
-use super::types::{PodStatusUpdate, RuntimeReconcileStatus};
+use klights_kubelet::pod_repository::{PodStatusUpdate, RuntimeReconcileStatus};
 
 pub(crate) struct PodStatusService {
     store: Arc<PodStore>,
-    status_only: Arc<dyn StateOnlyWriter>,
+    status_persistence: Arc<dyn PodStatusPersistence>,
     mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
     outbox: Option<Arc<Outbox>>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
@@ -184,7 +184,7 @@ impl PodStatusWriteResult {
 impl PodStatusService {
     pub(crate) fn new(
         store: Arc<PodStore>,
-        status_only: Arc<dyn StateOnlyWriter>,
+        status_persistence: Arc<dyn PodStatusPersistence>,
         mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
         outbox: Option<Arc<Outbox>>,
         cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
@@ -193,7 +193,7 @@ impl PodStatusService {
     ) -> Self {
         Self {
             store,
-            status_only,
+            status_persistence,
             mutation_reconcile,
             outbox,
             cluster_api,
@@ -618,8 +618,13 @@ impl PodStatusService {
             }
 
             match self
-                .status_only
-                .write_status(ns, name, status_obj, Some(cas_rv))
+                .status_persistence
+                .write_pod_status(PodStatusWriteRequest {
+                    namespace: ns.to_string(),
+                    name: name.to_string(),
+                    status: status_obj,
+                    expected_resource_version: Some(cas_rv),
+                })
                 .await
             {
                 Ok(updated) => {
@@ -652,7 +657,7 @@ impl PodStatusService {
                 {
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             }
         }
         unreachable!("status retry loop must return before exhausting attempts")
@@ -986,8 +991,13 @@ impl PodStatusService {
             }
 
             match self
-                .status_only
-                .write_status(ns, name, status, Some(cas_rv))
+                .status_persistence
+                .write_pod_status(PodStatusWriteRequest {
+                    namespace: ns.to_string(),
+                    name: name.to_string(),
+                    status,
+                    expected_resource_version: Some(cas_rv),
+                })
                 .await
             {
                 Ok(updated) => {
@@ -1022,7 +1032,7 @@ impl PodStatusService {
                 {
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             }
         }
         unreachable!("status retry loop must return before exhausting attempts")
@@ -1126,8 +1136,13 @@ impl PodStatusService {
             }
 
             match self
-                .status_only
-                .write_status(ns, name, status, Some(cas_rv))
+                .status_persistence
+                .write_pod_status(PodStatusWriteRequest {
+                    namespace: ns.to_string(),
+                    name: name.to_string(),
+                    status,
+                    expected_resource_version: Some(cas_rv),
+                })
                 .await
             {
                 Ok(updated) => {
@@ -1146,7 +1161,7 @@ impl PodStatusService {
                 {
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             }
         }
         unreachable!("status retry loop must return before exhausting attempts")
@@ -1231,8 +1246,13 @@ impl PodStatusService {
         }
 
         let updated = self
-            .status_only
-            .write_status(ns, name, status, Some(cas_rv))
+            .status_persistence
+            .write_pod_status(PodStatusWriteRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
+                status,
+                expected_resource_version: Some(cas_rv),
+            })
             .await?;
         let changed = log_pod_status_write_result(
             "ephemeral-container-status",
@@ -1438,8 +1458,13 @@ impl PodStatusService {
             }
 
             match self
-                .status_only
-                .write_status(ns, name, status, Some(cas_rv))
+                .status_persistence
+                .write_pod_status(PodStatusWriteRequest {
+                    namespace: ns.to_string(),
+                    name: name.to_string(),
+                    status,
+                    expected_resource_version: Some(cas_rv),
+                })
                 .await
             {
                 Ok(updated) => {
@@ -1474,7 +1499,7 @@ impl PodStatusService {
                 {
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             }
         }
         unreachable!("probe-readiness retry loop must return before exhausting attempts")
@@ -1606,8 +1631,13 @@ impl PodStatusService {
         }
 
         let updated = self
-            .status_only
-            .write_status(ns, name, status, Some(cas_rv))
+            .status_persistence
+            .write_pod_status(PodStatusWriteRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
+                status,
+                expected_resource_version: Some(cas_rv),
+            })
             .await?;
         let changed = log_pod_status_write_result(
             "deadline-exceeded",
@@ -2016,14 +2046,8 @@ fn upsert_terminal_readiness_condition(
     }));
 }
 
-fn is_conflict(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause
-            .downcast_ref::<klights_pod_api::PodRepositoryError>()
-            .is_some_and(|error| {
-                matches!(error, klights_pod_api::PodRepositoryError::Conflict { .. })
-            })
-    })
+fn is_conflict(error: &klights_pod_api::PodRepositoryError) -> bool {
+    matches!(error, klights_pod_api::PodRepositoryError::Conflict { .. })
 }
 
 fn log_noop_pod_status_write(

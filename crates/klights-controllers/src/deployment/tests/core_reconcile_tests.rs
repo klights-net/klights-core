@@ -699,74 +699,53 @@ impl klights_pod_api::PodQuery for RollingUpdateObservedGenerationReader {
         &self,
         request: klights_pod_api::PodOwnerListRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, Vec<klights_cluster_core::Resource>> {
-        klights_pod_api::PodQuery::list_pods_by_owner_uid(self.inner.as_ref(), request)
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::deployment::DeploymentPodReader for RollingUpdateObservedGenerationReader {
-    async fn list_pods_by_owner_uid(
-        &self,
-        ns: &str,
-        owner_uid: &str,
-    ) -> klights_reconcile_api::ControllerStoreResult<Vec<klights_cluster_core::Resource>> {
-        if !self.checked.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            let deployment = self
-                .db
-                .get_resource(
-                    "apps/v1",
-                    "Deployment",
-                    Some(self.namespace),
-                    self.deployment_name,
-                )
-                .await?
-                .expect("deployment must exist while planning rollout");
-            let observed = deployment
-                .data
-                .pointer("/status/observedGeneration")
-                .and_then(|v| v.as_i64());
-            let has_new_rs = self
-                .db
-                .list_resources(
-                    "apps/v1",
-                    "ReplicaSet",
-                    Some(self.namespace),
-                    crate::test_support::ResourceListQuery::all(),
-                )
-                .await?
-                .items
-                .iter()
-                .any(|rs| {
-                    rs.data
-                        .pointer("/spec/template/spec/containers/0/image")
-                        .and_then(|v| v.as_str())
-                        == Some(self.new_image)
-                });
-            if observed == Some(2) && !has_new_rs {
-                return Err(klights_reconcile_api::ControllerStoreError::unavailable(
-                    "deployment observedGeneration advanced to 2 before matching new ReplicaSet existed",
-                ));
+        Box::pin(async move {
+            if !self.checked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let deployment = self
+                    .db
+                    .get_resource(
+                        "apps/v1",
+                        "Deployment",
+                        Some(self.namespace),
+                        self.deployment_name,
+                    )
+                    .await
+                    .map_err(|error| {
+                        klights_pod_api::PodRepositoryError::unavailable(error.to_string())
+                    })?
+                    .expect("deployment must exist while planning rollout");
+                let observed = deployment
+                    .data
+                    .pointer("/status/observedGeneration")
+                    .and_then(|v| v.as_i64());
+                let has_new_rs = self
+                    .db
+                    .list_resources(
+                        "apps/v1",
+                        "ReplicaSet",
+                        Some(self.namespace),
+                        crate::test_support::ResourceListQuery::all(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        klights_pod_api::PodRepositoryError::unavailable(error.to_string())
+                    })?
+                    .items
+                    .iter()
+                    .any(|rs| {
+                        rs.data
+                            .pointer("/spec/template/spec/containers/0/image")
+                            .and_then(|v| v.as_str())
+                            == Some(self.new_image)
+                    });
+                if observed == Some(2) && !has_new_rs {
+                    return Err(klights_pod_api::PodRepositoryError::unavailable(
+                        "deployment observedGeneration advanced to 2 before matching new ReplicaSet existed",
+                    ));
+                }
             }
-        }
-        self.inner
-            .list_resources_by_owner_uid("v1", "Pod", Some(ns), owner_uid)
-            .await
-    }
-
-    async fn list_namespace_pods(
-        &self,
-        namespace: &str,
-    ) -> klights_reconcile_api::ControllerStoreResult<Vec<klights_cluster_core::Resource>> {
-        Ok(self
-            .inner
-            .list_resources(
-                "v1",
-                "Pod",
-                Some(namespace),
-                crate::test_support::ResourceListQuery::all(),
-            )
-            .await?
-            .items)
+            klights_pod_api::PodQuery::list_pods_by_owner_uid(self.inner.as_ref(), request).await
+        })
     }
 }
 

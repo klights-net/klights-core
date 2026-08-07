@@ -24,7 +24,7 @@ pub(crate) struct PodReconcileAdapter {
     dispatcher: ControllerDispatcherSlot,
     metrics: std::sync::Arc<klights_controllers::side_effects::SideEffectMetrics>,
     side_effects: std::sync::Arc<klights_controllers::side_effects::SideEffectRegistry>,
-    pod_reader: std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader>,
+    pod_reader: std::sync::Arc<dyn klights_pod_api::PodQuery>,
     non_pod_finalization:
         crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter,
     coordination: std::sync::Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
@@ -38,7 +38,7 @@ impl PodReconcileAdapter {
         dispatcher: ControllerDispatcherSlot,
         metrics: std::sync::Arc<klights_controllers::side_effects::SideEffectMetrics>,
         side_effects: std::sync::Arc<klights_controllers::side_effects::SideEffectRegistry>,
-        pod_reader: std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader>,
+        pod_reader: std::sync::Arc<dyn klights_pod_api::PodQuery>,
         identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Self {
         Self::new_with_coordination(
@@ -57,7 +57,7 @@ impl PodReconcileAdapter {
         dispatcher: ControllerDispatcherSlot,
         metrics: std::sync::Arc<klights_controllers::side_effects::SideEffectMetrics>,
         side_effects: std::sync::Arc<klights_controllers::side_effects::SideEffectRegistry>,
-        pod_reader: std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader>,
+        pod_reader: std::sync::Arc<dyn klights_pod_api::PodQuery>,
         coordination: std::sync::Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
         identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Self {

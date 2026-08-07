@@ -963,22 +963,6 @@ impl crate::resource_quota::ResourceQuotaRuntime for TestStore {
 }
 
 #[async_trait]
-impl crate::deployment::DeploymentPodReader for TestStore {
-    async fn list_pods_by_owner_uid(
-        &self,
-        namespace: &str,
-        owner_uid: &str,
-    ) -> ControllerStoreResult<Vec<Resource>> {
-        self.list_resources_by_owner_uid("v1", "Pod", Some(namespace), owner_uid)
-            .await
-    }
-
-    async fn list_namespace_pods(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
-        Ok(self.resources_of_kind("v1", "Pod", Some(namespace)))
-    }
-}
-
-#[async_trait]
 impl crate::deployment::DeploymentPodMutation for TestStore {
     async fn merge_deployment_pod_labels(
         &self,

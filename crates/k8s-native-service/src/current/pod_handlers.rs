@@ -130,7 +130,7 @@ pub(in crate::current) async fn list_pods(
     // Pin paginated continuations / Exact reads to a consistent snapshot, shared
     // with every other list handler. Pods live in the generic resource table, so
     // the snapshot side reads `("v1","Pod")` directly; the live side stays on the
-    // PodReader port. See `query::resolve_list_page`.
+    // PodQuery port. See `query::resolve_list_page`.
     let pod_repository = state.resource_mutation().pod_repository.clone();
     let snapshot_repository = pod_repository.clone();
     let snapshot_query = list_query.clone();
@@ -354,13 +354,6 @@ pub(in crate::current) async fn delete_pod(
     match outcome {
         klights_pod_api::PodApiDeleteOutcome::DryRun(v) => Ok((StatusCode::OK, Json(v))),
         klights_pod_api::PodApiDeleteOutcome::GracefulSet(r) => {
-            dispatch_pod_handler_mutation_event(
-                &state,
-                klights_reconcile_api::MutationOperation::DeleteMark,
-                &r.data,
-                "pod_delete_mark",
-            )
-            .await;
             let result = crate::generic_command::accepted_object(
                 state.resource_mutation().identity.as_ref(),
                 r.data,

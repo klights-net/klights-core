@@ -7,9 +7,9 @@
 
 use std::sync::Arc;
 
-use crate::kubelet::pod_repository::{
-    PodReader, PodRepository, PodStatusUpdate, PodStatusWriter, RuntimeReconcileStatus,
-};
+use crate::kubelet::pod_repository::{PodRepository, PodStatusWriter};
+use klights_kubelet::pod_repository::{PodStatusUpdate, RuntimeReconcileStatus};
+use klights_pod_api::{PodGetRequest, PodQuery};
 
 /// View of the local node's identity and Pod ownership.
 pub trait NodeRuntimeView: Send + Sync {
@@ -106,7 +106,9 @@ async fn apply_forwarded_status(
     }
 
     let live = repository
-        .get_pod_for_uid(&key.namespace, &key.name, &key.uid)
+        .get_pod(PodGetRequest::try_by_identity(
+            klights_types::PodIdentity::new(&key.namespace, &key.name, &key.uid),
+        )?)
         .await
         .map_err(|e| anyhow::anyhow!("{:#}", e))?;
     let status_update = PodStatusUpdate {
@@ -176,7 +178,7 @@ impl ClusterRuntimeView for RepositoryClusterRuntimeView {
         name: &str,
     ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
         self.repository
-            .get_pod(namespace, name)
+            .get_pod(PodGetRequest::try_by_name(namespace, name)?)
             .await
             .map_err(|e| anyhow::anyhow!("{:#}", e))
     }
@@ -198,7 +200,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
     use crate::kubelet::pod_runtime::service::PodRuntimeKey;
 
     async fn build_repo() -> PodRepository {
@@ -234,7 +235,7 @@ mod tests {
             }
         });
         let created = repo
-            .create_controller_pod("default", "init-forwarded", "worker-1", pod)
+            .test_create_pod("default", "init-forwarded", "worker-1", pod)
             .await
             .unwrap();
         let key = PodRuntimeKey::new("default", "init-forwarded", &created.uid);
@@ -274,7 +275,7 @@ mod tests {
         .unwrap();
 
         let stored = repo
-            .get_pod_for_uid("default", "init-forwarded", &created.uid)
+            .test_get_pod_for_uid("default", "init-forwarded", &created.uid)
             .await
             .unwrap()
             .unwrap();
@@ -332,7 +333,7 @@ mod tests {
             }
         });
         let created = repo
-            .create_controller_pod("default", "init-retry-forwarded", "worker-1", pod)
+            .test_create_pod("default", "init-retry-forwarded", "worker-1", pod)
             .await
             .unwrap();
         let key = PodRuntimeKey::new("default", "init-retry-forwarded", &created.uid);
@@ -383,7 +384,7 @@ mod tests {
         .unwrap();
 
         let stored = repo
-            .get_pod_for_uid("default", "init-retry-forwarded", &created.uid)
+            .test_get_pod_for_uid("default", "init-retry-forwarded", &created.uid)
             .await
             .unwrap()
             .unwrap();
@@ -429,7 +430,7 @@ mod tests {
             }
         });
         let created = repo
-            .create_controller_pod("default", "split-init-forwarded", "worker-1", pod)
+            .test_create_pod("default", "split-init-forwarded", "worker-1", pod)
             .await
             .unwrap();
         let key = PodRuntimeKey::new("default", "split-init-forwarded", &created.uid);
@@ -488,7 +489,7 @@ mod tests {
         .unwrap();
 
         let stored = repo
-            .get_pod_for_uid("default", "split-init-forwarded", &created.uid)
+            .test_get_pod_for_uid("default", "split-init-forwarded", &created.uid)
             .await
             .unwrap()
             .unwrap();

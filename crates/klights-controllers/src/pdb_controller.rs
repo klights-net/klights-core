@@ -15,7 +15,7 @@ impl crate::Controller for PDBController {
     ) -> anyhow::Result<()> {
         crate::pdb::reconcile_pdb_at(
             context.pdb_store(),
-            context.pdb_reader(),
+            context.pod_query(),
             &resource,
             context.reconcile_time(),
         )

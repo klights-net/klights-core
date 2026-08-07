@@ -7,6 +7,7 @@ use crate::common::ControllerStatusStore;
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_pod_api::{PodListRequest, PodQuery};
 use klights_reconcile_api::{ControllerStoreResult, PodEvictionAdmissionOutcome};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -17,12 +18,7 @@ pub trait PdbStore: ControllerStatusStore {
     async fn list_pdbs(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>>;
 }
 
-#[async_trait]
-pub trait PdbPodReader: Send + Sync {
-    async fn list_namespace_pods(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>>;
-}
-
-pub async fn reconcile_pdb_at<Store: PdbStore + ?Sized, Pods: PdbPodReader + ?Sized>(
+pub async fn reconcile_pdb_at<Store: PdbStore + ?Sized, Pods: PodQuery + ?Sized>(
     store: &Store,
     pod_reader: &Pods,
     pdb: &Value,
@@ -71,7 +67,17 @@ pub async fn reconcile_pdb_at<Store: PdbStore + ?Sized, Pods: PdbPodReader + ?Si
         };
 
         // List all pods in the namespace
-        let pod_list = pod_reader.list_namespace_pods(namespace).await?;
+        let pod_list = pod_reader
+            .list_pods(PodListRequest::try_new(
+                Some(namespace.to_string()),
+                None,
+                None,
+                None,
+                None,
+            )?)
+            .await?
+            .into_parts()
+            .0;
 
         // Preserve disruptedPods for selected pods that still exist, including
         // the normal eviction window where the pod is terminating.
@@ -224,7 +230,7 @@ fn disrupted_pods_for_live_matching_pods(
 /// Trigger PDB status reconcile for all PodDisruptionBudgets in a namespace.
 /// Called when pods in the namespace are created, updated, or deleted — so PDB
 /// status (disruptionsAllowed, currentHealthy, expectedPods) stays current.
-pub async fn reconcile_pdbs_for_namespace<Store: PdbStore + ?Sized, Pods: PdbPodReader + ?Sized>(
+pub async fn reconcile_pdbs_for_namespace<Store: PdbStore + ?Sized, Pods: PodQuery + ?Sized>(
     store: &Store,
     pod_reader: &Pods,
     namespace: &str,
@@ -256,7 +262,7 @@ pub async fn reconcile_pdbs_for_namespace<Store: PdbStore + ?Sized, Pods: PdbPod
 
 pub async fn reconcile_pdbs_for_namespace_checked<
     Store: PdbStore + ?Sized,
-    Pods: PdbPodReader + ?Sized,
+    Pods: PodQuery + ?Sized,
 >(
     store: &Store,
     pod_reader: &Pods,

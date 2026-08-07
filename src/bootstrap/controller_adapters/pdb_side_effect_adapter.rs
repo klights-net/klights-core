@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use klights_controllers::pdb;
 use klights_controllers::side_effects::PodSideEffectPortsSlot;
 use klights_controllers::side_effects::pdb::PdbSideEffectPort;
-use klights_pod_api::{PodListRequest, PodQuery};
+use klights_pod_api::PodQuery;
 
 struct RootPdbSideEffectPort {
     db: DatastoreHandle,
@@ -19,33 +19,10 @@ struct BoundPdbPort<'a> {
 }
 
 #[async_trait]
-impl klights_controllers::pdb::PdbPodReader for BoundPdbPort<'_> {
-    async fn list_namespace_pods(
-        &self,
-        namespace: &str,
-    ) -> klights_reconcile_api::ControllerStoreResult<Vec<klights_cluster_core::Resource>> {
-        let request = PodListRequest::try_new(Some(namespace.to_string()), None, None, None, None)
-            .map_err(|error| {
-                klights_reconcile_api::ControllerStoreError::internal(format!(
-                    "invalid PDB Pod list request: {error}"
-                ))
-            })?;
-        self.pod_query
-            .list_pods(request)
-            .await
-            .map(|listing| listing.into_parts().0)
-            .map_err(|error| {
-                klights_reconcile_api::ControllerStoreError::unavailable(format!(
-                    "PDB Pod list failed: {error}"
-                ))
-            })
-    }
-}
-
-#[async_trait]
 impl PdbSideEffectPort for BoundPdbPort<'_> {
     async fn reconcile_namespace(&self, namespace: &str) -> Result<()> {
-        pdb::reconcile_pdbs_for_namespace(self.db, self, namespace, chrono::Utc::now()).await;
+        pdb::reconcile_pdbs_for_namespace(self.db, self.pod_query, namespace, chrono::Utc::now())
+            .await;
         Ok(())
     }
 }

@@ -4,7 +4,6 @@ use klights_reconcile_api::ControllerStoreResult as Result;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
 use crate::datastore::{DatastoreBackend, ResourceListQuery};
-use crate::kubelet::pod_repository::PodObjectWriter;
 use klights_controllers::daemonset::{DaemonSetPodMutation, DaemonSetStore};
 
 #[async_trait]
@@ -15,40 +14,10 @@ impl DaemonSetPodMutation
         &self,
         namespace: &str,
         name: &str,
-        node_name: &str,
+        _node_name: &str,
         pod: serde_json::Value,
     ) -> Result<Resource> {
-        PodObjectWriter::create_controller_pod(self, namespace, name, node_name, pod)
-            .await
-            .map_err(map_controller_store_error)
-    }
-}
-
-#[async_trait]
-impl DaemonSetPodMutation for dyn PodObjectWriter + '_ {
-    async fn create_daemonset_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        node_name: &str,
-        pod: serde_json::Value,
-    ) -> Result<Resource> {
-        PodObjectWriter::create_controller_pod(self, namespace, name, node_name, pod)
-            .await
-            .map_err(map_controller_store_error)
-    }
-}
-
-#[async_trait]
-impl DaemonSetPodMutation for crate::kubelet::pod_repository::PodRepository {
-    async fn create_daemonset_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        node_name: &str,
-        pod: serde_json::Value,
-    ) -> Result<Resource> {
-        PodObjectWriter::create_controller_pod(self, namespace, name, node_name, pod)
+        self.create_controller_pod(namespace, name, pod)
             .await
             .map_err(map_controller_store_error)
     }

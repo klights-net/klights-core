@@ -632,9 +632,12 @@ async fn pod_lifecycle_key_for_pod_name(
     namespace: &str,
     pod_name: &str,
 ) -> Option<PodLifecycleKey> {
-    use crate::kubelet::pod_repository::PodReader;
+    use klights_pod_api::{PodGetRequest, PodQuery};
 
-    match pod_repo.get_pod(namespace, pod_name).await {
+    match pod_repo
+        .get_pod(PodGetRequest::try_by_name(namespace, pod_name).ok()?)
+        .await
+    {
         Ok(Some(pod_resource)) => pod_lifecycle_key_from_pod(&pod_resource.data),
         Ok(None) => None,
         Err(err) => {

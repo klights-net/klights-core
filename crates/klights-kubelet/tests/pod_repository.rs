@@ -5,17 +5,17 @@ use std::task::{Context, Poll, Waker};
 
 use klights_cluster_core::Resource;
 use klights_kubelet::pod_repository::{
-    PodLifecycleRouteRequest, PodLifecycleRouteSink, PodLifecycleWakeupService, PodQueryPort,
-    PodRepositoryList, PodRepositoryService, PodTerminationPort, PodUpdatePort,
+    PodLifecycleRouteRequest, PodLifecycleRouteSink, PodLifecycleWakeupService,
+    PodMetadataDependencies, PodRepositoryService, PodTerminationPort,
 };
 use klights_pod_api::{
-    PodGetRequest, PodLabel, PodLifecycleWakeup, PodLifecycleWakeupRequest, PodListRequest,
+    PodGetRequest, PodLifecycleWakeup, PodLifecycleWakeupRequest, PodListRequest, PodListResult,
     PodMarkTerminating, PodMarkTerminatingRequest, PodMutationTarget, PodOwnerListRequest,
-    PodOwnerReference, PodQuery, PodRepositoryError, PodRepositoryFuture, PodRoutingError,
-    PodUpdate, PodUpdateRequest,
+    PodPersistence, PodPersistenceCreateRequest, PodPersistenceReplaceRequest, PodQuery,
+    PodRepositoryError, PodRepositoryFuture, PodRoutingError,
 };
 use klights_types::PodIdentity;
-use serde_json::{Value, json};
+use serde_json::json;
 
 fn pod(namespace: &str, name: &str, uid: &str, resource_version: i64) -> Resource {
     Resource::try_from_data(Arc::new(json!({
@@ -42,14 +42,10 @@ fn resolve<T>(future: impl Future<Output = T>) -> T {
 
 #[derive(Clone, Debug, PartialEq)]
 enum QueryCall {
-    ByName {
+    Get {
         namespace: String,
         name: String,
-    },
-    ByUid {
-        namespace: String,
-        name: String,
-        uid: String,
+        uid: Option<String>,
     },
     List {
         namespace: Option<String>,
@@ -64,65 +60,30 @@ enum QueryCall {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum UpdateCall {
-    MergeLabels {
-        identity: PodIdentity,
-        labels: Vec<(String, String)>,
-    },
-    ReplaceOwnerReferences {
-        identity: PodIdentity,
-        owner_references: Vec<Value>,
-    },
-    RecordSandboxId {
-        identity: PodIdentity,
-        sandbox_id: String,
-    },
-}
-
 #[derive(Default)]
-struct FakePodPorts {
-    query_calls: Mutex<Vec<QueryCall>>,
-    update_calls: Mutex<Vec<UpdateCall>>,
-    marked: Mutex<Vec<PodMutationTarget>>,
+struct RecordingQuery {
+    calls: Mutex<Vec<QueryCall>>,
 }
 
-fn identity(namespace: &str, name: &str, uid: Option<&str>) -> PodIdentity {
-    PodIdentity::new(namespace, name, uid.unwrap_or_default())
-}
-
-impl PodQueryPort for FakePodPorts {
-    fn read_pod<'a>(
-        &'a self,
-        namespace: &'a str,
-        name: &'a str,
-    ) -> PodRepositoryFuture<'a, Option<Resource>> {
-        self.query_calls.lock().unwrap().push(QueryCall::ByName {
-            namespace: namespace.to_string(),
-            name: name.to_string(),
+impl PodQuery for RecordingQuery {
+    fn get_pod(&self, request: PodGetRequest) -> PodRepositoryFuture<'_, Option<Resource>> {
+        let uid = request.uid().map(str::to_string);
+        self.calls.lock().unwrap().push(QueryCall::Get {
+            namespace: request.namespace().to_string(),
+            name: request.name().to_string(),
+            uid: uid.clone(),
         });
-        Box::pin(async { Ok(Some(pod(namespace, name, "uid-live", 11))) })
+        let resource = pod(
+            request.namespace(),
+            request.name(),
+            uid.as_deref().unwrap_or("uid-live"),
+            11,
+        );
+        Box::pin(async move { Ok(Some(resource)) })
     }
 
-    fn read_pod_for_uid<'a>(
-        &'a self,
-        namespace: &'a str,
-        name: &'a str,
-        uid: &'a str,
-    ) -> PodRepositoryFuture<'a, Option<Resource>> {
-        self.query_calls.lock().unwrap().push(QueryCall::ByUid {
-            namespace: namespace.to_string(),
-            name: name.to_string(),
-            uid: uid.to_string(),
-        });
-        Box::pin(async { Ok(Some(pod(namespace, name, uid, 12))) })
-    }
-
-    fn list_pod_page(
-        &self,
-        request: &PodListRequest,
-    ) -> PodRepositoryFuture<'_, PodRepositoryList> {
-        self.query_calls.lock().unwrap().push(QueryCall::List {
+    fn list_pods(&self, request: PodListRequest) -> PodRepositoryFuture<'_, PodListResult> {
+        self.calls.lock().unwrap().push(QueryCall::List {
             namespace: request.namespace().map(str::to_string),
             label_selector: request.label_selector().map(str::to_string),
             field_selector: request.field_selector().map(str::to_string),
@@ -130,140 +91,116 @@ impl PodQueryPort for FakePodPorts {
             continue_token: request.continue_token().map(str::to_string),
         });
         Box::pin(async {
-            Ok(PodRepositoryList::new(
+            PodListResult::try_new(
                 vec![pod("default", "web", "uid-list", 20)],
                 20,
                 Some("next".to_string()),
                 Some(4),
-            ))
+            )
         })
     }
 
-    fn list_pods_by_owner_uid<'a>(
-        &'a self,
-        namespace: &'a str,
-        owner_uid: &'a str,
-    ) -> PodRepositoryFuture<'a, Vec<Resource>> {
-        self.query_calls.lock().unwrap().push(QueryCall::ByOwner {
-            namespace: namespace.to_string(),
-            owner_uid: owner_uid.to_string(),
+    fn list_pods_by_owner_uid(
+        &self,
+        request: PodOwnerListRequest,
+    ) -> PodRepositoryFuture<'_, Vec<Resource>> {
+        self.calls.lock().unwrap().push(QueryCall::ByOwner {
+            namespace: request.namespace().to_string(),
+            owner_uid: request.owner_uid().to_string(),
         });
-        Box::pin(async { Ok(vec![pod(namespace, "owned", "uid-owned", 21)]) })
+        let resource = pod(request.namespace(), "owned", "uid-owned", 21);
+        Box::pin(async move { Ok(vec![resource]) })
     }
 }
 
-impl PodUpdatePort for FakePodPorts {
-    fn merge_pod_labels<'a>(
-        &'a self,
-        namespace: &'a str,
-        name: &'a str,
-        labels: Vec<(String, String)>,
-    ) -> PodRepositoryFuture<'a, Resource> {
-        self.update_calls
-            .lock()
-            .unwrap()
-            .push(UpdateCall::MergeLabels {
-                identity: identity(namespace, name, None),
-                labels,
-            });
-        Box::pin(async { Ok(pod(namespace, name, "uid-updated", 30)) })
+struct UnexpectedPersistence;
+
+impl PodPersistence for UnexpectedPersistence {
+    fn create_pod(
+        &self,
+        _request: PodPersistenceCreateRequest,
+    ) -> PodRepositoryFuture<'_, Resource> {
+        Box::pin(async { Err(PodRepositoryError::internal("unexpected create")) })
     }
 
-    fn merge_pod_labels_for_uid<'a>(
-        &'a self,
-        namespace: &'a str,
-        name: &'a str,
-        uid: &'a str,
-        labels: Vec<(String, String)>,
-    ) -> PodRepositoryFuture<'a, Resource> {
-        self.update_calls
-            .lock()
-            .unwrap()
-            .push(UpdateCall::MergeLabels {
-                identity: identity(namespace, name, Some(uid)),
-                labels,
-            });
-        Box::pin(async { Ok(pod(namespace, name, uid, 30)) })
+    fn replace_pod(
+        &self,
+        _request: PodPersistenceReplaceRequest,
+    ) -> PodRepositoryFuture<'_, Resource> {
+        Box::pin(async { Err(PodRepositoryError::internal("unexpected replace")) })
     }
 
-    fn replace_pod_owner_references<'a>(
-        &'a self,
-        namespace: &'a str,
-        name: &'a str,
-        owner_references: Vec<Value>,
-    ) -> PodRepositoryFuture<'a, Resource> {
-        self.update_calls
-            .lock()
-            .unwrap()
-            .push(UpdateCall::ReplaceOwnerReferences {
-                identity: identity(namespace, name, None),
-                owner_references,
-            });
-        Box::pin(async { Ok(pod(namespace, name, "uid-updated", 31)) })
+    fn replace_pod_including_status(
+        &self,
+        _request: PodPersistenceReplaceRequest,
+    ) -> PodRepositoryFuture<'_, Resource> {
+        Box::pin(async { Err(PodRepositoryError::internal("unexpected scheduler replace")) })
     }
 
-    fn replace_pod_owner_references_for_uid<'a>(
-        &'a self,
-        namespace: &'a str,
-        name: &'a str,
-        uid: &'a str,
-        owner_references: Vec<Value>,
-    ) -> PodRepositoryFuture<'a, Resource> {
-        self.update_calls
-            .lock()
-            .unwrap()
-            .push(UpdateCall::ReplaceOwnerReferences {
-                identity: identity(namespace, name, Some(uid)),
-                owner_references,
-            });
-        Box::pin(async { Ok(pod(namespace, name, uid, 31)) })
-    }
-
-    fn record_pod_sandbox_id<'a>(
-        &'a self,
-        namespace: &'a str,
-        name: &'a str,
-        sandbox_id: String,
-    ) -> PodRepositoryFuture<'a, Resource> {
-        self.update_calls
-            .lock()
-            .unwrap()
-            .push(UpdateCall::RecordSandboxId {
-                identity: identity(namespace, name, None),
-                sandbox_id,
-            });
-        Box::pin(async { Ok(pod(namespace, name, "uid-updated", 32)) })
-    }
-
-    fn record_pod_sandbox_id_for_uid<'a>(
-        &'a self,
-        namespace: &'a str,
-        name: &'a str,
-        uid: &'a str,
-        sandbox_id: String,
-    ) -> PodRepositoryFuture<'a, Resource> {
-        self.update_calls
-            .lock()
-            .unwrap()
-            .push(UpdateCall::RecordSandboxId {
-                identity: identity(namespace, name, Some(uid)),
-                sandbox_id,
-            });
-        Box::pin(async { Ok(pod(namespace, name, uid, 32)) })
+    fn patch_pod_metadata(
+        &self,
+        _request: klights_pod_api::PodMetadataPatchRequest,
+    ) -> PodRepositoryFuture<'_, Resource> {
+        Box::pin(async { Err(PodRepositoryError::internal("unexpected metadata patch")) })
     }
 }
 
-impl PodTerminationPort for FakePodPorts {
+struct NoopEffects;
+
+impl klights_reconcile_api::PodMutationReconcileSink for NoopEffects {
+    fn reconcile_pod_mutation(
+        &self,
+        _request: klights_reconcile_api::PodMutationReconcileRequest,
+    ) -> klights_reconcile_api::ReconcileSinkFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct FixedClock;
+
+impl klights_kubelet::runtime_clock::RuntimeClock for FixedClock {
+    fn now_ms(&self) -> i64 {
+        1
+    }
+}
+
+#[derive(Default)]
+struct RecordingTermination {
+    targets: Mutex<Vec<PodMutationTarget>>,
+    fail: bool,
+}
+
+impl PodTerminationPort for RecordingTermination {
     fn mark_terminating(&self, target: PodMutationTarget) -> PodRepositoryFuture<'_, Resource> {
-        self.marked.lock().unwrap().push(target);
-        Box::pin(async { Ok(pod("default", "web", "uid-marked", 40)) })
+        self.targets.lock().unwrap().push(target.clone());
+        let fail = self.fail;
+        let namespace = target.namespace().to_string();
+        let name = target.name().to_string();
+        let uid = target.uid().unwrap_or("uid-marked").to_string();
+        Box::pin(async move {
+            if fail {
+                Err(PodRepositoryError::conflict("stale UID"))
+            } else {
+                Ok(pod(&namespace, &name, &uid, 40))
+            }
+        })
     }
 }
 
 #[test]
-fn query_service_routes_name_uid_page_and_owner_requests_exactly() {
-    let ports = Arc::new(FakePodPorts::default());
-    let service = PodRepositoryService::new(ports.clone(), ports.clone(), ports.clone());
+fn canonical_query_service_preserves_identity_selectors_and_page_metadata() {
+    let query = Arc::new(RecordingQuery::default());
+    let service = PodRepositoryService::new(
+        query.clone(),
+        PodMetadataDependencies {
+            persistence: Arc::new(UnexpectedPersistence),
+            outbox: None,
+            remote_delivery_required: false,
+            mutation_reconcile: Arc::new(NoopEffects),
+            wall_clock: Arc::new(FixedClock),
+        },
+        Arc::new(RecordingTermination::default()),
+    );
 
     let by_name = resolve(PodQuery::get_pod(
         &service,
@@ -305,16 +242,17 @@ fn query_service_routes_name_uid_page_and_owner_requests_exactly() {
     assert_eq!(owned[0].uid, "uid-owned");
 
     assert_eq!(
-        *ports.query_calls.lock().unwrap(),
+        *query.calls.lock().unwrap(),
         vec![
-            QueryCall::ByName {
+            QueryCall::Get {
                 namespace: "default".to_string(),
                 name: "web".to_string(),
+                uid: None,
             },
-            QueryCall::ByUid {
+            QueryCall::Get {
                 namespace: "default".to_string(),
                 name: "web".to_string(),
-                uid: "uid-exact".to_string(),
+                uid: Some("uid-exact".to_string()),
             },
             QueryCall::List {
                 namespace: Some("default".to_string()),
@@ -332,139 +270,47 @@ fn query_service_routes_name_uid_page_and_owner_requests_exactly() {
 }
 
 #[test]
-fn update_service_preserves_every_variant_and_uid_qualification() {
-    let ports = Arc::new(FakePodPorts::default());
-    let service = PodRepositoryService::new(ports.clone(), ports.clone(), ports.clone());
-
-    for uid in [None, Some("uid-exact")] {
-        let target = match uid {
-            Some(uid) => {
-                PodMutationTarget::try_by_identity(PodIdentity::new("default", "web", uid)).unwrap()
-            }
-            None => PodMutationTarget::try_by_name("default", "web").unwrap(),
-        };
-        resolve(PodUpdate::update_pod(
-            &service,
-            PodUpdateRequest::merge_labels(
-                target.clone(),
-                vec![PodLabel::try_new("app", "web").unwrap()],
-            ),
-        ))
-        .unwrap();
-        resolve(PodUpdate::update_pod(
-            &service,
-            PodUpdateRequest::replace_owner_references(
-                target.clone(),
-                vec![
-                    PodOwnerReference::try_new(
-                        "apps/v1",
-                        "ReplicaSet",
-                        "web-rs",
-                        "owner-uid",
-                        Some(true),
-                        Some(false),
-                    )
-                    .unwrap(),
-                ],
-            ),
-        ))
-        .unwrap();
-        resolve(PodUpdate::update_pod(
-            &service,
-            PodUpdateRequest::try_record_sandbox_id(target, "sandbox-a").unwrap(),
-        ))
-        .unwrap();
+fn canonical_mark_service_preserves_the_validated_target_and_structural_error() {
+    fn service(
+        query: Arc<RecordingQuery>,
+        termination: Arc<RecordingTermination>,
+    ) -> PodRepositoryService {
+        PodRepositoryService::new(
+            query,
+            PodMetadataDependencies {
+                persistence: Arc::new(UnexpectedPersistence),
+                outbox: None,
+                remote_delivery_required: false,
+                mutation_reconcile: Arc::new(NoopEffects),
+                wall_clock: Arc::new(FixedClock),
+            },
+            termination,
+        )
     }
 
-    let calls = ports.update_calls.lock().unwrap();
-    assert_eq!(calls.len(), 6);
-    for (index, expected_uid) in [None, Some("uid-exact")].into_iter().enumerate() {
-        fn call_identity(call: &UpdateCall) -> &PodIdentity {
-            match call {
-                UpdateCall::MergeLabels { identity, .. }
-                | UpdateCall::ReplaceOwnerReferences { identity, .. }
-                | UpdateCall::RecordSandboxId { identity, .. } => identity,
-            }
-        }
-        for call in &calls[index * 3..index * 3 + 3] {
-            assert_eq!(
-                if call_identity(call).uid.is_empty() {
-                    None
-                } else {
-                    Some(call_identity(call).uid.as_str())
-                },
-                expected_uid
-            );
-        }
-    }
-    assert_eq!(
-        calls[0],
-        UpdateCall::MergeLabels {
-            identity: PodIdentity::new("default", "web", ""),
-            labels: vec![("app".to_string(), "web".to_string())],
-        }
-    );
-    assert_eq!(
-        calls[1],
-        UpdateCall::ReplaceOwnerReferences {
-            identity: PodIdentity::new("default", "web", ""),
-            owner_references: vec![json!({
-                "apiVersion": "apps/v1",
-                "kind": "ReplicaSet",
-                "name": "web-rs",
-                "uid": "owner-uid",
-                "controller": true,
-                "blockOwnerDeletion": false
-            })],
-        }
-    );
-    assert_eq!(
-        calls[2],
-        UpdateCall::RecordSandboxId {
-            identity: PodIdentity::new("default", "web", ""),
-            sandbox_id: "sandbox-a".to_string(),
-        }
-    );
-}
-
-#[test]
-fn mark_service_delegates_only_the_validated_target_and_preserves_errors() {
-    let ports = Arc::new(FakePodPorts::default());
-    let service = PodRepositoryService::new(ports.clone(), ports.clone(), ports.clone());
     let target =
         PodMutationTarget::try_by_identity(PodIdentity::new("default", "web", "uid-exact"))
             .unwrap();
-
+    let termination = Arc::new(RecordingTermination::default());
     let marked = resolve(PodMarkTerminating::mark_pod_terminating(
-        &service,
+        &service(Arc::new(RecordingQuery::default()), termination.clone()),
         PodMarkTerminatingRequest::new(target.clone()),
     ))
     .unwrap();
-
-    assert_eq!(marked.uid, "uid-marked");
-    let actual = ports.marked.lock().unwrap();
+    assert_eq!(marked.uid, "uid-exact");
+    let actual = termination.targets.lock().unwrap();
     assert_eq!(actual.len(), 1);
     assert_eq!(actual[0].namespace(), target.namespace());
     assert_eq!(actual[0].name(), target.name());
     assert_eq!(actual[0].uid(), target.uid());
     drop(actual);
 
-    struct FailingMarker;
-    impl PodTerminationPort for FailingMarker {
-        fn mark_terminating(
-            &self,
-            _target: PodMutationTarget,
-        ) -> PodRepositoryFuture<'_, Resource> {
-            Box::pin(async { Err(PodRepositoryError::conflict("stale UID")) })
-        }
-    }
-    let failing = PodRepositoryService::new(
-        ports.clone(),
-        ports,
-        Arc::new(FailingMarker) as Arc<dyn PodTerminationPort>,
-    );
+    let failing = Arc::new(RecordingTermination {
+        targets: Mutex::new(Vec::new()),
+        fail: true,
+    });
     let error = resolve(PodMarkTerminating::mark_pod_terminating(
-        &failing,
+        &service(Arc::new(RecordingQuery::default()), failing.clone()),
         PodMarkTerminatingRequest::new(target),
     ))
     .unwrap_err();
@@ -472,6 +318,7 @@ fn mark_service_delegates_only_the_validated_target_and_preserves_errors() {
         error,
         PodRepositoryError::Conflict { message } if message == "stale UID"
     ));
+    assert_eq!(failing.targets.lock().unwrap().len(), 1);
 }
 
 #[derive(Default)]

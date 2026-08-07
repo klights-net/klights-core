@@ -75,14 +75,6 @@ impl Context {
         self.dependencies.pod_query.as_ref()
     }
 
-    pub(crate) fn pdb_reader(&self) -> &dyn crate::pdb::PdbPodReader {
-        self.dependencies.pdb_pod_reader.as_ref()
-    }
-
-    pub(crate) fn deployment_reader(&self) -> &dyn crate::DeploymentControllerPodReader {
-        self.dependencies.deployment_pod_reader.as_ref()
-    }
-
     pub(crate) fn deployment_mutation(&self) -> &dyn crate::DeploymentControllerPodMutation {
         self.dependencies.deployment_pod_mutation.as_ref()
     }

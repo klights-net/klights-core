@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
-use crate::kubelet::pod_repository::PodNetworkReader;
 use crate::kubelet::pod_runtime::service::PodRuntimeKey;
 use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+use klights_kubelet::pod_repository::{
+    PodNetworkAssignment, PodNetworkAssignmentError, PodNetworkAssignmentQuery,
+    PodNetworkAssignmentRequest,
+};
 
 /// Pod network runtime port wrapping CNI assignment reads and CNI cleanup.
 #[async_trait::async_trait]
@@ -13,7 +16,7 @@ pub trait PodNetworkRuntime: Send + Sync {
         sandbox_id: &str,
         key: &PodRuntimeKey,
         host_network: bool,
-    ) -> anyhow::Result<crate::kubelet::pod_repository::PodNetworkAssignment>;
+    ) -> anyhow::Result<PodNetworkAssignment>;
 
     /// Release sandbox network resources. `key` is the audit witness;
     /// sandbox_id is the CNI argument. The implementation must reject
@@ -31,14 +34,14 @@ pub trait PodNetworkRuntime: Send + Sync {
 /// Production network runtime adapter over Datapath + PodRepository.
 pub struct RealPodNetworkRuntime {
     datapath: Arc<dyn klights_network_api::Datapath>,
-    repository: Arc<crate::kubelet::pod_repository::PodRepository>,
+    repository: Arc<dyn PodNetworkAssignmentQuery>,
     store: Arc<dyn PodRuntimeStore>,
 }
 
 impl RealPodNetworkRuntime {
     pub fn new(
         datapath: Arc<dyn klights_network_api::Datapath>,
-        repository: Arc<crate::kubelet::pod_repository::PodRepository>,
+        repository: Arc<dyn PodNetworkAssignmentQuery>,
         store: Arc<dyn PodRuntimeStore>,
     ) -> Self {
         Self {
@@ -56,16 +59,21 @@ impl PodNetworkRuntime for RealPodNetworkRuntime {
         sandbox_id: &str,
         key: &PodRuntimeKey,
         host_network: bool,
-    ) -> anyhow::Result<crate::kubelet::pod_repository::PodNetworkAssignment> {
+    ) -> anyhow::Result<PodNetworkAssignment> {
         self.repository
-            .read_pod_network_assignment(
+            .read_pod_network_assignment(PodNetworkAssignmentRequest::try_new(
                 sandbox_id,
-                &key.namespace,
-                &key.name,
-                &key.uid,
+                klights_types::PodIdentity::new(&key.namespace, &key.name, &key.uid),
                 host_network,
-            )
+            )?)
             .await
+            .map_err(|error| match error {
+                PodNetworkAssignmentError::TimedOut(_) => anyhow::Error::new(
+                    klights_kubelet::pod_startup_error::PodStartupErrorKind::NetworkAssignmentTimedOut,
+                )
+                .context(error.to_string()),
+                other => anyhow::Error::new(other),
+            })
     }
 
     async fn release_sandbox_network(
@@ -104,14 +112,13 @@ impl PodNetworkRuntime for RealPodNetworkRuntime {
 #[cfg(test)]
 mod focused_datapath_tests {
     use super::{PodRuntimeStore, RealPodNetworkRuntime};
-    use crate::kubelet::pod_repository::PodRepository;
     use std::sync::Arc;
 
     #[test]
     fn test_kubelet_caller_takes_only_datapath() {
         type Constructor = fn(
             Arc<dyn klights_network_api::Datapath>,
-            Arc<PodRepository>,
+            Arc<dyn klights_kubelet::pod_repository::PodNetworkAssignmentQuery>,
             Arc<dyn PodRuntimeStore>,
         ) -> RealPodNetworkRuntime;
         let _constructor: Constructor = RealPodNetworkRuntime::new;
@@ -180,7 +187,7 @@ pub(crate) mod test_support {
             sandbox_id: &str,
             key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
             host_network: bool,
-        ) -> anyhow::Result<crate::kubelet::pod_repository::PodNetworkAssignment> {
+        ) -> anyhow::Result<klights_kubelet::pod_repository::PodNetworkAssignment> {
             if let Some(ref f) = *self.fail.lock().unwrap() {
                 if f == "read_assignment" {
                     anyhow::bail!("injected failure");
@@ -202,7 +209,7 @@ pub(crate) mod test_support {
                     uid: key.uid.clone(),
                     host_network,
                 });
-            Ok(crate::kubelet::pod_repository::PodNetworkAssignment {
+            Ok(klights_kubelet::pod_repository::PodNetworkAssignment {
                 pod_ip: "10.0.0.1".to_string(),
                 host_ip: "192.168.1.1".to_string(),
             })

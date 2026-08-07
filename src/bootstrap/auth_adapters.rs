@@ -7,7 +7,6 @@ use async_trait::async_trait;
 
 use crate::datastore::backend::DatastoreHandle;
 use crate::datastore::types::ListPageRequest;
-use crate::kubelet::pod_repository::PodReader;
 use klights_auth::node_policy_store::NodePolicyStore;
 use klights_auth::rbac_policy_store::RbacResourceReader;
 use klights_controllers::csr_signer::{
@@ -17,6 +16,7 @@ use klights_leader_rpc::server::{
     ControlplaneCredentialError, ControlplaneCredentialIssuer, ReplicationPeerAuthenticationError,
     ReplicationPeerAuthenticator, ReplicationPeerIdentity,
 };
+use klights_pod_api::{PodGetRequest, PodListRequest, PodQuery};
 
 /// Root-owned bridge from bootstrap token Secrets to the API authentication
 /// policy port. The HTTP/API owner receives only the auth-domain capability.
@@ -273,11 +273,11 @@ impl RbacResourceReader for DatastoreRbacResourceReader {
 /// Root adapter from the concrete Pod repository read surface to auth's
 /// transport-neutral node relationship policy port.
 pub(crate) struct PodRepositoryNodePolicyStore {
-    pods: Arc<dyn PodReader>,
+    pods: Arc<dyn PodQuery>,
 }
 
 impl PodRepositoryNodePolicyStore {
-    pub(crate) fn new(pods: Arc<dyn PodReader>) -> Self {
+    pub(crate) fn new(pods: Arc<dyn PodQuery>) -> Self {
         Self { pods }
     }
 }
@@ -285,7 +285,12 @@ impl PodRepositoryNodePolicyStore {
 #[async_trait]
 impl NodePolicyStore for PodRepositoryNodePolicyStore {
     async fn get_pod_node(&self, namespace: &str, name: &str) -> Option<String> {
-        let pod = self.pods.get_pod(namespace, name).await.ok().flatten()?;
+        let pod = self
+            .pods
+            .get_pod(PodGetRequest::try_by_name(namespace, name).ok()?)
+            .await
+            .ok()
+            .flatten()?;
         pod.data
             .pointer("/spec/nodeName")
             .and_then(serde_json::Value::as_str)
@@ -293,18 +298,22 @@ impl NodePolicyStore for PodRepositoryNodePolicyStore {
     }
 
     async fn list_pods_on_node(&self, node_name: &str) -> Vec<(String, String)> {
-        let Ok(pods) = self.pods.list_pods(None, None, None, None, None).await else {
+        let Ok(request) = PodListRequest::try_new(None, None, None, None, None) else {
             return Vec::new();
         };
-        pods.items
-            .iter()
+        let Ok(pods) = self.pods.list_pods(request).await else {
+            return Vec::new();
+        };
+        pods.into_parts()
+            .0
+            .into_iter()
             .filter(|pod| {
                 pod.data
                     .pointer("/spec/nodeName")
                     .and_then(serde_json::Value::as_str)
                     == Some(node_name)
             })
-            .map(|pod| (pod.namespace.clone().unwrap_or_default(), pod.name.clone()))
+            .map(|pod| (pod.namespace.unwrap_or_default(), pod.name))
             .collect()
     }
 
@@ -314,7 +323,10 @@ impl NodePolicyStore for PodRepositoryNodePolicyStore {
         pod_name: &str,
         resource: &str,
     ) -> Vec<String> {
-        let Ok(Some(pod)) = self.pods.get_pod(namespace, pod_name).await else {
+        let Ok(request) = PodGetRequest::try_by_name(namespace, pod_name) else {
+            return Vec::new();
+        };
+        let Ok(Some(pod)) = self.pods.get_pod(request).await else {
             return Vec::new();
         };
         extract_referenced_objects(&pod.data, resource)
@@ -428,67 +440,46 @@ fn extract_env_from_refs(pod: &serde_json::Value, ref_key: &str, names: &mut Has
 mod tests {
     use std::sync::Arc;
 
-    use async_trait::async_trait;
-
     use super::{PodRepositoryNodePolicyStore, extract_referenced_objects};
     use crate::datastore::Resource;
-    use crate::kubelet::pod_repository::PodReader;
-    use crate::kubelet::pod_repository::PodResourceList as ResourceList;
     use klights_auth::node_policy_store::NodePolicyStore;
 
     struct FakePodReader {
         pods: Vec<Resource>,
     }
 
-    #[async_trait]
-    impl PodReader for FakePodReader {
-        async fn get_pod(&self, namespace: &str, name: &str) -> anyhow::Result<Option<Resource>> {
-            Ok(self
-                .pods
-                .iter()
-                .find(|pod| pod.namespace.as_deref() == Some(namespace) && pod.name == name)
-                .cloned())
-        }
-
-        async fn get_pod_for_uid(
+    impl klights_pod_api::PodQuery for FakePodReader {
+        fn get_pod(
             &self,
-            namespace: &str,
-            name: &str,
-            uid: &str,
-        ) -> anyhow::Result<Option<Resource>> {
-            Ok(self
-                .pods
-                .iter()
-                .find(|pod| {
-                    pod.namespace.as_deref() == Some(namespace)
-                        && pod.name == name
-                        && pod.uid == uid
-                })
-                .cloned())
-        }
-
-        async fn list_pods(
-            &self,
-            _namespace: Option<&str>,
-            _label_selector: Option<&str>,
-            _field_selector: Option<&str>,
-            _limit: Option<i64>,
-            _continue_token: Option<&str>,
-        ) -> anyhow::Result<ResourceList> {
-            Ok(ResourceList {
-                items: self.pods.clone(),
-                resource_version: 1,
-                continue_token: None,
-                remaining_item_count: None,
+            request: klights_pod_api::PodGetRequest,
+        ) -> klights_pod_api::PodRepositoryFuture<'_, Option<Resource>> {
+            Box::pin(async move {
+                Ok(self
+                    .pods
+                    .iter()
+                    .find(|pod| {
+                        pod.namespace.as_deref() == Some(request.namespace())
+                            && pod.name == request.name()
+                            && request.uid().is_none_or(|uid| pod.uid == uid)
+                    })
+                    .cloned())
             })
         }
 
-        async fn list_pods_by_owner_uid(
+        fn list_pods(
             &self,
-            _namespace: &str,
-            _owner_uid: &str,
-        ) -> anyhow::Result<Vec<Resource>> {
-            Ok(Vec::new())
+            _request: klights_pod_api::PodListRequest,
+        ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodListResult> {
+            Box::pin(async move {
+                klights_pod_api::PodListResult::try_new(self.pods.clone(), 1, None, None)
+            })
+        }
+
+        fn list_pods_by_owner_uid(
+            &self,
+            _request: klights_pod_api::PodOwnerListRequest,
+        ) -> klights_pod_api::PodRepositoryFuture<'_, Vec<Resource>> {
+            Box::pin(async { Ok(Vec::new()) })
         }
     }
 

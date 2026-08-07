@@ -1283,6 +1283,11 @@ impl NativeApiTestHarness {
                 pod_subresource,
             ),
         );
+        let controller_pod_mutations =
+            Arc::new(klights_controllers::ControllerPodMutationAdapter::new(
+                controller_pod_port.clone(),
+                controller_pod_port.clone(),
+            ));
         side_effects.set_pod_ports(pod_repository.clone(), pod_repository.clone());
         let finalizer_lifecycle = crate::bootstrap::finalizer_lifecycle_adapter::
             DatastoreFinalizerLifecycleAdapter::new_with_coordination(
@@ -1336,14 +1341,12 @@ impl NativeApiTestHarness {
             apiservice_store: controller_leader_ports.clone(),
             csr_status_store: controller_leader_ports,
             pod_query: api_pod_repository.clone(),
-            pdb_pod_reader: pod_repository.clone(),
-            deployment_pod_reader: pod_repository.clone(),
-            deployment_pod_mutation: controller_pod_port.clone(),
-            replicaset_pod_mutation: controller_pod_port.clone(),
-            statefulset_pod_mutation: controller_pod_port.clone(),
-            daemonset_pod_mutation: controller_pod_port.clone(),
-            job_pod_mutation: controller_pod_port.clone(),
-            replicationcontroller_pod_mutation: controller_pod_port,
+            deployment_pod_mutation: controller_pod_mutations.clone(),
+            replicaset_pod_mutation: controller_pod_mutations.clone(),
+            statefulset_pod_mutation: controller_pod_mutations.clone(),
+            daemonset_pod_mutation: controller_pod_mutations.clone(),
+            job_pod_mutation: controller_pod_mutations.clone(),
+            replicationcontroller_pod_mutation: controller_pod_mutations.clone(),
             pod_delete_sink: pod_repository.clone(),
             reconcile: Arc::new(
                 crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerReconcilePort::new(
@@ -1376,6 +1379,7 @@ impl NativeApiTestHarness {
             crate::bootstrap::controller_adapters::hpa_controller_adapter::controller(
                 datastore.clone(),
                 pod_repository.clone(),
+                controller_pod_mutations,
                 non_pod_finalization,
                 gc_coordination.clone(),
                 Arc::from(config.node_name.as_str()),

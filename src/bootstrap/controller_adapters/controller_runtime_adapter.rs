@@ -785,20 +785,15 @@ impl RootControllerPodPort {
         let (api, subresource) = repository.test_root_api_services();
         Self::new(repository, api, subresource)
     }
-}
 
-#[async_trait]
-impl crate::kubelet::pod_repository::PodObjectWriter for RootControllerPodPort {
-    async fn create_controller_pod(
+    pub(crate) async fn create_controller_pod(
         &self,
         namespace: &str,
         name: &str,
-        _node_name: &str,
         pod: serde_json::Value,
     ) -> anyhow::Result<Resource> {
-        validate_controller_effect()?;
         let result = klights_pod_api::PodApiMutation::create_pod(
-            self.api.as_ref(),
+            self,
             klights_pod_api::PodApiCreateRequest {
                 namespace: namespace.to_string(),
                 body: pod,
@@ -812,180 +807,172 @@ impl crate::kubelet::pod_repository::PodObjectWriter for RootControllerPodPort {
         })
     }
 
-    async fn delete_pod(&self, namespace: &str, name: &str) -> anyhow::Result<()> {
-        validate_controller_effect()?;
-        crate::kubelet::pod_repository::PodObjectWriter::delete_pod(
-            self.repository.as_ref(),
-            namespace,
-            name,
-        )
-        .await
-    }
-
-    async fn update_pod_owner_references(
+    pub(crate) async fn replace_controller_owner_references(
         &self,
         namespace: &str,
         name: &str,
-        owner_refs: Vec<serde_json::Value>,
+        expected_uid: Option<&str>,
+        owner_references: Vec<serde_json::Value>,
     ) -> anyhow::Result<Resource> {
-        validate_controller_effect()?;
-        crate::kubelet::pod_repository::PodObjectWriter::update_pod_owner_references(
-            self.repository.as_ref(),
-            namespace,
-            name,
-            owner_refs,
+        let target = match expected_uid {
+            Some(uid) => klights_pod_api::PodMutationTarget::try_by_identity(
+                klights_types::PodIdentity::new(namespace, name, uid),
+            ),
+            None => klights_pod_api::PodMutationTarget::try_by_name(namespace, name),
+        }
+        .map_err(anyhow::Error::new)?;
+        let owner_references = owner_references
+            .into_iter()
+            .map(|owner| {
+                klights_pod_api::PodOwnerReference::try_new(
+                    owner
+                        .get("apiVersion")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                    owner
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                    owner
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                    owner
+                        .get("uid")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                    owner.get("controller").and_then(serde_json::Value::as_bool),
+                    owner
+                        .get("blockOwnerDeletion")
+                        .and_then(serde_json::Value::as_bool),
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::new)?;
+        klights_pod_api::PodUpdate::update_pod(
+            self,
+            klights_pod_api::PodUpdateRequest::replace_owner_references(target, owner_references),
         )
         .await
+        .map_err(anyhow::Error::new)
     }
 
-    async fn update_pod_owner_references_for_uid(
+    pub(crate) async fn merge_controller_pod_labels(
         &self,
         namespace: &str,
         name: &str,
-        expected_uid: &str,
-        owner_refs: Vec<serde_json::Value>,
-    ) -> anyhow::Result<Resource> {
-        validate_controller_effect()?;
-        crate::kubelet::pod_repository::PodObjectWriter::update_pod_owner_references_for_uid(
-            self.repository.as_ref(),
-            namespace,
-            name,
-            expected_uid,
-            owner_refs,
-        )
-        .await
-    }
-
-    async fn merge_pod_labels(
-        &self,
-        namespace: &str,
-        name: &str,
+        expected_uid: Option<&str>,
         labels: Vec<(String, String)>,
     ) -> anyhow::Result<Resource> {
-        validate_controller_effect()?;
-        crate::kubelet::pod_repository::PodObjectWriter::merge_pod_labels(
-            self.repository.as_ref(),
-            namespace,
-            name,
-            labels,
+        let target = match expected_uid {
+            Some(uid) => klights_pod_api::PodMutationTarget::try_by_identity(
+                klights_types::PodIdentity::new(namespace, name, uid),
+            ),
+            None => klights_pod_api::PodMutationTarget::try_by_name(namespace, name),
+        }
+        .map_err(anyhow::Error::new)?;
+        let labels = labels
+            .into_iter()
+            .map(|(key, value)| klights_pod_api::PodLabel::try_new(key, value))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::new)?;
+        klights_pod_api::PodUpdate::update_pod(
+            self,
+            klights_pod_api::PodUpdateRequest::merge_labels(target, labels),
         )
         .await
-    }
-
-    async fn merge_pod_labels_for_uid(
-        &self,
-        namespace: &str,
-        name: &str,
-        expected_uid: &str,
-        labels: Vec<(String, String)>,
-    ) -> anyhow::Result<Resource> {
-        validate_controller_effect()?;
-        crate::kubelet::pod_repository::PodObjectWriter::merge_pod_labels_for_uid(
-            self.repository.as_ref(),
-            namespace,
-            name,
-            expected_uid,
-            labels,
-        )
-        .await
+        .map_err(anyhow::Error::new)
     }
 }
 
-#[async_trait]
-impl crate::kubelet::pod_repository::PodSubresourceWriter for RootControllerPodPort {
-    async fn replace_status_from_api(
+impl klights_pod_api::PodUpdate for RootControllerPodPort {
+    fn update_pod(
         &self,
-        namespace: &str,
-        name: &str,
-        status: serde_json::Value,
-        expected_resource_version: i64,
-    ) -> anyhow::Result<Resource> {
-        validate_controller_effect()?;
-        self.subresource
-            .replace_status(klights_pod_api::PodStatusReplaceRequest {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-                expected_uid: None,
-                status,
-                expected_resource_version,
-            })
-            .await
-            .map_err(anyhow::Error::new)
+        request: klights_pod_api::PodUpdateRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
+        Box::pin(async move {
+            validate_controller_effect().map_err(|error| {
+                klights_pod_api::PodRepositoryError::forbidden(error.to_string())
+            })?;
+            klights_pod_api::PodUpdate::update_pod(self.repository.as_ref(), request).await
+        })
+    }
+}
+
+impl klights_pod_api::PodApiMutation for RootControllerPodPort {
+    fn create_pod(
+        &self,
+        request: klights_pod_api::PodApiCreateRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodApiCreateResult> {
+        Box::pin(async move {
+            validate_controller_effect().map_err(|error| {
+                klights_pod_api::PodRepositoryError::forbidden(error.to_string())
+            })?;
+            self.api.create_pod(request).await
+        })
     }
 
-    async fn replace_status_from_api_for_uid(
+    fn update_pod(
         &self,
-        namespace: &str,
-        name: &str,
-        pod_uid: &str,
-        status: serde_json::Value,
-        expected_resource_version: i64,
-    ) -> anyhow::Result<Resource> {
-        validate_controller_effect()?;
-        self.subresource
-            .replace_status(klights_pod_api::PodStatusReplaceRequest {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-                expected_uid: Some(pod_uid.to_string()),
-                status,
-                expected_resource_version,
-            })
-            .await
-            .map_err(anyhow::Error::new)
+        request: klights_pod_api::PodApiUpdateRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodApiWriteOutcome> {
+        self.api.update_pod(request)
     }
 
-    async fn patch_status_from_api(
+    fn patch_pod(
         &self,
-        namespace: &str,
-        name: &str,
-        patch: serde_json::Value,
-        patch_type: crate::kubelet::pod_repository::PodStatusPatchType,
-        expected_resource_version: i64,
-    ) -> anyhow::Result<Resource> {
-        validate_controller_effect()?;
-        let patch_type = match patch_type {
-            crate::kubelet::pod_repository::PodStatusPatchType::JsonPatch => {
-                klights_pod_api::PodStatusPatchKind::JsonPatch
-            }
-            crate::kubelet::pod_repository::PodStatusPatchType::MergePatch => {
-                klights_pod_api::PodStatusPatchKind::MergePatch
-            }
-            crate::kubelet::pod_repository::PodStatusPatchType::StrategicMerge => {
-                klights_pod_api::PodStatusPatchKind::StrategicMerge
-            }
-            crate::kubelet::pod_repository::PodStatusPatchType::ApplyPatch => {
-                klights_pod_api::PodStatusPatchKind::ApplyPatch
-            }
-        };
-        self.subresource
-            .patch_status(klights_pod_api::PodStatusPatchRequest {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-                patch,
-                patch_kind: patch_type,
-                expected_resource_version: Some(expected_resource_version),
-            })
-            .await
-            .map_err(anyhow::Error::new)
+        request: klights_pod_api::PodApiPatchRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodApiWriteOutcome> {
+        self.api.patch_pod(request)
     }
 
-    async fn update_ephemeral_containers(
+    fn delete_pod(
         &self,
-        namespace: &str,
-        name: &str,
-        containers: Vec<serde_json::Value>,
-        expected_resource_version: i64,
-    ) -> anyhow::Result<Resource> {
-        validate_controller_effect()?;
-        self.subresource
-            .update_ephemeral_containers(klights_pod_api::PodEphemeralContainersRequest {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-                containers,
-                expected_resource_version,
-            })
-            .await
-            .map_err(anyhow::Error::new)
+        request: klights_pod_api::PodApiDeleteRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodApiDeleteOutcome> {
+        Box::pin(async move {
+            validate_controller_effect().map_err(|error| {
+                klights_pod_api::PodRepositoryError::forbidden(error.to_string())
+            })?;
+            self.api.delete_pod(request).await
+        })
+    }
+
+    fn delete_collection_pods(
+        &self,
+        request: klights_pod_api::PodApiDeleteCollectionRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, ()> {
+        self.api.delete_collection_pods(request)
+    }
+
+    fn bind_pod(
+        &self,
+        request: klights_pod_api::PodBindingRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, ()> {
+        self.api.bind_pod(request)
+    }
+}
+
+impl klights_pod_api::PodSubresourceMutation for RootControllerPodPort {
+    fn replace_status(
+        &self,
+        request: klights_pod_api::PodStatusReplaceRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
+        self.subresource.replace_status(request)
+    }
+
+    fn patch_status(
+        &self,
+        request: klights_pod_api::PodStatusPatchRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
+        self.subresource.patch_status(request)
+    }
+
+    fn update_ephemeral_containers(
+        &self,
+        request: klights_pod_api::PodEphemeralContainersRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
+        self.subresource.update_ephemeral_containers(request)
     }
 }
 
@@ -993,17 +980,21 @@ impl crate::kubelet::pod_repository::PodSubresourceWriter for RootControllerPodP
 impl klights_controllers::node_lifecycle::NodeLifecyclePodStore for RootControllerPodPort {
     async fn list_pods_bound_to_node(&self, node_name: &str) -> Result<Vec<Resource>> {
         let field_selector = format!("spec.nodeName={node_name}");
-        Ok(crate::kubelet::pod_repository::PodReader::list_pods(
-            self.repository.as_ref(),
+        let request = klights_pod_api::PodListRequest::try_new(
             None,
             None,
-            Some(&field_selector),
+            Some(field_selector),
             None,
             None,
         )
-        .await
-        .map_err(crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error)?
-        .items)
+        .map_err(anyhow::Error::new)
+        .map_err(crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error)?;
+        Ok(klights_pod_api::PodQuery::list_pods(self.repository.as_ref(), request)
+            .await
+            .map_err(anyhow::Error::new)
+            .map_err(crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error)?
+            .into_parts()
+            .0)
     }
 
     async fn replace_pod_status_for_uid(
@@ -1114,6 +1105,10 @@ fn runtime_dependencies_for_test(
     let repository = crate::kubelet::pod_repository::pod_repository_for_test(db);
     let leader = Arc::new(RootControllerLeaderPort::new(db_handle.clone()));
     let pods = Arc::new(RootControllerPodPort::new_for_test(repository.clone()));
+    let pod_mutations = Arc::new(klights_controllers::ControllerPodMutationAdapter::new(
+        pods.clone(),
+        pods.clone(),
+    ));
     let non_pod_finalization: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort> = Arc::new(
         crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
             db_handle,
@@ -1135,14 +1130,12 @@ fn runtime_dependencies_for_test(
         apiservice_store: leader.clone(),
         csr_status_store: leader,
         pod_query: repository.clone(),
-        pdb_pod_reader: repository.clone(),
-        deployment_pod_reader: repository.clone(),
-        deployment_pod_mutation: pods.clone(),
-        replicaset_pod_mutation: pods.clone(),
-        statefulset_pod_mutation: pods.clone(),
-        daemonset_pod_mutation: pods.clone(),
-        job_pod_mutation: pods.clone(),
-        replicationcontroller_pod_mutation: pods,
+        deployment_pod_mutation: pod_mutations.clone(),
+        replicaset_pod_mutation: pod_mutations.clone(),
+        statefulset_pod_mutation: pod_mutations.clone(),
+        daemonset_pod_mutation: pod_mutations.clone(),
+        job_pod_mutation: pod_mutations.clone(),
+        replicationcontroller_pod_mutation: pod_mutations,
         pod_delete_sink: repository,
         reconcile: Arc::new(RootControllerReconcilePort::new(non_pod_finalization)),
         network: Arc::new(RootControllerNetworkPort::new(services)),

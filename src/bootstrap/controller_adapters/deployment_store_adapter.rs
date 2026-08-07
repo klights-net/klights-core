@@ -4,7 +4,6 @@ use klights_reconcile_api::ControllerStoreResult as Result;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
 use crate::datastore::{DatastoreBackend, ResourceListQuery, ResourcePatchRequest};
-use crate::kubelet::pod_repository::PodObjectWriter;
 use klights_controllers::deployment::{DeploymentPodMutation, DeploymentStore};
 
 #[async_trait]
@@ -17,35 +16,7 @@ impl DeploymentPodMutation
         name: &str,
         labels: Vec<(String, String)>,
     ) -> Result<Resource> {
-        PodObjectWriter::merge_pod_labels(self, namespace, name, labels)
-            .await
-            .map_err(map_controller_store_error)
-    }
-}
-
-#[async_trait]
-impl DeploymentPodMutation for dyn PodObjectWriter + '_ {
-    async fn merge_deployment_pod_labels(
-        &self,
-        namespace: &str,
-        name: &str,
-        labels: Vec<(String, String)>,
-    ) -> Result<Resource> {
-        PodObjectWriter::merge_pod_labels(self, namespace, name, labels)
-            .await
-            .map_err(map_controller_store_error)
-    }
-}
-
-#[async_trait]
-impl DeploymentPodMutation for crate::kubelet::pod_repository::PodRepository {
-    async fn merge_deployment_pod_labels(
-        &self,
-        namespace: &str,
-        name: &str,
-        labels: Vec<(String, String)>,
-    ) -> Result<Resource> {
-        PodObjectWriter::merge_pod_labels(self, namespace, name, labels)
+        self.merge_controller_pod_labels(namespace, name, None, labels)
             .await
             .map_err(map_controller_store_error)
     }

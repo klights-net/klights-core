@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use crate::pod_repository::PodQueryPort;
 use crate::runtime::{PodDeletionFinalizeResult, PodRuntimeKey};
 use klights_leader_api::NodeOutbox;
 use klights_pod_api::{
-    BoundPodFinalization, BoundPodFinalizationOutcome, BoundPodFinalizationRequest,
+    BoundPodFinalization, BoundPodFinalizationOutcome, BoundPodFinalizationRequest, PodGetRequest,
+    PodQuery,
 };
 use klights_reconcile_api::{
     GcPodDeleteRequest, GcPodDeleteSink, NamespaceTerminationRequest, NamespaceTerminationSink,
@@ -40,7 +40,7 @@ pub trait PodDeletionFinalizer: Send + Sync {
 /// behind the `PodDeletionFinalizer` trait so the actor-owned hard-delete
 /// invariant can be source-guarded.
 pub struct RealPodDeletionFinalizer {
-    pod_query: Arc<dyn PodQueryPort>,
+    pod_query: Arc<dyn PodQuery>,
     gc_pod_delete_sink: Arc<dyn GcPodDeleteSink>,
     gc_reconcile: Arc<dyn PodGcReconcileSink>,
     pdb_reconcile: Arc<dyn PodPdbReconcileSink>,
@@ -54,7 +54,7 @@ pub struct RealPodDeletionFinalizer {
 }
 
 pub struct RealPodDeletionFinalizerDependencies {
-    pub pod_query: Arc<dyn PodQueryPort>,
+    pub pod_query: Arc<dyn PodQuery>,
     pub gc_pod_delete_sink: Arc<dyn GcPodDeleteSink>,
     pub gc_reconcile: Arc<dyn PodGcReconcileSink>,
     pub pdb_reconcile: Arc<dyn PodPdbReconcileSink>,
@@ -170,7 +170,9 @@ impl PodDeletionFinalizer for RealPodDeletionFinalizer {
                 )?)
                 .await?
         } else {
-            self.pod_query.read_pod(ns, name).await?
+            self.pod_query
+                .get_pod(PodGetRequest::try_by_name(ns, name)?)
+                .await?
         };
         let Some(live) = live else {
             self.delete_status_checkpoint_after_finalization(uid).await;
@@ -313,49 +315,30 @@ mod policy_tests {
     };
 
     use super::*;
-    use crate::pod_repository::PodRepositoryList;
 
     struct RecordingQuery {
         events: Arc<Mutex<Vec<&'static str>>>,
         live: Resource,
     }
 
-    impl PodQueryPort for RecordingQuery {
-        fn read_pod<'a>(
-            &'a self,
-            _namespace: &'a str,
-            _name: &'a str,
-        ) -> PodRepositoryFuture<'a, Option<Resource>> {
+    impl PodQuery for RecordingQuery {
+        fn get_pod(&self, _request: PodGetRequest) -> PodRepositoryFuture<'_, Option<Resource>> {
             self.events.lock().unwrap().push("fresh_uid_check");
             let live = self.live.clone();
             Box::pin(async move { Ok(Some(live)) })
         }
 
-        fn read_pod_for_uid<'a>(
-            &'a self,
-            _namespace: &'a str,
-            _name: &'a str,
-            _uid: &'a str,
-        ) -> PodRepositoryFuture<'a, Option<Resource>> {
-            Box::pin(async {
-                Err(PodRepositoryError::unavailable(
-                    "unused UID-qualified query",
-                ))
-            })
-        }
-
-        fn list_pod_page<'a>(
-            &'a self,
-            _request: &'a PodListRequest,
-        ) -> PodRepositoryFuture<'a, PodRepositoryList> {
+        fn list_pods(
+            &self,
+            _request: PodListRequest,
+        ) -> PodRepositoryFuture<'_, klights_pod_api::PodListResult> {
             Box::pin(async { Err(PodRepositoryError::unavailable("unused list query")) })
         }
 
-        fn list_pods_by_owner_uid<'a>(
-            &'a self,
-            _namespace: &'a str,
-            _owner_uid: &'a str,
-        ) -> PodRepositoryFuture<'a, Vec<Resource>> {
+        fn list_pods_by_owner_uid(
+            &self,
+            _request: klights_pod_api::PodOwnerListRequest,
+        ) -> PodRepositoryFuture<'_, Vec<Resource>> {
             Box::pin(async { Err(PodRepositoryError::unavailable("unused owner query")) })
         }
     }

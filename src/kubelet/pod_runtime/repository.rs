@@ -1,6 +1,8 @@
-use crate::kubelet::pod_repository::{PodRepository, PodStatusUpdate, RuntimeReconcileStatus};
+use crate::kubelet::pod_repository::PodRepository;
 use klights_cluster_core::Resource;
+use klights_kubelet::pod_repository::{PodStatusUpdate, RuntimeReconcileStatus};
 use klights_kubelet::pod_startup_error::PodStartupErrorKind;
+use klights_pod_api::{PodGetRequest, PodQuery};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LivePodUidCheck {
@@ -91,7 +93,7 @@ pub trait PodRuntimeRepository: Send + Sync {
     /// tracked pod (`Matches`); a stale cache still showing the OLD uid would
     /// falsely return `Matches`, letting a deleted pod's actor act on a slot the
     /// replacement now owns. The production `PodRepository` impl satisfies this by
-    /// routing through `PodReader::get_pod` → `get_resource_fresh` on workers. Do
+    /// routing through `PodQuery::get_pod` → `get_resource_fresh` on workers. Do
     /// not migrate this to a cached read.
     async fn check_live_pod_uid(
         &self,
@@ -109,7 +111,12 @@ impl PodRuntimeRepository for PodRepository {
         name: &str,
         pod_uid: &str,
     ) -> anyhow::Result<Option<Resource>> {
-        crate::kubelet::pod_repository::PodReader::get_pod_for_uid(self, ns, name, pod_uid).await
+        PodQuery::get_pod(
+            self,
+            PodGetRequest::try_by_identity(klights_types::PodIdentity::new(ns, name, pod_uid))?,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn set_pod_status_for_uid(
@@ -253,7 +260,7 @@ impl PodRuntimeRepository for PodRepository {
         name: &str,
         pod_uid: &str,
     ) -> anyhow::Result<LivePodUidCheck> {
-        let Some(pod) = crate::kubelet::pod_repository::PodReader::get_pod(self, ns, name).await?
+        let Some(pod) = PodQuery::get_pod(self, PodGetRequest::try_by_name(ns, name)?).await?
         else {
             return Ok(LivePodUidCheck::Missing);
         };

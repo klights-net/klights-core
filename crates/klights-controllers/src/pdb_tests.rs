@@ -176,25 +176,89 @@ impl PdbStore for MemoryPdbRuntime {
     }
 }
 
-#[async_trait]
-impl PdbPodReader for MemoryPdbRuntime {
-    async fn list_namespace_pods(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
-        Ok(self
-            .resources
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|((api_version, kind, ns, _), _)| {
-                api_version == "v1" && kind == "Pod" && ns.as_deref() == Some(namespace)
-            })
-            .map(|(_, resource)| resource.clone())
-            .collect())
+impl PodQuery for MemoryPdbRuntime {
+    fn get_pod(
+        &self,
+        request: klights_pod_api::PodGetRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Option<Resource>> {
+        Box::pin(async move {
+            Ok(self
+                .resources
+                .lock()
+                .unwrap()
+                .get(&Self::key(
+                    "v1",
+                    "Pod",
+                    Some(request.namespace()),
+                    request.name(),
+                ))
+                .filter(|pod| request.uid().is_none_or(|uid| pod.uid == uid))
+                .cloned())
+        })
+    }
+
+    fn list_pods(
+        &self,
+        request: PodListRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodListResult> {
+        Box::pin(async move {
+            let pods = self
+                .resources
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((api_version, kind, namespace, _), _)| {
+                    api_version == "v1"
+                        && kind == "Pod"
+                        && request
+                            .namespace()
+                            .is_none_or(|expected| namespace.as_deref() == Some(expected))
+                })
+                .map(|(_, resource)| resource.clone())
+                .collect();
+            klights_pod_api::PodListResult::try_new(
+                pods,
+                self.next_resource_version.load(Ordering::Relaxed),
+                None,
+                None,
+            )
+        })
+    }
+
+    fn list_pods_by_owner_uid(
+        &self,
+        request: klights_pod_api::PodOwnerListRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Vec<Resource>> {
+        Box::pin(async move {
+            Ok(self
+                .resources
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((api_version, kind, namespace, _), resource)| {
+                    api_version == "v1"
+                        && kind == "Pod"
+                        && namespace.as_deref() == Some(request.namespace())
+                        && resource
+                            .data
+                            .pointer("/metadata/ownerReferences")
+                            .and_then(Value::as_array)
+                            .is_some_and(|owners| {
+                                owners.iter().any(|owner| {
+                                    owner.get("uid").and_then(Value::as_str)
+                                        == Some(request.owner_uid())
+                                })
+                            })
+                })
+                .map(|(_, resource)| resource.clone())
+                .collect())
+        })
     }
 }
 
 async fn reconcile_pdb(
     store: &(impl PdbStore + ?Sized),
-    pods: &(impl PdbPodReader + ?Sized),
+    pods: &(impl PodQuery + ?Sized),
     pdb: &Value,
 ) -> Result<()> {
     reconcile_pdb_at(store, pods, pdb, chrono::Utc::now()).await
@@ -304,22 +368,40 @@ async fn get_pdb_status(db: &MemoryPdbRuntime, namespace: &str, name: &str) -> V
     r.data["status"].clone()
 }
 
-struct BlockingOncePodReader {
+struct BlockingOncePodQuery {
     inner: Arc<MemoryPdbRuntime>,
     listed: Arc<Notify>,
     release: Arc<Notify>,
     block_next_list: AtomicBool,
 }
 
-#[async_trait]
-impl PdbPodReader for BlockingOncePodReader {
-    async fn list_namespace_pods(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
-        let pods = self.inner.list_namespace_pods(namespace).await?;
-        if self.block_next_list.swap(false, Ordering::SeqCst) {
-            self.listed.notify_one();
-            self.release.notified().await;
-        }
-        Ok(pods)
+impl PodQuery for BlockingOncePodQuery {
+    fn get_pod(
+        &self,
+        request: klights_pod_api::PodGetRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Option<Resource>> {
+        self.inner.get_pod(request)
+    }
+
+    fn list_pods(
+        &self,
+        request: PodListRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodListResult> {
+        Box::pin(async move {
+            let pods = self.inner.list_pods(request).await?;
+            if self.block_next_list.swap(false, Ordering::SeqCst) {
+                self.listed.notify_one();
+                self.release.notified().await;
+            }
+            Ok(pods)
+        })
+    }
+
+    fn list_pods_by_owner_uid(
+        &self,
+        request: klights_pod_api::PodOwnerListRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Vec<Resource>> {
+        self.inner.list_pods_by_owner_uid(request)
     }
 }
 
@@ -369,7 +451,7 @@ async fn test_pdb_reconcile_does_not_overwrite_fresher_status_after_stale_pod_li
     let repo = Arc::new(db.clone());
     let listed = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
-    let stale_reader = Arc::new(BlockingOncePodReader {
+    let stale_reader = Arc::new(BlockingOncePodQuery {
         inner: repo.clone(),
         listed: listed.clone(),
         release: release.clone(),

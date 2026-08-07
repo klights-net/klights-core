@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 use tokio::sync::broadcast;
 
-use super::PodResourceList;
 use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
 use klights_pod_api::{
     PodRepositoryCreateRequest, PodRepositoryError, PodRepositoryGetRequest,
@@ -103,7 +102,7 @@ impl PodStore {
         field_selector: Option<&str>,
         limit: Option<i64>,
         continue_token: Option<&str>,
-    ) -> Result<PodResourceList> {
+    ) -> Result<klights_pod_api::PodListResult> {
         let result = self
             .reads
             .list_persisted_pods(PodRepositoryListRequest {
@@ -115,12 +114,13 @@ impl PodStore {
             })
             .await?;
         let (items, resource_version, continue_token, remaining_item_count) = result.into_parts();
-        Ok(PodResourceList {
+        klights_pod_api::PodListResult::try_new(
             items,
             resource_version,
             continue_token,
             remaining_item_count,
-        })
+        )
+        .map_err(Into::into)
     }
 
     pub(crate) async fn snapshot_list(
@@ -189,6 +189,29 @@ impl PodStore {
             })
             .await
             .map_err(Into::into)
+    }
+
+    pub(crate) async fn patch_metadata(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+        expected_rv: i64,
+        patch: Value,
+    ) -> Result<Resource> {
+        self.writes
+            .patch_persisted_pod(PodRepositoryPatchRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
+                patch_kind: PatchKind::Merge,
+                patch,
+                preconditions: ResourcePreconditions {
+                    uid: Some(uid.to_string()),
+                    resource_version: Some(expected_rv),
+                },
+            })
+            .await?
+            .ok_or_else(|| PodRepositoryError::not_found(ns, name).into())
     }
 
     pub(super) async fn mark_deleting_latest(
@@ -297,15 +320,19 @@ impl PodStore {
             .map_err(Into::into)
     }
 
-    pub(super) async fn update_status(
+    pub(crate) async fn update_status_typed(
         &self,
         ns: &str,
         name: &str,
         status: Value,
         expected_rv: Option<i64>,
-    ) -> Result<Resource> {
+    ) -> std::result::Result<Resource, PodRepositoryError> {
         let current = self
-            .get(ns, name)
+            .reads
+            .get_persisted_pod(PodRepositoryGetRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
+            })
             .await?
             .ok_or_else(|| PodRepositoryError::not_found(ns, name))?;
         if current.data.get("status") == Some(&status) {
@@ -315,8 +342,7 @@ impl PodStore {
                 return Err(PodRepositoryError::conflict(format!(
                     "resourceVersion precondition failed: expected {} got {}",
                     expected, current.resource_version
-                ))
-                .into());
+                )));
             }
             self.writes
                 .log_persisted_pod_status_noop(PodRepositoryStatusNoop {
@@ -336,6 +362,18 @@ impl PodStore {
                     resource_version: expected_rv,
                 },
             })
+            .await
+    }
+
+    #[cfg(feature = "pod-repository-test-support")]
+    async fn update_status(
+        &self,
+        ns: &str,
+        name: &str,
+        status: Value,
+        expected_rv: Option<i64>,
+    ) -> Result<Resource> {
+        self.update_status_typed(ns, name, status, expected_rv)
             .await
             .map_err(Into::into)
     }
@@ -403,29 +441,52 @@ pub(crate) fn classify_bound_finalization(
     }
 }
 
-#[async_trait::async_trait]
-impl super::PodReader for PodStore {
-    async fn get_pod(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
-        self.get(ns, name).await
-    }
-
-    async fn get_pod_for_uid(&self, ns: &str, name: &str, uid: &str) -> Result<Option<Resource>> {
-        Ok(self.get(ns, name).await?.filter(|pod| pod.uid == uid))
-    }
-
-    async fn list_pods(
+impl klights_pod_api::PodQuery for PodStore {
+    fn get_pod(
         &self,
-        ns: Option<&str>,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        limit: Option<i64>,
-        continue_token: Option<&str>,
-    ) -> Result<PodResourceList> {
-        self.list(ns, label_selector, field_selector, limit, continue_token)
-            .await
+        request: klights_pod_api::PodGetRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Option<Resource>> {
+        Box::pin(async move {
+            let pod = self
+                .reads
+                .get_persisted_pod(PodRepositoryGetRequest {
+                    namespace: request.namespace().to_string(),
+                    name: request.name().to_string(),
+                })
+                .await?;
+            Ok(match request.uid() {
+                Some(uid) => pod.filter(|pod| pod.uid == uid),
+                None => pod,
+            })
+        })
     }
-    async fn list_pods_by_owner_uid(&self, ns: &str, owner_uid: &str) -> Result<Vec<Resource>> {
-        self.list_by_owner(ns, owner_uid).await
+
+    fn list_pods(
+        &self,
+        request: klights_pod_api::PodListRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodListResult> {
+        Box::pin(async move {
+            self.reads
+                .list_persisted_pods(PodRepositoryListRequest {
+                    namespace: request.namespace().map(str::to_string),
+                    label_selector: request.label_selector().map(str::to_string),
+                    field_selector: request.field_selector().map(str::to_string),
+                    limit: request.limit(),
+                    continue_token: request.continue_token().map(str::to_string),
+                })
+                .await
+        })
+    }
+
+    fn list_pods_by_owner_uid(
+        &self,
+        request: klights_pod_api::PodOwnerListRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Vec<Resource>> {
+        self.reads
+            .list_persisted_pods_by_owner(PodRepositoryOwnerListRequest {
+                namespace: request.namespace().to_string(),
+                owner_uid: request.owner_uid().to_string(),
+            })
     }
 }
 

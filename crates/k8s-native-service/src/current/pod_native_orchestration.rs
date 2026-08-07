@@ -37,7 +37,6 @@ use klights_supervisor::TaskSupervisor;
 use klights_types::PodIdentity;
 
 type PodApiUpdateOutcome = PodApiWriteOutcome;
-type PodStatusPatchType = PodStatusPatchKind;
 
 struct PodApiCreateRequest {
     namespace: String,
@@ -92,6 +91,7 @@ pub struct PodNativeOrchestration {
     supervisor: Arc<TaskSupervisor>,
     gc_reconcile: Arc<dyn PodGcReconcileSink>,
     service_reconcile: Arc<dyn PodServiceReconcileSink>,
+    mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     metrics: Arc<dyn ReconcileFailureMetrics>,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
@@ -109,6 +109,7 @@ pub struct PodNativeOrchestrationDependencies {
     pub supervisor: Arc<TaskSupervisor>,
     pub gc_reconcile: Arc<dyn PodGcReconcileSink>,
     pub service_reconcile: Arc<dyn PodServiceReconcileSink>,
+    pub mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     pub metrics: Arc<dyn ReconcileFailureMetrics>,
     pub wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
@@ -128,6 +129,7 @@ impl PodNativeOrchestration {
             supervisor,
             gc_reconcile,
             service_reconcile,
+            mutation_reconcile,
             metrics,
             wall_clock,
         } = dependencies;
@@ -144,6 +146,7 @@ impl PodNativeOrchestration {
             supervisor,
             gc_reconcile,
             service_reconcile,
+            mutation_reconcile,
             metrics,
             wall_clock,
         }
@@ -553,13 +556,13 @@ impl PodNativeOrchestration {
         ns: &str,
         name: &str,
         patch: Value,
-        patch_type: PodStatusPatchType,
+        patch_type: PodStatusPatchKind,
         dry_run: bool,
     ) -> Result<PodApiUpdateOutcome, AppError> {
         let content_type = patch_type_to_content_type(patch_type);
 
         // SSA-create on missing pod (only ApplyPatch).
-        if matches!(patch_type, PodStatusPatchType::ApplyPatch) {
+        if matches!(patch_type, PodStatusPatchKind::ApplyPatch) {
             let exists = self
                 .pod_query
                 .get_pod(pod_get_request(ns, name)?)
@@ -594,7 +597,7 @@ impl PodNativeOrchestration {
 
             // SSA: store the applied configuration in the
             // kubectl.kubernetes.io/last-applied-configuration annotation.
-            if matches!(patch_type, PodStatusPatchType::ApplyPatch)
+            if matches!(patch_type, PodStatusPatchKind::ApplyPatch)
                 && let Some(obj) = patched.as_object_mut()
             {
                 let patch_str = serde_json::to_string(&patch).unwrap_or_default();
@@ -838,7 +841,7 @@ impl PodNativeOrchestration {
         let uid = delete_outcome.uid;
         if let Err(err) = self
             .service_reconcile
-            .enqueue_after_pod_update(previous, updated.clone())
+            .enqueue_after_pod_update(previous.clone(), updated.clone())
             .await
         {
             tracing::debug!(
@@ -847,6 +850,16 @@ impl PodNativeOrchestration {
                 "failed to enqueue Service reconcile after pod endpoint state changed"
             );
         }
+        let _ = self
+            .mutation_reconcile
+            .reconcile_pod_mutation(
+                klights_reconcile_api::PodMutationReconcileRequest::RunHooks {
+                    pod: previous,
+                    named_hook: None,
+                    context: "pod_api_mark_terminating",
+                },
+            )
+            .await;
         // Cascade-delete dependents (resources with ownerReferences
         // pointing to this pod). This handles the GC dependency-circle
         // conformance test where deleting pod1 must cascade to pod2
@@ -1184,12 +1197,12 @@ fn priority_class_value_and_policy(pc: Option<&Value>) -> (Option<i64>, Option<S
     (priority, policy)
 }
 
-fn patch_type_to_content_type(p: PodStatusPatchType) -> &'static str {
+fn patch_type_to_content_type(p: PodStatusPatchKind) -> &'static str {
     match p {
-        PodStatusPatchType::JsonPatch => "application/json-patch+json",
-        PodStatusPatchType::MergePatch => "application/merge-patch+json",
-        PodStatusPatchType::StrategicMerge => "application/strategic-merge-patch+json",
-        PodStatusPatchType::ApplyPatch => "application/apply-patch+yaml",
+        PodStatusPatchKind::JsonPatch => "application/json-patch+json",
+        PodStatusPatchKind::MergePatch => "application/merge-patch+json",
+        PodStatusPatchKind::StrategicMerge => "application/strategic-merge-patch+json",
+        PodStatusPatchKind::ApplyPatch => "application/apply-patch+yaml",
     }
 }
 
@@ -1315,12 +1328,12 @@ impl klights_pod_api::PodApiMutation for PodNativeOrchestration {
     ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodApiWriteOutcome> {
         Box::pin(async move {
             let patch_type = match request.patch_kind {
-                klights_pod_api::PodStatusPatchKind::JsonPatch => PodStatusPatchType::JsonPatch,
-                klights_pod_api::PodStatusPatchKind::MergePatch => PodStatusPatchType::MergePatch,
+                klights_pod_api::PodStatusPatchKind::JsonPatch => PodStatusPatchKind::JsonPatch,
+                klights_pod_api::PodStatusPatchKind::MergePatch => PodStatusPatchKind::MergePatch,
                 klights_pod_api::PodStatusPatchKind::StrategicMerge => {
-                    PodStatusPatchType::StrategicMerge
+                    PodStatusPatchKind::StrategicMerge
                 }
-                klights_pod_api::PodStatusPatchKind::ApplyPatch => PodStatusPatchType::ApplyPatch,
+                klights_pod_api::PodStatusPatchKind::ApplyPatch => PodStatusPatchKind::ApplyPatch,
             };
             match self
                 .api_patch_pod(

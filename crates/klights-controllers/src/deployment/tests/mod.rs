@@ -21,7 +21,7 @@ fn coordination() -> &'static crate::ControllerCoordination {
 
 async fn reconcile_deployment(
     db: &crate::test_support::TestStore,
-    pod_reader: &(impl crate::deployment::DeploymentPodReader + klights_pod_api::PodQuery + ?Sized),
+    pod_reader: &(impl klights_pod_api::PodQuery + ?Sized),
     pod_writer: &(
          impl crate::deployment::DeploymentPodMutation
          + crate::replicaset::ReplicaSetPodMutation

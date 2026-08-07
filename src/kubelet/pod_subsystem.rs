@@ -264,7 +264,7 @@ impl PodSubsystem {
                 registry_proxy,
             ),
         );
-        let pod_reader: Arc<dyn crate::kubelet::pod_repository::PodReader> = repository.clone();
+        let pod_reader: Arc<dyn klights_pod_api::PodQuery> = repository.clone();
         let hostports: Arc<dyn crate::kubelet::pod_runtime::hostports::HostPortRuntime> = Arc::new(
             crate::kubelet::pod_runtime::hostports::RealHostPortRuntime::new(
                 service_router,

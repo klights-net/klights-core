@@ -13,7 +13,7 @@ use klights_controllers::coredns::{
 
 struct CoreDnsBootstrapAdapter<'a> {
     db: &'a dyn DatastoreBackend,
-    pod_reader: Arc<dyn klights_controllers::DeploymentControllerPodReader>,
+    pod_reader: Arc<dyn klights_pod_api::PodQuery>,
     pod_mutation: Arc<dyn klights_controllers::DeploymentControllerPodMutation>,
     pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
     non_pod_finalization: &'a dyn klights_reconcile_api::GcNonPodFinalizationPort,
@@ -103,7 +103,7 @@ pub(crate) struct CoreDnsBootstrapConfig<'a> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn bootstrap_coredns(
     db: &dyn DatastoreBackend,
-    pod_reader: Arc<dyn klights_controllers::DeploymentControllerPodReader>,
+    pod_reader: Arc<dyn klights_pod_api::PodQuery>,
     pod_mutation: Arc<dyn klights_controllers::DeploymentControllerPodMutation>,
     pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,

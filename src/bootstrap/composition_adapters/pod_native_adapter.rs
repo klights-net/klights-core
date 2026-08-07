@@ -7,14 +7,13 @@ use klights_cluster_core::Resource;
 use klights_pod_api::{
     PodActorFinalizeRequest, PodControlPlaneEventRequest, PodControlPlaneEventSink,
     PodDeleteMarkOutcome, PodDeleteMarkRequest, PodDeleteOrchestration, PodGetRequest,
-    PodListRequest, PodListResult, PodMarkedRetryRequest, PodPersistence,
+    PodListRequest, PodListResult, PodMarkedRetryRequest, PodMetadataPatchRequest, PodPersistence,
     PodPersistenceCreateRequest, PodPersistenceReplaceRequest, PodQuery, PodRepositoryError,
     PodRepositoryFuture, PodSpecValidation, PodStatusPersistence, PodStatusWriteRequest,
 };
 
 use crate::datastore::{DatastoreHandle, ResourceListQuery};
 use crate::kubelet::pod_repository::delete_coordinator::PodDeleteCoordinator;
-use crate::kubelet::pod_repository::state_only_writer::StateOnlyWriter;
 use crate::kubelet::pod_repository::store::PodStore;
 use k8s_native_service::AdmissionResourceStore;
 
@@ -59,7 +58,6 @@ impl SchedulerBindGateForTest {
 
 pub(crate) struct RootPodNativeAdapter {
     store: Arc<PodStore>,
-    status_only: Arc<dyn StateOnlyWriter>,
     delete_coordinator: Arc<PodDeleteCoordinator>,
     db: DatastoreHandle,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
@@ -70,7 +68,6 @@ pub(crate) struct RootPodNativeAdapter {
 impl RootPodNativeAdapter {
     pub(crate) fn new(
         store: Arc<PodStore>,
-        status_only: Arc<dyn StateOnlyWriter>,
         delete_coordinator: Arc<PodDeleteCoordinator>,
         db: DatastoreHandle,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
@@ -80,7 +77,6 @@ impl RootPodNativeAdapter {
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
-            status_only,
             delete_coordinator,
             db,
             wall_clock,
@@ -175,6 +171,24 @@ impl PodPersistence for RootPodNativeAdapter {
                 .map_err(|error| map_store_error(error, &request.namespace, &request.name))
         })
     }
+
+    fn patch_pod_metadata(
+        &self,
+        request: PodMetadataPatchRequest,
+    ) -> PodRepositoryFuture<'_, Resource> {
+        Box::pin(async move {
+            self.store
+                .patch_metadata(
+                    &request.namespace,
+                    &request.name,
+                    &request.expected_uid,
+                    request.expected_resource_version,
+                    request.patch,
+                )
+                .await
+                .map_err(|error| map_store_error(error, &request.namespace, &request.name))
+        })
+    }
 }
 
 impl PodStatusPersistence for RootPodNativeAdapter {
@@ -183,15 +197,14 @@ impl PodStatusPersistence for RootPodNativeAdapter {
         request: PodStatusWriteRequest,
     ) -> PodRepositoryFuture<'_, Resource> {
         Box::pin(async move {
-            self.status_only
-                .write_status(
+            self.store
+                .update_status_typed(
                     &request.namespace,
                     &request.name,
                     request.status,
                     request.expected_resource_version,
                 )
                 .await
-                .map_err(|error| map_store_error(error, &request.namespace, &request.name))
         })
     }
 }

@@ -748,6 +748,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             pod_subresource_service.clone(),
         ),
     );
+    let controller_pod_mutations =
+        Arc::new(klights_controllers::ControllerPodMutationAdapter::new(
+            controller_pod_port.clone(),
+            controller_pod_port.clone(),
+        ));
     let controller_leader_ports = Arc::new(
         crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(db_handle.clone()),
     );
@@ -766,14 +771,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         apiservice_store: controller_leader_ports.clone(),
         csr_status_store: controller_leader_ports,
         pod_query: api_pod_repository.clone(),
-        pdb_pod_reader: api_pod_repository.clone(),
-        deployment_pod_reader: api_pod_repository.clone(),
-        deployment_pod_mutation: controller_pod_port.clone(),
-        replicaset_pod_mutation: controller_pod_port.clone(),
-        statefulset_pod_mutation: controller_pod_port.clone(),
-        daemonset_pod_mutation: controller_pod_port.clone(),
-        job_pod_mutation: controller_pod_port.clone(),
-        replicationcontroller_pod_mutation: controller_pod_port.clone(),
+        deployment_pod_mutation: controller_pod_mutations.clone(),
+        replicaset_pod_mutation: controller_pod_mutations.clone(),
+        statefulset_pod_mutation: controller_pod_mutations.clone(),
+        daemonset_pod_mutation: controller_pod_mutations.clone(),
+        job_pod_mutation: controller_pod_mutations.clone(),
+        replicationcontroller_pod_mutation: controller_pod_mutations.clone(),
         pod_delete_sink: api_pod_repository.clone(),
         reconcile: Arc::new(
             crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerReconcilePort::new(
@@ -795,6 +798,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let hpa_controller = crate::bootstrap::controller_adapters::hpa_controller_adapter::controller(
         db_handle.clone(),
         api_pod_repository.clone(),
+        controller_pod_mutations,
         non_pod_finalization,
         controller_coordination.clone(),
         Arc::from(config.node_name.as_str()),

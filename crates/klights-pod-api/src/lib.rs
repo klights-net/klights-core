@@ -412,6 +412,12 @@ pub trait PodPersistence: Send + Sync {
         &self,
         request: PodPersistenceReplaceRequest,
     ) -> PodRepositoryFuture<'_, Resource>;
+
+    /// Apply a metadata-only merge patch under exact Pod UID/RV CAS.
+    fn patch_pod_metadata(
+        &self,
+        request: PodMetadataPatchRequest,
+    ) -> PodRepositoryFuture<'_, Resource>;
 }
 
 #[derive(Clone, Debug)]
@@ -427,6 +433,15 @@ pub struct PodPersistenceReplaceRequest {
     pub name: String,
     pub body: serde_json::Value,
     pub expected_resource_version: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PodMetadataPatchRequest {
+    pub namespace: String,
+    pub name: String,
+    pub expected_uid: String,
+    pub expected_resource_version: i64,
+    pub patch: serde_json::Value,
 }
 
 /// Status-only persistence capability. Implementations must discard every

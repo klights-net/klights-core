@@ -13,14 +13,14 @@
 #[cfg(test)]
 use crate::datastore::DatastoreBackend;
 #[cfg(test)]
-use crate::kubelet::pod_repository::PodReader;
-#[cfg(test)]
 use anyhow::Result;
+#[cfg(test)]
+use klights_pod_api::PodQuery;
 
 #[cfg(test)]
 pub async fn reconcile_endpoints_for_pod(
     db: &dyn DatastoreBackend,
-    pod_reader: &dyn PodReader,
+    pod_reader: &dyn PodQuery,
     pod: &serde_json::Value,
     service_router: Option<&dyn klights_network_api::ServiceRouter>,
 ) -> Result<()> {

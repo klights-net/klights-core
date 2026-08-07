@@ -11,7 +11,7 @@ use klights_pod_api::PodQuery;
 /// Recounts ResourceQuota status.used after any namespaced resource mutation.
 ///
 /// The late-bound repository is resolved for every event so construction
-/// order remains independent and pod-scoped counts always use `PodReader`.
+/// order remains independent and pod-scoped counts always use `PodQuery`.
 struct RootResourceQuotaSideEffectPort {
     db: DatastoreHandle,
     pod_repository: PodSideEffectPortsSlot,

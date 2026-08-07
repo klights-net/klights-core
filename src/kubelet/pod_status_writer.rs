@@ -80,7 +80,7 @@ pub struct PodStatusUpdate {
 #[cfg(test)]
 pub async fn update_pod_status(
     db: &dyn DatastoreBackend,
-    pod_reader: &dyn crate::kubelet::pod_repository::PodReader,
+    pod_reader: &dyn klights_pod_api::PodQuery,
     pod_name: &str,
     namespace: &str,
     status: PodStatusUpdate,

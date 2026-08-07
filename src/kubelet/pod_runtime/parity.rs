@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::kubelet::pod_cluster_runtime::ClusterRuntimeView;
-use crate::kubelet::pod_repository::{PodReader, PodRepository, PodRepositoryBuildConfig};
+use crate::kubelet::pod_repository::{PodRepository, PodRepositoryBuildConfig};
 use crate::kubelet::pod_runtime::service::PodRuntimeKey;
 
 use super::events::PodEventSink;
@@ -336,13 +336,16 @@ impl ParityFixture {
     /// status objects into a `Recording`.
     pub async fn snapshot_with_repository_state(&self) -> Recording {
         let mut recording = self.snapshot();
-        let pods = self
-            .repository
-            .list_pods(None, None, None, None, None)
-            .await
-            .expect("parity repository pod list should succeed");
+        let pods = klights_pod_api::PodQuery::list_pods(
+            self.repository.as_ref(),
+            klights_pod_api::PodListRequest::try_new(None, None, None, None, None)
+                .expect("valid parity list request"),
+        )
+        .await
+        .expect("parity repository pod list should succeed");
         let mut repository_writes = pods
-            .items
+            .into_parts()
+            .0
             .into_iter()
             .map(|pod| RepositoryWrite::PodSnapshot {
                 namespace: pod.namespace.unwrap_or_default(),
@@ -540,13 +543,13 @@ mod tests {
 
     #[tokio::test]
     async fn parity_fixture_snapshots_repository_status_payloads() {
-        use crate::kubelet::pod_repository::{PodObjectWriter, PodStatusUpdate, PodStatusWriter};
+        use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
 
         let fixture = ParityFixture::new().await;
         let pod = pod_json("default", "repo-pod", "uid-2", "nginx:1.25");
         fixture
             .repository
-            .create_controller_pod("default", "repo-pod", "test-node", pod)
+            .test_create_pod("default", "repo-pod", "test-node", pod)
             .await
             .expect("create repository pod");
 

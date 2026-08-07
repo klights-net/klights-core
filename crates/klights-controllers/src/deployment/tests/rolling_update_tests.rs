@@ -12,7 +12,7 @@ struct CountingPodWriter {
     creates: AtomicUsize,
 }
 
-struct ReplicaSetStatusRacingPodReader {
+struct ReplicaSetStatusRacingPodQuery {
     db: crate::test_support::TestStore,
     namespace: String,
     replica_set_name: String,
@@ -21,7 +21,7 @@ struct ReplicaSetStatusRacingPodReader {
 }
 
 #[async_trait::async_trait]
-impl klights_pod_api::PodQuery for ReplicaSetStatusRacingPodReader {
+impl klights_pod_api::PodQuery for ReplicaSetStatusRacingPodQuery {
     fn get_pod(
         &self,
         request: klights_pod_api::PodGetRequest,
@@ -40,85 +40,48 @@ impl klights_pod_api::PodQuery for ReplicaSetStatusRacingPodReader {
         &self,
         request: klights_pod_api::PodOwnerListRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, Vec<Resource>> {
-        klights_pod_api::PodQuery::list_pods_by_owner_uid(&self.db, request)
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::deployment::DeploymentPodReader for ReplicaSetStatusRacingPodReader {
-    async fn list_pods_by_owner_uid(
-        &self,
-        ns: &str,
-        owner_uid: &str,
-    ) -> ControllerStoreResult<Vec<Resource>> {
-        if ns == self.namespace
-            && owner_uid == self.replica_set_uid
-            && !self.bumped.swap(true, Ordering::SeqCst)
-        {
-            let rs = self
-                .db
-                .get_resource("apps/v1", "ReplicaSet", Some(ns), &self.replica_set_name)
-                .await?
-                .expect("racing ReplicaSet should exist");
-            crate::common::write_status_for_resource(
-                &self.db,
-                &rs,
-                &json!({
-                    "replicas": 1,
-                    "readyReplicas": 1,
-                    "availableReplicas": 1,
-                    "fullyLabeledReplicas": 1,
-                    "observedGeneration": 1,
-                    "conditions": [{
-                        "type": "ReplicaSetReplicaFailure",
-                        "status": "False",
-                        "reason": "RaceBump",
-                        "message": "test-only status write racing Deployment scale"
-                    }]
-                }),
-            )
-            .await
-            .map_err(|error| {
-                klights_reconcile_api::ControllerStoreError::unavailable(error.to_string())
-            })?;
-        }
-
-        let pods = self
-            .db
-            .list_resources(
-                "v1",
-                "Pod",
-                Some(ns),
-                crate::test_support::ResourceListQuery::all(),
-            )
-            .await?;
-        Ok(pods
-            .items
-            .into_iter()
-            .filter(|pod| {
-                pod.data
-                    .pointer("/metadata/ownerReferences")
-                    .and_then(|v| v.as_array())
-                    .is_some_and(|owners| {
-                        owners.iter().any(|owner| {
-                            owner.get("uid").and_then(|v| v.as_str()) == Some(owner_uid)
-                        })
-                    })
-            })
-            .collect())
-    }
-
-    async fn list_namespace_pods(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
-        Ok(self
-            .db
-            .list_resources(
-                "v1",
-                "Pod",
-                Some(namespace),
-                crate::test_support::ResourceListQuery::all(),
-            )
-            .await?
-            .items)
+        Box::pin(async move {
+            if request.namespace() == self.namespace
+                && request.owner_uid() == self.replica_set_uid
+                && !self.bumped.swap(true, Ordering::SeqCst)
+            {
+                let rs = self
+                    .db
+                    .get_resource(
+                        "apps/v1",
+                        "ReplicaSet",
+                        Some(request.namespace()),
+                        &self.replica_set_name,
+                    )
+                    .await
+                    .map_err(|error| {
+                        klights_pod_api::PodRepositoryError::unavailable(error.to_string())
+                    })?
+                    .expect("racing ReplicaSet should exist");
+                crate::common::write_status_for_resource(
+                    &self.db,
+                    &rs,
+                    &json!({
+                        "replicas": 1,
+                        "readyReplicas": 1,
+                        "availableReplicas": 1,
+                        "fullyLabeledReplicas": 1,
+                        "observedGeneration": 1,
+                        "conditions": [{
+                            "type": "ReplicaSetReplicaFailure",
+                            "status": "False",
+                            "reason": "RaceBump",
+                            "message": "test-only status write racing Deployment scale"
+                        }]
+                    }),
+                )
+                .await
+                .map_err(|error| {
+                    klights_pod_api::PodRepositoryError::unavailable(error.to_string())
+                })?;
+            }
+            klights_pod_api::PodQuery::list_pods_by_owner_uid(&self.db, request).await
+        })
     }
 }
 
@@ -2615,7 +2578,7 @@ async fn test_rolling_update_scale_down_tolerates_replicaset_status_rv_race() {
             .unwrap();
     }
 
-    let racing_reader = ReplicaSetStatusRacingPodReader {
+    let racing_reader = ReplicaSetStatusRacingPodQuery {
         db: db.clone(),
         namespace: namespace.to_string(),
         replica_set_name: "race-rollout-old".to_string(),

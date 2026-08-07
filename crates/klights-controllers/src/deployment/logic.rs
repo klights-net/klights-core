@@ -266,7 +266,7 @@ async fn redrive_zero_replica_old_replicasets_with_live_pods(
     ctx: ZeroReplicaOldReplicaSetRedrive<
         '_,
         impl DeploymentStore + ?Sized,
-        impl super::DeploymentPodReader + PodQuery + ?Sized,
+        impl PodQuery + ?Sized,
         impl DeploymentPodMutation + crate::replicaset::ReplicaSetPodMutation + ?Sized,
     >,
     owned_rs_list: &[Resource],
@@ -553,7 +553,7 @@ async fn scale_replicaset_resource(
 #[allow(clippy::too_many_arguments)]
 pub async fn reconcile_deployment(
     db: &(impl DeploymentStore + ?Sized),
-    pod_reader: &(impl super::DeploymentPodReader + PodQuery + ?Sized),
+    pod_reader: &(impl PodQuery + ?Sized),
     pod_writer: &(impl DeploymentPodMutation + crate::replicaset::ReplicaSetPodMutation + ?Sized),
     identity: &dyn crate::ControllerIdentityGenerator,
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
