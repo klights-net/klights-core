@@ -612,10 +612,14 @@ mod tests {
         let sock_path = temp_dir.path().join("cri.sock");
         let _listener =
             std::os::unix::net::UnixListener::bind(&sock_path).expect("bind temp unix socket");
-        let cri = klights_kubelet::cri::CriClient::connect(&sock_path.to_string_lossy(), "klights")
-            .await
-            .expect("connect temp cri socket");
         let mut config = fixture_config(db);
+        let cri = klights_kubelet::cri::CriClient::connect(
+            &sock_path.to_string_lossy(),
+            "klights",
+            config.supervisor.as_ref().clone(),
+        )
+        .await
+        .expect("connect temp cri socket");
         config.cri = Some(klights_kubelet::cri::SharedCriClient::new(cri));
         config.datapath = Some(Arc::new(
             klights_networking::test_support::MockNetworkProvider::new(),

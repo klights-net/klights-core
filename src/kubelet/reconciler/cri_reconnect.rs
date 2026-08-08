@@ -43,6 +43,26 @@ pub struct CriReconnectDependencies {
     pub router: Arc<PodLifecycleRouter>,
 }
 
+async fn collect_container_inventory(
+    container_control: &dyn ContainerRuntimeControl,
+    sandboxes: &[klights_kubelet::runtime::cri::CriPodSandboxSummary],
+) -> Result<Vec<CriContainerInventory>> {
+    let mut containers = Vec::new();
+    for sandbox in sandboxes {
+        for (container_id, state) in container_control
+            .list_containers(Some(&sandbox.sandbox_id))
+            .await?
+        {
+            containers.push(CriContainerInventory {
+                sandbox_id: sandbox.sandbox_id.clone(),
+                container_id,
+                state,
+            });
+        }
+    }
+    Ok(containers)
+}
+
 impl CriReconnectReconciler {
     pub fn new(node_name: String, dependencies: CriReconnectDependencies) -> Self {
         let CriReconnectDependencies {
@@ -91,20 +111,9 @@ impl CriReconnectReconciler {
             .map(|pod| (*pod.data).clone())
             .collect::<Vec<_>>();
         let sandboxes = self.cri.list_pod_sandbox_summaries().await?;
-        let mut containers = Vec::new();
-        for sandbox in &sandboxes {
-            for (container_id, state) in self
-                .container_control
-                .list_containers(Some(&sandbox.sandbox_id))
-                .await?
-            {
-                containers.push(CriContainerInventory {
-                    sandbox_id: sandbox.sandbox_id.clone(),
-                    container_id,
-                    state,
-                });
-            }
-        }
+        let containers = collect_container_inventory(self.container_control.as_ref(), &sandboxes)
+            .await
+            .context("list containers during CRI reconnect inventory")?;
 
         let actions =
             diff_cri_inventory(true, &runtime_rows, &leader_pods, &sandboxes, &containers);
@@ -212,5 +221,46 @@ impl CriReconnectReconciler {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FailingContainerInventory;
+
+    #[async_trait::async_trait]
+    impl ContainerRuntimeControl for FailingContainerInventory {
+        async fn list_containers(
+            &self,
+            _sandbox_id_filter: Option<&str>,
+        ) -> anyhow::Result<Vec<(String, klights_kubelet::runtime::cri::ContainerRuntimeState)>>
+        {
+            anyhow::bail!("injected reconnect ListContainers timeout")
+        }
+
+        async fn pod_metadata_for_container(
+            &self,
+            _container_id: &str,
+        ) -> anyhow::Result<Option<(String, String)>> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_inventory_propagates_container_list_failure() {
+        let control = FailingContainerInventory;
+        let sandboxes = vec![klights_kubelet::runtime::cri::CriPodSandboxSummary {
+            sandbox_id: "sandbox-timeout".into(),
+            namespace: "ns".into(),
+            name: "pod".into(),
+            uid: "uid".into(),
+        }];
+
+        let error = collect_container_inventory(&control, &sandboxes)
+            .await
+            .expect_err("reconnect must retry when inventory cannot be established");
+        assert!(error.to_string().contains("injected reconnect"));
     }
 }

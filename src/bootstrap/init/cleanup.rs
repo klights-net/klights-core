@@ -86,6 +86,8 @@ pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
         namespace,
         &cri_transport_policy,
         klights_kubelet::cri::DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT,
+        klights_kubelet::cri::DEFAULT_CRI_REQUEST_TIMEOUT,
+        cleanup_task_supervisor.as_ref().clone(),
     )
     .await
     {
@@ -123,51 +125,32 @@ pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
 
     // Drain leftover CRI containers first (covers stale pause/infra
     // containers that can survive sandbox cleanup in rare crash windows).
-    if let Err(e) = cleanup_all_runtime_containers(&mut cri).await {
-        tracing::warn!("Failed to cleanup leftover runtime containers: {}", e);
-    }
+    cleanup_all_runtime_containers(&mut cri).await?;
 
     // Stop all pod sandboxes.
     tracing::info!("Stopping all pod sandboxes");
-    match cri.list_pod_sandboxes(None).await {
-        Ok(sandboxes) => {
-            for sb in &sandboxes {
-                let _ = cri.stop_pod_sandbox(&sb.id).await;
-                match cri.remove_pod_sandbox(&sb.id).await {
-                    Ok(()) => {
-                        if let Some(uid) = sb
-                            .metadata
-                            .as_ref()
-                            .map(|meta| meta.uid.as_str())
-                            .filter(|uid| !uid.trim().is_empty())
-                            && let Err(e) = klights_kubelet::cgroup_cleanup::cleanup_pod_cgroup(
-                                &file_process,
-                                namespace,
-                                uid,
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                sandbox_id = %sb.id,
-                                pod_uid = %uid,
-                                error = %e,
-                                "Failed to cleanup pod cgroup after sandbox removal"
-                            );
-                        }
-                    }
-                    Err(e) => tracing::warn!(
-                        sandbox_id = %sb.id,
-                        error = %e,
-                        "Failed to remove sandbox during cleanup"
-                    ),
-                }
-            }
-            tracing::info!("Stopped and removed {} sandboxes", sandboxes.len());
-        }
-        Err(e) => {
-            tracing::warn!("Failed to list sandboxes during cleanup: {}", e);
+    let sandboxes = cri.list_pod_sandboxes(None).await?;
+    for sb in &sandboxes {
+        cri.stop_pod_sandbox(&sb.id).await?;
+        cri.remove_pod_sandbox(&sb.id).await?;
+        if let Some(uid) = sb
+            .metadata
+            .as_ref()
+            .map(|meta| meta.uid.as_str())
+            .filter(|uid| !uid.trim().is_empty())
+            && let Err(e) =
+                klights_kubelet::cgroup_cleanup::cleanup_pod_cgroup(&file_process, namespace, uid)
+                    .await
+        {
+            tracing::warn!(
+                sandbox_id = %sb.id,
+                pod_uid = %uid,
+                error = %e,
+                "Failed to cleanup pod cgroup after sandbox removal"
+            );
         }
     }
+    tracing::info!("Stopped and removed {} sandboxes", sandboxes.len());
 
     stop_namespace_containerd_after_cleanup(
         namespace,
@@ -206,13 +189,7 @@ async fn cleanup_all_runtime_containers(
             continue;
         }
         to_stop += 1;
-        if let Err(err) = cri.stop_container(&container.id, 5).await {
-            tracing::debug!(
-                container_id = %container.id,
-                error = %err,
-                "Failed to stop runtime container during cleanup"
-            );
-        }
+        cri.stop_container(&container.id, 5).await?;
     }
 
     let mut removed = 0usize;
@@ -220,14 +197,7 @@ async fn cleanup_all_runtime_containers(
         if container.id.trim().is_empty() {
             continue;
         }
-        if let Err(err) = cri.remove_container(&container.id).await {
-            tracing::debug!(
-                container_id = %container.id,
-                error = %err,
-                "Failed to remove runtime container during cleanup"
-            );
-            continue;
-        }
+        cri.remove_container(&container.id).await?;
         removed += 1;
     }
     tracing::info!(

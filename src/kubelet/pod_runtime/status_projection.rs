@@ -21,19 +21,11 @@ pub(crate) async fn runtime_state_from_container_status(
     cri: &dyn CriRuntime,
     container_id: &str,
 ) -> anyhow::Result<Option<ContainerRuntimeState>> {
-    let state = match cri.container_status(container_id).await {
-        Ok(response) => response
-            .status
-            .map(|status| ContainerRuntimeState::from_cri_state_i32(status.state)),
-        Err(e) => {
-            tracing::warn!(
-                container_id = container_id,
-                "failed to inspect hinted container during runtime reconcile: {}",
-                e
-            );
-            None
-        }
-    };
+    let state = cri
+        .container_status(container_id)
+        .await?
+        .status
+        .map(|status| ContainerRuntimeState::from_cri_state_i32(status.state));
     Ok(state)
 }
 
@@ -44,7 +36,7 @@ pub(crate) async fn reconcile_container_statuses_from_pod_spec(
     pod: &serde_json::Value,
     observed: &[(String, ContainerRuntimeState)],
     operation_now: chrono::DateTime<chrono::Utc>,
-) -> (String, Vec<serde_json::Value>) {
+) -> anyhow::Result<(String, Vec<serde_json::Value>)> {
     let spec_containers = pod
         .pointer("/spec/containers")
         .and_then(|v| v.as_array())
@@ -69,17 +61,7 @@ pub(crate) async fn reconcile_container_statuses_from_pod_spec(
     let mut infos_by_name: std::collections::HashMap<String, ReconcileContainerInfo> =
         std::collections::HashMap::new();
     for (idx, (container_id, observed_state)) in observed.iter().enumerate() {
-        let status = match cri.container_status(container_id).await {
-            Ok(response) => response.status,
-            Err(e) => {
-                tracing::warn!(
-                    container_id = container_id,
-                    "failed to inspect container during runtime reconcile: {}",
-                    e
-                );
-                None
-            }
-        };
+        let status = cri.container_status(container_id).await?.status;
         let fallback_spec = spec_containers.get(idx);
         // Prefer the CRI metadata name, then the existing status entry
         // whose containerID references this container (so a CRI event
@@ -186,7 +168,7 @@ pub(crate) async fn reconcile_container_statuses_from_pod_spec(
         operation_now,
     );
     let phase = compute_reconciled_phase(&spec_containers, &infos_by_name, pod);
-    (phase, container_statuses)
+    Ok((phase, container_statuses))
 }
 
 async fn read_termination_message_for_container(

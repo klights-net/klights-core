@@ -86,33 +86,24 @@ impl RealPodRuntimeService {
             let containers = self
                 .container_control
                 .list_containers(Some(sandbox_id))
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(
-                        namespace = key.namespace,
-                        name = key.name,
-                        uid = key.uid,
-                        sandbox_id = sandbox_id,
-                        "failed to list containers for orphan pod stop: {:#}",
-                        e
-                    );
-                    Vec::new()
-                });
+                .await?;
             for (container_id, state) in containers {
                 if state.is_running() {
-                    let _ = self.cri.stop_container(&container_id, 0).await;
+                    self.cri.stop_container(&container_id, 0).await?;
                 }
-                let _ = self.cri.remove_container(&container_id).await;
+                self.cri.remove_container(&container_id).await?;
             }
-            let _ = self.cri.stop_pod_sandbox(sandbox_id).await;
-            let _ = self.cri.remove_pod_sandbox(sandbox_id).await;
-            let _ = self.network.release_sandbox_network(key, sandbox_id).await;
+            self.cri.stop_pod_sandbox(sandbox_id).await?;
+            self.cri.remove_pod_sandbox(sandbox_id).await?;
+            self.network
+                .release_sandbox_network(key, sandbox_id)
+                .await?;
         }
         if !sandbox_ids.is_empty() {
-            let _ = self.store.delete_sandbox(key).await;
+            self.store.delete_sandbox(key).await?;
         }
-        self.cleanup_pod_local_artifacts(key).await;
-        let _ = self.slot_admission.clear_slot(key).await;
+        self.cleanup_pod_local_artifacts(key).await?;
+        self.slot_admission.clear_slot(key).await?;
         Ok(())
     }
 
@@ -136,22 +127,13 @@ impl RealPodRuntimeService {
         {
             return Ok(vec![id]);
         }
-        match self.cri.list_pod_sandboxes(Some(key.uid.as_str())).await {
-            Ok(found) => Ok(found
-                .into_iter()
-                .map(|(id, _state)| id)
-                .filter(|id| !id.trim().is_empty())
-                .collect()),
-            Err(e) => {
-                tracing::warn!(
-                    namespace = %key.namespace,
-                    name = %key.name,
-                    uid = %key.uid,
-                    "failed to list CRI sandboxes for orphan pod stop: {:#}",
-                    e
-                );
-                Ok(Vec::new())
-            }
-        }
+        Ok(self
+            .cri
+            .list_pod_sandboxes(Some(key.uid.as_str()))
+            .await?
+            .into_iter()
+            .map(|(id, _state)| id)
+            .filter(|id| !id.trim().is_empty())
+            .collect())
     }
 }

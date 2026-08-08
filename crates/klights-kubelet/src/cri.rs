@@ -25,6 +25,82 @@ use tower::service_fn;
 pub(crate) const DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT_SECS);
+pub const DEFAULT_CRI_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CriRequestTimeout {
+    operation: &'static str,
+    timeout: std::time::Duration,
+}
+
+impl CriRequestTimeout {
+    pub fn new(operation: &'static str, timeout: std::time::Duration) -> Self {
+        Self { operation, timeout }
+    }
+
+    pub fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    pub fn timeout(&self) -> std::time::Duration {
+        self.timeout
+    }
+}
+
+impl std::fmt::Display for CriRequestTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "CRI {} request exceeded its {:?} transport deadline",
+            self.operation, self.timeout
+        )
+    }
+}
+
+impl std::error::Error for CriRequestTimeout {}
+
+async fn await_unary_response<T, F>(
+    supervisor: &klights_supervisor::TaskSupervisor,
+    request_timeout: std::time::Duration,
+    operation: &'static str,
+    future: F,
+) -> Result<tonic::Response<T>>
+where
+    F: std::future::Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+{
+    let result = supervisor
+        .timeout(
+            format!("cri_unary_{}", operation.to_ascii_lowercase()),
+            request_timeout,
+            future,
+        )
+        .await
+        .with_context(|| format!("supervise CRI {operation} request"))?;
+    match result {
+        Err(_) => Err(anyhow::Error::new(CriRequestTimeout::new(
+            operation,
+            request_timeout,
+        ))),
+        Ok(Err(status)) if status.code() == tonic::Code::DeadlineExceeded => Err(
+            anyhow::Error::new(CriRequestTimeout::new(operation, request_timeout))
+                .context(status.to_string()),
+        ),
+        Ok(Err(status)) => Err(anyhow::Error::new(status)),
+        Ok(Ok(response)) => Ok(response),
+    }
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<tonic::Status>()
+        .is_some_and(|status| status.code() == tonic::Code::NotFound)
+}
+
+fn request_with_timeout<T>(message: T, timeout: std::time::Duration) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    request.set_timeout(timeout);
+    request
+}
 
 #[derive(Clone)]
 pub struct CriClient {
@@ -35,6 +111,8 @@ pub struct CriClient {
     /// per-call client builders (e.g. `subscribe_container_events`) reuse it.
     max_message_bytes: usize,
     image_pull_response_timeout: std::time::Duration,
+    request_timeout: std::time::Duration,
+    supervisor: klights_supervisor::TaskSupervisor,
 }
 
 /// Cloneable CRI handle for pod lifecycle work.
@@ -62,12 +140,18 @@ impl SharedCriClient {
 impl CriClient {
     /// Test helper that connects using the default transport policy.
     #[cfg(any(test, feature = "test-support"))]
-    pub async fn connect(socket_path: &str, namespace: &str) -> Result<Self> {
+    pub async fn connect(
+        socket_path: &str,
+        namespace: &str,
+        supervisor: klights_supervisor::TaskSupervisor,
+    ) -> Result<Self> {
         Self::connect_with_policy(
             socket_path,
             namespace,
             &CriTransportPolicy::new(std::time::Duration::from_secs(10), 32 * 1024 * 1024),
             DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT,
+            DEFAULT_CRI_REQUEST_TIMEOUT,
+            supervisor,
         )
         .await
     }
@@ -79,6 +163,8 @@ impl CriClient {
         _namespace: &str,
         policy: &CriTransportPolicy,
         image_pull_response_timeout: std::time::Duration,
+        request_timeout: std::time::Duration,
+        supervisor: klights_supervisor::TaskSupervisor,
     ) -> Result<Self> {
         // Connect to containerd Unix socket
         let socket_path = socket_path.to_string();
@@ -107,24 +193,33 @@ impl CriClient {
             channel,
             max_message_bytes,
             image_pull_response_timeout,
+            request_timeout,
+            supervisor,
         })
+    }
+
+    fn request<T>(&self, message: T) -> tonic::Request<T> {
+        request_with_timeout(message, self.request_timeout)
     }
 
     /// Returns true if the named image is already present in the local CRI image store.
     /// Honors `imagePullPolicy: IfNotPresent` — caller skips `pull_image` when this is true.
     pub async fn image_status(&mut self, image: &str) -> Result<bool> {
-        let request = tonic::Request::new(ImageStatusRequest {
+        let request = self.request(ImageStatusRequest {
             image: Some(ImageSpec {
                 image: image.to_string(),
                 ..Default::default()
             }),
             verbose: false,
         });
-        let response = self
-            .image
-            .image_status(request)
-            .await
-            .with_context(|| format!("CRI image_status failed for {}", image))?;
+        let response = await_unary_response(
+            &self.supervisor,
+            self.request_timeout,
+            "ImageStatus",
+            self.image.image_status(request),
+        )
+        .await
+        .with_context(|| format!("CRI image_status failed for {}", image))?;
         Ok(response.into_inner().image.is_some())
     }
 
@@ -156,31 +251,57 @@ impl CriClient {
     }
 
     pub async fn run_pod_sandbox(&mut self, config: PodSandboxConfig) -> Result<String> {
-        let request = tonic::Request::new(RunPodSandboxRequest {
+        let request = self.request(RunPodSandboxRequest {
             config: Some(config),
             runtime_handler: String::new(),
         });
 
-        let response = self.runtime.run_pod_sandbox(request).await?;
+        let response = await_unary_response(
+            &self.supervisor,
+            self.request_timeout,
+            "RunPodSandbox",
+            self.runtime.run_pod_sandbox(request),
+        )
+        .await?;
         Ok(response.into_inner().pod_sandbox_id)
     }
 
     pub async fn stop_pod_sandbox(&mut self, sandbox_id: &str) -> Result<()> {
-        let request = tonic::Request::new(StopPodSandboxRequest {
+        let request = self.request(StopPodSandboxRequest {
             pod_sandbox_id: sandbox_id.to_string(),
         });
 
-        self.runtime.stop_pod_sandbox(request).await?;
-        Ok(())
+        match await_unary_response(
+            &self.supervisor,
+            self.request_timeout,
+            "StopPodSandbox",
+            self.runtime.stop_pod_sandbox(request),
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if is_not_found(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn remove_pod_sandbox(&mut self, sandbox_id: &str) -> Result<()> {
-        let request = tonic::Request::new(RemovePodSandboxRequest {
+        let request = self.request(RemovePodSandboxRequest {
             pod_sandbox_id: sandbox_id.to_string(),
         });
 
-        self.runtime.remove_pod_sandbox(request).await?;
-        Ok(())
+        match await_unary_response(
+            &self.supervisor,
+            self.request_timeout,
+            "RemovePodSandbox",
+            self.runtime.remove_pod_sandbox(request),
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if is_not_found(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// List pod sandboxes, optionally filtered. Returns sandbox metadata including IDs.
@@ -188,9 +309,15 @@ impl CriClient {
         &mut self,
         filter: Option<k8s_cri::v1::PodSandboxFilter>,
     ) -> Result<Vec<k8s_cri::v1::PodSandbox>> {
-        let request = tonic::Request::new(ListPodSandboxRequest { filter });
+        let request = self.request(ListPodSandboxRequest { filter });
 
-        let response = self.runtime.list_pod_sandbox(request).await?;
+        let response = await_unary_response(
+            &self.supervisor,
+            self.request_timeout,
+            "ListPodSandbox",
+            self.runtime.list_pod_sandbox(request),
+        )
+        .await?;
         Ok(response.into_inner().items)
     }
 
@@ -203,9 +330,15 @@ impl CriClient {
         &mut self,
         filter: Option<PodSandboxStatsFilter>,
     ) -> Result<Vec<PodSandboxStats>> {
-        let request = tonic::Request::new(ListPodSandboxStatsRequest { filter });
+        let request = self.request(ListPodSandboxStatsRequest { filter });
 
-        let response = self.runtime.list_pod_sandbox_stats(request).await?;
+        let response = await_unary_response(
+            &self.supervisor,
+            self.request_timeout,
+            "ListPodSandboxStats",
+            self.runtime.list_pod_sandbox_stats(request),
+        )
+        .await?;
         Ok(response.into_inner().stats)
     }
 
@@ -215,42 +348,74 @@ impl CriClient {
         config: ContainerConfig,
         sandbox_config: PodSandboxConfig,
     ) -> Result<String> {
-        let request = tonic::Request::new(CreateContainerRequest {
+        let request = self.request(CreateContainerRequest {
             pod_sandbox_id: sandbox_id.to_string(),
             config: Some(config),
             sandbox_config: Some(sandbox_config),
         });
 
-        let response = self.runtime.create_container(request).await?;
+        let response = await_unary_response(
+            &self.supervisor,
+            self.request_timeout,
+            "CreateContainer",
+            self.runtime.create_container(request),
+        )
+        .await?;
         Ok(response.into_inner().container_id)
     }
 
     pub async fn start_container(&mut self, container_id: &str) -> Result<()> {
-        let request = tonic::Request::new(StartContainerRequest {
+        let request = self.request(StartContainerRequest {
             container_id: container_id.to_string(),
         });
 
-        self.runtime.start_container(request).await?;
+        await_unary_response(
+            &self.supervisor,
+            self.request_timeout,
+            "StartContainer",
+            self.runtime.start_container(request),
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn stop_container(&mut self, container_id: &str, timeout: i64) -> Result<()> {
-        let request = tonic::Request::new(StopContainerRequest {
+        let request = self.request(StopContainerRequest {
             container_id: container_id.to_string(),
             timeout,
         });
 
-        self.runtime.stop_container(request).await?;
-        Ok(())
+        match await_unary_response(
+            &self.supervisor,
+            self.request_timeout,
+            "StopContainer",
+            self.runtime.stop_container(request),
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if is_not_found(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn remove_container(&mut self, container_id: &str) -> Result<()> {
-        let request = tonic::Request::new(RemoveContainerRequest {
+        let request = self.request(RemoveContainerRequest {
             container_id: container_id.to_string(),
         });
 
-        self.runtime.remove_container(request).await?;
-        Ok(())
+        match await_unary_response(
+            &self.supervisor,
+            self.request_timeout,
+            "RemoveContainer",
+            self.runtime.remove_container(request),
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if is_not_found(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn container_status(
@@ -265,12 +430,18 @@ impl CriClient {
         container_id: &str,
         verbose: bool,
     ) -> Result<ContainerStatusResponse> {
-        let request = tonic::Request::new(ContainerStatusRequest {
+        let request = self.request(ContainerStatusRequest {
             container_id: container_id.to_string(),
             verbose,
         });
 
-        let response = self.runtime.container_status(request).await?;
+        let response = await_unary_response(
+            &self.supervisor,
+            self.request_timeout,
+            "ContainerStatus",
+            self.runtime.container_status(request),
+        )
+        .await?;
         Ok(response.into_inner())
     }
 
@@ -278,9 +449,15 @@ impl CriClient {
         &mut self,
         filter: Option<ContainerFilter>,
     ) -> Result<ListContainersResponse> {
-        let request = tonic::Request::new(ListContainersRequest { filter });
+        let request = self.request(ListContainersRequest { filter });
 
-        let response = self.runtime.list_containers(request).await?;
+        let response = await_unary_response(
+            &self.supervisor,
+            self.request_timeout,
+            "ListContainers",
+            self.runtime.list_containers(request),
+        )
+        .await?;
         Ok(response.into_inner())
     }
 
@@ -311,13 +488,19 @@ impl CriClient {
         cmd: &[String],
         timeout: i64,
     ) -> Result<ExecSyncResponse> {
-        let request = tonic::Request::new(ExecSyncRequest {
+        let request = self.request(ExecSyncRequest {
             container_id: container_id.to_string(),
             cmd: cmd.to_vec(),
             timeout,
         });
 
-        let response = self.runtime.exec_sync(request).await?;
+        let response = await_unary_response(
+            &self.supervisor,
+            self.request_timeout,
+            "ExecSync",
+            self.runtime.exec_sync(request),
+        )
+        .await?;
         Ok(response.into_inner())
     }
 
@@ -330,19 +513,25 @@ impl CriClient {
         let mut grpc = tonic::client::Grpc::new(self.channel.clone())
             .max_decoding_message_size(self.max_message_bytes)
             .max_encoding_message_size(self.max_message_bytes);
-        let request = tonic::Request::new(GetEventsRequest {});
-        let request = request;
+        let request = self.request(GetEventsRequest {});
         let path = tonic::codegen::http::uri::PathAndQuery::from_static(
             "/runtime.v1.RuntimeService/GetContainerEvents",
         );
         let codec = CriContainerEventCodec;
-        grpc.ready()
-            .await
-            .map_err(|e| anyhow::anyhow!("CRI runtime service was not ready: {}", e))?;
-        let response = grpc
-            .server_streaming(request, path, codec)
-            .await
-            .context("CRI get_container_events failed")?;
+        let establish_stream = async move {
+            grpc.ready().await.map_err(|error| {
+                tonic::Status::unavailable(format!("CRI runtime service was not ready: {error}"))
+            })?;
+            grpc.server_streaming(request, path, codec).await
+        };
+        let response = await_unary_response(
+            &self.supervisor,
+            self.request_timeout,
+            "GetContainerEvents",
+            establish_stream,
+        )
+        .await
+        .context("CRI get_container_events failed")?;
         Ok(response.into_inner())
     }
 
@@ -355,7 +544,7 @@ impl CriClient {
         stdout: bool,
         stderr: bool,
     ) -> Result<ExecResponse> {
-        let request = tonic::Request::new(ExecRequest {
+        let request = self.request(ExecRequest {
             container_id: container_id.to_string(),
             cmd: cmd.to_vec(),
             tty,
@@ -364,7 +553,13 @@ impl CriClient {
             stderr,
         });
 
-        let response = self.runtime.exec(request).await?;
+        let response = await_unary_response(
+            &self.supervisor,
+            self.request_timeout,
+            "Exec",
+            self.runtime.exec(request),
+        )
+        .await?;
         Ok(response.into_inner())
     }
 
@@ -376,7 +571,7 @@ impl CriClient {
         stdout: bool,
         stderr: bool,
     ) -> Result<AttachResponse> {
-        let request = tonic::Request::new(AttachRequest {
+        let request = self.request(AttachRequest {
             container_id: container_id.to_string(),
             tty,
             stdin,
@@ -384,7 +579,13 @@ impl CriClient {
             stderr,
         });
 
-        let response = self.runtime.attach(request).await?;
+        let response = await_unary_response(
+            &self.supervisor,
+            self.request_timeout,
+            "Attach",
+            self.runtime.attach(request),
+        )
+        .await?;
         Ok(response.into_inner())
     }
 }
@@ -393,12 +594,116 @@ impl CriClient {
 mod tests {
     use super::*;
 
+    fn test_supervisor() -> klights_supervisor::TaskSupervisor {
+        klights_supervisor::TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default())
+    }
+
+    struct PendingUnary {
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl std::future::Future for PendingUnary {
+        type Output = std::result::Result<tonic::Response<()>, tonic::Status>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for PendingUnary {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     #[test]
     fn image_pull_timeout_default_remains_conservative() {
         assert_eq!(
             DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT,
             std::time::Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn unary_request_timeout_is_typed_and_independent_from_pod_grace() {
+        assert_eq!(
+            DEFAULT_CRI_REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(120)
+        );
+        let error = CriRequestTimeout::new("StopContainer", std::time::Duration::from_secs(2));
+        assert_eq!(error.operation(), "StopContainer");
+        assert_eq!(error.timeout(), std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn unary_request_carries_grpc_timeout_metadata() {
+        let request = request_with_timeout((), std::time::Duration::from_secs(7));
+        assert_eq!(
+            request
+                .metadata()
+                .get("grpc-timeout")
+                .and_then(|value| value.to_str().ok()),
+            Some("7000000u")
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_deadline_drops_hung_unary_and_returns_typed_error() {
+        let supervisor = klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        );
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let error = await_unary_response(
+            &supervisor,
+            std::time::Duration::from_millis(1),
+            "StopContainer",
+            PendingUnary {
+                dropped: dropped.clone(),
+            },
+        )
+        .await
+        .expect_err("hung unary must reach the supervisor deadline");
+        let typed = error
+            .downcast_ref::<CriRequestTimeout>()
+            .expect("deadline must retain its typed classification");
+        assert_eq!(typed.operation(), "StopContainer");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn tonic_deadline_is_normalized_to_typed_timeout() {
+        let supervisor = klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        );
+        let error = await_unary_response(
+            &supervisor,
+            std::time::Duration::from_secs(3),
+            "ListContainers",
+            std::future::ready(Err::<tonic::Response<()>, _>(
+                tonic::Status::deadline_exceeded("server deadline"),
+            )),
+        )
+        .await
+        .expect_err("tonic deadline must be normalized");
+        let typed = error
+            .downcast_ref::<CriRequestTimeout>()
+            .expect("normalized deadline must be downcastable");
+        assert_eq!(typed.operation(), "ListContainers");
+        assert_eq!(typed.timeout(), std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn not_found_is_recognized_only_for_idempotent_operation_mapping() {
+        assert!(is_not_found(&anyhow::Error::new(tonic::Status::not_found(
+            "already absent"
+        ))));
+        assert!(!is_not_found(&anyhow::Error::new(
+            tonic::Status::unavailable("runtime down")
+        )));
     }
 
     #[tokio::test]
@@ -410,7 +715,7 @@ mod tests {
             .join("containerd.sock")
             .to_string_lossy()
             .into_owned();
-        let mut client = CriClient::connect(&sock, "klights-test")
+        let mut client = CriClient::connect(&sock, "klights-test", test_supervisor())
             .await
             .expect("Failed to connect to containerd");
 
@@ -435,7 +740,7 @@ mod tests {
             .join("containerd.sock")
             .to_string_lossy()
             .into_owned();
-        let client = CriClient::connect(&sock, "klights-test")
+        let client = CriClient::connect(&sock, "klights-test", test_supervisor())
             .await
             .expect("Failed to connect to containerd");
 
@@ -461,7 +766,7 @@ mod tests {
             .join("containerd.sock")
             .to_string_lossy()
             .into_owned();
-        let mut client = CriClient::connect(&sock, "klights-test")
+        let mut client = CriClient::connect(&sock, "klights-test", test_supervisor())
             .await
             .expect("Failed to connect to containerd");
 
@@ -494,7 +799,7 @@ mod tests {
             .join("containerd.sock")
             .to_string_lossy()
             .into_owned();
-        let mut client = CriClient::connect(&sock, "klights-test")
+        let mut client = CriClient::connect(&sock, "klights-test", test_supervisor())
             .await
             .expect("Failed to connect to containerd");
 

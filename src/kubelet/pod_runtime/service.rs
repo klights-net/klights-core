@@ -215,7 +215,7 @@ impl RealPodRuntimeService {
         };
 
         let sandbox_id = if self.node_view.owns_pod_runtime(pod) {
-            self.resolve_sandbox_id_for_stop(key, pod).await
+            self.resolve_sandbox_id_for_stop(key, pod).await?
         } else {
             None
         };
@@ -346,7 +346,7 @@ impl RealPodRuntimeService {
         old_container_id: &str,
         last_state: serde_json::Value,
     ) -> anyhow::Result<String> {
-        let _ = self.cri.stop_container(old_container_id, 10).await;
+        self.cri.stop_container(old_container_id, 10).await?;
         self.cri.remove_container(old_container_id).await?;
 
         let volume_paths = self.volumes.process_volumes(key, pod).await?;
@@ -574,7 +574,7 @@ impl RealPodRuntimeService {
         key: &PodRuntimeKey,
         sandbox_id: &str,
         reason: &str,
-    ) {
+    ) -> anyhow::Result<()> {
         tracing::warn!(
             namespace = key.namespace,
             name = key.name,
@@ -586,30 +586,23 @@ impl RealPodRuntimeService {
         let containers = self
             .container_control
             .list_containers(Some(sandbox_id))
-            .await
-            .unwrap_or_else(|err| {
-                tracing::warn!(
-                    namespace = key.namespace,
-                    name = key.name,
-                    uid = key.uid,
-                    sandbox_id,
-                    "failed to list containers during partial rollback: {err:#}"
-                );
-                Vec::new()
-            });
+            .await?;
         let mut seen = std::collections::HashSet::new();
         for (container_id, _) in containers
             .into_iter()
             .filter(|(id, _)| seen.insert(id.clone()))
         {
-            let _ = self.cri.stop_container(&container_id, 10).await;
-            let _ = self.cri.remove_container(&container_id).await;
+            self.cri.stop_container(&container_id, 10).await?;
+            self.cri.remove_container(&container_id).await?;
         }
-        let _ = self.network.release_sandbox_network(key, sandbox_id).await;
-        let _ = self.cri.stop_pod_sandbox(sandbox_id).await;
-        let _ = self.cri.remove_pod_sandbox(sandbox_id).await;
-        let _ = self.store.delete_sandbox(key).await;
-        self.cleanup_pod_local_artifacts(key).await;
+        self.network
+            .release_sandbox_network(key, sandbox_id)
+            .await?;
+        self.cri.stop_pod_sandbox(sandbox_id).await?;
+        self.cri.remove_pod_sandbox(sandbox_id).await?;
+        self.store.delete_sandbox(key).await?;
+        self.cleanup_pod_local_artifacts(key).await?;
+        Ok(())
     }
 
     /// Shared local-artifact teardown for every pod stop path (normal delete,
@@ -620,10 +613,14 @@ impl RealPodRuntimeService {
     /// idempotent, so this path needs no deleted-Pod snapshot, is safe to re-run
     /// after a timed-out finalize, and never leaks the cgroup when no sandbox
     /// could be resolved.
-    pub(super) async fn cleanup_pod_local_artifacts(&self, key: &PodRuntimeKey) {
-        let _ = self.volumes.cleanup_volumes(key).await;
-        let _ = self.filesystem.cleanup_cgroup(key).await;
-        let _ = self.filesystem.cleanup_pod_filesystem(key).await;
+    pub(super) async fn cleanup_pod_local_artifacts(
+        &self,
+        key: &PodRuntimeKey,
+    ) -> anyhow::Result<()> {
+        self.volumes.cleanup_volumes(key).await?;
+        self.filesystem.cleanup_cgroup(key).await?;
+        self.filesystem.cleanup_pod_filesystem(key).await?;
+        Ok(())
     }
 
     /// Construct the production runtime service with all required ports.
@@ -683,12 +680,12 @@ impl RealPodRuntimeService {
         &self,
         key: &PodRuntimeKey,
         pod: &serde_json::Value,
-    ) -> Option<String> {
+    ) -> anyhow::Result<Option<String>> {
         // 1. Store row.
-        if let Ok(Some(id)) = self.store.get_sandbox_id(key).await
+        if let Some(id) = self.store.get_sandbox_id(key).await?
             && !id.is_empty()
         {
-            return Some(id);
+            return Ok(Some(id));
         }
 
         // 2. klights.dev/sandbox-id annotation.
@@ -699,7 +696,7 @@ impl RealPodRuntimeService {
             .and_then(|v| v.as_str())
             && !id.is_empty()
         {
-            return Some(id.to_string());
+            return Ok(Some(id.to_string()));
         }
 
         // 3. CRI list_pod_sandboxes matched by pod UID.
@@ -707,15 +704,14 @@ impl RealPodRuntimeService {
             .pointer("/metadata/uid")
             .and_then(|v| v.as_str())
             .unwrap_or(&key.uid);
-        if let Ok(sandboxes) = self.cri.list_pod_sandboxes(Some(pod_uid)).await {
-            for (sandbox_id, _state) in &sandboxes {
-                if !sandbox_id.is_empty() {
-                    return Some(sandbox_id.clone());
-                }
+        let sandboxes = self.cri.list_pod_sandboxes(Some(pod_uid)).await?;
+        for (sandbox_id, _state) in &sandboxes {
+            if !sandbox_id.is_empty() {
+                return Ok(Some(sandbox_id.clone()));
             }
         }
 
-        None
+        Ok(None)
     }
 
     async fn wait_for_init_container_stop(
@@ -1161,7 +1157,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                         &sandbox_id,
                         "network assignment timed out",
                     )
-                    .await;
+                    .await?;
                 }
                 return Err(anyhow::anyhow!("network assignment failed: {:#}", e));
             }
@@ -1176,7 +1172,7 @@ impl PodRuntimeService for RealPodRuntimeService {
         // --- Cancellation check: after sandbox + store + network, before hostports/containers ---
         if cancel.is_cancelled() {
             self.rollback_partial_pod_start(&key, &sandbox_id, "startup cancelled after sandbox")
-                .await;
+                .await?;
             return Ok(PodStartResult::Cancelled);
         }
 
@@ -1200,7 +1196,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                     "{message}"
                 );
                 self.rollback_partial_pod_start(&key, &sandbox_id, "hostPort setup failed")
-                    .await;
+                    .await?;
                 let _ = self
                     .events
                     .emit_pod_event(
@@ -1226,7 +1222,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                     "{message}"
                 );
                 self.rollback_partial_pod_start(&key, &sandbox_id, "hostPort setup timed out")
-                    .await;
+                    .await?;
                 let _ = self
                     .events
                     .emit_pod_event(
@@ -1283,7 +1279,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                 );
                 let _ = self.hostports.remove_host_ports(&pod_host_ports).await;
                 self.rollback_partial_pod_start(&key, &sandbox_id, "volume processing failed")
-                    .await;
+                    .await?;
                 let _ = self
                     .events
                     .emit_pod_event(
@@ -1310,7 +1306,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                 );
                 let _ = self.hostports.remove_host_ports(&pod_host_ports).await;
                 self.rollback_partial_pod_start(&key, &sandbox_id, "volume processing timed out")
-                    .await;
+                    .await?;
                 let _ = self
                     .events
                     .emit_pod_event(
@@ -1563,7 +1559,7 @@ impl PodRuntimeService for RealPodRuntimeService {
         // --- Cancellation check: after init containers, before main ---
         if cancel.is_cancelled() {
             self.rollback_partial_pod_start(&key, &sandbox_id, "startup cancelled after init")
-                .await;
+                .await?;
             return Ok(PodStartResult::Cancelled);
         }
 
@@ -1647,7 +1643,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                         "klights-kubelet",
                         &self.config.node_name,
                     )
-                    .await;
+                    .await?;
                 container_statuses.push(
                     crate::kubelet::pod_runtime::status_helpers::build_create_container_config_error_status(
                         container,
@@ -1674,7 +1670,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                         &sandbox_id,
                         "app container create failed",
                     )
-                    .await;
+                    .await?;
                     return Err(anyhow::anyhow!(
                         "failed to create container {}: {:#}",
                         container_name,
@@ -1700,7 +1696,7 @@ impl PodRuntimeService for RealPodRuntimeService {
 
         if cancel.is_cancelled() {
             self.rollback_partial_pod_start(&key, &sandbox_id, "startup cancelled after create")
-                .await;
+                .await?;
             return Ok(PodStartResult::Cancelled);
         }
 
@@ -1779,7 +1775,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                     )
                     .await;
                 self.rollback_partial_pod_start(&key, &sandbox_id, "app container start failed")
-                    .await;
+                    .await?;
                 return Err(anyhow::anyhow!(
                     "failed to start container {}: {:#}",
                     container_name,
@@ -1824,7 +1820,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                                 &self.config.node_name,
                             )
                             .await;
-                        let _ = self.cri.stop_container(container_id, 30).await;
+                        self.cri.stop_container(container_id, 30).await?;
                         return Ok(PodStartResult::Failed(format!(
                             "postStart hook failed for container {}: {}",
                             container_name, msg
@@ -1845,7 +1841,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                                 &self.config.node_name,
                             )
                             .await;
-                        let _ = self.cri.stop_container(container_id, 30).await;
+                        self.cri.stop_container(container_id, 30).await?;
                         return Ok(PodStartResult::Failed(format!(
                             "postStart hook failed for container {}: {:#}",
                             container_name, e
@@ -1955,10 +1951,10 @@ impl PodRuntimeService for RealPodRuntimeService {
             if !id.is_empty() {
                 Some(id.clone())
             } else {
-                self.resolve_sandbox_id_for_stop(&key, &pod).await
+                self.resolve_sandbox_id_for_stop(&key, &pod).await?
             }
         } else {
-            self.resolve_sandbox_id_for_stop(&key, &pod).await
+            self.resolve_sandbox_id_for_stop(&key, &pod).await?
         };
 
         // --- PreStop lifecycle hooks ---
@@ -1983,17 +1979,7 @@ impl PodRuntimeService for RealPodRuntimeService {
             else {
                 return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
             };
-            let containers = containers.unwrap_or_else(|e| {
-                tracing::warn!(
-                    namespace = key.namespace,
-                    name = key.name,
-                    uid = key.uid,
-                    sandbox_id = sandbox_id,
-                    "failed to list containers for pod stop: {:#}",
-                    e
-                );
-                Vec::new()
-            });
+            let containers = containers?;
             if containers.is_empty() {
                 container_ids.extend(status_name_by_id.keys().cloned());
             } else {
@@ -2020,9 +2006,8 @@ impl PodRuntimeService for RealPodRuntimeService {
                 else {
                     return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
                 };
-                container_name = status
-                    .ok()
-                    .and_then(|response| response.status)
+                container_name = status?
+                    .status
                     .and_then(|status| status.metadata.map(|metadata| metadata.name))
                     .filter(|name| !name.is_empty());
             }
@@ -2085,57 +2070,58 @@ impl PodRuntimeService for RealPodRuntimeService {
                     self.clock.now_utc(),
                     mode,
                 );
-                if stop_step_until_cancelled(
+                let Some(result) = stop_step_until_cancelled(
                     &cancel,
                     self.cri.stop_container(container_id, grace_period_seconds),
                 )
                 .await
-                .is_none()
-                {
+                else {
                     return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
-                }
-                if stop_step_until_cancelled(&cancel, self.cri.remove_container(container_id))
-                    .await
-                    .is_none()
-                {
+                };
+                result?;
+                let Some(result) =
+                    stop_step_until_cancelled(&cancel, self.cri.remove_container(container_id))
+                        .await
+                else {
                     return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
-                }
+                };
+                result?;
             }
 
             // Stop and remove sandbox.
-            if stop_step_until_cancelled(&cancel, self.cri.stop_pod_sandbox(sandbox_id))
-                .await
-                .is_none()
-            {
+            let Some(result) =
+                stop_step_until_cancelled(&cancel, self.cri.stop_pod_sandbox(sandbox_id)).await
+            else {
                 return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
-            }
-            if stop_step_until_cancelled(&cancel, self.cri.remove_pod_sandbox(sandbox_id))
-                .await
-                .is_none()
-            {
+            };
+            result?;
+            let Some(result) =
+                stop_step_until_cancelled(&cancel, self.cri.remove_pod_sandbox(sandbox_id)).await
+            else {
                 return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
-            }
+            };
+            result?;
 
             // Release CNI network. (cgroup teardown is UID-keyed and runs
             // unconditionally in cleanup_pod_local_artifacts below.)
-            if stop_step_until_cancelled(
+            let Some(result) = stop_step_until_cancelled(
                 &cancel,
                 self.network.release_sandbox_network(&key, sandbox_id),
             )
             .await
-            .is_none()
-            {
+            else {
                 return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
-            }
+            };
+            result?;
 
             // Delete the sandbox row after CNI release. Real network cleanup
             // uses the UID-qualified row as the authorization witness.
-            if stop_step_until_cancelled(&cancel, self.store.delete_sandbox(&key))
-                .await
-                .is_none()
-            {
+            let Some(result) =
+                stop_step_until_cancelled(&cancel, self.store.delete_sandbox(&key)).await
+            else {
                 return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
-            }
+            };
+            result?;
         } else {
             tracing::warn!(
                 namespace = %key.namespace,
@@ -2147,27 +2133,28 @@ impl PodRuntimeService for RealPodRuntimeService {
 
         // Remove hostPort rules.
         let pod_host_ports = super::hostports::pod_host_ports_from_resource(&key, &pod)?;
-        if stop_step_until_cancelled(&cancel, self.hostports.remove_host_ports(&pod_host_ports))
-            .await
-            .is_none()
-        {
+        let Some(result) =
+            stop_step_until_cancelled(&cancel, self.hostports.remove_host_ports(&pod_host_ports))
+                .await
+        else {
             return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
-        }
+        };
+        result?;
 
-        if stop_step_until_cancelled(&cancel, self.cleanup_pod_local_artifacts(&key))
-            .await
-            .is_none()
-        {
+        let Some(result) =
+            stop_step_until_cancelled(&cancel, self.cleanup_pod_local_artifacts(&key)).await
+        else {
             return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
-        }
+        };
+        result?;
 
         // Clear pod slot by UID.
-        if stop_step_until_cancelled(&cancel, self.slot_admission.clear_slot(&key))
-            .await
-            .is_none()
-        {
+        let Some(result) =
+            stop_step_until_cancelled(&cancel, self.slot_admission.clear_slot(&key)).await
+        else {
             return Ok(klights_kubelet::runtime::PodStopResult::Cancelled);
-        }
+        };
+        result?;
 
         Ok(klights_kubelet::runtime::PodStopResult::Completed)
     }
@@ -2332,8 +2319,7 @@ impl PodRuntimeService for RealPodRuntimeService {
         let mut containers = self
             .container_control
             .list_containers(Some(&sandbox_id))
-            .await
-            .unwrap_or_default();
+            .await?;
         // containerd can publish a Started event a few milliseconds before
         // ListContainers/ContainerStatus advances from Created. The event is
         // the newer CRI observation, so preserve that monotonic transition
@@ -2374,7 +2360,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                 &containers,
                 self.clock.now_utc(),
             )
-            .await;
+            .await?;
         if let Some(restarted_statuses) = self
             .restart_exited_containers_if_needed(
                 &key,
@@ -2495,26 +2481,12 @@ impl PodRuntimeService for RealPodRuntimeService {
         let runtime_containers = self
             .container_control
             .list_containers(Some(&sandbox_id))
-            .await
-            .unwrap_or_default();
+            .await?;
 
         let mut runtime_by_name: std::collections::HashMap<String, (String, String, String, i64)> =
             std::collections::HashMap::new();
         for (container_id, _) in runtime_containers {
-            let status = match self.cri.container_status(&container_id).await {
-                Ok(response) => response.status,
-                Err(e) => {
-                    tracing::warn!(
-                        namespace = key.namespace,
-                        name = key.name,
-                        uid = key.uid,
-                        container_id = container_id,
-                        "Failed to inspect runtime container for ephemeral reconcile: {}",
-                        e
-                    );
-                    None
-                }
-            };
+            let status = self.cri.container_status(&container_id).await?.status;
             let Some(status) = status else {
                 continue;
             };

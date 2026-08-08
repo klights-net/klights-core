@@ -8399,6 +8399,40 @@ async fn runtime_stop_uses_absolute_remaining_grace_and_recomputes_per_container
 }
 
 #[tokio::test]
+async fn runtime_stop_grace_can_exceed_cri_transport_request_timeout() {
+    let base_ms = 2_500_000_i64;
+    let harness = PodRuntimeHarness::new_with_clock(Arc::new(FixedRuntimeClock(base_ms))).await;
+    let key = PodRuntimeKey::new("ns", "long-grace", "uid-long-grace");
+    let pod = deadline_runtime_pod("long-grace", "uid-long-grace", false);
+    harness
+        .container_control
+        .set_containers(vec![("ctr-long-grace".into(), "running".into())]);
+    let deadline = chrono::DateTime::from_timestamp_millis(base_ms + 300_000).unwrap();
+
+    stop_with_deadline_request(
+        &harness,
+        key,
+        pod,
+        "sb-long-grace",
+        deadline,
+        klights_kubelet::runtime::PodStopMode::Graceful,
+        43,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        klights_kubelet::cri::DEFAULT_CRI_REQUEST_TIMEOUT,
+        std::time::Duration::from_secs(120)
+    );
+    assert!(harness.cri.recorded_calls().iter().any(|call| matches!(
+        call.operation,
+        MockCriOperation::StopContainer(ref id, 300) if id == "ctr-long-grace"
+    )));
+}
+
+#[tokio::test]
 async fn runtime_stop_elapsed_or_forced_deadline_passes_zero_and_skips_prestop() {
     for (mode, deadline_offset_ms) in [
         (klights_kubelet::runtime::PodStopMode::Graceful, -1),
@@ -9682,7 +9716,8 @@ async fn real_runtime_stop_pod_handles_partial_state_idempotently_with_parity() 
         ));
     }
 
-    // Scenario 2: CRI operations fail (simulate resources already gone) — cleanup still succeeds.
+    // Scenario 2: a non-NotFound CRI failure is fail-closed. The actor retries;
+    // CNI/store/artifact/slot cleanup must not run past an unconfirmed sandbox.
     {
         let harness = PodRuntimeHarness::new().await;
         harness.cri.set_fail_operation("StopPodSandbox");
@@ -9711,12 +9746,37 @@ async fn real_runtime_stop_pod_handles_partial_state_idempotently_with_parity() 
             .container_control
             .set_containers(vec![("ctr-cf".into(), "running".into())]);
 
-        // CRI failure must not propagate — cleanup is best-effort.
-        harness
+        let error = harness
             .runtime
             .stop_pod(key.clone(), Some(pod), Some("sb-crlfail".into()))
             .await
-            .unwrap();
+            .expect_err("sandbox stop failure must remain retryable");
+        assert!(error.to_string().contains("injected failure"));
+        let cri_calls = harness.cri.recorded_calls();
+        assert!(cri_calls.iter().any(|call| matches!(
+            call.operation,
+            MockCriOperation::StopPodSandbox(ref id) if id == "sb-crlfail"
+        )));
+        assert!(!cri_calls.iter().any(|call| matches!(
+            call.operation,
+            MockCriOperation::RemovePodSandbox(ref id) if id == "sb-crlfail"
+        )));
+        assert!(harness.network.recorded_calls().is_empty());
+        assert!(
+            !harness
+                .store
+                .recorded_calls()
+                .iter()
+                .any(|call| { call == "delete_sandbox:ns/crlfail-pod/uid-cf" })
+        );
+        assert!(harness.filesystem.recorded_calls().is_empty());
+        assert!(
+            !harness
+                .slot_admission
+                .recorded_calls()
+                .iter()
+                .any(|call| call.contains("clear_slot"))
+        );
     }
 
     // Scenario 3: no sandbox id and no resolution — succeeds (clears slot only).

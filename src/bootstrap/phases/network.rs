@@ -263,6 +263,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
                 rootless: is_rootless,
                 executable_path: &executable_path,
                 image_pull_response_timeout: runtime_inputs.image_pull_response_timeout,
+                cri_request_timeout: runtime_inputs.cri_request_timeout,
                 paths: runtime_paths,
                 task_supervisor: supervisor.clone(),
                 cri_transport_policy,
@@ -288,6 +289,8 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         &config.containerd_namespace,
         &cri_transport_policy,
         runtime_inputs.image_pull_response_timeout,
+        runtime_inputs.cri_request_timeout,
+        supervisor.as_ref().clone(),
     )
     .await
     {
@@ -302,6 +305,8 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         &config.containerd_namespace,
         &cri_transport_policy,
         runtime_inputs.image_pull_response_timeout,
+        runtime_inputs.cri_request_timeout,
+        supervisor.as_ref().clone(),
     )
     .await
     {

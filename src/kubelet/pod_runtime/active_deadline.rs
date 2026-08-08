@@ -41,14 +41,13 @@ impl ActiveDeadlineEnforcer {
             "pod exceeded activeDeadlineSeconds, terminating containers"
         );
 
-        if let Some(sandbox_id) = sandbox_id
-            && let Ok(containers) = self
+        if let Some(sandbox_id) = sandbox_id {
+            let containers = self
                 .container_control
                 .list_containers(Some(sandbox_id))
-                .await
-        {
+                .await?;
             for (container_id, _) in containers {
-                let _ = self.cri.stop_container(&container_id, 0).await;
+                self.cri.stop_container(&container_id, 0).await?;
             }
         }
 

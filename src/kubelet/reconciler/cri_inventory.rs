@@ -296,8 +296,8 @@ pub async fn cleanup_cold_sandbox(
             enqueue_orphan_finalize(router, key.clone(), OrphanReason::ColdCriOrphan).await?;
         }
         None => {
-            let _ = cri.stop_pod_sandbox(sandbox_id).await;
-            let _ = cri.remove_pod_sandbox(sandbox_id).await;
+            cri.stop_pod_sandbox(sandbox_id).await?;
+            cri.remove_pod_sandbox(sandbox_id).await?;
         }
     }
     Ok(())
@@ -574,5 +574,29 @@ pub mod tests {
             0,
             "identity-less cold sandbox must not enqueue actor work"
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_cold_sandbox_without_identity_propagates_runtime_failure() {
+        use klights_kubelet::runtime::test_support::{MockCriOperation, MockCriRuntime};
+
+        let (router, recorder) = actor_router_with_recorder();
+        let cri = MockCriRuntime::new();
+        cri.set_fail_operation("StopPodSandbox");
+
+        let error = cleanup_cold_sandbox(&router, &cri, "sb-timeout", None)
+            .await
+            .expect_err("unconfirmed stop must leave cold cleanup retryable");
+        assert!(error.to_string().contains("injected failure"));
+        let calls = cri.recorded_calls();
+        assert!(calls.iter().any(|call| matches!(
+            call.operation,
+            MockCriOperation::StopPodSandbox(ref id) if id == "sb-timeout"
+        )));
+        assert!(!calls.iter().any(|call| matches!(
+            call.operation,
+            MockCriOperation::RemovePodSandbox(ref id) if id == "sb-timeout"
+        )));
+        assert_eq!(recorder.action_count(), 0);
     }
 }

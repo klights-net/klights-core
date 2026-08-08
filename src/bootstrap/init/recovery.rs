@@ -49,8 +49,12 @@ pub async fn run_startup_resource_recovery(
         file_process,
         namespace,
         rootless,
-        &cri_transport_policy,
-        klights_kubelet::cri::DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT,
+        &klights_kubelet::containerd_manager::ContainerdCriConnectionConfig {
+            transport_policy: &cri_transport_policy,
+            image_pull_response_timeout: klights_kubelet::cri::DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT,
+            request_timeout: klights_kubelet::cri::DEFAULT_CRI_REQUEST_TIMEOUT,
+            supervisor: task_supervisor,
+        },
         runtime_paths,
     )
     .await

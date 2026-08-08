@@ -367,7 +367,7 @@ async fn dispatch_via_runtime(
                             )
                         } else if is_container_not_found_runtime_error(&e) {
                             (false, PodLifecycleWorkFailure::ContainerNotFound)
-                        } else if e.to_string().to_ascii_lowercase().contains("timed out") {
+                        } else if e.downcast_ref::<crate::cri::CriRequestTimeout>().is_some() {
                             (true, PodLifecycleWorkFailure::DeadlineExceeded)
                         } else {
                             (
@@ -1457,6 +1457,140 @@ mod tests {
                     ),
                     "other-node stop must classify as NotOwned with the target node; got {failure:?}"
                 );
+            }
+            other => panic!("expected PodWorkFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_cri_timeout_is_classified_as_retryable_deadline_exceeded() {
+        use crate::pod_lifecycle_core::message::PodLifecycleWorkFailure;
+
+        struct TimeoutStopRuntime;
+
+        #[async_trait::async_trait]
+        impl PodRuntimeService for TimeoutStopRuntime {
+            async fn start_pod(
+                &self,
+                _key: crate::runtime::PodRuntimeKey,
+                _pod: Option<serde_json::Value>,
+                _cancel: CancellationToken,
+            ) -> anyhow::Result<crate::runtime::PodStartResult> {
+                unreachable!()
+            }
+
+            async fn stop_pod(
+                &self,
+                _request: crate::runtime::PodStopRequest,
+            ) -> anyhow::Result<crate::runtime::PodStopResult> {
+                Err(anyhow::Error::new(crate::cri::CriRequestTimeout::new(
+                    "StopContainer",
+                    std::time::Duration::from_secs(2),
+                )))
+            }
+
+            async fn finalize_startup(
+                &self,
+                _key: crate::runtime::PodRuntimeKey,
+                _pod: Option<serde_json::Value>,
+                _sandbox_id_hint: Option<String>,
+            ) -> anyhow::Result<crate::runtime::PodFinalizeStartupResult> {
+                unreachable!()
+            }
+
+            async fn finalize_deletion(
+                &self,
+                _key: crate::runtime::PodRuntimeKey,
+            ) -> anyhow::Result<crate::runtime::PodDeletionFinalizeResult> {
+                unreachable!()
+            }
+
+            async fn reconcile_runtime(
+                &self,
+                _key: crate::runtime::PodRuntimeKey,
+                _hint: crate::runtime::RuntimeReconcileHint,
+            ) -> anyhow::Result<()> {
+                unreachable!()
+            }
+
+            async fn reconcile_cri_leftovers(
+                &self,
+                _key: crate::runtime::PodRuntimeKey,
+            ) -> anyhow::Result<()> {
+                unreachable!()
+            }
+
+            async fn reconcile_ephemeral(
+                &self,
+                _key: crate::runtime::PodRuntimeKey,
+                _pod: Option<serde_json::Value>,
+            ) -> anyhow::Result<()> {
+                unreachable!()
+            }
+
+            #[rustfmt::skip]
+            async fn /* keep this required trait method distinct from legacy executor handlers */ handle_lifecycle_command(
+                &self,
+                _command: crate::lifecycle::LifecycleCommand,
+            ) -> anyhow::Result<()> {
+                unreachable!()
+            }
+
+            async fn check_slot_admission(
+                &self,
+                _request: crate::runtime::PodSlotAdmissionRequest,
+                _reply_to: LifecycleReplyHandle,
+                _cancel: CancellationToken,
+            ) -> anyhow::Result<()> {
+                unreachable!()
+            }
+
+            async fn schedule_retry(
+                &self,
+                _key: crate::runtime::PodRuntimeKey,
+                _delay: std::time::Duration,
+                _reply_to: LifecycleReplyHandle,
+            ) -> anyhow::Result<()> {
+                unreachable!()
+            }
+
+            async fn schedule_start_pod_retry(
+                &self,
+                _key: crate::runtime::PodRuntimeKey,
+                _delay: std::time::Duration,
+                _error_message: String,
+                _attempt: u32,
+                _reply_to: LifecycleReplyHandle,
+            ) -> anyhow::Result<()> {
+                unreachable!()
+            }
+        }
+
+        let runtime = TimeoutStopRuntime;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<LifecycleMessage>(1);
+        dispatch_via_runtime(
+            &runtime,
+            PodAction::StopPod {
+                key: PodLifecycleKey::new("ns", "timed-out", "uid-timeout"),
+                pod: None,
+                sandbox_id: "sandbox-timeout".into(),
+                deletion_deadline: None,
+                mode: crate::runtime::PodStopMode::Forced,
+                operation_id: 3,
+                permit: None,
+            },
+            LifecycleReplyHandle::direct(tx),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dispatch must route the typed timeout");
+
+        match rx.recv().await.expect("PodWorkFailed must be routed") {
+            LifecycleMessage::PodWorkFailed {
+                retryable, failure, ..
+            } => {
+                assert!(retryable);
+                assert_eq!(failure, PodLifecycleWorkFailure::DeadlineExceeded);
             }
             other => panic!("expected PodWorkFailed, got {other:?}"),
         }

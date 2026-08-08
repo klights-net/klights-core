@@ -77,15 +77,13 @@ pub(super) async fn handle_lifecycle_command(
                 let containers = service
                     .container_control
                     .list_containers(Some(&sandbox_id))
-                    .await
-                    .unwrap_or_default();
+                    .await?;
                 for (candidate_id, _state) in containers {
                     let runtime_name = service
                         .cri
                         .container_status(&candidate_id)
-                        .await
-                        .ok()
-                        .and_then(|response| response.status)
+                        .await?
+                        .status
                         .and_then(|status| status.metadata.map(|metadata| metadata.name))
                         .filter(|name| !name.is_empty());
                     if runtime_name.as_deref() == Some(container_name.as_str()) {
@@ -105,13 +103,12 @@ pub(super) async fn handle_lifecycle_command(
                 return Ok(());
             };
 
-            let _ = service.cri.stop_container(&old_container_id, 10).await;
+            service.cri.stop_container(&old_container_id, 10).await?;
             let stopped_status = service
                 .cri
                 .container_status(&old_container_id)
-                .await
-                .ok()
-                .and_then(|response| response.status);
+                .await?
+                .status;
             let last_state =
                 restart_last_state_from_runtime_status(stopped_status.as_ref(), operation_now);
             let _ = service

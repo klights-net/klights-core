@@ -177,10 +177,18 @@ pub struct ContainerdStartConfig<'a> {
     pub rootless: bool,
     pub executable_path: &'a Path,
     pub image_pull_response_timeout: Duration,
+    pub cri_request_timeout: Duration,
     pub paths: &'a crate::runtime_paths::KubeletRuntimePaths,
     pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub cri_transport_policy: klights_node_api::CriTransportPolicy,
     pub registry_proxy: &'a crate::registry_proxy::RegistryProxyConfig,
+}
+
+pub struct ContainerdCriConnectionConfig<'a> {
+    pub transport_policy: &'a klights_node_api::CriTransportPolicy,
+    pub image_pull_response_timeout: Duration,
+    pub request_timeout: Duration,
+    pub supervisor: &'a klights_supervisor::TaskSupervisor,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -516,6 +524,7 @@ state = "{state_dir}"
             rootless,
             executable_path,
             image_pull_response_timeout,
+            cri_request_timeout,
             paths,
             task_supervisor,
             cri_transport_policy,
@@ -628,8 +637,12 @@ state = "{state_dir}"
             &socket_path,
             namespace,
             rootless,
-            &cri_transport_policy,
-            image_pull_response_timeout,
+            &ContainerdCriConnectionConfig {
+                transport_policy: &cri_transport_policy,
+                image_pull_response_timeout,
+                request_timeout: cri_request_timeout,
+                supervisor: task_supervisor.as_ref(),
+            },
             paths,
         )
         .await?
@@ -715,6 +728,8 @@ state = "{state_dir}"
                     &ns_for_ready,
                     &cri_transport_policy,
                     image_pull_response_timeout,
+                    cri_request_timeout,
+                    task_supervisor.as_ref().clone(),
                 )
                 .await
                 {
@@ -758,24 +773,15 @@ state = "{state_dir}"
         socket_path: &str,
         namespace: &str,
         rootless: bool,
-        cri_transport_policy: &klights_node_api::CriTransportPolicy,
-        image_pull_response_timeout: Duration,
+        cri: &ContainerdCriConnectionConfig<'_>,
         paths: &crate::runtime_paths::KubeletRuntimePaths,
     ) -> Result<bool> {
         if !klights_supervisor::runtime_fs::exists_async(file_process, socket_path).await? {
             return Ok(false);
         }
 
-        match Self::socket_is_reusable(
-            file_process,
-            socket_path,
-            namespace,
-            rootless,
-            cri_transport_policy,
-            image_pull_response_timeout,
-            paths,
-        )
-        .await
+        match Self::socket_is_reusable(file_process, socket_path, namespace, rootless, cri, paths)
+            .await
         {
             Ok(true) => Ok(true),
             Ok(false) => Ok(false),
@@ -808,24 +814,14 @@ state = "{state_dir}"
         file_process: &klights_supervisor::FileProcessExecutor,
         namespace: &str,
         rootless: bool,
-        cri_transport_policy: &klights_node_api::CriTransportPolicy,
-        image_pull_response_timeout: Duration,
+        cri: &ContainerdCriConnectionConfig<'_>,
         paths: &crate::runtime_paths::KubeletRuntimePaths,
     ) -> Result<bool> {
         let socket_path = paths.containerd_socket().to_string_lossy().into_owned();
         if !klights_supervisor::runtime_fs::exists_async(file_process, &socket_path).await? {
             return Ok(false);
         }
-        Self::socket_is_reusable(
-            file_process,
-            &socket_path,
-            namespace,
-            rootless,
-            cri_transport_policy,
-            image_pull_response_timeout,
-            paths,
-        )
-        .await
+        Self::socket_is_reusable(file_process, &socket_path, namespace, rootless, cri, paths).await
     }
 
     async fn socket_is_reusable(
@@ -833,15 +829,16 @@ state = "{state_dir}"
         socket_path: &str,
         namespace: &str,
         rootless: bool,
-        cri_transport_policy: &klights_node_api::CriTransportPolicy,
-        image_pull_response_timeout: Duration,
+        cri: &ContainerdCriConnectionConfig<'_>,
         paths: &crate::runtime_paths::KubeletRuntimePaths,
     ) -> Result<bool> {
         match super::cri::CriClient::connect_with_policy(
             socket_path,
             namespace,
-            cri_transport_policy,
-            image_pull_response_timeout,
+            cri.transport_policy,
+            cri.image_pull_response_timeout,
+            cri.request_timeout,
+            cri.supervisor.clone(),
         )
         .await
         {
