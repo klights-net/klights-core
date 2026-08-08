@@ -85,6 +85,10 @@ impl PodLifecycleRouteBackend for ActorPodLifecycleBackend {
         self.registry.actor_count().await
     }
 
+    async fn in_flight_start_keys(&self) -> Vec<PodLifecycleKey> {
+        self.registry.in_flight_start_keys().await
+    }
+
     fn set_work_executor(&self, executor: Arc<dyn PodWorkExecutor>) {
         *self.executor_holder.lock().unwrap() = executor;
     }

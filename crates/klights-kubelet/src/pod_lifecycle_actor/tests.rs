@@ -3263,6 +3263,65 @@ fn stop_pod_container_not_found_failure_moves_to_finalize() {
 }
 
 #[test]
+fn reconcile_runtime_container_not_found_retries_uid_bound_start_progression() {
+    use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
+    use crate::pod_lifecycle_core::action::PodAction;
+
+    let mut actor = direct_test_actor();
+    let key = PodLifecycleKey::new("default", "init-retry", "uid-init-retry");
+    let pod = test_pod("default", "init-retry", "uid-init-retry");
+    actor.enable_slot_admission_gate_for_test();
+
+    let admission = actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key: key.clone(),
+        resource_version: Some(1),
+        pod: pod.clone(),
+    });
+    let admission_id = admission.operation_id().expect("slot admission operation");
+    let start = actor.handle_for_test(LifecycleMessage::SlotAdmissionGranted {
+        key: key.clone(),
+        operation_id: admission_id,
+        pod,
+        resource_version: Some(1),
+        start_after_admit: true,
+    });
+    let start_id = start.operation_id().expect("start operation");
+    let finalize = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: key.clone(),
+        operation_id: start_id,
+        kind: PodLifecycleWorkKind::StartPod,
+        sandbox_id: Some("sb-init-retry".into()),
+    });
+    let finalize_id = finalize
+        .operation_id()
+        .expect("startup finalization operation");
+    let reconcile = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: key.clone(),
+        operation_id: finalize_id,
+        kind: PodLifecycleWorkKind::FinalizeStartup,
+        sandbox_id: Some("sb-init-retry".into()),
+    });
+    let reconcile_id = reconcile
+        .operation_id()
+        .expect("runtime reconcile operation");
+
+    let retry = actor.handle_for_test(LifecycleMessage::PodWorkFailed {
+        key: key.clone(),
+        operation_id: reconcile_id,
+        kind: PodLifecycleWorkKind::ReconcileRuntime,
+        retryable: true,
+        failure: PodLifecycleWorkFailure::ContainerNotFound,
+    });
+    assert!(matches!(retry, PodAction::ScheduleRetry { key: retry_key, .. } if retry_key == key));
+
+    let restarted = actor.handle_for_test(LifecycleMessage::RetryDue { key: key.clone() });
+    assert!(matches!(
+        restarted,
+        PodAction::StartPod { key: restarted_key, .. } if restarted_key == key
+    ));
+}
+
+#[test]
 fn retry_due_after_stop_pod_failure_retries_stop_with_snapshot() {
     use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
     use crate::pod_lifecycle_core::action::PodAction;

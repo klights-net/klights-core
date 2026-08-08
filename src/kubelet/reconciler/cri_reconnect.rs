@@ -4,7 +4,8 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
 use crate::kubelet::reconciler::cri_inventory::{
-    CriContainerInventory, CriInventoryAction, cleanup_cold_sandbox, diff_cri_inventory,
+    CriContainerInventory, CriInventoryAction, cleanup_cold_sandbox,
+    diff_cri_inventory_with_in_flight_starts,
 };
 use klights_kubelet::pod_lifecycle_core::message::LifecycleMessage;
 use klights_kubelet::pod_lifecycle_router::{
@@ -115,8 +116,20 @@ impl CriReconnectReconciler {
             .await
             .context("list containers during CRI reconnect inventory")?;
 
-        let actions =
-            diff_cri_inventory(true, &runtime_rows, &leader_pods, &sandboxes, &containers);
+        let in_flight_starts = self
+            .router
+            .in_flight_start_keys()
+            .await
+            .into_iter()
+            .collect();
+        let actions = diff_cri_inventory_with_in_flight_starts(
+            true,
+            &runtime_rows,
+            &leader_pods,
+            &sandboxes,
+            &containers,
+            &in_flight_starts,
+        );
         self.apply_actions(&actions).await?;
         Ok(actions)
     }
@@ -128,6 +141,18 @@ impl CriReconnectReconciler {
                     enqueue_orphan_finalize(self.router.as_ref(), key.clone(), *reason).await?;
                 }
                 CriInventoryAction::KillColdSandbox { sandbox_id, key } => {
+                    if let Some(key) = key
+                        && self.cold_sandbox_became_owned(key, sandbox_id).await?
+                    {
+                        self.router
+                            .route(LifecycleMessage::CriEvent {
+                                key: key.clone(),
+                                container_id: String::new(),
+                                kind: klights_kubelet::cri_events::KubeletEventKind::Stopped,
+                            })
+                            .await?;
+                        continue;
+                    }
                     cleanup_cold_sandbox(
                         self.router.as_ref(),
                         self.cri.as_ref(),
@@ -182,6 +207,31 @@ impl CriReconnectReconciler {
             }
         }
         Ok(())
+    }
+
+    async fn cold_sandbox_became_owned(
+        &self,
+        key: &klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey,
+        sandbox_id: &str,
+    ) -> Result<bool> {
+        if self
+            .router
+            .in_flight_start_keys()
+            .await
+            .iter()
+            .any(|candidate| candidate == key)
+        {
+            return Ok(true);
+        }
+        let row = self
+            .pod_runtime_store
+            .get_pod_runtime(klights_node_store::RuntimePodUid::try_new(key.uid.clone())?)
+            .await?;
+        Ok(row.is_some_and(|row| {
+            row.pod().namespace == key.namespace
+                && row.pod().name == key.name
+                && row.sandbox_id() == Some(sandbox_id)
+        }))
     }
 
     pub async fn run_lifecycle_loop(

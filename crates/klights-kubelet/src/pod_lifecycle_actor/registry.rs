@@ -140,6 +140,8 @@ pub struct PodLifecycleRegistry {
 pub struct PodLifecycleActorStateEntry {
     pub uid: String,
     pub state: String,
+    pub in_flight_uid: Option<String>,
+    pub in_flight_kind: Option<super::message::PodLifecycleWorkKind>,
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +150,7 @@ pub struct PodLifecycleActorState {
     pub name: String,
     pub uid: String,
     pub state: String,
+    pub in_flight_kind: Option<super::message::PodLifecycleWorkKind>,
 }
 
 impl PodLifecycleRegistry {
@@ -255,6 +258,8 @@ impl PodLifecycleRegistry {
                 PodLifecycleActorStateEntry {
                     uid: key.uid.clone(),
                     state: "running".to_string(),
+                    in_flight_uid: None,
+                    in_flight_kind: None,
                 },
             );
         }
@@ -395,6 +400,7 @@ impl PodLifecycleRegistry {
                 name: slot.name.clone(),
                 uid: entry.uid.clone(),
                 state: entry.state.clone(),
+                in_flight_kind: entry.in_flight_kind,
             })
             .collect();
         states.sort_by(|a, b| {
@@ -416,5 +422,32 @@ impl PodLifecycleRegistry {
         } else {
             snapshot[len.saturating_sub(limit)..].to_vec()
         }
+    }
+
+    pub async fn in_flight_start_keys(&self) -> Vec<PodLifecycleKey> {
+        let mut keys = self
+            .actor_states
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(slot, entry)| {
+                (entry.in_flight_kind == Some(super::message::PodLifecycleWorkKind::StartPod))
+                    .then(|| {
+                        entry
+                            .in_flight_uid
+                            .as_ref()
+                            .map(|uid| PodLifecycleKey::new(&slot.namespace, &slot.name, uid))
+                    })
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        keys.sort_by(|left, right| {
+            (&left.namespace, &left.name, &left.uid).cmp(&(
+                &right.namespace,
+                &right.name,
+                &right.uid,
+            ))
+        });
+        keys
     }
 }

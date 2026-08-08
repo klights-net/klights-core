@@ -507,7 +507,25 @@ async fn dispatch_via_runtime(
                         uid = %key.uid,
                         "ReconcileRuntime via runtime service failed: {e:#}"
                     );
-                    return Err(anyhow::anyhow!("{e:#}"));
+                    let (retryable, failure) = if is_reconcile_runtime_not_found(&e) {
+                        (true, PodLifecycleWorkFailure::ContainerNotFound)
+                    } else if e.downcast_ref::<crate::cri::CriRequestTimeout>().is_some() {
+                        (true, PodLifecycleWorkFailure::DeadlineExceeded)
+                    } else {
+                        (
+                            true,
+                            PodLifecycleWorkFailure::DispatchFailed(format!("{e:#}")),
+                        )
+                    };
+                    let _ = reply_to
+                        .route(LifecycleMessage::PodWorkFailed {
+                            key,
+                            operation_id,
+                            kind,
+                            retryable,
+                            failure,
+                        })
+                        .await;
                 }
             }
             Ok(())
@@ -1136,6 +1154,41 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn reconcile_runtime_not_found_is_retryable_but_stop_not_found_stays_idempotent() {
+        use crate::pod_lifecycle_core::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
+
+        let mock = std::sync::Arc::new(MockPodRuntimeService::new());
+        mock.set_reconcile_runtime_status(tonic::Status::not_found("gone"));
+        let key = PodLifecycleKey::new("default", "init-retry", "uid-init-retry");
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<LifecycleMessage>(4);
+
+        dispatch_via_runtime(
+            mock.as_ref(),
+            PodAction::ReconcileRuntime {
+                key: key.clone(),
+                hint: crate::runtime::RuntimeReconcileHint::none(),
+                operation_id: 41,
+                permit: None,
+            },
+            LifecycleReplyHandle::direct(tx),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("operation-specific NotFound classification must be routed to the actor");
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(LifecycleMessage::PodWorkFailed {
+                key: failed_key,
+                operation_id: 41,
+                kind: PodLifecycleWorkKind::ReconcileRuntime,
+                retryable: true,
+                failure: PodLifecycleWorkFailure::ContainerNotFound,
+            }) if failed_key == key
+        ));
+    }
+
     /// Retry timer actions are dispatched to the runtime service so the
     /// executor stays a transport adapter and does not own repo/event/timer
     /// side effects.
@@ -1601,4 +1654,11 @@ fn is_container_not_found_runtime_error(error: &anyhow::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     (message.contains("container") && message.contains("not found"))
         || message.contains("no such container")
+}
+
+fn is_reconcile_runtime_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<tonic::Status>()
+        .is_some_and(|status| status.code() == tonic::Code::NotFound)
+        || is_container_not_found_runtime_error(error)
 }

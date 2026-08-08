@@ -1861,6 +1861,10 @@ mod tests {
         async fn active_pod_count(&self) -> usize {
             0
         }
+
+        async fn in_flight_start_keys(&self) -> Vec<PodLifecycleKey> {
+            Vec::new()
+        }
     }
 
     #[tokio::test]

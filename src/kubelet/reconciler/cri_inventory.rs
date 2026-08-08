@@ -52,6 +52,24 @@ pub fn diff_cri_inventory(
     cri_sandboxes: &[CriPodSandboxSummary],
     cri_containers: &[CriContainerInventory],
 ) -> Vec<CriInventoryAction> {
+    diff_cri_inventory_with_in_flight_starts(
+        cache_primed,
+        runtime_rows,
+        leader_pods,
+        cri_sandboxes,
+        cri_containers,
+        &HashSet::new(),
+    )
+}
+
+pub fn diff_cri_inventory_with_in_flight_starts(
+    cache_primed: bool,
+    runtime_rows: &[klights_node_store::PodRuntimeRecord],
+    leader_pods: &[serde_json::Value],
+    cri_sandboxes: &[CriPodSandboxSummary],
+    cri_containers: &[CriContainerInventory],
+    in_flight_starts: &HashSet<PodLifecycleKey>,
+) -> Vec<CriInventoryAction> {
     if !cache_primed {
         return vec![CriInventoryAction::RefuseEmptyCache];
     }
@@ -134,10 +152,29 @@ pub fn diff_cri_inventory(
                 && !sandbox.name.trim().is_empty()
                 && !sandbox.uid.trim().is_empty())
             .then(|| PodLifecycleKey::new(&sandbox.namespace, &sandbox.name, &sandbox.uid));
-            actions.push(CriInventoryAction::KillColdSandbox {
-                sandbox_id: sandbox.sandbox_id.clone(),
-                key,
+            let exact_leader_uid = key.as_ref().is_some_and(|key| {
+                leader_by_slot
+                    .get(&(key.namespace.clone(), key.name.clone()))
+                    .is_some_and(|(uid, _)| uid == &key.uid)
             });
+            let fenced_start = key
+                .as_ref()
+                .is_some_and(|key| exact_leader_uid && in_flight_starts.contains(key));
+            if fenced_start {
+                // RunPodSandbox becomes visible to CRI before the following
+                // UID-qualified runtime-row commit. A reconnect in that exact
+                // await gap must notify the owning actor, which defers the CRI
+                // observation behind StartPod, rather than finalize the
+                // sandbox as a cold orphan.
+                actions.push(CriInventoryAction::ReconcileRuntime {
+                    key: key.expect("fenced start has an identity"),
+                });
+            } else {
+                actions.push(CriInventoryAction::KillColdSandbox {
+                    sandbox_id: sandbox.sandbox_id.clone(),
+                    key,
+                });
+            }
         }
     }
 
@@ -431,6 +468,83 @@ pub mod tests {
                 sandbox_id: "sb-cold".to_string(),
                 key: Some(PodLifecycleKey::new("default", "cold-pod", "uid-cold")),
             }]
+        );
+    }
+
+    #[test]
+    fn exact_uid_start_in_flight_fences_cold_sandbox_cleanup() {
+        let pod = pod("default", "starting", "uid-starting");
+        let key = PodLifecycleKey::new("default", "starting", "uid-starting");
+        let in_flight_starts = HashSet::from([key.clone()]);
+
+        // Model the exact RunPodSandbox -> record_owned_sandbox await gap: CRI
+        // already exposes the identity-stamped sandbox, while node-local
+        // runtime persistence has not committed the row yet.
+        let actions = diff_cri_inventory_with_in_flight_starts(
+            true,
+            &[],
+            std::slice::from_ref(&pod),
+            &[sandbox(
+                "sb-starting",
+                "default",
+                "starting",
+                "uid-starting",
+            )],
+            &[],
+            &in_flight_starts,
+        );
+
+        assert_eq!(
+            actions,
+            vec![CriInventoryAction::ReconcileRuntime { key }],
+            "reconnect must defer to the exact UID actor instead of finalizing its in-flight sandbox"
+        );
+
+        let completed_actions = diff_cri_inventory_with_in_flight_starts(
+            true,
+            &[runtime_row(
+                "uid-starting",
+                "default",
+                "starting",
+                Some("sb-starting"),
+            )],
+            &[pod],
+            &[sandbox(
+                "sb-starting",
+                "default",
+                "starting",
+                "uid-starting",
+            )],
+            &[],
+            &HashSet::new(),
+        );
+        assert!(matches!(
+            completed_actions.as_slice(),
+            [CriInventoryAction::ReattachExistingSandbox { key, sandbox_id, .. }]
+                if key.uid == "uid-starting" && sandbox_id == "sb-starting"
+        ));
+    }
+
+    #[test]
+    fn stale_in_flight_uid_cannot_fence_same_name_replacement_sandbox() {
+        let replacement = pod("default", "starting", "uid-new");
+        let stale_key = PodLifecycleKey::new("default", "starting", "uid-old");
+        let actions = diff_cri_inventory_with_in_flight_starts(
+            true,
+            &[],
+            &[replacement],
+            &[sandbox("sb-old", "default", "starting", "uid-old")],
+            &[],
+            &HashSet::from([stale_key.clone()]),
+        );
+
+        assert_eq!(
+            actions,
+            vec![CriInventoryAction::KillColdSandbox {
+                sandbox_id: "sb-old".into(),
+                key: Some(stale_key),
+            }],
+            "only an exact leader UID may fence reconnect cleanup"
         );
     }
 

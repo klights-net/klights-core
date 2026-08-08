@@ -936,6 +936,7 @@ pub struct MockPodRuntimeService {
     /// CancellationToken captured from the last `start_pod` call; cloned
     /// into the mock so tests can signal cancellation externally.
     start_pod_cancel: Mutex<Option<CancellationToken>>,
+    reconcile_runtime_status: Mutex<Option<tonic::Status>>,
 }
 
 impl Default for MockPodRuntimeService {
@@ -954,6 +955,7 @@ impl MockPodRuntimeService {
             fail_method: Mutex::new(None),
             stop_ownership_error: Mutex::new(None),
             start_pod_cancel: Mutex::new(None),
+            reconcile_runtime_status: Mutex::new(None),
         }
     }
 
@@ -972,6 +974,10 @@ impl MockPodRuntimeService {
     /// Cause the next call to the named method to return an error.
     pub fn set_fail_method(&self, method_name: &str) {
         *self.fail_method.lock().unwrap() = Some(method_name.to_string());
+    }
+
+    pub fn set_reconcile_runtime_status(&self, status: tonic::Status) {
+        *self.reconcile_runtime_status.lock().unwrap() = Some(status);
     }
 
     /// Cause the next `stop_pod` call to fail with a typed `PodOwnershipError`
@@ -1107,6 +1113,9 @@ impl PodRuntimeService for MockPodRuntimeService {
         key: PodRuntimeKey,
         hint: crate::runtime::RuntimeReconcileHint,
     ) -> anyhow::Result<()> {
+        if let Some(status) = self.reconcile_runtime_status.lock().unwrap().take() {
+            return Err(anyhow::Error::new(status));
+        }
         self.check_fail("reconcile_runtime")?;
         self.calls
             .lock()

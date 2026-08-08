@@ -133,6 +133,11 @@ pub trait PodLifecycleRouteBackend: Send + Sync {
     /// Number of active pod lifecycle actors/entries.
     async fn active_pod_count(&self) -> usize;
 
+    /// Exact UID keys whose actor currently owns StartPod work.
+    async fn in_flight_start_keys(&self) -> Vec<PodLifecycleKey> {
+        Vec::new()
+    }
+
     /// Replace the work executor at runtime. Default no-op; actor backend
     /// swaps the executor used by per-pod actors for dispatching `PodAction`s.
     fn set_work_executor(&self, _executor: Arc<dyn executor::PodWorkExecutor>) {}
@@ -289,6 +294,10 @@ impl PodLifecycleRouter {
         self.backend.active_pod_count().await
     }
 
+    pub async fn in_flight_start_keys(&self) -> Vec<PodLifecycleKey> {
+        self.backend.in_flight_start_keys().await
+    }
+
     /// Selected mode for diagnostics.
     pub fn mode(&self) -> PodLifecycleRouteMode {
         self.backend.mode()
@@ -359,6 +368,74 @@ mod tests {
         ))
     }
 
+    struct PausedStartExecutor {
+        entered_start: Arc<tokio::sync::Semaphore>,
+        release_start: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl executor::PodWorkExecutor for PausedStartExecutor {
+        async fn dispatch(
+            &self,
+            action: crate::pod_lifecycle_core::action::PodAction,
+            reply_to: LifecycleReplyHandle,
+        ) -> Result<(), executor::ExecutorError> {
+            match action {
+                crate::pod_lifecycle_core::action::PodAction::CheckSlotAdmission {
+                    key,
+                    pod,
+                    resource_version,
+                    start_after_admit,
+                    operation_id,
+                    ..
+                } => {
+                    reply_to
+                        .route(LifecycleMessage::SlotAdmissionGranted {
+                            key,
+                            operation_id,
+                            pod,
+                            resource_version,
+                            start_after_admit,
+                        })
+                        .await?;
+                }
+                crate::pod_lifecycle_core::action::PodAction::StartPod {
+                    key,
+                    operation_id,
+                    ..
+                } => {
+                    self.entered_start.add_permits(1);
+                    self.release_start.acquire().await?.forget();
+                    reply_to
+                        .route(LifecycleMessage::PodWorkCompleted {
+                            key,
+                            operation_id,
+                            kind:
+                                crate::pod_lifecycle_core::message::PodLifecycleWorkKind::StartPod,
+                            sandbox_id: Some("sb-paused".into()),
+                        })
+                        .await?;
+                }
+                crate::pod_lifecycle_core::action::PodAction::ReconcileCriLeftovers {
+                    key,
+                    operation_id,
+                    ..
+                } => {
+                    reply_to
+                        .route(LifecycleMessage::PodWorkCompleted {
+                            key,
+                            operation_id,
+                            kind: crate::pod_lifecycle_core::message::PodLifecycleWorkKind::ReconcileCriLeftovers,
+                            sandbox_id: None,
+                        })
+                        .await?;
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn injected_actor_mode_selects_actor() {
         let router = PodLifecycleRouter::new(
@@ -397,6 +474,39 @@ mod tests {
             .unwrap();
 
         assert_eq!(router.active_pod_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn router_snapshots_exact_uid_while_start_pod_is_in_flight() {
+        let entered_start = Arc::new(tokio::sync::Semaphore::new(0));
+        let release_start = Arc::new(tokio::sync::Semaphore::new(0));
+        let executor = Arc::new(PausedStartExecutor {
+            entered_start: entered_start.clone(),
+            release_start: release_start.clone(),
+        });
+        let registry = test_registry_with_executor(executor.clone());
+        let router = PodLifecycleRouter::new_actor_with_executor(registry, executor);
+        let key = PodLifecycleKey::new("default", "starting", "uid-starting");
+
+        router
+            .route(LifecycleMessage::WatchAdded {
+                key: key.clone(),
+                resource_version: Some(1),
+                pod: serde_json::json!({
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "starting",
+                        "uid": "uid-starting"
+                    },
+                    "spec": {"nodeName": "worker-a"}
+                }),
+            })
+            .await
+            .unwrap();
+        entered_start.acquire().await.unwrap().forget();
+
+        assert_eq!(router.in_flight_start_keys().await, vec![key]);
+        release_start.add_permits(1);
     }
 
     #[tokio::test]
@@ -1039,6 +1149,10 @@ mod tests {
 
         async fn active_pod_count(&self) -> usize {
             0
+        }
+
+        async fn in_flight_start_keys(&self) -> Vec<PodLifecycleKey> {
+            Vec::new()
         }
 
         fn set_work_executor(&self, executor: std::sync::Arc<dyn executor::PodWorkExecutor>) {

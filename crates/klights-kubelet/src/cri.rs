@@ -90,6 +90,37 @@ where
     }
 }
 
+async fn await_stream_establishment<T, F>(
+    supervisor: &klights_supervisor::TaskSupervisor,
+    request_timeout: std::time::Duration,
+    operation: &'static str,
+    future: F,
+) -> Result<tonic::Response<T>>
+where
+    F: std::future::Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+{
+    let result = supervisor
+        .timeout(
+            format!("cri_stream_establish_{}", operation.to_ascii_lowercase()),
+            request_timeout,
+            future,
+        )
+        .await
+        .with_context(|| format!("supervise CRI {operation} stream establishment"))?;
+    match result {
+        Err(_) => Err(anyhow::Error::new(CriRequestTimeout::new(
+            operation,
+            request_timeout,
+        ))),
+        Ok(Err(status)) if status.code() == tonic::Code::DeadlineExceeded => Err(
+            anyhow::Error::new(CriRequestTimeout::new(operation, request_timeout))
+                .context(status.to_string()),
+        ),
+        Ok(Err(status)) => Err(anyhow::Error::new(status)),
+        Ok(Ok(response)) => Ok(response),
+    }
+}
+
 fn is_not_found(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<tonic::Status>()
@@ -100,6 +131,10 @@ fn request_with_timeout<T>(message: T, timeout: std::time::Duration) -> tonic::R
     let mut request = tonic::Request::new(message);
     request.set_timeout(timeout);
     request
+}
+
+fn stream_request<T>(message: T) -> tonic::Request<T> {
+    tonic::Request::new(message)
 }
 
 #[derive(Clone)]
@@ -513,7 +548,7 @@ impl CriClient {
         let mut grpc = tonic::client::Grpc::new(self.channel.clone())
             .max_decoding_message_size(self.max_message_bytes)
             .max_encoding_message_size(self.max_message_bytes);
-        let request = self.request(GetEventsRequest {});
+        let request = stream_request(GetEventsRequest {});
         let path = tonic::codegen::http::uri::PathAndQuery::from_static(
             "/runtime.v1.RuntimeService/GetContainerEvents",
         );
@@ -524,7 +559,7 @@ impl CriClient {
             })?;
             grpc.server_streaming(request, path, codec).await
         };
-        let response = await_unary_response(
+        let response = await_stream_establishment(
             &self.supervisor,
             self.request_timeout,
             "GetContainerEvents",
@@ -649,6 +684,63 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("7000000u")
         );
+    }
+
+    #[test]
+    fn event_stream_request_has_no_lifetime_grpc_deadline() {
+        let request = stream_request(GetEventsRequest {});
+        assert!(
+            request.metadata().get("grpc-timeout").is_none(),
+            "GetEvents establishment is supervisor-bounded, but the returned long-lived stream must not inherit a lifetime deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_establishment_timeout_does_not_own_returned_stream_lifetime() {
+        let supervisor = test_supervisor();
+        let timeout = std::time::Duration::from_millis(1);
+        let lease = std::sync::Arc::new(());
+        let response = await_stream_establishment(
+            &supervisor,
+            timeout,
+            "GetContainerEvents",
+            std::future::ready(Ok::<_, tonic::Status>(tonic::Response::new(lease.clone()))),
+        )
+        .await
+        .expect("stream establishment succeeds");
+
+        supervisor
+            .sleep("cri_stream_lifetime_regression", timeout + timeout)
+            .await
+            .expect("supervised test delay");
+        assert_eq!(
+            std::sync::Arc::strong_count(response.get_ref()),
+            2,
+            "the establishment deadline must not cancel or drop the returned stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_deadline_drops_hung_stream_establishment() {
+        let supervisor = test_supervisor();
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let error = await_stream_establishment(
+            &supervisor,
+            std::time::Duration::from_millis(1),
+            "GetContainerEvents",
+            PendingUnary {
+                dropped: dropped.clone(),
+            },
+        )
+        .await
+        .expect_err("hung stream establishment must reach the supervisor deadline");
+        assert_eq!(
+            error
+                .downcast_ref::<CriRequestTimeout>()
+                .map(|error| error.operation()),
+            Some("GetContainerEvents")
+        );
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]

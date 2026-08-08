@@ -478,6 +478,8 @@ impl PodLifecycleActor {
                 PodLifecycleActorStateEntry {
                     uid: key.uid.clone(),
                     state: event_name.to_string(),
+                    in_flight_uid: self.state.in_flight.as_ref().map(|work| work.uid.clone()),
+                    in_flight_kind: self.state.in_flight.as_ref().map(|work| work.kind),
                 },
             );
         }
@@ -494,6 +496,17 @@ impl PodLifecycleActor {
 
         self.load_runtime_observation_checkpoint_once(&key).await;
         let action = self.handle(message);
+        if let Some(actor_state) = &self.actor_state {
+            actor_state.lock().await.insert(
+                super::message::PodSlotKey::from(&key),
+                PodLifecycleActorStateEntry {
+                    uid: key.uid.clone(),
+                    state: event_name.to_string(),
+                    in_flight_uid: self.state.in_flight.as_ref().map(|work| work.uid.clone()),
+                    in_flight_kind: self.state.in_flight.as_ref().map(|work| work.kind),
+                },
+            );
+        }
         self.reconcile_deletion_deadline_timer(completion_tx).await;
         self.load_runtime_observation_checkpoint_once(&key).await;
         if let Some(key) = checkpoint_after_defer_candidate {
@@ -1917,6 +1930,19 @@ impl PodLifecycleActor {
                     return self.resume_pending_restart_admission();
                 }
                 match (kind, retryable) {
+                    (PodLifecycleWorkKind::ReconcileRuntime, true)
+                        if matches!(failure, PodLifecycleWorkFailure::ContainerNotFound) =>
+                    {
+                        // Runtime observations can race a short-lived init
+                        // container out of CRI. Re-enter the admitted UID's
+                        // normal start/progression path; StopPod keeps its
+                        // separate idempotent NotFound completion semantics.
+                        self.state.phase = PodPhase::PendingStart;
+                        PodAction::ScheduleRetry {
+                            key,
+                            delay: std::time::Duration::from_secs(1),
+                        }
+                    }
                     (PodLifecycleWorkKind::StartPod, true) => {
                         let reconcile =
                             self.reconcile_deferred_runtime_after_start_failure(key.clone());
