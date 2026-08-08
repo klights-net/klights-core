@@ -31,7 +31,8 @@ pub trait PodNetworkRuntime: Send + Sync {
 
 // --- Production adapter ---
 
-/// Production network runtime adapter over Datapath + PodRepository.
+/// Production network runtime adapter over Datapath + the focused Pod
+/// network-assignment query capability.
 pub struct RealPodNetworkRuntime {
     datapath: Arc<dyn klights_network_api::Datapath>,
     repository: Arc<dyn PodNetworkAssignmentQuery>,

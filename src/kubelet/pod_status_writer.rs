@@ -1,8 +1,8 @@
 //! Legacy pod-status writer kept ONLY for unit-test fixtures that exercise
 //! the historical full-pod-update path.
 //!
-//! Production lifecycle code writes pod status through
-//! `crate::kubelet::pod_repository::PodRepository` (`set_pod_status`,
+//! Production lifecycle code writes pod status through the kubelet's focused
+//! `PodStatusWriter` capability (`set_pod_status`,
 //! `apply_runtime_reconcile_status`, `set_probe_readiness`,
 //! `set_deadline_exceeded`). Pod→Service endpoint reconcile is owned by the
 //! leader's controllers (driven by `side_effects::service_pod` and

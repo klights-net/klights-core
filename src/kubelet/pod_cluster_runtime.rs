@@ -75,7 +75,8 @@ fn live_status_string(
 }
 
 async fn apply_forwarded_status(
-    repository: &PodRepository,
+    pod_query: &dyn PodQuery,
+    pod_status: &dyn PodStatusWriter,
     key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
     status: serde_json::Value,
 ) -> anyhow::Result<klights_cluster_core::Resource> {
@@ -91,7 +92,7 @@ async fn apply_forwarded_status(
         && status.get("hostIP").is_none()
         && init_container_statuses.is_none()
     {
-        return repository
+        return pod_status
             .apply_runtime_reconcile_status_for_uid(
                 &key.namespace,
                 &key.name,
@@ -106,7 +107,7 @@ async fn apply_forwarded_status(
             .map_err(|e| anyhow::anyhow!("{:#}", e));
     }
 
-    let live = repository
+    let live = pod_query
         .get_pod(PodGetRequest::try_by_identity(
             klights_types::PodIdentity::new(&key.namespace, &key.name, &key.uid),
         )?)
@@ -124,7 +125,7 @@ async fn apply_forwarded_status(
         init_container_statuses,
         qos_class: None,
     };
-    repository
+    pod_status
         .set_pod_status_for_uid(&key.namespace, &key.name, &key.uid, status_update, None)
         .await
         .map_err(|e| anyhow::anyhow!("{:#}", e))
@@ -155,19 +156,33 @@ impl NodeRuntimeView for LocalNodeRuntimeView {
 
 /// Cluster runtime view shared by every node role (leader, worker, replica).
 ///
-/// The view is role-agnostic: it routes Pod cluster operations through whatever
-/// `PodRepository` it is handed. The leader is wired with the cluster-datastore
-/// repository (writes land locally); a worker is wired with the worker-safe
-/// repository that forwards to the leader. Because the role difference lives in
-/// the repository, the leader's kubelet uses this exact same path as a normal
-/// worker — there is no leader-specific runtime view or status bypass.
+/// The view is role-agnostic: it routes Pod cluster operations through
+/// whatever focused query/status capabilities it is handed at construction.
+/// The leader is wired with the cluster-datastore repository (writes land
+/// locally); a worker is wired with the worker-safe repository that forwards
+/// to the leader. Because the role difference lives in the repository, the
+/// leader's kubelet uses this exact same path as a normal worker — there is
+/// no leader-specific runtime view or status bypass.
+///
+/// The constructor still accepts the concrete `Arc<PodRepository>` (rather
+/// than two already-erased trait objects) because `src/kubelet/pod_runtime/
+/// tests.rs` — out of this packet's file scope — constructs this view
+/// directly from a bare `Arc<PodRepository>`/owned repository value at
+/// several call sites. Only the constructor's parameter names the concrete
+/// type; every stored field and every method body dispatches exclusively
+/// through the decomposed focused capabilities, never through a live
+/// aggregate accessor.
 pub struct RepositoryClusterRuntimeView {
-    repository: Arc<PodRepository>,
+    pod_query: Arc<dyn PodQuery>,
+    pod_status: Arc<dyn PodStatusWriter>,
 }
 
 impl RepositoryClusterRuntimeView {
     pub fn new(repository: Arc<PodRepository>) -> Self {
-        Self { repository }
+        Self {
+            pod_query: repository.clone(),
+            pod_status: repository,
+        }
     }
 }
 
@@ -178,7 +193,7 @@ impl ClusterRuntimeView for RepositoryClusterRuntimeView {
         namespace: &str,
         name: &str,
     ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
-        self.repository
+        self.pod_query
             .get_pod(PodGetRequest::try_by_name(namespace, name)?)
             .await
             .map_err(|e| anyhow::anyhow!("{:#}", e))
@@ -189,7 +204,13 @@ impl ClusterRuntimeView for RepositoryClusterRuntimeView {
         key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
         status: serde_json::Value,
     ) -> anyhow::Result<klights_cluster_core::Resource> {
-        apply_forwarded_status(self.repository.as_ref(), key, status).await
+        apply_forwarded_status(
+            self.pod_query.as_ref(),
+            self.pod_status.as_ref(),
+            key,
+            status,
+        )
+        .await
     }
 }
 
@@ -242,6 +263,7 @@ mod tests {
         let key = PodRuntimeKey::new("default", "init-forwarded", &created.uid);
 
         apply_forwarded_status(
+            &repo,
             &repo,
             &key,
             json!({
@@ -340,6 +362,7 @@ mod tests {
         let key = PodRuntimeKey::new("default", "init-retry-forwarded", &created.uid);
         apply_forwarded_status(
             &repo,
+            &repo,
             &key,
             json!({
                 "phase": "Pending",
@@ -352,6 +375,7 @@ mod tests {
         .unwrap();
 
         apply_forwarded_status(
+            &repo,
             &repo,
             &key,
             json!({
@@ -438,6 +462,7 @@ mod tests {
 
         apply_forwarded_status(
             &repo,
+            &repo,
             &key,
             json!({
                 "phase": "Pending",
@@ -470,6 +495,7 @@ mod tests {
         .unwrap();
 
         apply_forwarded_status(
+            &repo,
             &repo,
             &key,
             json!({

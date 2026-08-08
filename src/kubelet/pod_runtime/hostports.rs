@@ -41,7 +41,8 @@ pub trait HostPortRuntime: Send + Sync {
 
 // --- Production adapter ---
 
-/// Production hostPort adapter over ServiceRouter + PodRepository.
+/// Production hostPort adapter over ServiceRouter + the focused Pod query
+/// capability.
 pub struct RealHostPortRuntime {
     service_router: Arc<dyn klights_network_api::ServiceRouter>,
     repository: Arc<dyn PodQuery>,

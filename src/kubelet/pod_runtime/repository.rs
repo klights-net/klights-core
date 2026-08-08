@@ -1,6 +1,5 @@
-use crate::kubelet::pod_repository::PodRepository;
 use klights_cluster_core::Resource;
-use klights_kubelet::pod_repository::{PodStatusUpdate, RuntimeReconcileStatus};
+use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter, RuntimeReconcileStatus};
 use klights_kubelet::pod_startup_error::PodStartupErrorKind;
 use klights_pod_api::{PodGetRequest, PodQuery};
 
@@ -92,9 +91,10 @@ pub trait PodRuntimeRepository: Send + Sync {
     /// guard depends on distinguishing a replacement (`Different`) from the
     /// tracked pod (`Matches`); a stale cache still showing the OLD uid would
     /// falsely return `Matches`, letting a deleted pod's actor act on a slot the
-    /// replacement now owns. The production `PodRepository` impl satisfies this by
-    /// routing through `PodQuery::get_pod` → `get_resource_fresh` on workers. Do
-    /// not migrate this to a cached read.
+    /// replacement now owns. Any implementation backed by the kubelet's
+    /// focused Pod query capability satisfies this by routing through
+    /// `PodQuery::get_pod` → `get_resource_fresh` on workers. Do not migrate
+    /// this to a cached read.
     async fn check_live_pod_uid(
         &self,
         ns: &str,
@@ -103,8 +103,16 @@ pub trait PodRuntimeRepository: Send + Sync {
     ) -> anyhow::Result<LivePodUidCheck>;
 }
 
+/// Blanket bridge: any type backed by the focused Pod query and status-writer
+/// capabilities automatically satisfies `PodRuntimeRepository`. This keeps the
+/// bridge decoupled from any single concrete root aggregate type — that type
+/// gets the impl "for free" through its own focused-port impls, with no
+/// separate, aggregate-named impl of this trait required.
 #[async_trait::async_trait]
-impl PodRuntimeRepository for PodRepository {
+impl<T> PodRuntimeRepository for T
+where
+    T: PodQuery + PodStatusWriter + Send + Sync,
+{
     async fn get_pod_for_uid(
         &self,
         ns: &str,
@@ -127,15 +135,7 @@ impl PodRuntimeRepository for PodRepository {
         update: PodStatusUpdate,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::set_pod_status_for_uid(
-            self,
-            ns,
-            name,
-            pod_uid,
-            update,
-            expected_rv,
-        )
-        .await
+        PodStatusWriter::set_pod_status_for_uid(self, ns, name, pod_uid, update, expected_rv).await
     }
 
     async fn apply_runtime_reconcile_status_for_uid(
@@ -146,7 +146,7 @@ impl PodRuntimeRepository for PodRepository {
         update: RuntimeReconcileStatus,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::apply_runtime_reconcile_status_for_uid(
+        PodStatusWriter::apply_runtime_reconcile_status_for_uid(
             self,
             ns,
             name,
@@ -164,7 +164,7 @@ impl PodRuntimeRepository for PodRepository {
         pod_uid: &str,
         error_message: &str,
     ) -> anyhow::Result<Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::mark_start_pending_for_retry_for_uid(
+        PodStatusWriter::mark_start_pending_for_retry_for_uid(
             self,
             ns,
             name,
@@ -183,7 +183,7 @@ impl PodRuntimeRepository for PodRepository {
         ready: bool,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::set_probe_readiness_for_uid(
+        PodStatusWriter::set_probe_readiness_for_uid(
             self,
             ns,
             name,
@@ -203,7 +203,7 @@ impl PodRuntimeRepository for PodRepository {
         message: String,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::set_deadline_exceeded_for_uid(
+        PodStatusWriter::set_deadline_exceeded_for_uid(
             self,
             ns,
             name,
@@ -222,7 +222,7 @@ impl PodRuntimeRepository for PodRepository {
         statuses: Vec<serde_json::Value>,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::apply_ephemeral_container_statuses_for_uid(
+        PodStatusWriter::apply_ephemeral_container_statuses_for_uid(
             self,
             ns,
             name,
@@ -242,7 +242,7 @@ impl PodRuntimeRepository for PodRepository {
         terminated: serde_json::Value,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Option<Resource>> {
-        klights_kubelet::pod_repository::PodStatusWriter::note_container_restart_for_uid(
+        PodStatusWriter::note_container_restart_for_uid(
             self,
             ns,
             name,
