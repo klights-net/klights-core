@@ -214,7 +214,6 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
     }
 }
 
-pub mod background;
 pub mod facade;
 
 #[cfg(test)]
@@ -241,7 +240,7 @@ pub(crate) trait PodQueryTestExt: klights_pod_api::PodQuery {
 #[cfg(test)]
 impl<T> PodQueryTestExt for T where T: klights_pod_api::PodQuery + ?Sized {}
 
-use background::PodRepositoryBackground;
+use klights_kubelet::pod_repository::background::PodRepositoryBackground;
 use klights_kubelet::pod_repository::status;
 use klights_kubelet::pod_repository::store::PodStore;
 use klights_kubelet::pod_repository::workqueue::PodWorkqueue;

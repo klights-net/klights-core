@@ -633,7 +633,7 @@ pub struct IntegrationPodRepositoryComposition {
     pod_subresource: Arc<k8s_native_service::PodSubresourceService>,
     pod_scheduling: Arc<dyn klights_pod_api::PodScheduling>,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    background: crate::kubelet::pod_repository::background::PodRepositoryBackground,
+    background: klights_kubelet::pod_repository::background::PodRepositoryBackground,
     controller_dispatcher: Option<Arc<PodRepositoryRecordingReconcileSink>>,
     node_local: Option<Arc<crate::datastore::node_local::NodeLocalStores>>,
     outbox_delivery: Option<Arc<dyn klights_leader_api::LeaderOutboxDelivery>>,
@@ -1591,10 +1591,6 @@ pub async fn run_probe_readiness_status_race(
     }
 }
 
-pub struct IntegrationPodWatchRunnerFixture {
-    runner: crate::kubelet::pod_repository::background::PodWatchRunner,
-}
-
 pub struct IntegrationPodNetworkFixture {
     stores: Option<Arc<crate::datastore::node_local::NodeLocalStores>>,
     service: klights_kubelet::pod_repository::PodNetworkService,
@@ -1694,56 +1690,6 @@ impl IntegrationPodNetworkFixture {
                 )?,
             )
             .await
-    }
-}
-
-impl IntegrationPodWatchRunnerFixture {
-    pub fn new() -> Self {
-        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
-            klights_supervisor::TaskCategoryConfig::default(),
-        ));
-        Self {
-            runner: crate::kubelet::pod_repository::background::PodWatchRunner::new(supervisor),
-        }
-    }
-
-    pub fn started(&self) -> bool {
-        self.runner
-            .started
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    pub fn start(&self) {
-        self.runner.start();
-    }
-}
-
-pub struct IntegrationDeadlineTimerRunnerFixture {
-    runner: crate::kubelet::pod_repository::background::DeadlineTimerRunner,
-}
-
-impl IntegrationDeadlineTimerRunnerFixture {
-    pub fn new() -> Self {
-        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
-            klights_supervisor::TaskCategoryConfig::default(),
-        ));
-        Self {
-            runner: crate::kubelet::pod_repository::background::DeadlineTimerRunner::new(
-                supervisor,
-            ),
-        }
-    }
-
-    pub fn schedule_uid_bound_wakeup(
-        &self,
-        namespace: &str,
-        name: &str,
-        uid: &str,
-        delay_ms: u64,
-        reason: &'static str,
-    ) {
-        self.runner
-            .schedule_uid_bound_wakeup(namespace, name, uid, delay_ms, reason);
     }
 }
 

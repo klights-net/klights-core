@@ -7,7 +7,6 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::kubelet::pod_repository::PodRepository;
-use crate::kubelet::pod_repository::background::PodRepositoryBackground;
 use crate::kubelet::pod_repository::facade::PodRepositoryParts;
 use crate::kubelet::pod_runtime::events::PodEventSink;
 use crate::kubelet::pod_runtime::service::{
@@ -19,6 +18,7 @@ use klights_kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry;
 use klights_kubelet::pod_lifecycle_router::executor::{PodLifecycleExecutor, PodWorkExecutor};
 use klights_kubelet::pod_lifecycle_router::{PodLifecycleRouteMode, PodLifecycleRouter};
 use klights_kubelet::pod_lifecycle_service::PodLifecycleService;
+use klights_kubelet::pod_repository::background::PodRepositoryBackground;
 use klights_kubelet::probe_manager::ProbeManager;
 use klights_supervisor::TaskSupervisor;
 
