@@ -10,7 +10,7 @@ publish.workspace = true
 
 [features]
 default = []
-test-support = []
+test-support = ["dep:klights-watch"]
 
 [lints]
 workspace = true
@@ -37,6 +37,7 @@ klights-pod-api = { workspace = true }
 klights-reconcile-api = { workspace = true }
 klights-supervisor = { workspace = true }
 klights-types = { workspace = true }
+klights-watch = { workspace = true, optional = true }
 libc = { workspace = true }
 nix = { workspace = true }
 reqwest = { workspace = true }
@@ -52,6 +53,7 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["std", "v4"] }
 
 [dev-dependencies]
+klights-watch = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }

@@ -1,5 +1,5 @@
-//! Policy-aware Pod repository facade. Concrete datastore access is owned by
-//! the private root composition persistence adapter.
+//! Policy-aware Pod repository facade. Concrete datastore access remains
+//! owned by the private root composition persistence adapter.
 //!
 //! `pod_network` and `sandbox` table access is intentionally NOT routed
 //! through this hub — those are network-runtime / GC concerns owned by
@@ -10,7 +10,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(any(test, feature = "test-support"))]
 use tokio::sync::broadcast;
 
 use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
@@ -20,11 +20,11 @@ use klights_pod_api::{
     PodRepositoryReadPersistence, PodRepositoryReplaceRequest, PodRepositoryStatusNoop,
     PodRepositoryStatusRequest, PodRepositoryWritePersistence,
 };
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(any(test, feature = "test-support"))]
 use klights_watch::WatchEvent;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ActorPodDeleteObservation {
+pub enum ActorPodDeleteObservation {
     Ready {
         resource_version: i64,
         node_name: String,
@@ -42,33 +42,45 @@ fn pod_is_terminating_or_node_lost(pod: &Value) -> bool {
             && pod.pointer("/status/reason").and_then(Value::as_str) == Some("NodeLost"))
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
-pub(crate) trait PodRepositoryWatchPersistence: Send + Sync {
+#[cfg(any(test, feature = "test-support"))]
+pub trait PodRepositoryWatchPersistence: Send + Sync {
     fn pod_watch_receiver(&self) -> tokio::sync::broadcast::Receiver<WatchEvent>;
 }
 
 pub struct PodStore {
     reads: Arc<dyn PodRepositoryReadPersistence>,
     writes: Arc<dyn PodRepositoryWritePersistence>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(any(test, feature = "test-support"))]
     watches: Option<Arc<dyn PodRepositoryWatchPersistence>>,
     /// Incremented on every pod create/delete to signal sandbox GC that a sweep may be needed.
-    pub(super) sandbox_gc_dirty: Arc<AtomicUsize>,
+    sandbox_gc_dirty: Arc<AtomicUsize>,
 }
 
 impl PodStore {
-    pub(crate) fn from_persistence(
+    pub fn from_persistence(
         reads: Arc<dyn PodRepositoryReadPersistence>,
         writes: Arc<dyn PodRepositoryWritePersistence>,
         sandbox_gc_dirty: Arc<AtomicUsize>,
-        #[cfg(any(test, feature = "pod-repository-test-support"))] watches: Option<
-            Arc<dyn PodRepositoryWatchPersistence>,
-        >,
     ) -> Self {
         Self {
             reads,
             writes,
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(any(test, feature = "test-support"))]
+            watches: None,
+            sandbox_gc_dirty,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_persistence_with_watch(
+        reads: Arc<dyn PodRepositoryReadPersistence>,
+        writes: Arc<dyn PodRepositoryWritePersistence>,
+        sandbox_gc_dirty: Arc<AtomicUsize>,
+        watches: Option<Arc<dyn PodRepositoryWatchPersistence>>,
+    ) -> Self {
+        Self {
+            reads,
+            writes,
             watches,
             sandbox_gc_dirty,
         }
@@ -82,7 +94,7 @@ impl PodStore {
     /// set of repository services that legitimately need a non-Pod DB
     /// surface (see `mod.rs` doc comment). Outside `pod_repository/`,
     /// callers must always go through the typed methods.
-    pub(crate) async fn get(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
+    pub async fn get(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
         self.reads
             .get_persisted_pod(PodRepositoryGetRequest {
                 namespace: ns.to_string(),
@@ -92,7 +104,7 @@ impl PodStore {
             .map_err(Into::into)
     }
 
-    pub(crate) async fn list(
+    pub async fn list(
         &self,
         ns: Option<&str>,
         label_selector: Option<&str>,
@@ -120,7 +132,7 @@ impl PodStore {
         .map_err(Into::into)
     }
 
-    pub(crate) async fn snapshot_list(
+    pub async fn snapshot_list(
         &self,
         request: klights_pod_api::PodSnapshotListRequest,
     ) -> Result<klights_pod_api::PodSnapshotListOutcome> {
@@ -130,7 +142,7 @@ impl PodStore {
             .map_err(Into::into)
     }
 
-    pub(super) async fn list_by_owner(&self, ns: &str, owner_uid: &str) -> Result<Vec<Resource>> {
+    pub async fn list_by_owner(&self, ns: &str, owner_uid: &str) -> Result<Vec<Resource>> {
         self.reads
             .list_persisted_pods_by_owner(PodRepositoryOwnerListRequest {
                 namespace: ns.to_string(),
@@ -140,8 +152,8 @@ impl PodStore {
             .map_err(Into::into)
     }
 
-    #[cfg(feature = "pod-repository-test-support")]
-    pub(crate) async fn integration_list_by_owner(
+    #[cfg(feature = "test-support")]
+    pub async fn integration_list_by_owner(
         &self,
         namespace: &str,
         owner_uid: &str,
@@ -149,7 +161,7 @@ impl PodStore {
         self.list_by_owner(namespace, owner_uid).await
     }
 
-    pub(crate) async fn create(&self, ns: &str, name: &str, body: Value) -> Result<Resource> {
+    pub async fn create(&self, ns: &str, name: &str, body: Value) -> Result<Resource> {
         self.mark_sandbox_dirty();
         self.writes
             .create_persisted_pod(PodRepositoryCreateRequest {
@@ -161,7 +173,7 @@ impl PodStore {
             .map_err(Into::into)
     }
 
-    pub(crate) async fn update(
+    pub async fn update(
         &self,
         ns: &str,
         name: &str,
@@ -188,7 +200,7 @@ impl PodStore {
             .map_err(Into::into)
     }
 
-    pub(crate) async fn patch_metadata(
+    pub async fn patch_metadata(
         &self,
         ns: &str,
         name: &str,
@@ -211,8 +223,8 @@ impl PodStore {
             .ok_or_else(|| PodRepositoryError::not_found(ns, name).into())
     }
 
-    #[cfg(feature = "pod-repository-test-support")]
-    pub(super) async fn mark_deleting_latest(
+    #[cfg(feature = "test-support")]
+    async fn mark_deleting_latest(
         &self,
         ns: &str,
         name: &str,
@@ -253,8 +265,8 @@ impl PodStore {
             .ok_or_else(|| PodRepositoryError::not_found(ns, name).into())
     }
 
-    #[cfg(feature = "pod-repository-test-support")]
-    pub(crate) async fn integration_mark_deleting_latest(
+    #[cfg(feature = "test-support")]
+    pub async fn integration_mark_deleting_latest(
         &self,
         namespace: &str,
         name: &str,
@@ -264,7 +276,7 @@ impl PodStore {
         self.mark_deleting_latest(namespace, name, uid, body).await
     }
 
-    pub(super) async fn mark_deleting_at_resource_version(
+    pub async fn mark_deleting_at_resource_version(
         &self,
         ns: &str,
         name: &str,
@@ -292,7 +304,7 @@ impl PodStore {
     /// Internal scheduler path: bind `spec.nodeName` and update the
     /// PodScheduled condition in one datastore mutation. Normal Pod API update
     /// paths must use `update()`, which preserves status.
-    pub(crate) async fn update_including_status_for_scheduler(
+    pub async fn update_including_status_for_scheduler(
         &self,
         ns: &str,
         name: &str,
@@ -318,7 +330,7 @@ impl PodStore {
             .map_err(Into::into)
     }
 
-    pub(crate) async fn update_status_typed(
+    pub async fn update_status_typed(
         &self,
         ns: &str,
         name: &str,
@@ -363,7 +375,7 @@ impl PodStore {
             .await
     }
 
-    #[cfg(feature = "pod-repository-test-support")]
+    #[cfg(feature = "test-support")]
     async fn update_status(
         &self,
         ns: &str,
@@ -376,8 +388,8 @@ impl PodStore {
             .map_err(Into::into)
     }
 
-    #[cfg(feature = "pod-repository-test-support")]
-    pub(crate) async fn integration_update_status(
+    #[cfg(feature = "test-support")]
+    pub async fn integration_update_status(
         &self,
         ns: &str,
         name: &str,
@@ -387,7 +399,7 @@ impl PodStore {
         self.update_status(ns, name, status, expected_rv).await
     }
 
-    pub(crate) fn classify_bound_finalization(
+    pub fn classify_bound_finalization(
         &self,
         current: Option<&Resource>,
         uid: &str,
@@ -395,12 +407,16 @@ impl PodStore {
         classify_bound_finalization(current, uid)
     }
 
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
-    pub(super) fn subscribe_watch(&self) -> broadcast::Receiver<WatchEvent> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn subscribe_watch(&self) -> broadcast::Receiver<WatchEvent> {
         self.watches
             .as_ref()
             .expect("watch subscription is unavailable for this persistence adapter")
             .pod_watch_receiver()
+    }
+
+    pub fn sandbox_gc_dirty_counter(&self) -> Arc<AtomicUsize> {
+        self.sandbox_gc_dirty.clone()
     }
 }
 
@@ -435,7 +451,7 @@ fn planned_delete_mark_patch(body: &Value) -> Result<Value> {
     Ok(Value::Object(patch))
 }
 
-pub(crate) fn classify_bound_finalization(
+pub fn classify_bound_finalization(
     current: Option<&Resource>,
     uid: &str,
 ) -> ActorPodDeleteObservation {
@@ -519,7 +535,7 @@ impl klights_pod_api::PodQuery for PodStore {
     }
 }
 
-pub(crate) fn preserve_status_from_current(current: &Value, next: &mut Value) {
+pub fn preserve_status_from_current(current: &Value, next: &mut Value) {
     let Some(next_obj) = next.as_object_mut() else {
         return;
     };

@@ -16,10 +16,10 @@ use klights_reconcile_api::{
 };
 
 use crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::LocalBoundPodFinalizationPersistence;
-use crate::kubelet::pod_repository::store::{ActorPodDeleteObservation, PodStore};
 use klights_kubelet::outbox::{
     Outbox, OutboxCommand, OutboxOperation, OutboxSendPlanner, OutboxSubject,
 };
+use klights_kubelet::pod_repository::store::{ActorPodDeleteObservation, PodStore};
 
 pub(crate) struct RootBoundPodFinalization {
     store: Arc<PodStore>,

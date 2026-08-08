@@ -24,8 +24,8 @@ use klights_types::PodIdentity;
 
 use crate::datastore::DatastoreHandle;
 #[cfg(any(test, feature = "pod-repository-test-support"))]
-use crate::kubelet::pod_repository::store::PodRepositoryWatchPersistence;
-use crate::kubelet::pod_repository::store::{ActorPodDeleteObservation, PodStore};
+use klights_kubelet::pod_repository::store::PodRepositoryWatchPersistence;
+use klights_kubelet::pod_repository::store::{ActorPodDeleteObservation, PodStore};
 
 struct RootPodRepositoryPersistenceAdapter {
     db: DatastoreHandle,
@@ -298,7 +298,7 @@ impl LocalBoundPodFinalizationPersistence for RootPodRepositoryPersistenceAdapte
                 .await
                 .map_err(|error| BoundPodFinalizationError::unavailable(error.to_string()))?;
             let observed_resource_version =
-                match crate::kubelet::pod_repository::store::classify_bound_finalization(
+                match klights_kubelet::pod_repository::store::classify_bound_finalization(
                     current.as_ref(),
                     &identity.uid,
                 ) {
@@ -487,12 +487,18 @@ pub(crate) fn new_root_parts(
 ) -> RootPodRepositoryPersistenceParts {
     let sandbox_gc_dirty = Arc::new(AtomicUsize::new(1));
     let concrete = concrete_adapter(db, sandbox_gc_dirty.clone());
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    let store = Arc::new(PodStore::from_persistence_with_watch(
+        concrete.clone(),
+        concrete.clone(),
+        sandbox_gc_dirty,
+        Some(concrete.clone()),
+    ));
+    #[cfg(not(any(test, feature = "pod-repository-test-support")))]
     let store = Arc::new(PodStore::from_persistence(
         concrete.clone(),
         concrete.clone(),
         sandbox_gc_dirty,
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
-        Some(concrete.clone()),
     ));
     RootPodRepositoryPersistenceParts {
         store,
@@ -506,13 +512,17 @@ pub(crate) fn new_root_parts(
 pub(crate) fn new_store(db: DatastoreHandle) -> PodStore {
     let sandbox_gc_dirty = Arc::new(AtomicUsize::new(1));
     let concrete = concrete_adapter(db, sandbox_gc_dirty.clone());
-    PodStore::from_persistence(
-        concrete.clone(),
-        concrete.clone(),
-        sandbox_gc_dirty,
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
-        Some(concrete),
-    )
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    {
+        return PodStore::from_persistence_with_watch(
+            concrete.clone(),
+            concrete.clone(),
+            sandbox_gc_dirty,
+            Some(concrete),
+        );
+    }
+    #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+    PodStore::from_persistence(concrete.clone(), concrete, sandbox_gc_dirty)
 }
 
 #[cfg(test)]

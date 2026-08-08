@@ -1263,7 +1263,7 @@ enum IntegrationStatusRaceMode {
 }
 
 struct IntegrationStatusRaceWriter {
-    store: Arc<crate::kubelet::pod_repository::store::PodStore>,
+    store: Arc<klights_kubelet::pod_repository::store::PodStore>,
     attempts: std::sync::atomic::AtomicUsize,
     mode: IntegrationStatusRaceMode,
 }
@@ -1369,7 +1369,7 @@ impl klights_reconcile_api::PodMutationReconcileSink for IntegrationCountingPodM
 }
 
 struct IntegrationPausedStatusWriter {
-    store: Arc<crate::kubelet::pod_repository::store::PodStore>,
+    store: Arc<klights_kubelet::pod_repository::store::PodStore>,
     entered: Arc<tokio::sync::Barrier>,
     release: Arc<tokio::sync::Barrier>,
     requested_status: std::sync::Mutex<Option<serde_json::Value>>,
@@ -1749,7 +1749,7 @@ impl IntegrationDeadlineTimerRunnerFixture {
 
 pub struct IntegrationPodStoreFixture {
     _sqlite: crate::datastore::sqlite::Datastore,
-    store: Arc<crate::kubelet::pod_repository::store::PodStore>,
+    store: Arc<klights_kubelet::pod_repository::store::PodStore>,
     bound_finalization: Arc<
         dyn crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::LocalBoundPodFinalizationPersistence,
     >,

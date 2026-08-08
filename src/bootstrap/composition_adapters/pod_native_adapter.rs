@@ -14,8 +14,8 @@ use klights_pod_api::{
 
 use crate::datastore::{DatastoreHandle, ResourceListQuery};
 use crate::kubelet::pod_repository::delete_coordinator::PodDeleteCoordinator;
-use crate::kubelet::pod_repository::store::PodStore;
 use k8s_native_service::AdmissionResourceStore;
+use klights_kubelet::pod_repository::store::PodStore;
 
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 pub(crate) struct SchedulerBindGateForTest {

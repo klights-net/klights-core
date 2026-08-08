@@ -28,7 +28,6 @@ use crate::control_plane::client::{
     focused_dataplane, focused_node_subnet, query_error, query_list_result,
 };
 use crate::datastore::{DatastoreHandle, Resource};
-use crate::kubelet::pod_repository::store::PodStore;
 use klights_auth::projected_service_account_token::{
     authorize_projected_service_account_token, sign_authorized_projected_service_account_token,
 };
@@ -37,6 +36,7 @@ use klights_cluster_core::command::StorageCommand;
 use klights_controllers::ControllerDispatcher;
 #[cfg(test)]
 use klights_kubelet::node_outbox::payload::OutboxOperationExt as _;
+use klights_kubelet::pod_repository::store::PodStore;
 
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 type ProjectedTokenAsyncBoundary = Arc<

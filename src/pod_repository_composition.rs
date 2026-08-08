@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use crate::datastore::DatastoreHandle;
 use crate::kubelet::pod_repository::delete_coordinator::PodDeleteCoordinator;
-use crate::kubelet::pod_repository::store::PodStore;
 use crate::kubelet::pod_repository::{
     PodRepository, PodRepositoryAdapterDependencies, PodRepositoryAdapters,
     PodRepositoryCoreDependencies, PodRepositoryDeliveryDependencies,
     PodRepositoryNetworkDependencies, PodRepositoryRuntimeDependencies,
 };
+use klights_kubelet::pod_repository::store::PodStore;
 use klights_kubelet::pod_repository::workqueue::{
     PodWorkqueue, PodWorkqueueEntry, PodWorkqueueKind, PodWorkqueuePersistence,
 };
@@ -1108,8 +1108,6 @@ pub(crate) fn build_worker_pod_repository_parts(
         worker_persistence.clone(),
         worker_persistence.clone(),
         Arc::new(std::sync::atomic::AtomicUsize::new(1)),
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
-        None,
     ));
     let workqueue = PodWorkqueue::new(
         store.clone(),

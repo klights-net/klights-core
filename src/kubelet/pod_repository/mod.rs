@@ -3,7 +3,8 @@
 //! The repository owns kubelet lifecycle, workload-controller, accounting-
 //! controller, API pod subresource, AND the main API pod create / update /
 //! patch / delete / list paths. `("v1","Pod",...)` does not appear as a
-//! `DatastoreBackend` argument outside [`store::PodStore`].
+//! `DatastoreBackend` argument outside
+//! [`klights_kubelet::pod_repository::store::PodStore`].
 //!
 //! Internal services depend on `Arc<PodStore>` rather than
 //! `DatastoreHandle`, which localizes the pod-shaped DB boundary to a
@@ -216,7 +217,6 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
 pub mod background;
 pub mod delete_coordinator;
 pub mod facade;
-pub(crate) mod store;
 pub mod watch;
 
 #[cfg(test)]
@@ -246,9 +246,9 @@ impl<T> PodQueryTestExt for T where T: klights_pod_api::PodQuery + ?Sized {}
 use background::PodRepositoryBackground;
 use delete_coordinator::PodDeleteCoordinator;
 use klights_kubelet::pod_repository::status;
+use klights_kubelet::pod_repository::store::PodStore;
 use klights_kubelet::pod_repository::workqueue::PodWorkqueue;
 use klights_reconcile_api::{PodEvictionAdmissionSink, PodGcReconcileSink, PodPdbReconcileSink};
-use store::PodStore;
 use watch::PodWatchService;
 
 pub(crate) struct PodRepositoryAdapterDependencies {
@@ -580,7 +580,7 @@ impl PodRepository {
     }
 
     pub fn sandbox_gc_dirty_counter(&self) -> Arc<std::sync::atomic::AtomicUsize> {
-        self.store.sandbox_gc_dirty.clone()
+        self.store.sandbox_gc_dirty_counter()
     }
 
     pub(crate) fn host_ip_state(&self) -> klights_kubelet::context::HostIpState {

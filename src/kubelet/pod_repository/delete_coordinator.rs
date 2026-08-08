@@ -13,7 +13,7 @@ use klights_kubelet::pod_repository::delete_deadline::{
 use klights_reconcile_api::ReconcileFailureMetrics;
 use klights_supervisor::TaskSupervisor;
 
-use super::store::PodStore;
+use klights_kubelet::pod_repository::store::PodStore;
 use klights_kubelet::pod_repository::workqueue::PodWorkqueue;
 
 const MAX_DELETE_CONFLICT_RETRIES: u32 = 8;

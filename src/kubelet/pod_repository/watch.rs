@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use super::store::PodStore;
+use klights_kubelet::pod_repository::store::PodStore;
 
 pub(super) struct PodWatchService {
     _store: Arc<PodStore>,

@@ -7,6 +7,7 @@
 
 pub mod delete_deadline;
 pub mod status;
+pub mod store;
 pub mod workqueue;
 pub use status::PodStatusWriter;
 
