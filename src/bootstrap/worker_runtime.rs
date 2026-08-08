@@ -564,7 +564,10 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
 
     let pod_repository = pod_subsystem.repository.clone();
     let plr = pod_subsystem.lifecycle_router.clone();
-    pod_repository.set_pod_lifecycle_router_for_node(plr.clone(), config.node_name.clone());
+    let router_binding: std::sync::Arc<
+        dyn crate::kubelet::pod_repository::facade::PodLifecycleRouterBinding,
+    > = pod_repository.clone();
+    router_binding.bind_pod_lifecycle_router(plr.clone(), config.node_name.clone());
     worker_store.set_pod_lifecycle_router(plr.clone());
     let kubelet_config = crate::kubelet::context::KubeletConfig::try_new(
         config.service_cidr.clone(),

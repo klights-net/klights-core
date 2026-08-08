@@ -588,6 +588,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 root_parts.api,
                 root_parts.subresource,
                 root_parts.scheduling,
+                root_parts.mutation_reconcile,
             )),
         )
     };
@@ -696,6 +697,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     if let Some(worker_store_adapter) = worker_store_adapter.as_ref() {
         worker_store_adapter.set_pod_lifecycle_router(pod_lifecycle_router.clone());
     }
+    // Captured alongside the tuple below without widening its shape: several
+    // source guards match the exact destructure text of the 4-element tuple.
+    // Both arms assign this exactly once, so it is definitely initialized by
+    // the time it is read after the `if`/`else`.
+    let pod_mutation_reconcile_holder: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>;
     let (api_pod_repository, pod_api_service, pod_subresource_service, pod_scheduling) =
         if kubelet_uses_worker_store_adapter {
             let root_parts = crate::pod_repository_composition::build_pod_repository_parts(
@@ -732,6 +738,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 .start()
                 .await
                 .context("API Pod repository background startup")?;
+            pod_mutation_reconcile_holder = root_parts.mutation_reconcile;
             (
                 repo,
                 root_parts.api,
@@ -739,10 +746,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 root_parts.scheduling,
             )
         } else {
-            let (api, subresource, scheduling) = root_pod_api_services
+            let (api, subresource, scheduling, mutation_reconcile) = root_pod_api_services
                 .expect("root Pod API services must accompany the root repository");
+            pod_mutation_reconcile_holder = mutation_reconcile;
             (pod_repository.clone(), api, subresource, scheduling)
         };
+    let pod_mutation_reconcile = pod_mutation_reconcile_holder;
     let controller_pod_port = Arc::new(
         crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort::new(
             api_pod_repository.clone(),
@@ -1462,7 +1471,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let node_lifecycle_status = local_api_client.clone();
         let node_lifecycle_db = db_handle.clone();
         let node_lifecycle_pod_repository = controller_pod_port.clone();
-        let node_lifecycle_pod_mutations = api_pod_repository.mutation_reconcile_port();
+        let node_lifecycle_pod_mutations = pod_mutation_reconcile.clone();
         let node_lifecycle_pod_router = pod_lifecycle_router.clone();
         let node_lifecycle_lease_tracker = node_lease_tracker.clone();
         let node_lifecycle_supervisor = supervisor.clone();

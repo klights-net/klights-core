@@ -109,6 +109,10 @@ pub(crate) struct RootPodRepositoryParts {
     pub api: Arc<PodApiService>,
     pub subresource: Arc<PodSubresourceService>,
     pub scheduling: Arc<dyn klights_pod_api::PodScheduling>,
+    /// Focused mutation-reconcile port, captured at composition time so
+    /// callers reach it as an explicit field instead of a generic accessor
+    /// method on the full `PodRepository` aggregate.
+    pub mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
 }
 
 #[derive(Clone)]
@@ -1120,6 +1124,7 @@ fn build_pod_repository_parts_inner(
             supervisor: supervisor.clone(),
             deletion: delete_coordinator,
         });
+    let mutation_reconcile = adapters.mutation_reconcile.clone();
     let delivery_outbox = outbox.map(|outbox| outbox as Arc<dyn klights_leader_api::NodeOutbox>);
     let bound_pod_finalization =
         crate::bootstrap::composition_adapters::bound_pod_finalization_adapter::new_for_root(
@@ -1168,6 +1173,7 @@ fn build_pod_repository_parts_inner(
         api,
         subresource,
         scheduling,
+        mutation_reconcile,
     }
 }
 
