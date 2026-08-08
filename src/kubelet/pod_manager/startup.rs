@@ -2,7 +2,7 @@ use super::*;
 
 impl<'a> PodRecovery<'a> {
     pub fn new(
-        pod_repo: &'a Arc<crate::kubelet::pod_repository::PodRepository>,
+        pod_repo: Arc<dyn klights_pod_api::PodQuery>,
         node_name: &'a str,
         retry_state: &'a PodStartRetryTracker,
         pod_lifecycle_router: std::sync::Arc<
@@ -21,7 +21,7 @@ impl<'a> PodRecovery<'a> {
         // Route through PodQuery so the v1/Pod read boundary stays
         // inside `PodStore`.
         use klights_kubelet::pod_lifecycle_core::message::LifecycleMessage;
-        use klights_pod_api::{PodListRequest, PodQuery};
+        use klights_pod_api::PodListRequest;
         let field_selector = super::pod_watcher_node_field_selector(self.node_name);
         let pod_list = self
             .pod_repo
@@ -143,7 +143,7 @@ mod tests {
         let retry_state: klights_kubelet::pod_creation_state::PodStartRetryTracker = Arc::new(
             tokio::sync::Mutex::new(klights_kubelet::pod_creation_state::PodStartRetryState::new()),
         );
-        let mut recovery = PodRecovery::new(&pod_repo, "test-node", &retry_state, router);
+        let mut recovery = PodRecovery::new(pod_repo.clone(), "test-node", &retry_state, router);
 
         recovery
             .recover_existing_pods()

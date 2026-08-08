@@ -20,7 +20,12 @@ pub(super) struct WatchEventHandlerContext<'a> {
     pub persistent_volume_event_handler: &'a Arc<dyn PersistentVolumeEventHandler>,
     pub pod_cleanup_intents: &'a Arc<dyn klights_leader_api::LeaderPodCleanupIntents>,
     pub node_name: &'a str,
+    // `pod_repo` stays concrete: `handle_namespace_termination_event` needs
+    // the durable workqueue-backed `enqueue_actor_deletes_for_terminating_namespace`
+    // capability, which has no focused-port accessor yet. Volume-refresh reads
+    // use the focused `pod_query` field below instead of this aggregate.
     pub pod_repo: &'a Arc<crate::kubelet::pod_repository::PodRepository>,
+    pub pod_query: &'a dyn klights_pod_api::PodQuery,
     pub pod_creation_tracker: &'a PodCreationTracker,
     pub retry_state: &'a PodStartRetryTracker,
     pub pod_lifecycle_state: &'a PodLifecycleStateTracker,
@@ -40,6 +45,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
         pod_cleanup_intents,
         node_name,
         pod_repo,
+        pod_query,
         pod_creation_tracker,
         retry_state,
         pod_lifecycle_state,
@@ -98,7 +104,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
                 event_ns,
                 event_name,
                 &volumes_root,
-                pod_repo.as_ref(),
+                pod_query,
             )
             .await
         } else {
@@ -109,7 +115,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
                 event_name,
                 &event.object,
                 &volumes_root,
-                pod_repo.as_ref(),
+                pod_query,
             )
             .await
         };
@@ -944,6 +950,7 @@ mod tests {
                 pod_cleanup_intents: &pod_cleanup_intents,
                 node_name: "worker-a",
                 pod_repo: &pod_repo,
+                pod_query: pod_repo.as_ref(),
                 pod_creation_tracker: &pod_creation_tracker,
                 retry_state: &retry_state,
                 pod_lifecycle_state: &pod_lifecycle_state,

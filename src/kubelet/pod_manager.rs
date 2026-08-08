@@ -92,9 +92,15 @@ impl PodWatcherRuntimeContext {
         pod_watch_source: Arc<dyn PodWatchSource>,
         persistent_volume_event_handler: Arc<dyn PersistentVolumeEventHandler>,
     ) -> Self {
+        // `host_ip_state()` clones the repository's shared `HostIpState`
+        // handle; it is a crate-private convenience accessor with no
+        // focused-port replacement, so this is the one place remaining
+        // that names the concrete repository type explicitly.
+        let pod_repository: &Arc<crate::kubelet::pod_repository::PodRepository> =
+            &lifecycle.pod_repository;
         Self {
             pod_watch_source,
-            host_ip: lifecycle.pod_repository.host_ip_state(),
+            host_ip: pod_repository.host_ip_state(),
             lifecycle,
             status_delivery,
             local_execution,
@@ -122,7 +128,7 @@ mod watch_topic_tests {
 }
 
 struct PodRecovery<'a> {
-    pod_repo: &'a Arc<crate::kubelet::pod_repository::PodRepository>,
+    pod_repo: Arc<dyn klights_pod_api::PodQuery>,
     node_name: &'a str,
     retry_state: &'a PodStartRetryTracker,
     pod_lifecycle_router: std::sync::Arc<klights_kubelet::pod_lifecycle_router::PodLifecycleRouter>,
@@ -337,7 +343,7 @@ async fn run_pod_watcher_with_runtime(
 
     {
         let mut pod_recovery = PodRecovery::new(
-            &lifecycle.pod_repository,
+            lifecycle.pod_repository.clone(),
             &config.node_name,
             &pod_start_retry_state,
             pod_lifecycle_router.clone(),
@@ -496,6 +502,7 @@ async fn run_pod_watcher_with_runtime(
                         pod_cleanup_intents: &status_delivery.pod_cleanup_intents,
                         node_name: &config.node_name,
                         pod_repo: &lifecycle.pod_repository,
+                        pod_query: lifecycle.pod_repository.as_ref(),
                         pod_creation_tracker: &pod_creation_tracker,
                         retry_state: &pod_start_retry_state,
                         pod_lifecycle_state: &pod_lifecycle_state,
@@ -540,7 +547,7 @@ async fn run_pod_watcher_with_runtime(
                 );
                 if let Some(key) = pod_lifecycle_key_for_cri_event(
                     container_control.as_ref(),
-                    &lifecycle.pod_repository,
+                    lifecycle.pod_repository.as_ref(),
                     &ev,
                 ).await {
                     let _ = pod_lifecycle_router
@@ -628,11 +635,11 @@ fn lifecycle_message_from_watch_event(event: &PodWatchEvent) -> Option<Lifecycle
 }
 
 async fn pod_lifecycle_key_for_pod_name(
-    pod_repo: &Arc<crate::kubelet::pod_repository::PodRepository>,
+    pod_repo: &dyn klights_pod_api::PodQuery,
     namespace: &str,
     pod_name: &str,
 ) -> Option<PodLifecycleKey> {
-    use klights_pod_api::{PodGetRequest, PodQuery};
+    use klights_pod_api::PodGetRequest;
 
     match pod_repo
         .get_pod(PodGetRequest::try_by_name(namespace, pod_name).ok()?)
@@ -653,7 +660,7 @@ async fn pod_lifecycle_key_for_pod_name(
 
 async fn pod_lifecycle_key_for_cri_event(
     container_control: &dyn klights_kubelet::runtime::cri::ContainerRuntimeControl,
-    pod_repo: &Arc<crate::kubelet::pod_repository::PodRepository>,
+    pod_repo: &dyn klights_pod_api::PodQuery,
     event: &klights_kubelet::cri_events::KubeletEvent,
 ) -> Option<PodLifecycleKey> {
     let resolved = match (event.pod_namespace.as_deref(), event.pod_name.as_deref()) {
