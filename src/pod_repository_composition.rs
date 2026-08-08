@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use crate::datastore::DatastoreHandle;
-use crate::kubelet::pod_repository::delete_coordinator::PodDeleteCoordinator;
 use crate::kubelet::pod_repository::{
     PodRepository, PodRepositoryAdapterDependencies, PodRepositoryAdapters,
     PodRepositoryCoreDependencies, PodRepositoryDeliveryDependencies,
     PodRepositoryNetworkDependencies, PodRepositoryRuntimeDependencies,
 };
+use klights_kubelet::pod_repository::delete_coordinator::PodDeleteCoordinator;
 use klights_kubelet::pod_repository::store::PodStore;
 use klights_kubelet::pod_repository::workqueue::{
     PodWorkqueue, PodWorkqueueEntry, PodWorkqueueKind, PodWorkqueuePersistence,
@@ -861,7 +861,6 @@ impl RootPodRepositoryComposition {
         let native =
             crate::bootstrap::composition_adapters::pod_native_adapter::RootPodNativeAdapter::new(
                 dependencies.store.clone(),
-                dependencies.delete_coordinator.clone(),
                 self.db.clone(),
                 self.wall_clock.clone(),
                 #[cfg(any(test, feature = "pod-repository-test-support"))]
@@ -870,7 +869,7 @@ impl RootPodRepositoryComposition {
         let pod_query: Arc<dyn klights_pod_api::PodQuery> = native.clone();
         let persistence: Arc<dyn klights_pod_api::PodPersistence> = native.clone();
         let status_persistence: Arc<dyn klights_pod_api::PodStatusPersistence> = native.clone();
-        let deletion: Arc<dyn klights_pod_api::PodDeleteOrchestration> = native.clone();
+        let deletion: Arc<dyn klights_pod_api::PodDeleteOrchestration> = dependencies.deletion;
         let event_sink: Arc<dyn klights_pod_api::PodControlPlaneEventSink> = native.clone();
         let placement: Arc<dyn klights_pod_api::PodPlacement> =
             Arc::new(klights_controllers::scheduler::SchedulerPlacement::new());
@@ -1119,7 +1118,7 @@ fn build_pod_repository_parts_inner(
         .build(PodRepositoryAdapterDependencies {
             store: store.clone(),
             supervisor: supervisor.clone(),
-            delete_coordinator,
+            deletion: delete_coordinator,
         });
     let delivery_outbox = outbox.map(|outbox| outbox as Arc<dyn klights_leader_api::NodeOutbox>);
     let bound_pod_finalization =
@@ -1213,7 +1212,7 @@ pub(crate) fn build_worker_pod_repository_parts(
         PodRepositoryAdapterDependencies {
             store: store.clone(),
             supervisor: config.supervisor.clone(),
-            delete_coordinator: Arc::new(PodDeleteCoordinator::new(
+            deletion: Arc::new(PodDeleteCoordinator::new(
                 store.clone(),
                 workqueue.clone(),
                 config.supervisor.clone(),

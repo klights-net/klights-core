@@ -5,15 +5,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
 use klights_pod_api::{
-    PodActorFinalizeRequest, PodControlPlaneEventRequest, PodControlPlaneEventSink,
-    PodDeleteMarkOutcome, PodDeleteMarkRequest, PodDeleteOrchestration, PodGetRequest,
-    PodListRequest, PodListResult, PodMarkedRetryRequest, PodMetadataPatchRequest, PodPersistence,
-    PodPersistenceCreateRequest, PodPersistenceReplaceRequest, PodQuery, PodRepositoryError,
-    PodRepositoryFuture, PodSpecValidation, PodStatusPersistence, PodStatusWriteRequest,
+    PodControlPlaneEventRequest, PodControlPlaneEventSink, PodGetRequest, PodListRequest,
+    PodListResult, PodMetadataPatchRequest, PodPersistence, PodPersistenceCreateRequest,
+    PodPersistenceReplaceRequest, PodQuery, PodRepositoryError, PodRepositoryFuture,
+    PodSpecValidation, PodStatusPersistence, PodStatusWriteRequest,
 };
 
 use crate::datastore::{DatastoreHandle, ResourceListQuery};
-use crate::kubelet::pod_repository::delete_coordinator::PodDeleteCoordinator;
 use k8s_native_service::AdmissionResourceStore;
 use klights_kubelet::pod_repository::store::PodStore;
 
@@ -58,7 +56,6 @@ impl SchedulerBindGateForTest {
 
 pub(crate) struct RootPodNativeAdapter {
     store: Arc<PodStore>,
-    delete_coordinator: Arc<PodDeleteCoordinator>,
     db: DatastoreHandle,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
     #[cfg(any(test, feature = "pod-repository-test-support"))]
@@ -68,7 +65,6 @@ pub(crate) struct RootPodNativeAdapter {
 impl RootPodNativeAdapter {
     pub(crate) fn new(
         store: Arc<PodStore>,
-        delete_coordinator: Arc<PodDeleteCoordinator>,
         db: DatastoreHandle,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
         #[cfg(any(test, feature = "pod-repository-test-support"))] scheduler_bind_gate: Option<
@@ -77,7 +73,6 @@ impl RootPodNativeAdapter {
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
-            delete_coordinator,
             db,
             wall_clock,
             #[cfg(any(test, feature = "pod-repository-test-support"))]
@@ -205,71 +200,6 @@ impl PodStatusPersistence for RootPodNativeAdapter {
                     request.expected_resource_version,
                 )
                 .await
-        })
-    }
-}
-
-impl PodDeleteOrchestration for RootPodNativeAdapter {
-    fn preview_delete(
-        &self,
-        resource: &Resource,
-        requested_grace_period_seconds: Option<i64>,
-    ) -> Result<serde_json::Value, PodRepositoryError> {
-        self.delete_coordinator
-            .dry_run_delete_body(resource, requested_grace_period_seconds)
-    }
-
-    fn mark_and_queue_delete(
-        &self,
-        request: PodDeleteMarkRequest,
-    ) -> PodRepositoryFuture<'_, PodDeleteMarkOutcome> {
-        Box::pin(async move {
-            let outcome = self
-                .delete_coordinator
-                .mark_and_queue_api_delete(
-                    &request.namespace,
-                    &request.name,
-                    request.requested_grace_period_seconds,
-                    &request.preconditions,
-                    request.initial_resource,
-                )
-                .await?;
-            Ok(PodDeleteMarkOutcome {
-                updated: outcome.updated,
-                previous: outcome.previous,
-                uid: outcome.uid,
-                changed: outcome.changed,
-            })
-        })
-    }
-
-    fn enqueue_actor_finalize_if_ready(
-        &self,
-        request: PodActorFinalizeRequest,
-    ) -> PodRepositoryFuture<'_, ()> {
-        Box::pin(async move {
-            self.delete_coordinator
-                .enqueue_actor_finalize_if_ready(
-                    &request.namespace,
-                    &request.name,
-                    &request.resource,
-                )
-                .await
-        })
-    }
-
-    fn enqueue_marked_retry(&self, request: PodMarkedRetryRequest) -> PodRepositoryFuture<'_, ()> {
-        Box::pin(async move {
-            self.delete_coordinator
-                .enqueue_marked_pod_retry(
-                    request.namespace,
-                    request.name,
-                    request.uid,
-                    request.run_after,
-                    &request.pod_data,
-                )
-                .await
-                .map_err(|error| PodRepositoryError::internal(error.to_string()))
         })
     }
 }

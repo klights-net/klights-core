@@ -3,31 +3,26 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use klights_pod_api::PodRepositoryError;
+use klights_pod_api::{
+    PodActorFinalizeRequest, PodDeleteMarkOutcome, PodDeleteMarkRequest, PodDeleteOrchestration,
+    PodMarkedRetryRequest, PodRepositoryError, PodRepositoryFuture,
+};
 use serde_json::Value;
 
-use klights_cluster_core::{Resource, ResourcePreconditions};
-use klights_kubelet::pod_repository::delete_deadline::{
+use crate::pod_repository::delete_deadline::{
     PodDeleteDeadlineDisposition, has_nonempty_pod_deletion_timestamp, plan_pod_delete_deadline,
 };
+use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_reconcile_api::ReconcileFailureMetrics;
 use klights_supervisor::TaskSupervisor;
 
-use klights_kubelet::pod_repository::store::PodStore;
-use klights_kubelet::pod_repository::workqueue::PodWorkqueue;
+use crate::pod_repository::store::PodStore;
+use crate::pod_repository::workqueue::PodWorkqueue;
 
 const MAX_DELETE_CONFLICT_RETRIES: u32 = 8;
 
-#[derive(Debug)]
-pub(crate) struct PodDeleteMarkOutcome {
-    pub updated: Resource,
-    pub previous: Resource,
-    pub uid: String,
-    pub changed: bool,
-}
-
 #[async_trait]
-pub(crate) trait PodDeleteStorePort: Send + Sync {
+trait PodDeleteStorePort: Send + Sync {
     async fn get(&self, ns: &str, name: &str) -> Result<Option<Resource>>;
 
     async fn mark_deleting_at_resource_version(
@@ -59,7 +54,7 @@ impl PodDeleteStorePort for PodStore {
 }
 
 #[async_trait]
-pub(crate) trait PodDeleteQueuePort: Send + Sync {
+trait PodDeleteQueuePort: Send + Sync {
     async fn enqueue_deferred_delete_with_target_node(
         &self,
         ns: String,
@@ -113,7 +108,7 @@ impl PodDeleteQueuePort for WorkqueuePodDeleteQueue {
 }
 
 #[async_trait]
-pub(crate) trait PodDeleteSleeperPort: Send + Sync {
+trait PodDeleteSleeperPort: Send + Sync {
     async fn sleep(&self, name: &'static str, duration: Duration);
 }
 
@@ -133,16 +128,16 @@ pub struct PodDeleteCoordinator {
     queue: Arc<dyn PodDeleteQueuePort>,
     sleeper: Arc<dyn PodDeleteSleeperPort>,
     metrics: Arc<dyn ReconcileFailureMetrics>,
-    wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+    wall_clock: Arc<dyn crate::runtime_clock::RuntimeClock>,
 }
 
 impl PodDeleteCoordinator {
-    pub(crate) fn new(
+    pub fn new(
         store: Arc<PodStore>,
         workqueue: Arc<PodWorkqueue>,
         supervisor: Arc<TaskSupervisor>,
         metrics: Arc<dyn ReconcileFailureMetrics>,
-        wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+        wall_clock: Arc<dyn crate::runtime_clock::RuntimeClock>,
     ) -> Self {
         Self::new_with_ports(
             store,
@@ -153,12 +148,12 @@ impl PodDeleteCoordinator {
         )
     }
 
-    pub(crate) fn new_with_ports(
+    fn new_with_ports(
         store: Arc<dyn PodDeleteStorePort>,
         queue: Arc<dyn PodDeleteQueuePort>,
         sleeper: Arc<dyn PodDeleteSleeperPort>,
         metrics: Arc<dyn ReconcileFailureMetrics>,
-        wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+        wall_clock: Arc<dyn crate::runtime_clock::RuntimeClock>,
     ) -> Self {
         Self {
             store,
@@ -169,7 +164,7 @@ impl PodDeleteCoordinator {
         }
     }
 
-    pub(crate) fn dry_run_delete_body(
+    fn dry_run_delete_body(
         &self,
         resource: &Resource,
         requested_grace_period_seconds: Option<i64>,
@@ -192,7 +187,7 @@ impl PodDeleteCoordinator {
         Ok(data)
     }
 
-    pub(crate) async fn enqueue_actor_finalize_if_ready(
+    async fn enqueue_actor_finalize_if_ready_inner(
         &self,
         ns: &str,
         name: &str,
@@ -234,7 +229,7 @@ impl PodDeleteCoordinator {
         Ok(())
     }
 
-    pub(crate) async fn mark_and_queue_api_delete(
+    async fn mark_and_queue_api_delete(
         &self,
         ns: &str,
         name: &str,
@@ -378,7 +373,7 @@ impl PodDeleteCoordinator {
             .await
     }
 
-    pub(crate) async fn enqueue_marked_pod_retry(
+    async fn enqueue_marked_pod_retry(
         &self,
         ns: String,
         name: String,
@@ -395,6 +390,60 @@ impl PodDeleteCoordinator {
                 pod_target_node_from_pod_data(pod_data),
             )
             .await
+    }
+}
+
+impl PodDeleteOrchestration for PodDeleteCoordinator {
+    fn preview_delete(
+        &self,
+        resource: &Resource,
+        requested_grace_period_seconds: Option<i64>,
+    ) -> Result<Value, PodRepositoryError> {
+        self.dry_run_delete_body(resource, requested_grace_period_seconds)
+    }
+
+    fn mark_and_queue_delete(
+        &self,
+        request: PodDeleteMarkRequest,
+    ) -> PodRepositoryFuture<'_, PodDeleteMarkOutcome> {
+        Box::pin(async move {
+            self.mark_and_queue_api_delete(
+                &request.namespace,
+                &request.name,
+                request.requested_grace_period_seconds,
+                &request.preconditions,
+                request.initial_resource,
+            )
+            .await
+        })
+    }
+
+    fn enqueue_actor_finalize_if_ready(
+        &self,
+        request: PodActorFinalizeRequest,
+    ) -> PodRepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            self.enqueue_actor_finalize_if_ready_inner(
+                &request.namespace,
+                &request.name,
+                &request.resource,
+            )
+            .await
+        })
+    }
+
+    fn enqueue_marked_retry(&self, request: PodMarkedRetryRequest) -> PodRepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            self.enqueue_marked_pod_retry(
+                request.namespace,
+                request.name,
+                request.uid,
+                request.run_after,
+                &request.pod_data,
+            )
+            .await
+            .map_err(|error| PodRepositoryError::internal(error.to_string()))
+        })
     }
 }
 
@@ -437,7 +486,7 @@ fn is_repository_conflict(error: &anyhow::Error) -> bool {
     )
 }
 
-pub(super) fn pod_target_node_from_pod_data(pod: &Value) -> Option<String> {
+fn pod_target_node_from_pod_data(pod: &Value) -> Option<String> {
     pod.pointer("/spec/nodeName")
         .and_then(|node| node.as_str())
         .filter(|node| !node.trim().is_empty())
@@ -447,10 +496,33 @@ pub(super) fn pod_target_node_from_pod_data(pod: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use klights_controllers::side_effects::SideEffectMetrics;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingMetrics {
+        cascade_delete_failures_total: AtomicUsize,
+        namespace_delete_failures_total: AtomicUsize,
+    }
+
+    impl RecordingMetrics {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+    }
+
+    impl ReconcileFailureMetrics for RecordingMetrics {
+        fn record_cascade_delete_failure(&self) {
+            self.cascade_delete_failures_total
+                .fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn record_namespace_delete_failure(&self) {
+            self.namespace_delete_failures_total
+                .fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     struct FakeDeleteStore {
         current: Mutex<Resource>,
@@ -654,7 +726,7 @@ mod tests {
 
     struct FixedDeleteClock;
 
-    impl klights_kubelet::runtime_clock::RuntimeClock for FixedDeleteClock {
+    impl crate::runtime_clock::RuntimeClock for FixedDeleteClock {
         fn now_ms(&self) -> i64 {
             1_786_190_400_000
         }
@@ -665,7 +737,7 @@ mod tests {
         calls: AtomicUsize,
     }
 
-    impl klights_kubelet::runtime_clock::RuntimeClock for AdvancingDeleteClock {
+    impl crate::runtime_clock::RuntimeClock for AdvancingDeleteClock {
         fn now_ms(&self) -> i64 {
             1_786_190_400_000 + self.calls.fetch_add(1, Ordering::SeqCst) as i64 * 10_000
         }
@@ -734,7 +806,7 @@ mod tests {
             Arc::new(FakeDeleteStore::new(pod_resource())),
             Arc::new(RecordingDeleteQueue::default()),
             Arc::new(NoopDeleteSleeper),
-            SideEffectMetrics::new(),
+            RecordingMetrics::new(),
             Arc::new(FixedDeleteClock),
         );
         let body = coordinator
@@ -765,7 +837,7 @@ mod tests {
             store.clone(),
             queue.clone(),
             Arc::new(NoopDeleteSleeper),
-            SideEffectMetrics::new(),
+            RecordingMetrics::new(),
             Arc::new(FixedDeleteClock),
         );
 
@@ -802,7 +874,7 @@ mod tests {
                 store.clone(),
                 queue.clone(),
                 Arc::new(NoopDeleteSleeper),
-                SideEffectMetrics::new(),
+                RecordingMetrics::new(),
                 Arc::new(FixedDeleteClock),
             );
 
@@ -835,7 +907,7 @@ mod tests {
             store.clone(),
             queue.clone(),
             Arc::new(NoopDeleteSleeper),
-            SideEffectMetrics::new(),
+            RecordingMetrics::new(),
             Arc::new(FixedDeleteClock),
         );
 
@@ -869,7 +941,7 @@ mod tests {
             store.clone(),
             queue.clone(),
             Arc::new(NoopDeleteSleeper),
-            SideEffectMetrics::new(),
+            RecordingMetrics::new(),
             Arc::new(FixedDeleteClock),
         );
 
@@ -914,7 +986,7 @@ mod tests {
             store.clone(),
             queue.clone(),
             Arc::new(NoopDeleteSleeper),
-            SideEffectMetrics::new(),
+            RecordingMetrics::new(),
             Arc::new(FixedDeleteClock),
         );
 
@@ -954,7 +1026,7 @@ mod tests {
             store,
             queue.clone(),
             Arc::new(NoopDeleteSleeper),
-            SideEffectMetrics::new(),
+            RecordingMetrics::new(),
             clock.clone(),
         );
 
@@ -1012,13 +1084,13 @@ mod tests {
         let queue = Arc::new(FailingDeleteQueue {
             calls: AtomicUsize::new(0),
         });
-        let metrics = SideEffectMetrics::new();
+        let metrics = RecordingMetrics::new();
         let coordinator = PodDeleteCoordinator::new_with_ports(
             store.clone(),
             queue.clone(),
             Arc::new(NoopDeleteSleeper),
             metrics.clone(),
-            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+            Arc::new(crate::runtime_clock::SystemRuntimeClock),
         );
 
         let err = coordinator
@@ -1066,7 +1138,7 @@ mod tests {
             store.clone(),
             queue.clone(),
             Arc::new(NoopDeleteSleeper),
-            SideEffectMetrics::new(),
+            RecordingMetrics::new(),
             Arc::new(FixedDeleteClock),
         );
 
@@ -1110,7 +1182,7 @@ mod tests {
         let queue = Arc::new(FailingDeleteQueue {
             calls: AtomicUsize::new(0),
         });
-        let metrics = SideEffectMetrics::new();
+        let metrics = RecordingMetrics::new();
         let coordinator = PodDeleteCoordinator::new_with_ports(
             Arc::new(FakeDeleteStore::new(resource.clone())),
             queue.clone(),
@@ -1120,7 +1192,7 @@ mod tests {
         );
 
         let error = coordinator
-            .enqueue_actor_finalize_if_ready("default", "pod-a", &resource)
+            .enqueue_actor_finalize_if_ready_inner("default", "pod-a", &resource)
             .await
             .expect_err("finalizer-drain queue failure must reach the API retry path");
         assert!(matches!(error, PodRepositoryError::Internal { .. }));
@@ -1145,7 +1217,7 @@ mod tests {
             store.clone(),
             queue.clone(),
             Arc::new(NoopDeleteSleeper),
-            SideEffectMetrics::new(),
+            RecordingMetrics::new(),
             Arc::new(FixedDeleteClock),
         );
 
@@ -1181,12 +1253,12 @@ mod tests {
             Arc::new(FakeDeleteStore::new(resource.clone())),
             queue.clone(),
             Arc::new(NoopDeleteSleeper),
-            SideEffectMetrics::new(),
+            RecordingMetrics::new(),
             Arc::new(FixedDeleteClock),
         );
 
         coordinator
-            .enqueue_actor_finalize_if_ready("default", "pod-a", &resource)
+            .enqueue_actor_finalize_if_ready_inner("default", "pod-a", &resource)
             .await
             .expect("null timestamp is not terminating and must be ignored");
         assert_eq!(queue.calls.load(Ordering::SeqCst), 0);
@@ -1249,7 +1321,7 @@ mod tests {
             store.clone(),
             queue.clone(),
             Arc::new(NoopDeleteSleeper),
-            SideEffectMetrics::new(),
+            RecordingMetrics::new(),
             Arc::new(FixedDeleteClock),
         ));
         let entered = store.mark_entered.notified();

@@ -215,7 +215,6 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
 }
 
 pub mod background;
-pub mod delete_coordinator;
 pub mod facade;
 pub mod watch;
 
@@ -244,7 +243,6 @@ pub(crate) trait PodQueryTestExt: klights_pod_api::PodQuery {
 impl<T> PodQueryTestExt for T where T: klights_pod_api::PodQuery + ?Sized {}
 
 use background::PodRepositoryBackground;
-use delete_coordinator::PodDeleteCoordinator;
 use klights_kubelet::pod_repository::status;
 use klights_kubelet::pod_repository::store::PodStore;
 use klights_kubelet::pod_repository::workqueue::PodWorkqueue;
@@ -254,7 +252,7 @@ use watch::PodWatchService;
 pub(crate) struct PodRepositoryAdapterDependencies {
     pub store: Arc<PodStore>,
     pub supervisor: Arc<TaskSupervisor>,
-    pub delete_coordinator: Arc<PodDeleteCoordinator>,
+    pub deletion: Arc<dyn klights_pod_api::PodDeleteOrchestration>,
 }
 
 pub(crate) struct PodRepositoryRuntimeDependencies {

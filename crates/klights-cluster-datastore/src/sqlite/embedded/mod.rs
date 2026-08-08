@@ -4016,7 +4016,7 @@ impl Datastore {
 
     /// Focused test-support constructor with bootstrap ownership injected by
     /// the external integration-test composition root.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn new_for_gc_test_support(
         supervisor: std::sync::Arc<TaskSupervisor>,
     ) -> Result<Self> {
