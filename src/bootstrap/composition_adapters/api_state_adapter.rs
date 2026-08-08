@@ -244,19 +244,41 @@ impl klights_reconcile_api::NamespaceTerminationSink for RootNamespaceTerminatio
 }
 
 pub(crate) struct RootApiPodRepository {
-    inner: Arc<crate::kubelet::pod_repository::PodRepository>,
+    query: Arc<dyn klights_pod_api::PodQuery>,
+    snapshot: Arc<dyn klights_pod_api::PodSnapshotQuery>,
+    mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
+    namespace_termination_queue: Arc<dyn klights_reconcile_api::NamespaceTerminationQueueSink>,
+    eviction_admission: Arc<dyn klights_reconcile_api::PodEvictionAdmissionSink>,
+    namespace_bootstrap: Arc<dyn klights_reconcile_api::NamespaceBootstrapSink>,
     api: Arc<dyn klights_pod_api::PodApiMutation>,
     subresource: Arc<dyn klights_pod_api::PodSubresourceMutation>,
 }
 
 impl RootApiPodRepository {
+    /// `inner` is decomposed into focused capability fields immediately;
+    /// this constructor is the only place in this file that names the
+    /// concrete root repository type, matching its role as the single
+    /// composition boundary that still receives it from the caller.
     pub(crate) fn new(
         inner: Arc<crate::kubelet::pod_repository::PodRepository>,
         api: Arc<dyn klights_pod_api::PodApiMutation>,
         subresource: Arc<dyn klights_pod_api::PodSubresourceMutation>,
     ) -> Arc<Self> {
+        let mutation_reconcile = inner.mutation_reconcile_port();
+        let eviction_admission = inner.eviction_admission_port();
+        let namespace_bootstrap = inner.namespace_bootstrap_port();
+        let query: Arc<dyn klights_pod_api::PodQuery> = inner.clone();
+        let snapshot: Arc<dyn klights_pod_api::PodSnapshotQuery> = inner.clone();
+        let namespace_termination_queue: Arc<
+            dyn klights_reconcile_api::NamespaceTerminationQueueSink,
+        > = inner;
         Arc::new(Self {
-            inner,
+            query,
+            snapshot,
+            mutation_reconcile,
+            namespace_termination_queue,
+            eviction_admission,
+            namespace_bootstrap,
             api,
             subresource,
         })
@@ -268,21 +290,21 @@ impl klights_pod_api::PodQuery for RootApiPodRepository {
         &self,
         request: klights_pod_api::PodGetRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, Option<Resource>> {
-        klights_pod_api::PodQuery::get_pod(self.inner.as_ref(), request)
+        self.query.get_pod(request)
     }
 
     fn list_pods(
         &self,
         request: klights_pod_api::PodListRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodListResult> {
-        klights_pod_api::PodQuery::list_pods(self.inner.as_ref(), request)
+        self.query.list_pods(request)
     }
 
     fn list_pods_by_owner_uid(
         &self,
         request: klights_pod_api::PodOwnerListRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, Vec<Resource>> {
-        klights_pod_api::PodQuery::list_pods_by_owner_uid(self.inner.as_ref(), request)
+        self.query.list_pods_by_owner_uid(request)
     }
 }
 
@@ -291,7 +313,7 @@ impl klights_pod_api::PodSnapshotQuery for RootApiPodRepository {
         &self,
         request: klights_pod_api::PodSnapshotListRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodSnapshotListOutcome> {
-        klights_pod_api::PodSnapshotQuery::snapshot_pods(self.inner.as_ref(), request)
+        self.snapshot.snapshot_pods(request)
     }
 }
 
@@ -426,8 +448,7 @@ impl klights_pod_api::PodEvictionDelete for RootApiPodRepository {
                 }
                 klights_pod_api::PodApiDeleteOutcome::GracefulSet(resource) => {
                     let _ = self
-                        .inner
-                        .mutation_reconcile_port()
+                        .mutation_reconcile
                         .reconcile_pod_mutation(
                             klights_reconcile_api::PodMutationReconcileRequest::RunHooks {
                                 pod: resource.clone(),
@@ -451,21 +472,18 @@ impl klights_reconcile_api::NamespaceTerminationQueueSink for RootApiPodReposito
         namespace: String,
         uid: String,
     ) -> klights_reconcile_api::ReconcileSinkFuture<'_> {
-        klights_reconcile_api::NamespaceTerminationQueueSink::enqueue_namespace_termination(
-            self.inner.as_ref(),
-            namespace,
-            uid,
-        )
+        self.namespace_termination_queue
+            .enqueue_namespace_termination(namespace, uid)
     }
 }
 
 impl ApiPodRepository for RootApiPodRepository {
     fn eviction_admission_port(&self) -> Arc<dyn klights_reconcile_api::PodEvictionAdmissionSink> {
-        self.inner.eviction_admission_port()
+        self.eviction_admission.clone()
     }
 
     fn namespace_bootstrap_port(&self) -> Arc<dyn klights_reconcile_api::NamespaceBootstrapSink> {
-        self.inner.namespace_bootstrap_port()
+        self.namespace_bootstrap.clone()
     }
 }
 

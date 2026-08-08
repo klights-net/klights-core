@@ -4,7 +4,7 @@ use crate::datastore::DatastoreHandle;
 
 pub(crate) struct GcOwnerLifecycleAdapter {
     db: DatastoreHandle,
-    pod_delete_sink: std::sync::Arc<crate::kubelet::pod_repository::PodRepository>,
+    pod_delete_sink: std::sync::Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
     non_pod_finalization: GcNonPodFinalizationAdapter,
     coordination: std::sync::Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
 }
@@ -12,7 +12,7 @@ pub(crate) struct GcOwnerLifecycleAdapter {
 impl GcOwnerLifecycleAdapter {
     pub(crate) fn new_with_coordination(
         db: DatastoreHandle,
-        pod_delete_sink: std::sync::Arc<crate::kubelet::pod_repository::PodRepository>,
+        pod_delete_sink: std::sync::Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
         coordination: std::sync::Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
     ) -> Self {
         Self {

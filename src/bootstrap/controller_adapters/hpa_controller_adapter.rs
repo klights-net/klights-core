@@ -89,7 +89,8 @@ impl HpaMetrics for NodeApiHpaMetrics<'_> {
 
 struct RootHpaReconcileAdapter {
     db: crate::datastore::DatastoreHandle,
-    pod_repository: std::sync::Arc<PodRepository>,
+    pod_query: std::sync::Arc<dyn PodQuery>,
+    pod_delete_sink: std::sync::Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
     pod_mutation: std::sync::Arc<ControllerPodMutationAdapter>,
     non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
     coordination: std::sync::Arc<klights_controllers::ControllerCoordination>,
@@ -109,10 +110,17 @@ pub(crate) fn controller(
     node_metrics: std::sync::Arc<dyn NodeMetrics>,
     identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
 ) -> std::sync::Arc<klights_controllers::hpa::HpaController> {
+    // `pod_repository` is decomposed into focused capability fields
+    // immediately; this constructor is the only place in this file that
+    // names the concrete root repository type.
+    let pod_query: std::sync::Arc<dyn PodQuery> = pod_repository.clone();
+    let pod_delete_sink: std::sync::Arc<dyn klights_reconcile_api::GcPodDeleteSink> =
+        pod_repository;
     std::sync::Arc::new(klights_controllers::hpa::HpaController::new(
         std::sync::Arc::new(RootHpaReconcileAdapter {
             db,
-            pod_repository,
+            pod_query,
+            pod_delete_sink,
             pod_mutation,
             non_pod_finalization,
             coordination,
@@ -132,7 +140,8 @@ impl klights_controllers::hpa::HpaReconcilePort for RootHpaReconcileAdapter {
     ) -> Result<()> {
         reconcile_hpa_with_metrics(
             self.db.as_ref(),
-            self.pod_repository.as_ref(),
+            self.pod_query.as_ref(),
+            self.pod_delete_sink.as_ref(),
             self.pod_mutation.as_ref(),
             self.non_pod_finalization.as_ref(),
             self.coordination.as_ref(),
@@ -148,7 +157,8 @@ impl klights_controllers::hpa::HpaReconcilePort for RootHpaReconcileAdapter {
 
 struct HpaControllerAdapter<'a> {
     db: &'a dyn DatastoreBackend,
-    pod_repository: &'a PodRepository,
+    pod_query: &'a dyn PodQuery,
+    pod_delete_sink: &'a dyn klights_reconcile_api::GcPodDeleteSink,
     pod_mutation: &'a ControllerPodMutationAdapter,
     non_pod_finalization: &'a dyn klights_reconcile_api::GcNonPodFinalizationPort,
     coordination: &'a klights_controllers::ControllerCoordination,
@@ -191,14 +201,14 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
         &self,
         namespace: &str,
     ) -> klights_reconcile_api::ControllerStoreResult<Vec<Resource>> {
-        PodQuery::list_pods(
-            self.pod_repository,
-            PodListRequest::try_new(Some(namespace.to_string()), None, None, None, None)
-                .map_err(|error| map_controller_store_error(error.into()))?,
-        )
-        .await
-        .map(|listing| listing.into_parts().0)
-        .map_err(|error| map_controller_store_error(error.into()))
+        self.pod_query
+            .list_pods(
+                PodListRequest::try_new(Some(namespace.to_string()), None, None, None, None)
+                    .map_err(|error| map_controller_store_error(error.into()))?,
+            )
+            .await
+            .map(|listing| listing.into_parts().0)
+            .map_err(|error| map_controller_store_error(error.into()))
     }
 
     async fn patch_scale_target(
@@ -235,16 +245,17 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
         resource: &Value,
         node_name: &str,
     ) -> klights_reconcile_api::ControllerStoreResult<()> {
-        let pods = self.pod_repository;
+        let pod_query = self.pod_query;
+        let pod_delete_sink = self.pod_delete_sink;
         let pod_mutation = self.pod_mutation;
         let now = chrono::Utc::now();
         match target.kind_tag {
             ScaleTargetKind::Deployment => klights_controllers::deployment::reconcile_deployment(
                 self.db,
-                pods,
+                pod_query,
                 pod_mutation,
                 self.identity,
-                pods,
+                pod_delete_sink,
                 self.non_pod_finalization,
                 resource,
                 klights_controllers::ControllerReconcileContext::at(
@@ -257,10 +268,10 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
             .map_err(map_controller_store_error),
             ScaleTargetKind::ReplicaSet => klights_controllers::replicaset::reconcile_replicaset(
                 self.db,
-                pods,
+                pod_query,
                 pod_mutation,
                 self.identity,
-                pods,
+                pod_delete_sink,
                 self.non_pod_finalization,
                 resource,
                 klights_controllers::ControllerReconcileContext::at(
@@ -274,10 +285,10 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
             ScaleTargetKind::StatefulSet => {
                 klights_controllers::statefulset::reconcile_statefulset(
                     self.db,
-                    pods,
+                    pod_query,
                     pod_mutation,
                     self.identity,
-                    pods,
+                    pod_delete_sink,
                     self.non_pod_finalization,
                     resource,
                     klights_controllers::ControllerReconcileContext::at(
@@ -292,10 +303,10 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
             ScaleTargetKind::ReplicationController => {
                 klights_controllers::replicationcontroller::reconcile_replicationcontroller(
                     self.db,
-                    pods,
+                    pod_query,
                     pod_mutation,
                     self.identity,
-                    pods,
+                    pod_delete_sink,
                     self.non_pod_finalization,
                     resource,
                     klights_controllers::ControllerReconcileContext::at(
@@ -333,7 +344,8 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
 #[allow(clippy::too_many_arguments)]
 pub async fn reconcile_hpa_with_metrics(
     db: &dyn DatastoreBackend,
-    pod_repository: &PodRepository,
+    pod_query: &dyn PodQuery,
+    pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     pod_mutation: &ControllerPodMutationAdapter,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     coordination: &klights_controllers::ControllerCoordination,
@@ -346,7 +358,8 @@ pub async fn reconcile_hpa_with_metrics(
     reconcile_hpa_with_runtime(
         &HpaControllerAdapter {
             db,
-            pod_repository,
+            pod_query,
+            pod_delete_sink,
             pod_mutation,
             non_pod_finalization,
             coordination,

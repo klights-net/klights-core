@@ -762,19 +762,26 @@ impl klights_controllers::csr_signer::CsrStatusStore for RootControllerLeaderPor
 }
 
 pub(crate) struct RootControllerPodPort {
-    repository: Arc<PodRepository>,
+    query: Arc<dyn klights_pod_api::PodQuery>,
+    update: Arc<dyn klights_pod_api::PodUpdate>,
     api: Arc<dyn klights_pod_api::PodApiMutation>,
     subresource: Arc<dyn klights_pod_api::PodSubresourceMutation>,
 }
 
 impl RootControllerPodPort {
+    /// `repository` is decomposed into focused capability fields immediately;
+    /// this constructor is the only place in this file that names the
+    /// concrete root repository type.
     pub(crate) fn new(
         repository: Arc<PodRepository>,
         api: Arc<dyn klights_pod_api::PodApiMutation>,
         subresource: Arc<dyn klights_pod_api::PodSubresourceMutation>,
     ) -> Self {
+        let query: Arc<dyn klights_pod_api::PodQuery> = repository.clone();
+        let update: Arc<dyn klights_pod_api::PodUpdate> = repository;
         Self {
-            repository,
+            query,
+            update,
             api,
             subresource,
         }
@@ -894,7 +901,7 @@ impl klights_pod_api::PodUpdate for RootControllerPodPort {
             validate_controller_effect().map_err(|error| {
                 klights_pod_api::PodRepositoryError::forbidden(error.to_string())
             })?;
-            klights_pod_api::PodUpdate::update_pod(self.repository.as_ref(), request).await
+            self.update.update_pod(request).await
         })
     }
 }
@@ -989,7 +996,7 @@ impl klights_controllers::node_lifecycle::NodeLifecyclePodStore for RootControll
         )
         .map_err(anyhow::Error::new)
         .map_err(crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error)?;
-        Ok(klights_pod_api::PodQuery::list_pods(self.repository.as_ref(), request)
+        Ok(self.query.list_pods(request)
             .await
             .map_err(anyhow::Error::new)
             .map_err(crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error)?

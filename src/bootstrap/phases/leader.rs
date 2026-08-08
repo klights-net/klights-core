@@ -48,7 +48,8 @@ struct LeaderScopedTaskContext {
     task_supervisor: Arc<TaskSupervisor>,
     dispatcher_for_worker: Arc<klights_controllers::ControllerDispatcher>,
     dispatcher_for_cronjobs: Arc<klights_controllers::ControllerDispatcher>,
-    pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
+    pod_query: Arc<dyn klights_pod_api::PodQuery>,
+    sandbox_gc_dirty_counter: Arc<std::sync::atomic::AtomicUsize>,
     pod_scheduling: Arc<dyn klights_pod_api::PodScheduling>,
     cri_for_shutdown: Option<Arc<tokio::sync::Mutex<klights_kubelet::cri::CriClient>>>,
     datapath: Arc<dyn klights_network_api::Datapath>,
@@ -77,6 +78,12 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
         return Ok(());
     };
 
+    // `pod_repository` is decomposed into focused capability fields
+    // immediately; the long-lived leader-scoped task context (cloned into
+    // the lease-scoped background closure) never carries the concrete root
+    // repository type.
+    let pod_query: Arc<dyn klights_pod_api::PodQuery> = pod_repository.clone();
+    let sandbox_gc_dirty_counter = pod_repository.sandbox_gc_dirty_counter();
     let leader_context = LeaderScopedTaskContext {
         config: config.clone(),
         db_handle: db_handle.clone(),
@@ -86,7 +93,8 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
         task_supervisor: task_supervisor.clone(),
         dispatcher_for_worker: dispatcher_for_worker.clone(),
         dispatcher_for_cronjobs: dispatcher_for_cronjobs.clone(),
-        pod_repository: pod_repository.clone(),
+        pod_query,
+        sandbox_gc_dirty_counter,
         pod_scheduling: pod_scheduling.clone(),
         cri_for_shutdown: cri_for_shutdown.clone(),
         datapath: datapath.clone(),
@@ -217,7 +225,8 @@ async fn start_leader_scoped_tasks(
         task_supervisor,
         dispatcher_for_worker,
         dispatcher_for_cronjobs,
-        pod_repository,
+        pod_query,
+        sandbox_gc_dirty_counter,
         pod_scheduling,
         cri_for_shutdown,
         datapath,
@@ -312,20 +321,17 @@ async fn start_leader_scoped_tasks(
     }
     tracing::info!("Scheduler controller started");
 
-    let sandbox_maintenance = if let Some(cri_arc) = cri_for_shutdown {
-        let pod_query: Arc<dyn klights_pod_api::PodQuery> = pod_repository.clone();
-        Some(Arc::new(klights_kubelet::sandbox_gc::SandboxGc::new(
+    let sandbox_maintenance = cri_for_shutdown.map(|cri_arc| {
+        Arc::new(klights_kubelet::sandbox_gc::SandboxGc::new(
             pod_network_cache,
             pod_runtime_store,
             cri_arc.clone(),
             pod_query,
             config.containerd_namespace.clone(),
-            pod_repository.sandbox_gc_dirty_counter(),
+            sandbox_gc_dirty_counter,
             klights_supervisor::FileProcessExecutor::from_supervisor(task_supervisor.as_ref()),
-        )))
-    } else {
-        None
-    };
+        ))
+    });
     let maintenance = crate::bootstrap::maintenance::MaintenanceRunner::new(
         db_handle.clone(),
         sandbox_maintenance,
