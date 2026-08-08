@@ -4,15 +4,27 @@ use klights_kubelet::pod_status_logic::ContainerInfo;
 use klights_kubelet::pod_watch_source::PodWatchEvent as WatchEvent;
 use klights_leader_api::WatchEventType as EventType;
 
+/// Enqueue the owning Job for asynchronous reconciliation after a terminal
+/// watch event, through the focused mutation-reconcile sink port rather than
+/// the concrete root repository — callers hold only the capability this
+/// function actually needs.
 pub(super) async fn enqueue_job_reconcile_for_terminal_watch_pod(
-    pod_repo: &Arc<crate::kubelet::pod_repository::PodRepository>,
+    mutation_reconcile: &dyn klights_reconcile_api::PodMutationReconcileSink,
     pod: &Value,
 ) {
     let phase = pod
         .pointer("/status/phase")
         .and_then(|value| value.as_str());
-    if matches!(phase, Some("Succeeded") | Some("Failed")) {
-        pod_repo.enqueue_job_reconcile_for_pod(pod).await;
+    if matches!(phase, Some("Succeeded") | Some("Failed"))
+        && let Err(err) = mutation_reconcile
+            .reconcile_pod_mutation(
+                klights_reconcile_api::PodMutationReconcileRequest::EnqueueJobOwner {
+                    pod: klights_cluster_core::Resource::from_data_lossy(Arc::new(pod.clone())),
+                },
+            )
+            .await
+    {
+        tracing::warn!(error = %err, "failed to enqueue Job reconcile for terminal Pod");
     }
 }
 
@@ -225,7 +237,11 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
         // status writes. Re-enqueue the owning Job from this event so indexed
         // Job status cannot miss a final succeeded/failed index due to races
         // between CRI completion handling and controller queue coalescing.
-        enqueue_job_reconcile_for_terminal_watch_pod(pod_repo, &event.object).await;
+        enqueue_job_reconcile_for_terminal_watch_pod(
+            pod_repo.mutation_reconcile_port().as_ref(),
+            &event.object,
+        )
+        .await;
 
         // Refresh downwardAPI volumes to reflect metadata changes (labels/annotations)
         let volumes_root = paths.volumes_root().to_string_lossy().into_owned();

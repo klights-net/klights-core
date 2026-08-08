@@ -2151,7 +2151,7 @@ async fn test_enqueue_job_reconcile_no_owner_is_noop() {
     let db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
-    let pod_repo = crate::kubelet::pod_repository::pod_repository_for_test(&db);
+    let pod_repo = super::fixture_pod_repository(&db);
     let pod = serde_json::json!({
         "metadata": {"name": "pod", "namespace": "default"},
         "spec": {"nodeName": "node"},
@@ -2166,7 +2166,7 @@ async fn test_enqueue_job_reconcile_non_job_owner_is_noop() {
     let db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
-    let pod_repo = crate::kubelet::pod_repository::pod_repository_for_test(&db);
+    let pod_repo = super::fixture_pod_repository(&db);
     let pod = serde_json::json!({
         "metadata": {
             "name": "pod",
@@ -2186,19 +2186,7 @@ async fn test_enqueue_job_reconcile_enqueues_job_key_via_dispatcher() {
     let dispatcher = std::sync::Arc::new(
         crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(),
     );
-    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
-        klights_supervisor::TaskCategoryConfig::default(),
-    ));
-    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-    let side_effects =
-        std::sync::Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
-    side_effects.set_controller_dispatcher(dispatcher.clone());
-    let pod_repo = std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(
-        db_handle,
-        supervisor,
-        side_effects,
-        metrics,
-    ));
+    let pod_repo = super::fixture_pod_repository_with_dispatcher(db_handle, dispatcher.clone());
 
     let job = serde_json::json!({
         "apiVersion": "batch/v1",
@@ -2277,19 +2265,7 @@ async fn test_terminal_watch_modified_pod_enqueues_job_reconcile() {
     let dispatcher = std::sync::Arc::new(
         crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(),
     );
-    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
-        klights_supervisor::TaskCategoryConfig::default(),
-    ));
-    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-    let side_effects =
-        std::sync::Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
-    side_effects.set_controller_dispatcher(dispatcher.clone());
-    let pod_repo = std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(
-        db_handle,
-        supervisor,
-        side_effects,
-        metrics,
-    ));
+    let pod_repo = super::fixture_pod_repository_with_dispatcher(db_handle, dispatcher.clone());
 
     let job = serde_json::json!({
         "apiVersion": "batch/v1",
@@ -2340,8 +2316,11 @@ async fn test_terminal_watch_modified_pod_enqueues_job_reconcile() {
             "normal-backlog",
         ))
         .await;
-    event_handlers::enqueue_job_reconcile_for_terminal_watch_pod(&pod_repo, &terminal_watch_pod)
-        .await;
+    event_handlers::enqueue_job_reconcile_for_terminal_watch_pod(
+        pod_repo.mutation_reconcile_port().as_ref(),
+        &terminal_watch_pod,
+    )
+    .await;
 
     let keys = dispatcher.pending_keys().await;
     assert!(
@@ -2369,7 +2348,7 @@ async fn test_enqueue_job_reconcile_skips_when_dispatcher_not_bound() {
     let db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
-    let pod_repo = crate::kubelet::pod_repository::pod_repository_for_test(&db);
+    let pod_repo = super::fixture_pod_repository(&db);
     let pod = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",

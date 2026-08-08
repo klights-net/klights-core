@@ -41,3 +41,34 @@ pub(super) fn fixture_pod_repository(
     side_effects.set_pod_ports(repo.clone(), repo.clone());
     repo
 }
+
+/// Canonical builder for the small set of pod_manager tests that must
+/// observe controller-dispatcher enqueue side effects directly (bypassing
+/// `crate::bootstrap::side_effects::default_registry`'s broader wiring, which
+/// would pull in unrelated side-effect ports). This is the single place in
+/// the pod_manager test tree that names the concrete root repository type
+/// for a dispatcher-bound fixture; callers receive only the `Arc` handle and
+/// never construct it inline themselves.
+pub(super) fn fixture_pod_repository_with_dispatcher<T>(
+    db_handle: crate::datastore::DatastoreHandle,
+    dispatcher: std::sync::Arc<T>,
+) -> std::sync::Arc<crate::kubelet::pod_repository::PodRepository>
+where
+    T: klights_reconcile_api::ControllerReconcileSink
+        + klights_reconcile_api::ServiceReconcileSink
+        + 'static,
+{
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
+    ));
+    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
+    let side_effects =
+        std::sync::Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
+    side_effects.set_controller_dispatcher(dispatcher);
+    std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(
+        db_handle,
+        supervisor,
+        side_effects,
+        metrics,
+    ))
+}

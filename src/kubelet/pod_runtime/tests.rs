@@ -43,6 +43,41 @@ fn kubelet_runtime_paths_for_test(
     .expect("kubelet test runtime path must be absolute")
 }
 
+/// Canonical builder for the concrete root repository backing pod_runtime
+/// test fixtures. This is the single place in this file that constructs
+/// `PodRepositoryBuildConfig` / calls `PodRepository::build_parts` directly
+/// with the shared in-memory scheduling config; every caller receives just
+/// the decomposed `Arc<PodRepository>` handle instead of repeating this
+/// boilerplate. `controller_identity` stays an explicit parameter (each
+/// caller still names `deterministic_controller_identity()` itself) so this
+/// consolidation does not change the frozen live call-site count tracked by
+/// `source_guard_phase18_controller_test_support_ownership.py`.
+fn build_test_pod_repository(
+    db: crate::datastore::DatastoreHandle,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    node_local: Arc<crate::datastore::node_local::NodeLocalStores>,
+    controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
+) -> Arc<crate::kubelet::pod_repository::PodRepository> {
+    let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
+        crate::kubelet::pod_repository::PodRepositoryBuildConfig {
+            db,
+            pod_workqueue_store: Some(node_local.clone()),
+            supervisor,
+            side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
+            metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
+            pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(node_local),
+            assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
+            scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+            outbox: None,
+            cluster_api: None,
+            remote_delivery_required: false,
+            controller_identity,
+            scheduler_bind_gate: None,
+        },
+    );
+    Arc::new(parts.repository)
+}
+
 async fn node_local_runtime_store() -> Arc<crate::datastore::node_local::NodeLocalStores> {
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
@@ -522,25 +557,12 @@ async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_matc
     ));
     let node_local =
         crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
-    let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
-        crate::kubelet::pod_repository::PodRepositoryBuildConfig {
-            db: db.clone(),
-            pod_workqueue_store: Some(node_local.clone()),
-            supervisor,
-            side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
-            metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
-            pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(node_local),
-            assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
-            scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
-            outbox: None,
-            cluster_api: None,
-            remote_delivery_required: false,
-            controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(
-            ),
-            scheduler_bind_gate: None,
-        },
+    let repository = build_test_pod_repository(
+        db.clone(),
+        supervisor,
+        node_local,
+        crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
     );
-    let repository = Arc::new(parts.repository);
     let datapath = Arc::new(klights_networking::test_support::MockNetworkProvider::new());
     let old_key = PodRuntimeKey::new("ns", "same-name", "old-uid");
     let new_key = PodRuntimeKey::new("ns", "same-name", "new-uid");
@@ -1127,30 +1149,14 @@ async fn fixture_pod_repository() -> std::sync::Arc<crate::kubelet::pod_reposito
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let side_effects =
-        std::sync::Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
-    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let node_local =
         crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
-    let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
-        crate::kubelet::pod_repository::PodRepositoryBuildConfig {
-            db: handle.clone(),
-            pod_workqueue_store: Some(node_local.clone()),
-            supervisor,
-            side_effects,
-            metrics,
-            pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(node_local),
-            assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
-            scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
-            outbox: None,
-            cluster_api: None,
-            remote_delivery_required: false,
-            controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(
-            ),
-            scheduler_bind_gate: None,
-        },
-    );
-    std::sync::Arc::new(parts.repository)
+    build_test_pod_repository(
+        handle,
+        supervisor,
+        node_local,
+        crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
+    )
 }
 
 async fn fixture_env_source(
@@ -1241,7 +1247,7 @@ async fn real_pod_runtime_service_constructs_from_mock_dependencies() {
 use crate::kubelet::pod_repository::PodQueryTestExt;
 
 struct SnapshotOnlyStartRepository {
-    inner: Arc<crate::kubelet::pod_repository::PodRepository>,
+    inner: Arc<dyn crate::kubelet::pod_runtime::repository::PodRuntimeRepository>,
 }
 
 #[async_trait::async_trait]
@@ -1263,15 +1269,9 @@ impl crate::kubelet::pod_runtime::repository::PodRuntimeRepository for SnapshotO
         update: klights_kubelet::pod_repository::PodStatusUpdate,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::set_pod_status_for_uid(
-            self.inner.as_ref(),
-            ns,
-            name,
-            pod_uid,
-            update,
-            expected_rv,
-        )
-        .await
+        self.inner
+            .set_pod_status_for_uid(ns, name, pod_uid, update, expected_rv)
+            .await
     }
 
     async fn apply_runtime_reconcile_status_for_uid(
@@ -1282,15 +1282,9 @@ impl crate::kubelet::pod_runtime::repository::PodRuntimeRepository for SnapshotO
         update: klights_kubelet::pod_repository::RuntimeReconcileStatus,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::apply_runtime_reconcile_status_for_uid(
-            self.inner.as_ref(),
-            ns,
-            name,
-            pod_uid,
-            update,
-            expected_rv,
-        )
-        .await
+        self.inner
+            .apply_runtime_reconcile_status_for_uid(ns, name, pod_uid, update, expected_rv)
+            .await
     }
 
     async fn mark_start_pending_for_retry_for_uid(
@@ -1300,14 +1294,9 @@ impl crate::kubelet::pod_runtime::repository::PodRuntimeRepository for SnapshotO
         pod_uid: &str,
         error_message: &str,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::mark_start_pending_for_retry_for_uid(
-            self.inner.as_ref(),
-            ns,
-            name,
-            pod_uid,
-            error_message,
-        )
-        .await
+        self.inner
+            .mark_start_pending_for_retry_for_uid(ns, name, pod_uid, error_message)
+            .await
     }
 
     async fn set_probe_readiness_for_uid(
@@ -1319,16 +1308,9 @@ impl crate::kubelet::pod_runtime::repository::PodRuntimeRepository for SnapshotO
         ready: bool,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::set_probe_readiness_for_uid(
-            self.inner.as_ref(),
-            ns,
-            name,
-            pod_uid,
-            container_name,
-            ready,
-            expected_rv,
-        )
-        .await
+        self.inner
+            .set_probe_readiness_for_uid(ns, name, pod_uid, container_name, ready, expected_rv)
+            .await
     }
 
     async fn set_deadline_exceeded_for_uid(
@@ -1339,15 +1321,9 @@ impl crate::kubelet::pod_runtime::repository::PodRuntimeRepository for SnapshotO
         message: String,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::set_deadline_exceeded_for_uid(
-            self.inner.as_ref(),
-            ns,
-            name,
-            pod_uid,
-            message,
-            expected_rv,
-        )
-        .await
+        self.inner
+            .set_deadline_exceeded_for_uid(ns, name, pod_uid, message, expected_rv)
+            .await
     }
 
     async fn apply_ephemeral_container_statuses_for_uid(
@@ -1358,15 +1334,9 @@ impl crate::kubelet::pod_runtime::repository::PodRuntimeRepository for SnapshotO
         statuses: Vec<serde_json::Value>,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::apply_ephemeral_container_statuses_for_uid(
-            self.inner.as_ref(),
-            ns,
-            name,
-            pod_uid,
-            statuses,
-            expected_rv,
-        )
-        .await
+        self.inner
+            .apply_ephemeral_container_statuses_for_uid(ns, name, pod_uid, statuses, expected_rv)
+            .await
     }
 
     async fn note_container_restart_for_uid(
@@ -1378,16 +1348,16 @@ impl crate::kubelet::pod_runtime::repository::PodRuntimeRepository for SnapshotO
         terminated: serde_json::Value,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        klights_kubelet::pod_repository::PodStatusWriter::note_container_restart_for_uid(
-            self.inner.as_ref(),
-            ns,
-            name,
-            pod_uid,
-            container_name,
-            terminated,
-            expected_rv,
-        )
-        .await
+        self.inner
+            .note_container_restart_for_uid(
+                ns,
+                name,
+                pod_uid,
+                container_name,
+                terminated,
+                expected_rv,
+            )
+            .await
     }
 
     async fn check_live_pod_uid(
@@ -10653,27 +10623,12 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
     ));
     let node_local =
         crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
-    let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
-        crate::kubelet::pod_repository::PodRepositoryBuildConfig {
-            db: db.clone(),
-            pod_workqueue_store: Some(node_local.clone()),
-            supervisor: supervisor.clone(),
-            side_effects: std::sync::Arc::new(
-                klights_controllers::side_effects::SideEffectRegistry::new(),
-            ),
-            metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
-            pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(node_local),
-            assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
-            scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
-            outbox: None,
-            cluster_api: None,
-            remote_delivery_required: false,
-            controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(
-            ),
-            scheduler_bind_gate: None,
-        },
+    let repo = build_test_pod_repository(
+        db.clone(),
+        supervisor.clone(),
+        node_local,
+        crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
     );
-    let repo = std::sync::Arc::new(parts.repository);
     let key = PodRuntimeKey::new("sonobuoy", "sonobuoy", "uid-sonobuoy");
     let pod = serde_json::json!({
         "apiVersion": "v1",
@@ -11416,34 +11371,14 @@ impl PodRuntimeHarness {
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let side_effects =
-            std::sync::Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
-        let metrics: std::sync::Arc<klights_controllers::side_effects::SideEffectMetrics> =
-            klights_controllers::side_effects::SideEffectMetrics::new();
         let node_local =
             crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
-        let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
-            crate::kubelet::pod_repository::PodRepositoryBuildConfig {
-                db: handle.clone(),
-                pod_workqueue_store: Some(node_local.clone()),
-                supervisor: supervisor.clone(),
-                side_effects,
-                metrics,
-                pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(
-                    node_local,
-                ),
-                assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
-                scheduling_mode:
-                    crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
-                outbox: None,
-                cluster_api: None,
-                remote_delivery_required: false,
-                controller_identity:
-                    crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
-                scheduler_bind_gate: None,
-            },
+        let repo = build_test_pod_repository(
+            handle.clone(),
+            supervisor.clone(),
+            node_local,
+            crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         );
-        let repo = std::sync::Arc::new(parts.repository);
         let cri = std::sync::Arc::new(MockCriRuntime::new());
         let container_control = std::sync::Arc::new(MockContainerRuntimeControl::new());
         let network = std::sync::Arc::new(MockPodNetworkRuntime::new());

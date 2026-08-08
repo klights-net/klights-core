@@ -244,7 +244,16 @@ pub(crate) struct ParityFixture {
     pub hostports: Arc<MockHostPortRuntime>,
     pub events: Arc<MockPodEventSink>,
     pub cluster_view: Arc<RecordingClusterRuntimeView>,
-    pub repository: Arc<PodRepository>,
+    /// Focused Pod query capability, decomposed once at construction time
+    /// from the in-memory repository — parity assertions never hold or name
+    /// the concrete root aggregate.
+    pub query: Arc<dyn klights_pod_api::PodQuery>,
+    /// Focused Pod status-write capability used to drive the parity
+    /// baseline (`klights_kubelet::pod_repository::PodStatusWriter`).
+    pub status: Arc<dyn klights_kubelet::pod_repository::PodStatusWriter>,
+    /// Focused Pod API mutation capability used only for fixture setup
+    /// (creating the seed Pod row under test).
+    pub mutation: Arc<dyn klights_pod_api::PodApiMutation>,
     pub outbox_log: Arc<Mutex<Vec<OutboxEvent>>>,
 }
 
@@ -276,6 +285,10 @@ impl ParityFixture {
             controller_identity: Arc::new(ParityControllerIdentity),
             scheduler_bind_gate: None,
         });
+        // The concrete repository is constructed here, once, and immediately
+        // decomposed into the focused capabilities the fixture actually
+        // exposes; no field or method downstream names or stores the
+        // concrete aggregate.
         let repository = Arc::new(parts.repository);
 
         Self {
@@ -290,7 +303,9 @@ impl ParityFixture {
             hostports: Arc::new(MockHostPortRuntime::new()),
             events: Arc::new(MockPodEventSink::new()),
             cluster_view: Arc::new(RecordingClusterRuntimeView::new()),
-            repository,
+            query: repository.clone(),
+            status: repository.clone(),
+            mutation: repository,
             outbox_log: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -338,7 +353,7 @@ impl ParityFixture {
     pub async fn snapshot_with_repository_state(&self) -> Recording {
         let mut recording = self.snapshot();
         let pods = klights_pod_api::PodQuery::list_pods(
-            self.repository.as_ref(),
+            self.query.as_ref(),
             klights_pod_api::PodListRequest::try_new(None, None, None, None, None)
                 .expect("valid parity list request"),
         )
@@ -544,18 +559,26 @@ mod tests {
 
     #[tokio::test]
     async fn parity_fixture_snapshots_repository_status_payloads() {
-        use klights_kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+        use klights_kubelet::pod_repository::PodStatusUpdate;
 
         let fixture = ParityFixture::new().await;
         let pod = pod_json("default", "repo-pod", "uid-2", "nginx:1.25");
-        fixture
-            .repository
-            .test_create_pod("default", "repo-pod", "test-node", pod)
-            .await
-            .expect("create repository pod");
+        let created = klights_pod_api::PodApiMutation::create_pod(
+            fixture.mutation.as_ref(),
+            klights_pod_api::PodApiCreateRequest {
+                namespace: "default".to_string(),
+                body: pod,
+                dry_run: false,
+            },
+        )
+        .await
+        .expect("create repository pod");
+        created
+            .resource
+            .expect("fixture-seeded pod create must not be dry-run");
 
         fixture
-            .repository
+            .status
             .set_pod_status_for_uid(
                 "default",
                 "repo-pod",

@@ -199,16 +199,15 @@ mod tests {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-        let side_effects = Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
-        let repository = Arc::new(crate::kubelet::pod_repository::PodRepository::new(
-            db_handle.clone(),
-            supervisor.clone(),
-            side_effects,
-            metrics,
-        ));
+        // Built through the canonical kubelet test-support constructor and
+        // decomposed immediately into the two focused ports this adapter's
+        // tests actually need; nothing here names or stores the concrete
+        // root repository type.
+        let repository = crate::kubelet::pod_repository::pod_repository_for_test(&db);
+        let pod_query: Arc<dyn klights_pod_api::PodQuery> = repository.clone();
+        let pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink> = repository;
         let slot = PodSideEffectPortsSlot::new();
-        slot.set(repository.clone(), repository);
+        slot.set(pod_query, pod_delete_sink);
         (db, db_handle, slot, supervisor)
     }
 

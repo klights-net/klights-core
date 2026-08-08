@@ -124,14 +124,17 @@ pub enum IntegrationPodFinalizationOutcome {
     FinalizersPending,
 }
 
+/// Finalizes bound-pod cleanup through the focused deletion-finalizer port
+/// only — callers pass the port obtained from their own concrete backing
+/// repository rather than the repository itself.
 async fn integration_finalize_pod_after_actor_cleanup(
-    repository: &crate::kubelet::pod_repository::PodRepository,
+    finalizer: &dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer,
     namespace: &str,
     name: &str,
     uid: &str,
 ) -> anyhow::Result<IntegrationPodFinalizationOutcome> {
     let key = crate::kubelet::pod_runtime::service::PodRuntimeKey::new(namespace, name, uid);
-    Ok(match repository.deletion_finalizer().finalize_after_actor_cleanup(&key).await? {
+    Ok(match finalizer.finalize_after_actor_cleanup(&key).await? {
         crate::kubelet::pod_runtime::service::PodDeletionFinalizeResult::DeletedOrAlreadyGone => {
             IntegrationPodFinalizationOutcome::DeletedOrAlreadyGone
         }
@@ -205,8 +208,13 @@ impl IntegrationPodWorkerComposition {
         name: &str,
         uid: &str,
     ) -> anyhow::Result<IntegrationPodFinalizationOutcome> {
-        integration_finalize_pod_after_actor_cleanup(self.repository.as_ref(), namespace, name, uid)
-            .await
+        integration_finalize_pod_after_actor_cleanup(
+            self.repository.deletion_finalizer().as_ref(),
+            namespace,
+            name,
+            uid,
+        )
+        .await
     }
 
     pub async fn get_pod(
@@ -2787,8 +2795,13 @@ impl IntegrationPodRepositoryComposition {
         name: &str,
         uid: &str,
     ) -> anyhow::Result<IntegrationPodFinalizationOutcome> {
-        integration_finalize_pod_after_actor_cleanup(self.repository.as_ref(), namespace, name, uid)
-            .await
+        integration_finalize_pod_after_actor_cleanup(
+            self.repository.deletion_finalizer().as_ref(),
+            namespace,
+            name,
+            uid,
+        )
+        .await
     }
 
     pub fn has_deferred_runtime_for_uid(&self, pod_uid: &str) -> bool {
