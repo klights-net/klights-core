@@ -216,7 +216,6 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
 
 pub mod background;
 pub mod facade;
-pub mod watch;
 
 #[cfg(test)]
 pub(crate) use crate::pod_repository_composition::PodRepositoryBuildConfig;
@@ -247,7 +246,6 @@ use klights_kubelet::pod_repository::status;
 use klights_kubelet::pod_repository::store::PodStore;
 use klights_kubelet::pod_repository::workqueue::PodWorkqueue;
 use klights_reconcile_api::{PodEvictionAdmissionSink, PodGcReconcileSink, PodPdbReconcileSink};
-use watch::PodWatchService;
 
 pub(crate) struct PodRepositoryAdapterDependencies {
     pub store: Arc<PodStore>,
@@ -313,7 +311,6 @@ pub struct PodRepository {
     #[cfg(any(test, feature = "pod-repository-test-support"))]
     test_subresource: Option<Arc<dyn klights_pod_api::PodSubresourceMutation>>,
     network_svc: Arc<dyn PodNetworkAssignmentQuery>,
-    _watch: PodWatchService,
     #[cfg(any(test, feature = "pod-repository-test-support"))]
     test_api: Option<Arc<dyn klights_pod_api::PodApiMutation>>,
     #[cfg(any(test, feature = "pod-repository-test-support"))]
@@ -769,7 +766,6 @@ impl PodRepository {
                 wall_clock: wall_clock.clone(),
             },
         );
-        let watch = PodWatchService::new(store.clone());
         let gc_pod_delete_sink = adapters.gc_delete.clone();
         workqueue.set_remote_pod_delete_resignal_sink(Arc::downgrade(&gc_pod_delete_sink));
 
@@ -799,7 +795,6 @@ impl PodRepository {
             #[cfg(any(test, feature = "pod-repository-test-support"))]
             test_subresource: adapters.test_subresource,
             network_svc: assignment_query,
-            _watch: watch,
             #[cfg(any(test, feature = "pod-repository-test-support"))]
             test_api: adapters.test_api,
             #[cfg(any(test, feature = "pod-repository-test-support"))]
