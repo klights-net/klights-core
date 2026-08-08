@@ -593,6 +593,82 @@ impl PodWorkqueuePersistence for RootPodWorkqueuePersistence {
         }
     }
 
+    async fn ensure_absent(
+        &self,
+        kind: PodWorkqueueKind,
+        pod: &PodIdentity,
+        payload: serde_json::Value,
+        attempt_count: i64,
+        min_delay_ms: i64,
+        last_error: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        if let Some(node_local) = &self.node_local {
+            let identity = match legacy_workqueue_kind(kind) {
+                klights_node_store::PodWorkqueueKind::Pod => {
+                    klights_node_store::PodWorkIdentity::try_pod(pod.clone())?
+                }
+                klights_node_store::PodWorkqueueKind::Namespace => {
+                    klights_node_store::PodWorkIdentity::try_namespace(&pod.name, &pod.uid)?
+                }
+            };
+            let entry = klights_node_store::PodWorkqueueEnqueue::try_new(
+                identity,
+                serde_json::to_vec(&payload)?,
+                attempt_count,
+                min_delay_ms,
+                last_error.map(str::to_string),
+            )?;
+            return node_local
+                .ensure_work_if_absent(entry)
+                .await
+                .map_err(anyhow::Error::from);
+        }
+        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+        return Err(anyhow::anyhow!(
+            "production Pod workqueue persistence requires node-local storage"
+        ));
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        {
+            let now_ms = self.wall_clock.now_ms();
+            let mut rows = self.test_rows.lock().unwrap();
+            if rows.iter().any(|row| {
+                row.kind == kind
+                    && row.namespace == pod.namespace
+                    && row.name == pod.name
+                    && row.uid == pod.uid
+            }) {
+                return Ok(false);
+            }
+            let floor = now_ms
+                .checked_add(min_delay_ms)
+                .ok_or_else(|| anyhow::anyhow!("workqueue ensure due time overflow"))?;
+            let tail_next =
+                rows.iter()
+                    .map(|row| row.next_attempt_at_ms)
+                    .max()
+                    .map_or(Ok(floor), |tail| {
+                        tail.checked_add(1)
+                            .map(|next| floor.max(next))
+                            .ok_or_else(|| anyhow::anyhow!("workqueue ensure tail overflow"))
+                    })?;
+            let id = self
+                .test_next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            rows.push(RootInMemoryPodWorkqueueEntry {
+                id,
+                kind,
+                namespace: pod.namespace.clone(),
+                name: pod.name.clone(),
+                uid: pod.uid.clone(),
+                payload,
+                attempt_count,
+                next_attempt_at_ms: tail_next,
+            });
+            let _ = last_error;
+            Ok(true)
+        }
+    }
+
     async fn peek_next_due(&self) -> anyhow::Result<Option<i64>> {
         if let Some(node_local) = &self.node_local {
             return node_local

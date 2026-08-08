@@ -1114,6 +1114,10 @@ pub trait PodWorkqueueStore: Send + Sync {
     /// `(kind, namespace, name, UID)` key. Due ordering remains strictly after
     /// the current tail of every other key while honoring the minimum delay.
     fn enqueue_work(&self, entry: PodWorkqueueEnqueue) -> RuntimeWorkFuture<'_, ()>;
+    /// Inserts an absent exact `(kind, namespace, name, UID)` row and reports
+    /// whether it was inserted. An existing pending or leased row is returned
+    /// unchanged, including its payload, due time, attempt state, and row ID.
+    fn ensure_work_if_absent(&self, entry: PodWorkqueueEnqueue) -> RuntimeWorkFuture<'_, bool>;
     fn peek_next_due_ms(&self) -> RuntimeWorkFuture<'_, Option<i64>>;
     /// Atomically leases and retains the due row ordered by `(next_due_ms, id)`.
     fn claim_due_work_with_lease(

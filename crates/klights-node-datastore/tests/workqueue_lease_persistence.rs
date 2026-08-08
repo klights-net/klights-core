@@ -54,6 +54,100 @@ fn enqueue_named(name: &str, uid: &str, delay_ms: i64) -> PodWorkqueueEnqueue {
     .unwrap()
 }
 
+fn ensure_named(name: &str, uid: &str, payload: &[u8], delay_ms: i64) -> PodWorkqueueEnqueue {
+    PodWorkqueueEnqueue::try_new(
+        PodWorkIdentity::try_pod(PodIdentity::new("default", name, uid)).unwrap(),
+        payload.to_vec(),
+        0,
+        delay_ms,
+        None,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn ensure_absent_inserts_once_and_preserves_pending_row_exactly() {
+    let store = fresh(100).await;
+    assert!(
+        store
+            .ensure_work_if_absent(ensure_named("web", "uid-web", b"node-a", 10))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .ensure_work_if_absent(ensure_named("web", "uid-web", b"node-b", 900))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .ensure_work_if_absent(ensure_named("web", "uid-web", b"node-c", i64::MAX))
+            .await
+            .unwrap(),
+        "an existing exact reminder must return unchanged before evaluating a replacement due time"
+    );
+    let claimed = store
+        .claim_due_work_with_lease(PodWorkqueueClaimRequest::try_new(110, 50).unwrap())
+        .await
+        .unwrap()
+        .expect("original due row");
+    assert_eq!(claimed.entry().payload(), b"node-a");
+    assert_eq!(claimed.entry().identity().as_pod().unwrap().uid, "uid-web");
+}
+
+#[tokio::test]
+async fn ensure_absent_does_not_mutate_an_existing_lease() {
+    let store = fresh(100).await;
+    store.enqueue_work(enqueue("uid-web", 0)).await.unwrap();
+    let claimed = store
+        .claim_due_work_with_lease(PodWorkqueueClaimRequest::try_new(100, 50).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !store
+            .ensure_work_if_absent(ensure_named("web", "uid-web", b"replacement", 0))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .acknowledge_work(claimed.token().clone())
+            .await
+            .unwrap(),
+        PodWorkqueueMutationOutcome::Applied
+    );
+}
+
+#[tokio::test]
+async fn concurrent_ensure_inserts_one_exact_uid_row_and_keeps_other_uids_distinct() {
+    let store = Arc::new(fresh(100).await);
+    let left = store.clone();
+    let right = store.clone();
+    let (left_inserted, right_inserted) = tokio::join!(
+        async move {
+            left.ensure_work_if_absent(ensure_named("web", "uid-web", b"node-a", 0))
+                .await
+                .unwrap()
+        },
+        async move {
+            right
+                .ensure_work_if_absent(ensure_named("web", "uid-web", b"node-a", 0))
+                .await
+                .unwrap()
+        }
+    );
+    assert_eq!(usize::from(left_inserted) + usize::from(right_inserted), 1);
+    assert!(
+        store
+            .ensure_work_if_absent(ensure_named("web", "uid-replacement", b"node-b", 0))
+            .await
+            .unwrap(),
+        "same-name replacement UID must remain a distinct reminder identity"
+    );
+}
+
 #[tokio::test]
 async fn crash_reopen_preserves_claim_until_lease_expiry() {
     let directory = tempfile::tempdir().unwrap();

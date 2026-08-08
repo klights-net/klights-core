@@ -823,7 +823,7 @@ impl PodNativeOrchestration {
         if dry_run {
             return Ok(PodApiDeleteOutcome::DryRun(
                 self.deletion
-                    .preview_delete(&resource, options._grace_period_seconds),
+                    .preview_delete(&resource, options._grace_period_seconds)?,
             ));
         }
 

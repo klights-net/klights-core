@@ -388,6 +388,60 @@ impl PodWorkqueueStore for SqliteRuntimeWorkStore {
         })
     }
 
+    fn ensure_work_if_absent(&self, entry: PodWorkqueueEnqueue) -> RuntimeWorkFuture<'_, bool> {
+        Box::pin(async move {
+            let (identity, payload, attempt_count, minimum_delay_ms, last_error) =
+                entry.into_parts();
+            let (kind, pod) = identity.into_persisted();
+            let kind = workqueue_kind(kind);
+            let now = self.now_ms();
+            let result = self.db_call("node_local:workqueue_ensure", move |conn| {
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pod_workqueue WHERE kind = ?1 AND namespace = ?2 AND pod_name = ?3 AND pod_uid = ?4)",
+                    rusqlite::params![kind, pod.namespace, pod.name, pod.uid],
+                    |row| row.get(0),
+                )?;
+                if exists {
+                    return Ok(Ok(false));
+                }
+                let floor = match now.checked_add(minimum_delay_ms) {
+                    Some(value) => value,
+                    None => return Ok(Err("ensure delay overflow".to_string())),
+                };
+                let tail: i64 = conn.query_row(
+                    "SELECT COALESCE(MAX(next_due_ms), 0) FROM pod_workqueue",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let tail_next = match tail.checked_add(1) {
+                    Some(value) => value,
+                    None => return Ok(Err("workqueue tail ordering overflow".to_string())),
+                };
+                let inserted = conn.execute(
+                    "INSERT INTO pod_workqueue \
+                     (kind, namespace, pod_name, pod_uid, payload, attempt_count, next_due_ms, last_error, enqueued_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                     ON CONFLICT(kind, namespace, pod_name, pod_uid) DO NOTHING",
+                    rusqlite::params![
+                        kind,
+                        pod.namespace,
+                        pod.name,
+                        pod.uid,
+                        payload,
+                        attempt_count,
+                        floor.max(tail_next),
+                        last_error,
+                        now
+                    ],
+                )?;
+                Ok(Ok(inserted == 1))
+            })
+            .await
+            .map_err(|error| persistence_error("pod_workqueue ensure", error))?;
+            result.map_err(|message| RuntimeWorkError::invalid_input("next_due_ms", message))
+        })
+    }
+
     fn peek_next_due_ms(&self) -> RuntimeWorkFuture<'_, Option<i64>> {
         Box::pin(async move {
             self.db_call("node_local:workqueue_peek", move |conn| {

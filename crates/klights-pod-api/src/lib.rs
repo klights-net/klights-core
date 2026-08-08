@@ -466,7 +466,7 @@ pub trait PodDeleteOrchestration: Send + Sync {
         &self,
         resource: &Resource,
         requested_grace_period_seconds: Option<i64>,
-    ) -> serde_json::Value;
+    ) -> Result<serde_json::Value, PodRepositoryError>;
 
     fn mark_and_queue_delete(
         &self,

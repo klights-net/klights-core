@@ -63,6 +63,10 @@ impl PodWorkqueueStore for NodeLocalStores {
         self.runtime_work_ref().enqueue_work(entry)
     }
 
+    fn ensure_work_if_absent(&self, entry: PodWorkqueueEnqueue) -> RuntimeWorkFuture<'_, bool> {
+        self.runtime_work_ref().ensure_work_if_absent(entry)
+    }
+
     fn peek_next_due_ms(&self) -> RuntimeWorkFuture<'_, Option<i64>> {
         self.runtime_work_ref().peek_next_due_ms()
     }

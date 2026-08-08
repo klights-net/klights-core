@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_kubelet::pod_repository::delete_deadline::{
-    PodDeleteDeadlineDisposition, plan_pod_delete_deadline,
+    PodDeleteDeadlineDisposition, has_nonempty_pod_deletion_timestamp, plan_pod_delete_deadline,
 };
 use klights_reconcile_api::ReconcileFailureMetrics;
 use klights_supervisor::TaskSupervisor;
@@ -68,6 +68,15 @@ pub(crate) trait PodDeleteQueuePort: Send + Sync {
         run_after: Duration,
         target_node: Option<String>,
     ) -> Result<()>;
+
+    async fn ensure_deferred_delete_with_target_node(
+        &self,
+        ns: String,
+        name: String,
+        uid: String,
+        run_after: Duration,
+        target_node: Option<String>,
+    ) -> Result<bool>;
 }
 
 struct WorkqueuePodDeleteQueue {
@@ -86,6 +95,19 @@ impl PodDeleteQueuePort for WorkqueuePodDeleteQueue {
     ) -> Result<()> {
         self.workqueue
             .enqueue_deferred_delete_with_target_node(ns, name, uid, run_after, target_node)
+            .await
+    }
+
+    async fn ensure_deferred_delete_with_target_node(
+        &self,
+        ns: String,
+        name: String,
+        uid: String,
+        run_after: Duration,
+        target_node: Option<String>,
+    ) -> Result<bool> {
+        self.workqueue
+            .ensure_deferred_delete_with_target_node(ns, name, uid, run_after, target_node)
             .await
     }
 }
@@ -151,14 +173,14 @@ impl PodDeleteCoordinator {
         &self,
         resource: &Resource,
         requested_grace_period_seconds: Option<i64>,
-    ) -> Value {
+    ) -> Result<Value, PodRepositoryError> {
         let mut data = plan_pod_delete_deadline(
             &resource.data,
             requested_grace_period_seconds,
             self.wall_clock.now_utc(),
         )
         .map(|plan| plan.body)
-        .unwrap_or_else(|_| (*resource.data).clone());
+        .map_err(|error| PodRepositoryError::internal(error.to_string()))?;
         if let Some(obj) = data.as_object_mut()
             && let Some(meta) = obj.get_mut("metadata").and_then(|m| m.as_object_mut())
         {
@@ -167,7 +189,7 @@ impl PodDeleteCoordinator {
                 Value::String(resource.resource_version.to_string()),
             );
         }
-        data
+        Ok(data)
     }
 
     pub(crate) async fn enqueue_actor_finalize_if_ready(
@@ -175,18 +197,15 @@ impl PodDeleteCoordinator {
         ns: &str,
         name: &str,
         resource: &Resource,
-    ) {
-        if resource
-            .data
-            .pointer("/metadata/deletionTimestamp")
-            .is_none()
+    ) -> Result<(), PodRepositoryError> {
+        if !has_nonempty_pod_deletion_timestamp(&resource.data)
             || resource
                 .data
                 .pointer("/metadata/finalizers")
                 .and_then(|finalizers| finalizers.as_array())
                 .is_some_and(|finalizers| !finalizers.is_empty())
         {
-            return;
+            return Ok(());
         }
 
         if let Err(err) = self
@@ -207,7 +226,12 @@ impl PodDeleteCoordinator {
                 error = %err,
                 "failed to enqueue actor finalization after pod finalizers drained"
             );
+            return Err(PodRepositoryError::internal(format!(
+                "failed to enqueue actor finalization for {ns}/{name} uid {}: {err:#}",
+                resource.uid
+            )));
         }
+        Ok(())
     }
 
     pub(crate) async fn mark_and_queue_api_delete(
@@ -291,17 +315,29 @@ impl PodDeleteCoordinator {
         };
 
         let uid = updated.uid.clone();
-        if plan.queue_actor_reminder
-            && let Err(e) = self
-                .enqueue_marked_pod_retry(
-                    ns.to_string(),
-                    name.to_string(),
-                    uid.clone(),
-                    plan.remaining_delay,
-                    &updated.data,
-                )
-                .await
-        {
+        let queue_result = if plan.disposition == PodDeleteDeadlineDisposition::Unchanged {
+            self.ensure_marked_pod_retry(
+                ns.to_string(),
+                name.to_string(),
+                uid.clone(),
+                plan.remaining_delay,
+                &updated.data,
+            )
+            .await
+            .map(|_| ())
+        } else if plan.queue_actor_reminder {
+            self.enqueue_marked_pod_retry(
+                ns.to_string(),
+                name.to_string(),
+                uid.clone(),
+                plan.remaining_delay,
+                &updated.data,
+            )
+            .await
+        } else {
+            Ok(())
+        };
+        if let Err(e) = queue_result {
             self.metrics.record_cascade_delete_failure();
             tracing::error!(
                 namespace = %ns,
@@ -321,6 +357,25 @@ impl PodDeleteCoordinator {
             uid,
             changed: plan.disposition != PodDeleteDeadlineDisposition::Unchanged,
         })
+    }
+
+    async fn ensure_marked_pod_retry(
+        &self,
+        ns: String,
+        name: String,
+        uid: String,
+        run_after: Duration,
+        pod_data: &Value,
+    ) -> Result<bool> {
+        self.queue
+            .ensure_deferred_delete_with_target_node(
+                ns,
+                name,
+                uid,
+                run_after,
+                pod_target_node_from_pod_data(pod_data),
+            )
+            .await
     }
 
     pub(crate) async fn enqueue_marked_pod_retry(
@@ -473,6 +528,57 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Err(anyhow::anyhow!("node-local workqueue write failed"))
         }
+
+        async fn ensure_deferred_delete_with_target_node(
+            &self,
+            _ns: String,
+            _name: String,
+            _uid: String,
+            _run_after: Duration,
+            _target_node: Option<String>,
+        ) -> Result<bool> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("node-local workqueue ensure failed"))
+        }
+    }
+
+    struct FailOnceDeleteQueue {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PodDeleteQueuePort for FailOnceDeleteQueue {
+        async fn enqueue_deferred_delete_with_target_node(
+            &self,
+            _ns: String,
+            _name: String,
+            _uid: String,
+            _run_after: Duration,
+            _target_node: Option<String>,
+        ) -> Result<()> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                Err(anyhow::anyhow!("injected first reminder failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn ensure_deferred_delete_with_target_node(
+            &self,
+            _ns: String,
+            _name: String,
+            _uid: String,
+            _run_after: Duration,
+            _target_node: Option<String>,
+        ) -> Result<bool> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                Err(anyhow::anyhow!("injected first reminder failure"))
+            } else {
+                Ok(true)
+            }
+        }
     }
 
     struct NoopDeleteSleeper;
@@ -482,9 +588,30 @@ mod tests {
         async fn sleep(&self, _name: &'static str, _duration: Duration) {}
     }
 
-    #[derive(Default)]
     struct RecordingDeleteQueue {
         delays: Mutex<Vec<Duration>>,
+        targets: Mutex<Vec<Option<String>>>,
+        existing: std::sync::atomic::AtomicBool,
+    }
+
+    impl Default for RecordingDeleteQueue {
+        fn default() -> Self {
+            Self {
+                delays: Mutex::new(Vec::new()),
+                targets: Mutex::new(Vec::new()),
+                existing: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl RecordingDeleteQueue {
+        fn with_existing() -> Self {
+            Self {
+                delays: Mutex::new(Vec::new()),
+                targets: Mutex::new(Vec::new()),
+                existing: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
     }
 
     #[async_trait]
@@ -495,10 +622,33 @@ mod tests {
             _name: String,
             _uid: String,
             run_after: Duration,
-            _target_node: Option<String>,
+            target_node: Option<String>,
         ) -> Result<()> {
             self.delays.lock().await.push(run_after);
+            self.targets.lock().await.push(target_node);
+            self.existing.store(true, Ordering::SeqCst);
             Ok(())
+        }
+
+        async fn ensure_deferred_delete_with_target_node(
+            &self,
+            _ns: String,
+            _name: String,
+            _uid: String,
+            run_after: Duration,
+            target_node: Option<String>,
+        ) -> Result<bool> {
+            if self
+                .existing
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                self.delays.lock().await.push(run_after);
+                self.targets.lock().await.push(target_node);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         }
     }
 
@@ -587,7 +737,9 @@ mod tests {
             SideEffectMetrics::new(),
             Arc::new(FixedDeleteClock),
         );
-        let body = coordinator.dry_run_delete_body(&pod_resource(), Some(5));
+        let body = coordinator
+            .dry_run_delete_body(&pod_resource(), Some(5))
+            .expect("valid dry-run delete plan");
         assert_eq!(
             body.pointer("/metadata/deletionTimestamp")
                 .and_then(Value::as_str),
@@ -608,7 +760,7 @@ mod tests {
         body["metadata"]["deletionGracePeriodSeconds"] = json!(30);
         resource.data = Arc::new(body);
         let store = Arc::new(FakeDeleteStore::new(resource.clone()));
-        let queue = Arc::new(RecordingDeleteQueue::default());
+        let queue = Arc::new(RecordingDeleteQueue::with_existing());
         let coordinator = PodDeleteCoordinator::new_with_ports(
             store.clone(),
             queue.clone(),
@@ -721,7 +873,9 @@ mod tests {
             Arc::new(FixedDeleteClock),
         );
 
-        let mut dry_run = coordinator.dry_run_delete_body(&pod_resource(), Some(5));
+        let mut dry_run = coordinator
+            .dry_run_delete_body(&pod_resource(), Some(5))
+            .expect("valid dry-run delete plan");
         assert_eq!(store.writes.load(Ordering::SeqCst), 0);
         assert!(queue.delays.lock().await.is_empty());
 
@@ -896,5 +1050,249 @@ mod tests {
                 .is_some(),
             "pod may be marked, but the caller must see failure and can retry durable enqueue"
         );
+    }
+
+    #[tokio::test]
+    async fn queue_failure_then_duplicate_delete_restores_missing_uid_reminder() {
+        let mut initial = pod_resource();
+        let mut initial_body = (*initial.data).clone();
+        initial_body["spec"]["terminationGracePeriodSeconds"] = json!(30);
+        initial.data = Arc::new(initial_body);
+        let store = Arc::new(FakeDeleteStore::new(initial.clone()));
+        let queue = Arc::new(FailOnceDeleteQueue {
+            calls: AtomicUsize::new(0),
+        });
+        let coordinator = PodDeleteCoordinator::new_with_ports(
+            store.clone(),
+            queue.clone(),
+            Arc::new(NoopDeleteSleeper),
+            SideEffectMetrics::new(),
+            Arc::new(FixedDeleteClock),
+        );
+
+        coordinator
+            .mark_and_queue_api_delete(
+                "default",
+                "pod-a",
+                None,
+                &ResourcePreconditions::default(),
+                initial,
+            )
+            .await
+            .expect_err("first reminder write must fail after the delete mark commits");
+        let marked = store.current.lock().await.clone();
+        let marked_rv = marked.resource_version;
+
+        let duplicate = coordinator
+            .mark_and_queue_api_delete(
+                "default",
+                "pod-a",
+                None,
+                &ResourcePreconditions::default(),
+                marked,
+            )
+            .await
+            .expect("duplicate delete must restore an absent durable reminder");
+
+        assert!(!duplicate.changed);
+        assert_eq!(duplicate.updated.resource_version, marked_rv);
+        assert_eq!(store.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(queue.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn finalizer_drain_enqueue_failure_is_returned_for_retry() {
+        let mut resource = pod_resource();
+        let mut body = (*resource.data).clone();
+        body["metadata"]["deletionTimestamp"] = json!("2026-08-08T12:00:30.000000000Z");
+        body["metadata"]["finalizers"] = json!([]);
+        resource.data = Arc::new(body);
+        let queue = Arc::new(FailingDeleteQueue {
+            calls: AtomicUsize::new(0),
+        });
+        let metrics = SideEffectMetrics::new();
+        let coordinator = PodDeleteCoordinator::new_with_ports(
+            Arc::new(FakeDeleteStore::new(resource.clone())),
+            queue.clone(),
+            Arc::new(NoopDeleteSleeper),
+            metrics.clone(),
+            Arc::new(FixedDeleteClock),
+        );
+
+        let error = coordinator
+            .enqueue_actor_finalize_if_ready("default", "pod-a", &resource)
+            .await
+            .expect_err("finalizer-drain queue failure must reach the API retry path");
+        assert!(matches!(error, PodRepositoryError::Internal { .. }));
+        assert_eq!(queue.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            metrics
+                .cascade_delete_failures_total
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_deletion_metadata_fails_closed_identically_for_dry_run_and_live() {
+        let mut resource = pod_resource();
+        let mut body = (*resource.data).clone();
+        body["metadata"]["deletionTimestamp"] = json!({"malformed": true});
+        resource.data = Arc::new(body);
+        let store = Arc::new(FakeDeleteStore::new(resource.clone()));
+        let queue = Arc::new(RecordingDeleteQueue::default());
+        let coordinator = PodDeleteCoordinator::new_with_ports(
+            store.clone(),
+            queue.clone(),
+            Arc::new(NoopDeleteSleeper),
+            SideEffectMetrics::new(),
+            Arc::new(FixedDeleteClock),
+        );
+
+        let dry_error = coordinator
+            .dry_run_delete_body(&resource, None)
+            .expect_err("dry-run malformed deadline must fail closed");
+        let live_error = coordinator
+            .mark_and_queue_api_delete(
+                "default",
+                "pod-a",
+                None,
+                &ResourcePreconditions::default(),
+                resource,
+            )
+            .await
+            .expect_err("live malformed deadline must fail closed");
+        assert_eq!(dry_error, live_error);
+        assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+        assert!(queue.delays.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn null_deletion_timestamp_does_not_enqueue_actor_finalization() {
+        let mut resource = pod_resource();
+        let mut body = (*resource.data).clone();
+        body["metadata"]["deletionTimestamp"] = Value::Null;
+        body["metadata"]["finalizers"] = json!([]);
+        resource.data = Arc::new(body);
+        let queue = Arc::new(FailingDeleteQueue {
+            calls: AtomicUsize::new(0),
+        });
+        let coordinator = PodDeleteCoordinator::new_with_ports(
+            Arc::new(FakeDeleteStore::new(resource.clone())),
+            queue.clone(),
+            Arc::new(NoopDeleteSleeper),
+            SideEffectMetrics::new(),
+            Arc::new(FixedDeleteClock),
+        );
+
+        coordinator
+            .enqueue_actor_finalize_if_ready("default", "pod-a", &resource)
+            .await
+            .expect("null timestamp is not terminating and must be ignored");
+        assert_eq!(queue.calls.load(Ordering::SeqCst), 0);
+    }
+
+    struct PausedBindingDeleteStore {
+        current: Mutex<Resource>,
+        mark_entered: tokio::sync::Notify,
+        release_mark: tokio::sync::Notify,
+        first_mark: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl PodDeleteStorePort for PausedBindingDeleteStore {
+        async fn get(&self, _ns: &str, _name: &str) -> Result<Option<Resource>> {
+            Ok(Some(self.current.lock().await.clone()))
+        }
+
+        async fn mark_deleting_at_resource_version(
+            &self,
+            _ns: &str,
+            _name: &str,
+            uid: &str,
+            body: Value,
+            expected_rv: i64,
+        ) -> Result<Resource> {
+            if self.first_mark.swap(false, Ordering::SeqCst) {
+                self.mark_entered.notify_one();
+                self.release_mark.notified().await;
+            }
+            let mut current = self.current.lock().await;
+            if current.uid != uid || current.resource_version != expected_rv {
+                return Err(anyhow::Error::new(PodRepositoryError::conflict(
+                    "scheduler bind won delete CAS",
+                )));
+            }
+            let mut updated = current.clone();
+            updated.resource_version += 1;
+            updated.data = Arc::new(body);
+            *current = updated.clone();
+            Ok(updated)
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_api_delete_retries_after_scheduler_bind_and_targets_winning_node() {
+        let mut initial = pod_resource();
+        let mut body = (*initial.data).clone();
+        body["spec"]["nodeName"] = json!("");
+        body["spec"]["terminationGracePeriodSeconds"] = json!(30);
+        initial.data = Arc::new(body);
+        let store = Arc::new(PausedBindingDeleteStore {
+            current: Mutex::new(initial.clone()),
+            mark_entered: tokio::sync::Notify::new(),
+            release_mark: tokio::sync::Notify::new(),
+            first_mark: std::sync::atomic::AtomicBool::new(true),
+        });
+        let queue = Arc::new(RecordingDeleteQueue::default());
+        let coordinator = Arc::new(PodDeleteCoordinator::new_with_ports(
+            store.clone(),
+            queue.clone(),
+            Arc::new(NoopDeleteSleeper),
+            SideEffectMetrics::new(),
+            Arc::new(FixedDeleteClock),
+        ));
+        let entered = store.mark_entered.notified();
+        let delete = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .mark_and_queue_api_delete(
+                        "default",
+                        "pod-a",
+                        None,
+                        &ResourcePreconditions::default(),
+                        initial,
+                    )
+                    .await
+            })
+        };
+        entered.await;
+        {
+            let mut current = store.current.lock().await;
+            let mut bound = (*current.data).clone();
+            bound["spec"]["nodeName"] = json!("node-bound-by-scheduler");
+            current.resource_version += 1;
+            current.data = Arc::new(bound);
+        }
+        store.release_mark.notify_one();
+
+        let outcome = delete.await.unwrap().expect("delete retry after bind");
+        assert!(outcome.changed);
+        assert_eq!(outcome.uid, "uid-a");
+        assert_eq!(
+            outcome
+                .updated
+                .data
+                .pointer("/spec/nodeName")
+                .and_then(Value::as_str),
+            Some("node-bound-by-scheduler")
+        );
+        assert!(has_nonempty_pod_deletion_timestamp(&outcome.updated.data));
+        assert_eq!(
+            queue.targets.lock().await.as_slice(),
+            &[Some("node-bound-by-scheduler".to_string())]
+        );
+        assert_eq!(store.current.lock().await.uid, "uid-a");
     }
 }

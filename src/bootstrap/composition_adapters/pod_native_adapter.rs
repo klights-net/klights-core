@@ -214,7 +214,7 @@ impl PodDeleteOrchestration for RootPodNativeAdapter {
         &self,
         resource: &Resource,
         requested_grace_period_seconds: Option<i64>,
-    ) -> serde_json::Value {
+    ) -> Result<serde_json::Value, PodRepositoryError> {
         self.delete_coordinator
             .dry_run_delete_body(resource, requested_grace_period_seconds)
     }
@@ -254,8 +254,7 @@ impl PodDeleteOrchestration for RootPodNativeAdapter {
                     &request.name,
                     &request.resource,
                 )
-                .await;
-            Ok(())
+                .await
         })
     }
 

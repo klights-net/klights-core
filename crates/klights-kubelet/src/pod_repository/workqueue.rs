@@ -59,6 +59,15 @@ pub trait PodWorkqueuePersistence: Send + Sync {
         min_delay_ms: i64,
         last_error: Option<&str>,
     ) -> Result<()>;
+    async fn ensure_absent(
+        &self,
+        kind: PodWorkqueueKind,
+        pod: &PodIdentity,
+        payload: Value,
+        attempt_count: i64,
+        min_delay_ms: i64,
+        last_error: Option<&str>,
+    ) -> Result<bool>;
     async fn peek_next_due(&self) -> Result<Option<i64>>;
     async fn claim_due(
         &self,
@@ -234,6 +243,28 @@ impl PodWorkqueue {
             .await?;
         self.wake.notify_one();
         Ok(())
+    }
+
+    pub async fn ensure_deferred_delete_with_target_node(
+        self: &Arc<Self>,
+        ns: String,
+        name: String,
+        uid: String,
+        run_after: Duration,
+        target_node: Option<String>,
+    ) -> Result<bool> {
+        self.ensure_reconciler_started().await?;
+        let delay_ms = run_after.as_millis().min(i64::MAX as u128) as i64;
+        let pod = PodIdentity::new(&ns, &name, &uid);
+        let payload = pod_delete_target_payload(target_node.as_deref());
+        let inserted = self
+            .persistence
+            .ensure_absent(PodWorkqueueKind::Pod, &pod, payload, 0, delay_ms, None)
+            .await?;
+        if inserted {
+            self.wake.notify_one();
+        }
+        Ok(inserted)
     }
 
     pub async fn enqueue_deferred_delete_row_with_target_node(

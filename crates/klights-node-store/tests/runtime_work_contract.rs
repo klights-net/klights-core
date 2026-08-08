@@ -66,6 +66,10 @@ impl PodWorkqueueStore for EmptyRuntimeWorkStore {
         Box::pin(async { Ok(()) })
     }
 
+    fn ensure_work_if_absent(&self, _entry: PodWorkqueueEnqueue) -> RuntimeWorkFuture<'_, bool> {
+        Box::pin(async { Ok(true) })
+    }
+
     fn peek_next_due_ms(&self) -> RuntimeWorkFuture<'_, Option<i64>> {
         Box::pin(async { Ok(None) })
     }
@@ -543,6 +547,10 @@ impl ModelWorkqueue {
 impl PodWorkqueueStore for ModelWorkqueue {
     fn enqueue_work(&self, _entry: PodWorkqueueEnqueue) -> RuntimeWorkFuture<'_, ()> {
         Box::pin(async { Ok(()) })
+    }
+
+    fn ensure_work_if_absent(&self, _entry: PodWorkqueueEnqueue) -> RuntimeWorkFuture<'_, bool> {
+        Box::pin(async { Ok(true) })
     }
 
     fn peek_next_due_ms(&self) -> RuntimeWorkFuture<'_, Option<i64>> {

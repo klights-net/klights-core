@@ -121,6 +121,18 @@ mod tests {
             Ok(())
         }
 
+        async fn ensure_absent(
+            &self,
+            _kind: PodWorkqueueKind,
+            _pod: &PodIdentity,
+            _payload: Value,
+            _attempt_count: i64,
+            _min_delay_ms: i64,
+            _last_error: Option<&str>,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
         async fn peek_next_due(&self) -> Result<Option<i64>> {
             Ok(Some(0))
         }
@@ -187,6 +199,18 @@ mod tests {
             _last_error: Option<&str>,
         ) -> Result<()> {
             Ok(())
+        }
+
+        async fn ensure_absent(
+            &self,
+            _kind: PodWorkqueueKind,
+            _pod: &PodIdentity,
+            _payload: Value,
+            _attempt_count: i64,
+            _min_delay_ms: i64,
+            _last_error: Option<&str>,
+        ) -> Result<bool> {
+            Ok(true)
         }
 
         async fn peek_next_due(&self) -> Result<Option<i64>> {

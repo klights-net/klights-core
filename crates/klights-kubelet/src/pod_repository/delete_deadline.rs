@@ -25,6 +25,12 @@ pub struct PodDeleteDeadlineError {
     message: String,
 }
 
+pub fn has_nonempty_pod_deletion_timestamp(pod: &Value) -> bool {
+    pod.pointer("/metadata/deletionTimestamp")
+        .and_then(Value::as_str)
+        .is_some_and(|timestamp| !timestamp.trim().is_empty())
+}
+
 impl std::fmt::Display for PodDeleteDeadlineError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)
