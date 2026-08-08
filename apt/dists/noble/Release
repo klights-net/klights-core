@@ -1,0 +1,31 @@
+Architectures: amd64 arm64
+Codename: noble
+Components: main
+Date: Sat, 08 Aug 2026 08:37:09 +0000
+Label: klights
+Origin: klights
+Suite: noble
+MD5Sum:
+ 7c362a6e80cbaf0dbec9cfabb62b00a0              142 Release
+ 8aced87e650f86bd63b5b17311c7d98d              626 main/binary-amd64/Packages
+ 1731a171efd248b2bba2fc54eb08d612              435 main/binary-amd64/Packages.gz
+ 79ec81ab1575326046a0eec8c9e0cf4f              626 main/binary-arm64/Packages
+ 524e1a0df7a430c859267511e1494880              437 main/binary-arm64/Packages.gz
+SHA1:
+ 7e2d34d54dc091c9d776d9399b5d7e7cc34b86e2              142 Release
+ 658722fcae68deee479888dcb43720577d83b5db              626 main/binary-amd64/Packages
+ 80ef21488cacb4090305e98bfe32053eeb97a041              435 main/binary-amd64/Packages.gz
+ e78235df4d469f0266ea1c2504a030091b657800              626 main/binary-arm64/Packages
+ e6e19bcadd7ad98f6c51db4568ac52da94e958be              437 main/binary-arm64/Packages.gz
+SHA256:
+ 864a441689372d697e4114b969038099ed284a09b4ff25ce8b4b6b435fbec082              142 Release
+ 6b23362f80dbcfbfeaac1038acc317578d09f45433d46f10a3bc779562d3ff64              626 main/binary-amd64/Packages
+ 861225ff2b9148090b2bb12fb9ae11bda3d711182b4d183d1465b9567429ec52              435 main/binary-amd64/Packages.gz
+ 64424fb90d6567acceb696cfbac5e6fe3ffa77aa08dd89e0293f0782ac3a1337              626 main/binary-arm64/Packages
+ f5bf4d651f0432ee165927c717821d7e85c4b4f4fc6314e9ebd60fb1010f76c6              437 main/binary-arm64/Packages.gz
+SHA512:
+ eda9415a95fd4d5f54217bdedfd8128f50067ef1cbd268ae03139eca73366dc4e79e5c6f098c589085b5c9a7b932c22ec9b261cbfefb0f8f806bfd2cff347a77              142 Release
+ 2186d8052238b77ea190e97ded0af53de03eeb526c466c0e192674ec3f6c7350f10020a7cf0ce7e6f5e23f845fe7d4cdd9bd6927e21d497d170902a019a5bc96              626 main/binary-amd64/Packages
+ f68ab3302340d48e2a51c4f07d002a564dddc24043abece4abdd6e6b9392542c7a2139db417405ecb3e9e79db22bcee6ac58b436ae2ed0f2dadddcb44b1f9c73              435 main/binary-amd64/Packages.gz
+ 28d112a4492957ef13550d5fb33af99893a63b138775bed5dbf2ddc7ab1bd64efd31c23090eca410f751e68f8a357c5345c9ae089dace093e8d9a7e422effa7e              626 main/binary-arm64/Packages
+ bfd2ea014cb84860911ec86af1839f6ad4dd32cc230a1291aef36a1a3a5978465ef6c20e3c8589ac7ba72881a747b35685c8110c127af37b3efa1a46860c12c6              437 main/binary-arm64/Packages.gz
