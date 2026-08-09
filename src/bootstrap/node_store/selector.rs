@@ -20,31 +20,6 @@ pub(crate) async fn open_node_local(
     }
 }
 
-#[cfg(test)]
-pub(crate) async fn open_node_local_with_sqlite(
-    kind: BackendKind,
-    path: Option<&Path>,
-    supervisor: Arc<TaskSupervisor>,
-    key_file: Option<&Path>,
-    connection_key: &'static str,
-) -> Result<(
-    NodeLocalStores,
-    Option<Arc<crate::bootstrap::node_store::NodeLocalStores>>,
-)> {
-    match kind {
-        BackendKind::Sqlite => {
-            let node = open_sqlite(path, supervisor, key_file, connection_key).await?;
-            let legacy = Arc::new(
-                crate::bootstrap::node_store::NodeLocalStores::from_executor(
-                    node.executor_for_test(),
-                )?,
-            );
-            Ok((node, Some(legacy)))
-        }
-        BackendKind::Redb => match crate::datastore::node_local::redb::open().await? {},
-    }
-}
-
 async fn open_sqlite(
     path: Option<&Path>,
     supervisor: Arc<TaskSupervisor>,

@@ -27,8 +27,6 @@ pub(crate) struct NodeLocalStores {
     delivery: Arc<SqliteDeliveryStore>,
     network: Arc<SqliteNodeNetworkStateStore>,
     runtime_work: Arc<SqliteRuntimeWorkStore>,
-    #[cfg(test)]
-    executor: DbExecutor,
 }
 
 impl NodeLocalStores {
@@ -48,8 +46,6 @@ impl NodeLocalStores {
                 wall_clock.clone(),
             )),
             runtime_work: Arc::new(SqliteRuntimeWorkStore::new(executor.clone(), wall_clock)),
-            #[cfg(test)]
-            executor,
         })
     }
 
@@ -126,10 +122,5 @@ impl NodeLocalStores {
 
     pub(crate) fn pod_slot_events(&self) -> Arc<dyn PodSlotAdmissionEventSource> {
         self.runtime_work.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn executor_for_test(&self) -> DbExecutor {
-        self.executor.clone()
     }
 }

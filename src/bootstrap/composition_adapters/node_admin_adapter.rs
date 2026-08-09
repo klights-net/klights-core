@@ -151,10 +151,12 @@ mod tests {
     use super::*;
 
     use crate::bootstrap::node_store::NodeLocalStores;
-    use crate::bootstrap::node_store::{open_node_local, open_node_local_with_sqlite};
+    use crate::bootstrap::node_store::open_node_local;
     use crate::datastore::backend_kind::BackendKind;
-    use crate::datastore::node_local::DeadLetterTestInsert;
-    use klights_node_store::{DeadLetterMoveRequest, OutboxEnqueue, OutboxSubject};
+    use klights_node_datastore::test_support::{DeadLetterTestInsert, NodeDeliveryTestStore};
+    use klights_node_store::{
+        DeadLetterMoveRequest, DeadLetterStore, OutboxEnqueue, OutboxSubject,
+    };
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use klights_types::ResourceKey;
 
@@ -201,12 +203,15 @@ mod tests {
         .expect("open node-local test db")
     }
 
-    async fn node_db_with_dead_letter() -> (NodeLocalStores, i64) {
-        let ndb = node_db("sqlite:node-admin-adapter-test").await;
+    async fn node_db_with_dead_letter(
+        connection_key: &'static str,
+        idempotency_key: &'static str,
+    ) -> (NodeLocalStores, i64) {
+        let ndb = node_db(connection_key).await;
         ndb.outbox_producer()
             .enqueue_outbox(
                 OutboxEnqueue::try_new(
-                    "node-admin-dl-key",
+                    idempotency_key,
                     1000,
                     OutboxSubject::new(
                         "v1/Pod/default/web/uid-1",
@@ -225,7 +230,7 @@ mod tests {
             .expect("enqueue for dead letter");
         ndb.dead_letters()
             .move_outbox_to_dead_letter_if_max_attempts(
-                DeadLetterMoveRequest::try_new("node-admin-dl-key", 0)
+                DeadLetterMoveRequest::try_new(idempotency_key, 0)
                     .expect("valid dead-letter move request"),
             )
             .await
@@ -241,35 +246,30 @@ mod tests {
         (ndb, id)
     }
 
-    async fn node_db_with_unassigned_dead_letter() -> (NodeLocalStores, i64) {
-        let (ndb, _legacy) = open_node_local_with_sqlite(
-            BackendKind::Sqlite,
-            None,
+    async fn node_db_with_unassigned_dead_letter() -> (NodeDeliveryTestStore, i64) {
+        let ndb = NodeDeliveryTestStore::open(
             supervisor(),
-            None,
             "sqlite:node-admin-unassigned-dead-letter-adapter-test",
         )
         .await
         .expect("open node-local test db");
-        _legacy
-            .expect("SQLite backend")
-            .insert_dead_letter_test_only(DeadLetterTestInsert {
-                idempotency_key: "node-admin-unassigned-dl-key",
-                operation: "PodStatus",
-                subject_key: "v1/Pod/default/web/uid-1",
-                subject_api_version: "v1",
-                subject_kind: "Pod",
-                subject_namespace: Some("default"),
-                subject_name: "web",
-                subject_uid: Some("uid-1"),
-                pod_uid: "uid-1",
-                payload_proto: &[1, 2, 3],
-                attempts: 720,
-                last_error: "max attempts",
-                moved_at_ms: 2_000,
-            })
-            .await
-            .expect("insert unassigned dead letter");
+        ndb.insert_dead_letter_test_only(DeadLetterTestInsert {
+            idempotency_key: "node-admin-unassigned-dl-key",
+            operation: "PodStatus",
+            subject_key: "v1/Pod/default/web/uid-1",
+            subject_api_version: "v1",
+            subject_kind: "Pod",
+            subject_namespace: Some("default"),
+            subject_name: "web",
+            subject_uid: Some("uid-1"),
+            pod_uid: "uid-1",
+            payload_proto: &[1, 2, 3],
+            attempts: 720,
+            last_error: "max attempts",
+            moved_at_ms: 2_000,
+        })
+        .await
+        .expect("insert unassigned dead letter through canonical test support");
         let id = ndb
             .dead_letters()
             .list_dead_letter()
@@ -281,8 +281,8 @@ mod tests {
         (ndb, id)
     }
 
-    fn adapter(node_db: &NodeLocalStores, notify: Arc<Notify>) -> Arc<RootNodeAdmin> {
-        RootNodeAdmin::new(node_db.dead_letters(), notify)
+    fn adapter(dead_letters: Arc<dyn DeadLetterStore>, notify: Arc<Notify>) -> Arc<RootNodeAdmin> {
+        RootNodeAdmin::new(dead_letters, notify)
     }
 
     #[tokio::test]
@@ -317,7 +317,7 @@ mod tests {
             .await
             .expect("enqueue");
 
-        let status = adapter(&ndb, Arc::new(Notify::new()))
+        let status = adapter(ndb.dead_letters(), Arc::new(Notify::new()))
             .outbox_status()
             .await
             .expect("read status through root adapter");
@@ -329,22 +329,30 @@ mod tests {
 
     #[tokio::test]
     async fn dead_letter_list_adapter_preserves_row_identity() {
-        let (ndb, _) = node_db_with_dead_letter().await;
-        let rows = adapter(&ndb, Arc::new(Notify::new()))
+        let (ndb, _) = node_db_with_dead_letter(
+            "sqlite:node-admin-list-adapter-test",
+            "node-admin-list-dl-key",
+        )
+        .await;
+        let rows = adapter(ndb.dead_letters(), Arc::new(Notify::new()))
             .list_dead_letters()
             .await
             .expect("list through root adapter");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].idempotency_key, "node-admin-dl-key");
+        assert_eq!(rows[0].idempotency_key, "node-admin-list-dl-key");
         assert_eq!(rows[0].subject_uid.as_deref(), Some("uid-1"));
     }
 
     #[tokio::test]
     async fn dead_letter_replay_adapter_requeues_and_wakes_dispatcher() {
-        let (ndb, id) = node_db_with_dead_letter().await;
+        let (ndb, id) = node_db_with_dead_letter(
+            "sqlite:node-admin-replay-adapter-test",
+            "node-admin-replay-dl-key",
+        )
+        .await;
         let notify = Arc::new(Notify::new());
         assert!(
-            adapter(&ndb, notify.clone())
+            adapter(ndb.dead_letters(), notify.clone())
                 .replay_dead_letter(id)
                 .await
                 .expect("replay through root adapter")
@@ -365,7 +373,7 @@ mod tests {
     async fn dead_letter_delete_adapter_removes_unassigned_row() {
         let (ndb, id) = node_db_with_unassigned_dead_letter().await;
         assert!(
-            adapter(&ndb, Arc::new(Notify::new()))
+            adapter(ndb.dead_letters(), Arc::new(Notify::new()))
                 .delete_dead_letter(id)
                 .await
                 .expect("delete through root adapter")
@@ -383,7 +391,7 @@ mod tests {
     async fn dead_letter_replay_adapter_reports_missing_row() {
         let ndb = node_db("sqlite:node-admin-missing-adapter-test").await;
         assert!(
-            !adapter(&ndb, Arc::new(Notify::new()))
+            !adapter(ndb.dead_letters(), Arc::new(Notify::new()))
                 .replay_dead_letter(99_999)
                 .await
                 .expect("missing replay through root adapter")

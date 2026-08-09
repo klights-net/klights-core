@@ -28,6 +28,4 @@ mod selector_tests;
 mod selector;
 
 pub(crate) use selector::open_node_local;
-#[cfg(test)]
-pub(crate) use selector::open_node_local_with_sqlite;
 pub(crate) use stores::NodeLocalStores;

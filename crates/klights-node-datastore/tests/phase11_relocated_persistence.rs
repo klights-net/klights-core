@@ -14,6 +14,7 @@ use klights_node_store::{
 };
 use klights_supervisor::{DbExecutor, SystemWallClock, TaskCategoryConfig, TaskSupervisor};
 use klights_types::PodIdentity;
+use sha2::Digest;
 
 struct NodePersistence {
     executor: DbExecutor,
@@ -152,6 +153,48 @@ async fn node_local_schema_has_only_slim_uid_bound_tables() {
         })
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn node_local_schema_and_index_digest_is_stable() {
+    let db = fresh().await;
+    let digest: String = db
+        .executor
+        .call_raw("test:node_schema_index_digest", |conn| {
+            let mut statement = conn.prepare(
+                "SELECT type, name, tbl_name, COALESCE(sql, '') \
+                 FROM sqlite_master \
+                 WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%' \
+                 ORDER BY type, name",
+            )?;
+            let mut rows = statement.query([])?;
+            let mut hasher = sha2::Sha256::new();
+            while let Some(row) = rows.next()? {
+                for value in [
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ] {
+                    hasher.update(value.as_bytes());
+                    hasher.update([0]);
+                }
+                hasher.update([b'\n']);
+            }
+            let digest = hasher.finalize();
+            Ok::<_, tokio_rusqlite::Error>(
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        digest,
+        "52f00f8f32c9d27367b329af8269638d2d2a01043c79747d1fb93bd097e3f087"
+    );
 }
 
 #[tokio::test]

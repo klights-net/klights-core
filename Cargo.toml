@@ -289,6 +289,7 @@ klights-cluster-store = { workspace = true, features = ["test-support"] }
 klights-kubelet = { workspace = true, features = ["test-support"] }
 klights-networking = { workspace = true, features = ["test-support"] }
 klights-watch = { workspace = true, features = ["integration-test-harness"] }
+klights-node-datastore = { workspace = true, features = ["test-support"] }
 openraft = { workspace = true }
 rtnetlink = { workspace = true }
 tempfile = { workspace = true }
