@@ -2218,7 +2218,7 @@ fn assemble_pod_services(
 
 #[cfg(test)]
 struct TestDatastorePodNetworkCache {
-    node_local: Option<std::sync::Arc<crate::bootstrap::node_store::NodeLocalStores>>,
+    network: Option<Arc<dyn klights_node_store::PodNetworkCache>>,
 }
 
 #[cfg(test)]
@@ -2226,13 +2226,13 @@ pub(crate) fn test_pod_network_cache(
     node_local: std::sync::Arc<crate::bootstrap::node_store::NodeLocalStores>,
 ) -> Arc<dyn klights_node_store::PodNetworkCache> {
     Arc::new(TestDatastorePodNetworkCache {
-        node_local: Some(node_local),
+        network: Some(node_local.pod_network_cache()),
     })
 }
 
 #[cfg(test)]
 pub(crate) fn empty_test_pod_network_cache() -> Arc<dyn klights_node_store::PodNetworkCache> {
-    Arc::new(TestDatastorePodNetworkCache { node_local: None })
+    Arc::new(TestDatastorePodNetworkCache { network: None })
 }
 
 #[cfg(test)]
@@ -2264,11 +2264,10 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
         pod_uid: klights_node_store::PodUidKey,
     ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
     {
-        match &self.node_local {
-            Some(node_local) => klights_node_store::PodNetworkCache::get_network_for_uid(
-                node_local.as_ref(),
-                pod_uid,
-            ),
+        match &self.network {
+            Some(network) => {
+                klights_node_store::PodNetworkCache::get_network_for_uid(network.as_ref(), pod_uid)
+            }
             None => Box::pin(async { Ok(None) }),
         }
     }
@@ -2278,9 +2277,9 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
         pod: klights_types::PodIdentity,
     ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
     {
-        match &self.node_local {
-            Some(node_local) => {
-                klights_node_store::PodNetworkCache::get_network_for_pod(node_local.as_ref(), pod)
+        match &self.network {
+            Some(network) => {
+                klights_node_store::PodNetworkCache::get_network_for_pod(network.as_ref(), pod)
             }
             None => Box::pin(async { Ok(None) }),
         }
@@ -2291,9 +2290,9 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
         sandbox_id: klights_node_store::SandboxKey,
     ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
     {
-        match &self.node_local {
-            Some(node_local) => klights_node_store::PodNetworkCache::get_network_for_sandbox(
-                node_local.as_ref(),
+        match &self.network {
+            Some(network) => klights_node_store::PodNetworkCache::get_network_for_sandbox(
+                network.as_ref(),
                 sandbox_id,
             ),
             None => Box::pin(async { Ok(None) }),
@@ -2306,9 +2305,9 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
         pod: klights_types::PodIdentity,
     ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
     {
-        match &self.node_local {
-            Some(node_local) => klights_node_store::PodNetworkCache::get_network_for_assignment(
-                node_local.as_ref(),
+        match &self.network {
+            Some(network) => klights_node_store::PodNetworkCache::get_network_for_assignment(
+                network.as_ref(),
                 sandbox_id,
                 pod,
             ),
@@ -2320,9 +2319,9 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
         &self,
         sandbox_id: klights_node_store::SandboxKey,
     ) -> klights_node_store::CacheNetworkFuture<'_, ()> {
-        match &self.node_local {
-            Some(node_local) => klights_node_store::PodNetworkCache::delete_network_for_sandbox(
-                node_local.as_ref(),
+        match &self.network {
+            Some(network) => klights_node_store::PodNetworkCache::delete_network_for_sandbox(
+                network.as_ref(),
                 sandbox_id,
             ),
             None => Box::pin(async { Ok(()) }),
@@ -2333,9 +2332,9 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
         &self,
         request: klights_node_store::PodNetworkAllocationRequest,
     ) -> klights_node_store::CacheNetworkFuture<'_, bool> {
-        match &self.node_local {
-            Some(node_local) => klights_node_store::PodNetworkCache::delete_network_if_matches(
-                node_local.as_ref(),
+        match &self.network {
+            Some(network) => klights_node_store::PodNetworkCache::delete_network_if_matches(
+                network.as_ref(),
                 request,
             ),
             None => Box::pin(async { Ok(false) }),
@@ -2348,9 +2347,9 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
         '_,
         Vec<klights_node_store::PodNetworkAssignmentSnapshot>,
     > {
-        match &self.node_local {
-            Some(node_local) => {
-                klights_node_store::PodNetworkCache::list_network_assignments(node_local.as_ref())
+        match &self.network {
+            Some(network) => {
+                klights_node_store::PodNetworkCache::list_network_assignments(network.as_ref())
             }
             None => Box::pin(async { Ok(Vec::new()) }),
         }
