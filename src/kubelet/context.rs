@@ -1,4 +1,3 @@
-use crate::kubelet::pod_repository::PodRepository;
 use klights_kubelet::outbox::Outbox;
 use klights_kubelet::pod_creation_state::PodStartRetryTracker;
 use klights_kubelet::pod_lifecycle_router::PodLifecycleRouter;
@@ -10,7 +9,6 @@ pub(crate) type KubeletConfig = klights_kubelet::context::KubeletConfig<
 >;
 
 pub(crate) type KubeletLifecycleServices = klights_kubelet::context::LifecycleServices<
-    PodRepository,
     PodLifecycleRouter,
     klights_kubelet::context::PodLifecycleReceiver,
     PodStartRetryTracker,

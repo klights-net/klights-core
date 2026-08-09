@@ -32,7 +32,7 @@ impl PdbSideEffectPort for RootPdbSideEffectPort {
     async fn reconcile_namespace(&self, namespace: &str) -> Result<()> {
         let Some(pod_query) = self.pod_repository.query() else {
             tracing::debug!(
-                "PDBReconcileEffect skipped for {}: PodRepository not yet bound",
+                "PDBReconcileEffect skipped for {}: Pod query not yet bound",
                 namespace
             );
             return Ok(());

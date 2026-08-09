@@ -43,8 +43,6 @@ pub(crate) struct RootPodRepositoryPersistenceParts {
     pub(crate) store: Arc<PodStore>,
     pub(crate) bound_finalization: Arc<dyn LocalBoundPodFinalizationPersistence>,
     pub(crate) unscheduled_deletion: Arc<dyn UnscheduledPodDeletion>,
-    #[cfg(feature = "pod-repository-test-support")]
-    pub(crate) test_local_bound_finalization: Arc<dyn BoundPodFinalization>,
 }
 
 fn pod_persistence_error(error: anyhow::Error, namespace: &str, name: &str) -> PodRepositoryError {
@@ -504,8 +502,6 @@ pub(crate) fn new_root_parts(
         store,
         bound_finalization: concrete.clone(),
         unscheduled_deletion: Arc::new(UnscheduledPodDeletionService::new(concrete.clone())),
-        #[cfg(feature = "pod-repository-test-support")]
-        test_local_bound_finalization: concrete,
     }
 }
 
@@ -514,12 +510,12 @@ pub(crate) fn new_store(db: DatastoreHandle) -> PodStore {
     let concrete = concrete_adapter(db, sandbox_gc_dirty.clone());
     #[cfg(any(test, feature = "pod-repository-test-support"))]
     {
-        return PodStore::from_persistence_with_watch(
+        PodStore::from_persistence_with_watch(
             concrete.clone(),
             concrete.clone(),
             sandbox_gc_dirty,
             Some(concrete),
-        );
+        )
     }
     #[cfg(not(any(test, feature = "pod-repository-test-support")))]
     PodStore::from_persistence(concrete.clone(), concrete, sandbox_gc_dirty)

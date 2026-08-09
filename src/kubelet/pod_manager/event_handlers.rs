@@ -1,4 +1,5 @@
 use super::*;
+use klights_kubelet::pod_repository::workqueue::PodWorkqueue;
 #[cfg(test)]
 use klights_kubelet::pod_status_logic::ContainerInfo;
 use klights_kubelet::pod_watch_source::PodWatchEvent as WatchEvent;
@@ -32,12 +33,14 @@ pub(super) struct WatchEventHandlerContext<'a> {
     pub persistent_volume_event_handler: &'a Arc<dyn PersistentVolumeEventHandler>,
     pub pod_cleanup_intents: &'a Arc<dyn klights_leader_api::LeaderPodCleanupIntents>,
     pub node_name: &'a str,
-    // `pod_repo` stays concrete: `handle_namespace_termination_event` needs
-    // the durable workqueue-backed `enqueue_actor_deletes_for_terminating_namespace`
-    // capability, which has no focused-port accessor yet. Volume-refresh reads
-    // use the focused `pod_query` field below instead of this aggregate.
-    pub pod_repo: &'a Arc<crate::kubelet::pod_repository::PodRepository>,
+    // `pod_workqueue` backs the durable namespace-termination enqueue
+    // capability (`enqueue_actor_deletes_for_terminating_namespace`);
+    // volume-refresh reads use the focused `pod_query` field below, and
+    // phase/restart persistence goes through the focused status writer.
+    pub pod_workqueue: &'a Arc<PodWorkqueue>,
     pub pod_query: &'a dyn klights_pod_api::PodQuery,
+    pub pod_status_writer: &'a dyn klights_kubelet::pod_repository::status::PodStatusWriter,
+    pub mutation_reconcile: &'a dyn klights_reconcile_api::PodMutationReconcileSink,
     pub pod_creation_tracker: &'a PodCreationTracker,
     pub retry_state: &'a PodStartRetryTracker,
     pub pod_lifecycle_state: &'a PodLifecycleStateTracker,
@@ -56,8 +59,10 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
         persistent_volume_event_handler,
         pod_cleanup_intents,
         node_name,
-        pod_repo,
+        pod_workqueue,
         pod_query,
+        pod_status_writer: _pod_status_writer,
+        mutation_reconcile,
         pod_creation_tracker,
         retry_state,
         pod_lifecycle_state,
@@ -144,7 +149,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
     }
 
     if event_kind == "Namespace" {
-        handle_namespace_termination_event(pod_repo, &event).await;
+        handle_namespace_termination_event(pod_workqueue, &event).await;
         return;
     }
 
@@ -237,11 +242,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
         // status writes. Re-enqueue the owning Job from this event so indexed
         // Job status cannot miss a final succeeded/failed index due to races
         // between CRI completion handling and controller queue coalescing.
-        enqueue_job_reconcile_for_terminal_watch_pod(
-            pod_repo.mutation_reconcile_port().as_ref(),
-            &event.object,
-        )
-        .await;
+        enqueue_job_reconcile_for_terminal_watch_pod(mutation_reconcile, &event.object).await;
 
         // Refresh downwardAPI volumes to reflect metadata changes (labels/annotations)
         let volumes_root = paths.volumes_root().to_string_lossy().into_owned();
@@ -399,7 +400,7 @@ fn node_lost_cleanup_intent_key_for_deleted_pod(
 }
 
 pub(super) async fn handle_namespace_termination_event(
-    pod_repo: &Arc<crate::kubelet::pod_repository::PodRepository>,
+    pod_workqueue: &Arc<PodWorkqueue>,
     event: &WatchEvent,
 ) {
     if event.object.get("kind").and_then(|kind| kind.as_str()) != Some("Namespace") {
@@ -425,7 +426,7 @@ pub(super) async fn handle_namespace_termination_event(
         return;
     }
 
-    if let Err(err) = pod_repo
+    if let Err(err) = pod_workqueue
         .enqueue_actor_deletes_for_terminating_namespace(namespace)
         .await
     {
@@ -461,7 +462,7 @@ pub(super) struct PodPhaseUpdateRequest<'a> {
 
 #[cfg(test)]
 pub(super) async fn apply_pod_phase_update(
-    pod_repo: &Arc<crate::kubelet::pod_repository::PodRepository>,
+    pod_parts: &crate::kubelet::pod_manager::tests::PodManagerTestPorts,
     request: PodPhaseUpdateRequest<'_>,
 ) {
     let PodPhaseUpdateRequest {
@@ -476,7 +477,7 @@ pub(super) async fn apply_pod_phase_update(
     use klights_kubelet::pod_status_builders::build_container_statuses;
     use klights_kubelet::pod_status_logic::extract_ready_containers_from_pod_condition;
 
-    use klights_kubelet::pod_repository::{PodStatusWriter, RuntimeReconcileStatus};
+    use klights_kubelet::pod_repository::RuntimeReconcileStatus;
     tracing::info!(
         namespace, pod_name,
         current_phase = current_phase.unwrap_or("None"),
@@ -591,7 +592,8 @@ pub(super) async fn apply_pod_phase_update(
     // own them. On error, log and continue: today this site swallows
     // failures via `let _ = ...`, and the standing Task 16.6 decision is to
     // preserve the infallible-from-caller's-perspective contract here.
-    if let Err(e) = pod_repo
+    if let Err(e) = pod_parts
+        .pod_status_writer
         .apply_runtime_reconcile_status_for_uid(
             namespace,
             pod_name,
@@ -618,8 +620,13 @@ pub(super) async fn apply_pod_phase_update(
     // conditions are updated promptly. Uses the controller dispatcher
     // workqueue (not inline reconcile) to avoid blocking the watcher.
     if new_phase == "Succeeded" || new_phase == "Failed" {
-        pod_repo
-            .enqueue_job_reconcile_for_pod(&pod_resource.data)
+        let _ = pod_parts
+            .mutation_reconcile
+            .reconcile_pod_mutation(
+                klights_reconcile_api::PodMutationReconcileRequest::EnqueueJobOwner {
+                    pod: klights_cluster_core::Resource::from_data_lossy(pod_resource.data.clone()),
+                },
+            )
             .await;
     }
 }
@@ -723,36 +730,57 @@ mod tests {
         db_handle: crate::datastore::DatastoreHandle,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> (
-        Arc<crate::kubelet::pod_repository::PodRepository>,
+        crate::kubelet::pod_manager::tests::PodManagerTestPorts,
         std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
     ) {
         let node_local =
-            crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
-        let pod_repo = Arc::new(
-            crate::kubelet::pod_repository::PodRepository::build_parts(
-                crate::kubelet::pod_repository::PodRepositoryBuildConfig {
-                    db: db_handle,
-                    pod_workqueue_store: Some(node_local.clone()),
-                    supervisor: supervisor.clone(),
-                    side_effects: Arc::new(
-                        klights_controllers::side_effects::SideEffectRegistry::new(),
-                    ),
-                    metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
-                    pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(
-                        node_local.clone(),
-                    ),
-                    assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
-                    scheduling_mode:
-                        crate::kubelet::pod_repository::PodSchedulingMode::InlineSingleNode,
-                    outbox: None,
-                    cluster_api: None,
-                    remote_delivery_required: false,
-                    controller_identity:
-                        crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
-                    scheduler_bind_gate: None,
-                },
-            )
-            .repository,
+            crate::pod_repository_composition::test_node_local_store(supervisor.clone()).await;
+        let (
+            pod_query,
+            _pod_snapshot,
+            _pod_update,
+            pod_status_writer,
+            pod_workqueue,
+            _pod_network_assignment,
+            _pod_host_ip,
+            _background,
+            _deletion_finalizer,
+            _dirty_counter,
+            mutation_reconcile,
+            _gc_delete,
+            _eviction_admission,
+            _namespace_bootstrap,
+            _namespace_termination_queue,
+            _pod_api,
+            _pod_subresource,
+            _pod_scheduling,
+            _watch_source,
+            _bound_finalization,
+            _deferred_runtime,
+            _test_api,
+            _test_subresource,
+        ) = crate::pod_repository_composition::build_pod_repository_parts(
+            crate::pod_repository_composition::PodRepositoryBuildConfig {
+                db: db_handle,
+                pod_workqueue_store: Some(node_local.clone()),
+                supervisor: supervisor.clone(),
+                side_effects: Arc::new(
+                    klights_controllers::side_effects::SideEffectRegistry::new(),
+                ),
+                metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
+                pod_network_cache:
+                    crate::pod_repository_composition::test_pod_network_cache(node_local.clone()),
+                assignment_waiter: crate::pod_repository_composition::test_assignment_bus(),
+                scheduling_mode:
+                    crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+                outbox: None,
+                cluster_api: None,
+                remote_delivery_required: false,
+                controller_identity:
+                    crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
+                scheduler_bind_gate: None,
+            },
+            None,
         );
 
         let registry = Arc::new(klights_kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry::new(
@@ -770,8 +798,16 @@ mod tests {
                 Arc::new(klights_kubelet::pod_lifecycle_router::executor::NoopExecutor),
             ),
         );
-        pod_repo.set_pod_lifecycle_router_for_node(router, "worker-a".to_string());
-        (pod_repo, node_local)
+        pod_workqueue.set_lifecycle_router_for_node(router, "worker-a".to_string());
+        (
+            crate::kubelet::pod_manager::tests::PodManagerTestPorts {
+                pod_query,
+                pod_status_writer,
+                pod_workqueue,
+                mutation_reconcile,
+            },
+            node_local,
+        )
     }
 
     #[test]
@@ -832,7 +868,7 @@ mod tests {
         let (db, db_handle) =
             crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let supervisor = fixture_supervisor();
-        let (pod_repo, node_local) = fixture_pod_repo(db_handle.clone(), supervisor).await;
+        let (pod_parts, node_local) = fixture_pod_repo(db_handle.clone(), supervisor).await;
 
         db.create_resource(
             "v1",
@@ -859,7 +895,7 @@ mod tests {
         .expect("create terminating pod");
 
         handle_namespace_termination_event(
-            &pod_repo,
+            &pod_parts.pod_workqueue,
             &WatchEvent::modified(json!({
                 "apiVersion": "v1",
                 "kind": "Namespace",
@@ -895,7 +931,8 @@ mod tests {
         let (db, db_handle) =
             crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let supervisor = fixture_supervisor();
-        let (pod_repo, _node_local) = fixture_pod_repo(db_handle.clone(), supervisor.clone()).await;
+        let (pod_parts, _node_local) =
+            fixture_pod_repo(db_handle.clone(), supervisor.clone()).await;
         let pod_cleanup_intents: Arc<dyn klights_leader_api::LeaderPodCleanupIntents> =
             Arc::new(crate::control_plane::client::local::LocalApiClient::new(
                 db_handle.clone(),
@@ -965,8 +1002,10 @@ mod tests {
                 persistent_volume_event_handler: &persistent_volume_event_handler,
                 pod_cleanup_intents: &pod_cleanup_intents,
                 node_name: "worker-a",
-                pod_repo: &pod_repo,
-                pod_query: pod_repo.as_ref(),
+                pod_workqueue: &pod_parts.pod_workqueue,
+                pod_query: pod_parts.pod_query.as_ref(),
+                pod_status_writer: pod_parts.pod_status_writer.as_ref(),
+                mutation_reconcile: pod_parts.mutation_reconcile.as_ref(),
                 pod_creation_tracker: &pod_creation_tracker,
                 retry_state: &retry_state,
                 pod_lifecycle_state: &pod_lifecycle_state,

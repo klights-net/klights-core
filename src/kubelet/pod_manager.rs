@@ -92,15 +92,9 @@ impl PodWatcherRuntimeContext {
         pod_watch_source: Arc<dyn PodWatchSource>,
         persistent_volume_event_handler: Arc<dyn PersistentVolumeEventHandler>,
     ) -> Self {
-        // `host_ip_state()` clones the repository's shared `HostIpState`
-        // handle; it is a crate-private convenience accessor with no
-        // focused-port replacement, so this is the one place remaining
-        // that names the concrete repository type explicitly.
-        let pod_repository: &Arc<crate::kubelet::pod_repository::PodRepository> =
-            &lifecycle.pod_repository;
         Self {
             pod_watch_source,
-            host_ip: pod_repository.host_ip_state(),
+            host_ip: lifecycle.host_ip.clone(),
             lifecycle,
             status_delivery,
             local_execution,
@@ -343,7 +337,7 @@ async fn run_pod_watcher_with_runtime(
 
     {
         let mut pod_recovery = PodRecovery::new(
-            lifecycle.pod_repository.clone(),
+            lifecycle.pod_query.clone(),
             &config.node_name,
             &pod_start_retry_state,
             pod_lifecycle_router.clone(),
@@ -501,8 +495,10 @@ async fn run_pod_watcher_with_runtime(
                         persistent_volume_event_handler: &state.persistent_volume_event_handler,
                         pod_cleanup_intents: &status_delivery.pod_cleanup_intents,
                         node_name: &config.node_name,
-                        pod_repo: &lifecycle.pod_repository,
-                        pod_query: lifecycle.pod_repository.as_ref(),
+                        pod_workqueue: &lifecycle.pod_workqueue,
+                        pod_query: lifecycle.pod_query.as_ref(),
+                        pod_status_writer: lifecycle.pod_status_writer.as_ref(),
+                        mutation_reconcile: lifecycle.pod_mutation_reconcile.as_ref(),
                         pod_creation_tracker: &pod_creation_tracker,
                         retry_state: &pod_start_retry_state,
                         pod_lifecycle_state: &pod_lifecycle_state,
@@ -547,7 +543,7 @@ async fn run_pod_watcher_with_runtime(
                 );
                 if let Some(key) = pod_lifecycle_key_for_cri_event(
                     container_control.as_ref(),
-                    lifecycle.pod_repository.as_ref(),
+                    lifecycle.pod_query.as_ref(),
                     &ev,
                 ).await {
                     let _ = pod_lifecycle_router
@@ -565,7 +561,7 @@ async fn run_pod_watcher_with_runtime(
             Some(cmd) = lifecycle_rx.recv() => {
                 // R2g: Lifecycle commands route through router → actor → executor.
                 // The executor handles all command dispatching.
-                if let Some(message) = lifecycle_message_from_command(&lifecycle.pod_repository, cmd.clone()).await {
+                if let Some(message) = lifecycle_message_from_command(cmd.clone()).await {
                     let _ = pod_lifecycle_router.route(message).await;
                 }
             }
@@ -690,7 +686,6 @@ fn lifecycle_command_target(
 }
 
 pub(crate) async fn lifecycle_message_from_command(
-    _pod_repo: &Arc<crate::kubelet::pod_repository::PodRepository>,
     command: klights_kubelet::lifecycle::LifecycleCommand,
 ) -> Option<LifecycleMessage> {
     let (namespace, pod_name, pod_uid) = lifecycle_command_target(&command);
@@ -773,16 +768,14 @@ fn container_attempt_order_key(info: &ContainerInfo, created_at: i64) -> i64 {
 
 #[cfg(test)]
 async fn persist_runtime_restart_status(
-    pod_repo: &Arc<crate::kubelet::pod_repository::PodRepository>,
+    pod_status_writer: &dyn klights_kubelet::pod_repository::status::PodStatusWriter,
     pod_resource: &klights_cluster_core::Resource,
     namespace: &str,
     pod_name: &str,
     container_name: &str,
     info: &ContainerInfo,
 ) -> Result<Option<i32>> {
-    use klights_kubelet::pod_repository::PodStatusWriter;
-
-    let updated = pod_repo
+    let updated = pod_status_writer
         .note_container_restart_for_uid(
             namespace,
             pod_name,

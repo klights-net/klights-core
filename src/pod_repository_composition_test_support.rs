@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use klights_cluster_datastore::sqlite::embedded::ResourceMutationPauseOperation as IntegrationResourceMutationPauseOperation;
 use klights_pod_api::PodSubresourceMutation as _;
-use klights_pod_api::{PodQuery as _, PodUpdate as _};
 
 fn integration_owner_references(
     values: Vec<serde_json::Value>,
@@ -111,9 +110,14 @@ impl IntegrationSchedulerBindGate {
     }
 }
 
-/// Opaque worker-owned repository composition for node-local/outbox tests.
-pub struct IntegrationPodWorkerComposition {
-    repository: Arc<crate::kubelet::pod_repository::PodRepository>,
+/// Focused worker-status/outbox fixture.  It owns only worker-safe ports and
+/// node-local state; cluster API capabilities stay outside this type.
+pub struct IntegrationPodWorkerFixture {
+    pod_query: Arc<dyn klights_pod_api::PodQuery>,
+    pod_update: Arc<dyn klights_pod_api::PodUpdate>,
+    pod_status_writer: Arc<dyn klights_kubelet::pod_repository::status::PodStatusWriter>,
+    deletion_finalizer:
+        Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer>,
     node_local: Arc<crate::datastore::node_local::NodeLocalStores>,
 }
 
@@ -147,7 +151,7 @@ async fn integration_finalize_pod_after_actor_cleanup(
     })
 }
 
-impl IntegrationPodWorkerComposition {
+impl IntegrationPodWorkerFixture {
     pub async fn new(resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>) -> Self {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
@@ -176,7 +180,31 @@ impl IntegrationPodWorkerComposition {
             Arc::new(tokio::sync::Notify::new()),
             Arc::new(klights_supervisor::SystemWallClock),
         ));
-        let parts = crate::pod_repository_composition::build_worker_pod_repository_parts(
+        let (
+            pod_query,
+            _pod_snapshot,
+            pod_update,
+            pod_status_writer,
+            _pod_workqueue,
+            _pod_network_assignment,
+            _pod_host_ip,
+            _background,
+            deletion_finalizer,
+            _dirty_counter,
+            _mutation_reconcile,
+            _gc_delete,
+            _eviction_admission,
+            _namespace_bootstrap,
+            _namespace_termination_queue,
+            _pod_api,
+            _pod_subresource,
+            _pod_scheduling,
+            _watch_source,
+            _bound_finalization,
+            _deferred_runtime,
+            _test_api,
+            _test_subresource,
+        ) = crate::pod_repository_composition::build_worker_pod_repository_parts(
             crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
                 resource_query,
                 pod_workqueue_store: node_local.pod_workqueue(),
@@ -188,7 +216,10 @@ impl IntegrationPodWorkerComposition {
             },
         );
         Self {
-            repository: Arc::new(parts.repository),
+            pod_query,
+            pod_update,
+            pod_status_writer,
+            deletion_finalizer,
             node_local,
         }
     }
@@ -209,7 +240,7 @@ impl IntegrationPodWorkerComposition {
         uid: &str,
     ) -> anyhow::Result<IntegrationPodFinalizationOutcome> {
         integration_finalize_pod_after_actor_cleanup(
-            self.repository.deletion_finalizer().as_ref(),
+            self.deletion_finalizer.as_ref(),
             namespace,
             name,
             uid,
@@ -222,7 +253,7 @@ impl IntegrationPodWorkerComposition {
         namespace: &str,
         name: &str,
     ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.repository
+        self.pod_query
             .get_pod(klights_pod_api::PodGetRequest::try_by_name(
                 namespace, name,
             )?)
@@ -236,7 +267,7 @@ impl IntegrationPodWorkerComposition {
         name: &str,
         uid: &str,
     ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.repository
+        self.pod_query
             .get_pod(klights_pod_api::PodGetRequest::try_by_identity(
                 klights_types::PodIdentity::new(namespace, name, uid),
             )?)
@@ -253,7 +284,7 @@ impl IntegrationPodWorkerComposition {
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
         klights_kubelet::pod_repository::PodStatusWriter::set_pod_status_for_uid(
-            self.repository.as_ref(),
+            self.pod_status_writer.as_ref(),
             namespace,
             name,
             uid,
@@ -272,7 +303,7 @@ impl IntegrationPodWorkerComposition {
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
         klights_kubelet::pod_repository::PodStatusWriter::apply_runtime_reconcile_status_for_uid(
-            self.repository.as_ref(),
+            self.pod_status_writer.as_ref(),
             namespace,
             name,
             uid,
@@ -289,7 +320,7 @@ impl IntegrationPodWorkerComposition {
         uid: &str,
         sandbox_id: &str,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.repository
+        self.pod_update
             .update_pod(klights_pod_api::PodUpdateRequest::try_record_sandbox_id(
                 klights_pod_api::PodMutationTarget::try_by_identity(
                     klights_types::PodIdentity::new(namespace, name, uid),
@@ -308,7 +339,7 @@ impl IntegrationPodWorkerComposition {
         uid: &str,
         owner_references: Vec<serde_json::Value>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.repository
+        self.pod_update
             .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
                 klights_pod_api::PodMutationTarget::try_by_identity(
                     klights_types::PodIdentity::new(namespace, name, uid),
@@ -327,7 +358,7 @@ impl IntegrationPodWorkerComposition {
         uid: &str,
         labels: Vec<(String, String)>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.repository
+        self.pod_update
             .update_pod(klights_pod_api::PodUpdateRequest::merge_labels(
                 klights_pod_api::PodMutationTarget::try_by_identity(
                     klights_types::PodIdentity::new(namespace, name, uid),
@@ -453,7 +484,7 @@ pub async fn run_worker_actor_finalization_delivery_scenario()
             klights_supervisor::FileProcessExecutor::new(supervisor),
         ),
     );
-    let repository = IntegrationPodWorkerComposition::new(cluster_api).await;
+    let repository = IntegrationPodWorkerFixture::new(cluster_api).await;
     let queued = repository
         .finalize_pod_deletion_after_actor_cleanup(
             "default",
@@ -555,7 +586,7 @@ pub async fn run_worker_actor_finalization_race()
             klights_supervisor::FileProcessExecutor::new(supervisor),
         ),
     );
-    let repository = IntegrationPodWorkerComposition::new(cluster_api.clone()).await;
+    let repository = IntegrationPodWorkerFixture::new(cluster_api.clone()).await;
     let initially_pending = repository
         .finalize_pod_deletion_after_actor_cleanup(
             "default",
@@ -632,16 +663,480 @@ pub async fn run_worker_actor_finalization_race()
     })
 }
 
-/// Opaque root-owned repository fixture for base composition tests.
-pub struct IntegrationPodRepositoryComposition {
+/// Focused query capability used by the integration harness.
+pub struct IntegrationPodQueryPorts {
+    query: Arc<dyn klights_pod_api::PodQuery>,
+    snapshot: Arc<dyn klights_pod_api::PodSnapshotQuery>,
+}
+
+impl IntegrationPodQueryPorts {
+    pub async fn get_pod(
+        &self,
+        request: klights_pod_api::PodGetRequest,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        self.query
+            .get_pod(request)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    pub async fn list_pods(
+        &self,
+        request: klights_pod_api::PodListRequest,
+    ) -> anyhow::Result<klights_pod_api::PodListResult> {
+        self.query
+            .list_pods(request)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    pub async fn list_pods_by_owner_uid(
+        &self,
+        request: klights_pod_api::PodOwnerListRequest,
+    ) -> anyhow::Result<Vec<crate::datastore::Resource>> {
+        self.query
+            .list_pods_by_owner_uid(request)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    pub async fn snapshot_pods(
+        &self,
+        request: klights_pod_api::PodSnapshotListRequest,
+    ) -> anyhow::Result<klights_pod_api::PodSnapshotListOutcome> {
+        self.snapshot
+            .snapshot_pods(request)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+}
+
+/// Focused metadata mutation capability used by integration tests.
+pub struct IntegrationPodUpdatePorts {
+    update: Arc<dyn klights_pod_api::PodUpdate>,
+}
+
+impl IntegrationPodUpdatePorts {
+    pub async fn update_pod(
+        &self,
+        request: klights_pod_api::PodUpdateRequest,
+    ) -> Result<crate::datastore::Resource, klights_pod_api::PodRepositoryError> {
+        self.update.update_pod(request).await
+    }
+}
+
+/// Focused status capability used by integration tests.
+pub struct IntegrationPodStatusPorts {
+    writer: Arc<dyn klights_kubelet::pod_repository::status::PodStatusWriter>,
+}
+
+impl IntegrationPodStatusPorts {
+    pub async fn set_pod_status(
+        &self,
+        namespace: &str,
+        name: &str,
+        update: klights_kubelet::pod_repository::PodStatusUpdate,
+        expected_rv: Option<i64>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.writer
+            .set_pod_status(namespace, name, update, expected_rv)
+            .await
+    }
+
+    pub async fn set_pod_status_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        update: klights_kubelet::pod_repository::PodStatusUpdate,
+        expected_rv: Option<i64>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.writer
+            .set_pod_status_for_uid(namespace, name, uid, update, expected_rv)
+            .await
+    }
+
+    pub async fn apply_runtime_reconcile_status(
+        &self,
+        namespace: &str,
+        name: &str,
+        update: klights_kubelet::pod_repository::RuntimeReconcileStatus,
+        expected_rv: Option<i64>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.writer
+            .apply_runtime_reconcile_status(namespace, name, update, expected_rv)
+            .await
+    }
+
+    pub async fn apply_runtime_reconcile_status_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        update: klights_kubelet::pod_repository::RuntimeReconcileStatus,
+        expected_rv: Option<i64>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.writer
+            .apply_runtime_reconcile_status_for_uid(namespace, name, uid, update, expected_rv)
+            .await
+    }
+
+    pub async fn mark_start_pending_for_retry_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        error_message: &str,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.writer
+            .mark_start_pending_for_retry_for_uid(namespace, name, uid, error_message)
+            .await
+    }
+
+    pub async fn set_probe_readiness(
+        &self,
+        namespace: &str,
+        name: &str,
+        container_name: &str,
+        ready: bool,
+        expected_rv: Option<i64>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.writer
+            .set_probe_readiness(namespace, name, container_name, ready, expected_rv)
+            .await
+    }
+
+    pub async fn set_probe_readiness_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        container_name: &str,
+        ready: bool,
+        expected_rv: Option<i64>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.writer
+            .set_probe_readiness_for_uid(namespace, name, uid, container_name, ready, expected_rv)
+            .await
+    }
+
+    pub async fn set_deadline_exceeded(
+        &self,
+        namespace: &str,
+        name: &str,
+        message: String,
+        expected_rv: Option<i64>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.writer
+            .set_deadline_exceeded(namespace, name, message, expected_rv)
+            .await
+    }
+
+    pub async fn set_deadline_exceeded_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        message: String,
+        expected_rv: Option<i64>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.writer
+            .set_deadline_exceeded_for_uid(namespace, name, uid, message, expected_rv)
+            .await
+    }
+
+    pub async fn apply_ephemeral_container_statuses_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        statuses: Vec<serde_json::Value>,
+        expected_rv: Option<i64>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.writer
+            .apply_ephemeral_container_statuses_for_uid(namespace, name, uid, statuses, expected_rv)
+            .await
+    }
+}
+
+/// Focused node-local network-assignment capability used by tests.
+pub struct IntegrationPodNetworkPorts {
+    assignment: Arc<dyn klights_kubelet::pod_repository::PodNetworkAssignmentQuery>,
+}
+
+impl IntegrationPodNetworkPorts {
+    pub async fn read(
+        &self,
+        request: klights_kubelet::pod_repository::PodNetworkAssignmentRequest,
+    ) -> anyhow::Result<klights_kubelet::pod_repository::PodNetworkAssignment> {
+        self.assignment
+            .read_pod_network_assignment(request)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+}
+
+/// Focused API and subresource capabilities.  These keep API-facing tests
+/// from depending on any repository-wide trait implementation.
+pub struct IntegrationPodApiPorts {
+    api: Arc<k8s_native_service::PodApiService>,
+    subresource: Arc<k8s_native_service::PodSubresourceService>,
+}
+
+impl IntegrationPodApiPorts {
+    pub async fn create(
+        &self,
+        request: klights_pod_api::PodApiCreateRequest,
+    ) -> Result<klights_pod_api::PodApiCreateResult, klights_pod_api::PodRepositoryError> {
+        use klights_pod_api::PodApiMutation as _;
+        self.api.create_pod(request).await
+    }
+
+    pub async fn update_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        body: serde_json::Value,
+        current: crate::datastore::Resource,
+        dry_run: bool,
+    ) -> Result<klights_pod_api::PodApiWriteOutcome, klights_pod_api::PodRepositoryError> {
+        self.update(klights_pod_api::PodApiUpdateRequest {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            body,
+            current,
+            dry_run,
+        })
+        .await
+    }
+
+    pub async fn patch_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        patch: serde_json::Value,
+        patch_type: klights_pod_api::PodStatusPatchKind,
+        dry_run: bool,
+    ) -> Result<klights_pod_api::PodApiWriteOutcome, klights_pod_api::PodRepositoryError> {
+        self.patch(klights_pod_api::PodApiPatchRequest {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            patch,
+            patch_kind: patch_type,
+            dry_run,
+        })
+        .await
+    }
+
+    pub async fn update(
+        &self,
+        request: klights_pod_api::PodApiUpdateRequest,
+    ) -> Result<klights_pod_api::PodApiWriteOutcome, klights_pod_api::PodRepositoryError> {
+        use klights_pod_api::PodApiMutation as _;
+        self.api.update_pod(request).await
+    }
+
+    pub async fn patch(
+        &self,
+        request: klights_pod_api::PodApiPatchRequest,
+    ) -> Result<klights_pod_api::PodApiWriteOutcome, klights_pod_api::PodRepositoryError> {
+        use klights_pod_api::PodApiMutation as _;
+        self.api.patch_pod(request).await
+    }
+
+    pub async fn delete(
+        &self,
+        request: klights_pod_api::PodApiDeleteRequest,
+    ) -> Result<klights_pod_api::PodApiDeleteOutcome, klights_pod_api::PodRepositoryError> {
+        use klights_pod_api::PodApiMutation as _;
+        self.api.delete_pod(request).await
+    }
+
+    pub async fn delete_pod<O>(
+        &self,
+        namespace: &str,
+        name: &str,
+        options: O,
+        dry_run: bool,
+    ) -> Result<klights_pod_api::PodApiDeleteOutcome, klights_pod_api::PodRepositoryError>
+    where
+        O: Into<klights_pod_api::PodDeleteOptions> + Send,
+    {
+        self.delete(klights_pod_api::PodApiDeleteRequest {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            options: options.into(),
+            dry_run,
+        })
+        .await
+    }
+
+    pub async fn ordinary_mark_pod_terminating(
+        &self,
+        request: klights_pod_api::PodMarkTerminatingRequest,
+    ) -> Result<crate::datastore::Resource, klights_pod_api::PodRepositoryError> {
+        let target = request.into_target();
+        let options = target
+            .uid()
+            .map(k8s_native_service::DeleteOptions::with_uid_precondition)
+            .unwrap_or_default();
+        match self
+            .delete_pod(target.namespace(), target.name(), options, false)
+            .await?
+        {
+            klights_pod_api::PodApiDeleteOutcome::GracefulSet(resource) => Ok(resource),
+            klights_pod_api::PodApiDeleteOutcome::DryRun(_) => {
+                unreachable!("ordinary mark is never dry-run")
+            }
+        }
+    }
+
+    pub async fn delete_collection(
+        &self,
+        request: klights_pod_api::PodApiDeleteCollectionRequest,
+    ) -> Result<(), klights_pod_api::PodRepositoryError> {
+        use klights_pod_api::PodApiMutation as _;
+        self.api.delete_collection_pods(request).await
+    }
+
+    pub async fn delete_collection_pods(
+        &self,
+        namespace: &str,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        dry_run: bool,
+    ) -> Result<(), klights_pod_api::PodRepositoryError> {
+        self.delete_collection(klights_pod_api::PodApiDeleteCollectionRequest {
+            namespace: namespace.to_string(),
+            label_selector: label_selector.map(str::to_string),
+            field_selector: field_selector.map(str::to_string),
+            dry_run,
+        })
+        .await
+    }
+
+    pub async fn replace_status(
+        &self,
+        request: klights_pod_api::PodStatusReplaceRequest,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.subresource
+            .replace_status(request)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    pub async fn replace_status_from_api(
+        &self,
+        namespace: &str,
+        name: &str,
+        status: serde_json::Value,
+        expected_resource_version: i64,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.replace_status(klights_pod_api::PodStatusReplaceRequest {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            expected_uid: None,
+            status,
+            expected_resource_version,
+        })
+        .await
+    }
+
+    pub async fn replace_status_from_api_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        status: serde_json::Value,
+        expected_resource_version: i64,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.replace_status(klights_pod_api::PodStatusReplaceRequest {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            expected_uid: Some(uid.to_string()),
+            status,
+            expected_resource_version,
+        })
+        .await
+    }
+
+    pub async fn patch_status(
+        &self,
+        request: klights_pod_api::PodStatusPatchRequest,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.subresource
+            .patch_status(request)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    pub async fn patch_status_from_api(
+        &self,
+        namespace: &str,
+        name: &str,
+        patch: serde_json::Value,
+        patch_type: klights_pod_api::PodStatusPatchKind,
+        expected_resource_version: i64,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.patch_status(klights_pod_api::PodStatusPatchRequest {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            patch,
+            patch_kind: patch_type,
+            expected_resource_version: Some(expected_resource_version),
+        })
+        .await
+    }
+
+    pub async fn update_ephemeral_containers(
+        &self,
+        request: klights_pod_api::PodEphemeralContainersRequest,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.subresource
+            .update_ephemeral_containers(request)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    pub async fn update_ephemeral_containers_for_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        containers: Vec<serde_json::Value>,
+        expected_resource_version: i64,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.update_ephemeral_containers(klights_pod_api::PodEphemeralContainersRequest {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            containers,
+            expected_resource_version,
+        })
+        .await
+    }
+}
+
+/// Private lifetime owner for one integration scenario.
+///
+/// Public tests receive a suite-specific handle below.  Keeping this owner
+/// private means the wiring can never become a reusable all-capability test
+/// facade or leak a datastore/PodStore through a constructor boundary.
+struct PodRepositoryScenarioOwner {
     _sqlite: crate::datastore::sqlite::Datastore,
     db: crate::datastore::DatastoreHandle,
-    repository: Arc<crate::kubelet::pod_repository::PodRepository>,
-    pod_api: Arc<k8s_native_service::PodApiService>,
-    pod_subresource: Arc<k8s_native_service::PodSubresourceService>,
-    pod_scheduling: Arc<dyn klights_pod_api::PodScheduling>,
+    query_ports: IntegrationPodQueryPorts,
+    update_ports: IntegrationPodUpdatePorts,
+    status_ports: IntegrationPodStatusPorts,
+    network_ports: IntegrationPodNetworkPorts,
+    api_ports: IntegrationPodApiPorts,
+    scheduling: Arc<dyn klights_pod_api::PodScheduling>,
+    gc_delete: Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
+    deletion_finalizer:
+        Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer>,
+    bound_pod_finalization: Arc<dyn klights_pod_api::BoundPodFinalization>,
+    deferred_runtime: klights_kubelet::pod_repository::status::DeferredRuntimeReducerHandle,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
     background: klights_kubelet::pod_repository::background::PodRepositoryBackground,
+    watch_source: Arc<dyn crate::pod_repository_composition::PodWatchSource>,
     controller_dispatcher: Option<Arc<PodRepositoryRecordingReconcileSink>>,
     node_local: Option<Arc<crate::datastore::node_local::NodeLocalStores>>,
     outbox_delivery: Option<Arc<dyn klights_leader_api::LeaderOutboxDelivery>>,
@@ -900,7 +1395,31 @@ pub async fn run_raft_delete_mark_status_race(
         db.clone(), crate::datastore::selector::sqlite_passive_read_ports(&sqlite), "delete-race-leader".to_string(),
         Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(chrono::Utc::now())), crate::control_plane::client::local::always_leader_watch(), klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
     ));
-    let parts = crate::pod_repository_composition::build_integration_pod_repository_parts(
+    let (
+        _pod_query,
+        _pod_snapshot,
+        _pod_update,
+        _pod_status_writer,
+        _pod_workqueue,
+        _pod_network_assignment,
+        _pod_host_ip,
+        _background,
+        _deletion_finalizer,
+        _dirty_counter,
+        _mutation_reconcile,
+        _gc_delete,
+        _eviction_admission,
+        _namespace_bootstrap,
+        _namespace_termination_queue,
+        api,
+        _subresource,
+        _scheduling,
+        _watch_source,
+        _bound_finalization,
+        _deferred_runtime,
+        _test_api,
+        _test_subresource,
+    ) = crate::pod_repository_composition::build_integration_pod_repository_parts(
         crate::pod_repository_composition::PodRepositoryBuildConfig {
             db: db.clone(), pod_workqueue_store: None, supervisor, side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
             metrics: klights_controllers::side_effects::SideEffectMetrics::new(), pod_network_cache: Arc::new(IntegrationEmptyPodNetworkCache), assignment_waiter: Arc::new(klights_networking::PodNetworkAssignmentBus::new()),
@@ -915,9 +1434,16 @@ pub async fn run_raft_delete_mark_status_race(
         }, local_query,
     );
     use klights_pod_api::PodApiMutation as _;
-    let created = parts.api.create_pod(klights_pod_api::PodApiCreateRequest { namespace: "default".to_string(), body: serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":pod_name},"spec":{"containers":[{"name":"c","image":"busybox"}]}}), dry_run: false }).await.map_err(anyhow::Error::new)?.resource.expect("race create persists");
-    let deleted = match parts
-        .api
+    let created = api
+        .as_ref()
+        .expect("integration root Pod API")
+        .create_pod(klights_pod_api::PodApiCreateRequest { namespace: "default".to_string(), body: serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":pod_name},"spec":{"containers":[{"name":"c","image":"busybox"}]}}), dry_run: false })
+        .await
+        .map_err(anyhow::Error::new)?
+        .resource
+        .expect("race create persists");
+    let deleted = match api
+        .expect("integration root Pod API")
         .delete_pod(klights_pod_api::PodApiDeleteRequest {
             namespace: "default".to_string(),
             name: pod_name.to_string(),
@@ -954,9 +1480,10 @@ pub async fn run_api_delete_status_race(
     pod_name: &str,
     grace_period_seconds: Option<i64>,
 ) -> anyhow::Result<IntegrationApiDeleteStatusRaceOutcome> {
-    let repo = IntegrationPodRepositoryComposition::new_inline().await;
+    let repo = PodRepositoryScenarioOwner::new_inline().await;
     let created = repo
-        .api_create_pod(klights_pod_api::PodApiCreateRequest {
+        .api_ports()
+        .create(klights_pod_api::PodApiCreateRequest {
             namespace: "default".to_string(),
             body: serde_json::json!({
                 "apiVersion": "v1",
@@ -977,7 +1504,7 @@ pub async fn run_api_delete_status_race(
         Some("default"),
         pod_name,
     );
-    let delete = repo.api_delete_pod(
+    let delete = repo.api_ports().delete_pod(
         "default",
         pod_name,
         k8s_native_service::DeleteOptions {
@@ -990,15 +1517,19 @@ pub async fn run_api_delete_status_race(
     let race = async {
         pause.wait_until_reached().await;
         let current = repo
-            .read_pod("default", pod_name)
+            .query_ports()
+            .get_pod(klights_pod_api::PodGetRequest::try_by_name(
+                "default", pod_name,
+            )?)
             .await?
             .expect("delete race Pod exists before mark");
         let updated = repo
-            .update_pod_status(
+            .api_ports()
+            .replace_status_from_api(
                 "default",
                 pod_name,
                 serde_json::json!({"phase": "Running", "raceBump": 1}),
-                Some(current.resource_version),
+                current.resource_version,
             )
             .await;
         pause.resume();
@@ -1013,7 +1544,10 @@ pub async fn run_api_delete_status_race(
         }
     };
     let persisted = repo
-        .read_pod("default", pod_name)
+        .query_ports()
+        .get_pod(klights_pod_api::PodGetRequest::try_by_name(
+            "default", pod_name,
+        )?)
         .await?
         .expect("actor-owned row remains after delete mark");
     Ok(IntegrationApiDeleteStatusRaceOutcome {
@@ -1249,7 +1783,7 @@ pub async fn run_deferred_runtime_cleanup_case(
     use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer as _;
     let deferred = klights_kubelet::pod_repository::status::DeferredRuntimeReducerHandle::default();
     deferred.insert_marker(uid);
-    let finalizer = crate::kubelet::pod_repository::DeferredRuntimeCleanupFinalizer::new(
+    let finalizer = crate::pod_repository_composition::DeferredRuntimeCleanupFinalizer::new(
         Arc::new(IntegrationFixedDeletionFinalizer { outcome }),
         deferred.clone(),
     );
@@ -1271,7 +1805,7 @@ enum IntegrationStatusRaceMode {
 }
 
 struct IntegrationStatusRaceWriter {
-    store: Arc<klights_kubelet::pod_repository::store::PodStore>,
+    store: Arc<IntegrationPodStoreFixture>,
     attempts: std::sync::atomic::AtomicUsize,
     mode: IntegrationStatusRaceMode,
 }
@@ -1307,7 +1841,7 @@ impl klights_pod_api::PodStatusPersistence for IntegrationStatusRaceWriter {
             if inject {
                 let current = self
                     .store
-                    .get(&namespace, &name)
+                    .read_pod(&namespace, &name)
                     .await
                     .map_err(|error| {
                         klights_pod_api::PodRepositoryError::unavailable(error.to_string())
@@ -1331,7 +1865,7 @@ impl klights_pod_api::PodStatusPersistence for IntegrationStatusRaceWriter {
                     }
                 }
                 self.store
-                    .update(&namespace, &name, raced, current.resource_version)
+                    .update_pod(&namespace, &name, raced, current.resource_version)
                     .await
                     .map_err(|error| {
                         klights_pod_api::PodRepositoryError::unavailable(error.to_string())
@@ -1341,7 +1875,7 @@ impl klights_pod_api::PodStatusPersistence for IntegrationStatusRaceWriter {
                 ));
             }
             self.store
-                .integration_update_status(&namespace, &name, status, expected_resource_version)
+                .update_pod_status(&namespace, &name, status, expected_resource_version)
                 .await
                 .map_err(|error| {
                     klights_pod_api::PodRepositoryError::unavailable(error.to_string())
@@ -1377,7 +1911,7 @@ impl klights_reconcile_api::PodMutationReconcileSink for IntegrationCountingPodM
 }
 
 struct IntegrationPausedStatusWriter {
-    store: Arc<klights_kubelet::pod_repository::store::PodStore>,
+    store: Arc<IntegrationPodStoreFixture>,
     entered: Arc<tokio::sync::Barrier>,
     release: Arc<tokio::sync::Barrier>,
     requested_status: std::sync::Mutex<Option<serde_json::Value>>,
@@ -1399,13 +1933,16 @@ impl klights_pod_api::PodStatusPersistence for IntegrationPausedStatusWriter {
             self.entered.wait().await;
             self.release.wait().await;
             self.store
-                .update_status_typed(
+                .update_pod_status(
                     &request.namespace,
                     &request.name,
                     request.status,
                     request.expected_resource_version,
                 )
                 .await
+                .map_err(|error| {
+                    klights_pod_api::PodRepositoryError::unavailable(error.to_string())
+                })
         })
     }
 }
@@ -1416,12 +1953,8 @@ pub async fn run_same_name_replacement_status_race(
 ) -> IntegrationSameNameStatusRaceOutcome {
     let pod_name = "same-name-status-race";
     pod["metadata"]["name"] = serde_json::json!(pod_name);
-    let sqlite = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
-    let db: crate::datastore::DatastoreHandle = Arc::new(sqlite);
-    let store = Arc::new(crate::pod_repository_composition::new_pod_store(db.clone()));
-    let created = store.create("default", pod_name, pod).await.unwrap();
+    let store = Arc::new(IntegrationPodStoreFixture::new().await);
+    let created = store.seed_pod("default", pod_name, pod).await.unwrap();
     let entered = Arc::new(tokio::sync::Barrier::new(2));
     let release = Arc::new(tokio::sync::Barrier::new(2));
     let writer = Arc::new(IntegrationPausedStatusWriter {
@@ -1436,7 +1969,7 @@ pub async fn run_same_name_replacement_status_race(
     });
     let service = klights_kubelet::pod_repository::status::PodStatusService::new(
         klights_kubelet::pod_repository::status::PodStatusServiceDependencies {
-            pod_query: store.clone(),
+            pod_query: store.query_port(),
             status_persistence: writer.clone(),
             mutation_reconcile: reconcile.clone(),
             outbox: None,
@@ -1472,11 +2005,8 @@ pub async fn run_same_name_replacement_status_race(
         // between the status service's read and persistence CAS. Production
         // Pod deletion remains actor-owned; no production path reaches this
         // characterization fixture.
-        db.delete_resource("v1", "Pod", Some("default"), pod_name)
-            .await
-            .expect("remove old Pod in paused race fixture");
-        let replacement = db
-            .create_resource("v1", "Pod", Some("default"), pod_name, replacement_body)
+        let replacement = store
+            .replace_same_name_for_test("default", pod_name, replacement_body)
             .await
             .expect("install same-name replacement while status write is paused");
         release.wait().await;
@@ -1488,7 +2018,7 @@ pub async fn run_same_name_replacement_status_race(
         .err()
         .is_some_and(|error| error.to_string().contains("409"));
     let persisted_after = store
-        .get("default", pod_name)
+        .read_pod("default", pod_name)
         .await
         .unwrap()
         .expect("replacement remains persisted");
@@ -1515,12 +2045,8 @@ async fn integration_status_race_service(
     Arc<IntegrationStatusRaceWriter>,
     crate::datastore::Resource,
 ) {
-    let sqlite = crate::datastore::sqlite::Datastore::new_in_memory()
-        .await
-        .unwrap();
-    let db: crate::datastore::DatastoreHandle = Arc::new(sqlite);
-    let store = Arc::new(crate::pod_repository_composition::new_pod_store(db));
-    let created = store.create("default", pod_name, pod).await.unwrap();
+    let store = Arc::new(IntegrationPodStoreFixture::new().await);
+    let created = store.seed_pod("default", pod_name, pod).await.unwrap();
     let writer = Arc::new(IntegrationStatusRaceWriter {
         store: store.clone(),
         attempts: std::sync::atomic::AtomicUsize::new(0),
@@ -1528,7 +2054,7 @@ async fn integration_status_race_service(
     });
     let service = klights_kubelet::pod_repository::status::PodStatusService::new(
         klights_kubelet::pod_repository::status::PodStatusServiceDependencies {
-            pod_query: store,
+            pod_query: store.query_port(),
             status_persistence: writer.clone(),
             mutation_reconcile: Arc::new(IntegrationNoopPodMutationReconcile),
             outbox: None,
@@ -1703,6 +2229,7 @@ impl IntegrationPodNetworkFixture {
 
 pub struct IntegrationPodStoreFixture {
     _sqlite: crate::datastore::sqlite::Datastore,
+    db: crate::datastore::DatastoreHandle,
     store: Arc<klights_kubelet::pod_repository::store::PodStore>,
     bound_finalization: Arc<
         dyn crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::LocalBoundPodFinalizationPersistence,
@@ -1717,11 +2244,12 @@ impl IntegrationPodStoreFixture {
             .expect("Pod store integration fixture");
         let datastore: crate::datastore::DatastoreHandle = Arc::new(sqlite.clone());
         let persistence = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
-            datastore,
+            datastore.clone(),
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
         Self {
             _sqlite: sqlite,
+            db: datastore,
             store: persistence.store,
             bound_finalization: persistence.bound_finalization,
             unscheduled_deletion: persistence.unscheduled_deletion,
@@ -1735,6 +2263,10 @@ impl IntegrationPodStoreFixture {
         pod: serde_json::Value,
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.store.create(namespace, name, pod).await
+    }
+
+    pub fn query_port(&self) -> Arc<dyn klights_pod_api::PodQuery> {
+        self.store.clone()
     }
 
     pub async fn read_pod(
@@ -1798,6 +2330,20 @@ impl IntegrationPodStoreFixture {
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.store
             .integration_update_status(namespace, name, status, expected_resource_version)
+            .await
+    }
+
+    pub async fn replace_same_name_for_test(
+        &self,
+        namespace: &str,
+        name: &str,
+        replacement: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.db
+            .delete_resource("v1", "Pod", Some(namespace), name)
+            .await?;
+        self.db
+            .create_resource("v1", "Pod", Some(namespace), name, replacement)
             .await
     }
 
@@ -2161,7 +2707,42 @@ pub async fn run_bound_pod_delete_cas_race(
     })
 }
 
-impl IntegrationPodRepositoryComposition {
+impl PodRepositoryScenarioOwner {
+    pub fn query_ports(&self) -> &IntegrationPodQueryPorts {
+        &self.query_ports
+    }
+
+    pub fn update_ports(&self) -> &IntegrationPodUpdatePorts {
+        &self.update_ports
+    }
+
+    pub fn status_ports(&self) -> &IntegrationPodStatusPorts {
+        &self.status_ports
+    }
+
+    pub fn network_ports(&self) -> &IntegrationPodNetworkPorts {
+        &self.network_ports
+    }
+
+    pub fn api_ports(&self) -> &IntegrationPodApiPorts {
+        &self.api_ports
+    }
+
+    pub fn scheduling_ports(&self) -> &dyn klights_pod_api::PodScheduling {
+        self.scheduling.as_ref()
+    }
+
+    /// Test-only watch subscription over the canonical store-owned event
+    /// source. This keeps the compatibility fixture focused while avoiding
+    /// any public root repository facade.
+    pub fn subscribe_pod_watch(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
+        crate::pod_repository_composition::PodWatchSource::subscribe_pod_watch(
+            self.watch_source.as_ref(),
+        )
+    }
+
     pub async fn new_inline() -> Self {
         Self::new_exact(
             None,
@@ -2431,7 +3012,31 @@ impl IntegrationPodRepositoryComposition {
                 Arc::new(klights_supervisor::SystemWallClock),
             ))
         });
-        let parts = crate::pod_repository_composition::build_integration_pod_repository_parts(
+        let (
+            pod_query,
+            pod_snapshot,
+            pod_update,
+            pod_status_writer,
+            _pod_workqueue,
+            pod_network_assignment,
+            _pod_host_ip,
+            background,
+            deletion_finalizer,
+            _dirty_counter,
+            _mutation_reconcile,
+            gc_delete,
+            _eviction_admission,
+            _namespace_bootstrap,
+            _namespace_termination_queue,
+            api,
+            subresource,
+            scheduling,
+            watch_source,
+            bound_pod_finalization,
+            deferred_runtime,
+            _test_api,
+            _test_subresource,
+        ) = crate::pod_repository_composition::build_integration_pod_repository_parts(
             crate::pod_repository_composition::PodRepositoryBuildConfig {
                 db: db.clone(),
                 pod_workqueue_store: with_workqueue.then(|| node_local.as_ref().expect("GC workqueue fixture").pod_workqueue()),
@@ -2457,20 +3062,35 @@ impl IntegrationPodRepositoryComposition {
             },
             native_resource_query,
         );
-        let repository_parts = parts.repository_parts;
-        let repository = Arc::new(repository_parts.repository);
         if with_dispatcher {
-            side_effects.set_pod_ports(repository.clone(), repository.clone());
+            side_effects.set_pod_ports(pod_query.clone(), gc_delete.clone());
         }
         Self {
             _sqlite: sqlite,
             db,
-            repository,
-            pod_api: parts.api,
-            pod_subresource: parts.subresource,
-            pod_scheduling: parts.scheduling,
+            query_ports: IntegrationPodQueryPorts {
+                query: pod_query,
+                snapshot: pod_snapshot,
+            },
+            update_ports: IntegrationPodUpdatePorts { update: pod_update },
+            status_ports: IntegrationPodStatusPorts {
+                writer: pod_status_writer,
+            },
+            network_ports: IntegrationPodNetworkPorts {
+                assignment: pod_network_assignment,
+            },
+            api_ports: IntegrationPodApiPorts {
+                api: api.expect("integration root Pod API"),
+                subresource: subresource.expect("integration root Pod subresource"),
+            },
+            scheduling: scheduling.expect("integration root Pod scheduler"),
+            gc_delete,
+            deletion_finalizer,
+            bound_pod_finalization,
+            deferred_runtime,
             supervisor,
-            background: repository_parts.background,
+            background,
+            watch_source,
             controller_dispatcher,
             node_local,
             outbox_delivery: with_outbox.then_some(local_client),
@@ -2561,7 +3181,7 @@ impl IntegrationPodRepositoryComposition {
         uid: &str,
     ) -> anyhow::Result<()> {
         klights_reconcile_api::GcPodDeleteSink::request_gc_pod_delete(
-            self.repository.as_ref(),
+            self.gc_delete.as_ref(),
             klights_reconcile_api::GcPodDeleteRequest::new(klights_types::PodIdentity::new(
                 namespace, name, uid,
             )),
@@ -2594,7 +3214,8 @@ impl IntegrationPodRepositoryComposition {
         )
         .await?;
         match self
-            .api_delete_pod(
+            .api_ports()
+            .delete_pod(
                 "default",
                 "side-effect-pod",
                 klights_pod_api::PodDeleteOptions::default(),
@@ -2669,7 +3290,7 @@ impl IntegrationPodRepositoryComposition {
             owner_name,
             owner_kind,
             Some(namespace.to_string()),
-            self.repository.as_ref(),
+            self.gc_delete.as_ref(),
             &crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(self.db.clone()),
             &coordination,
         )
@@ -2723,8 +3344,8 @@ impl IntegrationPodRepositoryComposition {
         name: &str,
         pod: serde_json::Value,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.repository
-            .integration_seed_pod(namespace, name, pod)
+        self.db
+            .create_resource("v1", "Pod", Some(namespace), name, pod)
             .await
     }
 
@@ -2744,48 +3365,20 @@ impl IntegrationPodRepositoryComposition {
             .await
     }
 
-    pub async fn read_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.repository.integration_read_pod(namespace, name).await
-    }
-
-    pub async fn update_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        pod: serde_json::Value,
-        expected_resource_version: i64,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.repository
-            .integration_update_pod(namespace, name, pod, expected_resource_version)
-            .await
-    }
-
-    pub async fn update_pod_status(
-        &self,
-        namespace: &str,
-        name: &str,
-        status: serde_json::Value,
-        expected_resource_version: Option<i64>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.repository
-            .integration_update_pod_status(namespace, name, status, expected_resource_version)
-            .await
-    }
-
     pub async fn finalize_bound_pod_after_actor_cleanup(
         &self,
         namespace: &str,
         name: &str,
         uid: &str,
     ) -> anyhow::Result<IntegrationBoundPodDeleteOutcome> {
+        let request = klights_pod_api::BoundPodFinalizationRequest::try_new(
+            klights_types::PodIdentity::new(namespace, name, uid),
+        )?;
         let outcome = self
-            .repository
-            .integration_finalize_bound_pod(namespace, name, uid)
-            .await?;
+            .bound_pod_finalization
+            .finalize_bound_pod(request)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         Ok(map_bound_delete_outcome(outcome))
     }
 
@@ -2796,7 +3389,7 @@ impl IntegrationPodRepositoryComposition {
         uid: &str,
     ) -> anyhow::Result<IntegrationPodFinalizationOutcome> {
         integration_finalize_pod_after_actor_cleanup(
-            self.repository.deletion_finalizer().as_ref(),
+            self.deletion_finalizer.as_ref(),
             namespace,
             name,
             uid,
@@ -2805,198 +3398,7 @@ impl IntegrationPodRepositoryComposition {
     }
 
     pub fn has_deferred_runtime_for_uid(&self, pod_uid: &str) -> bool {
-        self.repository
-            .integration_has_deferred_runtime_for_uid(pod_uid)
-    }
-
-    pub async fn api_create_pod(
-        &self,
-        request: klights_pod_api::PodApiCreateRequest,
-    ) -> Result<klights_pod_api::PodApiCreateResult, klights_pod_api::PodRepositoryError> {
-        use klights_pod_api::PodApiMutation as _;
-        self.pod_api.create_pod(request).await
-    }
-
-    pub async fn api_update_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        body: serde_json::Value,
-        current: crate::datastore::Resource,
-        dry_run: bool,
-    ) -> Result<klights_pod_api::PodApiWriteOutcome, klights_pod_api::PodRepositoryError> {
-        use klights_pod_api::PodApiMutation as _;
-        self.pod_api
-            .update_pod(klights_pod_api::PodApiUpdateRequest {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-                body,
-                current,
-                dry_run,
-            })
-            .await
-    }
-
-    pub async fn api_patch_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        patch: serde_json::Value,
-        patch_type: klights_pod_api::PodStatusPatchKind,
-        dry_run: bool,
-    ) -> Result<klights_pod_api::PodApiWriteOutcome, klights_pod_api::PodRepositoryError> {
-        use klights_pod_api::PodApiMutation as _;
-        self.pod_api
-            .patch_pod(klights_pod_api::PodApiPatchRequest {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-                patch,
-                patch_kind: patch_type,
-                dry_run,
-            })
-            .await
-    }
-
-    pub async fn api_delete_pod<O>(
-        &self,
-        namespace: &str,
-        name: &str,
-        options: O,
-        dry_run: bool,
-    ) -> Result<klights_pod_api::PodApiDeleteOutcome, klights_pod_api::PodRepositoryError>
-    where
-        O: Into<klights_pod_api::PodDeleteOptions> + Send,
-    {
-        use klights_pod_api::PodApiMutation as _;
-        self.pod_api
-            .delete_pod(klights_pod_api::PodApiDeleteRequest {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-                options: options.into(),
-                dry_run,
-            })
-            .await
-    }
-
-    pub async fn api_delete_collection_pods(
-        &self,
-        namespace: &str,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        dry_run: bool,
-    ) -> Result<(), klights_pod_api::PodRepositoryError> {
-        use klights_pod_api::PodApiMutation as _;
-        self.pod_api
-            .delete_collection_pods(klights_pod_api::PodApiDeleteCollectionRequest {
-                namespace: namespace.to_string(),
-                label_selector: label_selector.map(str::to_string),
-                field_selector: field_selector.map(str::to_string),
-                dry_run,
-            })
-            .await
-    }
-
-    pub async fn ordinary_mark_pod_terminating(
-        &self,
-        request: klights_pod_api::PodMarkTerminatingRequest,
-    ) -> Result<crate::datastore::Resource, klights_pod_api::PodRepositoryError> {
-        let target = request.into_target();
-        let options = target
-            .uid()
-            .map(k8s_native_service::DeleteOptions::with_uid_precondition)
-            .unwrap_or_default();
-        match self
-            .api_delete_pod(target.namespace(), target.name(), options, false)
-            .await?
-        {
-            klights_pod_api::PodApiDeleteOutcome::GracefulSet(resource) => Ok(resource),
-            klights_pod_api::PodApiDeleteOutcome::DryRun(_) => {
-                unreachable!("ordinary mark is never dry-run")
-            }
-        }
-    }
-
-    pub async fn schedule_all_unbound_pods(
-        &self,
-    ) -> Result<(), klights_pod_api::PodRepositoryError> {
-        self.pod_scheduling.schedule_all_unbound_pods().await
-    }
-
-    pub async fn replace_status_from_api(
-        &self,
-        namespace: &str,
-        name: &str,
-        status: serde_json::Value,
-        expected_resource_version: i64,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.pod_subresource
-            .replace_status(klights_pod_api::PodStatusReplaceRequest {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-                expected_uid: None,
-                status,
-                expected_resource_version,
-            })
-            .await
-            .map_err(anyhow::Error::new)
-    }
-
-    pub async fn replace_status_from_api_for_uid(
-        &self,
-        namespace: &str,
-        name: &str,
-        uid: &str,
-        status: serde_json::Value,
-        expected_resource_version: i64,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.pod_subresource
-            .replace_status(klights_pod_api::PodStatusReplaceRequest {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-                expected_uid: Some(uid.to_string()),
-                status,
-                expected_resource_version,
-            })
-            .await
-            .map_err(anyhow::Error::new)
-    }
-
-    pub async fn patch_status_from_api(
-        &self,
-        namespace: &str,
-        name: &str,
-        patch: serde_json::Value,
-        patch_type: klights_pod_api::PodStatusPatchKind,
-        expected_resource_version: i64,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.pod_subresource
-            .patch_status(klights_pod_api::PodStatusPatchRequest {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-                patch,
-                patch_kind: patch_type,
-                expected_resource_version: Some(expected_resource_version),
-            })
-            .await
-            .map_err(anyhow::Error::new)
-    }
-
-    pub async fn update_ephemeral_containers(
-        &self,
-        namespace: &str,
-        name: &str,
-        containers: Vec<serde_json::Value>,
-        expected_resource_version: i64,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.pod_subresource
-            .update_ephemeral_containers(klights_pod_api::PodEphemeralContainersRequest {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-                containers,
-                expected_resource_version,
-            })
-            .await
-            .map_err(anyhow::Error::new)
+        self.deferred_runtime.contains(pod_uid)
     }
 
     pub async fn seed_non_pod_resource(
@@ -3127,316 +3529,1200 @@ impl IntegrationPodRepositoryComposition {
         pdb: &serde_json::Value,
         now: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<()> {
-        klights_controllers::pdb::reconcile_pdb_at(self.db.as_ref(), self, pdb, now).await
+        klights_controllers::pdb::reconcile_pdb_at(
+            self.db.as_ref(),
+            self.query_ports.query.as_ref(),
+            pdb,
+            now,
+        )
+        .await
     }
 }
 
-impl klights_pod_api::PodQuery for IntegrationPodRepositoryComposition {
-    fn get_pod(
-        &self,
-        request: klights_pod_api::PodGetRequest,
-    ) -> klights_pod_api::PodRepositoryFuture<'_, Option<crate::datastore::Resource>> {
-        klights_pod_api::PodQuery::get_pod(self.repository.as_ref(), request)
+/// Construction scenarios use one focused handle for lifecycle wiring and
+/// metadata/status assertions.  The private owner keeps the backing stores
+/// alive without exposing an aggregate repository object.
+pub struct IntegrationPodConstructionFixture {
+    owner: Arc<PodRepositoryScenarioOwner>,
+}
+
+impl IntegrationPodConstructionFixture {
+    pub async fn new_inline() -> Self {
+        Self {
+            owner: Arc::new(PodRepositoryScenarioOwner::new_inline().await),
+        }
     }
 
-    fn list_pods(
-        &self,
-        request: klights_pod_api::PodListRequest,
-    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodListResult> {
-        klights_pod_api::PodQuery::list_pods(self.repository.as_ref(), request)
+    pub fn background_is_available(&self) -> bool {
+        self.owner.background_is_available()
     }
 
-    fn list_pods_by_owner_uid(
-        &self,
-        request: klights_pod_api::PodOwnerListRequest,
-    ) -> klights_pod_api::PodRepositoryFuture<'_, Vec<crate::datastore::Resource>> {
-        klights_pod_api::PodQuery::list_pods_by_owner_uid(self.repository.as_ref(), request)
+    pub fn workqueue_start_called(&self) -> bool {
+        self.owner.workqueue_start_called()
+    }
+
+    pub async fn start_background(&self) -> anyhow::Result<()> {
+        self.owner.start_background().await
     }
 }
 
-impl klights_pod_api::PodUpdate for IntegrationPodRepositoryComposition {
-    fn update_pod(
+/// Metadata mutation scenarios carry only Pod query/update capabilities.
+pub struct IntegrationPodMetadataFixture {
+    owner: Arc<PodRepositoryScenarioOwner>,
+}
+
+impl IntegrationPodMetadataFixture {
+    pub async fn new_inline() -> Self {
+        Self {
+            owner: Arc::new(PodRepositoryScenarioOwner::new_inline().await),
+        }
+    }
+
+    pub async fn get_pod(
         &self,
-        request: klights_pod_api::PodUpdateRequest,
-    ) -> klights_pod_api::PodRepositoryFuture<'_, crate::datastore::Resource> {
-        klights_pod_api::PodUpdate::update_pod(self.repository.as_ref(), request)
+        namespace: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        self.owner
+            .query_ports()
+            .get_pod(klights_pod_api::PodGetRequest::try_by_name(
+                namespace, name,
+            )?)
+            .await
+    }
+
+    pub async fn seed_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        pod: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.owner.seed_pod(namespace, name, pod).await
+    }
+
+    pub async fn update_pod_owner_references_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        owner_references: Vec<serde_json::Value>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.owner
+            .update_ports()
+            .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
+                klights_pod_api::PodMutationTarget::try_by_identity(
+                    klights_types::PodIdentity::new(namespace, name, uid),
+                )?,
+                integration_owner_references(owner_references)?,
+            ))
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    pub async fn merge_pod_labels_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        labels: Vec<(String, String)>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.owner
+            .update_ports()
+            .update_pod(klights_pod_api::PodUpdateRequest::merge_labels(
+                klights_pod_api::PodMutationTarget::try_by_identity(
+                    klights_types::PodIdentity::new(namespace, name, uid),
+                )?,
+                labels
+                    .into_iter()
+                    .map(|(key, value)| klights_pod_api::PodLabel::try_new(key, value))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+            .await
+            .map_err(anyhow::Error::new)
     }
 }
 
-impl klights_kubelet::pod_repository::PodNetworkAssignmentQuery
-    for IntegrationPodRepositoryComposition
-{
-    fn read_pod_network_assignment(
+/// Repository-backed network lookup scenario.  It exposes only the focused
+/// assignment query; the standalone `IntegrationPodNetworkFixture` remains
+/// the node-local allocator scenario.
+pub struct IntegrationPodNetworkScenarioFixture {
+    owner: Arc<PodRepositoryScenarioOwner>,
+}
+
+impl IntegrationPodNetworkScenarioFixture {
+    pub async fn new_inline() -> Self {
+        Self {
+            owner: Arc::new(PodRepositoryScenarioOwner::new_inline().await),
+        }
+    }
+
+    pub async fn read_pod_network_assignment(
         &self,
-        request: klights_kubelet::pod_repository::PodNetworkAssignmentRequest,
-    ) -> klights_kubelet::pod_repository::PodNetworkAssignmentFuture<'_> {
-        klights_kubelet::pod_repository::PodNetworkAssignmentQuery::read_pod_network_assignment(
-            self.repository.as_ref(),
-            request,
+        sandbox_id: &str,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        host_network: bool,
+    ) -> anyhow::Result<klights_kubelet::pod_repository::PodNetworkAssignment> {
+        self.owner
+            .network_ports()
+            .read(
+                klights_kubelet::pod_repository::PodNetworkAssignmentRequest::try_new(
+                    sandbox_id,
+                    klights_types::PodIdentity::new(namespace, name, uid),
+                    host_network,
+                )?,
+            )
+            .await
+    }
+}
+
+/// Status/namespace scenarios receive only the status, query and namespace
+/// handles needed by those tests.
+pub struct IntegrationPodStatusFixture {
+    owner: Arc<PodRepositoryScenarioOwner>,
+}
+
+impl IntegrationPodStatusFixture {
+    pub async fn new_inline() -> Self {
+        Self {
+            owner: Arc::new(PodRepositoryScenarioOwner::new_inline().await),
+        }
+    }
+
+    pub async fn new_with_status_dispatcher() -> Self {
+        Self {
+            owner: Arc::new(PodRepositoryScenarioOwner::new_with_status_dispatcher().await),
+        }
+    }
+
+    pub fn query_ports(&self) -> &IntegrationPodQueryPorts {
+        self.owner.query_ports()
+    }
+
+    pub fn update_ports(&self) -> &IntegrationPodUpdatePorts {
+        self.owner.update_ports()
+    }
+
+    pub fn status_ports(&self) -> &IntegrationPodStatusPorts {
+        self.owner.status_ports()
+    }
+
+    pub fn api_ports(&self) -> &IntegrationPodApiPorts {
+        self.owner.api_ports()
+    }
+
+    pub async fn get_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        self.query_ports()
+            .get_pod(klights_pod_api::PodGetRequest::try_by_name(
+                namespace, name,
+            )?)
+            .await
+    }
+
+    pub async fn seed_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        pod: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.owner.seed_pod(namespace, name, pod).await
+    }
+
+    pub async fn seed_non_pod_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.owner
+            .seed_non_pod_resource(api_version, kind, namespace, name, value)
+            .await
+    }
+
+    pub async fn read_non_pod_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        self.owner
+            .read_non_pod_resource(api_version, kind, namespace, name)
+            .await
+    }
+
+    pub async fn seed_namespace(
+        &self,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.owner.seed_namespace(name, value).await
+    }
+
+    pub async fn read_namespace(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        self.owner.read_namespace(name).await
+    }
+
+    pub async fn update_namespace(
+        &self,
+        name: &str,
+        value: serde_json::Value,
+        expected_resource_version: i64,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.owner
+            .update_namespace(name, value, expected_resource_version)
+            .await
+    }
+
+    pub async fn reconcile_namespace_termination(
+        &self,
+        name: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        self.owner.reconcile_namespace_termination(name, now).await
+    }
+
+    pub async fn reconcile_pod_disruption_budget(
+        &self,
+        pdb: &serde_json::Value,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        self.owner.reconcile_pod_disruption_budget(pdb, now).await
+    }
+
+    pub async fn pending_reconcile_keys(&self) -> Vec<klights_reconcile_api::ReconcileKey> {
+        self.owner.pending_reconcile_keys().await
+    }
+
+    pub async fn enqueue_reconcile_key(&self, key: klights_reconcile_api::ReconcileKey) {
+        self.owner.enqueue_reconcile_key(key).await
+    }
+
+    pub fn has_deferred_runtime_for_uid(&self, uid: &str) -> bool {
+        self.owner.has_deferred_runtime_for_uid(uid)
+    }
+
+    pub async fn finalize_pod_deletion_after_actor_cleanup(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+    ) -> anyhow::Result<IntegrationPodFinalizationOutcome> {
+        self.owner
+            .finalize_pod_deletion_after_actor_cleanup(namespace, name, uid)
+            .await
+    }
+
+    pub async fn record_sandbox_id(
+        &self,
+        namespace: &str,
+        name: &str,
+        sandbox_id: &str,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.update_ports()
+            .update_pod(klights_pod_api::PodUpdateRequest::try_record_sandbox_id(
+                klights_pod_api::PodMutationTarget::try_by_name(namespace, name)?,
+                sandbox_id,
+            )?)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    pub async fn record_sandbox_id_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        sandbox_id: &str,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.update_ports()
+            .update_pod(klights_pod_api::PodUpdateRequest::try_record_sandbox_id(
+                klights_pod_api::PodMutationTarget::try_by_identity(
+                    klights_types::PodIdentity::new(namespace, name, uid),
+                )?,
+                sandbox_id,
+            )?)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+}
+
+/// Watch/store scenarios own a query handle and the canonical watch source;
+/// no mutation, status or controller family is exposed.
+pub struct IntegrationPodStoreWatchFixture {
+    owner: Arc<PodRepositoryScenarioOwner>,
+}
+
+impl IntegrationPodStoreWatchFixture {
+    pub async fn new_inline() -> Self {
+        Self {
+            owner: Arc::new(PodRepositoryScenarioOwner::new_inline().await),
+        }
+    }
+
+    pub async fn new_cluster_backed(
+        resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    ) -> Self {
+        Self {
+            owner: Arc::new(PodRepositoryScenarioOwner::new_cluster_backed(resource_query).await),
+        }
+    }
+
+    pub fn query_ports(&self) -> &IntegrationPodQueryPorts {
+        self.owner.query_ports()
+    }
+
+    pub async fn get_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        self.query_ports()
+            .get_pod(klights_pod_api::PodGetRequest::try_by_name(
+                namespace, name,
+            )?)
+            .await
+    }
+
+    pub async fn list_pods(
+        &self,
+        namespace: Option<&str>,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        limit: Option<i64>,
+        continue_token: Option<&str>,
+    ) -> anyhow::Result<klights_pod_api::PodListResult> {
+        self.query_ports()
+            .list_pods(klights_pod_api::PodListRequest::try_new(
+                namespace.map(str::to_string),
+                label_selector.map(str::to_string),
+                field_selector.map(str::to_string),
+                limit,
+                continue_token.map(str::to_string),
+            )?)
+            .await
+    }
+
+    pub async fn list_pods_by_owner_uid(
+        &self,
+        namespace: &str,
+        owner_uid: &str,
+    ) -> anyhow::Result<Vec<crate::datastore::Resource>> {
+        self.query_ports()
+            .list_pods_by_owner_uid(klights_pod_api::PodOwnerListRequest::try_new(
+                namespace, owner_uid,
+            )?)
+            .await
+    }
+
+    pub async fn seed_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        pod: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.owner.seed_pod(namespace, name, pod).await
+    }
+
+    pub fn subscribe_pod_watch(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
+        self.owner.subscribe_pod_watch()
+    }
+
+    pub async fn pod_watch_events_since(
+        &self,
+        resource_version: i64,
+    ) -> anyhow::Result<Vec<IntegrationPodWatchEvent>> {
+        self.owner.pod_watch_events_since(resource_version).await
+    }
+}
+
+/// API/deadline scenarios expose API and query ports plus persistence needed
+/// to seed a Pod and inspect its canonical watch history.
+pub struct IntegrationPodApiFixture {
+    owner: Arc<PodRepositoryScenarioOwner>,
+}
+
+impl IntegrationPodApiFixture {
+    pub async fn new_inline() -> Self {
+        Self {
+            owner: Arc::new(PodRepositoryScenarioOwner::new_inline().await),
+        }
+    }
+
+    pub fn query_ports(&self) -> &IntegrationPodQueryPorts {
+        self.owner.query_ports()
+    }
+
+    pub fn api_ports(&self) -> &IntegrationPodApiPorts {
+        self.owner.api_ports()
+    }
+
+    pub async fn seed_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        pod: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.owner.seed_pod(namespace, name, pod).await
+    }
+
+    pub async fn pod_watch_events_since(
+        &self,
+        resource_version: i64,
+    ) -> anyhow::Result<Vec<IntegrationPodWatchEvent>> {
+        self.owner.pod_watch_events_since(resource_version).await
+    }
+}
+
+/// Scheduling scenarios expose scheduling/query/API ports and node-local
+/// delivery helpers, but no status, network, deletion or lifecycle facade.
+pub struct IntegrationPodSchedulingFixture {
+    owner: Arc<PodRepositoryScenarioOwner>,
+}
+
+impl IntegrationPodSchedulingFixture {
+    pub async fn new_inline() -> Self {
+        Self {
+            owner: Arc::new(PodRepositoryScenarioOwner::new_inline().await),
+        }
+    }
+
+    pub async fn new_deferred_leader() -> Self {
+        Self {
+            owner: Arc::new(PodRepositoryScenarioOwner::new_deferred_leader().await),
+        }
+    }
+
+    pub async fn new_deferred_leader_with_node_outbox() -> Self {
+        Self {
+            owner: Arc::new(
+                PodRepositoryScenarioOwner::new_deferred_leader_with_node_outbox().await,
+            ),
+        }
+    }
+
+    pub async fn new_deferred_leader_with_bind_gate() -> (Self, IntegrationSchedulerBindGate) {
+        let (owner, gate) = PodRepositoryScenarioOwner::new_deferred_leader_with_bind_gate().await;
+        (
+            Self {
+                owner: Arc::new(owner),
+            },
+            gate,
         )
     }
+
+    pub async fn new_with_status_dispatcher() -> Self {
+        Self {
+            owner: Arc::new(PodRepositoryScenarioOwner::new_with_status_dispatcher().await),
+        }
+    }
+
+    pub fn query_ports(&self) -> &IntegrationPodQueryPorts {
+        self.owner.query_ports()
+    }
+
+    pub fn api_ports(&self) -> &IntegrationPodApiPorts {
+        self.owner.api_ports()
+    }
+
+    pub fn scheduling_ports(&self) -> &dyn klights_pod_api::PodScheduling {
+        self.owner.scheduling_ports()
+    }
+
+    pub async fn get_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        self.query_ports()
+            .get_pod(klights_pod_api::PodGetRequest::try_by_name(
+                namespace, name,
+            )?)
+            .await
+    }
+
+    pub async fn list_pods(
+        &self,
+        namespace: Option<&str>,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        limit: Option<i64>,
+        continue_token: Option<&str>,
+    ) -> anyhow::Result<klights_pod_api::PodListResult> {
+        self.query_ports()
+            .list_pods(klights_pod_api::PodListRequest::try_new(
+                namespace.map(str::to_string),
+                label_selector.map(str::to_string),
+                field_selector.map(str::to_string),
+                limit,
+                continue_token.map(str::to_string),
+            )?)
+            .await
+    }
+
+    pub async fn seed_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        pod: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.owner.seed_pod(namespace, name, pod).await
+    }
+
+    pub async fn seed_scheduling_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.owner
+            .seed_scheduling_resource(api_version, kind, namespace, name, value)
+            .await
+    }
+
+    pub async fn pending_reconcile_keys(&self) -> Vec<klights_reconcile_api::ReconcileKey> {
+        self.owner.pending_reconcile_keys().await
+    }
+
+    pub async fn pod_watch_events_since(
+        &self,
+        resource_version: i64,
+    ) -> anyhow::Result<Vec<IntegrationPodWatchEvent>> {
+        self.owner.pod_watch_events_since(resource_version).await
+    }
+
+    pub async fn list_scheduling_resources(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+    ) -> anyhow::Result<crate::datastore::ResourceList> {
+        self.owner
+            .list_scheduling_resources(api_version, kind, namespace)
+            .await
+    }
+
+    pub fn active_supervised_task_count(&self) -> usize {
+        self.owner.active_supervised_task_count()
+    }
+
+    pub async fn drain_node_outbox_to_local_leader(&self) -> anyhow::Result<()> {
+        self.owner.drain_node_outbox_to_local_leader().await
+    }
+
+    pub async fn apply_uid_bound_worker_status_reducer_scenario(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        authenticated_node: &str,
+        status: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.owner
+            .apply_uid_bound_worker_status_reducer_scenario(
+                namespace,
+                name,
+                uid,
+                authenticated_node,
+                status,
+            )
+            .await
+    }
+
+    pub async fn create_controller_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        _node_name: &str,
+        pod: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.api_ports()
+            .create(klights_pod_api::PodApiCreateRequest {
+                namespace: namespace.to_string(),
+                body: pod,
+                dry_run: false,
+            })
+            .await
+            .map_err(anyhow::Error::new)?
+            .resource
+            .ok_or_else(|| {
+                anyhow::anyhow!("controller Pod {namespace}/{name} unexpectedly dry-ran")
+            })
+    }
 }
 
-#[async_trait::async_trait]
-impl klights_kubelet::pod_repository::PodStatusWriter for IntegrationPodRepositoryComposition {
-    async fn set_pod_status(
+/// Root worker-role scenario fixture.  This is intentionally distinct from
+/// `IntegrationPodWorkerFixture`, which models the worker-local adapter; the
+/// scenario below only exposes the status/metadata/query ports needed to
+/// exercise node-outbox routing.
+pub struct IntegrationPodWorkerScenarioFixture {
+    owner: Arc<PodRepositoryScenarioOwner>,
+}
+
+impl IntegrationPodWorkerScenarioFixture {
+    pub async fn new_with_node_outbox() -> Self {
+        Self {
+            owner: Arc::new(PodRepositoryScenarioOwner::new_with_node_outbox().await),
+        }
+    }
+
+    pub async fn new_cluster_backed(
+        resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    ) -> Self {
+        Self {
+            owner: Arc::new(PodRepositoryScenarioOwner::new_cluster_backed(resource_query).await),
+        }
+    }
+
+    pub fn query_ports(&self) -> &IntegrationPodQueryPorts {
+        self.owner.query_ports()
+    }
+
+    pub fn update_ports(&self) -> &IntegrationPodUpdatePorts {
+        self.owner.update_ports()
+    }
+
+    pub fn status_ports(&self) -> &IntegrationPodStatusPorts {
+        self.owner.status_ports()
+    }
+
+    pub async fn get_pod(
         &self,
-        ns: &str,
+        namespace: &str,
         name: &str,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        self.query_ports()
+            .get_pod(klights_pod_api::PodGetRequest::try_by_name(
+                namespace, name,
+            )?)
+            .await
+    }
+
+    pub async fn seed_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        pod: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.owner.seed_pod(namespace, name, pod).await
+    }
+
+    pub async fn set_pod_status_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
         update: klights_kubelet::pod_repository::PodStatusUpdate,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::set_pod_status(
-            self.repository.as_ref(),
-            ns,
-            name,
-            update,
-            expected_rv,
-        )
-        .await
+        self.status_ports()
+            .set_pod_status_for_uid(namespace, name, uid, update, expected_rv)
+            .await
     }
-    async fn set_pod_status_for_uid(
+
+    pub async fn apply_runtime_reconcile_status_for_uid(
         &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-        update: klights_kubelet::pod_repository::PodStatusUpdate,
-        expected_rv: Option<i64>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::set_pod_status_for_uid(
-            self.repository.as_ref(),
-            ns,
-            name,
-            uid,
-            update,
-            expected_rv,
-        )
-        .await
-    }
-    async fn apply_runtime_reconcile_status(
-        &self,
-        ns: &str,
-        name: &str,
-        update: klights_kubelet::pod_repository::RuntimeReconcileStatus,
-        expected_rv: Option<i64>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::apply_runtime_reconcile_status(
-            self.repository.as_ref(),
-            ns,
-            name,
-            update,
-            expected_rv,
-        )
-        .await
-    }
-    async fn apply_runtime_reconcile_status_for_uid(
-        &self,
-        ns: &str,
+        namespace: &str,
         name: &str,
         uid: &str,
         update: klights_kubelet::pod_repository::RuntimeReconcileStatus,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::apply_runtime_reconcile_status_for_uid(
-            self.repository.as_ref(),
-            ns,
-            name,
-            uid,
-            update,
-            expected_rv,
-        )
-        .await
+        self.status_ports()
+            .apply_runtime_reconcile_status_for_uid(namespace, name, uid, update, expected_rv)
+            .await
     }
-    async fn mark_start_pending_for_retry_for_uid(
+
+    pub async fn record_sandbox_id_for_uid(
         &self,
-        ns: &str,
+        namespace: &str,
         name: &str,
         uid: &str,
-        error_message: &str,
+        sandbox_id: &str,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::mark_start_pending_for_retry_for_uid(
-            self.repository.as_ref(),
-            ns,
-            name,
-            uid,
-            error_message,
-        )
-        .await
+        self.update_ports()
+            .update_pod(klights_pod_api::PodUpdateRequest::try_record_sandbox_id(
+                klights_pod_api::PodMutationTarget::try_by_identity(
+                    klights_types::PodIdentity::new(namespace, name, uid),
+                )?,
+                sandbox_id,
+            )?)
+            .await
+            .map_err(anyhow::Error::new)
     }
-    async fn set_probe_readiness(
+
+    pub async fn update_pod_owner_references(
         &self,
-        ns: &str,
+        namespace: &str,
         name: &str,
-        container_name: &str,
-        ready: bool,
-        expected_rv: Option<i64>,
+        refs: Vec<serde_json::Value>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::set_probe_readiness(
-            self.repository.as_ref(),
-            ns,
-            name,
-            container_name,
-            ready,
-            expected_rv,
-        )
-        .await
+        self.update_ports()
+            .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
+                klights_pod_api::PodMutationTarget::try_by_name(namespace, name)?,
+                integration_owner_references(refs)?,
+            ))
+            .await
+            .map_err(anyhow::Error::new)
     }
-    async fn set_probe_readiness_for_uid(
+
+    pub async fn update_pod_owner_references_for_uid(
         &self,
-        ns: &str,
+        namespace: &str,
         name: &str,
         uid: &str,
-        container_name: &str,
-        ready: bool,
-        expected_rv: Option<i64>,
+        refs: Vec<serde_json::Value>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::set_probe_readiness_for_uid(
-            self.repository.as_ref(),
-            ns,
-            name,
-            uid,
-            container_name,
-            ready,
-            expected_rv,
-        )
-        .await
+        self.update_ports()
+            .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
+                klights_pod_api::PodMutationTarget::try_by_identity(
+                    klights_types::PodIdentity::new(namespace, name, uid),
+                )?,
+                integration_owner_references(refs)?,
+            ))
+            .await
+            .map_err(anyhow::Error::new)
     }
-    async fn set_deadline_exceeded(
+
+    pub async fn merge_pod_labels_for_uid(
         &self,
-        ns: &str,
-        name: &str,
-        message: String,
-        expected_rv: Option<i64>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::set_deadline_exceeded(
-            self.repository.as_ref(),
-            ns,
-            name,
-            message,
-            expected_rv,
-        )
-        .await
-    }
-    async fn set_deadline_exceeded_for_uid(
-        &self,
-        ns: &str,
+        namespace: &str,
         name: &str,
         uid: &str,
-        message: String,
-        expected_rv: Option<i64>,
+        labels: Vec<(String, String)>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::set_deadline_exceeded_for_uid(
-            self.repository.as_ref(),
-            ns,
-            name,
-            uid,
-            message,
-            expected_rv,
-        )
-        .await
+        self.update_ports()
+            .update_pod(klights_pod_api::PodUpdateRequest::merge_labels(
+                klights_pod_api::PodMutationTarget::try_by_identity(
+                    klights_types::PodIdentity::new(namespace, name, uid),
+                )?,
+                labels
+                    .into_iter()
+                    .map(|(key, value)| klights_pod_api::PodLabel::try_new(key, value))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+            .await
+            .map_err(anyhow::Error::new)
     }
-    async fn apply_ephemeral_container_statuses(
+
+    pub async fn claim_next_due_outbox(
         &self,
-        ns: &str,
-        name: &str,
-        statuses: Vec<serde_json::Value>,
-        expected_rv: Option<i64>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::apply_ephemeral_container_statuses(
-            self.repository.as_ref(),
-            ns,
-            name,
-            statuses,
-            expected_rv,
-        )
-        .await
+        now_ms: i64,
+        lease_ms: i64,
+        lease_token: &str,
+    ) -> anyhow::Result<Option<IntegrationClaimedPodOutbox>> {
+        self.owner
+            .claim_next_due_outbox(now_ms, lease_ms, lease_token)
+            .await
     }
-    async fn apply_ephemeral_container_statuses_for_uid(
+
+    pub async fn seed_status_checkpoint(
         &self,
-        ns: &str,
+        namespace: &str,
         name: &str,
         uid: &str,
-        statuses: Vec<serde_json::Value>,
-        expected_rv: Option<i64>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        klights_kubelet::pod_repository::PodStatusWriter::apply_ephemeral_container_statuses_for_uid(
-            self.repository.as_ref(),
-            ns,
-            name,
-            uid,
-            statuses,
-            expected_rv,
-        )
-        .await
+        base_position: i64,
+        status: serde_json::Value,
+        updated_ms: i64,
+    ) -> anyhow::Result<()> {
+        let checkpoint = klights_node_store::PodStatusCheckpointUpsert::try_new(
+            klights_types::PodIdentity::new(namespace, name, uid),
+            base_position,
+            serde_json::to_vec(&status)?,
+            updated_ms,
+        )?;
+        self.owner
+            .node_local
+            .as_ref()
+            .expect("worker scenario node-local store")
+            .pod_status_checkpoints()
+            .upsert_pod_status_checkpoint(checkpoint)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
     }
-    async fn note_container_restart(
-        &self,
-        ns: &str,
-        name: &str,
-        container_name: &str,
-        terminated: serde_json::Value,
-        expected_rv: Option<i64>,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        klights_kubelet::pod_repository::PodStatusWriter::note_container_restart(
-            self.repository.as_ref(),
-            ns,
-            name,
-            container_name,
-            terminated,
-            expected_rv,
-        )
-        .await
-    }
-    async fn note_container_restart_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-        container_name: &str,
-        terminated: serde_json::Value,
-        expected_rv: Option<i64>,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        klights_kubelet::pod_repository::PodStatusWriter::note_container_restart_for_uid(
-            self.repository.as_ref(),
-            ns,
-            name,
-            uid,
-            container_name,
-            terminated,
-            expected_rv,
-        )
-        .await
+
+    pub async fn has_status_checkpoint(&self, uid: &str) -> anyhow::Result<bool> {
+        let key = klights_node_store::PodCheckpointKey::try_new(uid)?;
+        self.owner
+            .node_local
+            .as_ref()
+            .expect("worker scenario node-local store")
+            .pod_status_checkpoints()
+            .get_pod_status_checkpoint(key)
+            .await
+            .map(|value| value.is_some())
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
     }
 }
 
-impl crate::kubelet::pod_repository::PodWatchSource for IntegrationPodRepositoryComposition {
-    fn subscribe_pod_watch(&self) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
-        crate::kubelet::pod_repository::PodWatchSource::subscribe_pod_watch(
-            self.repository.as_ref(),
-        )
-    }
+/// Deletion scenarios own the UID-bound deletion/query/API and GC ports for
+/// that scenario only.  This is intentionally separate from status and
+/// network fixtures.
+pub struct IntegrationPodDeletionFixture {
+    owner: Arc<PodRepositoryScenarioOwner>,
 }
 
-impl klights_pod_api::PodSubresourceMutation for IntegrationPodRepositoryComposition {
-    fn replace_status(
-        &self,
-        request: klights_pod_api::PodStatusReplaceRequest,
-    ) -> klights_pod_api::PodRepositoryFuture<'_, crate::datastore::Resource> {
-        self.pod_subresource.replace_status(request)
+impl IntegrationPodDeletionFixture {
+    pub async fn new_inline() -> Self {
+        Self {
+            owner: Arc::new(PodRepositoryScenarioOwner::new_inline().await),
+        }
     }
 
-    fn patch_status(
-        &self,
-        request: klights_pod_api::PodStatusPatchRequest,
-    ) -> klights_pod_api::PodRepositoryFuture<'_, crate::datastore::Resource> {
-        self.pod_subresource.patch_status(request)
+    pub async fn new_with_status_dispatcher() -> Self {
+        Self {
+            owner: Arc::new(PodRepositoryScenarioOwner::new_with_status_dispatcher().await),
+        }
     }
 
-    fn update_ephemeral_containers(
+    pub async fn new_with_delete_side_effect_observation() -> Self {
+        Self {
+            owner: Arc::new(
+                PodRepositoryScenarioOwner::new_with_delete_side_effect_observation().await,
+            ),
+        }
+    }
+
+    pub async fn new_with_gc_workqueue() -> Self {
+        Self {
+            owner: Arc::new(PodRepositoryScenarioOwner::new_with_gc_workqueue().await),
+        }
+    }
+
+    pub async fn new_cluster_backed(
+        resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    ) -> Self {
+        Self {
+            owner: Arc::new(PodRepositoryScenarioOwner::new_cluster_backed(resource_query).await),
+        }
+    }
+
+    pub fn query_ports(&self) -> &IntegrationPodQueryPorts {
+        self.owner.query_ports()
+    }
+
+    pub fn update_ports(&self) -> &IntegrationPodUpdatePorts {
+        self.owner.update_ports()
+    }
+
+    pub fn status_ports(&self) -> &IntegrationPodStatusPorts {
+        self.owner.status_ports()
+    }
+
+    pub fn api_ports(&self) -> &IntegrationPodApiPorts {
+        self.owner.api_ports()
+    }
+
+    pub async fn get_pod(
         &self,
-        request: klights_pod_api::PodEphemeralContainersRequest,
-    ) -> klights_pod_api::PodRepositoryFuture<'_, crate::datastore::Resource> {
-        self.pod_subresource.update_ephemeral_containers(request)
+        namespace: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        self.query_ports()
+            .get_pod(klights_pod_api::PodGetRequest::try_by_name(
+                namespace, name,
+            )?)
+            .await
+    }
+
+    pub async fn list_pods(
+        &self,
+        namespace: Option<&str>,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        limit: Option<i64>,
+        continue_token: Option<&str>,
+    ) -> anyhow::Result<klights_pod_api::PodListResult> {
+        self.query_ports()
+            .list_pods(klights_pod_api::PodListRequest::try_new(
+                namespace.map(str::to_string),
+                label_selector.map(str::to_string),
+                field_selector.map(str::to_string),
+                limit,
+                continue_token.map(str::to_string),
+            )?)
+            .await
+    }
+
+    pub async fn list_pods_by_owner_uid(
+        &self,
+        namespace: &str,
+        owner_uid: &str,
+    ) -> anyhow::Result<Vec<crate::datastore::Resource>> {
+        self.query_ports()
+            .list_pods_by_owner_uid(klights_pod_api::PodOwnerListRequest::try_new(
+                namespace, owner_uid,
+            )?)
+            .await
+    }
+
+    pub async fn seed_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        pod: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.owner.seed_pod(namespace, name, pod).await
+    }
+
+    pub async fn seed_scheduling_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.owner
+            .seed_scheduling_resource(api_version, kind, namespace, name, value)
+            .await
+    }
+
+    pub async fn seed_namespace(
+        &self,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.owner.seed_namespace(name, value).await
+    }
+
+    pub async fn seed_non_pod_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.owner
+            .seed_non_pod_resource(api_version, kind, namespace, name, value)
+            .await
+    }
+
+    pub async fn read_non_pod_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        self.owner
+            .read_non_pod_resource(api_version, kind, namespace, name)
+            .await
+    }
+
+    pub async fn pending_reconcile_keys(&self) -> Vec<klights_reconcile_api::ReconcileKey> {
+        self.owner.pending_reconcile_keys().await
+    }
+
+    pub async fn request_gc_pod_delete(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+    ) -> anyhow::Result<()> {
+        self.owner.request_gc_pod_delete(namespace, name, uid).await
+    }
+
+    pub async fn run_gc_cascade(
+        &self,
+        owner_uid: &str,
+        owner_api_version: &str,
+        owner_name: &str,
+        owner_kind: &str,
+        namespace: &str,
+    ) -> anyhow::Result<()> {
+        self.owner
+            .run_gc_cascade(
+                owner_uid,
+                owner_api_version,
+                owner_name,
+                owner_kind,
+                namespace,
+            )
+            .await
+    }
+
+    pub async fn claim_uid_bound_pod_work(
+        &self,
+    ) -> anyhow::Result<Option<IntegrationPodWorkqueueEntry>> {
+        self.owner.claim_uid_bound_pod_work().await
+    }
+
+    pub async fn run_delete_side_effect_order_case(&self) -> anyhow::Result<Option<(bool, bool)>> {
+        self.owner.run_delete_side_effect_order_case().await
+    }
+
+    pub async fn finalize_pod_deletion_after_actor_cleanup(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+    ) -> anyhow::Result<IntegrationPodFinalizationOutcome> {
+        self.owner
+            .finalize_pod_deletion_after_actor_cleanup(namespace, name, uid)
+            .await
+    }
+
+    pub async fn finalize_bound_pod_after_actor_cleanup(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+    ) -> anyhow::Result<IntegrationBoundPodDeleteOutcome> {
+        self.owner
+            .finalize_bound_pod_after_actor_cleanup(namespace, name, uid)
+            .await
+    }
+
+    pub async fn seed_mutating_webhook_configuration(
+        &self,
+        name: &str,
+        configuration: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.owner
+            .seed_mutating_webhook_configuration(name, configuration)
+            .await
+    }
+
+    pub async fn pod_watch_events_since(
+        &self,
+        resource_version: i64,
+    ) -> anyhow::Result<Vec<IntegrationPodWatchEvent>> {
+        self.owner.pod_watch_events_since(resource_version).await
+    }
+
+    pub async fn read_namespace(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        self.owner.read_namespace(name).await
+    }
+
+    pub async fn update_pod_owner_references(
+        &self,
+        namespace: &str,
+        name: &str,
+        refs: Vec<serde_json::Value>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.update_ports()
+            .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
+                klights_pod_api::PodMutationTarget::try_by_name(namespace, name)?,
+                integration_owner_references(refs)?,
+            ))
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    pub async fn merge_pod_labels(
+        &self,
+        namespace: &str,
+        name: &str,
+        labels: Vec<(String, String)>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.update_ports()
+            .update_pod(klights_pod_api::PodUpdateRequest::merge_labels(
+                klights_pod_api::PodMutationTarget::try_by_name(namespace, name)?,
+                labels
+                    .into_iter()
+                    .map(|(key, value)| klights_pod_api::PodLabel::try_new(key, value))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    pub async fn merge_pod_labels_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        labels: Vec<(String, String)>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.update_ports()
+            .update_pod(klights_pod_api::PodUpdateRequest::merge_labels(
+                klights_pod_api::PodMutationTarget::try_by_identity(
+                    klights_types::PodIdentity::new(namespace, name, uid),
+                )?,
+                labels
+                    .into_iter()
+                    .map(|(key, value)| klights_pod_api::PodLabel::try_new(key, value))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    pub async fn update_pod_owner_references_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        refs: Vec<serde_json::Value>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.update_ports()
+            .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
+                klights_pod_api::PodMutationTarget::try_by_identity(
+                    klights_types::PodIdentity::new(namespace, name, uid),
+                )?,
+                integration_owner_references(refs)?,
+            ))
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    pub async fn create_controller_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        _node_name: &str,
+        pod: serde_json::Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.api_ports()
+            .create(klights_pod_api::PodApiCreateRequest {
+                namespace: namespace.to_string(),
+                body: pod,
+                dry_run: false,
+            })
+            .await
+            .map_err(anyhow::Error::new)?
+            .resource
+            .ok_or_else(|| {
+                anyhow::anyhow!("controller Pod {namespace}/{name} unexpectedly dry-ran")
+            })
+    }
+
+    pub async fn delete_pod(&self, namespace: &str, name: &str) -> anyhow::Result<()> {
+        match self
+            .api_ports()
+            .delete(klights_pod_api::PodApiDeleteRequest {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                options: klights_pod_api::PodDeleteOptions::default(),
+                dry_run: false,
+            })
+            .await
+            .map_err(anyhow::Error::new)?
+        {
+            klights_pod_api::PodApiDeleteOutcome::GracefulSet(_) => Ok(()),
+            klights_pod_api::PodApiDeleteOutcome::DryRun(_) => {
+                anyhow::bail!("Pod delete unexpectedly dry-ran")
+            }
+        }
     }
 }
 
@@ -3506,7 +4792,7 @@ pub async fn run_local_bound_finalization_with_incidental_delivery_handles() -> 
             }
         })),
     };
-    let repository = IntegrationPodRepositoryComposition::new_exact(
+    let repository = PodRepositoryScenarioOwner::new_exact(
         Some(Arc::new(BoundFinalizationHostileLeaderQuery {
             pod: incidental_remote,
         })),
@@ -3621,7 +4907,8 @@ pub async fn run_local_bound_finalization_with_incidental_delivery_handles() -> 
     );
     anyhow::ensure!(
         repository
-            .read_pod("default", "local-finalize-child")
+            .db
+            .get_resource("v1", "Pod", Some("default"), "local-finalize-child",)
             .await?
             .is_none(),
         "local persistence retained the finalized Pod"

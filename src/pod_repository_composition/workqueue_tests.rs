@@ -549,8 +549,10 @@ mod tests {
             db,
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
-        let mut config = klights_supervisor::TaskCategoryConfig::default();
-        config.pod_delete_workqueue = 1;
+        let config = klights_supervisor::TaskCategoryConfig {
+            pod_delete_workqueue: 1,
+            ..Default::default()
+        };
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(config));
         let persistence_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),

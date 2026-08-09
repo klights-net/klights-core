@@ -217,14 +217,10 @@ mod tests {
             .unwrap();
 
         // Call reconcile_endpoints_for_pod (simulating pod watcher event)
-        reconcile_endpoints_for_pod(
-            &db,
-            crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
-            &pod,
-            None,
-        )
-        .await
-        .unwrap();
+        let pod_query = crate::pod_repository_composition::pod_query_for_test(&db);
+        reconcile_endpoints_for_pod(&db, pod_query.as_ref(), &pod, None)
+            .await
+            .unwrap();
 
         // Verify endpoints were updated with pod IP
         let endpoints = db

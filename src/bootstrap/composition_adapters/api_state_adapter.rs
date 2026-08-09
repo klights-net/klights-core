@@ -255,23 +255,20 @@ pub(crate) struct RootApiPodRepository {
 }
 
 impl RootApiPodRepository {
-    /// `inner` is decomposed into focused capability fields immediately;
-    /// this constructor is the only place in this file that names the
-    /// concrete root repository type, matching its role as the single
-    /// composition boundary that still receives it from the caller.
+    /// Focused-port constructor: the concrete root repository aggregate no
+    /// longer exists; callers hand the individual capability ports from
+    /// the focused Pod composition ports.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        inner: Arc<crate::kubelet::pod_repository::PodRepository>,
+        query: Arc<dyn klights_pod_api::PodQuery>,
+        snapshot: Arc<dyn klights_pod_api::PodSnapshotQuery>,
+        mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
+        namespace_termination_queue: Arc<dyn klights_reconcile_api::NamespaceTerminationQueueSink>,
+        eviction_admission: Arc<dyn klights_reconcile_api::PodEvictionAdmissionSink>,
+        namespace_bootstrap: Arc<dyn klights_reconcile_api::NamespaceBootstrapSink>,
         api: Arc<dyn klights_pod_api::PodApiMutation>,
         subresource: Arc<dyn klights_pod_api::PodSubresourceMutation>,
     ) -> Arc<Self> {
-        let mutation_reconcile = inner.mutation_reconcile_port();
-        let eviction_admission = inner.eviction_admission_port();
-        let namespace_bootstrap = inner.namespace_bootstrap_port();
-        let query: Arc<dyn klights_pod_api::PodQuery> = inner.clone();
-        let snapshot: Arc<dyn klights_pod_api::PodSnapshotQuery> = inner.clone();
-        let namespace_termination_queue: Arc<
-            dyn klights_reconcile_api::NamespaceTerminationQueueSink,
-        > = inner;
         Arc::new(Self {
             query,
             snapshot,

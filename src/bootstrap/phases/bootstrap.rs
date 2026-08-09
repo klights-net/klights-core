@@ -30,7 +30,8 @@ fn publish_leadership_if_changed(
 
 pub struct BootstrapPhase {
     pub _node_lifecycle_start_resource_version: i64,
-    pub pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
+    pub pod_query: Arc<dyn klights_pod_api::PodQuery>,
+    pub pod_sandbox_gc_dirty_counter: Arc<std::sync::atomic::AtomicUsize>,
     pub pod_api_service: Arc<k8s_native_service::PodApiService>,
     pub pod_scheduling: Arc<dyn klights_pod_api::PodScheduling>,
     pub crd_registry_watch_handle: SupervisedJoinHandle<()>,
@@ -543,23 +544,40 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             cni_readiness.clone(),
         )
     });
-    let (pod_repository_parts, root_pod_api_services) = if kubelet_uses_worker_store_adapter {
-        (
-            crate::pod_repository_composition::build_worker_pod_repository_parts(
-                crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
-                    resource_query: leader_ports.resource_query.clone(),
-                    pod_workqueue_store: pod_workqueue_store.clone(),
-                    supervisor: supervisor.clone(),
-                    metrics: metrics.clone(),
-                    pod_network_cache: pod_network_cache.clone(),
-                    assignment_waiter: assignment_waiter.clone(),
-                    outbox: outbox_runtime.clone(),
-                },
-            ),
-            None,
+    let (
+        pod_query,
+        pod_snapshot,
+        pod_update,
+        pod_status_writer,
+        pod_workqueue,
+        pod_network_assignment,
+        pod_host_ip,
+        pod_repository_background,
+        pod_deletion_finalizer,
+        sandbox_gc_dirty_counter,
+        mutation_reconcile,
+        gc_delete,
+        eviction_admission,
+        namespace_bootstrap,
+        namespace_termination_queue,
+        pod_api,
+        pod_subresource,
+        pod_scheduling,
+        ..,
+    ) = if kubelet_uses_worker_store_adapter {
+        crate::pod_repository_composition::build_worker_pod_repository_parts(
+            crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
+                resource_query: leader_ports.resource_query.clone(),
+                pod_workqueue_store: pod_workqueue_store.clone(),
+                supervisor: supervisor.clone(),
+                metrics: metrics.clone(),
+                pod_network_cache: pod_network_cache.clone(),
+                assignment_waiter: assignment_waiter.clone(),
+                outbox: outbox_runtime.clone(),
+            },
         )
     } else {
-        let root_parts = crate::pod_repository_composition::build_pod_repository_parts(
+        crate::pod_repository_composition::build_pod_repository_parts(
             crate::pod_repository_composition::PodRepositoryBuildConfig {
                 db: db_handle.clone(),
                 pod_workqueue_store: Some(pod_workqueue_store.clone()),
@@ -581,15 +599,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 gc_coordination: controller_coordination.clone(),
             },
             leader_coordination.clone(),
-        );
-        (
-            root_parts.repository_parts,
-            Some((
-                root_parts.api,
-                root_parts.subresource,
-                root_parts.scheduling,
-                root_parts.mutation_reconcile,
-            )),
         )
     };
     let kubelet_file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
@@ -619,7 +628,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     );
     let pod_subsystem = crate::kubelet::pod_subsystem::PodSubsystem::new(
         crate::kubelet::pod_subsystem::PodSubsystemConfig {
-            repository_parts: pod_repository_parts,
+            pod_query: pod_query.clone(),
+            pod_network_assignment: pod_network_assignment.clone(),
+            pod_status_writer: pod_status_writer.clone(),
+            pod_repository_background,
+            pod_deletion_finalizer,
             supervisor: supervisor.clone(),
             outbox: Some(kubelet_status_delivery.outbox.clone()),
             resource_query: Some(kubelet_status_delivery.resource_query.clone()),
@@ -690,71 +703,127 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .lifecycle_router
         .set_work_executor(pod_executor);
 
-    let pod_repository = pod_subsystem.repository.clone();
     let pod_lifecycle_router = pod_subsystem.lifecycle_router.clone();
-    pod_repository
-        .set_pod_lifecycle_router_for_node(pod_lifecycle_router.clone(), config.node_name.clone());
+    pod_workqueue
+        .set_lifecycle_router_for_node(pod_lifecycle_router.clone(), config.node_name.clone());
     if let Some(worker_store_adapter) = worker_store_adapter.as_ref() {
         worker_store_adapter.set_pod_lifecycle_router(pod_lifecycle_router.clone());
     }
-    // Captured alongside the tuple below without widening its shape: several
-    // source guards match the exact destructure text of the 4-element tuple.
     // Both arms assign this exactly once, so it is definitely initialized by
     // the time it is read after the `if`/`else`.
     let pod_mutation_reconcile_holder: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>;
-    let (api_pod_repository, pod_api_service, pod_subresource_service, pod_scheduling) =
-        if kubelet_uses_worker_store_adapter {
-            let root_parts = crate::pod_repository_composition::build_pod_repository_parts(
-                crate::pod_repository_composition::PodRepositoryBuildConfig {
-                    db: db_handle.clone(),
-                    pod_workqueue_store: Some(pod_workqueue_store.clone()),
-                    supervisor: supervisor.clone(),
-                    side_effects: side_effects.clone(),
-                    metrics: metrics.clone(),
-                    pod_network_cache: pod_network_cache.clone(),
-                    assignment_waiter: assignment_waiter.clone(),
-                    scheduling_mode,
-                    outbox: Some(outbox_runtime.clone()),
-                    cluster_api: Some(leader_ports.resource_query.clone()),
-                    remote_delivery_required: false,
-                    controller_identity: controller_identity.clone(),
-                    #[cfg(not(test))]
-                    api_identity: api_identity.clone(),
-                    #[cfg(any(test, feature = "pod-repository-test-support"))]
-                    scheduler_bind_gate: None,
-                    #[cfg(not(test))]
-                    gc_coordination: controller_coordination.clone(),
-                },
-                leader_coordination.clone(),
-            );
-            let repo = Arc::new(root_parts.repository_parts.repository);
-            repo.set_pod_lifecycle_router_for_node(
-                pod_lifecycle_router.clone(),
-                config.node_name.clone(),
-            );
-            root_parts
-                .repository_parts
-                .background
-                .start()
-                .await
-                .context("API Pod repository background startup")?;
-            pod_mutation_reconcile_holder = root_parts.mutation_reconcile;
-            (
-                repo,
-                root_parts.api,
-                root_parts.subresource,
-                root_parts.scheduling,
-            )
-        } else {
-            let (api, subresource, scheduling, mutation_reconcile) = root_pod_api_services
-                .expect("root Pod API services must accompany the root repository");
-            pod_mutation_reconcile_holder = mutation_reconcile;
-            (pod_repository.clone(), api, subresource, scheduling)
-        };
+    let controller_pod_update: Arc<dyn klights_pod_api::PodUpdate>;
+    let controller_gc_delete: Arc<dyn klights_reconcile_api::GcPodDeleteSink>;
+    let (
+        api_pod_repository,
+        pod_api_service,
+        pod_subresource_service,
+        pod_scheduling,
+        root_api_pod_query,
+        root_api_pod_snapshot,
+        root_api_mutation_reconcile,
+        root_api_namespace_termination_queue,
+        root_api_eviction_admission,
+        root_api_namespace_bootstrap,
+    ) = if kubelet_uses_worker_store_adapter {
+        let (
+            root_pod_query,
+            root_pod_snapshot,
+            root_pod_update,
+            _root_pod_status_writer,
+            root_pod_workqueue,
+            _root_pod_network_assignment,
+            _root_pod_host_ip,
+            root_background,
+            _root_deletion_finalizer,
+            _root_sandbox_gc_dirty_counter,
+            root_mutation_reconcile,
+            root_gc_delete,
+            root_eviction_admission,
+            root_namespace_bootstrap,
+            root_namespace_termination_queue,
+            root_api,
+            root_subresource,
+            root_scheduling,
+            ..,
+        ) = crate::pod_repository_composition::build_pod_repository_parts(
+            crate::pod_repository_composition::PodRepositoryBuildConfig {
+                db: db_handle.clone(),
+                pod_workqueue_store: Some(pod_workqueue_store.clone()),
+                supervisor: supervisor.clone(),
+                side_effects: side_effects.clone(),
+                metrics: metrics.clone(),
+                pod_network_cache: pod_network_cache.clone(),
+                assignment_waiter: assignment_waiter.clone(),
+                scheduling_mode,
+                outbox: Some(outbox_runtime.clone()),
+                cluster_api: Some(leader_ports.resource_query.clone()),
+                remote_delivery_required: false,
+                controller_identity: controller_identity.clone(),
+                #[cfg(not(test))]
+                api_identity: api_identity.clone(),
+                #[cfg(any(test, feature = "pod-repository-test-support"))]
+                scheduler_bind_gate: None,
+                #[cfg(not(test))]
+                gc_coordination: controller_coordination.clone(),
+            },
+            leader_coordination.clone(),
+        );
+        let root_api =
+            root_api.ok_or_else(|| anyhow::anyhow!("joined control-plane Pod API unavailable"))?;
+        let root_subresource = root_subresource
+            .ok_or_else(|| anyhow::anyhow!("joined control-plane Pod subresource unavailable"))?;
+        let root_scheduling = root_scheduling
+            .ok_or_else(|| anyhow::anyhow!("joined control-plane Pod scheduler unavailable"))?;
+        let root_mutation_reconcile_for_api = root_mutation_reconcile.clone();
+        root_pod_workqueue
+            .set_lifecycle_router_for_node(pod_lifecycle_router.clone(), config.node_name.clone());
+        root_background
+            .start()
+            .await
+            .context("API Pod repository background startup")?;
+        pod_mutation_reconcile_holder = root_mutation_reconcile;
+        controller_pod_update = root_pod_update;
+        controller_gc_delete = root_gc_delete;
+        (
+            root_pod_query.clone(),
+            root_api,
+            root_subresource,
+            root_scheduling,
+            root_pod_query,
+            root_pod_snapshot,
+            root_mutation_reconcile_for_api,
+            root_namespace_termination_queue,
+            root_eviction_admission,
+            root_namespace_bootstrap,
+        )
+    } else {
+        pod_mutation_reconcile_holder = mutation_reconcile.clone();
+        controller_pod_update = pod_update.clone();
+        controller_gc_delete = gc_delete.clone();
+        (
+            pod_query.clone(),
+            pod_api
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("root Pod API services are unavailable"))?
+                .clone(),
+            pod_subresource
+                .ok_or_else(|| anyhow::anyhow!("root Pod subresource service is unavailable"))?,
+            pod_scheduling
+                .ok_or_else(|| anyhow::anyhow!("root Pod scheduling backend is unavailable"))?,
+            pod_query.clone(),
+            pod_snapshot.clone(),
+            mutation_reconcile.clone(),
+            namespace_termination_queue.clone(),
+            eviction_admission.clone(),
+            namespace_bootstrap.clone(),
+        )
+    };
     let pod_mutation_reconcile = pod_mutation_reconcile_holder;
     let controller_pod_port = Arc::new(
         crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort::new(
             api_pod_repository.clone(),
+            controller_pod_update.clone(),
             pod_api_service.clone(),
             pod_subresource_service.clone(),
         ),
@@ -788,7 +857,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         daemonset_pod_mutation: controller_pod_mutations.clone(),
         job_pod_mutation: controller_pod_mutations.clone(),
         replicationcontroller_pod_mutation: controller_pod_mutations.clone(),
-        pod_delete_sink: api_pod_repository.clone(),
+        pod_delete_sink: controller_gc_delete.clone(),
         reconcile: Arc::new(
             crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerReconcilePort::new(
                 non_pod_finalization.clone(),
@@ -809,6 +878,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let hpa_controller = crate::bootstrap::controller_adapters::hpa_controller_adapter::controller(
         db_handle.clone(),
         api_pod_repository.clone(),
+        controller_gc_delete.clone(),
         controller_pod_mutations,
         non_pod_finalization,
         controller_coordination.clone(),
@@ -830,7 +900,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let pod_start_retry_state: klights_kubelet::pod_creation_state::PodStartRetryTracker = Arc::new(
         tokio::sync::Mutex::new(klights_kubelet::pod_creation_state::PodStartRetryState::new()),
     );
-    side_effects.set_pod_ports(api_pod_repository.clone(), api_pod_repository.clone());
+    side_effects.set_pod_ports(api_pod_repository.clone(), controller_gc_delete.clone());
     let oidc_authenticator = compose_oidc_authenticator(config, supervisor.as_ref())
         .await
         .context("failed to build OIDC authenticator")?;
@@ -927,7 +997,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let finalizer_lifecycle =
         crate::bootstrap::finalizer_lifecycle_adapter::DatastoreFinalizerLifecycleAdapter::new_with_coordination(
             db_handle.clone(),
-            api_pod_repository.clone(),
+            controller_gc_delete.clone(),
             side_effects.clone(),
             metrics.clone(),
             controller_coordination.clone(),
@@ -941,7 +1011,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let gc_owner_lifecycle =
         crate::bootstrap::controller_adapters::gc_delete_adapter::GcOwnerLifecycleAdapter::new_with_coordination(
             db_handle.clone(),
-            api_pod_repository.clone(),
+            controller_gc_delete.clone(),
             controller_coordination.clone(),
         );
     let generated_handler_adapter = crate::bootstrap::composition_adapters::generated_handler_adapter::GeneratedHandlerAdapter::new(
@@ -964,10 +1034,14 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     .context("kubelet configuration")?;
     let kubelet_services = Arc::new(crate::kubelet::context::KubeletContext::new(
         crate::kubelet::context::KubeletLifecycleServices::new(
-            pod_repository.clone(),
+            pod_query.clone(),
+            pod_status_writer.clone(),
+            pod_workqueue.clone(),
+            mutation_reconcile.clone(),
             pod_lifecycle_router.clone(),
             pod_lifecycle_rx.clone(),
             pod_start_retry_state.clone(),
+            pod_host_ip.clone(),
         ),
         kubelet_runtime_network,
         kubelet_status_delivery,
@@ -1268,7 +1342,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             db,
             api_pod_repository.clone(),
             controller_pod_port.clone(),
-            api_pod_repository.clone(),
+            controller_gc_delete.clone(),
             &crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db_handle.clone()),
             controller_coordination.as_ref(),
             controller_identity.as_ref(),
@@ -1627,7 +1701,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         generated_handler_adapter,
         Arc::new(gc_owner_lifecycle),
         crate::bootstrap::composition_adapters::api_state_adapter::RootApiPodRepository::new(
-            api_pod_repository.clone(),
+            root_api_pod_query,
+            root_api_pod_snapshot,
+            root_api_mutation_reconcile,
+            root_api_namespace_termination_queue,
+            root_api_eviction_admission,
+            root_api_namespace_bootstrap,
             pod_api_service.clone(),
             pod_subresource_service.clone(),
         ),
@@ -1782,7 +1861,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     };
 
     Ok(BootstrapPhase {
-        pod_repository: api_pod_repository,
+        pod_query: api_pod_repository,
+        pod_sandbox_gc_dirty_counter: sandbox_gc_dirty_counter.clone(),
         pod_api_service,
         pod_scheduling,
         crd_registry_watch_handle,

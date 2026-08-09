@@ -250,7 +250,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let repo = crate::kubelet::pod_repository::pod_repository_for_test(&db);
+        let pod_query = crate::pod_repository_composition::pod_query_for_test(&db);
         let recreated = json!({
             "metadata": {"name": "ss-0", "namespace": "test-ns", "uid": "new-uid"},
             "spec": {
@@ -259,7 +259,7 @@ mod tests {
             }
         });
 
-        reject_hostport_conflicts(repo.as_ref(), &adapted_pod(&recreated), "test-node")
+        reject_hostport_conflicts(pod_query.as_ref(), &adapted_pod(&recreated), "test-node")
             .await
             .expect("same-name replacement must not fail hostPort admission");
     }
@@ -285,7 +285,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let repo = crate::kubelet::pod_repository::pod_repository_for_test(&db);
+        let pod_query = crate::pod_repository_composition::pod_query_for_test(&db);
         let claimant = json!({
             "metadata": {"name": "claimant", "namespace": "test-ns", "uid": "claimant-uid"},
             "spec": {
@@ -294,11 +294,12 @@ mod tests {
             }
         });
 
-        let err = reject_hostport_conflicts(repo.as_ref(), &adapted_pod(&claimant), "test-node")
-            .await
-            .expect_err(
-                "different pod binding the same hostPort on the same node must be rejected",
-            );
+        let err =
+            reject_hostport_conflicts(pod_query.as_ref(), &adapted_pod(&claimant), "test-node")
+                .await
+                .expect_err(
+                    "different pod binding the same hostPort on the same node must be rejected",
+                );
         assert!(format!("{err:#}").contains("hostPort 21017/TCP is already allocated"));
     }
 }

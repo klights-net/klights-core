@@ -2,27 +2,27 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::kubelet::pod_runtime::repository::PodRuntimeRepository;
 use crate::kubelet::pod_runtime::types::PodRuntimeKey;
+use klights_kubelet::pod_repository::status::PodStatusWriter;
 use klights_kubelet::runtime::cri::{ContainerRuntimeControl, CriRuntime};
 
 /// Owns the activeDeadlineSeconds exceeded transition for a Pod.
 pub(super) struct ActiveDeadlineEnforcer {
     cri: Arc<dyn CriRuntime>,
     container_control: Arc<dyn ContainerRuntimeControl>,
-    repository: Arc<dyn PodRuntimeRepository>,
+    pod_status_writer: Arc<dyn PodStatusWriter>,
 }
 
 impl ActiveDeadlineEnforcer {
     pub(super) fn new(
         cri: Arc<dyn CriRuntime>,
         container_control: Arc<dyn ContainerRuntimeControl>,
-        repository: Arc<dyn PodRuntimeRepository>,
+        pod_status_writer: Arc<dyn PodStatusWriter>,
     ) -> Self {
         Self {
             cri,
             container_control,
-            repository,
+            pod_status_writer,
         }
     }
 
@@ -56,7 +56,7 @@ impl ActiveDeadlineEnforcer {
             deadline_secs
         );
         if let Err(e) = self
-            .repository
+            .pod_status_writer
             .set_deadline_exceeded_for_uid(
                 &key.namespace,
                 &key.name,

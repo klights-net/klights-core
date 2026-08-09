@@ -199,13 +199,48 @@ mod tests {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        // Built through the canonical kubelet test-support constructor and
-        // decomposed immediately into the two focused ports this adapter's
-        // tests actually need; nothing here names or stores the concrete
-        // root repository type.
-        let repository = crate::kubelet::pod_repository::pod_repository_for_test(&db);
-        let pod_query: Arc<dyn klights_pod_api::PodQuery> = repository.clone();
-        let pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink> = repository;
+        let (
+            pod_query,
+            _pod_snapshot,
+            _pod_update,
+            _pod_status_writer,
+            _pod_workqueue,
+            _pod_network_assignment,
+            _pod_host_ip,
+            _background,
+            _deletion_finalizer,
+            _dirty_counter,
+            _mutation_reconcile,
+            pod_delete_sink,
+            _eviction_admission,
+            _namespace_bootstrap,
+            _namespace_termination_queue,
+            _pod_api,
+            _pod_subresource,
+            _pod_scheduling,
+            _watch_source,
+            _bound_finalization,
+            _deferred_runtime,
+            _test_api,
+            _test_subresource,
+        ) = crate::pod_repository_composition::build_pod_repository_parts(
+            crate::pod_repository_composition::PodRepositoryBuildConfig {
+                db: db_handle.clone(),
+                pod_workqueue_store: None,
+                supervisor: supervisor.clone(),
+                side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
+                metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
+                pod_network_cache: crate::pod_repository_composition::empty_test_pod_network_cache(),
+                assignment_waiter: crate::pod_repository_composition::test_assignment_bus(),
+                scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+                outbox: None,
+                cluster_api: None,
+                remote_delivery_required: false,
+                controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
+                scheduler_bind_gate: None,
+            },
+            None,
+        );
         let slot = PodSideEffectPortsSlot::new();
         slot.set(pod_query, pod_delete_sink);
         (db, db_handle, slot, supervisor)

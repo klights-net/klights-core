@@ -5,6 +5,7 @@ use std::sync::Arc;
 use super::workqueue::PodWorkqueue;
 
 /// Services that must be started after repository construction.
+#[derive(Clone)]
 pub struct PodRepositoryBackground {
     workqueue: Arc<PodWorkqueue>,
 }

@@ -147,43 +147,62 @@ fn validate_service_cidr(value: &str) -> Result<(), KubeletConfigError> {
 }
 
 /// Focused Pod lifecycle capabilities supplied by the application root.
-pub struct LifecycleServices<Repository, Router, Receiver, RetryTracker> {
-    pub pod_repository: Arc<Repository>,
+///
+/// The concrete Pod repository aggregate is gone: the root composes focused
+/// capabilities (`PodQuery`, `PodStatusWriter`, workqueue, mutation
+/// reconcile) and this context only ever carries those focused ports plus
+/// the router / receiver / retry-tracker wiring.
+pub struct LifecycleServices<Router, Receiver, RetryTracker> {
+    pub pod_query: Arc<dyn klights_pod_api::PodQuery>,
+    pub pod_status_writer: Arc<dyn crate::pod_repository::status::PodStatusWriter>,
+    pub pod_workqueue: Arc<crate::pod_repository::workqueue::PodWorkqueue>,
+    pub pod_mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     pub pod_lifecycle_router: Arc<Router>,
     pub pod_lifecycle_rx: Receiver,
     pub pod_start_retry_state: RetryTracker,
+    pub host_ip: HostIpState,
 }
 
-impl<Repository, Router, Receiver, RetryTracker> Clone
-    for LifecycleServices<Repository, Router, Receiver, RetryTracker>
+impl<Router, Receiver, RetryTracker> Clone for LifecycleServices<Router, Receiver, RetryTracker>
 where
     Receiver: Clone,
     RetryTracker: Clone,
 {
     fn clone(&self) -> Self {
         Self {
-            pod_repository: self.pod_repository.clone(),
+            pod_query: self.pod_query.clone(),
+            pod_status_writer: self.pod_status_writer.clone(),
+            pod_workqueue: self.pod_workqueue.clone(),
+            pod_mutation_reconcile: self.pod_mutation_reconcile.clone(),
             pod_lifecycle_router: self.pod_lifecycle_router.clone(),
             pod_lifecycle_rx: self.pod_lifecycle_rx.clone(),
             pod_start_retry_state: self.pod_start_retry_state.clone(),
+            host_ip: self.host_ip.clone(),
         }
     }
 }
 
-impl<Repository, Router, Receiver, RetryTracker>
-    LifecycleServices<Repository, Router, Receiver, RetryTracker>
-{
+impl<Router, Receiver, RetryTracker> LifecycleServices<Router, Receiver, RetryTracker> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        pod_repository: Arc<Repository>,
+        pod_query: Arc<dyn klights_pod_api::PodQuery>,
+        pod_status_writer: Arc<dyn super::pod_repository::status::PodStatusWriter>,
+        pod_workqueue: Arc<crate::pod_repository::workqueue::PodWorkqueue>,
+        pod_mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
         pod_lifecycle_router: Arc<Router>,
         pod_lifecycle_rx: Receiver,
         pod_start_retry_state: RetryTracker,
+        host_ip: HostIpState,
     ) -> Self {
         Self {
-            pod_repository,
+            pod_query,
+            pod_status_writer,
+            pod_workqueue,
+            pod_mutation_reconcile,
             pod_lifecycle_router,
             pod_lifecycle_rx,
             pod_start_retry_state,
+            host_ip,
         }
     }
 }

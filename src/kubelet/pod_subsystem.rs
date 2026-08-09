@@ -6,8 +6,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::kubelet::pod_repository::PodRepository;
-use crate::kubelet::pod_repository::facade::PodRepositoryParts;
 use crate::kubelet::pod_runtime::events::PodEventSink;
 use crate::kubelet::pod_runtime::service::{
     PodRuntimeService, RealPodRuntimeService, RealPodRuntimeServiceDependencies,
@@ -35,7 +33,13 @@ impl klights_supervisor::WallClock for LifecycleWallClock {
 
 /// Wiring inputs for PodSubsystem construction.
 pub struct PodSubsystemConfig {
-    pub repository_parts: PodRepositoryParts,
+    pub(crate) pod_query: Arc<dyn klights_pod_api::PodQuery>,
+    pub(crate) pod_network_assignment:
+        Arc<dyn klights_kubelet::pod_repository::PodNetworkAssignmentQuery>,
+    pub(crate) pod_status_writer: Arc<dyn klights_kubelet::pod_repository::status::PodStatusWriter>,
+    pub(crate) pod_repository_background: PodRepositoryBackground,
+    pub(crate) pod_deletion_finalizer:
+        Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer>,
     pub supervisor: Arc<TaskSupervisor>,
     pub outbox: Option<Arc<klights_kubelet::outbox::Outbox>>,
     pub resource_query: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
@@ -69,7 +73,6 @@ pub struct PodSubsystemConfig {
 /// Task 24 construction). Background work starts in explicit `start()`.
 pub struct PodSubsystem {
     pub supervisor: Arc<TaskSupervisor>,
-    pub repository: Arc<PodRepository>,
     pub repository_background: PodRepositoryBackground,
     pub lifecycle_router: Arc<PodLifecycleRouter>,
     pub lifecycle_service: PodLifecycleService,
@@ -86,7 +89,9 @@ pub struct PodSubsystem {
 
 struct RuntimeServiceBuildRequest {
     supervisor: Arc<TaskSupervisor>,
-    repository: Arc<PodRepository>,
+    pod_query: Arc<dyn klights_pod_api::PodQuery>,
+    pod_network_assignment: Arc<dyn klights_kubelet::pod_repository::PodNetworkAssignmentQuery>,
+    pod_status_writer: Arc<dyn klights_kubelet::pod_repository::status::PodStatusWriter>,
     cri: Option<klights_kubelet::cri::SharedCriClient>,
     registry_proxy: Option<klights_kubelet::registry_proxy::ContainerdRegistryProxyConfigurator>,
     containerd_ns: String,
@@ -128,9 +133,11 @@ impl PodSubsystem {
         let sandbox_inputs = config.sandbox_inputs.clone();
         let node_capacity = config.node_capacity;
         let paths = config.paths.clone();
-        let parts = config.repository_parts;
-        let (repository, repository_background, deletion_finalizer) =
-            parts.into_pod_subsystem_parts();
+        let pod_query = config.pod_query;
+        let pod_network_assignment = config.pod_network_assignment;
+        let pod_status_writer = config.pod_status_writer;
+        let repository_background = config.pod_repository_background;
+        let deletion_finalizer = config.pod_deletion_finalizer;
 
         let lifecycle_wall_clock: Arc<dyn klights_supervisor::WallClock> =
             Arc::new(LifecycleWallClock {
@@ -160,7 +167,6 @@ impl PodSubsystem {
             )),
         };
         let lifecycle_service = PodLifecycleService::new(lifecycle_router.clone());
-        let repository = Arc::new(repository);
         let probe_cri_runtime = config.cri.clone().map(|cri| {
             Arc::new(
                 klights_kubelet::runtime::cri::SharedCriRuntime::new_with_registry_proxy(
@@ -172,7 +178,7 @@ impl PodSubsystem {
         let probe_manager = config.probe_manager.unwrap_or_else(|| {
             Arc::new(ProbeManager::new_with_lifecycle(
                 supervisor.clone(),
-                repository.clone() as Arc<dyn klights_pod_api::PodQuery>,
+                pod_query.clone(),
                 probe_cri_runtime.clone(),
                 lifecycle_tx.clone(),
                 config.wall_clock.clone(),
@@ -182,7 +188,9 @@ impl PodSubsystem {
             Some(runtime_service) => runtime_service,
             None => Self::build_runtime_service(RuntimeServiceBuildRequest {
                 supervisor: supervisor.clone(),
-                repository: repository.clone(),
+                pod_query: pod_query.clone(),
+                pod_network_assignment: pod_network_assignment.clone(),
+                pod_status_writer: pod_status_writer.clone(),
                 cri: cri.clone(),
                 registry_proxy: registry_proxy.clone(),
                 containerd_ns: containerd_ns.clone(),
@@ -206,7 +214,6 @@ impl PodSubsystem {
 
         Ok(Self {
             supervisor,
-            repository,
             repository_background,
             lifecycle_router,
             lifecycle_service,
@@ -226,7 +233,9 @@ impl PodSubsystem {
     ) -> Result<Arc<dyn PodRuntimeService>> {
         let RuntimeServiceBuildRequest {
             supervisor,
-            repository,
+            pod_query,
+            pod_network_assignment,
+            pod_status_writer,
             cri,
             registry_proxy,
             containerd_ns,
@@ -265,7 +274,7 @@ impl PodSubsystem {
                 registry_proxy,
             ),
         );
-        let pod_reader: Arc<dyn klights_pod_api::PodQuery> = repository.clone();
+        let pod_reader: Arc<dyn klights_pod_api::PodQuery> = pod_query.clone();
         let hostports: Arc<dyn crate::kubelet::pod_runtime::hostports::HostPortRuntime> = Arc::new(
             crate::kubelet::pod_runtime::hostports::RealHostPortRuntime::new(
                 service_router,
@@ -282,7 +291,8 @@ impl PodSubsystem {
         let cluster_view: Arc<dyn crate::kubelet::pod_cluster_runtime::ClusterRuntimeView> =
             Arc::new(
                 crate::kubelet::pod_cluster_runtime::RepositoryClusterRuntimeView::new(
-                    repository.clone(),
+                    pod_query.clone(),
+                    pod_status_writer.clone(),
                 ),
             );
         Ok(Arc::new(RealPodRuntimeService::new(
@@ -292,14 +302,15 @@ impl PodSubsystem {
                 network: Arc::new(
                     crate::kubelet::pod_runtime::network::RealPodNetworkRuntime::new(
                         datapath,
-                        repository.clone(),
+                        pod_network_assignment.clone(),
                         runtime_store.clone(),
                     ),
                 ),
                 store: runtime_store,
                 clock: wall_clock,
                 slot_admission,
-                repository: repository.clone(),
+                pod_query,
+                pod_status_writer,
                 filesystem: Arc::new(
                     crate::kubelet::pod_runtime::filesystem::RealPodFilesystem::new(
                         supervisor.clone(),
@@ -406,15 +417,27 @@ mod tests {
         let supervisor = fixture_supervisor();
         let side_effects = Arc::new(SideEffectRegistry::new());
         let metrics = SideEffectMetrics::new();
-        let repository_parts =
-            PodRepository::build_parts(crate::kubelet::pod_repository::PodRepositoryBuildConfig {
+        let (
+            pod_query,
+            _pod_snapshot,
+            _pod_update,
+            pod_status_writer,
+            _pod_workqueue,
+            pod_network_assignment,
+            _pod_host_ip,
+            pod_repository_background,
+            pod_deletion_finalizer,
+            ..
+        ) = crate::pod_repository_composition::build_pod_repository_parts(
+            crate::pod_repository_composition::PodRepositoryBuildConfig {
                 db: db.clone(),
                 pod_workqueue_store: None,
                 supervisor: supervisor.clone(),
                 side_effects,
                 metrics,
-                pod_network_cache: crate::kubelet::pod_repository::empty_test_pod_network_cache(),
-                assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
+                pod_network_cache:
+                    crate::pod_repository_composition::empty_test_pod_network_cache(),
+                assignment_waiter: crate::pod_repository_composition::test_assignment_bus(),
                 scheduling_mode,
                 outbox: None,
                 cluster_api: Some(cluster_api.clone()),
@@ -422,9 +445,15 @@ mod tests {
                 controller_identity:
                     crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
                 scheduler_bind_gate: None,
-            });
+            },
+            None,
+        );
         PodSubsystemConfig {
-            repository_parts,
+            pod_query,
+            pod_network_assignment,
+            pod_status_writer,
+            pod_repository_background,
+            pod_deletion_finalizer,
             supervisor,
             outbox: None,
             resource_query: Some(cluster_api.clone()),
@@ -470,9 +499,10 @@ mod tests {
         let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let config = fixture_config(db);
         assert_eq!(config.node_name, "node-1");
-        // Repository builder parameters are present.
+        // Focused repository ports are present.
         let _ = &config.supervisor;
-        let _ = &config.repository_parts;
+        let _ = &config.pod_query;
+        let _ = &config.pod_status_writer;
         let _ = &config.lifecycle_concurrency;
         let _ = &config.runtime_store;
         let _ = &config.slot_admission;
@@ -488,9 +518,7 @@ mod tests {
 
         let subsystem = PodSubsystem::new(config).expect("PodSubsystem construction must succeed");
 
-        // Repository is available.
-        let _repo = &subsystem.repository;
-
+        // Query port is available through the subsystem config handoff.
         // Router is available.
         let _router = &subsystem.lifecycle_router;
 
@@ -659,8 +687,8 @@ mod tests {
 
         let subsystem = PodSubsystem::new(config).expect("PodSubsystem construction must succeed");
 
-        // All components accessible.
-        let _repo = &subsystem.repository;
+        // Router and lifecycle service are accessible; the repository is
+        // handed off as focused parts before construction.
         let _router = &subsystem.lifecycle_router;
         let _service = &subsystem.lifecycle_service;
 
@@ -684,8 +712,8 @@ mod tests {
 
         let subsystem = PodSubsystem::new(config).expect("PodSubsystem construction must succeed");
 
-        // All components accessible.
-        let _repo = &subsystem.repository;
+        // Router and lifecycle service are accessible; the repository is
+        // handed off as focused parts before construction.
         let _router = &subsystem.lifecycle_router;
         let _service = &subsystem.lifecycle_service;
 

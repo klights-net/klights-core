@@ -36,9 +36,8 @@ pub trait PodDeletionFinalizer: Send + Sync {
 
 /// Production actor-owned Pod deletion finalizer.
 ///
-/// Moves the body of `PodRepository::finalize_pod_deletion_after_actor_cleanup`
-/// behind the `PodDeletionFinalizer` trait so the actor-owned hard-delete
-/// invariant can be source-guarded.
+/// Keeps bound-Pod finalization behind the focused `PodDeletionFinalizer`
+/// trait so the actor-owned hard-delete invariant can be source-guarded.
 pub struct RealPodDeletionFinalizer {
     pod_query: Arc<dyn PodQuery>,
     gc_pod_delete_sink: Arc<dyn GcPodDeleteSink>,
@@ -105,32 +104,35 @@ impl RealPodDeletionFinalizer {
         let pdb_reconcile = self.pdb_reconcile.clone();
         let namespace_termination = self.namespace_termination.clone();
         let ns = namespace.to_string();
-        drop(self.supervisor.spawn_async(
-            klights_supervisor::TaskCategory::Background,
-            format!("post_write_maintenance/{ns}"),
-            async move {
-                if let Err(err) = pdb_reconcile.reconcile_namespace_pdbs(ns.clone()).await {
-                    tracing::warn!(
-                        namespace = %ns,
-                        error = ?err,
-                        "post-write PDB reconcile failed"
-                    );
-                }
-                if let Err(err) = namespace_termination
-                    .reconcile_namespace_termination(NamespaceTerminationRequest {
-                        namespace: ns.clone(),
-                        expected_uid: None,
-                    })
-                    .await
-                {
-                    tracing::warn!(
-                        namespace = %ns,
-                        error = ?err,
-                        "post-write namespace termination reconcile failed"
-                    );
-                }
-            },
-        ));
+        let _ = self
+            .supervisor
+            .spawn_async(
+                klights_supervisor::TaskCategory::Background,
+                format!("post_write_maintenance/{ns}"),
+                async move {
+                    if let Err(err) = pdb_reconcile.reconcile_namespace_pdbs(ns.clone()).await {
+                        tracing::warn!(
+                            namespace = %ns,
+                            error = ?err,
+                            "post-write PDB reconcile failed"
+                        );
+                    }
+                    if let Err(err) = namespace_termination
+                        .reconcile_namespace_termination(NamespaceTerminationRequest {
+                            namespace: ns.clone(),
+                            expected_uid: None,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            namespace = %ns,
+                            error = ?err,
+                            "post-write namespace termination reconcile failed"
+                        );
+                    }
+                },
+            )
+            .await;
     }
 
     async fn delete_status_checkpoint_after_finalization(&self, uid: &str) {
@@ -364,7 +366,7 @@ mod policy_tests {
                 .lock()
                 .unwrap()
                 .push("opaque_bound_finalization");
-            Box::pin(async { Ok(BoundPodFinalizationOutcome::Accepted) })
+            Box::pin(async { Ok(BoundPodFinalizationOutcome::Removed) })
         }
     }
 
@@ -416,13 +418,16 @@ mod policy_tests {
         }
     }
 
-    struct NoopNamespaceTermination;
+    struct RecordingNamespaceTermination {
+        requests: Arc<Mutex<Vec<NamespaceTerminationRequest>>>,
+    }
 
-    impl NamespaceTerminationSink for NoopNamespaceTermination {
+    impl NamespaceTerminationSink for RecordingNamespaceTermination {
         fn reconcile_namespace_termination(
             &self,
-            _request: NamespaceTerminationRequest,
+            request: NamespaceTerminationRequest,
         ) -> klights_reconcile_api::NamespaceTerminationFuture<'_> {
+            self.requests.lock().unwrap().push(request);
             Box::pin(async { Ok(klights_reconcile_api::NamespaceTerminationOutcome::Finalized) })
         }
     }
@@ -466,6 +471,10 @@ mod policy_tests {
     #[tokio::test]
     async fn fresh_uid_termination_and_finalizer_check_precedes_opaque_finalization() {
         let events = Arc::new(Mutex::new(Vec::new()));
+        let namespace_requests = Arc::new(Mutex::new(Vec::new()));
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
         let finalizer = compose_real_pod_deletion_finalizer(RealPodDeletionFinalizerDependencies {
             pod_query: Arc::new(RecordingQuery {
                 events: events.clone(),
@@ -474,7 +483,9 @@ mod policy_tests {
             gc_pod_delete_sink: Arc::new(NoopGcDelete),
             gc_reconcile: Arc::new(NoopGcReconcile),
             pdb_reconcile: Arc::new(NoopPdbReconcile),
-            namespace_termination: Arc::new(NoopNamespaceTermination),
+            namespace_termination: Arc::new(RecordingNamespaceTermination {
+                requests: namespace_requests.clone(),
+            }),
             cluster_api: None,
             outbox: None,
             remote_delivery_required: false,
@@ -483,9 +494,7 @@ mod policy_tests {
             }),
             mutation_reconcile: Arc::new(NoopMutationReconcile),
             metrics: Arc::new(NoopMetrics),
-            supervisor: Arc::new(klights_supervisor::TaskSupervisor::new(
-                klights_supervisor::TaskCategoryConfig::default(),
-            )),
+            supervisor: supervisor.clone(),
         });
 
         let result = finalizer
@@ -493,11 +502,16 @@ mod policy_tests {
             .await
             .expect("eligible bound Pod finalization");
 
-        assert_eq!(result, PodDeletionFinalizeResult::Queued);
+        assert_eq!(result, PodDeletionFinalizeResult::DeletedOrAlreadyGone);
         assert_eq!(
             *events.lock().unwrap(),
             ["fresh_uid_check", "opaque_bound_finalization"],
             "fresh UID/termination/finalizer validation must precede the opaque deleting capability"
         );
+        supervisor.shutdown(std::time::Duration::from_secs(1)).await;
+        let requests = namespace_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].namespace, "default");
+        assert_eq!(requests[0].expected_uid, None);
     }
 }

@@ -39,7 +39,7 @@ impl RealPodRuntimeService {
         let emitted = self
             .status_emitter
             .emit_readiness_if_changed(&emit_key, container_name, ready, |ready| async move {
-                self.repository
+                self.pod_status_writer
                     .set_probe_readiness_for_uid(
                         namespace,
                         pod_name,

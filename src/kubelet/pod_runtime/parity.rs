@@ -10,8 +10,8 @@
 use std::sync::{Arc, Mutex};
 
 use crate::kubelet::pod_cluster_runtime::ClusterRuntimeView;
-use crate::kubelet::pod_repository::{PodRepository, PodRepositoryBuildConfig};
 use crate::kubelet::pod_runtime::service::PodRuntimeKey;
+use crate::pod_repository_composition::PodRepositoryBuildConfig;
 
 use super::events::PodEventSink;
 use super::filesystem::PodFilesystem;
@@ -48,7 +48,8 @@ use klights_kubelet::runtime::test_support::{
 
 // ── Recording types ──
 
-/// A write recorded on the PodRepository during a parity run.
+/// A write recorded through the focused Pod status capability during a parity
+/// run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RepositoryWrite {
     SetPodStatus {
@@ -269,27 +270,55 @@ impl ParityFixture {
         let metrics: Arc<klights_controllers::side_effects::SideEffectMetrics> =
             klights_controllers::side_effects::SideEffectMetrics::new();
         let node_local =
-            crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
-        let parts = PodRepository::build_parts(PodRepositoryBuildConfig {
-            db: handle.clone(),
-            pod_workqueue_store: Some(node_local.clone()),
-            supervisor,
-            side_effects,
-            metrics,
-            pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(node_local),
-            assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
-            scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
-            outbox: None,
-            cluster_api: None,
-            remote_delivery_required: false,
-            controller_identity: Arc::new(ParityControllerIdentity),
-            scheduler_bind_gate: None,
-        });
-        // The concrete repository is constructed here, once, and immediately
-        // decomposed into the focused capabilities the fixture actually
-        // exposes; no field or method downstream names or stores the
-        // concrete aggregate.
-        let repository = Arc::new(parts.repository);
+            crate::pod_repository_composition::test_node_local_store(supervisor.clone()).await;
+        let (
+            pod_query,
+            _pod_snapshot,
+            _pod_update,
+            pod_status_writer,
+            _pod_workqueue,
+            _pod_network_assignment,
+            _pod_host_ip,
+            _background,
+            _deletion_finalizer,
+            _dirty_counter,
+            _mutation_reconcile,
+            _gc_delete,
+            _eviction_admission,
+            _namespace_bootstrap,
+            _namespace_termination_queue,
+            _pod_api,
+            _pod_subresource,
+            _pod_scheduling,
+            _watch_source,
+            _bound_finalization,
+            _deferred_runtime,
+            test_api,
+            _test_subresource,
+        ) = crate::pod_repository_composition::build_pod_repository_parts(
+            PodRepositoryBuildConfig {
+                db: handle.clone(),
+                pod_workqueue_store: Some(node_local.clone()),
+                supervisor,
+                side_effects,
+                metrics,
+                pod_network_cache: crate::pod_repository_composition::test_pod_network_cache(
+                    node_local,
+                ),
+                assignment_waiter: crate::pod_repository_composition::test_assignment_bus(),
+                scheduling_mode:
+                    crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+                outbox: None,
+                cluster_api: None,
+                remote_delivery_required: false,
+                controller_identity: Arc::new(ParityControllerIdentity),
+                scheduler_bind_gate: None,
+            },
+            None,
+        );
+        // The composite parts are decomposed immediately into the focused
+        // capabilities the fixture actually exposes; no field or method
+        // stores a concrete aggregate.
 
         Self {
             cri: Arc::new(MockCriRuntime::new()),
@@ -303,9 +332,11 @@ impl ParityFixture {
             hostports: Arc::new(MockHostPortRuntime::new()),
             events: Arc::new(MockPodEventSink::new()),
             cluster_view: Arc::new(RecordingClusterRuntimeView::new()),
-            query: repository.clone(),
-            status: repository.clone(),
-            mutation: repository,
+            query: pod_query,
+            status: pod_status_writer,
+            mutation: test_api
+                .clone()
+                .expect("parity fixture requires the root Pod API test port"),
             outbox_log: Arc::new(Mutex::new(Vec::new())),
         }
     }

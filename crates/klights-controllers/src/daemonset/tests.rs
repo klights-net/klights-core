@@ -578,7 +578,7 @@ fn active_pods(items: &[Resource]) -> Vec<&Resource> {
 }
 
 /// Test-only shim that mirrors the public `reconcile_daemonset` signature
-/// before the Task 18 migration. Builds a `PodRepository` over the supplied
+/// before the Task 18 migration. Builds focused Pod ports over the supplied
 /// in-memory `Datastore`.
 async fn reconcile_daemonset_test(db: &Datastore, daemonset: &Value) -> anyhow::Result<()> {
     let identity = deterministic_controller_identity();

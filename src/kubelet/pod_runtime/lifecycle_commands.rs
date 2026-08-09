@@ -1,3 +1,4 @@
+use crate::kubelet::pod_runtime::pod_identity::get_pod_for_uid;
 use crate::kubelet::pod_runtime::service::{
     ContainerConfigBuildRequest, PodRuntimeKey, RealPodRuntimeService,
 };
@@ -42,10 +43,8 @@ pub(super) async fn handle_lifecycle_command(
                 "restart requested"
             );
             let key = PodRuntimeKey::new(namespace, pod_name, pod_uid);
-            let Some(pod_resource) = service
-                .repository
-                .get_pod_for_uid(namespace, pod_name, pod_uid)
-                .await?
+            let Some(pod_resource) =
+                get_pod_for_uid(service.pod_query.as_ref(), namespace, pod_name, pod_uid).await?
             else {
                 return Ok(());
             };
@@ -112,7 +111,7 @@ pub(super) async fn handle_lifecycle_command(
             let last_state =
                 restart_last_state_from_runtime_status(stopped_status.as_ref(), operation_now);
             let _ = service
-                .repository
+                .pod_status_writer
                 .note_container_restart_for_uid(
                     namespace,
                     pod_name,

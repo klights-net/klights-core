@@ -39,7 +39,7 @@ impl ResourceQuotaSideEffectPort for RootResourceQuotaSideEffectPort {
     async fn recount_namespace(&self, namespace: &str) -> Result<()> {
         let Some(pod_query) = self.pod_repository.query() else {
             tracing::debug!(
-                "ResourceQuotaEffect skipped for {}: PodRepository not yet bound",
+                "ResourceQuotaEffect skipped for {}: Pod query not yet bound",
                 namespace
             );
             return Ok(());

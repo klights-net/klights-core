@@ -5,7 +5,6 @@ use serde_json::{Value, json};
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
 use crate::datastore::{DatastoreBackend, ResourcePatchRequest};
-use crate::kubelet::pod_repository::PodRepository;
 use klights_controllers::ControllerPodMutationAdapter;
 use klights_controllers::hpa::{
     HpaMetricUsage, HpaMetrics, HpaMetricsSnapshot, HpaRuntime, ScaleTarget, ScaleTargetKind,
@@ -102,7 +101,8 @@ struct RootHpaReconcileAdapter {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn controller(
     db: crate::datastore::DatastoreHandle,
-    pod_repository: std::sync::Arc<PodRepository>,
+    pod_query: std::sync::Arc<dyn PodQuery>,
+    pod_delete_sink: std::sync::Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
     pod_mutation: std::sync::Arc<ControllerPodMutationAdapter>,
     non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
     coordination: std::sync::Arc<klights_controllers::ControllerCoordination>,
@@ -110,12 +110,6 @@ pub(crate) fn controller(
     node_metrics: std::sync::Arc<dyn NodeMetrics>,
     identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
 ) -> std::sync::Arc<klights_controllers::hpa::HpaController> {
-    // `pod_repository` is decomposed into focused capability fields
-    // immediately; this constructor is the only place in this file that
-    // names the concrete root repository type.
-    let pod_query: std::sync::Arc<dyn PodQuery> = pod_repository.clone();
-    let pod_delete_sink: std::sync::Arc<dyn klights_reconcile_api::GcPodDeleteSink> =
-        pod_repository;
     std::sync::Arc::new(klights_controllers::hpa::HpaController::new(
         std::sync::Arc::new(RootHpaReconcileAdapter {
             db,

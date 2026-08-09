@@ -8,13 +8,14 @@ use crate::kubelet::pod_runtime::hooks::PodHookRuntime;
 use crate::kubelet::pod_runtime::hostports::HostPortRuntime;
 use crate::kubelet::pod_runtime::network::PodNetworkRuntime;
 use crate::kubelet::pod_runtime::probes::ProbeRuntime;
-use crate::kubelet::pod_runtime::repository::PodRuntimeRepository;
 use crate::kubelet::pod_runtime::service::RuntimeConfig;
 use crate::kubelet::pod_runtime::store::{PodRuntimeStore, PodSlotAdmission};
 use crate::kubelet::pod_runtime::volumes::PodVolumeRuntime;
 use klights_kubelet::pod_env::EnvSourceReader;
+use klights_kubelet::pod_repository::status::PodStatusWriter;
 use klights_kubelet::runtime::cri::{ContainerRuntimeControl, CriRuntime};
 use klights_kubelet::runtime_clock::RuntimeClock;
+use klights_pod_api::PodQuery;
 use klights_supervisor::TaskSupervisor;
 
 pub struct RealPodRuntimeServiceDependencies {
@@ -24,7 +25,8 @@ pub struct RealPodRuntimeServiceDependencies {
     pub store: Arc<dyn PodRuntimeStore>,
     pub clock: Arc<dyn RuntimeClock>,
     pub slot_admission: Arc<dyn PodSlotAdmission>,
-    pub repository: Arc<dyn PodRuntimeRepository>,
+    pub pod_query: Arc<dyn PodQuery>,
+    pub pod_status_writer: Arc<dyn PodStatusWriter>,
     pub filesystem: Arc<dyn PodFilesystem>,
     pub volumes: Arc<dyn PodVolumeRuntime>,
     pub probes: Arc<dyn ProbeRuntime>,

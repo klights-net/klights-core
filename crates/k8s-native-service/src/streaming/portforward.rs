@@ -55,7 +55,7 @@ where
         ));
     }
 
-    // Get pod from PodRepository to find pod IP
+    // Query the Pod to find its IP.
     let pod = get_pod(
         state.streaming_dependencies().pod_query.as_ref(),
         &namespace,

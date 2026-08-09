@@ -53,8 +53,10 @@ use crate::kubelet::pod_runtime::init_container_status::{
     init_container_stop_from_status, record_completed_init_container_status,
 };
 use crate::kubelet::pod_runtime::network::PodNetworkRuntime;
+use crate::kubelet::pod_runtime::pod_identity::{
+    LivePodUidCheck, check_live_pod_uid, get_pod_for_uid,
+};
 use crate::kubelet::pod_runtime::probes::{ProbeRuntime, StartupFinalizationAction};
-use crate::kubelet::pod_runtime::repository::{LivePodUidCheck, PodRuntimeRepository};
 use crate::kubelet::pod_runtime::status_emitter::PodStatusEmitter;
 use crate::kubelet::pod_runtime::status_helpers::{
     EphemeralContainerStatusInput, build_ephemeral_container_status,
@@ -181,7 +183,8 @@ pub struct RealPodRuntimeService {
     pub(super) store: Arc<dyn PodRuntimeStore>,
     pub(super) clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     pub(super) slot_admission: Arc<dyn PodSlotAdmission>,
-    pub(super) repository: Arc<dyn PodRuntimeRepository>,
+    pub(super) pod_query: Arc<dyn klights_pod_api::PodQuery>,
+    pub(super) pod_status_writer: Arc<dyn klights_kubelet::pod_repository::status::PodStatusWriter>,
     pub(super) filesystem: Arc<dyn PodFilesystem>,
     pub(super) volumes: Arc<dyn PodVolumeRuntime>,
     probes: Arc<dyn ProbeRuntime>,
@@ -401,7 +404,7 @@ impl RealPodRuntimeService {
             .await?;
         self.cri.start_container(&new_container_id).await?;
         let _ = self
-            .repository
+            .pod_status_writer
             .note_container_restart_for_uid(
                 &key.namespace,
                 &key.name,
@@ -633,7 +636,8 @@ impl RealPodRuntimeService {
             store,
             clock,
             slot_admission,
-            repository,
+            pod_query,
+            pod_status_writer,
             filesystem,
             volumes,
             probes,
@@ -647,8 +651,11 @@ impl RealPodRuntimeService {
             node_view,
             cluster_view,
         } = dependencies;
-        let active_deadline =
-            ActiveDeadlineEnforcer::new(cri.clone(), container_control.clone(), repository.clone());
+        let active_deadline = ActiveDeadlineEnforcer::new(
+            cri.clone(),
+            container_control.clone(),
+            pod_status_writer.clone(),
+        );
         Self {
             cri,
             container_control,
@@ -656,7 +663,8 @@ impl RealPodRuntimeService {
             store,
             clock,
             slot_admission,
-            repository,
+            pod_query,
+            pod_status_writer,
             filesystem,
             volumes,
             probes,
@@ -844,19 +852,18 @@ impl PodRuntimeService for RealPodRuntimeService {
         let (pod, from_snapshot) = match pod {
             Some(p) => (p, true),
             None => {
-                let resource = self
-                    .repository
-                    .get_pod_for_uid(&key.namespace, &key.name, &key.uid)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to read pod: {:#}", e))?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "pod {}/{} not found for uid {}",
-                            key.namespace,
-                            key.name,
-                            key.uid
-                        )
-                    })?;
+                let resource =
+                    get_pod_for_uid(self.pod_query.as_ref(), &key.namespace, &key.name, &key.uid)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to read pod: {:#}", e))?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "pod {}/{} not found for uid {}",
+                                key.namespace,
+                                key.name,
+                                key.uid
+                            )
+                        })?;
                 ((*resource.data).clone(), false)
             }
         };
@@ -874,11 +881,10 @@ impl PodRuntimeService for RealPodRuntimeService {
             )));
         }
         if from_snapshot
-            && let LivePodUidCheck::Different { live_uid } = self
-                .repository
-                .check_live_pod_uid(&key.namespace, &key.name, &key.uid)
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to verify live pod identity: {:#}", e))?
+            && let LivePodUidCheck::Different { live_uid } =
+                check_live_pod_uid(self.pod_query.as_ref(), &key.namespace, &key.name, &key.uid)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to verify live pod identity: {:#}", e))?
         {
             return Ok(PodStartResult::Failed(format!(
                 "UID mismatch: key {} != live pod {}",
@@ -2165,28 +2171,27 @@ impl PodRuntimeService for RealPodRuntimeService {
         pod: Option<serde_json::Value>,
         sandbox_id_hint: Option<String>,
     ) -> anyhow::Result<PodFinalizeStartupResult> {
-        let live_resource = match self
-            .repository
-            .get_pod_for_uid(&key.namespace, &key.name, &key.uid)
-            .await
-        {
-            Ok(resource) => resource,
-            Err(e) if pod.is_some() => {
-                tracing::warn!(
-                    namespace = key.namespace,
-                    name = key.name,
-                    uid = key.uid,
-                    "failed to read pod for startup finalization; using actor snapshot: {e:#}"
-                );
-                None
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "failed to read pod for startup finalization: {:#}",
-                    e
-                ));
-            }
-        };
+        let live_resource =
+            match get_pod_for_uid(self.pod_query.as_ref(), &key.namespace, &key.name, &key.uid)
+                .await
+            {
+                Ok(resource) => resource,
+                Err(e) if pod.is_some() => {
+                    tracing::warn!(
+                        namespace = key.namespace,
+                        name = key.name,
+                        uid = key.uid,
+                        "failed to read pod for startup finalization; using actor snapshot: {e:#}"
+                    );
+                    None
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "failed to read pod for startup finalization: {:#}",
+                        e
+                    ));
+                }
+            };
         let pod = match live_resource
             .as_ref()
             .map(|resource| resource.data.as_ref())
@@ -2289,11 +2294,10 @@ impl PodRuntimeService for RealPodRuntimeService {
         key: PodRuntimeKey,
         hint: RuntimeReconcileHint,
     ) -> anyhow::Result<()> {
-        let resource = self
-            .repository
-            .get_pod_for_uid(&key.namespace, &key.name, &key.uid)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read pod for runtime reconcile: {e:#}"))?;
+        let resource =
+            get_pod_for_uid(self.pod_query.as_ref(), &key.namespace, &key.name, &key.uid)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to read pod for runtime reconcile: {e:#}"))?;
         let Some(resource) = resource else {
             return Ok(());
         };
@@ -2415,11 +2419,12 @@ impl PodRuntimeService for RealPodRuntimeService {
     async fn reconcile_cri_leftovers(&self, key: PodRuntimeKey) -> anyhow::Result<()> {
         // CRI leftover cleanup is node-local: only clean up leftovers for
         // pods owned by this node.
-        let resource = self
-            .repository
-            .get_pod_for_uid(&key.namespace, &key.name, &key.uid)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read pod for CRI leftover check: {:#}", e))?;
+        let resource =
+            get_pod_for_uid(self.pod_query.as_ref(), &key.namespace, &key.name, &key.uid)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to read pod for CRI leftover check: {:#}", e)
+                })?;
         let Some(resource) = resource else {
             return Ok(()); // Pod already gone, nothing to reconcile.
         };
@@ -2789,15 +2794,14 @@ impl PodRuntimeService for RealPodRuntimeService {
 
         let mut attempt = 0u8;
         while attempt < 5 {
-            let Some(current) = self
-                .repository
-                .get_pod_for_uid(&key.namespace, &key.name, &key.uid)
-                .await?
+            let Some(current) =
+                get_pod_for_uid(self.pod_query.as_ref(), &key.namespace, &key.name, &key.uid)
+                    .await?
             else {
                 return Ok(());
             };
             match self
-                .repository
+                .pod_status_writer
                 .apply_ephemeral_container_statuses_for_uid(
                     &key.namespace,
                     &key.name,
@@ -2861,7 +2865,7 @@ impl PodRuntimeService for RealPodRuntimeService {
     ) -> anyhow::Result<()> {
         crate::kubelet::pod_runtime::retry::schedule_start_pod_retry(
             crate::kubelet::pod_runtime::retry::RetryRuntimeContext {
-                repository: self.repository.as_ref(),
+                pod_status_writer: self.pod_status_writer.as_ref(),
                 events: self.events.as_ref(),
                 supervisor: &self.supervisor,
                 node_name: &self.config.node_name,

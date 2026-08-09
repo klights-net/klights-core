@@ -5,7 +5,6 @@ use klights_cluster_core::{Resource, ResourceBatchOperation, ResourcePreconditio
 use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult as Result};
 
 use crate::datastore::DatastoreHandle;
-use crate::kubelet::pod_repository::PodRepository;
 use klights_controllers::{
     ControllerEffectPort, ControllerNetworkPort, ControllerReconcilePort, ControllerResourceQuery,
 };
@@ -769,16 +768,15 @@ pub(crate) struct RootControllerPodPort {
 }
 
 impl RootControllerPodPort {
-    /// `repository` is decomposed into focused capability fields immediately;
-    /// this constructor is the only place in this file that names the
-    /// concrete root repository type.
+    /// Focused-port constructor: the concrete root repository aggregate no
+    /// longer exists; callers pass the query + update ports from
+    /// the focused Pod composition ports.
     pub(crate) fn new(
-        repository: Arc<PodRepository>,
+        query: Arc<dyn klights_pod_api::PodQuery>,
+        update: Arc<dyn klights_pod_api::PodUpdate>,
         api: Arc<dyn klights_pod_api::PodApiMutation>,
         subresource: Arc<dyn klights_pod_api::PodSubresourceMutation>,
     ) -> Self {
-        let query: Arc<dyn klights_pod_api::PodQuery> = repository.clone();
-        let update: Arc<dyn klights_pod_api::PodUpdate> = repository;
         Self {
             query,
             update,
@@ -788,9 +786,13 @@ impl RootControllerPodPort {
     }
 
     #[cfg(test)]
-    pub(crate) fn new_for_test(repository: Arc<PodRepository>) -> Self {
-        let (api, subresource) = repository.test_root_api_services();
-        Self::new(repository, api, subresource)
+    pub(crate) fn new_for_test(
+        query: Arc<dyn klights_pod_api::PodQuery>,
+        update: Arc<dyn klights_pod_api::PodUpdate>,
+        api: Arc<dyn klights_pod_api::PodApiMutation>,
+        subresource: Arc<dyn klights_pod_api::PodSubresourceMutation>,
+    ) -> Self {
+        Self::new(query, update, api, subresource)
     }
 
     pub(crate) async fn create_controller_pod(
@@ -1109,9 +1111,62 @@ fn runtime_dependencies_for_test(
     node_name: &str,
 ) -> klights_controllers::ControllerRuntimeDependencies {
     let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
-    let repository = crate::kubelet::pod_repository::pod_repository_for_test(db);
+    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
+    ));
+    let (
+        pod_query,
+        _pod_snapshot,
+        pod_update,
+        _pod_status_writer,
+        _pod_workqueue,
+        _pod_network_assignment,
+        _pod_host_ip,
+        _background,
+        _deletion_finalizer,
+        _dirty_counter,
+        _mutation_reconcile,
+        gc_delete,
+        _eviction_admission,
+        _namespace_bootstrap,
+        _namespace_termination_queue,
+        _pod_api,
+        _pod_subresource,
+        _pod_scheduling,
+        _watch_source,
+        _bound_finalization,
+        _deferred_runtime,
+        test_api,
+        test_subresource,
+    ) = crate::pod_repository_composition::build_pod_repository_parts(
+        crate::pod_repository_composition::PodRepositoryBuildConfig {
+            db: db_handle.clone(),
+            pod_workqueue_store: None,
+            supervisor,
+            side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
+            metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
+            pod_network_cache: crate::pod_repository_composition::empty_test_pod_network_cache(),
+            assignment_waiter: crate::pod_repository_composition::test_assignment_bus(),
+            scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+            outbox: None,
+            cluster_api: None,
+            remote_delivery_required: false,
+            controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
+            scheduler_bind_gate: None,
+        },
+        None,
+    );
     let leader = Arc::new(RootControllerLeaderPort::new(db_handle.clone()));
-    let pods = Arc::new(RootControllerPodPort::new_for_test(repository.clone()));
+    let pods = Arc::new(RootControllerPodPort::new_for_test(
+        pod_query.clone(),
+        pod_update.clone(),
+        test_api
+            .clone()
+            .expect("controller test runtime requires the root Pod API port"),
+        test_subresource
+            .clone()
+            .expect("controller test runtime requires the root Pod subresource port"),
+    ));
     let pod_mutations = Arc::new(klights_controllers::ControllerPodMutationAdapter::new(
         pods.clone(),
         pods.clone(),
@@ -1136,14 +1191,14 @@ fn runtime_dependencies_for_test(
         replicationcontroller_store: leader.clone(),
         apiservice_store: leader.clone(),
         csr_status_store: leader,
-        pod_query: repository.clone(),
+        pod_query: pod_query.clone(),
         deployment_pod_mutation: pod_mutations.clone(),
         replicaset_pod_mutation: pod_mutations.clone(),
         statefulset_pod_mutation: pod_mutations.clone(),
         daemonset_pod_mutation: pod_mutations.clone(),
         job_pod_mutation: pod_mutations.clone(),
         replicationcontroller_pod_mutation: pod_mutations,
-        pod_delete_sink: repository,
+        pod_delete_sink: gc_delete.clone(),
         reconcile: Arc::new(RootControllerReconcilePort::new(non_pod_finalization)),
         network: Arc::new(RootControllerNetworkPort::new(services)),
         effects: Arc::new(RootControllerEffectPort::new(

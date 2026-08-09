@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use crate::kubelet::pod_repository::PodRepository;
 use klights_kubelet::pod_repository::PodStatusWriter;
 use klights_kubelet::pod_repository::{PodStatusUpdate, RuntimeReconcileStatus};
 use klights_pod_api::{PodGetRequest, PodQuery};
@@ -164,24 +163,22 @@ impl NodeRuntimeView for LocalNodeRuntimeView {
 /// leader's kubelet uses this exact same path as a normal worker — there is
 /// no leader-specific runtime view or status bypass.
 ///
-/// The constructor still accepts the concrete `Arc<PodRepository>` (rather
-/// than two already-erased trait objects) because `src/kubelet/pod_runtime/
-/// tests.rs` — out of this packet's file scope — constructs this view
-/// directly from a bare `Arc<PodRepository>`/owned repository value at
-/// several call sites. Only the constructor's parameter names the concrete
-/// type; every stored field and every method body dispatches exclusively
-/// through the decomposed focused capabilities, never through a live
-/// aggregate accessor.
+/// The constructor accepts the two focused trait objects directly. Every
+/// stored field and every method body dispatches exclusively through those
+/// capabilities; there is no aggregate accessor or role-specific bypass.
 pub struct RepositoryClusterRuntimeView {
     pod_query: Arc<dyn PodQuery>,
     pod_status: Arc<dyn PodStatusWriter>,
 }
 
 impl RepositoryClusterRuntimeView {
-    pub fn new(repository: Arc<PodRepository>) -> Self {
+    pub fn new(
+        pod_query: Arc<dyn klights_pod_api::PodQuery>,
+        pod_status: Arc<dyn klights_kubelet::pod_repository::status::PodStatusWriter>,
+    ) -> Self {
         Self {
-            pod_query: repository.clone(),
-            pod_status: repository,
+            pod_query,
+            pod_status,
         }
     }
 }
@@ -217,21 +214,90 @@ impl ClusterRuntimeView for RepositoryClusterRuntimeView {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use std::sync::Arc;
-
     use serde_json::json;
 
     use super::*;
     use crate::kubelet::pod_runtime::service::PodRuntimeKey;
 
-    async fn build_repo() -> PodRepository {
+    struct PodClusterTestPorts {
+        pod_query: Arc<dyn klights_pod_api::PodQuery>,
+        pod_status_writer: Arc<dyn klights_kubelet::pod_repository::status::PodStatusWriter>,
+        test_api: Option<Arc<dyn klights_pod_api::PodApiMutation>>,
+    }
+
+    async fn build_repo() -> PodClusterTestPorts {
         let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
-            klights_supervisor::TaskCategoryConfig::default(),
-        ));
-        let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-        let side_effects = Arc::new(klights_controllers::side_effects::SideEffectRegistry::new());
-        PodRepository::new(db, supervisor, side_effects, metrics)
+        let (
+            pod_query,
+            _pod_snapshot,
+            _pod_update,
+            pod_status_writer,
+            _pod_workqueue,
+            _pod_network_assignment,
+            _pod_host_ip,
+            _background,
+            _deletion_finalizer,
+            _dirty_counter,
+            _mutation_reconcile,
+            _gc_delete,
+            _eviction_admission,
+            _namespace_bootstrap,
+            _namespace_termination_queue,
+            _pod_api,
+            _pod_subresource,
+            _pod_scheduling,
+            _watch_source,
+            _bound_finalization,
+            _deferred_runtime,
+            test_api,
+            _test_subresource,
+        ) = crate::pod_repository_composition::build_pod_repository_parts(
+            crate::pod_repository_composition::PodRepositoryBuildConfig {
+                db: db.clone(),
+                pod_workqueue_store: None,
+                supervisor: Arc::new(klights_supervisor::TaskSupervisor::new(
+                    klights_supervisor::TaskCategoryConfig::default(),
+                )),
+                side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
+                metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
+                pod_network_cache: crate::pod_repository_composition::empty_test_pod_network_cache(),
+                assignment_waiter: crate::pod_repository_composition::test_assignment_bus(),
+                scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+                outbox: None,
+                cluster_api: None,
+                remote_delivery_required: false,
+                controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
+                scheduler_bind_gate: None,
+            },
+            None,
+        );
+        PodClusterTestPorts {
+            pod_query,
+            pod_status_writer,
+            test_api,
+        }
+    }
+
+    async fn test_create_pod(
+        parts: &PodClusterTestPorts,
+        namespace: &str,
+        name: &str,
+        _node_name: &str,
+        body: serde_json::Value,
+    ) -> anyhow::Result<klights_cluster_core::Resource> {
+        let created = parts
+            .test_api
+            .as_ref()
+            .expect("runtime fixture requires the root Pod API test port")
+            .create_pod(klights_pod_api::PodApiCreateRequest {
+                namespace: namespace.to_string(),
+                body,
+                dry_run: false,
+            })
+            .await?;
+        created
+            .resource
+            .ok_or_else(|| anyhow::anyhow!("test Pod {namespace}/{name} create returned dry-run"))
     }
 
     #[tokio::test]
@@ -256,15 +322,14 @@ mod tests {
                 ]
             }
         });
-        let created = repo
-            .test_create_pod("default", "init-forwarded", "worker-1", pod)
+        let created = test_create_pod(&repo, "default", "init-forwarded", "worker-1", pod)
             .await
             .unwrap();
         let key = PodRuntimeKey::new("default", "init-forwarded", &created.uid);
 
         apply_forwarded_status(
-            &repo,
-            &repo,
+            repo.pod_query.as_ref(),
+            repo.pod_status_writer.as_ref(),
             &key,
             json!({
                 "phase": "Succeeded",
@@ -297,11 +362,17 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = repo
-            .test_get_pod_for_uid("default", "init-forwarded", &created.uid)
-            .await
-            .unwrap()
-            .unwrap();
+        let stored =
+            repo.pod_query
+                .get_pod(
+                    klights_pod_api::PodGetRequest::try_by_identity(
+                        klights_types::PodIdentity::new("default", "init-forwarded", &created.uid),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
         let init_statuses = stored
             .data
             .pointer("/status/initContainerStatuses")
@@ -355,14 +426,13 @@ mod tests {
                 "containerStatuses": []
             }
         });
-        let created = repo
-            .test_create_pod("default", "init-retry-forwarded", "worker-1", pod)
+        let created = test_create_pod(&repo, "default", "init-retry-forwarded", "worker-1", pod)
             .await
             .unwrap();
         let key = PodRuntimeKey::new("default", "init-retry-forwarded", &created.uid);
         apply_forwarded_status(
-            &repo,
-            &repo,
+            repo.pod_query.as_ref(),
+            repo.pod_status_writer.as_ref(),
             &key,
             json!({
                 "phase": "Pending",
@@ -375,8 +445,8 @@ mod tests {
         .unwrap();
 
         apply_forwarded_status(
-            &repo,
-            &repo,
+            repo.pod_query.as_ref(),
+            repo.pod_status_writer.as_ref(),
             &key,
             json!({
                 "phase": "Pending",
@@ -409,7 +479,15 @@ mod tests {
         .unwrap();
 
         let stored = repo
-            .test_get_pod_for_uid("default", "init-retry-forwarded", &created.uid)
+            .pod_query
+            .get_pod(
+                klights_pod_api::PodGetRequest::try_by_identity(klights_types::PodIdentity::new(
+                    "default",
+                    "init-retry-forwarded",
+                    &created.uid,
+                ))
+                .unwrap(),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -454,15 +532,14 @@ mod tests {
                 "containerStatuses": []
             }
         });
-        let created = repo
-            .test_create_pod("default", "split-init-forwarded", "worker-1", pod)
+        let created = test_create_pod(&repo, "default", "split-init-forwarded", "worker-1", pod)
             .await
             .unwrap();
         let key = PodRuntimeKey::new("default", "split-init-forwarded", &created.uid);
 
         apply_forwarded_status(
-            &repo,
-            &repo,
+            repo.pod_query.as_ref(),
+            repo.pod_status_writer.as_ref(),
             &key,
             json!({
                 "phase": "Pending",
@@ -495,8 +572,8 @@ mod tests {
         .unwrap();
 
         apply_forwarded_status(
-            &repo,
-            &repo,
+            repo.pod_query.as_ref(),
+            repo.pod_status_writer.as_ref(),
             &key,
             json!({
                 "phase": "Pending",
@@ -516,7 +593,15 @@ mod tests {
         .unwrap();
 
         let stored = repo
-            .test_get_pod_for_uid("default", "split-init-forwarded", &created.uid)
+            .pod_query
+            .get_pod(
+                klights_pod_api::PodGetRequest::try_by_identity(klights_types::PodIdentity::new(
+                    "default",
+                    "split-init-forwarded",
+                    &created.uid,
+                ))
+                .unwrap(),
+            )
             .await
             .unwrap()
             .unwrap();

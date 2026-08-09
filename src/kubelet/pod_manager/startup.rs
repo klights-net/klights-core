@@ -91,15 +91,39 @@ mod tests {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
-            crate::kubelet::pod_repository::PodRepositoryBuildConfig {
+        let (
+            pod_repo,
+            _pod_snapshot,
+            _pod_update,
+            _pod_status_writer,
+            _pod_workqueue,
+            _pod_network_assignment,
+            _pod_host_ip,
+            _background,
+            _deletion_finalizer,
+            _dirty_counter,
+            _mutation_reconcile,
+            _gc_delete,
+            _eviction_admission,
+            _namespace_bootstrap,
+            _namespace_termination_queue,
+            _pod_api,
+            _pod_subresource,
+            _pod_scheduling,
+            _watch_source,
+            _bound_finalization,
+            _deferred_runtime,
+            test_api,
+            _test_subresource,
+        ) = crate::pod_repository_composition::build_pod_repository_parts(
+            crate::pod_repository_composition::PodRepositoryBuildConfig {
                 db: db_handle.clone(),
                 pod_workqueue_store: None,
                 supervisor: supervisor.clone(),
                 side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
                 metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
-                pod_network_cache: crate::kubelet::pod_repository::empty_test_pod_network_cache(),
-                assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
+                pod_network_cache: crate::pod_repository_composition::empty_test_pod_network_cache(),
+                assignment_waiter: crate::pod_repository_composition::test_assignment_bus(),
                 scheduling_mode:
                     crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
                 outbox: None,
@@ -109,8 +133,9 @@ mod tests {
                     crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
                 scheduler_bind_gate: None,
             },
+            None,
         );
-        let pod_repo = Arc::new(parts.repository);
+        let pod_repo: std::sync::Arc<dyn klights_pod_api::PodQuery> = pod_repo;
         let pod = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
@@ -125,8 +150,14 @@ mod tests {
             },
             "status": {"phase": "Pending"}
         });
-        pod_repo
-            .test_create_pod("kube-system", "coredns", "test-node", pod)
+        let _created = test_api
+            .as_ref()
+            .expect("recovery fixture requires the root Pod API test port")
+            .create_pod(klights_pod_api::PodApiCreateRequest {
+                namespace: "kube-system".to_string(),
+                body: pod,
+                dry_run: false,
+            })
             .await
             .expect("create recovery pod");
 

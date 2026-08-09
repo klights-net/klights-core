@@ -31,7 +31,8 @@ pub struct LeaderStart<'a> {
     pub task_supervisor: &'a Arc<TaskSupervisor>,
     pub dispatcher_for_worker: &'a Arc<klights_controllers::ControllerDispatcher>,
     pub dispatcher_for_cronjobs: &'a Arc<klights_controllers::ControllerDispatcher>,
-    pub pod_repository: &'a Arc<crate::kubelet::pod_repository::PodRepository>,
+    pub pod_query: &'a Arc<dyn klights_pod_api::PodQuery>,
+    pub pod_sandbox_gc_dirty_counter: &'a Arc<std::sync::atomic::AtomicUsize>,
     pub pod_scheduling: &'a Arc<dyn klights_pod_api::PodScheduling>,
     pub cri_for_shutdown: &'a Option<Arc<tokio::sync::Mutex<klights_kubelet::cri::CriClient>>>,
     pub datapath: &'a Arc<dyn klights_network_api::Datapath>,
@@ -66,7 +67,8 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
         task_supervisor,
         dispatcher_for_worker,
         dispatcher_for_cronjobs,
-        pod_repository,
+        pod_query,
+        pod_sandbox_gc_dirty_counter,
         pod_scheduling,
         cri_for_shutdown,
         datapath,
@@ -78,12 +80,11 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
         return Ok(());
     };
 
-    // `pod_repository` is decomposed into focused capability fields
-    // immediately; the long-lived leader-scoped task context (cloned into
-    // the lease-scoped background closure) never carries the concrete root
-    // repository type.
-    let pod_query: Arc<dyn klights_pod_api::PodQuery> = pod_repository.clone();
-    let sandbox_gc_dirty_counter = pod_repository.sandbox_gc_dirty_counter();
+    // `pod_query` is already a focused trait object; the long-lived
+    // leader-scoped task context (cloned into the lease-scoped background
+    // closure) only carries focused capability fields.
+    let pod_query: Arc<dyn klights_pod_api::PodQuery> = pod_query.clone();
+    let sandbox_gc_dirty_counter = pod_sandbox_gc_dirty_counter.clone();
     let leader_context = LeaderScopedTaskContext {
         config: config.clone(),
         db_handle: db_handle.clone(),

@@ -457,7 +457,20 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             cni_readiness.clone(),
         )
     });
-    let pod_repository_parts = compose_worker_pod_repository_parts(
+    let (
+        pod_query,
+        _pod_snapshot,
+        _pod_update,
+        pod_status_writer,
+        pod_workqueue,
+        pod_network_assignment,
+        pod_host_ip,
+        pod_repository_background,
+        pod_deletion_finalizer,
+        _sandbox_gc_dirty_counter,
+        mutation_reconcile,
+        ..,
+    ) = crate::pod_repository_composition::build_worker_pod_repository_parts(
         crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
             resource_query: leader_ports.resource_query.clone(),
             pod_workqueue_store: node_local.pod_workqueue(),
@@ -493,7 +506,11 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let pod_slot_events = node_local.pod_slot_events();
     let pod_subsystem = crate::kubelet::pod_subsystem::PodSubsystem::new(
         crate::kubelet::pod_subsystem::PodSubsystemConfig {
-            repository_parts: pod_repository_parts,
+            pod_query: pod_query.clone(),
+            pod_network_assignment: pod_network_assignment.clone(),
+            pod_status_writer: pod_status_writer.clone(),
+            pod_repository_background,
+            pod_deletion_finalizer,
             supervisor: task_supervisor.clone(),
             outbox: Some(kubelet_status_delivery.outbox.clone()),
             resource_query: Some(kubelet_status_delivery.resource_query.clone()),
@@ -562,12 +579,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         .lifecycle_router
         .set_work_executor(pod_executor);
 
-    let pod_repository = pod_subsystem.repository.clone();
     let plr = pod_subsystem.lifecycle_router.clone();
-    let router_binding: std::sync::Arc<
-        dyn crate::kubelet::pod_repository::facade::PodLifecycleRouterBinding,
-    > = pod_repository.clone();
-    router_binding.bind_pod_lifecycle_router(plr.clone(), config.node_name.clone());
+    pod_workqueue.set_lifecycle_router_for_node(plr.clone(), config.node_name.clone());
     worker_store.set_pod_lifecycle_router(plr.clone());
     let kubelet_config = crate::kubelet::context::KubeletConfig::try_new(
         config.service_cidr.clone(),
@@ -580,12 +593,16 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     .context("worker kubelet configuration")?;
     let kctx = std::sync::Arc::new(crate::kubelet::context::KubeletContext::new(
         crate::kubelet::context::KubeletLifecycleServices::new(
-            pod_repository.clone(),
+            pod_query.clone(),
+            pod_status_writer.clone(),
+            pod_workqueue.clone(),
+            mutation_reconcile.clone(),
             plr,
             pod_lifecycle_rx,
             std::sync::Arc::new(tokio::sync::Mutex::new(
                 klights_kubelet::pod_creation_state::PodStartRetryState::new(),
             )),
+            pod_host_ip.clone(),
         ),
         kubelet_runtime_network,
         kubelet_status_delivery,
@@ -705,12 +722,6 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let _ = pidfile::remove(&pid_path);
     tracing::info!("Worker shutdown complete");
     Ok(())
-}
-
-fn compose_worker_pod_repository_parts(
-    config: crate::pod_repository_composition::WorkerPodRepositoryBuildConfig,
-) -> crate::kubelet::pod_repository::facade::PodRepositoryParts {
-    crate::pod_repository_composition::build_worker_pod_repository_parts(config)
 }
 
 /// Subsystems enabled for a worker node.
@@ -855,24 +866,37 @@ mod tests {
             crate::bootstrap::composition_tests::support::outbox_from_node_db(node_local.clone()),
         );
 
-        let parts = compose_worker_pod_repository_parts(
+        let (
+            _pod_query,
+            _pod_snapshot,
+            _pod_update,
+            _pod_status_writer,
+            _pod_workqueue,
+            _pod_network_assignment,
+            _pod_host_ip,
+            background,
+            _pod_deletion_finalizer,
+            _sandbox_gc_dirty_counter,
+            _mutation_reconcile,
+            ..,
+        ) = crate::pod_repository_composition::build_worker_pod_repository_parts(
             crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
                 resource_query: std::sync::Arc::new(UnavailableWorkerQuery),
                 pod_workqueue_store: node_local.pod_workqueue(),
                 supervisor,
                 metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
-                pod_network_cache: crate::kubelet::pod_repository::empty_test_pod_network_cache(),
-                assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
+                pod_network_cache: crate::pod_repository_composition::empty_test_pod_network_cache(
+                ),
+                assignment_waiter: crate::pod_repository_composition::test_assignment_bus(),
                 outbox,
             },
         );
 
-        parts
-            .background
+        background
             .start()
             .await
             .expect("worker repository background starts without cluster datastore");
-        assert!(parts.background.workqueue_start_called());
+        assert!(background.workqueue_start_called());
     }
 
     #[test]

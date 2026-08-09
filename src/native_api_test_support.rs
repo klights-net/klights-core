@@ -713,7 +713,8 @@ pub struct NativeApiTestHarness {
     datastore: IntegrationDatastoreHandle,
     sqlite: crate::datastore::sqlite::Datastore,
     nodeport_alloc: Arc<klights_controllers::service::NodePortAllocator>,
-    pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
+    pod_query: Arc<dyn klights_pod_api::PodQuery>,
+    pod_finalization: Arc<dyn klights_pod_api::BoundPodFinalization>,
     _node_local: Arc<crate::datastore::node_local::NodeLocalStores>,
     #[allow(dead_code)]
     outbox_dispatcher: Arc<klights_kubelet::node_outbox::OutboxDispatcher>,
@@ -1264,24 +1265,54 @@ impl NativeApiTestHarness {
             gc_coordination: gc_coordination.clone(),
             scheduler_bind_gate: None,
         };
-        let root_pod_parts = crate::pod_repository_composition::build_pod_repository_parts(
+        let (
+            pod_query,
+            pod_snapshot,
+            pod_update,
+            _pod_status_writer,
+            _pod_workqueue,
+            _pod_network_assignment,
+            _pod_host_ip,
+            _background,
+            _deletion_finalizer,
+            _dirty_counter,
+            mutation_reconcile,
+            gc_delete,
+            eviction_admission,
+            namespace_bootstrap,
+            namespace_termination_queue,
+            pod_api,
+            pod_subresource,
+            _pod_scheduling,
+            _watch_source,
+            bound_pod_finalization,
+            _deferred_runtime,
+            _test_api,
+            _test_subresource,
+        ) = crate::pod_repository_composition::build_pod_repository_parts(
             pod_repository_config,
             None,
         );
-        let pod_api = root_pod_parts.api;
-        let pod_subresource = root_pod_parts.subresource;
-        let pod_repository = Arc::new(root_pod_parts.repository_parts.repository);
+        let pod_api = pod_api.expect("native API root Pod API service");
+        let pod_subresource = pod_subresource.expect("native API root Pod subresource service");
+        let pod_query = pod_query;
         let api_pod_repository =
             crate::bootstrap::composition_adapters::api_state_adapter::RootApiPodRepository::new(
-                pod_repository.clone(),
+                pod_query.clone(),
+                pod_snapshot.clone(),
+                mutation_reconcile.clone(),
+                namespace_termination_queue.clone(),
+                eviction_admission.clone(),
+                namespace_bootstrap.clone(),
                 pod_api.clone(),
                 pod_subresource.clone(),
             );
         let controller_pod_port = Arc::new(
             crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerPodPort::new(
-                pod_repository.clone(),
-                pod_api,
-                pod_subresource,
+                pod_query.clone(),
+                pod_update.clone(),
+                pod_api.clone(),
+                pod_subresource.clone(),
             ),
         );
         let controller_pod_mutations =
@@ -1289,11 +1320,11 @@ impl NativeApiTestHarness {
                 controller_pod_port.clone(),
                 controller_pod_port.clone(),
             ));
-        side_effects.set_pod_ports(pod_repository.clone(), pod_repository.clone());
+        side_effects.set_pod_ports(pod_query.clone(), gc_delete.clone());
         let finalizer_lifecycle = crate::bootstrap::finalizer_lifecycle_adapter::
             DatastoreFinalizerLifecycleAdapter::new_with_coordination(
                 datastore.clone(),
-                pod_repository.clone(),
+                gc_delete.clone(),
                 side_effects.clone(),
                 metrics.clone(),
                 gc_coordination.clone(),
@@ -1348,7 +1379,7 @@ impl NativeApiTestHarness {
             daemonset_pod_mutation: controller_pod_mutations.clone(),
             job_pod_mutation: controller_pod_mutations.clone(),
             replicationcontroller_pod_mutation: controller_pod_mutations.clone(),
-            pod_delete_sink: pod_repository.clone(),
+            pod_delete_sink: gc_delete.clone(),
             reconcile: Arc::new(
                 crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerReconcilePort::new(
                     non_pod_finalization.clone(),
@@ -1379,7 +1410,8 @@ impl NativeApiTestHarness {
         let hpa_controller =
             crate::bootstrap::controller_adapters::hpa_controller_adapter::controller(
                 datastore.clone(),
-                pod_repository.clone(),
+                api_pod_repository.clone(),
+                gc_delete.clone(),
                 controller_pod_mutations,
                 non_pod_finalization,
                 gc_coordination.clone(),
@@ -1527,11 +1559,11 @@ impl NativeApiTestHarness {
             Arc::new(
                 crate::bootstrap::controller_adapters::gc_delete_adapter::GcOwnerLifecycleAdapter::new_with_coordination(
                     datastore.clone(),
-                    pod_repository.clone(),
+                    gc_delete.clone(),
                     gc_coordination,
                 ),
             ),
-            api_pod_repository,
+            api_pod_repository.clone(),
             crd_registry.clone(),
             crate::bootstrap::service_adapters::ApiServiceWriteAllocator::new(
                 datastore.clone(),
@@ -1586,7 +1618,8 @@ impl NativeApiTestHarness {
             datastore,
             sqlite: db,
             nodeport_alloc,
-            pod_repository,
+            pod_query: api_pod_repository,
+            pod_finalization: bound_pod_finalization,
             _node_local: node_local,
             outbox_dispatcher,
             controller_dispatcher,
@@ -1646,10 +1679,14 @@ impl NativeApiTestHarness {
         name: &str,
         uid: &str,
     ) -> anyhow::Result<bool> {
+        let request = klights_pod_api::BoundPodFinalizationRequest::try_new(
+            klights_types::PodIdentity::new(namespace, name, uid),
+        )?;
         let outcome = self
-            .pod_repository
-            .integration_finalize_bound_pod(namespace, name, uid)
-            .await?;
+            .pod_finalization
+            .finalize_bound_pod(request)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         Ok(matches!(
             outcome,
             klights_pod_api::BoundPodFinalizationOutcome::Removed
@@ -1730,7 +1767,7 @@ impl NativeApiTestHarness {
     ) -> anyhow::Result<()> {
         klights_controllers::endpoints::reconcile_endpointslice(
             self.datastore.as_ref(),
-            self.pod_repository.as_ref(),
+            self.pod_query.as_ref(),
             service_name,
             service_uid,
             namespace,
@@ -1904,7 +1941,7 @@ impl NativeApiTestHarness {
     ) -> anyhow::Result<()> {
         klights_controllers::endpoints::reconcile_endpoints(
             self.datastore.as_ref(),
-            self.pod_repository.as_ref(),
+            self.pod_query.as_ref(),
             service_name,
             namespace,
             selector,
@@ -1925,7 +1962,7 @@ impl NativeApiTestHarness {
     ) -> anyhow::Result<()> {
         klights_controllers::endpoints::reconcile_service_endpoints_batch(
             self.datastore.as_ref(),
-            self.pod_repository.as_ref(),
+            self.pod_query.as_ref(),
             klights_controllers::endpoints::ServiceEndpointBatchReconcileRequest {
                 service_name,
                 service_uid,

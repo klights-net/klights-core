@@ -21,7 +21,7 @@ pub mod reconcile_hint;
 pub mod recovery {
     pub use klights_kubelet::runtime::recovery::*;
 }
-pub mod repository;
+pub mod pod_identity;
 pub mod retry;
 pub mod service;
 pub mod service_dependencies;

@@ -403,7 +403,8 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         is_leader_rx: is_leader_rx.clone(),
     })
     .await?;
-    let pod_repository = bp.pod_repository;
+    let pod_query = bp.pod_query;
+    let pod_sandbox_gc_dirty_counter = bp.pod_sandbox_gc_dirty_counter;
     let _pod_api_service = bp.pod_api_service;
     let pod_scheduling = bp.pod_scheduling;
     let crd_registry_watch_handle = bp.crd_registry_watch_handle;
@@ -428,7 +429,8 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         task_supervisor: &task_supervisor,
         dispatcher_for_worker: &dispatcher_for_worker,
         dispatcher_for_cronjobs: &dispatcher_for_cronjobs,
-        pod_repository: &pod_repository,
+        pod_query: &pod_query,
+        pod_sandbox_gc_dirty_counter: &pod_sandbox_gc_dirty_counter,
         pod_scheduling: &pod_scheduling,
         cri_for_shutdown: &cri_for_shutdown,
         datapath: network.datapath(),

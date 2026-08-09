@@ -81,7 +81,7 @@ where
         tty,
     };
 
-    // Get pod from PodRepository to find container ID
+    // Query the Pod to find its container ID.
     let pod = get_pod(
         state.streaming_dependencies().pod_query.as_ref(),
         &namespace,

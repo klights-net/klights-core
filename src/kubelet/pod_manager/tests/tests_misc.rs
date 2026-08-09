@@ -151,10 +151,9 @@ async fn lifecycle_message_from_command_uses_command_uid_not_live_pod_uid() {
     )
     .await
     .expect("create replacement pod");
-    let pod_repo = super::fixture_pod_repository(&db);
+    let _pod_repo = super::fixture_pod_repository(&db);
 
     let message = lifecycle_message_from_command(
-        &pod_repo,
         klights_kubelet::lifecycle::LifecycleCommand::ReadinessChanged {
             pod_uid: "uid-old".to_string(),
             namespace: "default".to_string(),
@@ -598,7 +597,6 @@ fn test_watch_startup_reconciliation_skips_realized_pod_with_pod_ip() {
 
 #[tokio::test]
 async fn test_mark_pod_start_pending_for_retry_keeps_image_pull_non_terminal() {
-    use klights_kubelet::pod_repository::PodStatusWriter;
     let db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
@@ -626,6 +624,7 @@ async fn test_mark_pod_start_pending_for_retry_keeps_image_pull_non_terminal() {
 
     let error_msg = "Failed to pull image docker.io/coredns/coredns:1.11.1: CRI pull_image failed: 429 Too Many Requests";
     super::fixture_pod_repository(&db)
+        .pod_status_writer
         .mark_start_pending_for_retry_for_uid("kube-system", "coredns", "pod-uid-1", error_msg)
         .await
         .expect("retry-status write must succeed");
@@ -655,7 +654,6 @@ async fn test_mark_pod_start_pending_for_retry_keeps_image_pull_non_terminal() {
 
 #[tokio::test]
 async fn test_mark_pod_start_pending_for_retry_replaces_existing_pull_status_with_image_error() {
-    use klights_kubelet::pod_repository::PodStatusWriter;
     let db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
@@ -697,6 +695,7 @@ async fn test_mark_pod_start_pending_for_retry_replaces_existing_pull_status_wit
 
     let error_msg = "Failed to pull image registry.example.invalid/klights/test-image:1: CRI pull_image failed: pull access denied";
     super::fixture_pod_repository(&db)
+        .pod_status_writer
         .mark_start_pending_for_retry_for_uid(
             "default",
             "private-image",
@@ -732,7 +731,6 @@ async fn test_mark_pod_start_pending_for_retry_replaces_existing_pull_status_wit
 
 #[tokio::test]
 async fn test_mark_pod_start_pending_for_retry_rebuilds_status_for_retrying_init_failure() {
-    use klights_kubelet::pod_repository::PodStatusWriter;
     let db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
@@ -774,6 +772,7 @@ async fn test_mark_pod_start_pending_for_retry_rebuilds_status_for_retrying_init
 
     let error_msg = "Init container init1 failed with exit code 1";
     super::fixture_pod_repository(&db)
+        .pod_status_writer
         .mark_start_pending_for_retry_for_uid(
             "default",
             "init-retry",
@@ -1520,7 +1519,7 @@ async fn test_runtime_restart_status_increment_uses_live_pod_with_stale_snapshot
     let (_, mut exited) = make_container("app", 2, 1);
 
     persist_runtime_restart_status(
-        &pod_repo,
+        pod_repo.pod_status_writer.as_ref(),
         &stale_snapshot,
         "default",
         "runtime-restart-live-count",
@@ -1533,7 +1532,7 @@ async fn test_runtime_restart_status_increment_uses_live_pod_with_stale_snapshot
     exited.exit_code = 2;
     exited.finished_at += 1_000_000_000;
     persist_runtime_restart_status(
-        &pod_repo,
+        pod_repo.pod_status_writer.as_ref(),
         &stale_snapshot,
         "default",
         "runtime-restart-live-count",
@@ -1931,7 +1930,7 @@ async fn test_apply_pod_phase_update_reconciles_pdb_on_ready_transition() {
 
     klights_controllers::pdb::reconcile_pdb_at(
         &db,
-        crate::kubelet::pod_repository::pod_repository_for_test(&db).as_ref(),
+        super::pod_query_for_test(&db).as_ref(),
         &pdb,
         chrono::Utc::now(),
     )
@@ -2158,7 +2157,11 @@ async fn test_enqueue_job_reconcile_no_owner_is_noop() {
         "status": {"phase": "Succeeded"}
     });
     // No ownerReferences — must not panic and must not enqueue anything.
-    pod_repo.enqueue_job_reconcile_for_pod(&pod).await;
+    crate::pod_repository_composition::enqueue_job_reconcile_for_terminal_pod(
+        pod_repo.mutation_reconcile.as_ref(),
+        &pod,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -2177,7 +2180,11 @@ async fn test_enqueue_job_reconcile_non_job_owner_is_noop() {
         "status": {"phase": "Succeeded"}
     });
     // Non-Job owner — must be a no-op.
-    pod_repo.enqueue_job_reconcile_for_pod(&pod).await;
+    crate::pod_repository_composition::enqueue_job_reconcile_for_terminal_pod(
+        pod_repo.mutation_reconcile.as_ref(),
+        &pod,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -2239,7 +2246,11 @@ async fn test_enqueue_job_reconcile_enqueues_job_key_via_dispatcher() {
             "normal-backlog",
         ))
         .await;
-    pod_repo.enqueue_job_reconcile_for_pod(&pod).await;
+    crate::pod_repository_composition::enqueue_job_reconcile_for_terminal_pod(
+        pod_repo.mutation_reconcile.as_ref(),
+        &pod,
+    )
+    .await;
 
     let keys = dispatcher.pending_keys().await;
     assert!(
@@ -2317,7 +2328,7 @@ async fn test_terminal_watch_modified_pod_enqueues_job_reconcile() {
         ))
         .await;
     event_handlers::enqueue_job_reconcile_for_terminal_watch_pod(
-        pod_repo.mutation_reconcile_port().as_ref(),
+        pod_repo.mutation_reconcile.as_ref(),
         &terminal_watch_pod,
     )
     .await;
@@ -2367,7 +2378,11 @@ async fn test_enqueue_job_reconcile_skips_when_dispatcher_not_bound() {
         "status": {"phase": "Succeeded"}
     });
     // Dispatcher not bound — must not panic.
-    pod_repo.enqueue_job_reconcile_for_pod(&pod).await;
+    crate::pod_repository_composition::enqueue_job_reconcile_for_terminal_pod(
+        pod_repo.mutation_reconcile.as_ref(),
+        &pod,
+    )
+    .await;
 }
 
 #[test]
