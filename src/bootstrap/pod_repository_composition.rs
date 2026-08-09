@@ -57,13 +57,13 @@ use klights_types::{PodIdentity, ResourceKey};
 mod workqueue_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PodSchedulingMode {
+pub(crate) enum PodSchedulingMode {
     InlineSingleNode,
     DeferredMultiNodeLeader,
 }
 
 #[derive(Clone)]
-pub struct PodRepositoryBuildConfig {
+pub(crate) struct PodRepositoryBuildConfig {
     pub db: DatastoreHandle,
     pub pod_workqueue_store: Option<Arc<dyn klights_node_store::PodWorkqueueStore>>,
     pub supervisor: Arc<TaskSupervisor>,
@@ -87,7 +87,7 @@ pub struct PodRepositoryBuildConfig {
 }
 
 #[derive(Clone)]
-pub struct WorkerPodRepositoryBuildConfig {
+pub(crate) struct WorkerPodRepositoryBuildConfig {
     pub resource_query: Arc<dyn LeaderResourceQuery>,
     pub pod_workqueue_store: Arc<dyn klights_node_store::PodWorkqueueStore>,
     pub supervisor: Arc<TaskSupervisor>,
@@ -153,7 +153,7 @@ struct PodRepositoryApiServices {
 
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 #[allow(dead_code)]
-pub trait PodWatchSource: Send + Sync {
+pub(crate) trait PodWatchSource: Send + Sync {
     fn subscribe_pod_watch(&self) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent>;
 }
 
@@ -995,7 +995,7 @@ pub(crate) struct RootPodQueryWriter {
 }
 
 impl RootPodQueryWriter {
-    pub fn new(
+    pub(crate) fn new(
         store: Arc<PodStore>,
         cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
         outbox: Option<Arc<klights_kubelet::outbox::Outbox>>,

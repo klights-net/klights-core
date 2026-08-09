@@ -61,16 +61,16 @@ pub(super) fn fixture_pod_repository(
         _deferred_runtime,
         _test_api,
         _test_subresource,
-    ) = crate::pod_repository_composition::build_pod_repository_parts(
-        crate::pod_repository_composition::PodRepositoryBuildConfig {
+    ) = crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
+        crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
             db: std::sync::Arc::new(db.clone()),
             pod_workqueue_store: None,
             supervisor,
             side_effects: side_effects.clone(),
             metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
-            pod_network_cache: crate::pod_repository_composition::empty_test_pod_network_cache(),
-            assignment_waiter: crate::pod_repository_composition::test_assignment_bus(),
-            scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+            pod_network_cache: crate::bootstrap::pod_repository_composition::empty_test_pod_network_cache(),
+            assignment_waiter: crate::bootstrap::pod_repository_composition::test_assignment_bus(),
+            scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
             remote_delivery_required: false,
@@ -135,16 +135,16 @@ where
         _deferred_runtime,
         _test_api,
         _test_subresource,
-    ) = crate::pod_repository_composition::build_pod_repository_parts(
-        crate::pod_repository_composition::PodRepositoryBuildConfig {
+    ) = crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
+        crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
             db: db_handle,
             pod_workqueue_store: None,
             supervisor,
             side_effects,
             metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
-            pod_network_cache: crate::pod_repository_composition::empty_test_pod_network_cache(),
-            assignment_waiter: crate::pod_repository_composition::test_assignment_bus(),
-            scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+            pod_network_cache: crate::bootstrap::pod_repository_composition::empty_test_pod_network_cache(),
+            assignment_waiter: crate::bootstrap::pod_repository_composition::test_assignment_bus(),
+            scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
             remote_delivery_required: false,
@@ -165,5 +165,5 @@ where
 pub(super) fn pod_query_for_test(
     db: &crate::datastore::sqlite::Datastore,
 ) -> std::sync::Arc<dyn klights_pod_api::PodQuery> {
-    crate::pod_repository_composition::pod_query_for_test(db)
+    crate::bootstrap::pod_repository_composition::pod_query_for_test(db)
 }

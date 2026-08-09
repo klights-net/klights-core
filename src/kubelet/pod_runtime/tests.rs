@@ -151,18 +151,19 @@ fn build_test_pod_repository(
         _deferred_runtime,
         test_api,
         _test_subresource,
-    ) = crate::pod_repository_composition::build_pod_repository_parts(
-        crate::pod_repository_composition::PodRepositoryBuildConfig {
+    ) = crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
+        crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
             db,
             pod_workqueue_store: Some(node_local.clone()),
             supervisor,
             side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
             metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
-            pod_network_cache: crate::pod_repository_composition::test_pod_network_cache(
+            pod_network_cache: crate::bootstrap::pod_repository_composition::test_pod_network_cache(
                 node_local,
             ),
-            assignment_waiter: crate::pod_repository_composition::test_assignment_bus(),
-            scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+            assignment_waiter: crate::bootstrap::pod_repository_composition::test_assignment_bus(),
+            scheduling_mode:
+                crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
             remote_delivery_required: false,
@@ -650,7 +651,8 @@ async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_matc
         klights_supervisor::TaskCategoryConfig::default(),
     ));
     let node_local =
-        crate::pod_repository_composition::test_node_local_store(supervisor.clone()).await;
+        crate::bootstrap::pod_repository_composition::test_node_local_store(supervisor.clone())
+            .await;
     let repository = build_test_pod_repository(
         db.clone(),
         supervisor,
@@ -1244,7 +1246,8 @@ async fn fixture_pod_repository() -> PodRuntimeTestPorts {
         klights_supervisor::TaskCategoryConfig::default(),
     ));
     let node_local =
-        crate::pod_repository_composition::test_node_local_store(supervisor.clone()).await;
+        crate::bootstrap::pod_repository_composition::test_node_local_store(supervisor.clone())
+            .await;
     build_test_pod_repository(
         handle,
         supervisor,
@@ -4935,7 +4938,8 @@ async fn real_pod_slot_admission_admits_and_clears_slot() {
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let node_local = crate::pod_repository_composition::test_node_local_store(supervisor).await;
+    let node_local =
+        crate::bootstrap::pod_repository_composition::test_node_local_store(supervisor).await;
     let pod_slot_adapter = crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(
         node_local.pod_slots(),
         node_local.pod_slot_events(),
@@ -4970,7 +4974,8 @@ async fn real_pod_slot_admission_blocks_duplicate_re_admit() {
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let node_local = crate::pod_repository_composition::test_node_local_store(supervisor).await;
+    let node_local =
+        crate::bootstrap::pod_repository_composition::test_node_local_store(supervisor).await;
     let pod_slot_adapter = crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(
         node_local.pod_slots(),
         node_local.pod_slot_events(),
@@ -10656,7 +10661,8 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
         klights_supervisor::TaskCategoryConfig::default(),
     ));
     let node_local =
-        crate::pod_repository_composition::test_node_local_store(supervisor.clone()).await;
+        crate::bootstrap::pod_repository_composition::test_node_local_store(supervisor.clone())
+            .await;
     let repo = build_test_pod_repository(
         db.clone(),
         supervisor.clone(),
@@ -11495,7 +11501,8 @@ impl PodRuntimeHarness {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let node_local =
-            crate::pod_repository_composition::test_node_local_store(supervisor.clone()).await;
+            crate::bootstrap::pod_repository_composition::test_node_local_store(supervisor.clone())
+                .await;
         let repo = build_test_pod_repository(
             handle.clone(),
             supervisor.clone(),

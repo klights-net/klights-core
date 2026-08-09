@@ -1246,7 +1246,7 @@ impl NativeApiTestHarness {
             controller_identity.clone(),
         ));
         let gc_coordination = Arc::new(klights_controllers::ControllerCoordination::new());
-        let pod_repository_config = crate::pod_repository_composition::PodRepositoryBuildConfig {
+        let pod_repository_config = crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
             db: datastore.clone(),
             pod_workqueue_store: Some(node_local.pod_workqueue()),
             supervisor: supervisor.clone(),
@@ -1254,7 +1254,7 @@ impl NativeApiTestHarness {
             metrics: metrics.clone(),
             pod_network_cache: node_local.pod_network_cache(),
             assignment_waiter: Arc::new(klights_networking::PodNetworkAssignmentBus::new()),
-            scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+            scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: Some(outbox),
             cluster_api: Some(resource_query.clone()),
             remote_delivery_required: false,
@@ -1289,7 +1289,7 @@ impl NativeApiTestHarness {
             _deferred_runtime,
             _test_api,
             _test_subresource,
-        ) = crate::pod_repository_composition::build_pod_repository_parts(
+        ) = crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
             pod_repository_config,
             None,
         );

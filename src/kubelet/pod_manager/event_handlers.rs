@@ -734,7 +734,8 @@ mod tests {
         std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
     ) {
         let node_local =
-            crate::pod_repository_composition::test_node_local_store(supervisor.clone()).await;
+            crate::bootstrap::pod_repository_composition::test_node_local_store(supervisor.clone())
+                .await;
         let (
             pod_query,
             _pod_snapshot,
@@ -759,8 +760,8 @@ mod tests {
             _deferred_runtime,
             _test_api,
             _test_subresource,
-        ) = crate::pod_repository_composition::build_pod_repository_parts(
-            crate::pod_repository_composition::PodRepositoryBuildConfig {
+        ) = crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
+            crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
                 db: db_handle,
                 pod_workqueue_store: Some(node_local.clone()),
                 supervisor: supervisor.clone(),
@@ -769,10 +770,10 @@ mod tests {
                 ),
                 metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
                 pod_network_cache:
-                    crate::pod_repository_composition::test_pod_network_cache(node_local.clone()),
-                assignment_waiter: crate::pod_repository_composition::test_assignment_bus(),
+                    crate::bootstrap::pod_repository_composition::test_pod_network_cache(node_local.clone()),
+                assignment_waiter: crate::bootstrap::pod_repository_composition::test_assignment_bus(),
                 scheduling_mode:
-                    crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+                    crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
                 outbox: None,
                 cluster_api: None,
                 remote_delivery_required: false,

@@ -385,8 +385,8 @@ impl PodSubsystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bootstrap::pod_repository_composition::PodSchedulingMode;
     use crate::datastore::DatastoreHandle;
-    use crate::pod_repository_composition::PodSchedulingMode;
     use klights_controllers::side_effects::SideEffectMetrics;
     use klights_controllers::side_effects::SideEffectRegistry;
     use klights_kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
@@ -428,16 +428,16 @@ mod tests {
             pod_repository_background,
             pod_deletion_finalizer,
             ..
-        ) = crate::pod_repository_composition::build_pod_repository_parts(
-            crate::pod_repository_composition::PodRepositoryBuildConfig {
+        ) = crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
+            crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
                 db: db.clone(),
                 pod_workqueue_store: None,
                 supervisor: supervisor.clone(),
                 side_effects,
                 metrics,
                 pod_network_cache:
-                    crate::pod_repository_composition::empty_test_pod_network_cache(),
-                assignment_waiter: crate::pod_repository_composition::test_assignment_bus(),
+                    crate::bootstrap::pod_repository_composition::empty_test_pod_network_cache(),
+                assignment_waiter: crate::bootstrap::pod_repository_composition::test_assignment_bus(),
                 scheduling_mode,
                 outbox: None,
                 cluster_api: Some(cluster_api.clone()),

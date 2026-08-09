@@ -217,7 +217,7 @@ mod tests {
             .unwrap();
 
         // Call reconcile_endpoints_for_pod (simulating pod watcher event)
-        let pod_query = crate::pod_repository_composition::pod_query_for_test(&db);
+        let pod_query = crate::bootstrap::pod_repository_composition::pod_query_for_test(&db);
         reconcile_endpoints_for_pod(&db, pod_query.as_ref(), &pod, None)
             .await
             .unwrap();

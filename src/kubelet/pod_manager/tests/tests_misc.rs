@@ -2157,7 +2157,7 @@ async fn test_enqueue_job_reconcile_no_owner_is_noop() {
         "status": {"phase": "Succeeded"}
     });
     // No ownerReferences — must not panic and must not enqueue anything.
-    crate::pod_repository_composition::enqueue_job_reconcile_for_terminal_pod(
+    crate::bootstrap::pod_repository_composition::enqueue_job_reconcile_for_terminal_pod(
         pod_repo.mutation_reconcile.as_ref(),
         &pod,
     )
@@ -2180,7 +2180,7 @@ async fn test_enqueue_job_reconcile_non_job_owner_is_noop() {
         "status": {"phase": "Succeeded"}
     });
     // Non-Job owner — must be a no-op.
-    crate::pod_repository_composition::enqueue_job_reconcile_for_terminal_pod(
+    crate::bootstrap::pod_repository_composition::enqueue_job_reconcile_for_terminal_pod(
         pod_repo.mutation_reconcile.as_ref(),
         &pod,
     )
@@ -2246,7 +2246,7 @@ async fn test_enqueue_job_reconcile_enqueues_job_key_via_dispatcher() {
             "normal-backlog",
         ))
         .await;
-    crate::pod_repository_composition::enqueue_job_reconcile_for_terminal_pod(
+    crate::bootstrap::pod_repository_composition::enqueue_job_reconcile_for_terminal_pod(
         pod_repo.mutation_reconcile.as_ref(),
         &pod,
     )
@@ -2378,7 +2378,7 @@ async fn test_enqueue_job_reconcile_skips_when_dispatcher_not_bound() {
         "status": {"phase": "Succeeded"}
     });
     // Dispatcher not bound — must not panic.
-    crate::pod_repository_composition::enqueue_job_reconcile_for_terminal_pod(
+    crate::bootstrap::pod_repository_composition::enqueue_job_reconcile_for_terminal_pod(
         pod_repo.mutation_reconcile.as_ref(),
         &pod,
     )

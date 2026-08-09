@@ -527,9 +527,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     local_api_client.set_non_pod_finalization(non_pod_finalization.clone());
 
     let scheduling_mode = if has_leader_coordination {
-        crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader
+        crate::bootstrap::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader
     } else {
-        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode
+        crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode
     };
     let (pod_lifecycle_tx, pod_lifecycle_rx) =
         tokio::sync::mpsc::channel::<klights_kubelet::lifecycle::LifecycleCommand>(128);
@@ -565,8 +565,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         pod_scheduling,
         ..,
     ) = if kubelet_uses_worker_store_adapter {
-        crate::pod_repository_composition::build_worker_pod_repository_parts(
-            crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
+        crate::bootstrap::pod_repository_composition::build_worker_pod_repository_parts(
+            crate::bootstrap::pod_repository_composition::WorkerPodRepositoryBuildConfig {
                 resource_query: leader_ports.resource_query.clone(),
                 pod_workqueue_store: pod_workqueue_store.clone(),
                 supervisor: supervisor.clone(),
@@ -577,8 +577,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             },
         )
     } else {
-        crate::pod_repository_composition::build_pod_repository_parts(
-            crate::pod_repository_composition::PodRepositoryBuildConfig {
+        crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
+            crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
                 db: db_handle.clone(),
                 pod_workqueue_store: Some(pod_workqueue_store.clone()),
                 supervisor: supervisor.clone(),
@@ -746,8 +746,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             root_subresource,
             root_scheduling,
             ..,
-        ) = crate::pod_repository_composition::build_pod_repository_parts(
-            crate::pod_repository_composition::PodRepositoryBuildConfig {
+        ) = crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
+            crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
                 db: db_handle.clone(),
                 pod_workqueue_store: Some(pod_workqueue_store.clone()),
                 supervisor: supervisor.clone(),

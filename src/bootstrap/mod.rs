@@ -25,6 +25,7 @@ pub(crate) mod operational_adapters;
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 pub(crate) mod outbox_apply_adapter;
 pub mod phases;
+pub(crate) mod pod_repository_composition;
 pub mod runtime;
 pub(crate) mod runtime_inputs;
 pub(crate) mod scheduler_adapter;

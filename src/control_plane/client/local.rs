@@ -699,7 +699,9 @@ impl LocalApiClient {
             db,
             positioned_watch,
         } = persistence;
-        let pod_store = Arc::new(crate::pod_repository_composition::new_pod_store(db.clone()));
+        let pod_store = Arc::new(crate::bootstrap::pod_repository_composition::new_pod_store(
+            db.clone(),
+        ));
         let crypto = file_process.crypto_executor();
         let outbox_side_effects = Arc::new(RootOutboxSideEffectState::new(db.clone()));
         #[cfg(any(test, feature = "pod-repository-test-support"))]
@@ -1414,7 +1416,7 @@ mod inner_gate_tests {
                 .count(),
             1
         );
-        let pod_store = crate::pod_repository_composition::new_pod_store(db.clone());
+        let pod_store = crate::bootstrap::pod_repository_composition::new_pod_store(db.clone());
         klights_controllers::endpoints::reconcile_service_endpoints_batch(
             db.as_ref(),
             &pod_store,

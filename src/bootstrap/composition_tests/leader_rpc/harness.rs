@@ -420,7 +420,8 @@ impl IntegrationLeaderRpcComposition {
         &self,
         request: klights_controllers::endpoints::ServiceEndpointBatchReconcileRequest<'_>,
     ) -> anyhow::Result<()> {
-        let pod_store = crate::pod_repository_composition::new_pod_store(self.db.clone());
+        let pod_store =
+            crate::bootstrap::pod_repository_composition::new_pod_store(self.db.clone());
         klights_controllers::endpoints::reconcile_service_endpoints_batch(
             self.db.as_ref(),
             &pod_store,

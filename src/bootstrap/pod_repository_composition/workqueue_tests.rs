@@ -436,7 +436,7 @@ mod tests {
         let (coordination, _publisher) = test_coordination(true);
         let workqueue = PodWorkqueue::new_leader(
             store,
-            crate::pod_repository_composition::test_workqueue_persistence(
+            crate::bootstrap::pod_repository_composition::test_workqueue_persistence(
                 node_local.clone(),
                 clock.clone(),
             ),
@@ -456,7 +456,9 @@ mod tests {
         std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
     ) {
         let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-        let store = Arc::new(crate::pod_repository_composition::new_pod_store(db.clone()));
+        let store = Arc::new(crate::bootstrap::pod_repository_composition::new_pod_store(
+            db.clone(),
+        ));
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
@@ -464,7 +466,7 @@ mod tests {
         let metrics = SideEffectMetrics::new();
         let workqueue = PodWorkqueue::new(
             store,
-            crate::pod_repository_composition::test_workqueue_persistence(
+            crate::bootstrap::pod_repository_composition::test_workqueue_persistence(
                 node_local.clone(),
                 Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             ),
@@ -484,7 +486,9 @@ mod tests {
         persistence: impl PodWorkqueuePersistence + 'static,
     ) -> Arc<PodWorkqueue> {
         let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-        let store = Arc::new(crate::pod_repository_composition::new_pod_store(db));
+        let store = Arc::new(crate::bootstrap::pod_repository_composition::new_pod_store(
+            db,
+        ));
         PodWorkqueue::new(
             store,
             persistence,
@@ -571,7 +575,7 @@ mod tests {
         let workqueue = match coordination {
             Some(coordination) => PodWorkqueue::new_leader(
                 persistence.store,
-                crate::pod_repository_composition::test_workqueue_persistence(
+                crate::bootstrap::pod_repository_composition::test_workqueue_persistence(
                     node_local.clone(),
                     Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
                 ),
@@ -583,7 +587,7 @@ mod tests {
             ),
             None => PodWorkqueue::new(
                 persistence.store,
-                crate::pod_repository_composition::test_workqueue_persistence(
+                crate::bootstrap::pod_repository_composition::test_workqueue_persistence(
                     node_local.clone(),
                     Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
                 ),
@@ -840,7 +844,7 @@ mod tests {
         let (coordination, leader_tx) = test_coordination(false);
         let workqueue = PodWorkqueue::new_leader(
             store,
-            crate::pod_repository_composition::test_workqueue_persistence(
+            crate::bootstrap::pod_repository_composition::test_workqueue_persistence(
                 node_local.clone(),
                 Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             ),
@@ -2055,7 +2059,7 @@ mod tests {
                 klights_controllers::side_effects::ControllerDispatcherSlot::new(),
                 SideEffectMetrics::new(),
                 Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
-                Arc::new(crate::pod_repository_composition::new_pod_store(db.clone())),
+                Arc::new(crate::bootstrap::pod_repository_composition::new_pod_store(db.clone())),
                 crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
             ),
         ));
@@ -2231,7 +2235,9 @@ mod tests {
     #[tokio::test]
     async fn reconciler_exits_on_root_cancellation() {
         let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-        let store = Arc::new(crate::pod_repository_composition::new_pod_store(db.clone()));
+        let store = Arc::new(crate::bootstrap::pod_repository_composition::new_pod_store(
+            db.clone(),
+        ));
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
@@ -2243,7 +2249,7 @@ mod tests {
         let metrics = SideEffectMetrics::new();
         let workqueue = PodWorkqueue::new(
             store,
-            crate::pod_repository_composition::test_workqueue_persistence(
+            crate::bootstrap::pod_repository_composition::test_workqueue_persistence(
                 node_local.clone(),
                 Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             ),

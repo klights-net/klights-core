@@ -250,7 +250,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let pod_query = crate::pod_repository_composition::pod_query_for_test(&db);
+        let pod_query = crate::bootstrap::pod_repository_composition::pod_query_for_test(&db);
         let recreated = json!({
             "metadata": {"name": "ss-0", "namespace": "test-ns", "uid": "new-uid"},
             "spec": {
@@ -285,7 +285,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let pod_query = crate::pod_repository_composition::pod_query_for_test(&db);
+        let pod_query = crate::bootstrap::pod_repository_composition::pod_query_for_test(&db);
         let claimant = json!({
             "metadata": {"name": "claimant", "namespace": "test-ns", "uid": "claimant-uid"},
             "spec": {

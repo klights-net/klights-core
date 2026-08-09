@@ -115,17 +115,17 @@ mod tests {
             _deferred_runtime,
             test_api,
             _test_subresource,
-        ) = crate::pod_repository_composition::build_pod_repository_parts(
-            crate::pod_repository_composition::PodRepositoryBuildConfig {
+        ) = crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
+            crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
                 db: db_handle.clone(),
                 pod_workqueue_store: None,
                 supervisor: supervisor.clone(),
                 side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
                 metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
-                pod_network_cache: crate::pod_repository_composition::empty_test_pod_network_cache(),
-                assignment_waiter: crate::pod_repository_composition::test_assignment_bus(),
+                pod_network_cache: crate::bootstrap::pod_repository_composition::empty_test_pod_network_cache(),
+                assignment_waiter: crate::bootstrap::pod_repository_composition::test_assignment_bus(),
                 scheduling_mode:
-                    crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+                    crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
                 outbox: None,
                 cluster_api: None,
                 remote_delivery_required: false,

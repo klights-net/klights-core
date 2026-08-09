@@ -9,9 +9,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig;
 use crate::kubelet::pod_cluster_runtime::ClusterRuntimeView;
 use crate::kubelet::pod_runtime::service::PodRuntimeKey;
-use crate::pod_repository_composition::PodRepositoryBuildConfig;
 
 use super::events::PodEventSink;
 use super::filesystem::PodFilesystem;
@@ -270,7 +270,8 @@ impl ParityFixture {
         let metrics: Arc<klights_controllers::side_effects::SideEffectMetrics> =
             klights_controllers::side_effects::SideEffectMetrics::new();
         let node_local =
-            crate::pod_repository_composition::test_node_local_store(supervisor.clone()).await;
+            crate::bootstrap::pod_repository_composition::test_node_local_store(supervisor.clone())
+                .await;
         let (
             pod_query,
             _pod_snapshot,
@@ -295,19 +296,19 @@ impl ParityFixture {
             _deferred_runtime,
             test_api,
             _test_subresource,
-        ) = crate::pod_repository_composition::build_pod_repository_parts(
+        ) = crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
             PodRepositoryBuildConfig {
                 db: handle.clone(),
                 pod_workqueue_store: Some(node_local.clone()),
                 supervisor,
                 side_effects,
                 metrics,
-                pod_network_cache: crate::pod_repository_composition::test_pod_network_cache(
+                pod_network_cache: crate::bootstrap::pod_repository_composition::test_pod_network_cache(
                     node_local,
                 ),
-                assignment_waiter: crate::pod_repository_composition::test_assignment_bus(),
+                assignment_waiter: crate::bootstrap::pod_repository_composition::test_assignment_bus(),
                 scheduling_mode:
-                    crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+                    crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
                 outbox: None,
                 cluster_api: None,
                 remote_delivery_required: false,

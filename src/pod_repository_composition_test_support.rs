@@ -204,8 +204,8 @@ impl IntegrationPodWorkerFixture {
             _deferred_runtime,
             _test_api,
             _test_subresource,
-        ) = crate::pod_repository_composition::build_worker_pod_repository_parts(
-            crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
+        ) = crate::bootstrap::pod_repository_composition::build_worker_pod_repository_parts(
+            crate::bootstrap::pod_repository_composition::WorkerPodRepositoryBuildConfig {
                 resource_query,
                 pod_workqueue_store: node_local.pod_workqueue(),
                 supervisor,
@@ -1136,7 +1136,7 @@ struct PodRepositoryScenarioOwner {
     deferred_runtime: klights_kubelet::pod_repository::status::DeferredRuntimeReducerHandle,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
     background: klights_kubelet::pod_repository::background::PodRepositoryBackground,
-    watch_source: Arc<dyn crate::pod_repository_composition::PodWatchSource>,
+    watch_source: Arc<dyn crate::bootstrap::pod_repository_composition::PodWatchSource>,
     controller_dispatcher: Option<Arc<PodRepositoryRecordingReconcileSink>>,
     node_local: Option<Arc<crate::datastore::node_local::NodeLocalStores>>,
     outbox_delivery: Option<Arc<dyn klights_leader_api::LeaderOutboxDelivery>>,
@@ -1419,11 +1419,11 @@ pub async fn run_raft_delete_mark_status_race(
         _deferred_runtime,
         _test_api,
         _test_subresource,
-    ) = crate::pod_repository_composition::build_integration_pod_repository_parts(
-        crate::pod_repository_composition::PodRepositoryBuildConfig {
+    ) = crate::bootstrap::pod_repository_composition::build_integration_pod_repository_parts(
+        crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
             db: db.clone(), pod_workqueue_store: None, supervisor, side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
             metrics: klights_controllers::side_effects::SideEffectMetrics::new(), pod_network_cache: Arc::new(IntegrationEmptyPodNetworkCache), assignment_waiter: Arc::new(klights_networking::PodNetworkAssignmentBus::new()),
-            scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode, outbox: None, cluster_api: None,
+            scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode, outbox: None, cluster_api: None,
             remote_delivery_required: false,
             controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
             #[cfg(not(test))]
@@ -1783,10 +1783,11 @@ pub async fn run_deferred_runtime_cleanup_case(
     use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer as _;
     let deferred = klights_kubelet::pod_repository::status::DeferredRuntimeReducerHandle::default();
     deferred.insert_marker(uid);
-    let finalizer = crate::pod_repository_composition::DeferredRuntimeCleanupFinalizer::new(
-        Arc::new(IntegrationFixedDeletionFinalizer { outcome }),
-        deferred.clone(),
-    );
+    let finalizer =
+        crate::bootstrap::pod_repository_composition::DeferredRuntimeCleanupFinalizer::new(
+            Arc::new(IntegrationFixedDeletionFinalizer { outcome }),
+            deferred.clone(),
+        );
     let result = finalizer
         .finalize_after_actor_cleanup(&crate::kubelet::pod_runtime::service::PodRuntimeKey::new(
             "default",
@@ -2738,7 +2739,7 @@ impl PodRepositoryScenarioOwner {
     pub fn subscribe_pod_watch(
         &self,
     ) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
-        crate::pod_repository_composition::PodWatchSource::subscribe_pod_watch(
+        crate::bootstrap::pod_repository_composition::PodWatchSource::subscribe_pod_watch(
             self.watch_source.as_ref(),
         )
     }
@@ -2750,7 +2751,7 @@ impl PodRepositoryScenarioOwner {
             false,
             false,
             false,
-            crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+            crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             None,
             None,
         )
@@ -2764,7 +2765,7 @@ impl PodRepositoryScenarioOwner {
             false,
             false,
             false,
-            crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+            crate::bootstrap::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
             None,
             None,
         )
@@ -2778,7 +2779,7 @@ impl PodRepositoryScenarioOwner {
             false,
             true,
             false,
-            crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+            crate::bootstrap::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
             None,
             None,
         )
@@ -2795,7 +2796,7 @@ impl PodRepositoryScenarioOwner {
             false,
             false,
             false,
-            crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+            crate::bootstrap::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
             Some(gate.clone()),
             None,
         )
@@ -2812,7 +2813,7 @@ impl PodRepositoryScenarioOwner {
             false,
             false,
             false,
-            crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+            crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             None,
             None,
         )
@@ -2826,7 +2827,7 @@ impl PodRepositoryScenarioOwner {
             false,
             true,
             false,
-            crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+            crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             None,
             None,
         )
@@ -2843,7 +2844,7 @@ impl PodRepositoryScenarioOwner {
             false,
             true,
             false,
-            crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+            crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             None,
             None,
         )
@@ -2857,7 +2858,7 @@ impl PodRepositoryScenarioOwner {
             true,
             false,
             false,
-            crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+            crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             None,
             None,
         )
@@ -2871,7 +2872,7 @@ impl PodRepositoryScenarioOwner {
             false,
             false,
             true,
-            crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+            crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             None,
             None,
         )
@@ -2886,7 +2887,7 @@ impl PodRepositoryScenarioOwner {
             false,
             false,
             false,
-            crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+            crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             None,
             Some(observation),
         )
@@ -2899,7 +2900,7 @@ impl PodRepositoryScenarioOwner {
         with_dispatcher: bool,
         with_outbox: bool,
         with_workqueue: bool,
-        scheduling_mode: crate::pod_repository_composition::PodSchedulingMode,
+        scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode,
         scheduler_bind_gate: Option<Arc<crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest>>,
         delete_observation: Option<Arc<tokio::sync::Mutex<Option<(bool, bool)>>>>,
     ) -> Self {
@@ -2924,7 +2925,7 @@ impl PodRepositoryScenarioOwner {
         with_dispatcher: bool,
         with_outbox: bool,
         with_workqueue: bool,
-        scheduling_mode: crate::pod_repository_composition::PodSchedulingMode,
+        scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode,
         scheduler_bind_gate: Option<Arc<crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest>>,
         delete_observation: Option<Arc<tokio::sync::Mutex<Option<(bool, bool)>>>>,
     ) -> Self {
@@ -3036,8 +3037,8 @@ impl PodRepositoryScenarioOwner {
             deferred_runtime,
             _test_api,
             _test_subresource,
-        ) = crate::pod_repository_composition::build_integration_pod_repository_parts(
-            crate::pod_repository_composition::PodRepositoryBuildConfig {
+        ) = crate::bootstrap::pod_repository_composition::build_integration_pod_repository_parts(
+            crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
                 db: db.clone(),
                 pod_workqueue_store: with_workqueue.then(|| node_local.as_ref().expect("GC workqueue fixture").pod_workqueue()),
                 supervisor: supervisor.clone(),
@@ -4800,7 +4801,7 @@ pub async fn run_local_bound_finalization_with_incidental_delivery_handles() -> 
         true,
         true,
         false,
-        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+        crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         None,
         None,
     )
