@@ -10864,6 +10864,88 @@ async fn real_runtime_reconcile_uses_cri_event_container_id_when_list_is_empty()
 }
 
 #[tokio::test]
+async fn missing_hinted_workload_container_is_an_observation_miss() {
+    use crate::kubelet::pod_runtime::service::RuntimeReconcileHint;
+    use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+    use klights_kubelet::pod_repository::PodStatusUpdate;
+
+    let harness = PodRuntimeHarness::new().await;
+    let key = PodRuntimeKey::new("workloads", "observation-miss", "uid-observation-miss");
+    let pod = serde_json::json!({
+        "apiVersion":"v1","kind":"Pod",
+        "metadata":{"namespace":"workloads","name":"observation-miss","uid":"uid-observation-miss","resourceVersion":"1"},
+        "spec":{"nodeName":"test-node","restartPolicy":"Never","containers":[{"name":"app","image":"busybox:latest"}]},
+        "status":{"phase":"Running","containerStatuses":[{"name":"app","containerID":"containerd://ctr-live","image":"busybox:latest","imageID":"busybox:latest","ready":true,"started":true,"restartCount":0,"state":{"running":{"startedAt":"2026-01-01T00:00:00Z"}}}]}
+    });
+    harness.create_runtime_pod(pod.clone()).await;
+    harness
+        .repo
+        .pod_status_writer
+        .set_pod_status_for_uid(
+            "workloads",
+            "observation-miss",
+            "uid-observation-miss",
+            PodStatusUpdate {
+                phase: "Running".to_string(),
+                pod_ip: "10.50.2.45".to_string(),
+                host_ip: String::new(),
+                container_statuses: pod
+                    .pointer("/status/containerStatuses")
+                    .and_then(|value| value.as_array())
+                    .cloned()
+                    .unwrap(),
+                init_container_statuses: None,
+                qos_class: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    harness
+        .store
+        .record_sandbox(&key, "sandbox-observation-miss")
+        .await
+        .unwrap();
+    harness.container_control.set_container_states(Vec::new());
+    harness
+        .cri
+        .set_container_status_not_found_for_test("ctr-already-gone");
+
+    harness
+        .runtime
+        .reconcile_runtime(
+            key.clone(),
+            RuntimeReconcileHint::from_container_event(
+                "ctr-already-gone",
+                klights_kubelet::cri_events::KubeletEventKind::Stopped,
+            ),
+        )
+        .await
+        .expect("a missing hinted container is only an observation miss");
+
+    let updated = harness.stored_pod(&key).await;
+    assert_eq!(
+        updated
+            .pointer("/status/phase")
+            .and_then(|value| value.as_str()),
+        Some("Running"),
+        "an observation miss must not regress existing pod status"
+    );
+}
+
+#[tokio::test]
+async fn hinted_container_status_non_not_found_error_remains_fail_closed() {
+    let cri = klights_kubelet::runtime::test_support::MockCriRuntime::new();
+    cri.set_fail_operation("ContainerStatus");
+
+    let error =
+        super::status_projection::runtime_state_from_container_status(&cri, "ctr-runtime-down")
+            .await
+            .expect_err("non-NotFound CRI errors must propagate");
+    assert!(error.to_string().contains("injected failure"));
+}
+
+#[tokio::test]
 async fn started_cri_event_overrides_lagging_created_status_snapshot() {
     use crate::kubelet::pod_runtime::service::RuntimeReconcileHint;
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;

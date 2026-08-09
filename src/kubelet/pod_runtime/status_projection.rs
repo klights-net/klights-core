@@ -21,9 +21,18 @@ pub(crate) async fn runtime_state_from_container_status(
     cri: &dyn CriRuntime,
     container_id: &str,
 ) -> anyhow::Result<Option<ContainerRuntimeState>> {
-    let state = cri
-        .container_status(container_id)
-        .await?
+    let response = match cri.container_status(container_id).await {
+        Ok(response) => response,
+        Err(error)
+            if error
+                .downcast_ref::<tonic::Status>()
+                .is_some_and(|status| status.code() == tonic::Code::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let state = response
         .status
         .map(|status| ContainerRuntimeState::from_cri_state_i32(status.state));
     Ok(state)

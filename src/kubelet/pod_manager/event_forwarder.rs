@@ -93,6 +93,14 @@ pub(super) async fn spawn_cri_event_forwarder(
                             KubeletEventKind::Started | KubeletEventKind::Stopped => {}
                             KubeletEventKind::Created | KubeletEventKind::Deleted => continue,
                         }
+                        if raw_event.is_pod_sandbox_transition() {
+                            tracing::debug!(
+                                sandbox_id = %raw_event.container_id,
+                                event_kind = raw_event.kind.as_str(),
+                                "ignoring pod sandbox lifecycle transition"
+                            );
+                            continue;
+                        }
                         if (raw_event.pod_namespace.is_none()
                             || raw_event.pod_name.is_none()
                             || raw_event.pod_uid.is_none())
@@ -162,6 +170,15 @@ mod tests {
         }
     }
 
+    struct EventsStream(VecDeque<KubeletEvent>);
+
+    #[async_trait::async_trait]
+    impl CriRuntimeContainerEventStream for EventsStream {
+        async fn next_event(&mut self) -> Result<Option<KubeletEvent>> {
+            Ok(self.0.pop_front())
+        }
+    }
+
     struct PendingStream {
         cancel: CancellationToken,
     }
@@ -203,6 +220,7 @@ mod tests {
                 pod_namespace: Some("workloads".into()),
                 pod_name: Some("identity-pod".into()),
                 pod_uid: Some("identity-uid".into()),
+                pod_sandbox_id: Some("sandbox-identity".into()),
                 timestamp_ns: 1_777_000_123,
             })))],
             cancel.clone(),
@@ -226,6 +244,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filters_pod_sandbox_transition_but_forwards_workload_container_stopped() {
+        use klights_kubelet::cri_events::KubeletEventKind;
+
+        let cancel = CancellationToken::new();
+        let identity = || {
+            (
+                Some("workloads".into()),
+                Some("pod-a".into()),
+                Some("uid-a".into()),
+            )
+        };
+        let (namespace, name, uid) = identity();
+        let sandbox = KubeletEvent {
+            container_id: "sandbox-a".into(),
+            kind: KubeletEventKind::Started,
+            pod_namespace: namespace,
+            pod_name: name,
+            pod_uid: uid,
+            pod_sandbox_id: Some("sandbox-a".into()),
+            timestamp_ns: 10,
+        };
+        let (namespace, name, uid) = identity();
+        let app = KubeletEvent {
+            container_id: "container-app".into(),
+            kind: KubeletEventKind::Stopped,
+            pod_namespace: namespace,
+            pod_name: name,
+            pod_uid: uid,
+            pod_sandbox_id: Some("sandbox-a".into()),
+            timestamp_ns: 11,
+        };
+        let runtime = Arc::new(SequenceCriRuntime::new(
+            vec![Box::new(EventsStream(VecDeque::from([sandbox, app])))],
+            cancel.clone(),
+        ));
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let mut receiver = super::spawn_cri_event_forwarder(
+            runtime,
+            cancel.clone(),
+            supervisor,
+            None,
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        )
+        .await;
+
+        let forwarded = receiver.recv().await.expect("workload event forwarded");
+        cancel.cancel();
+        assert_eq!(forwarded.container_id, "container-app");
+        assert_eq!(forwarded.kind, KubeletEventKind::Stopped);
+    }
+
+    #[tokio::test]
     async fn unresolved_cri_event_requests_event_driven_inventory_resync() {
         use klights_kubelet::cri_events::KubeletEventKind;
 
@@ -237,6 +309,7 @@ mod tests {
                 pod_namespace: None,
                 pod_name: None,
                 pod_uid: None,
+                pod_sandbox_id: None,
                 timestamp_ns: 1_777_000_456,
             })))],
             cancel.clone(),

@@ -164,9 +164,9 @@ impl CriContainerEventResponse {
         Ok(event)
     }
 
-    fn pod_metadata(&self) -> Option<CompatPodSandboxMetadata> {
+    fn pod_identity(&self) -> (Option<CompatPodSandboxMetadata>, Option<String>) {
         if self.pod_sandbox.is_empty() {
-            return None;
+            return (None, None);
         }
 
         if let Some(status) = decode_pod_sandbox_status(&self.pod_sandbox)
@@ -175,10 +175,10 @@ impl CriContainerEventResponse {
                 || !metadata.namespace.is_empty()
                 || !metadata.uid.is_empty())
         {
-            return Some(metadata);
+            return (Some(metadata), non_empty(status.id));
         }
 
-        decode_metadata(&self.pod_sandbox)
+        (decode_metadata(&self.pod_sandbox), None)
     }
 }
 
@@ -352,18 +352,27 @@ pub struct KubeletEvent {
     /// Required to reject a delayed event for a deleted Pod when a same-name
     /// replacement is already live.
     pub pod_uid: Option<String>,
+    /// Current CRI wire identity of the owning pod sandbox. When equal to
+    /// `container_id`, this transition belongs to the sandbox rather than a
+    /// workload container and must not enter workload lifecycle routing.
+    pub pod_sandbox_id: Option<String>,
     /// Event creation timestamp from containerd (nanoseconds), retained in
     /// unresolved-identity diagnostics and inventory-reconcile signals.
     pub timestamp_ns: i64,
 }
 
 impl KubeletEvent {
+    pub fn is_pod_sandbox_transition(&self) -> bool {
+        self.pod_sandbox_id.as_deref() == Some(self.container_id.as_str())
+    }
+
     /// Decode a `ContainerEventResponse` into the typed shape.
     /// Returns `None` for event types we don't react to (so the
     /// caller can drop them silently without per-event branching).
     pub fn from_cri(raw: CriContainerEventResponse) -> Option<Self> {
         let kind = kubelet_event_kind_from_raw(raw.container_event_type)?;
-        let (pod_namespace, pod_name, pod_uid) = match raw.pod_metadata() {
+        let (metadata, pod_sandbox_id) = raw.pod_identity();
+        let (pod_namespace, pod_name, pod_uid) = match metadata {
             Some(meta) => (
                 non_empty(meta.namespace),
                 non_empty(meta.name),
@@ -377,6 +386,7 @@ impl KubeletEvent {
             pod_namespace,
             pod_name,
             pod_uid,
+            pod_sandbox_id,
             timestamp_ns: raw.created_at,
         })
     }
@@ -432,6 +442,7 @@ mod tests {
         assert_eq!(ev.pod_namespace.as_deref(), Some("default"));
         assert_eq!(ev.pod_name.as_deref(), Some("log-test"));
         assert_eq!(ev.pod_uid.as_deref(), Some("uid-1"));
+        assert_eq!(ev.pod_sandbox_id.as_deref(), Some("sandbox123"));
     }
 
     #[test]

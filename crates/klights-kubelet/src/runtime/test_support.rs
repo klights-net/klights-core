@@ -107,6 +107,8 @@ pub struct MockCriRuntime {
     /// populated `metadata.name`), so tests can drive fast-exit/CRI-event
     /// scenarios where the global scalar fields do not apply.
     container_status_overrides: Mutex<HashMap<String, MockContainerStatus>>,
+    /// Container IDs whose status lookup returns CRI NotFound.
+    missing_container_statuses: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Per-container mock status record used by `container_status` overrides.
@@ -145,6 +147,7 @@ impl MockCriRuntime {
             create_sandbox_configs: Mutex::new(Vec::new()),
             event_sender,
             container_status_overrides: Mutex::new(HashMap::new()),
+            missing_container_statuses: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -211,6 +214,13 @@ impl MockCriRuntime {
                 image: image.to_string(),
             },
         );
+    }
+
+    pub fn set_container_status_not_found_for_test(&self, container_id: &str) {
+        self.missing_container_statuses
+            .lock()
+            .unwrap()
+            .insert(container_id.to_string());
     }
 
     pub fn set_exec_exit_code(&self, exit_code: i32) {
@@ -294,6 +304,7 @@ impl MockCriRuntime {
             pod_namespace: None,
             pod_name: None,
             pod_uid: None,
+            pod_sandbox_id: None,
             timestamp_ns: 0,
         });
     }
@@ -441,6 +452,16 @@ impl crate::runtime::cri::CriRuntime for MockCriRuntime {
         container_id: &str,
     ) -> anyhow::Result<k8s_cri::v1::ContainerStatusResponse> {
         self.record(MockCriOperation::ContainerStatus(container_id.to_string()))?;
+        if self
+            .missing_container_statuses
+            .lock()
+            .unwrap()
+            .contains(container_id)
+        {
+            return Err(
+                tonic::Status::not_found(format!("container {container_id} not found")).into(),
+            );
+        }
         if let Some(override_status) = self
             .container_status_overrides
             .lock()

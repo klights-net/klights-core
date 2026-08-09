@@ -2285,6 +2285,78 @@ fn cri_event_during_startup_finalization_preserves_container_id_hint() {
 }
 
 #[test]
+fn sandbox_then_app_started_during_finalization_defers_only_workload_hint() {
+    use crate::cri_events::{KubeletEvent, KubeletEventKind};
+    use crate::pod_lifecycle_core::action::PodAction;
+
+    let mut actor = direct_test_actor();
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+    let mut actions = Vec::new();
+    actions.push(actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key: key.clone(),
+        resource_version: Some(1),
+        pod: test_pod("default", "pod-a", "uid-a"),
+    }));
+    actions.push(actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: key.clone(),
+        operation_id: 1,
+        kind: super::message::PodLifecycleWorkKind::StartPod,
+        sandbox_id: Some("sandbox-a".into()),
+    }));
+
+    let transition = |container_id: &str| KubeletEvent {
+        kind: KubeletEventKind::Started,
+        container_id: container_id.into(),
+        pod_namespace: Some("default".into()),
+        pod_name: Some("pod-a".into()),
+        pod_uid: Some("uid-a".into()),
+        pod_sandbox_id: Some("sandbox-a".into()),
+        timestamp_ns: 1,
+    };
+    for event in [transition("sandbox-a"), transition("container-app")] {
+        if event.is_pod_sandbox_transition() {
+            continue;
+        }
+        actions.push(actor.handle_for_test(LifecycleMessage::CriEvent {
+            key: key.clone(),
+            container_id: event.container_id,
+            kind: event.kind,
+        }));
+    }
+    actions.push(actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key,
+        operation_id: 2,
+        kind: super::message::PodLifecycleWorkKind::FinalizeStartup,
+        sandbox_id: Some("sandbox-a".into()),
+    }));
+
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|action| matches!(action, PodAction::StartPod { .. }))
+            .count(),
+        1
+    );
+    let hint = actions.iter().find_map(|action| match action {
+        PodAction::ReconcileRuntime { hint, .. } => Some(hint),
+        _ => None,
+    });
+    assert_eq!(
+        hint.expect("deferred workload reconcile")
+            .container_ids()
+            .collect::<Vec<_>>(),
+        vec!["container-app"]
+    );
+    assert!(!actions.iter().any(|action| matches!(
+        action,
+        PodAction::ScheduleRetry { .. }
+            | PodAction::ScheduleStartPodRetry { .. }
+            | PodAction::StopPod { .. }
+            | PodAction::FinalizePodDeletion { .. }
+    )));
+}
+
+#[test]
 fn runtime_reconcile_after_unconfirmed_startup_finalization_retries_finalization() {
     use crate::cri_events::KubeletEventKind;
     use crate::pod_lifecycle_core::action::PodAction;

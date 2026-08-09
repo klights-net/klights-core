@@ -2352,6 +2352,9 @@ impl PodRuntimeService for RealPodRuntimeService {
             // If the hinted ID has no runtime status, treat as observation miss
             // and skip without regressing the Pod's existing phase/container state.
         }
+        if containers.is_empty() && !hint.is_empty() {
+            return Ok(());
+        }
 
         // 3. Build phase and container statuses from CRI state plus the Pod spec.
         let (mut phase, mut container_statuses) =

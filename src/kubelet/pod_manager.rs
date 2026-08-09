@@ -940,6 +940,7 @@ mod cri_event_identity_tests {
             pod_namespace: Some("workloads".into()),
             pod_name: Some("same-name".into()),
             pod_uid: uid.map(str::to_string),
+            pod_sandbox_id: None,
             timestamp_ns: 1_777_000_123,
         }
     }
