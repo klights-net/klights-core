@@ -288,9 +288,9 @@ mod stale_route_tests {
         ));
         let plane = NetworkPlane {
             root,
-            pod_network_cache: node_network.clone(),
-            pod_ipam: node_network.clone(),
-            pod_runtime: node_network,
+            pod_network_cache: node_network.pod_network_cache(),
+            pod_ipam: node_network.pod_ipam(),
+            pod_runtime: node_network.pod_runtime(),
             assignment_publisher: assignment_bus,
             sandbox_operations: klights_networking::SandboxOperationLocks::default(),
             my_node: NodeName::parse("node-a").unwrap(),

@@ -3530,51 +3530,66 @@ mod tests {
         .await
         .expect("open node-local");
         let pod = klights_types::PodIdentity::new("default", "stuck", "uid-stuck");
-        node_local
-            .enqueue_workqueue(
-                crate::datastore::node_local::PodWorkqueueKind::Pod,
-                &pod,
-                serde_json::json!({"source": "test"}),
-                3,
-                0,
-                None,
+        let workqueue = node_local.pod_workqueue();
+        workqueue
+            .enqueue_work(
+                klights_node_store::PodWorkqueueEnqueue::try_new(
+                    klights_node_store::PodWorkIdentity::try_pod(pod.clone())
+                        .expect("valid Pod work identity"),
+                    serde_json::to_vec(&serde_json::json!({"source": "test"}))
+                        .expect("encode work payload"),
+                    3,
+                    0,
+                    None,
+                )
+                .expect("valid workqueue enqueue"),
             )
             .await
             .expect("enqueue workqueue row");
-        let claimed = node_local
-            .claim_workqueue_due(i64::MAX)
+        let claimed = workqueue
+            .claim_due_work_with_lease(
+                klights_node_store::PodWorkqueueClaimRequest::try_new(i64::MAX - 1, 1)
+                    .expect("valid workqueue claim"),
+            )
             .await
             .expect("claim workqueue row")
             .expect("workqueue row exists");
 
-        let claimed_pod =
-            klights_types::PodIdentity::new(&claimed.namespace, &claimed.name, &claimed.uid);
-        node_local
-            .enqueue_workqueue(
-                claimed.kind,
-                &claimed_pod,
-                claimed.payload,
-                claimed.attempt_count.saturating_add(1),
-                0,
-                Some("missed delete"),
+        let entry = claimed.entry();
+        workqueue
+            .enqueue_work(
+                klights_node_store::PodWorkqueueEnqueue::try_new(
+                    entry.identity().clone(),
+                    entry.payload().to_vec(),
+                    entry.attempt_count().saturating_add(1),
+                    0,
+                    Some("missed delete".to_string()),
+                )
+                .expect("valid retry enqueue"),
             )
             .await
             .expect("record worker-local failure");
 
-        let retried = node_local
-            .claim_workqueue_due(i64::MAX)
+        let retried = workqueue
+            .claim_due_work_with_lease(
+                klights_node_store::PodWorkqueueClaimRequest::try_new(i64::MAX - 1, 1)
+                    .expect("valid retry claim"),
+            )
             .await
             .expect("claim retried workqueue row")
             .expect("failure must requeue worker-local pod delete work");
+        let entry = retried.entry();
+        assert_eq!(entry.kind(), klights_node_store::PodWorkqueueKind::Pod);
+        let pod = entry.identity().as_pod().expect("retry remains Pod work");
+        assert_eq!(pod.namespace, "default");
+        assert_eq!(pod.name, "stuck");
+        assert_eq!(pod.uid, "uid-stuck");
+        assert_eq!(entry.attempt_count(), 4);
         assert_eq!(
-            retried.kind,
-            crate::datastore::node_local::PodWorkqueueKind::Pod
+            serde_json::from_slice::<serde_json::Value>(entry.payload())
+                .expect("decode retry payload"),
+            serde_json::json!({"source": "test"})
         );
-        assert_eq!(retried.namespace, "default");
-        assert_eq!(retried.name, "stuck");
-        assert_eq!(retried.uid, "uid-stuck");
-        assert_eq!(retried.attempt_count, 4);
-        assert_eq!(retried.payload, serde_json::json!({"source": "test"}));
     }
 
     #[tokio::test]

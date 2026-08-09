@@ -154,7 +154,7 @@ fn build_test_pod_repository(
     ) = crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
         crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
             db,
-            pod_workqueue_store: Some(node_local.clone()),
+            pod_workqueue_store: Some(node_local.pod_workqueue()),
             supervisor,
             side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
             metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
@@ -197,10 +197,7 @@ async fn node_local_runtime_store() -> Arc<crate::bootstrap::node_store::NodeLoc
     Arc::new(backend)
 }
 
-async fn admit_runtime_key(
-    store: &crate::bootstrap::node_store::NodeLocalStores,
-    key: &PodRuntimeKey,
-) {
+async fn admit_runtime_key(store: &dyn klights_node_store::PodRuntimeStore, key: &PodRuntimeKey) {
     klights_node_store::PodRuntimeStore::admit_pod_runtime(
         store,
         klights_node_store::PodRuntimeAdmission::try_new(
@@ -663,11 +660,12 @@ async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_matc
     let old_key = PodRuntimeKey::new("ns", "same-name", "old-uid");
     let new_key = PodRuntimeKey::new("ns", "same-name", "new-uid");
     let pod_runtime_store = node_local_runtime_store().await;
-    admit_runtime_key(&pod_runtime_store, &old_key).await;
-    admit_runtime_key(&pod_runtime_store, &new_key).await;
+    let persisted_runtime_store = pod_runtime_store.pod_runtime();
+    admit_runtime_key(persisted_runtime_store.as_ref(), &old_key).await;
+    admit_runtime_key(persisted_runtime_store.as_ref(), &new_key).await;
     let store = Arc::new(
         crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(
-            pod_runtime_store,
+            persisted_runtime_store,
             "node-1",
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         ),
@@ -4854,10 +4852,10 @@ impl klights_kubelet::runtime_clock::RuntimeClock for FixedRuntimeClock {
 #[tokio::test]
 async fn real_pod_runtime_store_records_and_retrieves_sandbox() {
     let pod_runtime_store = node_local_runtime_store().await;
-    let persisted_runtime_store = pod_runtime_store.clone();
+    let persisted_runtime_store = pod_runtime_store.pod_runtime();
     let key = PodRuntimeKey::new("ns", "test-pod", "uid-1");
     let store = crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(
-        pod_runtime_store,
+        persisted_runtime_store.clone(),
         "node-1",
         Arc::new(FixedRuntimeClock(1_234_567)),
     );

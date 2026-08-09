@@ -299,7 +299,7 @@ impl ParityFixture {
         ) = crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
             PodRepositoryBuildConfig {
                 db: handle.clone(),
-                pod_workqueue_store: Some(node_local.clone()),
+                pod_workqueue_store: Some(node_local.pod_workqueue()),
                 supervisor,
                 side_effects,
                 metrics,

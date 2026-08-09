@@ -266,9 +266,9 @@ mod tests {
             NetworkBootStores::new(
                 subnet_allocation,
                 topology,
-                node_network.clone(),
-                node_network.clone(),
-                node_network,
+                node_network.pod_network_cache(),
+                node_network.pod_ipam(),
+                node_network.pod_runtime(),
                 assignment_bus,
             ),
             cancel,

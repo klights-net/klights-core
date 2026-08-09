@@ -237,7 +237,7 @@ struct RootPodWorkqueuePersistence {
 
 #[cfg(test)]
 pub(crate) fn test_workqueue_persistence(
-    node_local: Arc<crate::bootstrap::node_store::NodeLocalStores>,
+    node_local: Arc<dyn klights_node_store::PodWorkqueueStore>,
     wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 ) -> impl PodWorkqueuePersistence + 'static {
     RootPodWorkqueuePersistence {

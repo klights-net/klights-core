@@ -44,24 +44,71 @@ mod tests {
         Value::Object(payload)
     }
 
-    fn focused_test_entry(
-        row: crate::datastore::node_local::PodWorkqueueEntry,
-    ) -> PodWorkqueueEntry {
+    fn focused_test_entry(lease: klights_node_store::PodWorkqueueLease) -> PodWorkqueueEntry {
+        let (row, lease_token) = lease.into_parts();
+        let (id, identity, payload, attempt_count, _next_due_ms) = row.into_parts();
+        let (kind, pod) = identity.into_persisted();
         PodWorkqueueEntry {
-            id: row.id,
-            kind: match row.kind {
-                crate::datastore::node_local::PodWorkqueueKind::Pod => PodWorkqueueKind::Pod,
-                crate::datastore::node_local::PodWorkqueueKind::Namespace => {
-                    PodWorkqueueKind::Namespace
-                }
+            id: id.get(),
+            kind: match kind {
+                klights_node_store::PodWorkqueueKind::Pod => PodWorkqueueKind::Pod,
+                klights_node_store::PodWorkqueueKind::Namespace => PodWorkqueueKind::Namespace,
             },
-            namespace: row.namespace,
-            name: row.name,
-            uid: row.uid,
-            payload: row.payload,
-            attempt_count: row.attempt_count,
-            lease_token: row.lease_token,
+            namespace: pod.namespace,
+            name: pod.name,
+            uid: pod.uid,
+            payload: serde_json::from_slice(&payload).expect("valid runtime work payload"),
+            attempt_count,
+            lease_token,
         }
+    }
+
+    async fn enqueue_runtime_work(
+        store: &dyn klights_node_store::PodWorkqueueStore,
+        kind: klights_node_store::PodWorkqueueKind,
+        pod: &PodIdentity,
+        payload: Value,
+        attempt_count: i64,
+        min_delay_ms: i64,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        let identity = match kind {
+            klights_node_store::PodWorkqueueKind::Pod => {
+                klights_node_store::PodWorkIdentity::try_pod(pod.clone())?
+            }
+            klights_node_store::PodWorkqueueKind::Namespace => {
+                klights_node_store::PodWorkIdentity::try_namespace(&pod.name, &pod.uid)?
+            }
+        };
+        store
+            .enqueue_work(klights_node_store::PodWorkqueueEnqueue::try_new(
+                identity,
+                serde_json::to_vec(&payload)?,
+                attempt_count,
+                min_delay_ms,
+                last_error.map(str::to_string),
+            )?)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn peek_runtime_work(
+        store: &dyn klights_node_store::PodWorkqueueStore,
+    ) -> Result<Option<i64>> {
+        store.peek_next_due_ms().await.map_err(Into::into)
+    }
+
+    async fn claim_runtime_work(
+        store: &dyn klights_node_store::PodWorkqueueStore,
+        now_ms: i64,
+    ) -> Result<Option<PodWorkqueueEntry>> {
+        let lease = store
+            .claim_due_work_with_lease(klights_node_store::PodWorkqueueClaimRequest::try_new(
+                now_ms.min(i64::MAX - 1),
+                1,
+            )?)
+            .await?;
+        Ok(lease.map(focused_test_entry))
     }
 
     struct FixedRuntimeClock(i64);
@@ -437,7 +484,7 @@ mod tests {
         let workqueue = PodWorkqueue::new_leader(
             store,
             crate::bootstrap::pod_repository_composition::test_workqueue_persistence(
-                node_local.clone(),
+                node_local.pod_workqueue(),
                 clock.clone(),
             ),
             supervisor,
@@ -467,7 +514,7 @@ mod tests {
         let workqueue = PodWorkqueue::new(
             store,
             crate::bootstrap::pod_repository_composition::test_workqueue_persistence(
-                node_local.clone(),
+                node_local.pod_workqueue(),
                 Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             ),
             supervisor,
@@ -506,7 +553,10 @@ mod tests {
     ) -> i64 {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            let due = node_local.peek_workqueue_next_due().await.unwrap().unwrap();
+            let due = peek_runtime_work(node_local.pod_workqueue().as_ref())
+                .await
+                .unwrap()
+                .unwrap();
             if due > initial_due + 1_000 {
                 return due;
             }
@@ -524,8 +574,7 @@ mod tests {
     ) {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            if node_local
-                .peek_workqueue_next_due()
+            if peek_runtime_work(node_local.pod_workqueue().as_ref())
                 .await
                 .unwrap()
                 .is_some_and(|due| due != leased_due)
@@ -576,7 +625,7 @@ mod tests {
             Some(coordination) => PodWorkqueue::new_leader(
                 persistence.store,
                 crate::bootstrap::pod_repository_composition::test_workqueue_persistence(
-                    node_local.clone(),
+                    node_local.pod_workqueue(),
                     Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
                 ),
                 supervisor.clone(),
@@ -588,7 +637,7 @@ mod tests {
             None => PodWorkqueue::new(
                 persistence.store,
                 crate::bootstrap::pod_repository_composition::test_workqueue_persistence(
-                    node_local.clone(),
+                    node_local.pod_workqueue(),
                     Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
                 ),
                 supervisor.clone(),
@@ -676,13 +725,15 @@ mod tests {
             )
             .await
             .unwrap();
-        let initial_due = node_local.peek_workqueue_next_due().await.unwrap().unwrap();
+        let initial_due = peek_runtime_work(node_local.pod_workqueue().as_ref())
+            .await
+            .unwrap()
+            .unwrap();
         let leased_due = wait_for_claimed_due(&node_local, initial_due).await;
         workqueue.notify_for_tests();
         wait_for_parked_due(&node_local, leased_due).await;
         assert!(
-            node_local
-                .claim_workqueue_due(i64::MAX)
+            claim_runtime_work(node_local.pod_workqueue().as_ref(), i64::MAX)
                 .await
                 .unwrap()
                 .is_some(),
@@ -707,7 +758,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let initial_due = node_local.peek_workqueue_next_due().await.unwrap().unwrap();
+        let initial_due = peek_runtime_work(node_local.pod_workqueue().as_ref())
+            .await
+            .unwrap()
+            .unwrap();
         let leased_due = wait_for_claimed_due(&node_local, initial_due).await;
         publisher.send_replace(TestCoordinationState {
             local: false,
@@ -715,8 +769,7 @@ mod tests {
         });
         wait_for_parked_due(&node_local, leased_due).await;
         assert!(
-            node_local
-                .claim_workqueue_due(i64::MAX)
+            claim_runtime_work(node_local.pod_workqueue().as_ref(), i64::MAX)
                 .await
                 .unwrap()
                 .is_some(),
@@ -760,29 +813,31 @@ mod tests {
     async fn namespace_attempt_ceiling_acks_but_pod_attempt_ceiling_requeues() {
         let (workqueue, db, node_local) = test_workqueue().await;
 
-        node_local
-            .enqueue_workqueue(
-                crate::datastore::node_local::PodWorkqueueKind::Namespace,
-                &PodIdentity::new("", "terminating", "uid-namespace"),
-                json!({}),
-                MAX_ATTEMPTS,
-                0,
-                None,
-            )
+        enqueue_runtime_work(
+            node_local.pod_workqueue().as_ref(),
+            klights_node_store::PodWorkqueueKind::Namespace,
+            &PodIdentity::new("", "terminating", "uid-namespace"),
+            json!({}),
+            MAX_ATTEMPTS,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        let due = peek_runtime_work(node_local.pod_workqueue().as_ref())
             .await
+            .unwrap()
             .unwrap();
-        let due = node_local.peek_workqueue_next_due().await.unwrap().unwrap();
-        let namespace = node_local.claim_workqueue_due(due).await.unwrap().unwrap();
+        let namespace = claim_runtime_work(node_local.pod_workqueue().as_ref(), due)
+            .await
+            .unwrap()
+            .unwrap();
         workqueue
             .clone()
-            .run_retry_for_tests(
-                focused_test_entry(namespace),
-                workqueue.current_test_leader_lease(),
-            )
+            .run_retry_for_tests(namespace, workqueue.current_test_leader_lease())
             .await;
         assert!(
-            node_local
-                .peek_workqueue_next_due()
+            peek_runtime_work(node_local.pod_workqueue().as_ref())
                 .await
                 .unwrap()
                 .is_none()
@@ -797,35 +852,34 @@ mod tests {
         )
         .await
         .unwrap();
-        node_local
-            .enqueue_workqueue(
-                crate::datastore::node_local::PodWorkqueueKind::Pod,
-                &PodIdentity::new("default", "never-dead-letter", "uid-pod"),
-                json!({}),
-                MAX_ATTEMPTS,
-                0,
-                None,
-            )
+        enqueue_runtime_work(
+            node_local.pod_workqueue().as_ref(),
+            klights_node_store::PodWorkqueueKind::Pod,
+            &PodIdentity::new("default", "never-dead-letter", "uid-pod"),
+            json!({}),
+            MAX_ATTEMPTS,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        let due = peek_runtime_work(node_local.pod_workqueue().as_ref())
             .await
+            .unwrap()
             .unwrap();
-        let due = node_local.peek_workqueue_next_due().await.unwrap().unwrap();
-        let pod = node_local.claim_workqueue_due(due).await.unwrap().unwrap();
+        let pod = claim_runtime_work(node_local.pod_workqueue().as_ref(), due)
+            .await
+            .unwrap()
+            .unwrap();
         workqueue
             .clone()
-            .run_retry_for_tests(
-                focused_test_entry(pod),
-                workqueue.current_test_leader_lease(),
-            )
+            .run_retry_for_tests(pod, workqueue.current_test_leader_lease())
             .await;
-        let retried = node_local
-            .claim_workqueue_due(i64::MAX)
+        let retried = claim_runtime_work(node_local.pod_workqueue().as_ref(), i64::MAX)
             .await
             .unwrap()
             .expect("Pod work must remain durable beyond the namespace attempt ceiling");
-        assert_eq!(
-            retried.kind,
-            crate::datastore::node_local::PodWorkqueueKind::Pod
-        );
+        assert_eq!(retried.kind, PodWorkqueueKind::Pod);
         assert_eq!(retried.attempt_count, MAX_ATTEMPTS + 1);
     }
 
@@ -845,7 +899,7 @@ mod tests {
         let workqueue = PodWorkqueue::new_leader(
             store,
             crate::bootstrap::pod_repository_composition::test_workqueue_persistence(
-                node_local.clone(),
+                node_local.pod_workqueue(),
                 Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             ),
             supervisor.clone(),
@@ -880,8 +934,7 @@ mod tests {
             "follower must not process or lose the terminating Pod"
         );
         assert!(
-            node_local
-                .peek_workqueue_next_due()
+            peek_runtime_work(node_local.pod_workqueue().as_ref())
                 .await
                 .unwrap()
                 .is_none()
@@ -1703,7 +1756,9 @@ mod tests {
 
         let mut claimed_rows = Vec::new();
         loop {
-            let row = _node_local.claim_workqueue_due(i64::MAX).await.unwrap();
+            let row = claim_runtime_work(_node_local.pod_workqueue().as_ref(), i64::MAX)
+                .await
+                .unwrap();
             if let Some(row) = row {
                 claimed_rows.push(row);
                 continue;
@@ -1746,8 +1801,7 @@ mod tests {
             .unwrap();
         let system_after_ms = now_ms();
 
-        let due_ms = node_local
-            .peek_workqueue_next_due()
+        let due_ms = peek_runtime_work(node_local.pod_workqueue().as_ref())
             .await
             .unwrap()
             .expect("namespace cleanup must enqueue a durable reminder");
@@ -1756,8 +1810,7 @@ mod tests {
             "namespace cleanup must retain the Pod's 17-second remaining deletion deadline"
         );
         assert!(
-            node_local
-                .claim_workqueue_due(due_ms - 1)
+            claim_runtime_work(node_local.pod_workqueue().as_ref(), due_ms - 1)
                 .await
                 .unwrap()
                 .is_none(),
@@ -1780,8 +1833,7 @@ mod tests {
             .await
             .unwrap();
 
-        let due = _node_local
-            .peek_workqueue_next_due()
+        let due = peek_runtime_work(_node_local.pod_workqueue().as_ref())
             .await
             .unwrap()
             .expect("deferred delete must be recorded in the durable workqueue");
@@ -1789,11 +1841,11 @@ mod tests {
             due >= before + 40,
             "deferred delete should not be due before the requested delay"
         );
-        let row = _node_local.claim_workqueue_due(due).await.unwrap().unwrap();
-        assert_eq!(
-            row.kind,
-            crate::datastore::node_local::PodWorkqueueKind::Pod
-        );
+        let row = claim_runtime_work(_node_local.pod_workqueue().as_ref(), due)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.kind, PodWorkqueueKind::Pod);
         assert_eq!(row.namespace, "default");
         assert_eq!(row.name, "same-name");
         assert_eq!(row.uid, "uid-old");
@@ -1825,8 +1877,7 @@ mod tests {
             .await
             .unwrap();
 
-        let due = _node_local
-            .peek_workqueue_next_due()
+        let due = peek_runtime_work(_node_local.pod_workqueue().as_ref())
             .await
             .unwrap()
             .expect("deferred delete must be recorded in the durable workqueue");
@@ -1834,11 +1885,11 @@ mod tests {
             due >= before + 40,
             "deferred delete should not be due before the requested delay"
         );
-        let row = _node_local.claim_workqueue_due(due).await.unwrap().unwrap();
-        assert_eq!(
-            row.kind,
-            crate::datastore::node_local::PodWorkqueueKind::Pod
-        );
+        let row = claim_runtime_work(_node_local.pod_workqueue().as_ref(), due)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.kind, PodWorkqueueKind::Pod);
         assert_eq!(row.namespace, "default");
         assert_eq!(row.name, "same-name");
         assert_eq!(row.uid, "uid-old");
@@ -1876,29 +1927,28 @@ mod tests {
         let router = test_router(&supervisor, executor.clone());
         workqueue.set_lifecycle_router_for_node(router, "node-a".to_string());
 
-        _node_local
-            .enqueue_workqueue(
-                crate::datastore::node_local::PodWorkqueueKind::Pod,
-                &klights_types::PodIdentity::new("default", "remote-pod", "uid-old"),
-                json!({"target_node": "node-b"}),
-                0,
-                0,
-                None,
-            )
-            .await
-            .unwrap();
+        enqueue_runtime_work(
+            _node_local.pod_workqueue().as_ref(),
+            klights_node_store::PodWorkqueueKind::Pod,
+            &klights_types::PodIdentity::new("default", "remote-pod", "uid-old"),
+            json!({"target_node": "node-b"}),
+            0,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
 
-        let due = _node_local
-            .peek_workqueue_next_due()
+        let due = peek_runtime_work(_node_local.pod_workqueue().as_ref())
             .await
             .unwrap()
             .unwrap();
-        let row = _node_local.claim_workqueue_due(due).await.unwrap().unwrap();
+        let row = claim_runtime_work(_node_local.pod_workqueue().as_ref(), due)
+            .await
+            .unwrap()
+            .unwrap();
         let lease = workqueue.current_test_leader_lease();
-        workqueue
-            .clone()
-            .run_retry_for_tests(focused_test_entry(row), lease)
-            .await;
+        workqueue.clone().run_retry_for_tests(row, lease).await;
 
         // The local actor must NOT be woken for a remote pod.
         assert!(
@@ -1915,8 +1965,7 @@ mod tests {
         // for retry rather than completed. The target worker's actor is the
         // only terminal delete owner for a picked-up Pod.
         assert!(
-            _node_local
-                .claim_workqueue_due(i64::MAX)
+            claim_runtime_work(_node_local.pod_workqueue().as_ref(), i64::MAX)
                 .await
                 .unwrap()
                 .is_some(),
@@ -1947,24 +1996,26 @@ mod tests {
         let router = test_router(&supervisor, executor.clone());
         workqueue.set_lifecycle_router_for_node(router, "node-b".to_string());
 
-        _node_local
-            .enqueue_workqueue(
-                crate::datastore::node_local::PodWorkqueueKind::Pod,
-                &klights_types::PodIdentity::new("default", "worker-pod", "uid-old"),
-                json!({"target_node": "node-b"}),
-                0,
-                0,
-                None,
-            )
-            .await
-            .unwrap();
+        enqueue_runtime_work(
+            _node_local.pod_workqueue().as_ref(),
+            klights_node_store::PodWorkqueueKind::Pod,
+            &klights_types::PodIdentity::new("default", "worker-pod", "uid-old"),
+            json!({"target_node": "node-b"}),
+            0,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
 
-        let due = _node_local
-            .peek_workqueue_next_due()
+        let due = peek_runtime_work(_node_local.pod_workqueue().as_ref())
             .await
             .unwrap()
             .unwrap();
-        let row = _node_local.claim_workqueue_due(due).await.unwrap().unwrap();
+        let row = claim_runtime_work(_node_local.pod_workqueue().as_ref(), due)
+            .await
+            .unwrap()
+            .unwrap();
         workqueue
             .run_pod_delete_full_with_target_node_for_tests(
                 row.namespace.clone(),
@@ -2029,13 +2080,14 @@ mod tests {
             .await
             .unwrap();
 
-        let due = _node_local.peek_workqueue_next_due().await.unwrap();
+        let due = peek_runtime_work(_node_local.pod_workqueue().as_ref())
+            .await
+            .unwrap();
         assert!(
             due.is_some(),
             "remote-targeted deferred delete must be enqueued in the workqueue"
         );
-        let row = _node_local
-            .claim_workqueue_due(i64::MAX)
+        let row = claim_runtime_work(_node_local.pod_workqueue().as_ref(), i64::MAX)
             .await
             .unwrap()
             .unwrap();
@@ -2117,15 +2169,11 @@ mod tests {
             "unexpected namespace retry error: {err:#}"
         );
 
-        let row = _node_local
-            .claim_workqueue_due(now_ms() + 1_000)
+        let row = claim_runtime_work(_node_local.pod_workqueue().as_ref(), now_ms() + 1_000)
             .await
             .unwrap()
             .expect("namespace termination must enqueue actor-owned Pod delete work");
-        assert_eq!(
-            row.kind,
-            crate::datastore::node_local::PodWorkqueueKind::Pod
-        );
+        assert_eq!(row.kind, PodWorkqueueKind::Pod);
         assert_eq!(row.namespace, "terminating-ns");
         assert_eq!(row.name, "unscheduled");
         assert_eq!(row.uid, "pod-uid");
@@ -2179,29 +2227,28 @@ mod tests {
         workqueue.set_lifecycle_router_for_node(router, "node-a".to_string());
 
         // Enqueue as if namespace termination did it.
-        _node_local
-            .enqueue_workqueue(
-                crate::datastore::node_local::PodWorkqueueKind::Pod,
-                &klights_types::PodIdentity::new("terminating-ns", "finalizer-pod", "uid-f"),
-                json!({"target_node": "node-b"}),
-                0,
-                0,
-                None,
-            )
-            .await
-            .unwrap();
+        enqueue_runtime_work(
+            _node_local.pod_workqueue().as_ref(),
+            klights_node_store::PodWorkqueueKind::Pod,
+            &klights_types::PodIdentity::new("terminating-ns", "finalizer-pod", "uid-f"),
+            json!({"target_node": "node-b"}),
+            0,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
 
-        let due = _node_local
-            .peek_workqueue_next_due()
+        let due = peek_runtime_work(_node_local.pod_workqueue().as_ref())
             .await
             .unwrap()
             .unwrap();
-        let row = _node_local.claim_workqueue_due(due).await.unwrap().unwrap();
+        let row = claim_runtime_work(_node_local.pod_workqueue().as_ref(), due)
+            .await
+            .unwrap()
+            .unwrap();
         let lease = workqueue.current_test_leader_lease();
-        workqueue
-            .clone()
-            .run_retry_for_tests(focused_test_entry(row), lease)
-            .await;
+        workqueue.clone().run_retry_for_tests(row, lease).await;
 
         // The pod must STILL exist in the datastore — remote leader workqueue
         // retries are actor wakeup/reminder state only.
@@ -2221,7 +2268,9 @@ mod tests {
 
         // The workqueue entry must be re-enqueued for retry (not completed),
         // because the pod still has finalizers.
-        let retry_row = _node_local.claim_workqueue_due(i64::MAX).await.unwrap();
+        let retry_row = claim_runtime_work(_node_local.pod_workqueue().as_ref(), i64::MAX)
+            .await
+            .unwrap();
         assert!(
             retry_row.is_some(),
             "remote pod with finalizers must be re-enqueued for retry"
@@ -2250,7 +2299,7 @@ mod tests {
         let workqueue = PodWorkqueue::new(
             store,
             crate::bootstrap::pod_repository_composition::test_workqueue_persistence(
-                node_local.clone(),
+                node_local.pod_workqueue(),
                 Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             ),
             supervisor.clone(),
@@ -2307,8 +2356,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(
-            node_local
-                .peek_workqueue_next_due()
+            peek_runtime_work(node_local.pod_workqueue().as_ref())
                 .await
                 .unwrap()
                 .is_some(),

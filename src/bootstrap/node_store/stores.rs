@@ -134,11 +134,6 @@ impl NodeLocalStores {
     }
 
     #[cfg(test)]
-    pub(crate) fn runtime_work_ref(&self) -> &SqliteRuntimeWorkStore {
-        &self.runtime_work
-    }
-
-    #[cfg(test)]
     pub(crate) fn executor_for_test(&self) -> DbExecutor {
         self.executor.clone()
     }

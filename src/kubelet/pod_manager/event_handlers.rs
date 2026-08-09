@@ -763,7 +763,7 @@ mod tests {
         ) = crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
             crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
                 db: db_handle,
-                pod_workqueue_store: Some(node_local.clone()),
+                pod_workqueue_store: Some(node_local.pod_workqueue()),
                 supervisor: supervisor.clone(),
                 side_effects: Arc::new(
                     klights_controllers::side_effects::SideEffectRegistry::new(),
@@ -911,18 +911,31 @@ mod tests {
         )
         .await;
 
-        let row = node_local
-            .claim_workqueue_due(i64::MAX)
+        let lease = node_local
+            .pod_workqueue()
+            .claim_due_work_with_lease(
+                klights_node_store::PodWorkqueueClaimRequest::try_new(i64::MAX - 1, 1)
+                    .expect("valid workqueue claim request"),
+            )
             .await
             .expect("claim pod workqueue row")
             .expect("namespace termination event must enqueue local actor delete work");
-        assert_eq!(
-            row.kind,
-            crate::datastore::node_local::PodWorkqueueKind::Pod
-        );
-        assert_eq!(row.namespace, "terminating-ns");
-        assert_eq!(row.name, "left-behind");
-        assert_eq!(row.uid, "uid-left-behind");
+        let row = lease.entry();
+        match row.identity() {
+            klights_node_store::PodWorkIdentity::Pod(pod) => {
+                assert_eq!(pod.namespace, "terminating-ns");
+                assert_eq!(pod.name, "left-behind");
+                assert_eq!(pod.uid, "uid-left-behind");
+            }
+            klights_node_store::PodWorkIdentity::Namespace { .. } => {
+                panic!("namespace termination must enqueue Pod actor work")
+            }
+        }
+        node_local
+            .pod_workqueue()
+            .acknowledge_work(lease.token().clone())
+            .await
+            .expect("acknowledge inspected actor work");
     }
 
     #[tokio::test]
