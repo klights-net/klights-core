@@ -21,6 +21,10 @@ pub enum CriStreamLifecycle {
         disconnected_at_ms: i64,
         reconnected_at_ms: i64,
     },
+    IdentityUnresolved {
+        container_id: String,
+        timestamp_ns: i64,
+    },
 }
 
 pub struct CriReconnectReconciler {
@@ -32,6 +36,7 @@ pub struct CriReconnectReconciler {
     cri: Arc<dyn CriRuntime>,
     container_control: Arc<dyn ContainerRuntimeControl>,
     router: Arc<PodLifecycleRouter>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 pub struct CriReconnectDependencies {
@@ -42,6 +47,7 @@ pub struct CriReconnectDependencies {
     pub cri: Arc<dyn CriRuntime>,
     pub container_control: Arc<dyn ContainerRuntimeControl>,
     pub router: Arc<PodLifecycleRouter>,
+    pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 async fn collect_container_inventory(
@@ -74,6 +80,7 @@ impl CriReconnectReconciler {
             cri,
             container_control,
             router,
+            task_supervisor,
         } = dependencies;
         Self {
             node_name,
@@ -84,6 +91,7 @@ impl CriReconnectReconciler {
             cri,
             container_control,
             router,
+            task_supervisor,
         }
     }
 
@@ -243,30 +251,73 @@ impl CriReconnectReconciler {
             tokio::select! {
                 _ = cancel_token.cancelled() => return,
                 event = rx.recv() => {
-                    let Some(CriStreamLifecycle::Reconnected { generation, .. }) = event else {
+                    let Some(mut event) = event else {
                         return;
                     };
-                    let mut generation = generation;
+                    let mut retry_attempt = 0u32;
                     loop {
-                        match self.run_once().await {
-                            Ok(actions) => tracing::warn!(
-                                generation,
-                                action_count = actions.len(),
-                                "CRI reconnect inventory diff completed"
-                            ),
-                            Err(err) => tracing::warn!(
-                                generation,
-                                "CRI reconnect inventory diff failed: {err:#}"
-                            ),
-                        }
-                        match rx.try_recv() {
-                            Ok(CriStreamLifecycle::Reconnected { generation: next_generation, .. }) => {
-                                generation = next_generation;
-                                continue;
+                        let (generation, reason, container_id) = match &event {
+                            CriStreamLifecycle::Reconnected { generation, .. } => {
+                                (Some(*generation), "stream-reconnected", None)
                             }
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
+                            CriStreamLifecycle::IdentityUnresolved { container_id, .. } => {
+                                (None, "event-identity-unresolved", Some(container_id.as_str()))
+                            }
+                        };
+                        let succeeded = match self.run_once().await {
+                            Ok(actions) => {
+                                tracing::warn!(
+                                    ?generation,
+                                    reason,
+                                    container_id,
+                                    action_count = actions.len(),
+                                    "CRI event-driven inventory diff completed"
+                                );
+                                true
+                            }
+                            Err(err) => {
+                                let delay = klights_supervisor::reconnect_backoff::delay(retry_attempt);
+                                retry_attempt = retry_attempt.saturating_add(1);
+                                tracing::warn!(
+                                    ?generation,
+                                    reason,
+                                    container_id,
+                                    ?delay,
+                                    "CRI event-driven inventory diff failed; retained signal will retry: {err:#}"
+                                );
+                                tokio::select! {
+                                    _ = cancel_token.cancelled() => return,
+                                    sleep_result = self.task_supervisor.sleep(
+                                        "cri_identity_reconcile_retry_backoff",
+                                        delay,
+                                    ) => {
+                                        if let Err(error) = sleep_result {
+                                            tracing::debug!(%error, "CRI inventory retry timer interrupted");
+                                            return;
+                                        }
+                                    }
+                                }
+                                false
+                            }
+                        };
+                        if !succeeded {
+                            continue;
                         }
+
+                        retry_attempt = 0;
+                        let mut coalesced = None;
+                        loop {
+                            match rx.try_recv() {
+                                Ok(next_event) => coalesced = Some(next_event),
+                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
+                            }
+                        }
+                        if let Some(next_event) = coalesced {
+                            event = next_event;
+                            continue;
+                        }
+                        break;
                     }
                 }
             }
@@ -276,7 +327,364 @@ impl CriReconnectReconciler {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+    use klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey;
+
+    static NEXT_DB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    struct FixedLeaderPod(klights_cluster_core::Resource);
+
+    impl LeaderResourceQuery for FixedLeaderPod {
+        fn get_resource(
+            &self,
+            _request: klights_leader_api::ResourceGetRequest,
+        ) -> klights_leader_api::ResourceQueryFuture<'_, Option<klights_cluster_core::Resource>>
+        {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn list_resources(
+            &self,
+            _request: klights_leader_api::ResourceListRequest,
+        ) -> klights_leader_api::ResourceQueryFuture<'_, klights_leader_api::ResourceListResult>
+        {
+            Box::pin(async move {
+                klights_leader_api::ResourceListResult::try_new(
+                    vec![self.0.clone()],
+                    7,
+                    None,
+                    None,
+                    None,
+                )
+            })
+        }
+    }
+
+    struct ReadyCache;
+
+    impl LeaderCacheReadiness for ReadyCache {
+        fn wait_cache_ready(
+            &self,
+            _request: CacheReadinessRequest,
+        ) -> klights_leader_api::CacheReadinessFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct SequencedContainerInventory {
+        calls: AtomicUsize,
+        fail_first: bool,
+        first_entered: Option<Arc<tokio::sync::Notify>>,
+        release_first: Option<Arc<tokio::sync::Notify>>,
+        second_entered: Option<Arc<tokio::sync::Notify>>,
+        release_second: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    impl SequencedContainerInventory {
+        fn immediate(fail_first: bool) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                fail_first,
+                first_entered: None,
+                release_first: None,
+                second_entered: None,
+                release_second: None,
+            })
+        }
+
+        fn blocked_first_two() -> (
+            Arc<Self>,
+            Arc<tokio::sync::Notify>,
+            Arc<tokio::sync::Notify>,
+            Arc<tokio::sync::Notify>,
+            Arc<tokio::sync::Notify>,
+        ) {
+            let first_entered = Arc::new(tokio::sync::Notify::new());
+            let release_first = Arc::new(tokio::sync::Notify::new());
+            let second_entered = Arc::new(tokio::sync::Notify::new());
+            let release_second = Arc::new(tokio::sync::Notify::new());
+            (
+                Arc::new(Self {
+                    calls: AtomicUsize::new(0),
+                    fail_first: false,
+                    first_entered: Some(first_entered.clone()),
+                    release_first: Some(release_first.clone()),
+                    second_entered: Some(second_entered.clone()),
+                    release_second: Some(release_second.clone()),
+                }),
+                first_entered,
+                release_first,
+                second_entered,
+                release_second,
+            )
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ContainerRuntimeControl for SequencedContainerInventory {
+        async fn list_containers(
+            &self,
+            _sandbox_id_filter: Option<&str>,
+        ) -> anyhow::Result<Vec<(String, klights_kubelet::runtime::cri::ContainerRuntimeState)>>
+        {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                if let Some(entered) = &self.first_entered {
+                    entered.notify_one();
+                }
+                if let Some(release) = &self.release_first {
+                    release.notified().await;
+                }
+                if self.fail_first {
+                    anyhow::bail!("injected first inventory failure");
+                }
+            } else if call == 1 {
+                if let Some(entered) = &self.second_entered {
+                    entered.notify_one();
+                }
+                if let Some(release) = &self.release_second {
+                    release.notified().await;
+                }
+            }
+            Ok(vec![(
+                "ctr-a".into(),
+                klights_kubelet::runtime::cri::ContainerRuntimeState::Exited,
+            )])
+        }
+
+        async fn pod_metadata_for_container(
+            &self,
+            _container_id: &str,
+        ) -> anyhow::Result<Option<klights_types::PodIdentity>> {
+            Ok(None)
+        }
+    }
+
+    async fn reconnect_harness(
+        container_control: Arc<SequencedContainerInventory>,
+    ) -> (
+        Arc<CriReconnectReconciler>,
+        Arc<klights_kubelet::pod_lifecycle_router::executor::RecordingExecutor>,
+        Arc<klights_supervisor::TaskSupervisor>,
+    ) {
+        use klights_kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
+        use klights_kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry;
+        use klights_kubelet::pod_lifecycle_router::executor::{PodWorkExecutor, RecordingExecutor};
+        use klights_node_store::{OwnedPodSandbox, PodRuntimeAdmission, PodRuntimeStore};
+
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let db_name: &'static str = Box::leak(
+            format!("cri-reconnect-{}", NEXT_DB.fetch_add(1, Ordering::Relaxed)).into_boxed_str(),
+        );
+        let executor = klights_node_datastore::open::open_with_opts(
+            klights_supervisor::sqlite_open::OpenOpts::shared_memory(db_name),
+            supervisor.clone(),
+            "sqlite:cri-reconnect-test",
+        )
+        .await
+        .unwrap();
+        let clock = Arc::new(klights_supervisor::SystemWallClock);
+        let runtime_store = Arc::new(klights_node_datastore::SqliteRuntimeWorkStore::new(
+            executor.clone(),
+            clock.clone(),
+        ));
+        let endpoint_store = Arc::new(klights_node_datastore::SqliteNodeNetworkStateStore::new(
+            executor, clock,
+        ));
+        let identity = klights_types::PodIdentity::new("default", "web", "uid-a");
+        runtime_store
+            .admit_pod_runtime(PodRuntimeAdmission::try_new(identity.clone(), "worker-a").unwrap())
+            .await
+            .unwrap();
+        runtime_store
+            .record_owned_sandbox(
+                OwnedPodSandbox::try_new(identity, "worker-a", "sb-a", 1).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let recorder = RecordingExecutor::new();
+        let executor_holder = Arc::new(std::sync::Mutex::new(
+            recorder.clone() as Arc<dyn PodWorkExecutor>
+        ));
+        let registry = Arc::new(PodLifecycleRegistry::new(
+            supervisor.clone(),
+            PodLifecycleConcurrencyConfig::production_default(),
+            executor_holder,
+        ));
+        let router = Arc::new(PodLifecycleRouter::new_actor_with_executor(
+            registry,
+            recorder.clone(),
+        ));
+        let pod = klights_cluster_core::Resource::try_from_data(Arc::new(
+            crate::kubelet::reconciler::cri_inventory::tests::pod("default", "web", "uid-a"),
+        ))
+        .unwrap();
+        let cri = Arc::new(klights_kubelet::runtime::test_support::MockCriRuntime::new());
+        cri.set_pod_sandboxes(vec![("sb-a", "default", "web", "uid-a", "Ready")]);
+        let reconciler = Arc::new(CriReconnectReconciler::new(
+            "worker-a".into(),
+            CriReconnectDependencies {
+                resource_query: Arc::new(FixedLeaderPod(pod)),
+                cache_readiness: Arc::new(ReadyCache),
+                pod_runtime_store: runtime_store,
+                pod_endpoint_store: endpoint_store,
+                cri,
+                container_control,
+                router,
+                task_supervisor: supervisor.clone(),
+            },
+        ));
+        (reconciler, recorder, supervisor)
+    }
+
+    async fn wait_for_runtime_reconcile(
+        recorder: &klights_kubelet::pod_lifecycle_router::executor::RecordingExecutor,
+    ) -> klights_kubelet::pod_lifecycle_core::action::PodAction {
+        for _ in 0..1000 {
+            if let Some(action) = recorder.take_actions().into_iter().find(|action| {
+                matches!(
+                    action,
+                    klights_kubelet::pod_lifecycle_core::action::PodAction::ReconcileRuntime { .. }
+                )
+            }) {
+                return action;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("runtime reconcile action was not dispatched")
+    }
+
+    fn unresolved_signal() -> CriStreamLifecycle {
+        CriStreamLifecycle::IdentityUnresolved {
+            container_id: "ctr-a".into(),
+            timestamp_ns: 1_777_000_456,
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_unresolved_routes_exited_container_to_uid_qualified_runtime_reconcile() {
+        let inventory = SequencedContainerInventory::immediate(false);
+        let (reconciler, recorder, _supervisor) = reconnect_harness(inventory).await;
+        let (tx, rx) = mpsc::channel(4);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(reconciler.run_lifecycle_loop(rx, cancel.clone()));
+        tx.send(unresolved_signal()).await.unwrap();
+
+        let action = wait_for_runtime_reconcile(&recorder).await;
+        cancel.cancel();
+        task.await.unwrap();
+        assert!(matches!(
+            action,
+            klights_kubelet::pod_lifecycle_core::action::PodAction::ReconcileRuntime { key, .. }
+                if key == PodLifecycleKey::new("default", "web", "uid-a")
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn identity_unresolved_inventory_failure_retries_after_supervised_backoff() {
+        let inventory = SequencedContainerInventory::immediate(true);
+        let (reconciler, recorder, _supervisor) = reconnect_harness(inventory.clone()).await;
+        let (tx, rx) = mpsc::channel(4);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(reconciler.run_lifecycle_loop(rx, cancel.clone()));
+        tx.send(unresolved_signal()).await.unwrap();
+
+        while inventory.calls() == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(inventory.calls(), 1);
+        assert_eq!(recorder.action_count(), 0);
+        tokio::time::advance(std::time::Duration::from_millis(499)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(inventory.calls(), 1, "retry must honor the 500ms backoff");
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        while inventory.calls() < 2 {
+            tokio::task::yield_now().await;
+        }
+        let action = loop {
+            if let Some(action) = recorder.take_actions().into_iter().find(|action| {
+                matches!(
+                    action,
+                    klights_kubelet::pod_lifecycle_core::action::PodAction::ReconcileRuntime { .. }
+                )
+            }) {
+                break action;
+            }
+            tokio::task::yield_now().await;
+        };
+        cancel.cancel();
+        task.await.unwrap();
+        assert_eq!(inventory.calls(), 2);
+        assert!(matches!(
+            action,
+            klights_kubelet::pod_lifecycle_core::action::PodAction::ReconcileRuntime { key, .. }
+                if key.uid == "uid-a"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn identity_unresolved_supervised_backoff_is_cancellation_aware() {
+        let inventory = SequencedContainerInventory::immediate(true);
+        let (reconciler, _recorder, _supervisor) = reconnect_harness(inventory.clone()).await;
+        let (tx, rx) = mpsc::channel(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(reconciler.run_lifecycle_loop(rx, cancel.clone()));
+        tx.send(unresolved_signal()).await.unwrap();
+        while inventory.calls() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        cancel.cancel();
+        task.await.unwrap();
+        tokio::time::advance(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            inventory.calls(),
+            1,
+            "cancellation must suppress retained retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_unresolved_burst_is_coalesced_while_inventory_is_in_flight() {
+        let (inventory, first_entered, release_first, second_entered, release_second) =
+            SequencedContainerInventory::blocked_first_two();
+        let (reconciler, recorder, _supervisor) = reconnect_harness(inventory.clone()).await;
+        let (tx, rx) = mpsc::channel(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(reconciler.run_lifecycle_loop(rx, cancel.clone()));
+        tx.send(unresolved_signal()).await.unwrap();
+        first_entered.notified().await;
+        for _ in 0..4 {
+            tx.send(unresolved_signal()).await.unwrap();
+        }
+        release_first.notify_one();
+        second_entered.notified().await;
+        assert_eq!(
+            inventory.calls(),
+            2,
+            "queued burst must cause one follow-up pass"
+        );
+        release_second.notify_one();
+        let _ = wait_for_runtime_reconcile(&recorder).await;
+        cancel.cancel();
+        task.await.unwrap();
+
+        assert_eq!(
+            inventory.calls(),
+            2,
+            "burst must coalesce to exactly one follow-up pass"
+        );
+    }
 
     struct FailingContainerInventory;
 
@@ -293,7 +701,7 @@ mod tests {
         async fn pod_metadata_for_container(
             &self,
             _container_id: &str,
-        ) -> anyhow::Result<Option<(String, String)>> {
+        ) -> anyhow::Result<Option<klights_types::PodIdentity>> {
             Ok(None)
         }
     }

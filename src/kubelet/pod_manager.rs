@@ -315,6 +315,7 @@ async fn run_pod_watcher_with_runtime(
                     cri: cri_runtime.clone(),
                     container_control: container_control.clone(),
                     router: pod_lifecycle_router.clone(),
+                    task_supervisor: local_execution.task_supervisor.clone(),
                 },
             ),
         );
@@ -659,24 +660,53 @@ async fn pod_lifecycle_key_for_cri_event(
     pod_repo: &dyn klights_pod_api::PodQuery,
     event: &klights_kubelet::cri_events::KubeletEvent,
 ) -> Option<PodLifecycleKey> {
-    let resolved = match (event.pod_namespace.as_deref(), event.pod_name.as_deref()) {
-        (Some(namespace), Some(name)) => Some((namespace.to_string(), name.to_string())),
+    let resolved = match (
+        event.pod_namespace.as_deref(),
+        event.pod_name.as_deref(),
+        event.pod_uid.as_deref(),
+    ) {
+        (Some(namespace), Some(name), Some(uid)) => {
+            Some(klights_types::PodIdentity::new(namespace, name, uid))
+        }
         _ => match container_control
             .pod_metadata_for_container(&event.container_id)
             .await
         {
             Ok(resolved) => resolved,
             Err(err) => {
-                tracing::debug!(
+                tracing::warn!(
                     container_id = %event.container_id,
                     "failed to resolve CRI event pod for lifecycle actor routing: {err:#}"
                 );
                 None
             }
         },
-    }?;
+    };
 
-    pod_lifecycle_key_for_pod_name(pod_repo, &resolved.0, &resolved.1).await
+    let Some(resolved) = resolved else {
+        tracing::warn!(
+            container_id = %event.container_id,
+            kind = event.kind.as_str(),
+            "CRI transition has no UID-qualified Pod identity; lifecycle reconciliation cannot be routed"
+        );
+        return None;
+    };
+
+    let live_key =
+        pod_lifecycle_key_for_pod_name(pod_repo, &resolved.namespace, &resolved.name).await?;
+    if live_key.uid != resolved.uid {
+        tracing::warn!(
+            namespace = %resolved.namespace,
+            pod = %resolved.name,
+            event_uid = %resolved.uid,
+            live_uid = %live_key.uid,
+            container_id = %event.container_id,
+            "rejecting stale CRI transition for same-name replacement Pod"
+        );
+        return None;
+    }
+
+    Some(live_key)
 }
 
 fn lifecycle_command_target(
@@ -830,6 +860,138 @@ fn container_restart_count(pod: &Value, container_name: &str) -> Option<i32> {
         .and_then(|status| status.get("restartCount"))
         .and_then(|count| count.as_i64())
         .and_then(|count| i32::try_from(count).ok())
+}
+
+#[cfg(test)]
+mod cri_event_identity_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use klights_kubelet::runtime::cri::{ContainerRuntimeControl, ContainerRuntimeState};
+    use klights_types::PodIdentity;
+
+    struct LivePodQuery(klights_cluster_core::Resource);
+
+    impl klights_pod_api::PodQuery for LivePodQuery {
+        fn get_pod(
+            &self,
+            request: klights_pod_api::PodGetRequest,
+        ) -> klights_pod_api::PodRepositoryFuture<'_, Option<klights_cluster_core::Resource>>
+        {
+            let matches = request.namespace() == self.0.namespace.as_deref().unwrap_or("default")
+                && request.name() == self.0.name;
+            Box::pin(async move { Ok(matches.then(|| self.0.clone())) })
+        }
+
+        fn list_pods(
+            &self,
+            _request: klights_pod_api::PodListRequest,
+        ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodListResult> {
+            Box::pin(async { klights_pod_api::PodListResult::try_new(Vec::new(), 0, None, None) })
+        }
+
+        fn list_pods_by_owner_uid(
+            &self,
+            _request: klights_pod_api::PodOwnerListRequest,
+        ) -> klights_pod_api::PodRepositoryFuture<'_, Vec<klights_cluster_core::Resource>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    struct ContainerIdentity(Option<PodIdentity>);
+
+    #[async_trait::async_trait]
+    impl ContainerRuntimeControl for ContainerIdentity {
+        async fn list_containers(
+            &self,
+            _sandbox_id_filter: Option<&str>,
+        ) -> anyhow::Result<Vec<(String, ContainerRuntimeState)>> {
+            Ok(Vec::new())
+        }
+
+        async fn pod_metadata_for_container(
+            &self,
+            _container_id: &str,
+        ) -> anyhow::Result<Option<PodIdentity>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn live_pod(uid: &str) -> LivePodQuery {
+        LivePodQuery(
+            klights_cluster_core::Resource::try_from_data(Arc::new(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "workloads",
+                    "name": "same-name",
+                    "uid": uid,
+                    "resourceVersion": "7"
+                }
+            })))
+            .expect("valid Pod resource"),
+        )
+    }
+
+    fn stopped_event(uid: Option<&str>) -> klights_kubelet::cri_events::KubeletEvent {
+        klights_kubelet::cri_events::KubeletEvent {
+            kind: klights_kubelet::cri_events::KubeletEventKind::Stopped,
+            container_id: "gone-container".into(),
+            pod_namespace: Some("workloads".into()),
+            pod_name: Some("same-name".into()),
+            pod_uid: uid.map(str::to_string),
+            timestamp_ns: 1_777_000_123,
+        }
+    }
+
+    #[tokio::test]
+    async fn carried_uid_routes_when_container_inventory_is_missing() {
+        let key = pod_lifecycle_key_for_cri_event(
+            &ContainerIdentity(None),
+            &live_pod("carried-uid"),
+            &stopped_event(Some("carried-uid")),
+        )
+        .await
+        .expect("carried identity routes without container inventory");
+
+        assert_eq!(
+            key,
+            PodLifecycleKey::new("workloads", "same-name", "carried-uid")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_carried_uid_cannot_route_to_same_name_replacement() {
+        let key = pod_lifecycle_key_for_cri_event(
+            &ContainerIdentity(None),
+            &live_pod("replacement-uid"),
+            &stopped_event(Some("deleted-uid")),
+        )
+        .await;
+
+        assert!(
+            key.is_none(),
+            "stale event must not reach replacement actor"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_inventory_uid_routes_only_matching_live_pod() {
+        let mut event = stopped_event(None);
+        event.pod_namespace = None;
+        event.pod_name = None;
+        let identity = PodIdentity::new("workloads", "same-name", "inventory-uid");
+
+        let key = pod_lifecycle_key_for_cri_event(
+            &ContainerIdentity(Some(identity)),
+            &live_pod("inventory-uid"),
+            &event,
+        )
+        .await
+        .expect("typed inventory identity routes matching live pod");
+
+        assert_eq!(key.uid, "inventory-uid");
+    }
 }
 
 #[cfg(test)]

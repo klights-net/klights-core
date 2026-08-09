@@ -77,8 +77,7 @@ use klights_kubelet::pod_status_builders::{
     build_initial_pending_status, build_pod_initializing_app_statuses,
 };
 use klights_kubelet::runtime::cri::{
-    ContainerRuntimeControl, CriRuntime, CriRuntimeContainerEventKind,
-    CriRuntimeContainerEventStream,
+    ContainerRuntimeControl, CriRuntime, CriRuntimeContainerEventStream,
 };
 use klights_supervisor::TaskSupervisor;
 
@@ -750,7 +749,7 @@ impl RealPodRuntimeService {
                 );
             };
             if event.container_id == container_id
-                && event.kind == CriRuntimeContainerEventKind::Stopped
+                && event.kind == klights_kubelet::cri_events::KubeletEventKind::Stopped
             {
                 let status = self.cri.container_status(container_id).await?;
                 if let Some(stopped) =

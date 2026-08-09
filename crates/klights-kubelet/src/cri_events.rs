@@ -340,21 +340,20 @@ fn kubelet_event_kind_from_raw(raw: i32) -> Option<KubeletEventKind> {
 /// where length-delimited is expected) which makes the metadata
 /// field absent at the kubelet — see the protobuf decode warning
 /// the pod_watcher logs and reconnects on. In that case the event
-/// still arrives with a usable `container_id`; the kubelet looks up
-/// the owning pod via CRI (`list_containers` filtered by id).
+/// still arrives with a usable `container_id`; the kubelet first looks up
+/// the UID-qualified owner through CRI and requests an event-driven inventory
+/// reconciliation if that short-lived container has already disappeared.
 #[derive(Debug, Clone)]
 pub struct KubeletEvent {
     pub kind: KubeletEventKind,
     pub container_id: String,
     pub pod_namespace: Option<String>,
     pub pod_name: Option<String>,
-    /// Carried for diagnostics/future stale-uid handling. Not consumed by
-    /// the current event handler — the (namespace, name) pair is enough to
-    /// reach the live Pod object in the datastore.
+    /// Required to reject a delayed event for a deleted Pod when a same-name
+    /// replacement is already live.
     pub pod_uid: Option<String>,
-    /// Event creation timestamp from containerd (nanoseconds). Carried for
-    /// future ordering / latency-tracing use; the handler doesn't need it
-    /// today since per-pod reconciliation always reads fresh CRI state.
+    /// Event creation timestamp from containerd (nanoseconds), retained in
+    /// unresolved-identity diagnostics and inventory-reconcile signals.
     pub timestamp_ns: i64,
 }
 

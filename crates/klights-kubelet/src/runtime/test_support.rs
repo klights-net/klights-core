@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use super::cri::{CriRuntimeContainerEvent, CriRuntimeContainerEventKind};
+use crate::cri_events::{KubeletEvent, KubeletEventKind};
 
 use crate::lifecycle::LifecycleCommand;
 use crate::runtime::{
@@ -101,7 +101,7 @@ pub struct MockCriRuntime {
     sandbox_configs: Mutex<Vec<PodSandboxConfig>>,
     /// Recorded PodSandboxConfig from create_container calls.
     create_sandbox_configs: Mutex<Vec<PodSandboxConfig>>,
-    event_sender: tokio::sync::broadcast::Sender<CriRuntimeContainerEvent>,
+    event_sender: tokio::sync::broadcast::Sender<KubeletEvent>,
     /// Per-container mock status keyed by container id. When an entry exists
     /// for the queried id, `container_status` returns its values (including a
     /// populated `metadata.name`), so tests can drive fast-exit/CRI-event
@@ -287,22 +287,26 @@ impl MockCriRuntime {
         format!("sandbox-{:04}", *counter)
     }
 
-    fn emit_container_event(&self, container_id: &str, kind: CriRuntimeContainerEventKind) {
-        let _ = self.event_sender.send(CriRuntimeContainerEvent {
+    fn emit_container_event(&self, container_id: &str, kind: KubeletEventKind) {
+        let _ = self.event_sender.send(KubeletEvent {
             container_id: container_id.to_string(),
             kind,
+            pod_namespace: None,
+            pod_name: None,
+            pod_uid: None,
+            timestamp_ns: 0,
         });
     }
 }
 
 pub struct MockCriEventStream {
-    receiver: tokio::sync::broadcast::Receiver<CriRuntimeContainerEvent>,
-    buffered: VecDeque<CriRuntimeContainerEvent>,
+    receiver: tokio::sync::broadcast::Receiver<KubeletEvent>,
+    buffered: VecDeque<KubeletEvent>,
 }
 
 #[async_trait::async_trait]
 impl crate::runtime::cri::CriRuntimeContainerEventStream for MockCriEventStream {
-    async fn next_event(&mut self) -> anyhow::Result<Option<CriRuntimeContainerEvent>> {
+    async fn next_event(&mut self) -> anyhow::Result<Option<KubeletEvent>> {
         if let Some(event) = self.buffered.pop_front() {
             return Ok(Some(event));
         }
@@ -415,7 +419,7 @@ impl crate::runtime::cri::CriRuntime for MockCriRuntime {
 
     async fn start_container(&self, container_id: &str) -> anyhow::Result<()> {
         self.record(MockCriOperation::StartContainer(container_id.to_string()))?;
-        self.emit_container_event(container_id, CriRuntimeContainerEventKind::Stopped);
+        self.emit_container_event(container_id, KubeletEventKind::Stopped);
         Ok(())
     }
 
@@ -580,7 +584,7 @@ impl crate::runtime::cri::ContainerRuntimeControl for MockContainerRuntimeContro
     async fn pod_metadata_for_container(
         &self,
         container_id: &str,
-    ) -> anyhow::Result<Option<(String, String)>> {
+    ) -> anyhow::Result<Option<klights_types::PodIdentity>> {
         self.calls
             .lock()
             .unwrap()

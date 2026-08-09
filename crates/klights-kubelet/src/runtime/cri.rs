@@ -59,26 +59,10 @@ impl From<String> for ContainerRuntimeState {
     }
 }
 
-/// Container lifecycle event kind exposed by the CRI runtime port.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CriRuntimeContainerEventKind {
-    Created,
-    Started,
-    Stopped,
-    Deleted,
-}
-
-/// Container lifecycle event exposed by the CRI runtime port.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CriRuntimeContainerEvent {
-    pub container_id: String,
-    pub kind: CriRuntimeContainerEventKind,
-}
-
 /// Event stream returned by `CriRuntime::subscribe_container_events`.
 #[async_trait::async_trait]
 pub trait CriRuntimeContainerEventStream: Send {
-    async fn next_event(&mut self) -> anyhow::Result<Option<CriRuntimeContainerEvent>>;
+    async fn next_event(&mut self) -> anyhow::Result<Option<KubeletEvent>>;
 }
 
 /// A CRI pod sandbox with the pod identity labels CRI stamped at creation.
@@ -186,17 +170,17 @@ pub trait ContainerRuntimeControl: Send + Sync {
         sandbox_id_filter: Option<&str>,
     ) -> anyhow::Result<Vec<(String, ContainerRuntimeState)>>;
 
-    /// Resolve a container id to owning Pod namespace/name through CRI metadata.
+    /// Resolve a container id to its UID-qualified owning Pod through CRI metadata.
     async fn pod_metadata_for_container(
         &self,
         container_id: &str,
-    ) -> anyhow::Result<Option<(String, String)>>;
+    ) -> anyhow::Result<Option<klights_types::PodIdentity>>;
 }
 
 // --- Production adapter: SharedCriRuntime ---
 
 use crate::cri::SharedCriClient;
-use crate::cri_events::{KubeletEvent, KubeletEventKind};
+use crate::cri_events::KubeletEvent;
 
 /// Production CRI adapter implementing `CriRuntime`.
 /// Each method clones `SharedCriClient::client()` and calls the
@@ -231,7 +215,7 @@ struct SharedCriRuntimeEventStream {
 
 #[async_trait::async_trait]
 impl CriRuntimeContainerEventStream for SharedCriRuntimeEventStream {
-    async fn next_event(&mut self) -> anyhow::Result<Option<CriRuntimeContainerEvent>> {
+    async fn next_event(&mut self) -> anyhow::Result<Option<KubeletEvent>> {
         loop {
             let Some(raw) = self.inner.message().await? else {
                 return Ok(None);
@@ -239,16 +223,7 @@ impl CriRuntimeContainerEventStream for SharedCriRuntimeEventStream {
             let Some(event) = KubeletEvent::from_cri(raw) else {
                 continue;
             };
-            let kind = match event.kind {
-                KubeletEventKind::Created => CriRuntimeContainerEventKind::Created,
-                KubeletEventKind::Started => CriRuntimeContainerEventKind::Started,
-                KubeletEventKind::Stopped => CriRuntimeContainerEventKind::Stopped,
-                KubeletEventKind::Deleted => CriRuntimeContainerEventKind::Deleted,
-            };
-            return Ok(Some(CriRuntimeContainerEvent {
-                container_id: event.container_id,
-                kind,
-            }));
+            return Ok(Some(event));
         }
     }
 }
@@ -399,7 +374,7 @@ impl ContainerRuntimeControl for SharedCriRuntime {
     async fn pod_metadata_for_container(
         &self,
         container_id: &str,
-    ) -> anyhow::Result<Option<(String, String)>> {
+    ) -> anyhow::Result<Option<klights_types::PodIdentity>> {
         let filter = k8s_cri::v1::ContainerFilter {
             id: container_id.to_string(),
             state: None,
@@ -427,10 +402,14 @@ impl ContainerRuntimeControl for SharedCriRuntime {
         let Some(meta) = sandbox.metadata else {
             return Ok(None);
         };
-        if meta.namespace.is_empty() || meta.name.is_empty() {
+        if meta.namespace.is_empty() || meta.name.is_empty() || meta.uid.is_empty() {
             return Ok(None);
         }
-        Ok(Some((meta.namespace, meta.name)))
+        Ok(Some(klights_types::PodIdentity::new(
+            &meta.namespace,
+            &meta.name,
+            &meta.uid,
+        )))
     }
 }
 

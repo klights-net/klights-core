@@ -9,8 +9,7 @@ pub(super) async fn spawn_cri_event_forwarder(
     >,
     wall_clock: std::sync::Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 ) -> CriEventReceiver {
-    use klights_kubelet::cri_events::{KubeletEvent, KubeletEventKind};
-    use klights_kubelet::runtime::cri::CriRuntimeContainerEventKind;
+    use klights_kubelet::cri_events::KubeletEventKind;
 
     let (tx, rx) = mpsc::channel(1024);
     let task_supervisor_for_worker = task_supervisor.clone();
@@ -90,21 +89,23 @@ pub(super) async fn spawn_cri_event_forwarder(
 
                 match message {
                     Ok(Some(raw_event)) => {
-                        let kind = match raw_event.kind {
-                            CriRuntimeContainerEventKind::Started => KubeletEventKind::Started,
-                            CriRuntimeContainerEventKind::Stopped => KubeletEventKind::Stopped,
-                            CriRuntimeContainerEventKind::Created
-                            | CriRuntimeContainerEventKind::Deleted => continue,
-                        };
-                        let ev = KubeletEvent {
-                            kind,
-                            container_id: raw_event.container_id,
-                            pod_namespace: None,
-                            pod_name: None,
-                            pod_uid: None,
-                            timestamp_ns: 0,
-                        };
-                        if tx.send(ev).await.is_err() {
+                        match raw_event.kind {
+                            KubeletEventKind::Started | KubeletEventKind::Stopped => {}
+                            KubeletEventKind::Created | KubeletEventKind::Deleted => continue,
+                        }
+                        if (raw_event.pod_namespace.is_none()
+                            || raw_event.pod_name.is_none()
+                            || raw_event.pod_uid.is_none())
+                            && let Some(lifecycle_tx) = lifecycle_tx.as_ref()
+                        {
+                            let _ = lifecycle_tx
+                                .send(crate::kubelet::reconciler::cri_reconnect::CriStreamLifecycle::IdentityUnresolved {
+                                    container_id: raw_event.container_id.clone(),
+                                    timestamp_ns: raw_event.timestamp_ns,
+                                })
+                                .await;
+                        }
+                        if tx.send(raw_event).await.is_err() {
                             tracing::debug!("CRI event receiver dropped; stopping forwarder");
                             return;
                         }
@@ -140,16 +141,24 @@ mod tests {
     use anyhow::Result;
     use tokio_util::sync::CancellationToken;
 
-    use klights_kubelet::runtime::cri::{
-        CriRuntime, CriRuntimeContainerEvent, CriRuntimeContainerEventStream,
-    };
+    use klights_kubelet::cri_events::KubeletEvent;
+    use klights_kubelet::runtime::cri::{CriRuntime, CriRuntimeContainerEventStream};
 
     struct EndingStream;
 
     #[async_trait::async_trait]
     impl CriRuntimeContainerEventStream for EndingStream {
-        async fn next_event(&mut self) -> Result<Option<CriRuntimeContainerEvent>> {
+        async fn next_event(&mut self) -> Result<Option<KubeletEvent>> {
             Ok(None)
+        }
+    }
+
+    struct OneEventStream(Option<KubeletEvent>);
+
+    #[async_trait::async_trait]
+    impl CriRuntimeContainerEventStream for OneEventStream {
+        async fn next_event(&mut self) -> Result<Option<KubeletEvent>> {
+            Ok(self.0.take())
         }
     }
 
@@ -159,7 +168,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CriRuntimeContainerEventStream for PendingStream {
-        async fn next_event(&mut self) -> Result<Option<CriRuntimeContainerEvent>> {
+        async fn next_event(&mut self) -> Result<Option<KubeletEvent>> {
             self.cancel.cancelled().await;
             Ok(None)
         }
@@ -180,6 +189,82 @@ mod tests {
                 cancel,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn forwards_cri_event_identity_and_timestamp_without_loss() {
+        use klights_kubelet::cri_events::KubeletEventKind;
+
+        let cancel = CancellationToken::new();
+        let runtime = Arc::new(SequenceCriRuntime::new(
+            vec![Box::new(OneEventStream(Some(KubeletEvent {
+                container_id: "container-identity".into(),
+                kind: KubeletEventKind::Stopped,
+                pod_namespace: Some("workloads".into()),
+                pod_name: Some("identity-pod".into()),
+                pod_uid: Some("identity-uid".into()),
+                timestamp_ns: 1_777_000_123,
+            })))],
+            cancel.clone(),
+        ));
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let wall_clock = Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock);
+
+        let mut receiver =
+            super::spawn_cri_event_forwarder(runtime, cancel.clone(), supervisor, None, wall_clock)
+                .await;
+        let event = receiver.recv().await.expect("forwarded CRI event");
+        cancel.cancel();
+
+        assert_eq!(event.container_id, "container-identity");
+        assert_eq!(event.pod_namespace.as_deref(), Some("workloads"));
+        assert_eq!(event.pod_name.as_deref(), Some("identity-pod"));
+        assert_eq!(event.pod_uid.as_deref(), Some("identity-uid"));
+        assert_eq!(event.timestamp_ns, 1_777_000_123);
+    }
+
+    #[tokio::test]
+    async fn unresolved_cri_event_requests_event_driven_inventory_resync() {
+        use klights_kubelet::cri_events::KubeletEventKind;
+
+        let cancel = CancellationToken::new();
+        let runtime = Arc::new(SequenceCriRuntime::new(
+            vec![Box::new(OneEventStream(Some(KubeletEvent {
+                container_id: "container-without-metadata".into(),
+                kind: KubeletEventKind::Stopped,
+                pod_namespace: None,
+                pod_name: None,
+                pod_uid: None,
+                timestamp_ns: 1_777_000_456,
+            })))],
+            cancel.clone(),
+        ));
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::channel(1);
+
+        let mut receiver = super::spawn_cri_event_forwarder(
+            runtime,
+            cancel.clone(),
+            supervisor,
+            Some(lifecycle_tx),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        )
+        .await;
+        receiver.recv().await.expect("forwarded unresolved event");
+        let lifecycle = lifecycle_rx.recv().await.expect("inventory resync request");
+        cancel.cancel();
+
+        assert!(matches!(
+            lifecycle,
+            crate::kubelet::reconciler::cri_reconnect::CriStreamLifecycle::IdentityUnresolved {
+                container_id,
+                timestamp_ns: 1_777_000_456,
+            } if container_id == "container-without-metadata"
+        ));
     }
 
     #[async_trait::async_trait]
