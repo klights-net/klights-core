@@ -56,7 +56,7 @@ async fn open_leader_node_local(
         kind == BackendKind::Sqlite,
         "the redb node-local backend does not implement Raft durability"
     );
-    let node = crate::datastore::node_local::selector::open_node_local(
+    let node = crate::bootstrap::node_store::open_node_local(
         kind,
         path,
         supervisor,
@@ -253,7 +253,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     let node_local = if let Some(stores) = leader_node_local.as_ref() {
         stores.node.clone()
     } else {
-        crate::datastore::node_local::selector::open_node_local(
+        crate::bootstrap::node_store::open_node_local(
             config.node_local_backend,
             node_local_db_path,
             supervisor.clone(),

@@ -199,7 +199,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     } else {
         Some(config.node_db_path.as_path())
     };
-    let node_local = crate::datastore::node_local::selector::open_node_local(
+    let node_local = crate::bootstrap::node_store::open_node_local(
         config.node_local_backend,
         nldb,
         task_supervisor.clone(),
@@ -853,7 +853,7 @@ mod tests {
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),

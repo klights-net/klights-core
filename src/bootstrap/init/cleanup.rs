@@ -316,7 +316,7 @@ async fn open_cleanup_node_local(
     } else {
         Some(config.node_db_path.as_path())
     };
-    crate::datastore::node_local::selector::open_node_local(
+    crate::bootstrap::node_store::open_node_local(
         config.node_local_backend,
         node_db_path,
         task_supervisor,

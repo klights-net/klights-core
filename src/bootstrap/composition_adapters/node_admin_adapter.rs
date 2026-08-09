@@ -151,9 +151,10 @@ mod tests {
     use super::*;
 
     use crate::bootstrap::node_store::NodeLocalStores;
+    use crate::bootstrap::node_store::{open_node_local, open_node_local_with_sqlite};
     use crate::datastore::backend_kind::BackendKind;
     use crate::datastore::node_local::DeadLetterTestInsert;
-    use crate::datastore::node_local::{LegacyDeliveryTestStore as _, OutboxInsert, selector};
+    use crate::datastore::node_local::{LegacyDeliveryTestStore as _, OutboxInsert};
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     fn supervisor() -> Arc<TaskSupervisor> {
@@ -188,7 +189,7 @@ mod tests {
     }
 
     async fn node_db(connection_key: &'static str) -> NodeLocalStores {
-        selector::open_node_local(
+        open_node_local(
             BackendKind::Sqlite,
             None,
             supervisor(),
@@ -232,7 +233,7 @@ mod tests {
     }
 
     async fn node_db_with_unassigned_dead_letter() -> (NodeLocalStores, i64) {
-        let (ndb, sqlite) = selector::open_node_local_with_sqlite(
+        let (ndb, sqlite) = open_node_local_with_sqlite(
             BackendKind::Sqlite,
             None,
             supervisor(),

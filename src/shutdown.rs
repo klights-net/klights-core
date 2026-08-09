@@ -1052,7 +1052,7 @@ tmpfs on /data/klights/pods/pod-a/volumes/empty-dir/cache type tmpfs (rw,relatim
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,

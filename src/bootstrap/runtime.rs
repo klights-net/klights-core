@@ -786,7 +786,7 @@ mod tests {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let node_db = crate::datastore::node_local::selector::open_node_local(
+        let node_db = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,

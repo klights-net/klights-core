@@ -209,7 +209,7 @@ mod tests {
     async fn node_local_for_test(
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> crate::bootstrap::node_store::NodeLocalStores {
-        crate::datastore::node_local::selector::open_node_local(
+        crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,

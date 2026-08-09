@@ -157,7 +157,7 @@ impl IntegrationPodWorkerFixture {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let node_local = Arc::new(
-            crate::datastore::node_local::selector::open_node_local(
+            crate::bootstrap::node_store::open_node_local(
                 crate::datastore::backend_kind::BackendKind::Sqlite,
                 None,
                 supervisor.clone(),
@@ -2156,7 +2156,7 @@ impl IntegrationPodNetworkFixture {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let stores = Arc::new(
-            crate::datastore::node_local::selector::open_node_local(
+            crate::bootstrap::node_store::open_node_local(
                 crate::datastore::backend_kind::BackendKind::Sqlite,
                 None,
                 supervisor.clone(),
@@ -2984,7 +2984,7 @@ impl PodRepositoryScenarioOwner {
         }
         let node_local = if with_outbox || with_workqueue {
             Some(Arc::new(
-                crate::datastore::node_local::selector::open_node_local(
+                crate::bootstrap::node_store::open_node_local(
                     crate::datastore::backend_kind::BackendKind::Sqlite,
                     None,
                     supervisor.clone(),

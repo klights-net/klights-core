@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use crate::bootstrap::node_store::NodeLocalStores;
 use crate::datastore::backend_kind::BackendKind;
-use crate::datastore::node_local::selector;
 use klights_node_store::NodeIdentity;
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
@@ -50,7 +49,7 @@ async fn selector_creates_sqlite_node_db_and_node_local_schema() {
     )
     .expect("secure node-local fixture directory");
     let path = directory.path().join("node.db");
-    let handle = selector::open_node_local(
+    let handle = crate::bootstrap::node_store::open_node_local(
         BackendKind::Sqlite,
         Some(&path),
         supervisor(),
@@ -79,7 +78,7 @@ async fn selector_creates_sqlite_node_db_and_node_local_schema() {
 
 #[tokio::test]
 async fn redb_node_local_selector_fails_fast_until_backend_lands() {
-    let result = selector::open_node_local(
+    let result = crate::bootstrap::node_store::open_node_local(
         BackendKind::Redb,
         None,
         supervisor(),

@@ -3,7 +3,6 @@ mod delivery_composition;
 pub mod redb;
 #[cfg(test)]
 mod runtime_work_composition;
-pub mod selector;
 #[cfg(test)]
 mod sqlite;
 #[cfg(test)]

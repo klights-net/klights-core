@@ -1721,7 +1721,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -1870,7 +1870,7 @@ mod tests {
     #[tokio::test]
     async fn failed_local_pod_route_is_not_published_by_worker_mirror() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -1949,7 +1949,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -2329,7 +2329,7 @@ mod tests {
     #[tokio::test]
     async fn failed_pod_route_reconnects_and_replays_from_prior_exact_position() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
@@ -2549,7 +2549,7 @@ mod tests {
     #[tokio::test]
     async fn worker_pod_get_uses_worker_cache_not_fresh_leader_state() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -2575,7 +2575,7 @@ mod tests {
     #[tokio::test]
     async fn worker_store_pod_events_use_fresh_namespace_state_before_outbox_enqueue() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -2634,7 +2634,7 @@ mod tests {
     #[tokio::test]
     async fn worker_pod_lists_are_constrained_to_local_node() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -2693,7 +2693,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -2783,7 +2783,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -2869,7 +2869,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -2909,7 +2909,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -3001,7 +3001,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -3121,7 +3121,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -3197,7 +3197,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
@@ -3270,7 +3270,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
@@ -3327,7 +3327,7 @@ mod tests {
     async fn watch_mirror_relists_after_open_time_replay_window_expiration() {
         let cluster_api = Arc::new(OpenExpiredThenRelistLeaderApi::typed_expiry());
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
@@ -3397,7 +3397,7 @@ mod tests {
     async fn watch_mirror_unmarked_out_of_range_reconnects_without_relist() {
         let cluster_api = Arc::new(OpenExpiredThenRelistLeaderApi::unmarked_out_of_range());
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
@@ -3452,7 +3452,7 @@ mod tests {
     async fn watch_mirror_repeated_expiry_backs_off_before_next_relist() {
         let cluster_api = Arc::new(OpenExpiredThenRelistLeaderApi::repeated_typed_expiry());
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
@@ -3513,7 +3513,7 @@ mod tests {
     #[tokio::test]
     async fn worker_store_requeues_node_local_pod_workqueue_failures() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -3722,7 +3722,7 @@ mod tests {
         crate::control_plane::client::impl_unavailable_leader_pod_effects!(LocalPodLeaderApi);
 
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
@@ -3832,7 +3832,7 @@ mod tests {
     async fn watch_mirror_replays_pods_bound_between_initial_list_and_watch() {
         let cluster_api = Arc::new(HandoffLeaderApi);
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let _node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::bootstrap::node_store::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
