@@ -40,7 +40,7 @@ fn validate_raft_backend_capability(
 }
 
 struct LeaderNodeLocalStores {
-    node: crate::datastore::node_local::NodeLocalStores,
+    node: crate::bootstrap::node_store::NodeLocalStores,
     raft_log: Arc<dyn klights_node_store::RaftLogDurability>,
     raft_applied_state: Arc<dyn klights_node_store::RaftAppliedStateDurability>,
 }
@@ -106,7 +106,7 @@ pub struct DatastorePhase {
     pub authenticated_outbox_delivery:
         Arc<dyn klights_leader_api::LeaderAuthenticatedOutboxDelivery>,
     pub replication_service: Option<Arc<klights_replication::ReplicationService>>,
-    pub node_local: crate::datastore::node_local::NodeLocalStores,
+    pub node_local: crate::bootstrap::node_store::NodeLocalStores,
     pub outbox: Arc<klights_kubelet::node_outbox::Outbox>,
     pub node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
     pub node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,

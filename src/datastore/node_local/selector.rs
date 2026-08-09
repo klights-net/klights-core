@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use crate::bootstrap::node_store::NodeLocalStores;
 use crate::datastore::backend_kind::BackendKind;
-use crate::datastore::node_local::NodeLocalStores;
 use klights_supervisor::TaskSupervisor;
 
 pub(crate) async fn open_node_local(
@@ -16,7 +16,7 @@ pub(crate) async fn open_node_local(
 ) -> Result<NodeLocalStores> {
     match kind {
         BackendKind::Sqlite => open_sqlite(path, supervisor, key_file, connection_key).await,
-        BackendKind::Redb => crate::datastore::node_local::redb::open().await,
+        BackendKind::Redb => match crate::datastore::node_local::redb::open().await? {},
     }
 }
 
@@ -29,19 +29,19 @@ pub(crate) async fn open_node_local_with_sqlite(
     connection_key: &'static str,
 ) -> Result<(
     NodeLocalStores,
-    Option<Arc<crate::datastore::node_local::NodeLocalStores>>,
+    Option<Arc<crate::bootstrap::node_store::NodeLocalStores>>,
 )> {
     match kind {
         BackendKind::Sqlite => {
             let node = open_sqlite(path, supervisor, key_file, connection_key).await?;
             let legacy = Arc::new(
-                crate::datastore::node_local::NodeLocalStores::from_executor(
+                crate::bootstrap::node_store::NodeLocalStores::from_executor(
                     node.executor_for_test(),
                 )?,
             );
             Ok((node, Some(legacy)))
         }
-        BackendKind::Redb => Ok((crate::datastore::node_local::redb::open().await?, None)),
+        BackendKind::Redb => match crate::datastore::node_local::redb::open().await? {},
     }
 }
 

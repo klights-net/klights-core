@@ -9,7 +9,7 @@ use klights_node_store::{
     ProbeState, ProbeStateStore, RuntimeNamespace, RuntimePodUid, RuntimeWorkFuture,
 };
 
-use super::NodeLocalStores;
+use crate::bootstrap::node_store::NodeLocalStores;
 
 impl PodRuntimeStore for NodeLocalStores {
     fn admit_pod_runtime(&self, admission: PodRuntimeAdmission) -> RuntimeWorkFuture<'_, ()> {

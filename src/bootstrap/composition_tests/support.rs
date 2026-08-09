@@ -29,7 +29,7 @@ impl OutboxPayload {
 }
 
 pub(crate) fn outbox_from_node_db(
-    node_db: impl Into<Arc<crate::datastore::node_local::NodeLocalStores>>,
+    node_db: impl Into<Arc<crate::bootstrap::node_store::NodeLocalStores>>,
 ) -> klights_kubelet::node_outbox::Outbox {
     let node_db = node_db.into();
     let stores = klights_kubelet::node_outbox::OutboxStores::new(

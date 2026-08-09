@@ -410,7 +410,7 @@ mod tests {
     async fn test_workqueue() -> (
         Arc<PodWorkqueue>,
         crate::datastore::DatastoreHandle,
-        std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
+        std::sync::Arc<crate::bootstrap::node_store::NodeLocalStores>,
     ) {
         test_workqueue_at(Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock)).await
     }
@@ -420,7 +420,7 @@ mod tests {
     ) -> (
         Arc<PodWorkqueue>,
         crate::datastore::DatastoreHandle,
-        std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
+        std::sync::Arc<crate::bootstrap::node_store::NodeLocalStores>,
     ) {
         let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let persistence = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
@@ -453,7 +453,7 @@ mod tests {
     async fn test_non_leader_workqueue() -> (
         Arc<PodWorkqueue>,
         crate::datastore::DatastoreHandle,
-        std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
+        std::sync::Arc<crate::bootstrap::node_store::NodeLocalStores>,
     ) {
         let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let store = Arc::new(crate::bootstrap::pod_repository_composition::new_pod_store(
@@ -501,7 +501,7 @@ mod tests {
     }
 
     async fn wait_for_claimed_due(
-        node_local: &Arc<crate::datastore::node_local::NodeLocalStores>,
+        node_local: &Arc<crate::bootstrap::node_store::NodeLocalStores>,
         initial_due: i64,
     ) -> i64 {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -519,7 +519,7 @@ mod tests {
     }
 
     async fn wait_for_parked_due(
-        node_local: &Arc<crate::datastore::node_local::NodeLocalStores>,
+        node_local: &Arc<crate::bootstrap::node_store::NodeLocalStores>,
         leased_due: i64,
     ) {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -544,7 +544,7 @@ mod tests {
         coordination: Option<Arc<dyn ControllerCoordination>>,
     ) -> (
         Arc<PodWorkqueue>,
-        Arc<crate::datastore::node_local::NodeLocalStores>,
+        Arc<crate::bootstrap::node_store::NodeLocalStores>,
         Arc<klights_supervisor::TaskSupervisor>,
         Arc<Notify>,
     ) {

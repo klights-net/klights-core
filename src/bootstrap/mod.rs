@@ -20,6 +20,7 @@ pub mod node_mode;
 pub(crate) mod node_registration_adapter;
 pub(crate) mod node_registration_profile;
 pub mod node_role;
+pub(crate) mod node_store;
 pub mod observed_endpoint;
 pub(crate) mod operational_adapters;
 #[cfg(any(test, feature = "pod-repository-test-support"))]

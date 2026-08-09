@@ -731,7 +731,7 @@ mod tests {
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> (
         crate::kubelet::pod_manager::tests::PodManagerTestPorts,
-        std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
+        std::sync::Arc<crate::bootstrap::node_store::NodeLocalStores>,
     ) {
         let node_local =
             crate::bootstrap::pod_repository_composition::test_node_local_store(supervisor.clone())

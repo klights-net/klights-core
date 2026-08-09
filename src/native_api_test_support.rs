@@ -715,7 +715,7 @@ pub struct NativeApiTestHarness {
     nodeport_alloc: Arc<klights_controllers::service::NodePortAllocator>,
     pod_query: Arc<dyn klights_pod_api::PodQuery>,
     pod_finalization: Arc<dyn klights_pod_api::BoundPodFinalization>,
-    _node_local: Arc<crate::datastore::node_local::NodeLocalStores>,
+    _node_local: Arc<crate::bootstrap::node_store::NodeLocalStores>,
     #[allow(dead_code)]
     outbox_dispatcher: Arc<klights_kubelet::node_outbox::OutboxDispatcher>,
     controller_dispatcher: Arc<klights_controllers::ControllerDispatcher>,

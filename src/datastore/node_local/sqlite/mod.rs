@@ -90,7 +90,7 @@ pub struct DeadLetterTestInsert<'a> {
 }
 
 #[cfg(test)]
-impl super::NodeLocalStores {
+impl crate::bootstrap::node_store::NodeLocalStores {
     pub(crate) async fn with_test_connection<T, F>(
         &self,
         query_name: &'static str,

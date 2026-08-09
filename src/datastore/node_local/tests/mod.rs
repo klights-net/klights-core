@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
+use crate::bootstrap::node_store::NodeLocalStores;
 use crate::datastore::backend_kind::BackendKind;
-use crate::datastore::node_local::{NodeLocalStores, selector};
+use crate::datastore::node_local::selector;
 use klights_node_store::NodeIdentity;
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 

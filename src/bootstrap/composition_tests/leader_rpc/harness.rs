@@ -31,7 +31,7 @@ impl IntegrationLeaderRpcNodePorts {
 }
 
 pub struct IntegrationLeaderRpcNodeLocal {
-    stores: crate::datastore::node_local::NodeLocalStores,
+    stores: crate::bootstrap::node_store::NodeLocalStores,
 }
 
 pub struct IntegrationLeaderRpcClaimedOutbox {

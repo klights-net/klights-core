@@ -124,7 +124,7 @@ impl PodTestRepoExt for PodRuntimeTestPorts {
 fn build_test_pod_repository(
     db: crate::datastore::DatastoreHandle,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    node_local: Arc<crate::datastore::node_local::NodeLocalStores>,
+    node_local: Arc<crate::bootstrap::node_store::NodeLocalStores>,
     controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
 ) -> PodRuntimeTestPorts {
     let (
@@ -181,7 +181,7 @@ fn build_test_pod_repository(
     }
 }
 
-async fn node_local_runtime_store() -> Arc<crate::datastore::node_local::NodeLocalStores> {
+async fn node_local_runtime_store() -> Arc<crate::bootstrap::node_store::NodeLocalStores> {
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
@@ -192,13 +192,13 @@ async fn node_local_runtime_store() -> Arc<crate::datastore::node_local::NodeLoc
     )
     .await
     .expect("open node-local runtime store");
-    let backend = crate::datastore::node_local::NodeLocalStores::from_executor(executor)
+    let backend = crate::bootstrap::node_store::NodeLocalStores::from_executor(executor)
         .expect("create node-local runtime store");
     Arc::new(backend)
 }
 
 async fn admit_runtime_key(
-    store: &crate::datastore::node_local::NodeLocalStores,
+    store: &crate::bootstrap::node_store::NodeLocalStores,
     key: &PodRuntimeKey,
 ) {
     klights_node_store::PodRuntimeStore::admit_pod_runtime(

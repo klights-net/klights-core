@@ -10,7 +10,7 @@ use klights_node_store::{
     PodStatusCheckpointUpsert, RuntimeObservationCheckpoint, RuntimeObservationCheckpointStore,
 };
 
-use super::NodeLocalStores;
+use crate::bootstrap::node_store::NodeLocalStores;
 
 impl OutboxProducerStore for NodeLocalStores {
     fn enqueue_outbox(&self, entry: OutboxEnqueue) -> DeliveryFuture<'_, ()> {

@@ -150,11 +150,10 @@ pub(crate) async fn start_node_admin(
 mod tests {
     use super::*;
 
+    use crate::bootstrap::node_store::NodeLocalStores;
     use crate::datastore::backend_kind::BackendKind;
     use crate::datastore::node_local::DeadLetterTestInsert;
-    use crate::datastore::node_local::{
-        LegacyDeliveryTestStore as _, NodeLocalStores, OutboxInsert, selector,
-    };
+    use crate::datastore::node_local::{LegacyDeliveryTestStore as _, OutboxInsert, selector};
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     fn supervisor() -> Arc<TaskSupervisor> {

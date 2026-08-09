@@ -237,7 +237,7 @@ struct RootPodWorkqueuePersistence {
 
 #[cfg(test)]
 pub(crate) fn test_workqueue_persistence(
-    node_local: Arc<crate::datastore::node_local::NodeLocalStores>,
+    node_local: Arc<crate::bootstrap::node_store::NodeLocalStores>,
     wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 ) -> impl PodWorkqueuePersistence + 'static {
     RootPodWorkqueuePersistence {
@@ -2218,12 +2218,12 @@ fn assemble_pod_services(
 
 #[cfg(test)]
 struct TestDatastorePodNetworkCache {
-    node_local: Option<std::sync::Arc<crate::datastore::node_local::NodeLocalStores>>,
+    node_local: Option<std::sync::Arc<crate::bootstrap::node_store::NodeLocalStores>>,
 }
 
 #[cfg(test)]
 pub(crate) fn test_pod_network_cache(
-    node_local: std::sync::Arc<crate::datastore::node_local::NodeLocalStores>,
+    node_local: std::sync::Arc<crate::bootstrap::node_store::NodeLocalStores>,
 ) -> Arc<dyn klights_node_store::PodNetworkCache> {
     Arc::new(TestDatastorePodNetworkCache {
         node_local: Some(node_local),
@@ -2243,7 +2243,7 @@ pub(crate) fn test_assignment_bus() -> Arc<klights_networking::PodNetworkAssignm
 #[cfg(test)]
 pub(crate) async fn test_node_local_store(
     supervisor: Arc<TaskSupervisor>,
-) -> std::sync::Arc<crate::datastore::node_local::NodeLocalStores> {
+) -> std::sync::Arc<crate::bootstrap::node_store::NodeLocalStores> {
     std::sync::Arc::new(
         crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,

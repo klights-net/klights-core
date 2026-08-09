@@ -1,4 +1,4 @@
-use super::NodeLocalStores;
+use crate::bootstrap::node_store::NodeLocalStores;
 use klights_node_store::{
     CacheNetworkFuture, EndpointDeleteOutcome, EndpointUpsertOutcome, NodeKey, PodEndpointRecord,
     PodEndpointStore, PodEndpointStoreEventSource, PodEndpointStoreEventStream, PodIpamStore,

@@ -118,7 +118,7 @@ pub struct IntegrationPodWorkerFixture {
     pod_status_writer: Arc<dyn klights_kubelet::pod_repository::status::PodStatusWriter>,
     deletion_finalizer:
         Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer>,
-    node_local: Arc<crate::datastore::node_local::NodeLocalStores>,
+    node_local: Arc<crate::bootstrap::node_store::NodeLocalStores>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1138,7 +1138,7 @@ struct PodRepositoryScenarioOwner {
     background: klights_kubelet::pod_repository::background::PodRepositoryBackground,
     watch_source: Arc<dyn crate::bootstrap::pod_repository_composition::PodWatchSource>,
     controller_dispatcher: Option<Arc<PodRepositoryRecordingReconcileSink>>,
-    node_local: Option<Arc<crate::datastore::node_local::NodeLocalStores>>,
+    node_local: Option<Arc<crate::bootstrap::node_store::NodeLocalStores>>,
     outbox_delivery: Option<Arc<dyn klights_leader_api::LeaderOutboxDelivery>>,
     delete_observation: Option<Arc<tokio::sync::Mutex<Option<(bool, bool)>>>>,
 }
@@ -1646,7 +1646,7 @@ pub enum IntegrationPodOutboxCommand {
 }
 
 async fn claim_pod_outbox(
-    stores: &crate::datastore::node_local::NodeLocalStores,
+    stores: &crate::bootstrap::node_store::NodeLocalStores,
     now_ms: i64,
     lease_ms: i64,
     lease_token: &str,
@@ -2127,7 +2127,7 @@ pub async fn run_probe_readiness_status_race(
 }
 
 pub struct IntegrationPodNetworkFixture {
-    stores: Option<Arc<crate::datastore::node_local::NodeLocalStores>>,
+    stores: Option<Arc<crate::bootstrap::node_store::NodeLocalStores>>,
     service: klights_kubelet::pod_repository::PodNetworkService,
 }
 
