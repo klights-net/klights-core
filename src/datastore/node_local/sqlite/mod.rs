@@ -2,6 +2,8 @@ use anyhow::Result;
 #[cfg(test)]
 use anyhow::anyhow;
 #[cfg(test)]
+// P6.2d retains the raw SQLite DTO surface until it ports these fixtures.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxInsert {
     pub idempotency_key: String,
@@ -20,6 +22,8 @@ pub struct OutboxInsert {
 }
 
 #[cfg(test)]
+// P6.2d retains the raw SQLite DTO surface until it ports these fixtures.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxRow {
     pub id: i64,
@@ -48,6 +52,8 @@ pub struct OutboxRow {
 }
 
 #[cfg(test)]
+// P6.2d retains the raw SQLite DTO surface until it ports these fixtures.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DeadLetterRow {
     pub id: i64,

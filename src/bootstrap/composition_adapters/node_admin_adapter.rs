@@ -154,8 +154,9 @@ mod tests {
     use crate::bootstrap::node_store::{open_node_local, open_node_local_with_sqlite};
     use crate::datastore::backend_kind::BackendKind;
     use crate::datastore::node_local::DeadLetterTestInsert;
-    use crate::datastore::node_local::{LegacyDeliveryTestStore as _, OutboxInsert};
+    use klights_node_store::{DeadLetterMoveRequest, OutboxEnqueue, OutboxSubject};
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_types::ResourceKey;
 
     fn supervisor() -> Arc<TaskSupervisor> {
         Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))
@@ -202,38 +203,46 @@ mod tests {
 
     async fn node_db_with_dead_letter() -> (NodeLocalStores, i64) {
         let ndb = node_db("sqlite:node-admin-adapter-test").await;
-        ndb.legacy_enqueue_outbox(OutboxInsert {
-            idempotency_key: "node-admin-dl-key".to_string(),
-            enqueued_ms: 1000,
-            subject_key: "v1/Pod/default/web/uid-1".to_string(),
-            subject_api_version: "v1".to_string(),
-            subject_kind: "Pod".to_string(),
-            subject_namespace: Some("default".to_string()),
-            subject_name: "web".to_string(),
-            subject_uid: Some("uid-1".to_string()),
-            pod_uid: "uid-1".to_string(),
-            operation: "PodStatus".to_string(),
-            payload_proto: pod_status_payload(),
-            next_due_ms: 1000,
-            classification: pod_status_classification(),
-        })
-        .await
-        .expect("enqueue for dead letter");
-        ndb.legacy_move_outbox_to_dead_letter_if_max_attempts("node-admin-dl-key", 0)
+        ndb.outbox_producer()
+            .enqueue_outbox(
+                OutboxEnqueue::try_new(
+                    "node-admin-dl-key",
+                    1000,
+                    OutboxSubject::new(
+                        "v1/Pod/default/web/uid-1",
+                        ResourceKey::new("v1", "Pod", Some("default".to_string()), "web"),
+                        Some("uid-1".to_string()),
+                        "uid-1",
+                    ),
+                    "PodStatus",
+                    pod_status_classification(),
+                    pod_status_payload(),
+                    1000,
+                )
+                .expect("valid dead-letter outbox entry"),
+            )
+            .await
+            .expect("enqueue for dead letter");
+        ndb.dead_letters()
+            .move_outbox_to_dead_letter_if_max_attempts(
+                DeadLetterMoveRequest::try_new("node-admin-dl-key", 0)
+                    .expect("valid dead-letter move request"),
+            )
             .await
             .expect("move to dead letter");
         let id = ndb
-            .legacy_list_dead_letter()
+            .dead_letters()
+            .list_dead_letter()
             .await
             .expect("list dead letter")
             .first()
             .expect("dead letter row")
-            .id;
+            .id();
         (ndb, id)
     }
 
     async fn node_db_with_unassigned_dead_letter() -> (NodeLocalStores, i64) {
-        let (ndb, sqlite) = open_node_local_with_sqlite(
+        let (ndb, _legacy) = open_node_local_with_sqlite(
             BackendKind::Sqlite,
             None,
             supervisor(),
@@ -242,7 +251,7 @@ mod tests {
         )
         .await
         .expect("open node-local test db");
-        sqlite
+        _legacy
             .expect("SQLite backend")
             .insert_dead_letter_test_only(DeadLetterTestInsert {
                 idempotency_key: "node-admin-unassigned-dl-key",
@@ -262,12 +271,13 @@ mod tests {
             .await
             .expect("insert unassigned dead letter");
         let id = ndb
-            .legacy_list_dead_letter()
+            .dead_letters()
+            .list_dead_letter()
             .await
             .expect("list dead letter")
             .first()
             .expect("dead letter row")
-            .id;
+            .id();
         (ndb, id)
     }
 
@@ -286,23 +296,26 @@ mod tests {
             .set_node_meta("outbox_dispatch_errors_total", "7")
             .await
             .expect("write error counter");
-        ndb.legacy_enqueue_outbox(OutboxInsert {
-            idempotency_key: "status-test-key".to_string(),
-            enqueued_ms: 1000,
-            subject_key: "v1/Pod/default/web/uid-1".to_string(),
-            subject_api_version: "v1".to_string(),
-            subject_kind: "Pod".to_string(),
-            subject_namespace: Some("default".to_string()),
-            subject_name: "web".to_string(),
-            subject_uid: Some("uid-1".to_string()),
-            pod_uid: "uid-1".to_string(),
-            operation: "PodStatus".to_string(),
-            payload_proto: Vec::new(),
-            next_due_ms: 1000,
-            classification: pod_status_classification(),
-        })
-        .await
-        .expect("enqueue");
+        ndb.outbox_producer()
+            .enqueue_outbox(
+                OutboxEnqueue::try_new(
+                    "status-test-key",
+                    1000,
+                    OutboxSubject::new(
+                        "v1/Pod/default/web/uid-1",
+                        ResourceKey::new("v1", "Pod", Some("default".to_string()), "web"),
+                        Some("uid-1".to_string()),
+                        "uid-1",
+                    ),
+                    "PodStatus",
+                    pod_status_classification(),
+                    Vec::new(),
+                    1000,
+                )
+                .expect("valid status outbox entry"),
+            )
+            .await
+            .expect("enqueue");
 
         let status = adapter(&ndb, Arc::new(Notify::new()))
             .outbox_status()
@@ -340,7 +353,8 @@ mod tests {
             .await
             .expect("successful replay must wake the idle dispatcher");
         assert!(
-            ndb.legacy_list_dead_letter()
+            ndb.dead_letters()
+                .list_dead_letter()
                 .await
                 .expect("list dead letter")
                 .is_empty()
@@ -357,7 +371,8 @@ mod tests {
                 .expect("delete through root adapter")
         );
         assert!(
-            ndb.legacy_list_dead_letter()
+            ndb.dead_letters()
+                .list_dead_letter()
                 .await
                 .expect("list dead letter")
                 .is_empty()

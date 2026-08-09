@@ -465,8 +465,8 @@ mod tests {
     use super::super::init::predicates::validate_rootless_multinode_support;
     use super::should_use_worker_store_adapter_for_kubelet;
     use crate::bootstrap::{NodeMode, NodeRole};
-    use crate::datastore::node_local::LegacyDeliveryTestStore as _;
     use klights_apiserver::load_tls_pem_files;
+    use klights_node_store::OutboxClaimRequest;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -810,16 +810,20 @@ mod tests {
             .expect("worker dataplane metadata should enqueue");
 
         let row = node_db
-            .legacy_claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
+            .outbox_dispatcher()
+            .claim_next_due_outbox(
+                OutboxClaimRequest::try_new(i64::MAX / 4, 1_000, "assert")
+                    .expect("valid outbox claim request"),
+            )
             .await
             .expect("claim outbox row")
             .expect("dataplane outbox row must exist");
-        assert_eq!(row.operation, "NodeDataplane");
-        assert_eq!(row.subject_kind, "Node");
-        assert_eq!(row.subject_name, "worker-a");
-        assert_eq!(row.subject_key, "v1/Node/worker-a/dataplane");
+        assert_eq!(row.operation(), "NodeDataplane");
+        assert_eq!(row.subject().resource().kind, "Node");
+        assert_eq!(row.subject().resource().name, "worker-a");
+        assert_eq!(row.subject().subject_key(), "v1/Node/worker-a/dataplane");
         let payload = crate::bootstrap::composition_tests::support::OutboxPayload::decode_protobuf(
-            &row.payload_proto,
+            row.payload(),
         )
         .expect("decode dataplane outbox payload");
         match payload.command {

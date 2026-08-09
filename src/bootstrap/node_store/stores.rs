@@ -128,11 +128,6 @@ impl NodeLocalStores {
         self.runtime_work.clone()
     }
 
-    #[cfg(test)]
-    pub(crate) fn delivery_ref(&self) -> &SqliteDeliveryStore {
-        &self.delivery
-    }
-
     #[cfg(any(test, feature = "pod-repository-test-support"))]
     pub(crate) fn network_state_ref(&self) -> &SqliteNodeNetworkStateStore {
         &self.network

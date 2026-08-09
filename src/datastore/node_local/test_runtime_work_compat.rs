@@ -26,8 +26,6 @@ pub struct PodWorkqueueEntry {
 
 #[cfg(test)]
 pub use super::sqlite::DeadLetterTestInsert;
-#[cfg(test)]
-pub use super::sqlite::{DeadLetterRow, OutboxInsert, OutboxRow};
 
 impl crate::bootstrap::node_store::NodeLocalStores {
     #[cfg(test)]

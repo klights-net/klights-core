@@ -1554,7 +1554,6 @@ impl crate::datastore::PodCleanupStore for WorkerStoreAdapter {
 mod tests {
     use super::*;
     use crate::control_plane::client::local::LocalApiClient;
-    use crate::datastore::node_local::LegacyDeliveryTestStore as _;
     use crate::datastore::{NetworkMetadataStore, ResourceListStore, ResourceStore};
     use klights_kubelet::pod_lifecycle_router::{
         PodLifecycleDiagnostics, PodLifecycleRouteBackend, PodLifecycleRouteError,
@@ -1565,6 +1564,7 @@ mod tests {
         LeaderWatch, LeaderWatchFuture, ResourceEvent, ResourceListResult, ResourceQueryFuture,
         WatchEventType, WatchStream,
     };
+    use klights_node_store::OutboxClaimRequest;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use std::sync::atomic::AtomicUsize;
 
@@ -2622,13 +2622,20 @@ mod tests {
         .expect("worker-store event emission should enqueue event");
 
         let row = node_local
-            .legacy_claim_next_due_outbox(i64::MAX / 2, 1_000, "event-test")
+            .outbox_dispatcher()
+            .claim_next_due_outbox(
+                OutboxClaimRequest::try_new(i64::MAX / 2, 1_000, "event-test")
+                    .expect("valid outbox claim request"),
+            )
             .await
             .expect("claim outbox")
             .expect("event outbox row should be enqueued");
-        assert_eq!(row.operation, "EventCreate");
-        assert_eq!(row.subject_namespace.as_deref(), Some("fresh-events"));
-        assert_eq!(row.subject_kind, "Event");
+        assert_eq!(row.operation(), "EventCreate");
+        assert_eq!(
+            row.subject().resource().namespace.as_deref(),
+            Some("fresh-events")
+        );
+        assert_eq!(row.subject().resource().kind, "Event");
     }
 
     #[tokio::test]
