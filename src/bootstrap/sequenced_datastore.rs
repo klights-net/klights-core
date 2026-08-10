@@ -13,6 +13,22 @@ use klights_replication::proposal::RaftProposal;
 
 use crate::datastore::DatastoreBackend;
 
+fn compatibility_resource_command_error(
+    error: klights_leader_api::ResourceCommandError,
+) -> anyhow::Error {
+    use klights_cluster_datastore::errors::DatastoreError;
+    use klights_leader_api::ResourceCommandError;
+
+    match error {
+        ResourceCommandError::AlreadyExists { message } => {
+            DatastoreError::already_exists(message).into()
+        }
+        ResourceCommandError::Conflict { message } => DatastoreError::conflict(message).into(),
+        ResourceCommandError::NotFound { message } => DatastoreError::not_found(message).into(),
+        other => anyhow::Error::new(other),
+    }
+}
+
 mod backend_impl;
 
 pub(crate) struct SequencedDatastore {
@@ -97,6 +113,6 @@ impl SequencedDatastore {
         self.resource_command
             .submit_resource_command(request)
             .await
-            .map_err(anyhow::Error::new)
+            .map_err(compatibility_resource_command_error)
     }
 }

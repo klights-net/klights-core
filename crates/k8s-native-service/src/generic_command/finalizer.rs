@@ -523,3 +523,143 @@ pub fn ready_to_finalize_after_update(data: &Value) -> bool {
             .and_then(Value::as_array)
             .is_none_or(Vec::is_empty)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use klights_reconcile_api::{
+        FinalizerEffectsRequest, FinalizerLifecycleError, FinalizerLifecycleFuture,
+        FinalizerLifecyclePort, FinalizerOrphanRequest, FinalizerResourceTarget,
+        FinalizerTombstoneDeleteRequest, FinalizerUpdateRequest,
+    };
+    use serde_json::json;
+
+    use super::*;
+
+    struct ConcurrentStatusLifecycle {
+        resource: Mutex<Resource>,
+        delete_attempts: AtomicUsize,
+    }
+
+    impl ConcurrentStatusLifecycle {
+        fn new() -> Self {
+            Self {
+                resource: Mutex::new(resource_at(1, json!([]))),
+                delete_attempts: AtomicUsize::new(0),
+            }
+        }
+
+        fn replace_data(resource: &mut Resource, mut data: Value) {
+            resource.resource_version += 1;
+            data["metadata"]["resourceVersion"] =
+                Value::String(resource.resource_version.to_string());
+            resource.data = Arc::new(data);
+        }
+    }
+
+    impl FinalizerLifecyclePort for ConcurrentStatusLifecycle {
+        fn get_resource(
+            &self,
+            _target: FinalizerResourceTarget,
+        ) -> FinalizerLifecycleFuture<'_, Option<Resource>> {
+            Box::pin(async move { Ok(Some(self.resource.lock().unwrap().clone())) })
+        }
+
+        fn update_resource(
+            &self,
+            request: FinalizerUpdateRequest,
+        ) -> FinalizerLifecycleFuture<'_, Resource> {
+            Box::pin(async move {
+                let mut resource = self.resource.lock().unwrap();
+                if request.preconditions.resource_version != Some(resource.resource_version) {
+                    return Err(FinalizerLifecycleError::Conflict(
+                        "stale update resourceVersion".to_string(),
+                    ));
+                }
+                Self::replace_data(&mut resource, request.data);
+                Ok(resource.clone())
+            })
+        }
+
+        fn delete_with_tombstone(
+            &self,
+            request: FinalizerTombstoneDeleteRequest,
+        ) -> FinalizerLifecycleFuture<'_, Resource> {
+            Box::pin(async move {
+                let mut resource = self.resource.lock().unwrap();
+                if self.delete_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let data = (*resource.data).clone();
+                    Self::replace_data(&mut resource, data);
+                    return Err(FinalizerLifecycleError::Conflict(
+                        "concurrent status update advanced resourceVersion".to_string(),
+                    ));
+                }
+                if request.preconditions.resource_version != Some(resource.resource_version) {
+                    return Err(FinalizerLifecycleError::Conflict(
+                        "stale delete resourceVersion".to_string(),
+                    ));
+                }
+                Ok(resource.clone())
+            })
+        }
+
+        fn orphan_children(
+            &self,
+            _request: FinalizerOrphanRequest,
+        ) -> FinalizerLifecycleFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn run_finalized_effects(
+            &self,
+            _request: FinalizerEffectsRequest,
+        ) -> FinalizerLifecycleFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn resource_at(resource_version: i64, finalizers: Value) -> Resource {
+        Resource::try_from_data(Arc::new(json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": {
+                "name": "orphan-owner",
+                "namespace": "default",
+                "uid": "owner-uid",
+                "resourceVersion": resource_version.to_string(),
+                "finalizers": finalizers
+            }
+        })))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn orphan_delete_reloads_after_concurrent_status_resource_version_conflict() {
+        let lifecycle = ConcurrentStatusLifecycle::new();
+        let initial = lifecycle.resource.lock().unwrap().clone();
+        let completion = complete_non_foreground_delete_with_live_recheck(
+            &lifecycle,
+            NonForegroundDeleteRequest {
+                target: ResourceDeleteTarget {
+                    api_version: "v1",
+                    kind: "ReplicationController",
+                    namespace: Some("default"),
+                    name: "orphan-owner",
+                },
+                initial_resource: initial,
+                delete_preconditions: ResourcePreconditions::default(),
+                orphan_children_before_completion: true,
+                uid_mismatch_is_conflict: true,
+                grace_seconds: 0,
+                operation_now: chrono::Utc::now(),
+            },
+        )
+        .await
+        .expect("internal RV churn must be retried from a fresh owner snapshot");
+
+        assert!(matches!(completion, DeleteCompletion::HardDeleted(_)));
+        assert_eq!(lifecycle.delete_attempts.load(Ordering::SeqCst), 2);
+    }
+}

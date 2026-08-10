@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use klights_cluster_core::{
     LogApplyAppliedOutboxRow, LogApplyPodCleanupIntentRow, OutboxApplyError as OutboxDeliveryError,
     OutboxApplyOutcome as OutboxDeliveryResult, PatchKind, Resource, ResourceBatchOperation,
-    ResourcePatchRequest, ResourcePreconditions, StorageCommand,
+    ResourcePatchRequest, ResourcePreconditions, StorageCommand, WatchReplayPosition,
 };
 use serde_json::Value;
 #[cfg(any(test, feature = "pod-repository-test-support"))]
@@ -15,8 +15,8 @@ use tokio::sync::broadcast;
 use crate::datastore::WatchTopic;
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::types::{
-    CatchUpResource, ListPageRequest, ResourceList, ResourceListQuery, SnapshotAtRv,
-    WatchReplayFloor, WatchReplayRead, WatchTarget,
+    CatchUpResource, ListPageRequest, PositionedWatchReplayRead, ResourceList, ResourceListQuery,
+    SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
 };
 use klights_cluster_datastore::errors::DatastoreError;
 #[cfg(any(test, feature = "pod-repository-test-support"))]
@@ -679,6 +679,33 @@ impl DatastoreBackend for SequencedDatastore {
             .await
     }
 
+    async fn list_watch_events_after_position_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
+        self.passive
+            .list_watch_events_after_position_checked_bounded(targets, position, limit)
+            .await
+    }
+
+    async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition> {
+        self.passive.current_watch_replay_position().await
+    }
+
+    async fn snapshot_resources_at_position(
+        &self,
+        targets: &[WatchTarget],
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        position: WatchReplayPosition,
+    ) -> Result<SnapshotAtRv> {
+        self.passive
+            .snapshot_resources_at_position(targets, label_selector, field_selector, position)
+            .await
+    }
+
     async fn list_raw_watch_events_since_checked_bounded(
         &self,
         targets: &[WatchTarget],
@@ -687,6 +714,17 @@ impl DatastoreBackend for SequencedDatastore {
     ) -> Result<WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
         self.passive
             .list_raw_watch_events_since_checked_bounded(targets, since_rv, limit)
+            .await
+    }
+
+    async fn list_raw_watch_events_after_position_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
+        self.passive
+            .list_raw_watch_events_after_position_checked_bounded(targets, position, limit)
             .await
     }
 

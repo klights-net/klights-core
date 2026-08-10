@@ -43,6 +43,7 @@ impl VolumeRegistry {
         registry.register(Arc::new(DownwardApiHandler));
         registry.register(Arc::new(ProjectedHandler));
         registry.register(Arc::new(PersistentVolumeClaimHandler));
+        registry.register(Arc::new(CsiInlineHandler));
         registry
     }
 
@@ -116,6 +117,38 @@ struct SecretHandler;
 struct DownwardApiHandler;
 struct ProjectedHandler;
 struct PersistentVolumeClaimHandler;
+struct CsiInlineHandler;
+
+#[async_trait]
+impl VolumeHandler for CsiInlineHandler {
+    fn volume_type(&self) -> &'static str {
+        "csi"
+    }
+
+    async fn setup(
+        &self,
+        volume: &Value,
+        _volume_name: &str,
+        _ctx: &VolumeContext<'_>,
+    ) -> Result<Option<String>> {
+        let csi = volume
+            .get("csi")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("CSI inline volume missing csi source"))?;
+        let driver = csi
+            .get("driver")
+            .and_then(Value::as_str)
+            .filter(|driver| !driver.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("CSI inline volume missing driver"))?;
+
+        // Kubelet must never omit a requested CSI mount and start the container
+        // against an empty host path. Driver registration and NodePublishVolume
+        // are not available until the node plugin registrar owns a matching
+        // endpoint, so an unknown driver is a mount setup failure, as it is in
+        // upstream kubelet.
+        anyhow::bail!("CSI driver {driver} is not registered on this node")
+    }
+}
 
 #[async_trait]
 impl VolumeHandler for EmptyDirHandler {
@@ -639,6 +672,45 @@ mod tests {
         assert!(registry.has_handler("downwardAPI"));
         assert!(registry.has_handler("projected"));
         assert!(registry.has_handler("persistentVolumeClaim"));
+        assert!(registry.has_handler("csi"));
+    }
+
+    #[tokio::test]
+    async fn csi_inline_volume_without_registered_driver_fails_closed() {
+        let registry = VolumeRegistry::with_defaults();
+        let runtime_ns = "volreg-csi-inline-unregistered";
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "inline", "namespace": "default", "uid": "inline-uid"}
+        });
+        let volume = json!({
+            "name": "csi-inline-vol1",
+            "csi": {"driver": "e2e.example.com"}
+        });
+        let sources = RecordingVolumeSourceReader::new(vec![], "unused");
+        let file_process = crate::phase15d_test_support::file_process_executor();
+        let volumes_root = isolated_volumes_root(runtime_ns);
+        let ctx = VolumeContext {
+            file_process: &file_process,
+            sources: &sources,
+            namespace: "default",
+            pod_name: "inline",
+            pod_dir_id: "default_inline_inline-uid",
+            pod: &pod,
+            volumes_root: &volumes_root,
+            node_capacity: crate::node_capacity::NodeCapacity::default(),
+        };
+
+        let error = registry
+            .resolve_path(&volume, "csi-inline-vol1", &ctx)
+            .await
+            .expect_err("an unavailable CSI driver must not start a container unmounted");
+        assert!(
+            error.to_string().contains("e2e.example.com")
+                && error.to_string().contains("not registered"),
+            "unexpected CSI inline rejection: {error:#}"
+        );
     }
 
     #[test]
