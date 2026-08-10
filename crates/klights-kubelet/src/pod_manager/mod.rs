@@ -1,33 +1,18 @@
-use anyhow::Result;
-#[cfg(test)]
-use event_handlers::{PodPhaseUpdateRequest, apply_pod_phase_update};
-use futures::StreamExt as _;
-#[cfg(test)]
-use klights_kubelet::pod_creation_state::PodStartRetryState;
-#[cfg(test)]
-use klights_kubelet::pod_creation_state::PodStartSource;
-use klights_kubelet::pod_creation_state::{
+use crate::pod_creation_state::{
     PodCreationTracker, PodStartRetryTracker, clear_pod_creation_inflight,
     should_clear_pod_creation_inflight,
 };
-use klights_kubelet::pod_lifecycle_actor::message::{LifecycleMessage, PodLifecycleKey};
-use klights_kubelet::pod_lifecycle_actor::state::{
+use crate::pod_lifecycle_actor::message::{LifecycleMessage, PodLifecycleKey};
+use crate::pod_lifecycle_actor::state::{
     PodLifecycleStateTracker, new_pod_lifecycle_state_tracker,
 };
-#[cfg(test)]
-use klights_kubelet::pod_runtime_state::{PodRuntimeState, StartupDecision, decide_startup_action};
-#[cfg(test)]
-use klights_kubelet::pod_status_builders::{
-    build_container_statuses, build_creation_error_statuses, build_failed_init_container_statuses,
-    cri_timestamp_from_ns,
-};
-#[cfg(test)]
-use klights_kubelet::pod_status_logic::{ContainerInfo, compute_pod_phase, should_restart};
-use klights_kubelet::pod_watch_handlers::PersistentVolumeEventHandler;
-use klights_kubelet::pod_watch_source::{
+use crate::pod_watch_handlers::PersistentVolumeEventHandler;
+use crate::pod_watch_source::{
     PodWatchCheckpoint, PodWatchDisconnect, PodWatchEvent, PodWatchRecoveryPlan, PodWatchSession,
     PodWatchSource, PodWatchStream,
 };
+use anyhow::Result;
+use futures::StreamExt as _;
 use klights_leader_api::{LeaderWatchError, WatchEventType};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -35,7 +20,22 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
-type CriEventReceiver = mpsc::Receiver<klights_kubelet::cri_events::KubeletEvent>;
+type CriEventReceiver = mpsc::Receiver<crate::cri_events::KubeletEvent>;
+type ManagerKubeletConfig = crate::context::KubeletConfig<
+    crate::log_rotation::LogRotationPolicy,
+    crate::node_capacity::NodeCapacity,
+    crate::runtime_paths::KubeletRuntimePaths,
+>;
+type ManagerLifecycleServices = crate::context::LifecycleServices<
+    crate::pod_lifecycle_router::PodLifecycleRouter,
+    crate::context::PodLifecycleReceiver,
+    crate::pod_creation_state::PodStartRetryTracker,
+>;
+type ManagerStatusDeliveryServices = crate::context::StatusDeliveryServices<crate::outbox::Outbox>;
+type ManagerLocalExecutionServices = crate::context::LocalExecutionServices<
+    dyn crate::runtime_clock::RuntimeClock,
+    ManagerKubeletConfig,
+>;
 type PodWatchReconnectFuture = std::pin::Pin<
     Box<
         dyn std::future::Future<Output = Result<PodWatchSession, LeaderWatchError>>
@@ -44,7 +44,7 @@ type PodWatchReconnectFuture = std::pin::Pin<
     >,
 >;
 
-pub mod event_handlers;
+mod event_handlers;
 mod startup;
 
 mod deadline_timers;
@@ -52,16 +52,16 @@ mod event_forwarder;
 
 #[derive(Clone)]
 pub struct PodWatcherRuntimePorts {
-    cri_runtime: Arc<dyn klights_kubelet::runtime::cri::CriRuntime>,
-    container_control: Arc<dyn klights_kubelet::runtime::cri::ContainerRuntimeControl>,
-    cni_readiness: klights_kubelet::cni_readiness::CniReadiness,
+    cri_runtime: Arc<dyn crate::runtime::cri::CriRuntime>,
+    container_control: Arc<dyn crate::runtime::cri::ContainerRuntimeControl>,
+    cni_readiness: crate::cni_readiness::CniReadiness,
 }
 
 impl PodWatcherRuntimePorts {
     pub fn new(
-        cri_runtime: Arc<dyn klights_kubelet::runtime::cri::CriRuntime>,
-        container_control: Arc<dyn klights_kubelet::runtime::cri::ContainerRuntimeControl>,
-        cni_readiness: klights_kubelet::cni_readiness::CniReadiness,
+        cri_runtime: Arc<dyn crate::runtime::cri::CriRuntime>,
+        container_control: Arc<dyn crate::runtime::cri::ContainerRuntimeControl>,
+        cni_readiness: crate::cni_readiness::CniReadiness,
     ) -> Self {
         Self {
             cri_runtime,
@@ -74,19 +74,19 @@ impl PodWatcherRuntimePorts {
 #[derive(Clone)]
 struct PodWatcherRuntimeContext {
     pod_watch_source: Arc<dyn PodWatchSource>,
-    lifecycle: crate::kubelet::context::KubeletLifecycleServices,
-    status_delivery: crate::kubelet::context::KubeletStatusDeliveryServices,
-    local_execution: crate::kubelet::context::KubeletLocalExecutionServices,
-    host_ip: klights_kubelet::context::HostIpState,
+    lifecycle: ManagerLifecycleServices,
+    status_delivery: ManagerStatusDeliveryServices,
+    local_execution: ManagerLocalExecutionServices,
+    host_ip: crate::context::HostIpState,
     persistent_volume_event_handler: Arc<dyn PersistentVolumeEventHandler>,
     deadline_timers: deadline_timers::DeadlineTimerRegistry,
 }
 
 impl PodWatcherRuntimeContext {
     fn new(
-        lifecycle: crate::kubelet::context::KubeletLifecycleServices,
-        status_delivery: crate::kubelet::context::KubeletStatusDeliveryServices,
-        local_execution: crate::kubelet::context::KubeletLocalExecutionServices,
+        lifecycle: ManagerLifecycleServices,
+        status_delivery: ManagerStatusDeliveryServices,
+        local_execution: ManagerLocalExecutionServices,
         pod_watch_source: Arc<dyn PodWatchSource>,
         persistent_volume_event_handler: Arc<dyn PersistentVolumeEventHandler>,
     ) -> Self {
@@ -123,16 +123,16 @@ struct PodRecovery<'a> {
     pod_repo: Arc<dyn klights_pod_api::PodQuery>,
     node_name: &'a str,
     retry_state: &'a PodStartRetryTracker,
-    pod_lifecycle_router: std::sync::Arc<klights_kubelet::pod_lifecycle_router::PodLifecycleRouter>,
+    pod_lifecycle_router: std::sync::Arc<crate::pod_lifecycle_router::PodLifecycleRouter>,
 }
 async fn spawn_cri_event_forwarder(
-    cri: Arc<dyn klights_kubelet::runtime::cri::CriRuntime>,
+    cri: Arc<dyn crate::runtime::cri::CriRuntime>,
     cancel_token: tokio_util::sync::CancellationToken,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     lifecycle_tx: Option<
-        tokio::sync::mpsc::Sender<klights_kubelet::reconciler::cri_reconnect::CriStreamLifecycle>,
+        tokio::sync::mpsc::Sender<crate::reconciler::cri_reconnect::CriStreamLifecycle>,
     >,
-    wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+    wall_clock: Arc<dyn crate::runtime_clock::RuntimeClock>,
 ) -> CriEventReceiver {
     event_forwarder::spawn_cri_event_forwarder(
         cri,
@@ -145,7 +145,7 @@ async fn spawn_cri_event_forwarder(
 }
 
 async fn wait_for_cni_readiness(
-    readiness: klights_kubelet::cni_readiness::CniReadiness,
+    readiness: crate::cni_readiness::CniReadiness,
     cancel_token: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     readiness.wait_ready(cancel_token).await
@@ -173,7 +173,7 @@ fn pod_watch_reconnect_future(
 
 async fn next_pod_watch_event(
     stream: &mut Option<PodWatchStream>,
-) -> Option<Result<PodWatchEvent, klights_kubelet::pod_watch_source::PodWatchStreamError>> {
+) -> Option<Result<PodWatchEvent, crate::pod_watch_source::PodWatchStreamError>> {
     match stream {
         Some(stream) => stream.next().await,
         None => std::future::pending().await,
@@ -200,7 +200,7 @@ pub struct PodWatcherConfig {
 async fn rotate_all_pod_logs(
     file_process: &klights_supervisor::FileProcessExecutor,
     log_root: std::path::PathBuf,
-    policy: klights_kubelet::log_rotation::LogRotationPolicy,
+    policy: crate::log_rotation::LogRotationPolicy,
 ) {
     let key = log_root.to_string_lossy().into_owned();
     let _ = file_process
@@ -212,7 +212,7 @@ async fn rotate_all_pod_logs(
 }
 
 fn rotate_logs_sync(root: &std::path::Path, max_size: u64, max_files: usize) {
-    use klights_kubelet::log_rotation::{RotationPlan, build_rotation_plan};
+    use crate::log_rotation::{RotationPlan, build_rotation_plan};
 
     let Ok(pod_dirs) = std::fs::read_dir(root) else {
         return;
@@ -319,11 +319,11 @@ mod pod_log_rotation_tests {
     }
 }
 
-pub(crate) async fn run_pod_watcher_with_services(
+pub async fn run_pod_watcher_with_services(
     runtime_ports: PodWatcherRuntimePorts,
-    lifecycle: crate::kubelet::context::KubeletLifecycleServices,
-    status_delivery: crate::kubelet::context::KubeletStatusDeliveryServices,
-    local_execution: crate::kubelet::context::KubeletLocalExecutionServices,
+    lifecycle: ManagerLifecycleServices,
+    status_delivery: ManagerStatusDeliveryServices,
+    local_execution: ManagerLocalExecutionServices,
     pod_watch_source: Arc<dyn PodWatchSource>,
     persistent_volume_event_handler: Arc<dyn PersistentVolumeEventHandler>,
     cancel_token: tokio_util::sync::CancellationToken,
@@ -358,7 +358,7 @@ async fn run_pod_watcher_with_runtime(
 
     // Compute and cache the host IP for pod status from the registered Node
     // InternalIP. Node names are Kubernetes identities, not DNS names.
-    let node_ip = klights_kubelet::node_ip::resolve_node_ip_from_leader_api_or_hostname(
+    let node_ip = crate::node_ip::resolve_node_ip_from_leader_api_or_hostname(
         status_delivery.resource_query.as_ref(),
         kubelet_config.node_name(),
     )
@@ -392,10 +392,10 @@ async fn run_pod_watcher_with_runtime(
     let pod_lifecycle_router = lifecycle.pod_lifecycle_router.clone();
 
     let cri_reconnect_lifecycle_tx = {
-        let reconciler = klights_kubelet::reconciler::startup::StartupReconciler::new(
+        let reconciler = crate::reconciler::startup::StartupReconciler::new(
             config.node_name.clone(),
             kubelet_config.paths().clone(),
-            klights_kubelet::reconciler::startup::StartupDependencies {
+            crate::reconciler::startup::StartupDependencies {
                 resource_query: status_delivery.resource_query.clone(),
                 cache_readiness: status_delivery.cache_readiness.clone(),
                 pod_cleanup_intents: status_delivery.pod_cleanup_intents.clone(),
@@ -411,9 +411,9 @@ async fn run_pod_watcher_with_runtime(
         }
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let reconnect = std::sync::Arc::new(
-            klights_kubelet::reconciler::cri_reconnect::CriReconnectReconciler::new(
+            crate::reconciler::cri_reconnect::CriReconnectReconciler::new(
                 config.node_name.clone(),
-                klights_kubelet::reconciler::cri_reconnect::CriReconnectDependencies {
+                crate::reconciler::cri_reconnect::CriReconnectDependencies {
                     resource_query: status_delivery.resource_query.clone(),
                     cache_readiness: status_delivery.cache_readiness.clone(),
                     pod_runtime_store: local_execution.pod_runtime_store.clone(),
@@ -762,9 +762,9 @@ async fn pod_lifecycle_key_for_pod_name(
 }
 
 async fn pod_lifecycle_key_for_cri_event(
-    container_control: &dyn klights_kubelet::runtime::cri::ContainerRuntimeControl,
+    container_control: &dyn crate::runtime::cri::ContainerRuntimeControl,
     pod_repo: &dyn klights_pod_api::PodQuery,
-    event: &klights_kubelet::cri_events::KubeletEvent,
+    event: &crate::cri_events::KubeletEvent,
 ) -> Option<PodLifecycleKey> {
     let resolved = match (
         event.pod_namespace.as_deref(),
@@ -815,14 +815,12 @@ async fn pod_lifecycle_key_for_cri_event(
     Some(live_key)
 }
 
-fn lifecycle_command_target(
-    command: &klights_kubelet::lifecycle::LifecycleCommand,
-) -> (&str, &str, &str) {
+fn lifecycle_command_target(command: &crate::lifecycle::LifecycleCommand) -> (&str, &str, &str) {
     command.target()
 }
 
 pub(crate) async fn lifecycle_message_from_command(
-    command: klights_kubelet::lifecycle::LifecycleCommand,
+    command: crate::lifecycle::LifecycleCommand,
 ) -> Option<LifecycleMessage> {
     let (namespace, pod_name, pod_uid) = lifecycle_command_target(&command);
     if pod_uid.is_empty() {
@@ -845,25 +843,12 @@ async fn clear_pod_start_retry_state(
     retry_state.lock().await.clear(namespace, pod_name);
 }
 
-#[cfg(test)]
-fn parse_deadline_timer_delay_secs(
-    pod: &serde_json::Value,
-) -> Option<(String, String, u64, String)> {
-    parse_deadline_timer_delay_secs_at(pod, chrono::Utc::now().timestamp())
-}
-#[cfg(test)]
-fn parse_deadline_timer_delay_secs_at(
-    pod: &serde_json::Value,
-    now_unix_seconds: i64,
-) -> Option<(String, String, u64, String)> {
-    deadline_timers::parse_deadline_timer_delay_secs_at(pod, now_unix_seconds)
-}
 async fn schedule_active_deadline_timer_for_modified_pod(
     pod: &serde_json::Value,
     now_unix_seconds: i64,
     registry: deadline_timers::DeadlineTimerRegistry,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
-    pod_lifecycle_router: std::sync::Arc<klights_kubelet::pod_lifecycle_router::PodLifecycleRouter>,
+    pod_lifecycle_router: std::sync::Arc<crate::pod_lifecycle_router::PodLifecycleRouter>,
 ) {
     deadline_timers::schedule_active_deadline_timer_for_modified_pod(
         pod,
@@ -875,105 +860,11 @@ async fn schedule_active_deadline_timer_for_modified_pod(
     .await
 }
 #[cfg(test)]
-fn latest_container_infos_by_name(
-    all_container_infos: Vec<(String, ContainerInfo, i64)>,
-) -> Vec<(String, ContainerInfo)> {
-    let mut latest_containers: std::collections::HashMap<String, (ContainerInfo, i64)> =
-        std::collections::HashMap::new();
-    for (name, info, created_at) in all_container_infos {
-        let name_clone = name.clone();
-        let order_key = container_attempt_order_key(&info, created_at);
-        match latest_containers.get(&name) {
-            Some((_, existing_order_key)) if order_key <= *existing_order_key => continue,
-            _ => {
-                latest_containers.insert(name_clone, (info, order_key));
-            }
-        }
-    }
-
-    latest_containers
-        .into_iter()
-        .map(|(name, (info, _))| (name, info))
-        .collect()
-}
-
-#[cfg(test)]
-fn container_attempt_order_key(info: &ContainerInfo, created_at: i64) -> i64 {
-    created_at.max(info.started_at).max(info.finished_at)
-}
-
-#[cfg(test)]
-async fn persist_runtime_restart_status(
-    pod_status_writer: &dyn klights_kubelet::pod_repository::status::PodStatusWriter,
-    pod_resource: &klights_cluster_core::Resource,
-    namespace: &str,
-    pod_name: &str,
-    container_name: &str,
-    info: &ContainerInfo,
-) -> Result<Option<i32>> {
-    let updated = pod_status_writer
-        .note_container_restart_for_uid(
-            namespace,
-            pod_name,
-            &pod_resource.uid,
-            container_name,
-            runtime_restart_last_state(info),
-            None,
-        )
-        .await?;
-    Ok(updated
-        .as_ref()
-        .and_then(|resource| container_restart_count(&resource.data, container_name)))
-}
-
-#[cfg(test)]
-fn runtime_restart_last_state(info: &ContainerInfo) -> Value {
-    let reason = if info.exit_code == 0 {
-        "Completed"
-    } else {
-        "Error"
-    };
-    let mut last_state = serde_json::json!({
-        "terminated": {
-            "exitCode": info.exit_code,
-            "reason": reason,
-            "startedAt": cri_timestamp_from_ns(info.started_at, chrono::DateTime::UNIX_EPOCH),
-            "finishedAt": cri_timestamp_from_ns(info.finished_at, chrono::DateTime::UNIX_EPOCH),
-        }
-    });
-    if !info.termination_message.is_empty()
-        && let Some(terminated) = last_state
-            .get_mut("terminated")
-            .and_then(|value| value.as_object_mut())
-    {
-        terminated.insert(
-            "message".to_string(),
-            serde_json::json!(info.termination_message),
-        );
-    }
-    last_state
-}
-
-#[cfg(test)]
-fn container_restart_count(pod: &Value, container_name: &str) -> Option<i32> {
-    pod.pointer("/status/containerStatuses")
-        .and_then(|statuses| statuses.as_array())
-        .and_then(|statuses| {
-            statuses.iter().find(|status| {
-                status.get("name").and_then(|value| value.as_str()) == Some(container_name)
-            })
-        })
-        .and_then(|status| status.get("restartCount"))
-        .and_then(|count| count.as_i64())
-        .and_then(|count| i32::try_from(count).ok())
-}
-
-#[cfg(test)]
 mod cri_event_identity_tests {
     use std::sync::Arc;
 
     use super::*;
-    use klights_kubelet::runtime::cri::{ContainerRuntimeControl, ContainerRuntimeState};
+    use crate::runtime::cri::{ContainerRuntimeControl, ContainerRuntimeState};
     use klights_types::PodIdentity;
 
     struct LivePodQuery(klights_cluster_core::Resource);
@@ -1039,9 +930,9 @@ mod cri_event_identity_tests {
         )
     }
 
-    fn stopped_event(uid: Option<&str>) -> klights_kubelet::cri_events::KubeletEvent {
-        klights_kubelet::cri_events::KubeletEvent {
-            kind: klights_kubelet::cri_events::KubeletEventKind::Stopped,
+    fn stopped_event(uid: Option<&str>) -> crate::cri_events::KubeletEvent {
+        crate::cri_events::KubeletEvent {
+            kind: crate::cri_events::KubeletEventKind::Stopped,
             container_id: "gone-container".into(),
             pod_namespace: Some("workloads".into()),
             pod_name: Some("same-name".into()),

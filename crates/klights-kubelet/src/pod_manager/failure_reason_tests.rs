@@ -1,4 +1,7 @@
-use klights_kubelet::pod_status_logic::classify_failure_reason;
+use crate::pod_status_builders::{
+    build_creation_error_statuses, build_failed_init_container_statuses,
+};
+use crate::pod_status_logic::classify_failure_reason;
 
 #[test]
 fn pull_image_anyhow_chain_is_err_image_pull() {
@@ -51,7 +54,7 @@ fn build_creation_error_statuses_pod_initializing_has_no_message() {
         }
     });
     let error = "Init container init2 failed with exit code 1";
-    let statuses = super::build_creation_error_statuses(&pod, error);
+    let statuses = build_creation_error_statuses(&pod, error);
     assert_eq!(statuses.len(), 1);
     let state = &statuses[0]["state"]["waiting"];
     assert_eq!(state["reason"], "PodInitializing");
@@ -73,7 +76,7 @@ fn build_failed_init_container_statuses_shows_terminated_error() {
         }
     });
     let statuses =
-        super::build_failed_init_container_statuses(&pod, "init2", 1, chrono::DateTime::UNIX_EPOCH);
+        build_failed_init_container_statuses(&pod, "init2", 1, chrono::DateTime::UNIX_EPOCH);
     assert_eq!(statuses.len(), 2);
     // init1 completed successfully
     assert_eq!(statuses[0]["name"], "init1");

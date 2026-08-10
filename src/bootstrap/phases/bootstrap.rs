@@ -354,7 +354,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         is_leader_tx,
         is_leader_rx,
     } = args;
-    use crate::kubelet;
     #[cfg(not(test))]
     let service_account_signing_key_path = runtime_paths.service_account_signing_key();
     let api_runtime_paths =
@@ -538,7 +537,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let runtime = Arc::new(klights_kubelet::runtime::cri::SharedCriRuntime::new(
             SharedCriClient::new(cri),
         ));
-        crate::kubelet::pod_manager::PodWatcherRuntimePorts::new(
+        klights_kubelet::pod_manager::PodWatcherRuntimePorts::new(
             runtime.clone(),
             runtime,
             cni_readiness.clone(),
@@ -1422,7 +1421,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     klights_supervisor::TaskCategory::Background,
                     "runtime_pod_watcher",
                     async move {
-                        kubelet::pod_manager::run_pod_watcher_with_services(
+                        klights_kubelet::pod_manager::run_pod_watcher_with_services(
                             runtime_ports,
                             ctx.lifecycle(),
                             ctx.status_delivery(),

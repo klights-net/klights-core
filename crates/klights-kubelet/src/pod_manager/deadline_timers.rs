@@ -2,15 +2,39 @@ use super::*;
 
 #[derive(Clone, Default)]
 pub(super) struct DeadlineTimerRegistry {
-    scheduled: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    scheduled: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<PodLifecycleKey, String>>>,
 }
 
 impl DeadlineTimerRegistry {
-    fn remove(&self, key: &str) {
+    fn replace(&self, key: &PodLifecycleKey, schedule: &str) -> bool {
+        let mut scheduled = self
+            .scheduled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if scheduled.get(key).map(String::as_str) == Some(schedule) {
+            return false;
+        }
+        scheduled.insert(key.clone(), schedule.to_string());
+        true
+    }
+
+    fn invalidate(&self, key: &PodLifecycleKey) {
         self.scheduled
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(key);
+    }
+
+    fn take_if_current(&self, key: &PodLifecycleKey, schedule: &str) -> bool {
+        let mut scheduled = self
+            .scheduled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if scheduled.get(key).map(String::as_str) != Some(schedule) {
+            return false;
+        }
+        scheduled.remove(key);
+        true
     }
 }
 
@@ -67,14 +91,18 @@ pub(super) async fn schedule_active_deadline_timer_for_modified_pod(
     now_unix_seconds: i64,
     registry: DeadlineTimerRegistry,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
-    pod_lifecycle_router: std::sync::Arc<klights_kubelet::pod_lifecycle_router::PodLifecycleRouter>,
+    pod_lifecycle_router: std::sync::Arc<crate::pod_lifecycle_router::PodLifecycleRouter>,
 ) {
+    let lifecycle_key = pod_lifecycle_key_from_pod(pod);
     let Some((namespace, pod_name, delay_secs, schedule_key)) =
         parse_deadline_timer_delay_secs_at(pod, now_unix_seconds)
     else {
+        if let Some(key) = lifecycle_key.as_ref() {
+            registry.invalidate(key);
+        }
         return;
     };
-    let Some(key) = pod_lifecycle_key_from_pod(pod) else {
+    let Some(key) = lifecycle_key else {
         tracing::warn!(
             "cannot schedule active deadline for pod without lifecycle identity {}/{}",
             namespace,
@@ -83,28 +111,24 @@ pub(super) async fn schedule_active_deadline_timer_for_modified_pod(
         return;
     };
 
-    {
-        let mut guard = registry
-            .scheduled
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.contains(&schedule_key) {
-            return;
-        }
-        guard.insert(schedule_key.clone());
+    if !registry.replace(&key, &schedule_key) {
+        return;
     }
 
     let schedule_key_for_timer = schedule_key.clone();
+    let key_for_timer = key.clone();
+    let delivery_key = key.clone();
     let timer_registry = registry.clone();
     if let Err(err) = task_supervisor
         .spawn_delay(
             "pod_active_deadline_timer",
             std::time::Duration::from_secs(delay_secs),
             async move {
-                let _ = pod_lifecycle_router
-                    .route(LifecycleMessage::ActiveDeadlineDue { key })
-                    .await;
-                timer_registry.remove(&schedule_key_for_timer);
+                if timer_registry.take_if_current(&key_for_timer, &schedule_key_for_timer) {
+                    let _ = pod_lifecycle_router
+                        .route(LifecycleMessage::ActiveDeadlineDue { key: delivery_key })
+                        .await;
+                }
             },
         )
         .await
@@ -115,6 +139,38 @@ pub(super) async fn schedule_active_deadline_timer_for_modified_pod(
             pod_name,
             err
         );
-        registry.remove(&schedule_key);
+        if registry.take_if_current(&key, &schedule_key) {
+            tracing::debug!("removed rejected active deadline schedule");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key() -> PodLifecycleKey {
+        PodLifecycleKey::new("workloads", "deadline-pod", "deadline-uid")
+    }
+
+    #[test]
+    fn changed_deadline_supersedes_stale_timer_delivery() {
+        let registry = DeadlineTimerRegistry::default();
+        let key = key();
+
+        assert!(registry.replace(&key, "old-schedule"));
+        assert!(registry.replace(&key, "new-schedule"));
+        assert!(!registry.take_if_current(&key, "old-schedule"));
+        assert!(registry.take_if_current(&key, "new-schedule"));
+    }
+
+    #[test]
+    fn terminal_update_invalidates_pending_deadline_delivery() {
+        let registry = DeadlineTimerRegistry::default();
+        let key = key();
+
+        assert!(registry.replace(&key, "active-schedule"));
+        registry.invalidate(&key);
+        assert!(!registry.take_if_current(&key, "active-schedule"));
     }
 }

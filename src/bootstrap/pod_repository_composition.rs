@@ -1996,56 +1996,6 @@ pub(crate) fn build_worker_pod_repository_parts(
     )
 }
 
-/// Focused cfg(test) query constructor. The broad construction result is
-/// destructured inside this boundary and only the query port escapes.
-#[cfg(test)]
-pub(crate) fn pod_query_for_test(
-    db: &crate::datastore::sqlite::Datastore,
-) -> Arc<dyn klights_pod_api::PodQuery> {
-    let supervisor = Arc::new(TaskSupervisor::new(
-        klights_supervisor::TaskCategoryConfig::default(),
-    ));
-    let (pod_query, ..) = build_pod_repository_parts(
-        PodRepositoryBuildConfig {
-            db: Arc::new(db.clone()) as DatastoreHandle,
-            pod_workqueue_store: None,
-            supervisor,
-            side_effects: Arc::new(SideEffectRegistry::new()),
-            metrics: SideEffectMetrics::new(),
-            pod_network_cache: empty_test_pod_network_cache(),
-            assignment_waiter: test_assignment_bus(),
-            scheduling_mode: PodSchedulingMode::InlineSingleNode,
-            outbox: None,
-            cluster_api: None,
-            remote_delivery_required: false,
-            controller_identity:
-                crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
-            scheduler_bind_gate: None,
-        },
-        None,
-    );
-    pod_query
-}
-
-/// E6 cfg(test) re-home of the aggregate's `enqueue_job_reconcile_for_pod`:
-/// the terminal-Pod Job index enqueue via the focused mutation sink.
-#[cfg(test)]
-pub(crate) async fn enqueue_job_reconcile_for_terminal_pod(
-    mutation_reconcile: &dyn klights_reconcile_api::PodMutationReconcileSink,
-    pod: &serde_json::Value,
-) {
-    if let Err(err) = mutation_reconcile
-        .reconcile_pod_mutation(
-            klights_reconcile_api::PodMutationReconcileRequest::EnqueueJobOwner {
-                pod: klights_cluster_core::Resource::from_data_lossy(Arc::new(pod.clone())),
-            },
-        )
-        .await
-    {
-        tracing::warn!(error = %err, "failed to enqueue Job reconcile for terminal Pod");
-    }
-}
-
 /// Assemble the flat focused parts from the core/runtime/network/delivery
 /// dependencies and the API services produced by the root composition. The
 /// worker flow passes `None` for the API services (no leader-owned API
@@ -2219,15 +2169,6 @@ fn assemble_pod_services(
 #[cfg(test)]
 struct TestDatastorePodNetworkCache {
     network: Option<Arc<dyn klights_node_store::PodNetworkCache>>,
-}
-
-#[cfg(test)]
-pub(crate) fn test_pod_network_cache(
-    node_local: std::sync::Arc<crate::bootstrap::node_store::NodeLocalStores>,
-) -> Arc<dyn klights_node_store::PodNetworkCache> {
-    Arc::new(TestDatastorePodNetworkCache {
-        network: Some(node_local.pod_network_cache()),
-    })
 }
 
 #[cfg(test)]

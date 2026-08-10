@@ -15,7 +15,7 @@ use anyhow::Context;
 
 use crate::bootstrap::phases;
 use crate::bootstrap::{CliFlags, NodeRole};
-use crate::{kubelet, pidfile};
+use crate::pidfile;
 
 use super::init::dataplane::*;
 use super::init::host::print_ready_message;
@@ -451,7 +451,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         let runtime = std::sync::Arc::new(klights_kubelet::runtime::cri::SharedCriRuntime::new(
             klights_kubelet::cri::SharedCriClient::new(cri),
         ));
-        crate::kubelet::pod_manager::PodWatcherRuntimePorts::new(
+        klights_kubelet::pod_manager::PodWatcherRuntimePorts::new(
             runtime.clone(),
             runtime,
             cni_readiness.clone(),
@@ -630,7 +630,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                     klights_supervisor::TaskCategory::Background,
                     "worker_pod_watcher",
                     async move {
-                        kubelet::pod_manager::run_pod_watcher_with_services(
+                        klights_kubelet::pod_manager::run_pod_watcher_with_services(
                             runtime_ports,
                             ctx.lifecycle(),
                             ctx.status_delivery(),

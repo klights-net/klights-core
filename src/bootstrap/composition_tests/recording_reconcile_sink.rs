@@ -15,10 +15,6 @@ impl RecordingControllerReconcileSink {
         }
     }
 
-    pub(crate) async fn enqueue_key(&self, key: klights_reconcile_api::ReconcileKey) {
-        self.record([key]).await;
-    }
-
     pub(crate) async fn pending_keys(&self) -> Vec<klights_reconcile_api::ReconcileKey> {
         self.keys.lock().await.clone()
     }

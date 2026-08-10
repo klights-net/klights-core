@@ -1,15 +1,15 @@
 use super::*;
 
 pub(super) async fn spawn_cri_event_forwarder(
-    cri: std::sync::Arc<dyn klights_kubelet::runtime::cri::CriRuntime>,
+    cri: std::sync::Arc<dyn crate::runtime::cri::CriRuntime>,
     cancel_token: tokio_util::sync::CancellationToken,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     lifecycle_tx: Option<
-        tokio::sync::mpsc::Sender<klights_kubelet::reconciler::cri_reconnect::CriStreamLifecycle>,
+        tokio::sync::mpsc::Sender<crate::reconciler::cri_reconnect::CriStreamLifecycle>,
     >,
-    wall_clock: std::sync::Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+    wall_clock: std::sync::Arc<dyn crate::runtime_clock::RuntimeClock>,
 ) -> CriEventReceiver {
-    use klights_kubelet::cri_events::KubeletEventKind;
+    use crate::cri_events::KubeletEventKind;
 
     let (tx, rx) = mpsc::channel(1024);
     let task_supervisor_for_worker = task_supervisor.clone();
@@ -37,13 +37,15 @@ pub(super) async fn spawn_cri_event_forwarder(
                         generation = generation.saturating_add(1);
                         let reconnected_at_ms = wall_clock.now_ms();
                         if let Some(tx) = lifecycle_tx.as_ref() {
-                            let _ = tx
-                                .send(klights_kubelet::reconciler::cri_reconnect::CriStreamLifecycle::Reconnected {
+                            let event = crate::reconciler::cri_reconnect::CriStreamLifecycle::Reconnected {
                                     generation,
                                     disconnected_at_ms: disconnected_at_ms.unwrap_or(reconnected_at_ms),
                                     reconnected_at_ms,
-                                })
-                                .await;
+                                };
+                            tokio::select! {
+                                _ = cancel_token.cancelled() => return,
+                                _ = tx.send(event) => {}
+                            }
                         }
                     }
                     if reconnect_attempt > 0 {
@@ -106,14 +108,20 @@ pub(super) async fn spawn_cri_event_forwarder(
                             || raw_event.pod_uid.is_none())
                             && let Some(lifecycle_tx) = lifecycle_tx.as_ref()
                         {
-                            let _ = lifecycle_tx
-                                .send(klights_kubelet::reconciler::cri_reconnect::CriStreamLifecycle::IdentityUnresolved {
+                            let event = crate::reconciler::cri_reconnect::CriStreamLifecycle::IdentityUnresolved {
                                     container_id: raw_event.container_id.clone(),
                                     timestamp_ns: raw_event.timestamp_ns,
-                                })
-                                .await;
+                                };
+                            tokio::select! {
+                                _ = cancel_token.cancelled() => return,
+                                _ = lifecycle_tx.send(event) => {}
+                            }
                         }
-                        if tx.send(raw_event).await.is_err() {
+                        let send_result = tokio::select! {
+                            _ = cancel_token.cancelled() => return,
+                            result = tx.send(raw_event) => result,
+                        };
+                        if send_result.is_err() {
                             tracing::debug!("CRI event receiver dropped; stopping forwarder");
                             return;
                         }
@@ -149,8 +157,8 @@ mod tests {
     use anyhow::Result;
     use tokio_util::sync::CancellationToken;
 
-    use klights_kubelet::cri_events::KubeletEvent;
-    use klights_kubelet::runtime::cri::{CriRuntime, CriRuntimeContainerEventStream};
+    use crate::cri_events::KubeletEvent;
+    use crate::runtime::cri::{CriRuntime, CriRuntimeContainerEventStream};
 
     struct EndingStream;
 
@@ -210,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn forwards_cri_event_identity_and_timestamp_without_loss() {
-        use klights_kubelet::cri_events::KubeletEventKind;
+        use crate::cri_events::KubeletEventKind;
 
         let cancel = CancellationToken::new();
         let runtime = Arc::new(SequenceCriRuntime::new(
@@ -228,7 +236,7 @@ mod tests {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let wall_clock = Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock);
+        let wall_clock = Arc::new(crate::runtime_clock::SystemRuntimeClock);
 
         let mut receiver =
             super::spawn_cri_event_forwarder(runtime, cancel.clone(), supervisor, None, wall_clock)
@@ -245,7 +253,7 @@ mod tests {
 
     #[tokio::test]
     async fn filters_pod_sandbox_transition_but_forwards_workload_container_stopped() {
-        use klights_kubelet::cri_events::KubeletEventKind;
+        use crate::cri_events::KubeletEventKind;
 
         let cancel = CancellationToken::new();
         let identity = || {
@@ -287,7 +295,7 @@ mod tests {
             cancel.clone(),
             supervisor,
             None,
-            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+            Arc::new(crate::runtime_clock::SystemRuntimeClock),
         )
         .await;
 
@@ -299,7 +307,7 @@ mod tests {
 
     #[tokio::test]
     async fn unresolved_cri_event_requests_event_driven_inventory_resync() {
-        use klights_kubelet::cri_events::KubeletEventKind;
+        use crate::cri_events::KubeletEventKind;
 
         let cancel = CancellationToken::new();
         let runtime = Arc::new(SequenceCriRuntime::new(
@@ -324,7 +332,7 @@ mod tests {
             cancel.clone(),
             supervisor,
             Some(lifecycle_tx),
-            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+            Arc::new(crate::runtime_clock::SystemRuntimeClock),
         )
         .await;
         receiver.recv().await.expect("forwarded unresolved event");
@@ -333,7 +341,7 @@ mod tests {
 
         assert!(matches!(
             lifecycle,
-            klights_kubelet::reconciler::cri_reconnect::CriStreamLifecycle::IdentityUnresolved {
+            crate::reconciler::cri_reconnect::CriStreamLifecycle::IdentityUnresolved {
                 container_id,
                 timestamp_ns: 1_777_000_456,
             } if container_id == "container-without-metadata"
@@ -368,7 +376,7 @@ mod tests {
         }
         async fn list_pod_sandbox_summaries(
             &self,
-        ) -> Result<Vec<klights_kubelet::runtime::cri::CriPodSandboxSummary>> {
+        ) -> Result<Vec<crate::runtime::cri::CriPodSandboxSummary>> {
             Ok(Vec::new())
         }
         async fn create_container(
@@ -438,7 +446,7 @@ mod tests {
             cancel.clone(),
             supervisor(),
             Some(_tx),
-            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+            Arc::new(crate::runtime_clock::SystemRuntimeClock),
         )
         .await;
 
@@ -470,7 +478,7 @@ mod tests {
             cancel.clone(),
             supervisor(),
             Some(tx),
-            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+            Arc::new(crate::runtime_clock::SystemRuntimeClock),
         )
         .await;
 
@@ -480,7 +488,7 @@ mod tests {
             .expect("lifecycle channel open");
         assert!(matches!(
             event,
-            klights_kubelet::reconciler::cri_reconnect::CriStreamLifecycle::Reconnected { .. }
+            crate::reconciler::cri_reconnect::CriStreamLifecycle::Reconnected { .. }
         ));
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), lifecycle_rx.recv())
@@ -489,5 +497,57 @@ mod tests {
             "one disconnect window must emit exactly one reconnect lifecycle event"
         );
         cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_forwarder_when_event_channel_is_full() {
+        use crate::cri_events::KubeletEventKind;
+
+        let cancel = CancellationToken::new();
+        let events = (0..=1024)
+            .map(|index| KubeletEvent {
+                container_id: format!("container-{index}"),
+                kind: KubeletEventKind::Stopped,
+                pod_namespace: Some("workloads".into()),
+                pod_name: Some("backpressure".into()),
+                pod_uid: Some("backpressure-uid".into()),
+                pod_sandbox_id: Some("sandbox".into()),
+                timestamp_ns: index,
+            })
+            .collect();
+        let runtime = Arc::new(SequenceCriRuntime::new(
+            vec![Box::new(EventsStream(events))],
+            cancel.clone(),
+        ));
+        let supervisor = supervisor();
+        let receiver = super::spawn_cri_event_forwarder(
+            runtime,
+            cancel.clone(),
+            supervisor.clone(),
+            None,
+            Arc::new(crate::runtime_clock::SystemRuntimeClock),
+        )
+        .await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while receiver.len() < 1024 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("forwarder fills the bounded receiver");
+        cancel.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            while supervisor
+                .active_tasks(None)
+                .iter()
+                .any(|task| task.name == "cri_event_forwarder")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation must stop a sender blocked by backpressure");
     }
 }

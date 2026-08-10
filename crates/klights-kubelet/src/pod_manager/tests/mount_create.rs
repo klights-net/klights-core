@@ -1,4 +1,4 @@
-use klights_kubelet::pod_env::collect_literal_env_vars;
+use crate::pod_env::collect_literal_env_vars;
 use std::collections::HashMap;
 
 fn build_mounts(
@@ -6,7 +6,7 @@ fn build_mounts(
     volume_paths: &std::collections::HashMap<String, String>,
     resolved_envs: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<(Vec<k8s_cri::v1::Mount>, Vec<std::path::PathBuf>)> {
-    klights_kubelet::pod_volume_manager::PodVolumeManager::build_mounts(
+    crate::pod_volume_manager::PodVolumeManager::build_mounts(
         container,
         volume_paths,
         resolved_envs,
@@ -90,17 +90,17 @@ fn test_build_mounts_sa_volume_via_volume_mount() {
         }]
     });
     let mut volume_paths = HashMap::new();
-    let projected_path = klights_kubelet::runtime_paths::KubeletRuntimePaths::new(
-        crate::paths::test_data_root_path("klights"),
-    )
-    .expect("kubelet test runtime path must be absolute")
-    .volumes_root()
-    .join("test-pod")
-    .join("volumes")
-    .join("projected")
-    .join("kube-api-access-abc12")
-    .to_string_lossy()
-    .into_owned();
+    let runtime_root = tempfile::tempdir().expect("create isolated runtime root");
+    let projected_path =
+        crate::runtime_paths::KubeletRuntimePaths::new(runtime_root.path().to_path_buf())
+            .expect("kubelet test runtime path must be absolute")
+            .volumes_root()
+            .join("test-pod")
+            .join("volumes")
+            .join("projected")
+            .join("kube-api-access-abc12")
+            .to_string_lossy()
+            .into_owned();
     volume_paths.insert("kube-api-access-abc12".to_string(), projected_path);
 
     let mounts = build_mounts(&container, &volume_paths, &std::collections::HashMap::new())
