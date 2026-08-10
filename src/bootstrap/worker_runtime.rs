@@ -182,7 +182,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         .await
         .context("worker startup rejected incompatible leader command codec")?;
     let remote_api_client = std::sync::Arc::new(
-        crate::control_plane::client::remote::RemoteApiClient::from_grpc(
+        klights_leader_rpc::client::RemoteApiClient::from_grpc(
             follower_grpc_client.clone(),
             task_supervisor.clone(),
             config.node_name.clone(),

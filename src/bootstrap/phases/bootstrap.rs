@@ -74,7 +74,7 @@ pub struct BootstrapRunArgs<'a> {
     pub db: &'a dyn crate::datastore::DatastoreBackend,
     pub leader_ports: crate::control_plane::client::LeaderClientPorts,
     pub resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
-    pub remote_api_client: Option<Arc<crate::control_plane::client::remote::RemoteApiClient>>,
+    pub remote_api_client: Option<Arc<klights_leader_rpc::client::RemoteApiClient>>,
     pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
     pub pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
     pub pod_endpoint_store: Arc<dyn klights_node_store::PodEndpointStore>,
@@ -1877,7 +1877,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
 }
 
 pub(crate) async fn start_controlplane_remote_informers_if_present(
-    remote_api_client: Option<Arc<crate::control_plane::client::remote::RemoteApiClient>>,
+    remote_api_client: Option<Arc<klights_leader_rpc::client::RemoteApiClient>>,
     shutdown_token: CancellationToken,
 ) -> Result<Vec<SupervisedJoinHandle<()>>> {
     match remote_api_client {
@@ -1894,8 +1894,8 @@ pub(crate) async fn start_controlplane_remote_informers_if_present(
 mod tests {
     use std::sync::Arc;
 
-    use crate::control_plane::client::remote::RemoteApiClient;
     use klights_leader_api::JoinRole;
+    use klights_leader_rpc::client::RemoteApiClient;
     use klights_leader_rpc::client::{
         GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient,
     };

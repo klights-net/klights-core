@@ -1,7 +1,7 @@
 use klights_cluster_core::Resource;
-use klights_leader_api::{
-    CacheReadinessRequest, LeaderWatchError, ResourceListRequest, WatchEventType, WatchRequest,
-};
+use klights_leader_api::{CacheReadinessRequest, ResourceListRequest};
+#[cfg(feature = "session")]
+use klights_leader_api::{LeaderWatchError, WatchEventType, WatchRequest};
 use klights_types::{FieldSelector, LabelSelector};
 
 use crate::WatchCacheError;
@@ -15,6 +15,7 @@ pub(crate) struct ResourceFilter {
 }
 
 impl ResourceFilter {
+    #[cfg(feature = "session")]
     pub(crate) fn for_watch(request: &WatchRequest) -> Result<Self, LeaderWatchError> {
         let label_selector = parse_label(request.label_selector()).map_err(|message| {
             LeaderWatchError::invalid_request("watch.label_selector", message)
@@ -58,6 +59,7 @@ impl ResourceFilter {
         })
     }
 
+    #[cfg(feature = "session")]
     pub(crate) fn has_selector(&self) -> bool {
         self.label_selector.is_some() || self.field_selector.is_some()
     }
@@ -86,6 +88,7 @@ impl ResourceFilter {
                 .is_none_or(|expected| resource.namespace.as_deref() == Some(expected))
     }
 
+    #[cfg(feature = "session")]
     pub(crate) fn event_always_deliver(event_type: WatchEventType) -> bool {
         matches!(event_type, WatchEventType::Bookmark | WatchEventType::Error)
     }

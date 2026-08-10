@@ -1,7 +1,7 @@
 use anyhow::Context;
 
 pub(crate) async fn start_worker_store_adapter(
-    remote_api_client: std::sync::Arc<crate::control_plane::client::remote::RemoteApiClient>,
+    remote_api_client: std::sync::Arc<klights_leader_rpc::client::RemoteApiClient>,
     node_name: String,
     supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     shutdown_token: tokio_util::sync::CancellationToken,

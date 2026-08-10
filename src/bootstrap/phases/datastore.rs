@@ -96,7 +96,7 @@ pub struct DatastorePhase {
     pub positioned_watch: klights_watch::PositionedWatchService,
     pub leader_ports: crate::control_plane::client::LeaderClientPorts,
     pub resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
-    pub remote_api_client: Option<Arc<crate::control_plane::client::remote::RemoteApiClient>>,
+    pub remote_api_client: Option<Arc<klights_leader_rpc::client::RemoteApiClient>>,
     /// The concrete leader-side LocalApiClient that the outbox dispatcher
     /// uses as its apply client. Must be reused (not re-created) by later
     /// bootstrap phases so that `set_controller_dispatcher` lands on the
@@ -134,7 +134,7 @@ struct RemoteForwarderParts {
     resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     outbox_deliveries: Arc<dyn klights_leader_api::LeaderOutboxDelivery>,
     node_lease_renewals: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
-    remote_api_client: Option<Arc<crate::control_plane::client::remote::RemoteApiClient>>,
+    remote_api_client: Option<Arc<klights_leader_rpc::client::RemoteApiClient>>,
     lease_client: Option<Arc<klights_leader_rpc::client::ReplicationGrpcClient>>,
 }
 
@@ -1020,7 +1020,7 @@ fn build_remote_forwarder(
     grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
 ) -> RemoteForwarderParts {
     use crate::control_plane::client::leader_proxy::StubRemoteForwarder;
-    use crate::control_plane::client::remote::RemoteApiClient;
+    use klights_leader_rpc::client::RemoteApiClient;
     use klights_leader_rpc::client::{GrpcClientConfig, ReplicationGrpcClient};
 
     let (endpoints, token, skip_ca) = match role {

@@ -66,7 +66,7 @@ klights-leader-rpc = { path = "crates/klights-leader-rpc" }
 klights-replication = { path = "crates/klights-replication" }
 k8s-native-service = { path = "crates/k8s-native-service" }
 klights-apiserver = { path = "crates/klights-apiserver" }
-klights-watch = { path = "crates/klights-watch" }
+klights-watch = { path = "crates/klights-watch", default-features = false }
 klights-node-store = { path = "crates/klights-node-store" }
 klights-node-datastore = { path = "crates/klights-node-datastore" }
 klights-node-api = { path = "crates/klights-node-api" }
@@ -210,7 +210,7 @@ klights-leader-rpc = { workspace = true }
 klights-replication = { workspace = true }
 klights-apiserver = { workspace = true }
 k8s-native-service = { workspace = true }
-klights-watch = { workspace = true }
+klights-watch = { workspace = true, features = ["session"] }
 klights-node-api = { workspace = true }
 klights-node-store = { workspace = true }
 klights-node-datastore = { workspace = true }

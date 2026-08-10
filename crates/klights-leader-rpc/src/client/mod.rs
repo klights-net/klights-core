@@ -6,7 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context as TaskContext, Poll};
 
+mod leader;
 mod reconnect;
+mod resource;
+mod watch;
+pub use leader::RemoteApiClient;
 pub use reconnect::pick_reachable_leader_endpoint;
 
 use anyhow::{Context, Result, anyhow};

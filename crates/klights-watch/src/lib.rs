@@ -8,8 +8,10 @@ mod cache;
 mod event;
 mod event_bus;
 mod filter;
+mod remote_cache;
 mod replay;
 mod selection;
+#[cfg(feature = "session")]
 mod session;
 mod signal;
 
@@ -26,11 +28,16 @@ pub use event_bus::WatchBus;
 pub use event_bus::WatchReceiver;
 pub use filter::WatchEventFilter;
 pub use klights_cluster_core::{PositionedWatchEvent, WatchReplayPosition};
+pub use remote_cache::{
+    PreparedWatchTransition, RemoteInformerCache, WatchTransitionProjector,
+    WatchTransitionProjectorFactory,
+};
 pub use replay::{
     PositionedWatchReplay, PositionedWatchReplayRead, WatchReplayRead, WatchTarget,
     WatchTargetScope,
 };
 pub use selection::WatchEventSelection;
+#[cfg(feature = "session")]
 pub use session::{
     PendingWatchSelectorTransition, PositionedWatchService, ProjectedWatchBaselineRead,
     ProjectedWatchBaselineRequest, ProjectedWatchPlan, WatchResourceProjection, WatchResourceScope,

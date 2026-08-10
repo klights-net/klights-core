@@ -6,8 +6,8 @@ use klights_leader_api::{
 };
 use klights_types::ResourceKey;
 
-use crate::control_plane::client::informer::RemoteInformerCache;
-use crate::control_plane::client::informer::{
+use klights_watch::RemoteInformerCache;
+use klights_watch::{
     PreparedWatchTransition, WatchTransitionProjector, WatchTransitionProjectorFactory,
 };
 

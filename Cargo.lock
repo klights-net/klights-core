@@ -2368,6 +2368,7 @@ dependencies = [
  "klights-node-api",
  "klights-supervisor",
  "klights-types",
+ "klights-watch",
  "libc",
  "prost",
  "rustls",
@@ -2540,7 +2541,9 @@ dependencies = [
 name = "klights-watch"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "async-stream",
+ "async-trait",
  "bytes",
  "futures",
  "klights-cluster-core",
