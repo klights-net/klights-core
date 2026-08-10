@@ -34,6 +34,8 @@ pub(crate) mod volumes;
 pub mod test_support;
 
 #[cfg(test)]
+mod parity;
+#[cfg(test)]
 mod test_repository;
 #[cfg(test)]
 mod tests;

@@ -1,5 +1,6 @@
 use klights_kubelet::pod_fs::PodFs;
 use klights_kubelet::pod_subsystem::PodSubsystem;
+use klights_kubelet::runtime::parity::{Recording, RuntimeParityFixture};
 use klights_kubelet::runtime::service::RealPodRuntimeService;
 
 fn leak_subsystem(subsystem: &PodSubsystem) {
@@ -9,4 +10,6 @@ fn leak_subsystem(subsystem: &PodSubsystem) {
 fn main() {
     let _ = std::any::type_name::<PodFs>();
     let _ = std::any::type_name::<RealPodRuntimeService>();
+    let _ = std::any::type_name::<Recording>();
+    let _ = std::any::type_name::<RuntimeParityFixture>();
 }

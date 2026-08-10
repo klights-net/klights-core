@@ -1,3 +1,17 @@
+error[E0432]: unresolved import `klights_kubelet::runtime::parity`
+ --> tests/ui/p7_b_private_leaves.rs:3:31
+  |
+3 | use klights_kubelet::runtime::parity::{Recording, RuntimeParityFixture};
+  |                               ^^^^^^ could not find `parity` in `runtime`
+  |
+note: found an item that was configured out
+ --> src/runtime.rs
+  |
+  | #[cfg(test)]
+  |       ---- the item is gated here
+  | mod parity;
+  |     ^^^^^^
+
 error[E0603]: module `pod_fs` is private
  --> tests/ui/p7_b_private_leaves.rs:1:22
   |
@@ -11,9 +25,9 @@ note: the module `pod_fs` is defined here
   | ^^^^^^^^^^
 
 error[E0603]: module `service` is private
- --> tests/ui/p7_b_private_leaves.rs:3:31
+ --> tests/ui/p7_b_private_leaves.rs:4:31
   |
-3 | use klights_kubelet::runtime::service::RealPodRuntimeService;
+4 | use klights_kubelet::runtime::service::RealPodRuntimeService;
   |                               ^^^^^^^ private module
   |
 note: the module `service` is defined here
@@ -23,7 +37,7 @@ note: the module `service` is defined here
   | ^^^^^^^^^^^^^^^^^^^^^^
 
 error[E0616]: field `runtime` of struct `PodSubsystem` is private
- --> tests/ui/p7_b_private_leaves.rs:6:24
+ --> tests/ui/p7_b_private_leaves.rs:7:24
   |
-6 |     let _ = &subsystem.runtime;
+7 |     let _ = &subsystem.runtime;
   |                        ^^^^^^^ private field
