@@ -39,7 +39,7 @@ pub struct PodSubsystemConfig {
     pub(crate) pod_status_writer: Arc<dyn klights_kubelet::pod_repository::status::PodStatusWriter>,
     pub(crate) pod_repository_background: PodRepositoryBackground,
     pub(crate) pod_deletion_finalizer:
-        Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer>,
+        Arc<dyn klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer>,
     pub supervisor: Arc<TaskSupervisor>,
     pub outbox: Option<Arc<klights_kubelet::outbox::Outbox>>,
     pub resource_query: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
@@ -109,8 +109,7 @@ struct RuntimeServiceBuildRequest {
     wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
     slot_admission: Arc<dyn PodSlotAdmission>,
     event_sink: Arc<dyn PodEventSink>,
-    deletion_finalizer:
-        Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer>,
+    deletion_finalizer: Arc<dyn klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer>,
 }
 
 impl PodSubsystem {
@@ -788,7 +787,7 @@ mod tests {
             std::any::type_name::<dyn crate::kubelet::pod_runtime::service::PodRuntimeService>();
         // Deletion finalizer port
         let _ = std::any::type_name::<
-            dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer,
+            dyn klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer,
         >();
     }
 }

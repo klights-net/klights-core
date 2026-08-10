@@ -116,8 +116,7 @@ pub struct IntegrationPodWorkerFixture {
     pod_query: Arc<dyn klights_pod_api::PodQuery>,
     pod_update: Arc<dyn klights_pod_api::PodUpdate>,
     pod_status_writer: Arc<dyn klights_kubelet::pod_repository::status::PodStatusWriter>,
-    deletion_finalizer:
-        Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer>,
+    deletion_finalizer: Arc<dyn klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer>,
     node_local: Arc<crate::bootstrap::node_store::NodeLocalStores>,
 }
 
@@ -132,7 +131,7 @@ pub enum IntegrationPodFinalizationOutcome {
 /// only — callers pass the port obtained from their own concrete backing
 /// repository rather than the repository itself.
 async fn integration_finalize_pod_after_actor_cleanup(
-    finalizer: &dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer,
+    finalizer: &dyn klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer,
     namespace: &str,
     name: &str,
     uid: &str,
@@ -1130,8 +1129,7 @@ struct PodRepositoryScenarioOwner {
     api_ports: IntegrationPodApiPorts,
     scheduling: Arc<dyn klights_pod_api::PodScheduling>,
     gc_delete: Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
-    deletion_finalizer:
-        Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer>,
+    deletion_finalizer: Arc<dyn klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer>,
     bound_pod_finalization: Arc<dyn klights_pod_api::BoundPodFinalization>,
     deferred_runtime: klights_kubelet::pod_repository::status::DeferredRuntimeReducerHandle,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
@@ -1754,7 +1752,7 @@ struct IntegrationFixedDeletionFinalizer {
 }
 
 #[async_trait::async_trait]
-impl crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer
+impl klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer
     for IntegrationFixedDeletionFinalizer
 {
     async fn finalize_after_actor_cleanup(
@@ -1780,7 +1778,7 @@ pub async fn run_deferred_runtime_cleanup_case(
     uid: &str,
     outcome: IntegrationDeferredRuntimeFinalizerOutcome,
 ) -> (bool, bool) {
-    use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer as _;
+    use klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer as _;
     let deferred = klights_kubelet::pod_repository::status::DeferredRuntimeReducerHandle::default();
     deferred.insert_marker(uid);
     let finalizer =

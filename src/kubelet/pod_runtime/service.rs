@@ -1,12 +1,12 @@
 pub use crate::kubelet::pod_runtime::service_dependencies::RealPodRuntimeServiceDependencies;
 pub use crate::kubelet::pod_runtime::slot_admission::PodSlotAdmissionRequest;
-pub use crate::kubelet::pod_runtime::types::{
-    PodDeletionFinalizeResult, PodFinalizeStartupResult, PodOwnershipError, PodRuntimeKey,
-    PodStartResult,
-};
 use klights_kubelet::lifecycle::LifecycleCommand;
 use klights_kubelet::pod_lifecycle_router::LifecycleReplyHandle;
 pub use klights_kubelet::runtime::{PodRuntimeService, RuntimeReconcileHint};
+pub use klights_kubelet::runtime_types::{
+    PodDeletionFinalizeResult, PodFinalizeStartupResult, PodOwnershipError, PodRuntimeKey,
+    PodStartResult,
+};
 use tokio_util::sync::CancellationToken;
 
 fn append_service_envs(
@@ -41,7 +41,6 @@ use std::sync::Arc;
 
 use crate::kubelet::pod_cluster_runtime::{ClusterRuntimeView, NodeRuntimeView};
 use crate::kubelet::pod_runtime::active_deadline::ActiveDeadlineEnforcer;
-use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
 use crate::kubelet::pod_runtime::events::PodEventSink;
 use crate::kubelet::pod_runtime::filesystem::PodFilesystem;
 use crate::kubelet::pod_runtime::hooks::{HookOutcome, PodHookRuntime};
@@ -71,6 +70,7 @@ use crate::kubelet::pod_termination::{find_pod_container_spec, get_termination_m
 use klights_kubelet::pod_container_config::{
     build_container_config_with_capacity, check_run_as_non_root,
 };
+use klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer;
 use klights_kubelet::pod_sandbox_config::build_sandbox_config_with_runtime_inputs;
 use klights_kubelet::pod_startup_error::PodStartupErrorKind;
 use klights_kubelet::pod_status_builders::{

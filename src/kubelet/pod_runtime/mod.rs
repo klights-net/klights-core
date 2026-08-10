@@ -1,7 +1,6 @@
 // Pod runtime service module.
 
 pub mod active_deadline;
-pub mod deletion_finalizer;
 pub mod events;
 pub mod filesystem;
 pub mod hooks {
@@ -14,10 +13,8 @@ pub mod images {
 pub mod init_container_status;
 pub mod lifecycle_commands;
 pub mod network;
-pub mod observations;
 pub mod orphan_stop;
 pub mod probes;
-pub mod reconcile_hint;
 pub mod recovery {
     pub use klights_kubelet::runtime::recovery::*;
 }
@@ -39,4 +36,3 @@ pub mod volumes;
 pub mod parity;
 #[cfg(test)]
 pub mod tests;
-pub mod types;

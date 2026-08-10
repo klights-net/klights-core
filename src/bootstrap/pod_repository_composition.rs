@@ -185,7 +185,7 @@ type PodRepositoryConstructionResult = (
     Arc<dyn klights_kubelet::pod_repository::PodNetworkAssignmentQuery>,
     klights_kubelet::context::HostIpState,
     PodRepositoryBackground,
-    Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer>,
+    Arc<dyn klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer>,
     Arc<std::sync::atomic::AtomicUsize>,
     Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     Arc<dyn GcPodDeleteSink>,
@@ -212,7 +212,7 @@ type PodRepositoryConstructionResult = (
     Arc<dyn klights_kubelet::pod_repository::PodNetworkAssignmentQuery>,
     klights_kubelet::context::HostIpState,
     PodRepositoryBackground,
-    Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer>,
+    Arc<dyn klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer>,
     Arc<std::sync::atomic::AtomicUsize>,
     Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     Arc<dyn GcPodDeleteSink>,
@@ -1522,13 +1522,13 @@ pub(crate) struct PodDeletionFinalizerDependencies {
 /// Finalizer decorator that releases repository-private deferred runtime state
 /// only after the actor-owned deletion boundary reports a terminal outcome.
 pub(crate) struct DeferredRuntimeCleanupFinalizer {
-    inner: Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer>,
+    inner: Arc<dyn klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer>,
     deferred_runtime: klights_kubelet::pod_repository::status::DeferredRuntimeReducerHandle,
 }
 
 impl DeferredRuntimeCleanupFinalizer {
     pub(crate) fn new(
-        inner: Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer>,
+        inner: Arc<dyn klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer>,
         deferred_runtime: klights_kubelet::pod_repository::status::DeferredRuntimeReducerHandle,
     ) -> Self {
         Self {
@@ -1540,10 +1540,10 @@ impl DeferredRuntimeCleanupFinalizer {
 
 pub(crate) fn compose_pod_deletion_finalizer(
     dependencies: PodDeletionFinalizerDependencies,
-) -> Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer> {
+) -> Arc<dyn klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer> {
     let runtime_deletion_finalizer =
-        crate::kubelet::pod_runtime::deletion_finalizer::compose_real_pod_deletion_finalizer(
-            crate::kubelet::pod_runtime::deletion_finalizer::RealPodDeletionFinalizerDependencies {
+        klights_kubelet::pod_deletion_finalizer::compose_real_pod_deletion_finalizer(
+            klights_kubelet::pod_deletion_finalizer::RealPodDeletionFinalizerDependencies {
                 pod_query: dependencies.store,
                 gc_pod_delete_sink: dependencies.gc_pod_delete_sink,
                 gc_reconcile: dependencies.gc_reconcile,
@@ -1567,7 +1567,7 @@ pub(crate) fn compose_pod_deletion_finalizer(
 }
 
 #[async_trait::async_trait]
-impl crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer
+impl klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer
     for DeferredRuntimeCleanupFinalizer
 {
     async fn finalize_after_actor_cleanup(

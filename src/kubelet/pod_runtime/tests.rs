@@ -12,7 +12,6 @@ mod worker_outbox;
 use k8s_cri::v1::PodSandboxConfig;
 
 use crate::kubelet::pod_cluster_runtime::{FakeCluster, FakeNode};
-use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
 use crate::kubelet::pod_runtime::events::PodEventSink;
 use crate::kubelet::pod_runtime::events::test_support::MockPodEventSink;
 use crate::kubelet::pod_runtime::filesystem::PodFilesystem;
@@ -31,6 +30,7 @@ use crate::kubelet::pod_runtime::service::{PodFinalizeStartupResult, PodRuntimeS
 use crate::kubelet::pod_runtime::store::{PodRuntimeStore, PodSlotAdmission};
 use crate::kubelet::pod_runtime::volumes::PodVolumeRuntime;
 use crate::kubelet::pod_runtime::volumes::test_support::MockPodVolumeRuntime;
+use klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer;
 use klights_kubelet::pod_env::EnvSourceReader;
 use klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey;
 use klights_kubelet::pod_service_envs::ServiceEnvSource;
@@ -77,8 +77,7 @@ struct PodRuntimeTestPorts {
     pod_query: Arc<dyn klights_pod_api::PodQuery>,
     pod_status_writer: Arc<dyn klights_kubelet::pod_repository::status::PodStatusWriter>,
     pod_network_assignment: Arc<dyn klights_kubelet::pod_repository::PodNetworkAssignmentQuery>,
-    deletion_finalizer:
-        Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer>,
+    deletion_finalizer: Arc<dyn klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer>,
     test_api: Option<Arc<dyn klights_pod_api::PodApiMutation>>,
 }
 
