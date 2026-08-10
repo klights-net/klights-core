@@ -81,6 +81,7 @@ macro_rules! real_runtime {
 
 mod cri_recovery;
 mod filesystem_volumes;
+mod forwarded_status;
 mod lifecycle_status;
 mod network_hostports;
 mod probes;

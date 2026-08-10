@@ -490,17 +490,17 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         .node_capacity();
     let sandbox_inputs =
         crate::bootstrap::runtime_inputs::capture_sandbox_inputs(&file_process, &node_mode).await;
-    let kubelet_runtime_network = crate::kubelet::context::KubeletRuntimeNetworkServices::new(
+    let kubelet_runtime_network = klights_kubelet::context::RuntimeNetworkServices::new(
         network.datapath().clone(),
         network.peering().clone(),
         services.clone(),
     );
-    let kubelet_status_delivery = crate::kubelet::context::KubeletStatusDeliveryServices::new(
+    let kubelet_status_delivery = klights_kubelet::context::StatusDeliveryServices::new(
         leader_ports.resource_query.clone(),
         leader_ports.cache_readiness.clone(),
         leader_ports.pod_cleanup_intents.clone(),
         leader_ports.projected_tokens.clone(),
-        outbox.clone(),
+        outbox.clone() as std::sync::Arc<klights_kubelet::outbox::Outbox>,
     );
     let pod_slot_store = node_local.pod_slots();
     let pod_slot_events = node_local.pod_slot_events();
@@ -537,7 +537,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             datapath: Some(kubelet_runtime_network.datapath.clone()),
             service_router: Some(services.clone()),
             runtime_store: std::sync::Arc::new(
-                crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(
+                klights_kubelet::runtime::store::RealPodRuntimeStore::new(
                     pod_runtime_store.clone(),
                     config.node_name.clone(),
                     std::sync::Arc::new(
@@ -549,7 +549,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                 klights_kubelet::runtime_clock::SystemRuntimeClock,
             ),
             slot_admission: std::sync::Arc::new(
-                crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
+                klights_kubelet::runtime::store::RealPodSlotAdmission::new(
                     pod_slot_store,
                     pod_slot_events,
                     config.node_name.clone(),
@@ -580,7 +580,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let plr = pod_subsystem.lifecycle_router().clone();
     pod_workqueue.set_lifecycle_router_for_node(plr.clone(), config.node_name.clone());
     worker_store.set_pod_lifecycle_router(plr.clone());
-    let kubelet_config = crate::kubelet::context::KubeletConfig::try_new(
+    let kubelet_config = klights_kubelet::context::KubeletConfig::try_new(
         config.service_cidr.clone(),
         config.node_name.clone(),
         config.containerd_namespace.clone(),
@@ -589,8 +589,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         runtime_paths,
     )
     .context("worker kubelet configuration")?;
-    let kctx = std::sync::Arc::new(crate::kubelet::context::KubeletContext::new(
-        crate::kubelet::context::KubeletLifecycleServices::new(
+    let kctx = std::sync::Arc::new(klights_kubelet::context::KubeletContext::new(
+        klights_kubelet::context::LifecycleServices::new(
             pod_query.clone(),
             pod_status_writer.clone(),
             pod_workqueue.clone(),
@@ -604,10 +604,11 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         ),
         kubelet_runtime_network,
         kubelet_status_delivery,
-        crate::kubelet::context::KubeletLocalExecutionServices::new(
+        klights_kubelet::context::LocalExecutionServices::new(
             pod_runtime_store,
             pod_endpoint_store,
-            std::sync::Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+            std::sync::Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock)
+                as std::sync::Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
             task_supervisor.clone(),
             file_process.clone(),
             kubelet_config,

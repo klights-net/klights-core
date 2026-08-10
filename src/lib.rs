@@ -3,7 +3,6 @@ pub mod cli;
 mod cluster_engine;
 pub mod control_plane;
 pub mod datastore;
-pub mod kubelet;
 #[cfg(feature = "native-api-test-support")]
 pub mod native_api_test_support;
 pub mod paths;

@@ -613,17 +613,17 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let sandbox_inputs =
         crate::bootstrap::runtime_inputs::capture_sandbox_inputs(&kubelet_file_process, node_mode)
             .await;
-    let kubelet_runtime_network = crate::kubelet::context::KubeletRuntimeNetworkServices::new(
+    let kubelet_runtime_network = klights_kubelet::context::RuntimeNetworkServices::new(
         network.datapath().clone(),
         network.peering().clone(),
         services.clone(),
     );
-    let kubelet_status_delivery = crate::kubelet::context::KubeletStatusDeliveryServices::new(
+    let kubelet_status_delivery = klights_kubelet::context::StatusDeliveryServices::new(
         leader_ports.resource_query.clone(),
         leader_ports.cache_readiness.clone(),
         leader_ports.pod_cleanup_intents.clone(),
         leader_ports.projected_tokens.clone(),
-        outbox_runtime.clone(),
+        outbox_runtime.clone() as Arc<klights_kubelet::outbox::Outbox>,
     );
     let pod_subsystem = klights_kubelet::pod_subsystem::PodSubsystem::new(
         klights_kubelet::pod_subsystem::PodSubsystemConfig {
@@ -658,7 +658,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             datapath: Some(kubelet_runtime_network.datapath.clone()),
             service_router: Some(services.clone()),
             runtime_store: Arc::new(
-                crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(
+                klights_kubelet::runtime::store::RealPodRuntimeStore::new(
                     node_pod_runtime_store.clone(),
                     config.node_name.clone(),
                     Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
@@ -666,7 +666,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             ),
             wall_clock: Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             slot_admission: Arc::new(
-                crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
+                klights_kubelet::runtime::store::RealPodSlotAdmission::new(
                     pod_slot_store,
                     pod_slot_events,
                     config.node_name.clone(),
@@ -1020,7 +1020,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         api_runtime_paths.ca_cert().to_path_buf(),
         controller_identity.clone(),
     );
-    let kubelet_config = crate::kubelet::context::KubeletConfig::try_new(
+    let kubelet_config = klights_kubelet::context::KubeletConfig::try_new(
         config.service_cidr.clone(),
         config.node_name.clone(),
         config.containerd_namespace.clone(),
@@ -1029,8 +1029,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         runtime_paths,
     )
     .context("kubelet configuration")?;
-    let kubelet_services = Arc::new(crate::kubelet::context::KubeletContext::new(
-        crate::kubelet::context::KubeletLifecycleServices::new(
+    let kubelet_services = Arc::new(klights_kubelet::context::KubeletContext::new(
+        klights_kubelet::context::LifecycleServices::new(
             pod_query.clone(),
             pod_status_writer.clone(),
             pod_workqueue.clone(),
@@ -1042,10 +1042,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         ),
         kubelet_runtime_network,
         kubelet_status_delivery,
-        crate::kubelet::context::KubeletLocalExecutionServices::new(
+        klights_kubelet::context::LocalExecutionServices::new(
             node_pod_runtime_store,
             node_pod_endpoint_store,
-            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock)
+                as Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
             supervisor.clone(),
             kubelet_file_process,
             kubelet_config,
