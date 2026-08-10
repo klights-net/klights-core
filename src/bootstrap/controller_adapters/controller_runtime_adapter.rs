@@ -1202,7 +1202,7 @@ fn runtime_dependencies_for_test(
         reconcile: Arc::new(RootControllerReconcilePort::new(non_pod_finalization)),
         network: Arc::new(RootControllerNetworkPort::new(services)),
         effects: Arc::new(RootControllerEffectPort::new(
-            crate::kubelet::file_blocking::test_file_process_executor(),
+            crate::bootstrap::file_blocking::test_file_process_executor(),
             crate::KlightsConfig::test_default()
                 .data_root
                 .join("local-path-provisioner"),

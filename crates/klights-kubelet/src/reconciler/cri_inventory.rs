@@ -1,10 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey;
-use klights_kubelet::pod_lifecycle_router::{
-    OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
-};
-use klights_kubelet::runtime::cri::{ContainerRuntimeState, CriPodSandboxSummary, CriRuntime};
+use crate::pod_lifecycle_core::message::PodLifecycleKey;
+use crate::pod_lifecycle_router::{OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize};
+use crate::runtime::cri::{ContainerRuntimeState, CriPodSandboxSummary, CriRuntime};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CriContainerInventory {
@@ -290,7 +288,7 @@ pub async fn sweep_orphan_pod_artifacts(
     for dir_id in &orphans {
         let pod_root = pods_root.join(dir_id);
         let volumes_dir = pod_root.join("volumes");
-        if let Err(e) = klights_kubelet::volumes::unmount_volume_mounts_under(
+        if let Err(e) = crate::volumes::unmount_volume_mounts_under(
             file_process,
             &volumes_dir.to_string_lossy(),
         )
@@ -614,11 +612,11 @@ pub mod tests {
 
     fn actor_router_with_recorder() -> (
         std::sync::Arc<PodLifecycleRouter>,
-        std::sync::Arc<klights_kubelet::pod_lifecycle_router::executor::RecordingExecutor>,
+        std::sync::Arc<crate::pod_lifecycle_router::executor::RecordingExecutor>,
     ) {
-        use klights_kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
-        use klights_kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry;
-        use klights_kubelet::pod_lifecycle_router::executor::{PodWorkExecutor, RecordingExecutor};
+        use crate::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
+        use crate::pod_lifecycle_actor::registry::PodLifecycleRegistry;
+        use crate::pod_lifecycle_router::executor::{PodWorkExecutor, RecordingExecutor};
 
         let recorder = RecordingExecutor::new();
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
@@ -644,7 +642,7 @@ pub mod tests {
     /// dir/cgroup/volumes), NOT a CRI-only sandbox teardown.
     #[tokio::test]
     async fn cleanup_cold_sandbox_with_identity_routes_to_orphan_finalize() {
-        use klights_kubelet::runtime::test_support::{MockCriOperation, MockCriRuntime};
+        use crate::runtime::test_support::{MockCriOperation, MockCriRuntime};
 
         let (router, recorder) = actor_router_with_recorder();
         let cri = MockCriRuntime::new();
@@ -685,7 +683,7 @@ pub mod tests {
     /// falls back to a direct CRI sandbox teardown.
     #[tokio::test]
     async fn cleanup_cold_sandbox_without_identity_tears_down_cri_only() {
-        use klights_kubelet::runtime::test_support::{MockCriOperation, MockCriRuntime};
+        use crate::runtime::test_support::{MockCriOperation, MockCriRuntime};
 
         let (router, recorder) = actor_router_with_recorder();
         let cri = MockCriRuntime::new();
@@ -718,7 +716,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn cleanup_cold_sandbox_without_identity_propagates_runtime_failure() {
-        use klights_kubelet::runtime::test_support::{MockCriOperation, MockCriRuntime};
+        use crate::runtime::test_support::{MockCriOperation, MockCriRuntime};
 
         let (router, recorder) = actor_router_with_recorder();
         let cri = MockCriRuntime::new();

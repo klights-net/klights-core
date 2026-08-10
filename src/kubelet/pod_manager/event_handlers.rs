@@ -286,7 +286,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
             .await;
         }
         let orphan_enqueued =
-            match crate::kubelet::reconciler::orphan::OrphanScanner::scan_deleted_event(
+            match klights_kubelet::reconciler::orphan::OrphanScanner::scan_deleted_event(
                 pod_lifecycle_router.as_ref(),
                 &event,
             )
@@ -1008,11 +1008,10 @@ mod tests {
         std::fs::create_dir_all(&volume_path).expect("create mounted configmap volume");
         std::fs::write(format!("{volume_path}/data-1"), "value-1").expect("seed mounted data");
 
-        let persistent_volume_event_handler: Arc<dyn PersistentVolumeEventHandler> =
-            Arc::new(NoopPersistentVolumeEventHandler::new());
+        let persistent_volume_event_handler: Arc<dyn PersistentVolumeEventHandler> = Arc::new(());
         handle_watch_event(
             WatchEventHandlerContext {
-                file_process: crate::kubelet::file_blocking::test_file_process_executor(),
+                file_process: crate::bootstrap::file_blocking::test_file_process_executor(),
                 persistent_volume_event_handler: &persistent_volume_event_handler,
                 pod_cleanup_intents: &pod_cleanup_intents,
                 node_name: "worker-a",

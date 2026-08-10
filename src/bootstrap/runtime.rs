@@ -645,7 +645,7 @@ mod tests {
 
         super::resolve_token_file_if_present(
             &mut flags,
-            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &crate::bootstrap::file_blocking::test_file_process_executor(),
         )
         .await
         .unwrap();

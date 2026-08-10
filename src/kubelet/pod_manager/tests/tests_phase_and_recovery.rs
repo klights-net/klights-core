@@ -8,7 +8,7 @@ async fn process_volumes(
     containerd_namespace: &str,
     pod: &serde_json::Value,
 ) -> anyhow::Result<std::collections::HashMap<String, String>> {
-    let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+    let file_process = crate::bootstrap::file_blocking::test_file_process_executor();
     let paths = kubelet_runtime_paths_for_test(containerd_namespace);
     let manager = klights_kubelet::pod_volume_manager::PodVolumeManager::new(
         &file_process,
@@ -328,7 +328,7 @@ async fn test_pvc_added_event_triggers_reconciliation() {
 
     // Call reconcile_pvc (what handle_watch_event will do)
     klights_controllers::pvc::reconcile_pvc(
-        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &crate::bootstrap::file_blocking::test_file_process_executor(),
         &kubelet_runtime_paths_for_test("pod-manager-pvc-tests")
             .data_root()
             .join("local-path-provisioner"),
@@ -418,7 +418,7 @@ async fn test_pv_added_event_triggers_pending_pvc_reconciliation() {
     }
 
     klights_controllers::pvc::reconcile_pvc(
-        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &crate::bootstrap::file_blocking::test_file_process_executor(),
         &kubelet_runtime_paths_for_test("pod-manager-pvc-tests")
             .data_root()
             .join("local-path-provisioner"),
@@ -495,7 +495,7 @@ async fn test_pv_added_event_triggers_pending_pvc_reconciliation() {
                 );
             }
             klights_controllers::pvc::reconcile_pvc(
-                &crate::kubelet::file_blocking::test_file_process_executor(),
+                &crate::bootstrap::file_blocking::test_file_process_executor(),
                 &kubelet_runtime_paths_for_test("pod-manager-pvc-tests")
                     .data_root()
                     .join("local-path-provisioner"),

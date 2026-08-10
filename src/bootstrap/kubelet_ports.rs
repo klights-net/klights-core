@@ -4,7 +4,7 @@ use futures::StreamExt as _;
 use klights_kubelet::node_heartbeat::{
     NodeHeartbeatClock, NodeHeartbeatEvent, NodeHeartbeatEventFuture, NodeHeartbeatEventSource,
 };
-use klights_kubelet::pod_watch_source::{PodWatchEvent, PodWatchSource, PodWatchStream};
+use klights_kubelet::pod_watch_source::{PodWatchSource, PodWatchStream};
 
 pub(crate) struct SystemNodeHeartbeatClock {
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
@@ -21,102 +21,6 @@ impl NodeHeartbeatClock for SystemNodeHeartbeatClock {
         klights_cluster_core::k8s_time::format_microtime(self.wall_clock.now_utc())
     }
 }
-
-pub(crate) struct LeaderPersistentVolumeEventHandler {
-    db: crate::datastore::DatastoreHandle,
-    is_leader_rx: tokio::sync::watch::Receiver<bool>,
-    file_process: klights_supervisor::FileProcessExecutor,
-    local_path_provisioner_root: std::path::PathBuf,
-}
-
-impl LeaderPersistentVolumeEventHandler {
-    pub fn new(
-        db: crate::datastore::DatastoreHandle,
-        is_leader_rx: tokio::sync::watch::Receiver<bool>,
-        file_process: klights_supervisor::FileProcessExecutor,
-        local_path_provisioner_root: std::path::PathBuf,
-    ) -> Self {
-        Self {
-            db,
-            is_leader_rx,
-            file_process,
-            local_path_provisioner_root,
-        }
-    }
-
-    async fn reconcile_pvc(&self, resource: klights_cluster_core::Resource, event_name: &str) {
-        use klights_reconcile_api::PvcReconcileSink;
-
-        let reconcile = crate::bootstrap::controller_adapters::pod_reconcile_adapter::PersistentVolumeReconcileAdapter::new(
-            self.db.as_ref(),
-            &self.file_process,
-            &self.local_path_provisioner_root,
-        );
-        if let Err(error) = reconcile.reconcile_pvc(resource).await {
-            tracing::error!(pvc = event_name, error = %error, "failed to reconcile PVC");
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::kubelet::pod_watch_handlers::PersistentVolumeEventHandler
-    for LeaderPersistentVolumeEventHandler
-{
-    async fn handle_pvc_event(&self, event: &PodWatchEvent, event_name: &str) {
-        if !*self.is_leader_rx.borrow()
-            || !matches!(
-                event.event_type,
-                klights_leader_api::WatchEventType::Added
-                    | klights_leader_api::WatchEventType::Modified
-            )
-        {
-            return;
-        }
-        let namespace = event
-            .object
-            .pointer("/metadata/namespace")
-            .and_then(serde_json::Value::as_str);
-        if let Ok(Some(resource)) = self
-            .db
-            .get_resource("v1", "PersistentVolumeClaim", namespace, event_name)
-            .await
-        {
-            self.reconcile_pvc(resource, event_name).await;
-        }
-    }
-
-    async fn handle_pv_event(&self, event: &PodWatchEvent, _event_name: &str) {
-        if !*self.is_leader_rx.borrow()
-            || event.event_type != klights_leader_api::WatchEventType::Added
-        {
-            return;
-        }
-        let Ok(pvcs) = self
-            .db
-            .list_resources(
-                "v1",
-                "PersistentVolumeClaim",
-                None,
-                crate::datastore::ResourceListQuery::all(),
-            )
-            .await
-        else {
-            return;
-        };
-        for pvc in pvcs.items {
-            if pvc
-                .data
-                .pointer("/status/phase")
-                .and_then(serde_json::Value::as_str)
-                != Some("Bound")
-            {
-                let name = pvc.name.clone();
-                self.reconcile_pvc(pvc, &name).await;
-            }
-        }
-    }
-}
-
 pub(crate) struct DatastorePodWatchSource {
     leader_watch: Arc<dyn klights_leader_api::LeaderWatch>,
     heartbeat_watch: tokio::sync::Mutex<HeartbeatWatchState>,

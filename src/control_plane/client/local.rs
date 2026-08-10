@@ -546,7 +546,7 @@ impl LocalApiClient {
             db,
             authoring_node,
             is_leader_rx,
-            crate::kubelet::file_blocking::test_file_process_executor(),
+            crate::bootstrap::file_blocking::test_file_process_executor(),
         )
     }
 
@@ -566,7 +566,7 @@ impl LocalApiClient {
                 chrono::Utc::now(),
             )),
             is_leader_rx,
-            crate::kubelet::file_blocking::test_file_process_executor(),
+            crate::bootstrap::file_blocking::test_file_process_executor(),
         )
     }
 
@@ -601,7 +601,7 @@ impl LocalApiClient {
             authoring_node,
             node_lease_tracker,
             is_leader_rx,
-            crate::kubelet::file_blocking::test_file_process_executor(),
+            crate::bootstrap::file_blocking::test_file_process_executor(),
         )
     }
 
@@ -2628,7 +2628,7 @@ mod inner_gate_tests {
                         chrono::Utc::now(),
                     )),
                     leadership_rx,
-                    crate::kubelet::file_blocking::test_file_process_executor(),
+                    crate::bootstrap::file_blocking::test_file_process_executor(),
                 ),
             );
             let request = ProjectedServiceAccountTokenRequest::try_new(
@@ -2753,7 +2753,7 @@ mod inner_gate_tests {
                     chrono::Utc::now(),
                 )),
                 always_leader_watch(),
-                crate::kubelet::file_blocking::test_file_process_executor(),
+                crate::bootstrap::file_blocking::test_file_process_executor(),
             ),
         );
         let request = ProjectedServiceAccountTokenRequest::try_new(

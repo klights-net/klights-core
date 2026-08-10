@@ -1,6 +1,3 @@
-#[cfg(test)]
-use crate::kubelet::pod_watch_handlers::NoopPersistentVolumeEventHandler;
-use crate::kubelet::pod_watch_handlers::PersistentVolumeEventHandler;
 use anyhow::Result;
 #[cfg(test)]
 use event_handlers::{PodPhaseUpdateRequest, apply_pod_phase_update};
@@ -26,6 +23,7 @@ use klights_kubelet::pod_status_builders::{
 };
 #[cfg(test)]
 use klights_kubelet::pod_status_logic::{ContainerInfo, compute_pod_phase, should_restart};
+use klights_kubelet::pod_watch_handlers::PersistentVolumeEventHandler;
 use klights_kubelet::pod_watch_source::{
     PodWatchCheckpoint, PodWatchDisconnect, PodWatchEvent, PodWatchRecoveryPlan, PodWatchSession,
     PodWatchSource, PodWatchStream,
@@ -132,7 +130,7 @@ async fn spawn_cri_event_forwarder(
     cancel_token: tokio_util::sync::CancellationToken,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     lifecycle_tx: Option<
-        tokio::sync::mpsc::Sender<crate::kubelet::reconciler::cri_reconnect::CriStreamLifecycle>,
+        tokio::sync::mpsc::Sender<klights_kubelet::reconciler::cri_reconnect::CriStreamLifecycle>,
     >,
     wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 ) -> CriEventReceiver {
@@ -394,10 +392,10 @@ async fn run_pod_watcher_with_runtime(
     let pod_lifecycle_router = lifecycle.pod_lifecycle_router.clone();
 
     let cri_reconnect_lifecycle_tx = {
-        let reconciler = crate::kubelet::reconciler::startup::StartupReconciler::new(
+        let reconciler = klights_kubelet::reconciler::startup::StartupReconciler::new(
             config.node_name.clone(),
             kubelet_config.paths().clone(),
-            crate::kubelet::reconciler::startup::StartupDependencies {
+            klights_kubelet::reconciler::startup::StartupDependencies {
                 resource_query: status_delivery.resource_query.clone(),
                 cache_readiness: status_delivery.cache_readiness.clone(),
                 pod_cleanup_intents: status_delivery.pod_cleanup_intents.clone(),
@@ -413,9 +411,9 @@ async fn run_pod_watcher_with_runtime(
         }
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let reconnect = std::sync::Arc::new(
-            crate::kubelet::reconciler::cri_reconnect::CriReconnectReconciler::new(
+            klights_kubelet::reconciler::cri_reconnect::CriReconnectReconciler::new(
                 config.node_name.clone(),
-                crate::kubelet::reconciler::cri_reconnect::CriReconnectDependencies {
+                klights_kubelet::reconciler::cri_reconnect::CriReconnectDependencies {
                     resource_query: status_delivery.resource_query.clone(),
                     cache_readiness: status_delivery.cache_readiness.clone(),
                     pod_runtime_store: local_execution.pod_runtime_store.clone(),

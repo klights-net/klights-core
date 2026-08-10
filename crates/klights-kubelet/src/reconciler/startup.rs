@@ -1,25 +1,23 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use klights_kubelet::pod_lifecycle_core::message::{
+use crate::pod_lifecycle_core::message::{
     LifecycleMessage, POD_CLEANUP_REASON_NODE_LOST, PodLifecycleKey,
 };
-use klights_kubelet::pod_lifecycle_router::{
-    OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
-};
-use klights_kubelet::runtime::cri::CriRuntime;
+use crate::pod_lifecycle_router::{OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize};
+use crate::runtime::cri::CriRuntime;
+use anyhow::{Context, Result};
 use klights_leader_api::{
     CacheReadinessRequest, LeaderCacheReadiness, LeaderPodCleanupIntents, LeaderResourceQuery,
     PodCleanupIntent, PodCleanupIntentListRequest,
 };
 
-pub use crate::kubelet::reconciler::cri_inventory::{
+pub use crate::reconciler::cri_inventory::{
     CriInventoryAction as StartupAction, diff_cri_inventory as plan_startup_actions,
 };
 
 pub struct StartupReconciler {
     node_name: String,
-    paths: klights_kubelet::runtime_paths::KubeletRuntimePaths,
+    paths: crate::runtime_paths::KubeletRuntimePaths,
     resource_query: Arc<dyn LeaderResourceQuery>,
     cache_readiness: Arc<dyn LeaderCacheReadiness>,
     pod_cleanup_intents: Arc<dyn LeaderPodCleanupIntents>,
@@ -44,7 +42,7 @@ pub struct StartupDependencies {
 impl StartupReconciler {
     pub fn new(
         node_name: String,
-        paths: klights_kubelet::runtime_paths::KubeletRuntimePaths,
+        paths: crate::runtime_paths::KubeletRuntimePaths,
         dependencies: StartupDependencies,
     ) -> Self {
         let StartupDependencies {
@@ -114,24 +112,22 @@ impl StartupReconciler {
             .iter()
             .filter_map(|row| {
                 let pod = row.pod();
-                crate::kubelet::reconciler::cri_inventory::pod_artifact_owner(
+                crate::reconciler::cri_inventory::pod_artifact_owner(
                     &pod.namespace,
                     &pod.name,
                     &pod.uid,
                 )
             })
             .chain(sandboxes.iter().filter_map(|s| {
-                crate::kubelet::reconciler::cri_inventory::pod_artifact_owner(
-                    &s.namespace,
-                    &s.name,
-                    &s.uid,
-                )
+                crate::reconciler::cri_inventory::pod_artifact_owner(&s.namespace, &s.name, &s.uid)
             }))
-            .chain(leader_pods.iter().filter_map(
-                crate::kubelet::reconciler::cri_inventory::pod_artifact_owner_from_value,
-            ))
+            .chain(
+                leader_pods
+                    .iter()
+                    .filter_map(crate::reconciler::cri_inventory::pod_artifact_owner_from_value),
+            )
             .collect();
-        match crate::kubelet::reconciler::cri_inventory::sweep_orphan_pod_artifacts(
+        match crate::reconciler::cri_inventory::sweep_orphan_pod_artifacts(
             &self.file_process,
             self.paths.volumes_root(),
             &live_owners,
@@ -184,7 +180,7 @@ impl StartupReconciler {
                     enqueue_orphan_finalize(self.router.as_ref(), key.clone(), *reason).await?;
                 }
                 StartupAction::KillColdSandbox { sandbox_id, key } => {
-                    crate::kubelet::reconciler::cri_inventory::cleanup_cold_sandbox(
+                    crate::reconciler::cri_inventory::cleanup_cold_sandbox(
                         self.router.as_ref(),
                         self.cri.as_ref(),
                         sandbox_id,
@@ -230,7 +226,7 @@ impl StartupReconciler {
                         .route(LifecycleMessage::CriEvent {
                             key: key.clone(),
                             container_id: String::new(),
-                            kind: klights_kubelet::cri_events::KubeletEventKind::Stopped,
+                            kind: crate::cri_events::KubeletEventKind::Stopped,
                         })
                         .await?;
                 }
@@ -258,7 +254,7 @@ fn append_cleanup_intent_actions(
 
 #[cfg(test)]
 mod tests {
-    use crate::kubelet::reconciler::cri_inventory::tests::{pod, runtime_row, sandbox};
+    use crate::reconciler::cri_inventory::tests::{pod, runtime_row, sandbox};
     use serde_json::json;
 
     use super::*;
@@ -301,10 +297,10 @@ mod tests {
         assert_eq!(
             actions,
             vec![StartupAction::FinalizeOrphan {
-                key: klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey::new(
+                key: crate::pod_lifecycle_core::message::PodLifecycleKey::new(
                     "default", "web", "old-uid",
                 ),
-                reason: klights_kubelet::pod_lifecycle_router::OrphanReason::UidChangedWhileDown,
+                reason: crate::pod_lifecycle_router::OrphanReason::UidChangedWhileDown,
             }]
         );
     }

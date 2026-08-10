@@ -1408,7 +1408,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 )
             };
         let volume_events = Arc::new(
-            crate::bootstrap::kubelet_ports::LeaderPersistentVolumeEventHandler::new(
+            crate::bootstrap::pod_watch_handler_adapter::LeaderPersistentVolumeEventHandler::new(
                 db_handle.clone(),
                 is_leader_rx.clone(),
                 ctx.local_execution().file_process,

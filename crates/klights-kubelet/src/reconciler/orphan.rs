@@ -1,8 +1,8 @@
-use klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey;
-use klights_kubelet::pod_lifecycle_router::{
+use crate::pod_lifecycle_core::message::PodLifecycleKey;
+use crate::pod_lifecycle_router::{
     OrphanReason, PodLifecycleRouteError, PodLifecycleRouter, enqueue_orphan_finalize,
 };
-use klights_kubelet::pod_watch_source::PodWatchEvent;
+use crate::pod_watch_source::PodWatchEvent;
 use klights_leader_api::WatchEventType;
 
 pub struct OrphanScanner;
@@ -45,7 +45,7 @@ mod tests {
 
     fn deleted_pod_event() -> PodWatchEvent {
         PodWatchEvent {
-            scope: klights_kubelet::pod_watch_source::PodWatchScope::Pod,
+            scope: crate::pod_watch_source::PodWatchScope::Pod,
             event_type: WatchEventType::Deleted,
             object: std::sync::Arc::new(serde_json::json!({
                 "apiVersion": "v1",

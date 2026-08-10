@@ -3,15 +3,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
-use crate::kubelet::reconciler::cri_inventory::{
+use crate::pod_lifecycle_core::message::LifecycleMessage;
+use crate::pod_lifecycle_router::{OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize};
+use crate::reconciler::cri_inventory::{
     CriContainerInventory, CriInventoryAction, cleanup_cold_sandbox,
     diff_cri_inventory_with_in_flight_starts,
 };
-use klights_kubelet::pod_lifecycle_core::message::LifecycleMessage;
-use klights_kubelet::pod_lifecycle_router::{
-    OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
-};
-use klights_kubelet::runtime::cri::{ContainerRuntimeControl, CriRuntime};
+use crate::runtime::cri::{ContainerRuntimeControl, CriRuntime};
 use klights_leader_api::{CacheReadinessRequest, LeaderCacheReadiness, LeaderResourceQuery};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,7 +50,7 @@ pub struct CriReconnectDependencies {
 
 async fn collect_container_inventory(
     container_control: &dyn ContainerRuntimeControl,
-    sandboxes: &[klights_kubelet::runtime::cri::CriPodSandboxSummary],
+    sandboxes: &[crate::runtime::cri::CriPodSandboxSummary],
 ) -> Result<Vec<CriContainerInventory>> {
     let mut containers = Vec::new();
     for sandbox in sandboxes {
@@ -156,7 +154,7 @@ impl CriReconnectReconciler {
                             .route(LifecycleMessage::CriEvent {
                                 key: key.clone(),
                                 container_id: String::new(),
-                                kind: klights_kubelet::cri_events::KubeletEventKind::Stopped,
+                                kind: crate::cri_events::KubeletEventKind::Stopped,
                             })
                             .await?;
                         continue;
@@ -207,7 +205,7 @@ impl CriReconnectReconciler {
                         .route(LifecycleMessage::CriEvent {
                             key: key.clone(),
                             container_id: String::new(),
-                            kind: klights_kubelet::cri_events::KubeletEventKind::Stopped,
+                            kind: crate::cri_events::KubeletEventKind::Stopped,
                         })
                         .await?;
                 }
@@ -219,7 +217,7 @@ impl CriReconnectReconciler {
 
     async fn cold_sandbox_became_owned(
         &self,
-        key: &klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey,
+        key: &crate::pod_lifecycle_core::message::PodLifecycleKey,
         sandbox_id: &str,
     ) -> Result<bool> {
         if self
@@ -330,7 +328,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use klights_kubelet::pod_lifecycle_core::message::PodLifecycleKey;
+    use crate::pod_lifecycle_core::message::PodLifecycleKey;
 
     static NEXT_DB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -432,8 +430,7 @@ mod tests {
         async fn list_containers(
             &self,
             _sandbox_id_filter: Option<&str>,
-        ) -> anyhow::Result<Vec<(String, klights_kubelet::runtime::cri::ContainerRuntimeState)>>
-        {
+        ) -> anyhow::Result<Vec<(String, crate::runtime::cri::ContainerRuntimeState)>> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
                 if let Some(entered) = &self.first_entered {
@@ -455,7 +452,7 @@ mod tests {
             }
             Ok(vec![(
                 "ctr-a".into(),
-                klights_kubelet::runtime::cri::ContainerRuntimeState::Exited,
+                crate::runtime::cri::ContainerRuntimeState::Exited,
             )])
         }
 
@@ -471,12 +468,12 @@ mod tests {
         container_control: Arc<SequencedContainerInventory>,
     ) -> (
         Arc<CriReconnectReconciler>,
-        Arc<klights_kubelet::pod_lifecycle_router::executor::RecordingExecutor>,
+        Arc<crate::pod_lifecycle_router::executor::RecordingExecutor>,
         Arc<klights_supervisor::TaskSupervisor>,
     ) {
-        use klights_kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
-        use klights_kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry;
-        use klights_kubelet::pod_lifecycle_router::executor::{PodWorkExecutor, RecordingExecutor};
+        use crate::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
+        use crate::pod_lifecycle_actor::registry::PodLifecycleRegistry;
+        use crate::pod_lifecycle_router::executor::{PodWorkExecutor, RecordingExecutor};
         use klights_node_store::{OwnedPodSandbox, PodRuntimeAdmission, PodRuntimeStore};
 
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
@@ -526,10 +523,10 @@ mod tests {
             recorder.clone(),
         ));
         let pod = klights_cluster_core::Resource::try_from_data(Arc::new(
-            crate::kubelet::reconciler::cri_inventory::tests::pod("default", "web", "uid-a"),
+            crate::reconciler::cri_inventory::tests::pod("default", "web", "uid-a"),
         ))
         .unwrap();
-        let cri = Arc::new(klights_kubelet::runtime::test_support::MockCriRuntime::new());
+        let cri = Arc::new(crate::runtime::test_support::MockCriRuntime::new());
         cri.set_pod_sandboxes(vec![("sb-a", "default", "web", "uid-a", "Ready")]);
         let reconciler = Arc::new(CriReconnectReconciler::new(
             "worker-a".into(),
@@ -548,13 +545,13 @@ mod tests {
     }
 
     async fn wait_for_runtime_reconcile(
-        recorder: &klights_kubelet::pod_lifecycle_router::executor::RecordingExecutor,
-    ) -> klights_kubelet::pod_lifecycle_core::action::PodAction {
+        recorder: &crate::pod_lifecycle_router::executor::RecordingExecutor,
+    ) -> crate::pod_lifecycle_core::action::PodAction {
         for _ in 0..1000 {
             if let Some(action) = recorder.take_actions().into_iter().find(|action| {
                 matches!(
                     action,
-                    klights_kubelet::pod_lifecycle_core::action::PodAction::ReconcileRuntime { .. }
+                    crate::pod_lifecycle_core::action::PodAction::ReconcileRuntime { .. }
                 )
             }) {
                 return action;
@@ -585,7 +582,7 @@ mod tests {
         task.await.unwrap();
         assert!(matches!(
             action,
-            klights_kubelet::pod_lifecycle_core::action::PodAction::ReconcileRuntime { key, .. }
+            crate::pod_lifecycle_core::action::PodAction::ReconcileRuntime { key, .. }
                 if key == PodLifecycleKey::new("default", "web", "uid-a")
         ));
     }
@@ -616,7 +613,7 @@ mod tests {
             if let Some(action) = recorder.take_actions().into_iter().find(|action| {
                 matches!(
                     action,
-                    klights_kubelet::pod_lifecycle_core::action::PodAction::ReconcileRuntime { .. }
+                    crate::pod_lifecycle_core::action::PodAction::ReconcileRuntime { .. }
                 )
             }) {
                 break action;
@@ -628,7 +625,7 @@ mod tests {
         assert_eq!(inventory.calls(), 2);
         assert!(matches!(
             action,
-            klights_kubelet::pod_lifecycle_core::action::PodAction::ReconcileRuntime { key, .. }
+            crate::pod_lifecycle_core::action::PodAction::ReconcileRuntime { key, .. }
                 if key.uid == "uid-a"
         ));
     }
@@ -694,8 +691,7 @@ mod tests {
         async fn list_containers(
             &self,
             _sandbox_id_filter: Option<&str>,
-        ) -> anyhow::Result<Vec<(String, klights_kubelet::runtime::cri::ContainerRuntimeState)>>
-        {
+        ) -> anyhow::Result<Vec<(String, crate::runtime::cri::ContainerRuntimeState)>> {
             anyhow::bail!("injected reconnect ListContainers timeout")
         }
 
@@ -710,7 +706,7 @@ mod tests {
     #[tokio::test]
     async fn reconnect_inventory_propagates_container_list_failure() {
         let control = FailingContainerInventory;
-        let sandboxes = vec![klights_kubelet::runtime::cri::CriPodSandboxSummary {
+        let sandboxes = vec![crate::runtime::cri::CriPodSandboxSummary {
             sandbox_id: "sandbox-timeout".into(),
             namespace: "ns".into(),
             name: "pod".into(),

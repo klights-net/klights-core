@@ -72,10 +72,13 @@ async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_awar
         .unwrap();
 
     let persistent_volume_event_handler =
-        crate::kubelet::pod_watch_handlers::DatastorePersistentVolumeEventHandler::new(
+        crate::bootstrap::pod_watch_handler_adapter::LeaderPersistentVolumeEventHandler::new(
             std::sync::Arc::new(db.clone()),
             is_leader_rx,
             klights_supervisor::FileProcessExecutor::new(supervisor),
+            crate::KlightsConfig::test_default()
+                .data_root
+                .join("local-path-provisioner"),
         );
 
     // The runtime context no longer carries a reconciliation boolean;

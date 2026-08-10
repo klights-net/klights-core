@@ -11,7 +11,7 @@ async fn run_shutdown_command(
 }
 
 async fn run_shutdown_command_with(
-    runner: &dyn crate::kubelet::file_blocking::ProcessOutputRunner,
+    runner: &dyn crate::bootstrap::file_blocking::ProcessOutputRunner,
     name: &'static str,
     program: &str,
     args: &[&str],
@@ -252,7 +252,7 @@ async fn unmount_mount_points(
 async fn unmount_mount_points_with_runner(
     mount_points: &[String],
     label: &str,
-    runner: &dyn crate::kubelet::file_blocking::ProcessOutputRunner,
+    runner: &dyn crate::bootstrap::file_blocking::ProcessOutputRunner,
 ) -> Result<()> {
     let mut count = 0u32;
     let mut failures = Vec::new();
@@ -553,7 +553,7 @@ pub async fn cleanup_volume_dirs(
 
 async fn cleanup_volume_root_with_runner(
     volumes_root: &std::path::Path,
-    runner: &dyn crate::kubelet::file_blocking::ProcessOutputRunner,
+    runner: &dyn crate::bootstrap::file_blocking::ProcessOutputRunner,
     file_process: &klights_supervisor::FileProcessExecutor,
 ) -> Result<()> {
     if !klights_supervisor::runtime_fs::exists_async(file_process, volumes_root).await? {
@@ -585,7 +585,7 @@ async fn cleanup_volume_root_with_runner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kubelet::file_blocking::process_test_support::{FakeProcessOutputRunner, output};
+    use crate::bootstrap::file_blocking::process_test_support::{FakeProcessOutputRunner, output};
 
     #[tokio::test]
     async fn failed_volume_unmount_prevents_directory_removal() {
@@ -602,7 +602,7 @@ mod tests {
         let result = cleanup_volume_root_with_runner(
             &volume_root,
             &runner,
-            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &crate::bootstrap::file_blocking::test_file_process_executor(),
         )
         .await;
 
@@ -1021,7 +1021,7 @@ tmpfs on /data/klights/pods/pod-a/volumes/empty-dir/cache type tmpfs (rw,relatim
         let executable = std::env::current_exe().expect("test executable");
         let executable = executable.to_string_lossy();
         let output = run_shutdown_command(
-            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &crate::bootstrap::file_blocking::test_file_process_executor(),
             "shutdown_test_process_output",
             &executable,
             &[

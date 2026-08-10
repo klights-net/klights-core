@@ -5,7 +5,7 @@ pub(super) async fn spawn_cri_event_forwarder(
     cancel_token: tokio_util::sync::CancellationToken,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     lifecycle_tx: Option<
-        tokio::sync::mpsc::Sender<crate::kubelet::reconciler::cri_reconnect::CriStreamLifecycle>,
+        tokio::sync::mpsc::Sender<klights_kubelet::reconciler::cri_reconnect::CriStreamLifecycle>,
     >,
     wall_clock: std::sync::Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 ) -> CriEventReceiver {
@@ -38,7 +38,7 @@ pub(super) async fn spawn_cri_event_forwarder(
                         let reconnected_at_ms = wall_clock.now_ms();
                         if let Some(tx) = lifecycle_tx.as_ref() {
                             let _ = tx
-                                .send(crate::kubelet::reconciler::cri_reconnect::CriStreamLifecycle::Reconnected {
+                                .send(klights_kubelet::reconciler::cri_reconnect::CriStreamLifecycle::Reconnected {
                                     generation,
                                     disconnected_at_ms: disconnected_at_ms.unwrap_or(reconnected_at_ms),
                                     reconnected_at_ms,
@@ -107,7 +107,7 @@ pub(super) async fn spawn_cri_event_forwarder(
                             && let Some(lifecycle_tx) = lifecycle_tx.as_ref()
                         {
                             let _ = lifecycle_tx
-                                .send(crate::kubelet::reconciler::cri_reconnect::CriStreamLifecycle::IdentityUnresolved {
+                                .send(klights_kubelet::reconciler::cri_reconnect::CriStreamLifecycle::IdentityUnresolved {
                                     container_id: raw_event.container_id.clone(),
                                     timestamp_ns: raw_event.timestamp_ns,
                                 })
@@ -333,7 +333,7 @@ mod tests {
 
         assert!(matches!(
             lifecycle,
-            crate::kubelet::reconciler::cri_reconnect::CriStreamLifecycle::IdentityUnresolved {
+            klights_kubelet::reconciler::cri_reconnect::CriStreamLifecycle::IdentityUnresolved {
                 container_id,
                 timestamp_ns: 1_777_000_456,
             } if container_id == "container-without-metadata"
@@ -480,7 +480,7 @@ mod tests {
             .expect("lifecycle channel open");
         assert!(matches!(
             event,
-            crate::kubelet::reconciler::cri_reconnect::CriStreamLifecycle::Reconnected { .. }
+            klights_kubelet::reconciler::cri_reconnect::CriStreamLifecycle::Reconnected { .. }
         ));
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), lifecycle_rx.recv())

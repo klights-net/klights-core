@@ -163,7 +163,7 @@ mod tests {
             .await
             .unwrap();
         klights_controllers::namespace::init_default_namespaces_with_ca_path(
-            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &crate::bootstrap::file_blocking::test_file_process_executor(),
             &db,
             &crate::paths::ca_cert_path(&crate::paths::runtime_namespace()),
             chrono::DateTime::UNIX_EPOCH,
