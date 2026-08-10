@@ -204,13 +204,121 @@ async fn rotate_all_pod_logs(
     log_root: std::path::PathBuf,
     policy: klights_kubelet::log_rotation::LogRotationPolicy,
 ) {
-    crate::kubelet::pod_fs::PodFs::rotate_logs(
-        file_process,
-        log_root,
-        policy.max_size(),
-        policy.max_files(),
-    )
-    .await;
+    let key = log_root.to_string_lossy().into_owned();
+    let _ = file_process
+        .run_blocking_file_keyed("podfs_rotate_logs", key, move || {
+            rotate_logs_sync(&log_root, policy.max_size(), policy.max_files());
+            Ok(())
+        })
+        .await;
+}
+
+fn rotate_logs_sync(root: &std::path::Path, max_size: u64, max_files: usize) {
+    use klights_kubelet::log_rotation::{RotationPlan, build_rotation_plan};
+
+    let Ok(pod_dirs) = std::fs::read_dir(root) else {
+        return;
+    };
+    for pod_dir in pod_dirs.flatten().filter(|entry| entry.path().is_dir()) {
+        let Ok(container_dirs) = std::fs::read_dir(pod_dir.path()) else {
+            continue;
+        };
+        for container_dir in container_dirs
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+        {
+            let log_file = container_dir.path().join("0.log");
+            let Ok(metadata) = std::fs::metadata(&log_file) else {
+                continue;
+            };
+            let Some(RotationPlan {
+                remove_oldest,
+                renames,
+                current_to_one,
+            }) = build_rotation_plan(&log_file, metadata.len(), max_size, max_files)
+            else {
+                continue;
+            };
+            let _ = std::fs::remove_file(remove_oldest);
+            for (source, destination) in renames {
+                let source: &std::path::Path = source.as_path();
+                if source.exists()
+                    && let Err(error) = std::fs::rename(source, &destination)
+                {
+                    tracing::warn!(
+                        "Failed to rename {:?} -> {:?}: {error:#}",
+                        source,
+                        destination
+                    );
+                }
+            }
+            let (current, destination) = current_to_one;
+            if let Err(error) = std::fs::rename(&current, &destination) {
+                tracing::warn!(
+                    "Failed to rotate {:?} -> {:?}: {error:#}",
+                    current,
+                    destination
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pod_log_rotation_tests {
+    use super::rotate_logs_sync;
+
+    fn fixture_log(size: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let container = root.path().join("ns_pod_uid").join("container0");
+        std::fs::create_dir_all(&container).unwrap();
+        let log = container.join("0.log");
+        std::fs::write(&log, vec![0_u8; size]).unwrap();
+        (root, log)
+    }
+
+    #[test]
+    fn test_rotate_logs_rotates_large_files() {
+        let (root, log) = fixture_log(11 * 1024 * 1024);
+        rotate_logs_sync(root.path(), 10 * 1024 * 1024, 5);
+        assert!(!log.exists());
+        assert!(log.with_file_name("0.1.log").exists());
+    }
+
+    #[test]
+    fn test_rotate_logs_skips_under_threshold_files() {
+        let (root, log) = fixture_log(1024);
+        rotate_logs_sync(root.path(), 10 * 1024 * 1024, 5);
+        assert!(log.exists());
+        assert!(!log.with_file_name("0.1.log").exists());
+    }
+
+    #[test]
+    fn test_rotate_logs_chain_deletes_oldest_and_renames_others() {
+        let (root, log) = fixture_log(11 * 1024 * 1024);
+        let container = log.parent().unwrap();
+        for index in 1..=4 {
+            std::fs::write(
+                container.join(format!("0.{index}.log")),
+                format!("log {index}"),
+            )
+            .unwrap();
+        }
+        rotate_logs_sync(root.path(), 10 * 1024 * 1024, 5);
+        assert_eq!(
+            std::fs::read_to_string(container.join("0.4.log")).unwrap(),
+            "log 3"
+        );
+        assert!(!container.join("0.5.log").exists());
+    }
+
+    #[test]
+    fn test_rotate_logs_handles_missing_log_file() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("ns_pod_uid/container0")).unwrap();
+        rotate_logs_sync(root.path(), 10 * 1024 * 1024, 5);
+        assert!(!root.path().join("ns_pod_uid/container0/0.1.log").exists());
+    }
 }
 
 pub(crate) async fn run_pod_watcher_with_services(

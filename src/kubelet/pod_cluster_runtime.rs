@@ -32,7 +32,7 @@ pub trait ClusterRuntimeView: Send + Sync {
     /// Forward a Pod status update to the owning node.
     async fn forward_pod_status(
         &self,
-        key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+        key: &klights_kubelet::runtime_types::PodRuntimeKey,
         status: serde_json::Value,
     ) -> anyhow::Result<klights_cluster_core::Resource>;
 }
@@ -76,7 +76,7 @@ fn live_status_string(
 async fn apply_forwarded_status(
     pod_query: &dyn PodQuery,
     pod_status: &dyn PodStatusWriter,
-    key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+    key: &klights_kubelet::runtime_types::PodRuntimeKey,
     status: serde_json::Value,
 ) -> anyhow::Result<klights_cluster_core::Resource> {
     let phase = status
@@ -198,7 +198,7 @@ impl ClusterRuntimeView for RepositoryClusterRuntimeView {
 
     async fn forward_pod_status(
         &self,
-        key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+        key: &klights_kubelet::runtime_types::PodRuntimeKey,
         status: serde_json::Value,
     ) -> anyhow::Result<klights_cluster_core::Resource> {
         apply_forwarded_status(
@@ -217,7 +217,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::kubelet::pod_runtime::service::PodRuntimeKey;
+    use klights_kubelet::runtime_types::PodRuntimeKey;
 
     struct PodClusterTestPorts {
         pod_query: Arc<dyn klights_pod_api::PodQuery>,
@@ -642,12 +642,14 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(dead_code)] // P7.C retains this unregistered parity fixture.
 /// Fake node implementing `NodeRuntimeView` for multi-node tests.
 pub(crate) struct FakeNode {
     node_name: String,
 }
 
 #[cfg(test)]
+#[allow(dead_code)] // P7.C retains this unregistered parity fixture.
 impl FakeNode {
     pub(crate) fn new(node_name: &str) -> Self {
         Self {
@@ -673,12 +675,14 @@ impl NodeRuntimeView for FakeNode {
 
 /// Records forwarded status updates for multi-node tests.
 #[cfg(test)]
+#[allow(dead_code)] // P7.C retains this unregistered parity fixture.
 type StatusForward = (
-    crate::kubelet::pod_runtime::service::PodRuntimeKey,
+    klights_kubelet::runtime_types::PodRuntimeKey,
     serde_json::Value,
 );
 /// Fake cluster implementing `ClusterRuntimeView` for multi-node tests.
 #[cfg(test)]
+#[allow(dead_code)] // P7.C retains this unregistered parity fixture.
 pub(crate) struct FakeCluster {
     fresh_pods:
         std::sync::Mutex<std::collections::HashMap<(String, String), crate::datastore::Resource>>,
@@ -693,6 +697,7 @@ impl Default for FakeCluster {
 }
 
 #[cfg(test)]
+#[allow(dead_code)] // P7.C retains this unregistered parity fixture.
 impl FakeCluster {
     pub(crate) fn new() -> Self {
         Self {
@@ -724,7 +729,7 @@ impl ClusterRuntimeView for FakeCluster {
 
     async fn forward_pod_status(
         &self,
-        key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+        key: &klights_kubelet::runtime_types::PodRuntimeKey,
         status: serde_json::Value,
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.status_forwards

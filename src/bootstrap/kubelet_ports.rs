@@ -117,53 +117,6 @@ impl crate::kubelet::pod_watch_handlers::PersistentVolumeEventHandler
     }
 }
 
-#[cfg(test)]
-pub struct DatastorePodSlotAdapter {
-    store: Arc<dyn klights_node_store::PodSlotAdmissionStore>,
-    events: Arc<dyn klights_node_store::PodSlotAdmissionEventSource>,
-}
-
-#[cfg(test)]
-impl DatastorePodSlotAdapter {
-    pub fn new(
-        store: Arc<dyn klights_node_store::PodSlotAdmissionStore>,
-        events: Arc<dyn klights_node_store::PodSlotAdmissionEventSource>,
-    ) -> Arc<Self> {
-        Arc::new(Self { store, events })
-    }
-}
-
-#[cfg(test)]
-impl klights_node_store::PodSlotAdmissionStore for DatastorePodSlotAdapter {
-    fn try_admit(
-        &self,
-        request: klights_node_store::PodSlotAdmissionRequest,
-    ) -> klights_node_store::RuntimeWorkFuture<'_, klights_node_store::PodSlotAdmissionResult> {
-        self.store.try_admit(request)
-    }
-
-    fn mark_terminating(
-        &self,
-        request: klights_node_store::PodSlotAdmissionRequest,
-    ) -> klights_node_store::RuntimeWorkFuture<'_, klights_node_store::PodSlotMutationResult> {
-        self.store.mark_terminating(request)
-    }
-
-    fn clear_if_uid(
-        &self,
-        request: klights_node_store::PodSlotAdmissionRequest,
-    ) -> klights_node_store::RuntimeWorkFuture<'_, klights_node_store::PodSlotClearResult> {
-        self.store.clear_if_uid(request)
-    }
-}
-
-#[cfg(test)]
-impl klights_node_store::PodSlotAdmissionEventSource for DatastorePodSlotAdapter {
-    fn subscribe(&self) -> Box<dyn klights_node_store::PodSlotEventSubscription> {
-        self.events.subscribe()
-    }
-}
-
 pub(crate) struct DatastorePodWatchSource {
     leader_watch: Arc<dyn klights_leader_api::LeaderWatch>,
     heartbeat_watch: tokio::sync::Mutex<HeartbeatWatchState>,
@@ -395,16 +348,16 @@ impl RootPodEventSink {
 }
 
 #[async_trait::async_trait]
-impl crate::kubelet::pod_runtime::events::PodEventSink for RootPodEventSink {
+impl klights_kubelet::runtime::events::PodEventSink for RootPodEventSink {
     async fn emit_pod_event(
         &self,
-        key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+        key: &klights_kubelet::runtime_types::PodRuntimeKey,
         event_type: &str,
         reason: &str,
         message: &str,
         reporting_component: &str,
         node_name: &str,
-    ) -> Result<(), crate::kubelet::pod_runtime::events::PodEventSinkError> {
+    ) -> Result<(), klights_kubelet::runtime::events::PodEventSinkError> {
         let pod = serde_json::json!({
             "metadata": {
                 "namespace": key.namespace,
@@ -431,7 +384,7 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for RootPodEventSink {
         )
         .await
         .map_err(|error| {
-            crate::kubelet::pod_runtime::events::PodEventSinkError::unavailable(error.to_string())
+            klights_kubelet::runtime::events::PodEventSinkError::unavailable(error.to_string())
         })?;
         Ok(())
     }
@@ -458,16 +411,16 @@ impl WorkerPodEventSink {
 }
 
 #[async_trait::async_trait]
-impl crate::kubelet::pod_runtime::events::PodEventSink for WorkerPodEventSink {
+impl klights_kubelet::runtime::events::PodEventSink for WorkerPodEventSink {
     async fn emit_pod_event(
         &self,
-        key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+        key: &klights_kubelet::runtime_types::PodRuntimeKey,
         event_type: &str,
         reason: &str,
         message: &str,
         reporting_component: &str,
         node_name: &str,
-    ) -> Result<(), crate::kubelet::pod_runtime::events::PodEventSinkError> {
+    ) -> Result<(), klights_kubelet::runtime::events::PodEventSinkError> {
         let pod = serde_json::json!({
             "metadata": {
                 "namespace": key.namespace,
@@ -494,7 +447,7 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for WorkerPodEventSink {
         )
         .await
         .map_err(|error| {
-            crate::kubelet::pod_runtime::events::PodEventSinkError::unavailable(error.to_string())
+            klights_kubelet::runtime::events::PodEventSinkError::unavailable(error.to_string())
         })?;
         Ok(())
     }

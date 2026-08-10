@@ -148,25 +148,20 @@ pub fn get_condition_last_transition_time(
 /// Any container exited with non-zero code -> Failed
 /// Any container still running -> Running
 /// All containers created but not started -> Pending
-#[cfg(any(test, feature = "test-support"))]
-pub fn compute_pod_phase(
-    container_states: &[(String, ContainerInfo)],
+pub(crate) fn canonical_container_phase(
+    container_states: impl IntoIterator<Item = (i32, i32)>,
     restart_policy: &str,
 ) -> String {
-    let restart_policy = effective_restart_policy(restart_policy);
+    let restart_policy = effective_restart_policy_value(restart_policy);
 
-    if container_states.is_empty() {
-        // No container state observed yet: pod startup is still in progress.
-        // Do not classify this as terminal for restartPolicy=Never/OnFailure.
-        return "Pending".to_string();
-    }
-
+    let mut observed = false;
     let mut any_running = false;
     let mut any_exited_nonzero = false;
     let mut all_exited_zero = true;
 
-    for (_, container) in container_states {
-        match container.state {
+    for (state, exit_code) in container_states {
+        observed = true;
+        match state {
             1 => {
                 // Running
                 any_running = true;
@@ -174,7 +169,7 @@ pub fn compute_pod_phase(
             }
             2 => {
                 // Exited
-                if container.exit_code != 0 {
+                if exit_code != 0 {
                     any_exited_nonzero = true;
                     all_exited_zero = false;
                 }
@@ -184,6 +179,12 @@ pub fn compute_pod_phase(
                 all_exited_zero = false;
             }
         }
+    }
+
+    if !observed {
+        // No container state observed yet: pod startup is still in progress.
+        // Do not classify this as terminal for restartPolicy=Never/OnFailure.
+        return "Pending".to_string();
     }
 
     // If any container is still running, pod is Running
@@ -213,10 +214,22 @@ pub fn compute_pod_phase(
     "Pending".to_string()
 }
 
-/// Decide whether to restart a container based on restart policy and exit code
 #[cfg(any(test, feature = "test-support"))]
-pub fn should_restart(restart_policy: &str, exit_code: i32) -> bool {
-    match effective_restart_policy(restart_policy) {
+pub fn compute_pod_phase(
+    container_states: &[(String, ContainerInfo)],
+    restart_policy: &str,
+) -> String {
+    canonical_container_phase(
+        container_states
+            .iter()
+            .map(|(_, container)| (container.state, container.exit_code)),
+        restart_policy,
+    )
+}
+
+/// Decide whether to restart a container based on restart policy and exit code
+pub(crate) fn should_restart_container(restart_policy: &str, exit_code: i32) -> bool {
+    match effective_restart_policy_value(restart_policy) {
         "Always" => true,
         "OnFailure" => exit_code != 0,
         "Never" => false,
@@ -225,12 +238,21 @@ pub fn should_restart(restart_policy: &str, exit_code: i32) -> bool {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn effective_restart_policy(restart_policy: &str) -> &str {
+pub fn should_restart(restart_policy: &str, exit_code: i32) -> bool {
+    should_restart_container(restart_policy, exit_code)
+}
+
+pub(crate) fn effective_restart_policy_value(restart_policy: &str) -> &str {
     if restart_policy.is_empty() {
         "Always"
     } else {
         restart_policy
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn effective_restart_policy(restart_policy: &str) -> &str {
+    effective_restart_policy_value(restart_policy)
 }
 
 /// Calculate exponential backoff delay in seconds for container restarts.

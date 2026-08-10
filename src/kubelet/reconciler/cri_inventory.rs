@@ -283,8 +283,7 @@ pub async fn sweep_orphan_pod_artifacts(
     pods_root: std::path::PathBuf,
     live_owners: &HashSet<(String, String, String)>,
 ) -> anyhow::Result<usize> {
-    let dir_ids =
-        crate::kubelet::pod_fs::PodFs::list_subdir_names(file_process, pods_root.clone()).await?;
+    let dir_ids = list_subdir_names(file_process, pods_root.clone()).await?;
 
     let orphans = orphaned_pod_dir_ids(&dir_ids, live_owners);
     let mut removed = 0usize;
@@ -311,6 +310,33 @@ pub async fn sweep_orphan_pod_artifacts(
         tracing::info!(dir = %dir_id, "orphan pod artifact sweep: removed leaked pod dir with no live owner");
     }
     Ok(removed)
+}
+
+async fn list_subdir_names(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    root: std::path::PathBuf,
+) -> anyhow::Result<Vec<String>> {
+    file_process
+        .run_blocking_file("podfs_list_subdir_names", move || {
+            let mut names = Vec::new();
+            match std::fs::read_dir(&root) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        if entry.path().is_dir()
+                            && let Some(name) = entry.file_name().to_str()
+                        {
+                            names.push(name.to_string());
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(anyhow::anyhow!("read dir {}: {error}", root.display()));
+                }
+            }
+            Ok(names)
+        })
+        .await
 }
 
 /// Tear down a cold (CRI-present but untracked) sandbox surfaced by

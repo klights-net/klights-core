@@ -2312,6 +2312,7 @@ dependencies = [
  "klights-leader-api",
  "klights-network-api",
  "klights-node-api",
+ "klights-node-datastore",
  "klights-node-store",
  "klights-pod-api",
  "klights-reconcile-api",
@@ -2324,6 +2325,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
  "time",
  "tokio",
  "tokio-util",
@@ -2331,6 +2333,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "trybuild",
  "uuid",
 ]
 

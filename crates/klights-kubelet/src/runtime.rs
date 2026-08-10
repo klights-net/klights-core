@@ -5,14 +5,38 @@ use tokio_util::sync::CancellationToken;
 use crate::lifecycle::LifecycleCommand;
 use crate::pod_lifecycle_router::LifecycleReplyHandle;
 
+pub(crate) mod active_deadline;
+pub(crate) mod cluster_policy;
 pub mod cri;
+pub mod events;
+pub(crate) mod filesystem;
 pub mod hooks;
+pub(crate) mod hostports;
 pub mod images;
+pub(crate) mod init_container_status;
+pub(crate) mod lifecycle_commands;
+pub(crate) mod network;
+pub(crate) mod orphan_stop;
+pub(crate) mod pod_identity;
+pub(crate) mod probes;
 pub mod recovery;
+pub(crate) mod retry;
+pub(crate) mod service;
+pub(crate) mod slot_admission;
+pub(crate) mod startup_finalization;
+pub(crate) mod status_emitter;
+pub(crate) mod status_helpers;
+pub(crate) mod status_projection;
 pub mod store;
+pub(crate) mod volumes;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+
+#[cfg(test)]
+mod test_repository;
+#[cfg(test)]
+mod tests;
 
 pub use crate::runtime_reconcile_hint::RuntimeReconcileHint;
 pub use crate::runtime_types::{

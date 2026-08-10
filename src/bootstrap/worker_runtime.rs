@@ -504,8 +504,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     );
     let pod_slot_store = node_local.pod_slots();
     let pod_slot_events = node_local.pod_slot_events();
-    let pod_subsystem = crate::kubelet::pod_subsystem::PodSubsystem::new(
-        crate::kubelet::pod_subsystem::PodSubsystemConfig {
+    let pod_subsystem = klights_kubelet::pod_subsystem::PodSubsystem::new(
+        klights_kubelet::pod_subsystem::PodSubsystemConfig {
             pod_query: pod_query.clone(),
             pod_network_assignment: pod_network_assignment.clone(),
             pod_status_writer: pod_status_writer.clone(),
@@ -534,10 +534,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             }),
             containerd_ns: config.containerd_namespace.clone(),
             lifecycle_tx: pod_lifecycle_tx,
-            probe_manager: None,
             datapath: Some(kubelet_runtime_network.datapath.clone()),
             service_router: Some(services.clone()),
-            runtime_service: None,
             runtime_store: std::sync::Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(
                     pod_runtime_store.clone(),
@@ -576,10 +574,10 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         .await
         .context("pod lifecycle executor construction")?;
     pod_subsystem
-        .lifecycle_router
+        .lifecycle_router()
         .set_work_executor(pod_executor);
 
-    let plr = pod_subsystem.lifecycle_router.clone();
+    let plr = pod_subsystem.lifecycle_router().clone();
     pod_workqueue.set_lifecycle_router_for_node(plr.clone(), config.node_name.clone());
     worker_store.set_pod_lifecycle_router(plr.clone());
     let kubelet_config = crate::kubelet::context::KubeletConfig::try_new(

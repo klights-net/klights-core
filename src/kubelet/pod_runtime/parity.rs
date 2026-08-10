@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig;
 use crate::kubelet::pod_cluster_runtime::ClusterRuntimeView;
-use crate::kubelet::pod_runtime::service::PodRuntimeKey;
+use klights_kubelet::runtime_types::PodRuntimeKey;
 
 use super::events::PodEventSink;
 use super::filesystem::PodFilesystem;

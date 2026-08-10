@@ -50,6 +50,7 @@ impl NodeLocalStores {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)] // Retained node-store constructor fixture.
     pub(crate) fn from_executor(executor: DbExecutor) -> Result<Self> {
         Self::from_executor_with_clock(executor, Arc::new(klights_supervisor::SystemWallClock))
     }

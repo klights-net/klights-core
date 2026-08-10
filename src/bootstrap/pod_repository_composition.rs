@@ -1572,13 +1572,13 @@ impl klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer
 {
     async fn finalize_after_actor_cleanup(
         &self,
-        key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
-    ) -> anyhow::Result<crate::kubelet::pod_runtime::service::PodDeletionFinalizeResult> {
+        key: &klights_kubelet::runtime_types::PodRuntimeKey,
+    ) -> anyhow::Result<klights_kubelet::runtime_types::PodDeletionFinalizeResult> {
         let result = self.inner.finalize_after_actor_cleanup(key).await?;
         if matches!(
             result,
-            crate::kubelet::pod_runtime::service::PodDeletionFinalizeResult::DeletedOrAlreadyGone
-                | crate::kubelet::pod_runtime::service::PodDeletionFinalizeResult::Queued
+            klights_kubelet::runtime_types::PodDeletionFinalizeResult::DeletedOrAlreadyGone
+                | klights_kubelet::runtime_types::PodDeletionFinalizeResult::Queued
         ) {
             self.deferred_runtime.forget(&key.uid);
         }

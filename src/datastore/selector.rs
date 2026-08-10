@@ -164,6 +164,7 @@ pub(crate) fn sqlite_passive_read_ports(db: &sqlite::Datastore) -> PassiveReadPo
 /// erased datastore handle. This keeps concrete cluster storage out of the
 /// kubelet-owned test surface.
 #[cfg(test)]
+#[allow(dead_code)] // P7.C retains the unregistered root parity fixture.
 pub(crate) async fn sqlite_in_memory_store_for_test() -> (sqlite::Datastore, super::DatastoreHandle)
 {
     sqlite::Datastore::new_in_memory_with_handle().await

@@ -1,0 +1,29 @@
+error[E0603]: module `pod_fs` is private
+ --> tests/ui/p7_b_private_leaves.rs:1:22
+  |
+1 | use klights_kubelet::pod_fs::PodFs;
+  |                      ^^^^^^ private module
+  |
+note: the module `pod_fs` is defined here
+ --> src/lib.rs
+  |
+  | mod pod_fs;
+  | ^^^^^^^^^^
+
+error[E0603]: module `service` is private
+ --> tests/ui/p7_b_private_leaves.rs:3:31
+  |
+3 | use klights_kubelet::runtime::service::RealPodRuntimeService;
+  |                               ^^^^^^^ private module
+  |
+note: the module `service` is defined here
+ --> src/runtime.rs
+  |
+  | pub(crate) mod service;
+  | ^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0616]: field `runtime` of struct `PodSubsystem` is private
+ --> tests/ui/p7_b_private_leaves.rs:6:24
+  |
+6 |     let _ = &subsystem.runtime;
+  |                        ^^^^^^^ private field

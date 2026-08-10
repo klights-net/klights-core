@@ -6,8 +6,10 @@ use crate::pod_status_logic::{
 };
 use serde_json::Value;
 
-#[cfg(any(test, feature = "test-support"))]
-pub fn cri_timestamp_from_ns(ns: i64, operation_now: chrono::DateTime<chrono::Utc>) -> String {
+pub(crate) fn canonical_cri_timestamp_from_ns(
+    ns: i64,
+    operation_now: chrono::DateTime<chrono::Utc>,
+) -> String {
     if ns <= 0 {
         return klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now);
     }
@@ -18,6 +20,11 @@ pub fn cri_timestamp_from_ns(ns: i64, operation_now: chrono::DateTime<chrono::Ut
     chrono::DateTime::from_timestamp(secs, sub_ns)
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S.%fZ").to_string())
         .unwrap_or_else(|| klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn cri_timestamp_from_ns(ns: i64, operation_now: chrono::DateTime<chrono::Utc>) -> String {
+    canonical_cri_timestamp_from_ns(ns, operation_now)
 }
 
 /// Build status object for completed init container
@@ -68,6 +75,17 @@ pub struct EphemeralContainerStatusFixture<'a> {
     pub image_ref: &'a str,
 }
 
+pub(crate) struct CanonicalEphemeralContainerStatusInput<'a> {
+    pub(crate) container_name: &'a str,
+    pub(crate) container_id: Option<&'a str>,
+    pub(crate) state: i32,
+    pub(crate) started_at_ns: i64,
+    pub(crate) finished_at_ns: i64,
+    pub(crate) exit_code: i32,
+    pub(crate) image: &'a str,
+    pub(crate) image_ref: &'a str,
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub fn build_ephemeral_container_status(
     fixture: EphemeralContainerStatusFixture<'_>,
@@ -83,18 +101,47 @@ pub fn build_ephemeral_container_status(
         image,
         image_ref,
     } = fixture;
+    canonical_ephemeral_container_status(
+        CanonicalEphemeralContainerStatusInput {
+            container_name,
+            container_id,
+            state,
+            started_at_ns,
+            finished_at_ns,
+            exit_code,
+            image,
+            image_ref,
+        },
+        operation_now,
+    )
+}
+
+pub(crate) fn canonical_ephemeral_container_status(
+    input: CanonicalEphemeralContainerStatusInput<'_>,
+    operation_now: chrono::DateTime<chrono::Utc>,
+) -> Value {
+    let CanonicalEphemeralContainerStatusInput {
+        container_name,
+        container_id,
+        state,
+        started_at_ns,
+        finished_at_ns,
+        exit_code,
+        image,
+        image_ref,
+    } = input;
     let state_obj = match state {
         1 => serde_json::json!({
             "running": {
-                "startedAt": cri_timestamp_from_ns(started_at_ns, operation_now)
+                "startedAt": canonical_cri_timestamp_from_ns(started_at_ns, operation_now)
             }
         }),
         2 => serde_json::json!({
             "terminated": {
                 "exitCode": exit_code,
                 "reason": if exit_code == 0 { "Completed" } else { "Error" },
-                "startedAt": cri_timestamp_from_ns(started_at_ns, operation_now),
-                "finishedAt": cri_timestamp_from_ns(finished_at_ns, operation_now),
+                "startedAt": canonical_cri_timestamp_from_ns(started_at_ns, operation_now),
+                "finishedAt": canonical_cri_timestamp_from_ns(finished_at_ns, operation_now),
             }
         }),
         _ => serde_json::json!({

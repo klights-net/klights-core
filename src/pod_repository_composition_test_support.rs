@@ -136,15 +136,15 @@ async fn integration_finalize_pod_after_actor_cleanup(
     name: &str,
     uid: &str,
 ) -> anyhow::Result<IntegrationPodFinalizationOutcome> {
-    let key = crate::kubelet::pod_runtime::service::PodRuntimeKey::new(namespace, name, uid);
+    let key = klights_kubelet::runtime_types::PodRuntimeKey::new(namespace, name, uid);
     Ok(match finalizer.finalize_after_actor_cleanup(&key).await? {
-        crate::kubelet::pod_runtime::service::PodDeletionFinalizeResult::DeletedOrAlreadyGone => {
+        klights_kubelet::runtime_types::PodDeletionFinalizeResult::DeletedOrAlreadyGone => {
             IntegrationPodFinalizationOutcome::DeletedOrAlreadyGone
         }
-        crate::kubelet::pod_runtime::service::PodDeletionFinalizeResult::Queued => {
+        klights_kubelet::runtime_types::PodDeletionFinalizeResult::Queued => {
             IntegrationPodFinalizationOutcome::Queued
         }
-        crate::kubelet::pod_runtime::service::PodDeletionFinalizeResult::FinalizersPending => {
+        klights_kubelet::runtime_types::PodDeletionFinalizeResult::FinalizersPending => {
             IntegrationPodFinalizationOutcome::FinalizersPending
         }
     })
@@ -1757,7 +1757,7 @@ impl klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer
 {
     async fn finalize_after_actor_cleanup(
         &self,
-        _key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+        _key: &klights_kubelet::runtime_types::PodRuntimeKey,
     ) -> anyhow::Result<klights_kubelet::runtime_types::PodDeletionFinalizeResult> {
         use klights_kubelet::runtime_types::PodDeletionFinalizeResult;
         match self.outcome {
@@ -1787,7 +1787,7 @@ pub async fn run_deferred_runtime_cleanup_case(
             deferred.clone(),
         );
     let result = finalizer
-        .finalize_after_actor_cleanup(&crate::kubelet::pod_runtime::service::PodRuntimeKey::new(
+        .finalize_after_actor_cleanup(&klights_kubelet::runtime_types::PodRuntimeKey::new(
             "default",
             "deferred-runtime",
             uid,

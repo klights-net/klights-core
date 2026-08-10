@@ -394,6 +394,7 @@ mod tests {
             })
         }
 
+        #[allow(clippy::type_complexity)] // Exact paused-concurrency test fixture tuple.
         fn blocked_first_two() -> (
             Arc<Self>,
             Arc<tokio::sync::Notify>,
