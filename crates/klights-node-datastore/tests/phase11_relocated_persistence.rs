@@ -271,6 +271,24 @@ async fn node_meta_mismatch_refuses_boot() {
 }
 
 #[tokio::test]
+async fn sqlite_store_implements_focused_node_identity() {
+    let db = fresh().await;
+    fn assert_identity_trait(_: &dyn NodeIdentity) {}
+
+    let identity: &dyn NodeIdentity = &db.identity;
+    assert_identity_trait(identity);
+    assert_eq!(identity.backend_name(), "sqlite");
+    identity
+        .set_node_meta("node_uid", "node-a")
+        .await
+        .expect("write meta through focused trait object");
+    assert_eq!(
+        identity.get_node_meta("node_uid").await.unwrap(),
+        Some("node-a".to_string())
+    );
+}
+
+#[tokio::test]
 async fn pod_runtime_is_uid_keyed_and_same_name_replacements_are_distinct() {
     let db = fresh().await;
     for uid in ["uid-old", "uid-new"] {

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::bootstrap::node_store::NodeLocalStores;
 use crate::datastore::backend_kind::BackendKind;
@@ -16,8 +16,12 @@ pub(crate) async fn open_node_local(
 ) -> Result<NodeLocalStores> {
     match kind {
         BackendKind::Sqlite => open_sqlite(path, supervisor, key_file, connection_key).await,
-        BackendKind::Redb => match crate::datastore::node_local::redb::open().await? {},
+        BackendKind::Redb => match open_redb().await? {},
     }
+}
+
+async fn open_redb() -> Result<std::convert::Infallible> {
+    bail!("node-local redb backend not implemented yet")
 }
 
 async fn open_sqlite(

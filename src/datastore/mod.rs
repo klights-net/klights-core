@@ -7,7 +7,6 @@
 pub mod backend;
 pub mod backend_kind;
 pub mod domain;
-pub mod node_local;
 pub mod redb;
 pub(crate) mod selector;
 pub mod snapshot;
