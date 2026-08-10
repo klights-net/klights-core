@@ -1540,15 +1540,6 @@ impl crate::datastore::NetworkMetadataStore for RedbDatastore {
 
 #[async_trait]
 impl crate::datastore::ReplicationStore for RedbDatastore {
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
-    async fn apply_replicated_command(
-        &self,
-        command: klights_cluster_core::command::StorageCommand,
-        meta: klights_cluster_core::command::CommandMeta,
-    ) -> Result<()> {
-        self.0.apply_legacy_test_command(command, meta).await
-    }
-
     async fn replace_replicated_resource_state(
         &self,
         entries: Vec<klights_cluster_core::SnapshotRestoreOperation>,

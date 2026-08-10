@@ -2,66 +2,77 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-#[cfg(any(test, feature = "pod-repository-test-support"))]
-use klights_cluster_core::CommandMeta;
 use klights_cluster_core::{
     LogApplyAppliedOutboxRow, LogApplyPodCleanupIntentRow, OutboxApplyError as OutboxDeliveryError,
     OutboxApplyOutcome as OutboxDeliveryResult, PatchKind, Resource, ResourceBatchOperation,
-    ResourcePatchRequest, ResourcePreconditions, StorageCommand, WatchReplayPosition,
+    ResourcePatchRequest, ResourcePreconditions, StorageCommand,
 };
 use serde_json::Value;
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 use tokio::sync::broadcast;
 
 #[cfg(any(test, feature = "pod-repository-test-support"))]
-use crate::datastore::ReplicatedCreateOptions;
-#[cfg(any(test, feature = "pod-repository-test-support"))]
 use crate::datastore::WatchTopic;
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::types::{
-    CatchUpResource, ListPageRequest, PositionedWatchReplayRead, ReplicatedSnapshotMetadata,
-    ResourceList, ResourceListQuery, SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
+    CatchUpResource, ListPageRequest, ResourceList, ResourceListQuery, SnapshotAtRv,
+    WatchReplayFloor, WatchReplayRead, WatchTarget,
 };
 use klights_cluster_datastore::errors::DatastoreError;
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_cluster_store::StagedPostCommit;
 
 use super::SequencedDatastore;
-#[cfg(any(test, feature = "pod-repository-test-support"))]
-use super::apply_command_to_backend;
 
 const NODE_LEASE_RENEW_OPERATION: &str = "LeaseRenew";
 
-fn ensure_mark_delete_timestamps(
-    data: &mut Value,
-    grace_seconds: i64,
-    operation_now: chrono::DateTime<chrono::Utc>,
-) {
-    let Some(metadata) = data.get_mut("metadata").and_then(Value::as_object_mut) else {
-        return;
-    };
-    if metadata
-        .get("deletionTimestamp")
-        .and_then(|timestamp| timestamp.as_str())
-        .is_none_or(str::is_empty)
-    {
-        metadata.insert(
-            "deletionTimestamp".to_string(),
-            Value::String(klights_cluster_core::k8s_time::format_legacy_timestamp(
-                operation_now,
-            )),
-        );
+fn command_resource(
+    operation: &'static str,
+    result: klights_leader_api::ResourceCommandResult,
+) -> Result<Resource> {
+    match result {
+        klights_leader_api::ResourceCommandResult::Resource(resource) => Ok(resource),
+        klights_leader_api::ResourceCommandResult::Ack { .. } => Err(anyhow::anyhow!(
+            "{operation}: canonical resource command returned an acknowledgement"
+        )),
     }
-    metadata
-        .entry("deletionGracePeriodSeconds".to_string())
-        .or_insert_with(|| Value::from(grace_seconds));
 }
 
-fn reject_application_committed_apply<T>(operation: &'static str) -> Result<T> {
-    Err(anyhow::anyhow!(
-        "sequenced datastore rejects application-side committed apply `{operation}`; \
-         this operation is reserved for the private passive Raft state-machine backend"
-    ))
+fn command_ack(
+    operation: &'static str,
+    result: klights_leader_api::ResourceCommandResult,
+) -> Result<i64> {
+    match result {
+        klights_leader_api::ResourceCommandResult::Ack { resource_version } => Ok(resource_version),
+        klights_leader_api::ResourceCommandResult::Resource(_) => Err(anyhow::anyhow!(
+            "{operation}: canonical resource command returned a resource"
+        )),
+    }
+}
+
+fn legacy_outbox_operation(
+    operation: &str,
+) -> std::result::Result<klights_leader_api::OutboxDeliveryOperation, OutboxDeliveryError> {
+    klights_leader_api::OutboxDeliveryOperation::try_from_wire_name(operation)
+        .map_err(|error| OutboxDeliveryError::ConflictTerminal(error.to_string()))
+}
+
+fn legacy_outbox_error(error: klights_leader_api::OutboxDeliveryError) -> OutboxDeliveryError {
+    match error {
+        klights_leader_api::OutboxDeliveryError::NotFound(message) => {
+            OutboxDeliveryError::NotFound(message)
+        }
+        klights_leader_api::OutboxDeliveryError::UidMismatch { expected, actual } => {
+            OutboxDeliveryError::UidMismatch { expected, actual }
+        }
+        klights_leader_api::OutboxDeliveryError::InvalidRequest { field, message } => {
+            OutboxDeliveryError::ConflictTerminal(format!("invalid {field}: {message}"))
+        }
+        klights_leader_api::OutboxDeliveryError::ConflictTerminal(message) => {
+            OutboxDeliveryError::ConflictTerminal(message)
+        }
+        other => OutboxDeliveryError::Retryable(other.to_string()),
+    }
 }
 
 #[async_trait]
@@ -111,38 +122,6 @@ impl DatastoreBackend for SequencedDatastore {
         self.passive.broadcast_watch_event(pending);
     }
 
-    async fn replace_replicated_resource_state(
-        &self,
-        _entries: Vec<klights_cluster_core::SnapshotRestoreOperation>,
-        _current_rv: i64,
-        _watch_event_high_water: Option<i64>,
-        _watch_replay_floors: Option<Vec<WatchReplayFloor>>,
-        _metadata: Option<ReplicatedSnapshotMetadata>,
-    ) -> Result<()> {
-        reject_application_committed_apply("replace_replicated_resource_state")
-    }
-
-    async fn apply_log_apply_commit(
-        &self,
-        _commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<()> {
-        reject_application_committed_apply("apply_log_apply_commit")
-    }
-
-    async fn apply_raft_log_apply_commit(
-        &self,
-        _commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_cluster_store::StorageCommandResult> {
-        reject_application_committed_apply("apply_raft_log_apply_commit")
-    }
-
-    async fn apply_raft_log_apply_commit_receipt(
-        &self,
-        _commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_cluster_store::CommittedRaftApplyReceipt> {
-        reject_application_committed_apply("apply_raft_log_apply_commit_receipt")
-    }
-
     async fn create_resource(
         &self,
         api_version: &str,
@@ -158,16 +137,10 @@ impl DatastoreBackend for SequencedDatastore {
             name: name.to_string(),
             data,
         };
-        self.propose_command(command).await?;
-        self
-            .passive
-            .get_resource(api_version, kind, namespace, name)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "raft-routed create_resource: row missing after commit for {api_version}/{kind}/{name}"
-                )
-            })
+        command_resource(
+            "create_resource",
+            self.submit_resource_command(command).await?,
+        )
     }
     async fn get_resource(
         &self,
@@ -252,16 +225,10 @@ impl DatastoreBackend for SequencedDatastore {
             expected_rv,
             preconditions,
         };
-        self.propose_command(command).await?;
-        self
-            .passive
-            .get_resource(api_version, kind, namespace, name)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "raft-routed update_resource: row missing after commit for {api_version}/{kind}/{name}"
-                )
-            })
+        command_resource(
+            "update_resource",
+            self.submit_resource_command(command).await?,
+        )
     }
     async fn update_resource_with_preconditions(
         &self,
@@ -282,16 +249,10 @@ impl DatastoreBackend for SequencedDatastore {
             expected_rv,
             preconditions,
         };
-        self.propose_command(command).await?;
-        self
-            .passive
-            .get_resource(api_version, kind, namespace, name)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "raft-routed update_resource_with_preconditions: row missing after commit for {api_version}/{kind}/{name}"
-                )
-            })
+        command_resource(
+            "update_resource_with_preconditions",
+            self.submit_resource_command(command).await?,
+        )
     }
     async fn update_main_resource_with_preconditions(
         &self,
@@ -312,16 +273,10 @@ impl DatastoreBackend for SequencedDatastore {
             expected_rv,
             preconditions,
         };
-        self.propose_command(command).await?;
-        self
-            .passive
-            .get_resource(api_version, kind, namespace, name)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "raft-routed update_main_resource_with_preconditions: row missing after commit for {api_version}/{kind}/{name}"
-                )
-            })
+        command_resource(
+            "update_main_resource_with_preconditions",
+            self.submit_resource_command(command).await?,
+        )
     }
 
     async fn apply_resource_batch(&self, operations: Vec<ResourceBatchOperation>) -> Result<()> {
@@ -329,7 +284,10 @@ impl DatastoreBackend for SequencedDatastore {
             return Ok(());
         }
         let command = StorageCommand::ApplyResourceBatch { operations };
-        self.propose_command(command).await?;
+        command_ack(
+            "apply_resource_batch",
+            self.submit_resource_command(command).await?,
+        )?;
         Ok(())
     }
 
@@ -355,16 +313,10 @@ impl DatastoreBackend for SequencedDatastore {
             },
             observed_status_stamp: None,
         };
-        self.propose_command(command).await?;
-        self
-            .passive
-            .get_resource(api_version, kind, namespace, name)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "raft-routed update_status_only: row missing after commit for {api_version}/{kind}/{name}"
-                )
-            })
+        command_resource(
+            "update_status_only",
+            self.submit_resource_command(command).await?,
+        )
     }
     async fn update_status_only_with_preconditions(
         &self,
@@ -386,16 +338,10 @@ impl DatastoreBackend for SequencedDatastore {
             preconditions,
             observed_status_stamp: None,
         };
-        self.propose_command(command).await?;
-        self
-            .passive
-            .get_resource(api_version, kind, namespace, name)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "raft-routed update_status_only_with_preconditions: row missing after commit for {api_version}/{kind}/{name}"
-                )
-            })
+        command_resource(
+            "update_status_only_with_preconditions",
+            self.submit_resource_command(command).await?,
+        )
     }
 
     async fn mark_for_delete_without_watch(
@@ -435,7 +381,11 @@ impl DatastoreBackend for SequencedDatastore {
             return Ok(Some(current));
         }
 
-        ensure_mark_delete_timestamps(&mut current_data, grace_seconds, self.wall_clock.now_utc());
+        crate::control_plane::client::local::ensure_mark_delete_timestamps(
+            &mut current_data,
+            grace_seconds,
+            self.wall_clock.now_utc(),
+        );
         let expected_rv = preconditions.resource_version.unwrap_or(0);
         let command = StorageCommand::UpdateResource {
             api_version: api_version.to_string(),
@@ -446,16 +396,11 @@ impl DatastoreBackend for SequencedDatastore {
             expected_rv,
             preconditions,
         };
-        self.propose_command(command).await?;
-        self.passive
-            .get_resource(api_version, kind, namespace, name)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "raft-routed mark_for_delete_without_watch: row missing after commit for {api_version}/{kind}/{name}"
-                )
-            })
-            .map(Some)
+        command_resource(
+            "mark_for_delete_without_watch",
+            self.submit_resource_command(command).await?,
+        )
+        .map(Some)
     }
     async fn delete_resource(
         &self,
@@ -508,12 +453,16 @@ impl DatastoreBackend for SequencedDatastore {
             name: name.to_string(),
             preconditions,
         };
-        self.propose_command(command).await?;
-        Ok(self
-            .passive
-            .get_current_resource_version()
-            .await
-            .unwrap_or(0))
+        if api_version == "v1" && kind == "Pod" {
+            return command_ack(
+                "delete_resource_with_preconditions_observed_rv",
+                self.submit_resource_command(command).await?,
+            );
+        }
+        command_ack(
+            "delete_resource_with_preconditions_observed_rv",
+            self.submit_resource_command(command).await?,
+        )
     }
 
     async fn delete_resource_without_watch_with_tombstone(
@@ -533,33 +482,10 @@ impl DatastoreBackend for SequencedDatastore {
             preconditions,
             grace_seconds,
         };
-        let applied = self.propose_command(command).await?;
-        let committed_rv = applied.applied_rv.ok_or_else(|| {
-            anyhow::anyhow!(
-                "raft-routed delete_resource_without_watch_with_tombstone: committed resourceVersion missing for {api_version}/{kind}/{name}"
-            )
-        })?;
-        match applied.applied_mutation {
-            Some(klights_cluster_store::AppliedMutation::Resource(mut resource)) => {
-                let Some(metadata) = std::sync::Arc::make_mut(&mut resource.data)
-                    .pointer_mut("/metadata")
-                    .and_then(serde_json::Value::as_object_mut)
-                else {
-                    return Err(anyhow::anyhow!(
-                        "raft-routed delete_resource_without_watch_with_tombstone: committed tombstone result missing metadata for {api_version}/{kind}/{name}"
-                    ));
-                };
-                resource.resource_version = committed_rv;
-                metadata.insert(
-                    "resourceVersion".to_string(),
-                    serde_json::Value::String(committed_rv.to_string()),
-                );
-                Ok(resource)
-            }
-            None => Err(anyhow::anyhow!(
-                "raft-routed delete_resource_without_watch_with_tombstone: committed tombstone result missing for {api_version}/{kind}/{name}"
-            )),
-        }
+        command_resource(
+            "delete_resource_without_watch_with_tombstone",
+            self.submit_resource_command(command).await?,
+        )
     }
 
     async fn get_current_resource_version(&self) -> Result<i64> {
@@ -570,10 +496,10 @@ impl DatastoreBackend for SequencedDatastore {
             name: name.to_string(),
             data: data.clone(),
         };
-        self.propose_command(command).await?;
-        self.passive.get_namespace(name).await?.ok_or_else(|| {
-            anyhow::anyhow!("raft-routed create_namespace: row missing after commit for {name}")
-        })
+        command_resource(
+            "create_namespace",
+            self.submit_resource_command(command).await?,
+        )
     }
     async fn get_namespace(&self, name: &str) -> Result<Option<Resource>> {
         self.passive.get_namespace(name).await
@@ -608,17 +534,20 @@ impl DatastoreBackend for SequencedDatastore {
             data: data.clone(),
             expected_rv,
         };
-        self.propose_command(command).await?;
-        self.passive.get_namespace(name).await?.ok_or_else(|| {
-            anyhow::anyhow!("raft-routed update_namespace: row missing after commit for {name}")
-        })
+        command_resource(
+            "update_namespace",
+            self.submit_resource_command(command).await?,
+        )
     }
     async fn delete_namespace_contents(&self, name: &str) -> Result<()> {
         let command = StorageCommand::DeleteNamespaceContents {
             name: name.to_string(),
         };
-        self.propose_command(command).await?;
-        Ok(())
+        command_ack(
+            "delete_namespace_contents",
+            self.submit_resource_command(command).await?,
+        )
+        .map(|_| ())
     }
     async fn delete_namespace(&self, name: &str) -> Result<()> {
         self.delete_namespace_observed_rv(name).await.map(|_| ())
@@ -628,8 +557,10 @@ impl DatastoreBackend for SequencedDatastore {
         let command = StorageCommand::DeleteNamespace {
             name: name.to_string(),
         };
-        self.propose_command(command).await?;
-        self.passive.get_current_resource_version().await
+        command_ack(
+            "delete_namespace_observed_rv",
+            self.submit_resource_command(command).await?,
+        )
     }
     async fn find_owned_resources(
         &self,
@@ -687,19 +618,11 @@ impl DatastoreBackend for SequencedDatastore {
             .await
     }
     async fn advance_resource_version_after(&self, min_rv: i64) -> Result<i64> {
-        let before_rv = self
-            .passive
-            .get_current_resource_version()
-            .await
-            .unwrap_or(0);
-        let new_rv = before_rv.saturating_add(1).max(min_rv.saturating_add(1));
-        self.propose_command(StorageCommand::AdvanceResourceVersion { min_rv, new_rv })
-            .await?;
-        Ok(self
-            .passive
-            .get_current_resource_version()
-            .await
-            .unwrap_or(new_rv))
+        klights_cluster_store::ClusterWatchMaintenance::advance_resource_version_after(
+            self.maintenance.as_ref(),
+            min_rv,
+        )
+        .await
     }
     async fn list_namespace_resources(&self, namespace: &str) -> Result<Vec<Resource>> {
         self.passive.list_namespace_resources(namespace).await
@@ -756,33 +679,6 @@ impl DatastoreBackend for SequencedDatastore {
             .await
     }
 
-    async fn list_watch_events_after_position_checked_bounded(
-        &self,
-        targets: &[WatchTarget],
-        position: WatchReplayPosition,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
-        self.passive
-            .list_watch_events_after_position_checked_bounded(targets, position, limit)
-            .await
-    }
-
-    async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition> {
-        self.passive.current_watch_replay_position().await
-    }
-
-    async fn snapshot_resources_at_position(
-        &self,
-        targets: &[WatchTarget],
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        position: WatchReplayPosition,
-    ) -> Result<SnapshotAtRv> {
-        self.passive
-            .snapshot_resources_at_position(targets, label_selector, field_selector, position)
-            .await
-    }
-
     async fn list_raw_watch_events_since_checked_bounded(
         &self,
         targets: &[WatchTarget],
@@ -791,17 +687,6 @@ impl DatastoreBackend for SequencedDatastore {
     ) -> Result<WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
         self.passive
             .list_raw_watch_events_since_checked_bounded(targets, since_rv, limit)
-            .await
-    }
-
-    async fn list_raw_watch_events_after_position_checked_bounded(
-        &self,
-        targets: &[WatchTarget],
-        position: WatchReplayPosition,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<PositionedWatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
-        self.passive
-            .list_raw_watch_events_after_position_checked_bounded(targets, position, limit)
             .await
     }
 
@@ -860,20 +745,15 @@ impl DatastoreBackend for SequencedDatastore {
         cluster_cidr: &str,
         node_ip: &str,
     ) -> Result<klights_cluster_store::StoredNodeSubnet> {
-        self.propose_command(StorageCommand::AllocateNodeSubnet {
-            node_name: node_name.to_string(),
-            subnet: cluster_cidr.to_string(),
-            node_ip: node_ip.to_string(),
-        })
-        .await?;
-        self.passive
-            .get_node_subnet(node_name)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "raft-routed allocate_node_subnet: row missing after commit for {node_name}"
-                )
-            })
+        use klights_leader_api::LeaderNodeSubnetAllocation as _;
+        let request = klights_leader_api::NodeSubnetAllocationRequest::try_new(
+            node_name,
+            cluster_cidr,
+            node_ip,
+        )?;
+        let result = self.network.allocate_node_subnet(request).await?;
+        crate::control_plane::client::legacy_node_subnet(result.into_subnet())
+            .map_err(anyhow::Error::new)
     }
     async fn update_node_peer_attributes(
         &self,
@@ -881,60 +761,75 @@ impl DatastoreBackend for SequencedDatastore {
         mode: klights_types::NodePeerMode,
         hostport_range: Option<klights_types::HostPortRange>,
     ) -> Result<()> {
-        let mode_value = match mode {
-            klights_types::NodePeerMode::Root => "root",
-            klights_types::NodePeerMode::Rootless => "rootless",
-        }
-        .to_string();
-        self.propose_command(StorageCommand::UpdateNodePeerAttributes {
-            node_name: node_name.to_string(),
-            mode: mode_value,
-            hostport_range: hostport_range.map(|range| range.to_string()),
-        })
-        .await?;
-        Ok(())
+        self.network
+            .update_node_peer_attributes(node_name, mode, hostport_range)
+            .await
+            .map_err(anyhow::Error::new)
     }
     async fn update_node_dataplane(
         &self,
         metadata: klights_cluster_store::DataplanePeerMetadata,
     ) -> Result<()> {
-        let command = StorageCommand::UpdateNodeDataplane {
-            node_name: metadata.node_name.clone(),
-            mode: metadata.mode.as_str().to_string(),
-            encryption: metadata.encryption.as_str().to_string(),
-            public_key: metadata.public_key.as_ref().map(ToString::to_string),
-            endpoint: metadata.endpoint.to_string(),
-            port: metadata.port,
-        };
-        self.propose_command(command).await?;
-        Ok(())
+        use klights_leader_api::LeaderNetworkTopologyCommand as _;
+        let metadata = crate::control_plane::client::focused_dataplane(metadata)?;
+        self.network
+            .register_node_dataplane(metadata)
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn get_node_dataplane(
         &self,
         node_name: &str,
     ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>> {
-        self.passive.get_node_dataplane(node_name).await
+        use klights_leader_api::LeaderNetworkTopologyQuery as _;
+        let request = klights_leader_api::NodeDataplaneQuery::try_new(node_name)?;
+        self.network
+            .get_node_dataplane(request)
+            .await?
+            .into_option()
+            .map(crate::control_plane::client::legacy_dataplane)
+            .transpose()
+            .map_err(anyhow::Error::new)
     }
 
     async fn get_node_subnet(
         &self,
         node_name: &str,
     ) -> Result<Option<klights_cluster_store::StoredNodeSubnet>> {
-        self.passive.get_node_subnet(node_name).await
+        use klights_leader_api::LeaderNetworkTopologyQuery as _;
+        let request = klights_leader_api::NodeSubnetQuery::try_new(node_name)?;
+        self.network
+            .get_node_subnet(request)
+            .await?
+            .into_option()
+            .map(crate::control_plane::client::legacy_node_subnet)
+            .transpose()
+            .map_err(anyhow::Error::new)
     }
     async fn list_peer_subnets(
         &self,
         request: klights_cluster_store::PeerTopologyRequest,
     ) -> Result<Vec<klights_cluster_store::StoredNodeSubnet>> {
-        self.passive.list_peer_subnets(request).await
+        use klights_leader_api::LeaderNetworkTopologyQuery as _;
+        let node_name = request
+            .excluded_node_name()
+            .ok_or_else(|| anyhow::anyhow!("focused peer query requires an excluded node"))?;
+        let request = klights_leader_api::PeerSubnetsQuery::try_new(node_name.as_str())?;
+        self.network
+            .list_peer_subnets(request)
+            .await?
+            .into_vec()
+            .into_iter()
+            .map(crate::control_plane::client::legacy_node_subnet)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::new)
     }
     async fn delete_node_subnet(&self, node_name: &str) -> Result<()> {
-        self.propose_command(StorageCommand::DeleteNodeSubnet {
-            node_name: node_name.to_string(),
-        })
-        .await?;
-        Ok(())
+        self.network
+            .delete_node_subnet(node_name)
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn move_pod_to_cleanup_intent(
@@ -945,24 +840,26 @@ impl DatastoreBackend for SequencedDatastore {
         pod_uid: &str,
         reason: &str,
     ) -> Result<()> {
-        self.propose_command(StorageCommand::MovePodToCleanupIntent {
-            node_name: node_name.to_string(),
-            namespace: namespace.to_string(),
-            pod_name: pod_name.to_string(),
-            pod_uid: pod_uid.to_string(),
-            reason: reason.to_string(),
-        })
-        .await?;
-        Ok(())
+        self.pod_cleanup
+            .move_intent(node_name, namespace, pod_name, pod_uid, reason)
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn list_pod_cleanup_intents_for_node(
         &self,
         node_name: &str,
     ) -> Result<Vec<LogApplyPodCleanupIntentRow>> {
-        self.passive
-            .list_pod_cleanup_intents_for_node(node_name)
-            .await
+        use klights_leader_api::LeaderPodCleanupIntents as _;
+        let request = klights_leader_api::PodCleanupIntentListRequest::try_new(node_name)?;
+        let intents = self
+            .pod_cleanup
+            .list_pod_cleanup_intents(request)
+            .await?
+            .into_iter()
+            .map(crate::control_plane::client::local::legacy_pod_cleanup_intent)
+            .collect::<Vec<_>>();
+        Ok(intents)
     }
 
     async fn delete_pod_cleanup_intent(
@@ -973,23 +870,21 @@ impl DatastoreBackend for SequencedDatastore {
         pod_uid: &str,
         reason: &str,
     ) -> Result<()> {
-        self.propose_command(StorageCommand::DeletePodCleanupIntent {
-            node_name: node_name.to_string(),
-            namespace: namespace.to_string(),
-            pod_name: pod_name.to_string(),
-            pod_uid: pod_uid.to_string(),
-            reason: reason.to_string(),
-        })
-        .await?;
-        Ok(())
+        use klights_leader_api::LeaderPodCleanupIntents as _;
+        let request = klights_leader_api::PodCleanupIntentAckRequest::try_new(
+            node_name, namespace, pod_name, pod_uid, reason,
+        )?;
+        self.pod_cleanup
+            .acknowledge_pod_cleanup_intent(request)
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn delete_pod_cleanup_intents_for_node(&self, node_name: &str) -> Result<()> {
-        self.propose_command(StorageCommand::DeletePodCleanupIntentsForNode {
-            node_name: node_name.to_string(),
-        })
-        .await?;
-        Ok(())
+        self.pod_cleanup
+            .delete_all_for_node(node_name)
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn patch_resource_latest(
@@ -1011,10 +906,11 @@ impl DatastoreBackend for SequencedDatastore {
             preconditions: ResourcePreconditions::default(),
             strict_resource_version: false,
         };
-        self.propose_command(command).await?;
-        self.passive
-            .get_resource(api_version, kind, namespace, name)
-            .await
+        command_resource(
+            "patch_resource_latest",
+            self.submit_resource_command(command).await?,
+        )
+        .map(Some)
     }
     async fn patch_resource_latest_with_preconditions(
         &self,
@@ -1040,42 +936,43 @@ impl DatastoreBackend for SequencedDatastore {
             preconditions: preconditions.clone(),
             strict_resource_version,
         };
-        self.propose_command(command).await?;
-        self.passive
-            .get_resource(api_version, kind, namespace, name)
-            .await
+        command_resource(
+            "patch_resource_latest_with_preconditions",
+            self.submit_resource_command(command).await?,
+        )
+        .map(Some)
     }
     async fn watch_events_gc_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
-        self.passive
-            .watch_events_gc_prunable_count(max_rows, batch_cap)
-            .await
-    }
-    async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
-        let prunable = self
-            .passive
-            .watch_events_gc_prunable_count(max_rows, batch_cap)
-            .await?;
-        if prunable == 0 {
-            return Ok(0);
-        }
-        self.propose_command(StorageCommand::GcWatchEvents {
+        klights_cluster_store::ClusterWatchMaintenance::watch_events_gc_prunable_count(
+            self.maintenance.as_ref(),
             max_rows,
             batch_cap,
-        })
-        .await?;
-        Ok(prunable)
+        )
+        .await
+    }
+    async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
+        klights_cluster_store::ClusterWatchMaintenance::gc_watch_events(
+            self.maintenance.as_ref(),
+            max_rows,
+            batch_cap,
+        )
+        .await
     }
     async fn get_klights_meta(&self, key: &str) -> Result<Option<String>> {
-        self.passive.get_klights_meta(key).await
+        klights_cluster_store::ClusterMetadataMutation::get_klights_meta(
+            self.maintenance.as_ref(),
+            key,
+        )
+        .await
     }
 
     async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()> {
-        let command = StorageCommand::SetKlightsMeta {
-            key: key.to_string(),
-            value: value.to_string(),
-        };
-        self.propose_command(command).await?;
-        Ok(())
+        klights_cluster_store::ClusterMetadataMutation::set_klights_meta(
+            self.maintenance.as_ref(),
+            key,
+            value,
+        )
+        .await
     }
 
     async fn list_outbox_stream_watermarks(
@@ -1121,9 +1018,17 @@ impl DatastoreBackend for SequencedDatastore {
                 .map_err(|err| OutboxDeliveryError::ConflictTerminal(err.to_string()))?;
             return Ok(OutboxDeliveryResult::Applied { applied_rv: 0 });
         }
-        self.proposal
-            .propose_outbox_command(idempotency_key, operation, command, authoring_node, None)
+        self.outbox_delivery
+            .deliver_authenticated_outbox_command_effect(
+                authoring_node.to_string(),
+                idempotency_key.to_string(),
+                legacy_outbox_operation(operation)?,
+                Ok(command),
+                None,
+            )
             .await
+            .map(|effect| effect.into_parts().0)
+            .map_err(legacy_outbox_error)
     }
 
     async fn apply_outbox_transactionally_with_watermark(
@@ -1139,15 +1044,17 @@ impl DatastoreBackend for SequencedDatastore {
                 .map_err(|err| OutboxDeliveryError::ConflictTerminal(err.to_string()))?;
             return Ok(OutboxDeliveryResult::Applied { applied_rv: 0 });
         }
-        self.proposal
-            .propose_outbox_command(
-                idempotency_key,
-                operation,
-                command,
-                authoring_node,
+        self.outbox_delivery
+            .deliver_authenticated_outbox_command_effect(
+                authoring_node.to_string(),
+                idempotency_key.to_string(),
+                legacy_outbox_operation(operation)?,
+                Ok(command),
                 watermark,
             )
             .await
+            .map(|effect| effect.into_parts().0)
+            .map_err(legacy_outbox_error)
     }
 
     async fn apply_outbox_transactionally_with_watermark_effect(
@@ -1168,15 +1075,16 @@ impl DatastoreBackend for SequencedDatastore {
             ));
         }
         let effect = self
-            .proposal
-            .propose_outbox_command_effect(
-                idempotency_key,
-                operation,
-                command,
-                authoring_node,
+            .outbox_delivery
+            .deliver_authenticated_outbox_command_effect(
+                authoring_node.to_string(),
+                idempotency_key.to_string(),
+                legacy_outbox_operation(operation)?,
+                Ok(command),
                 watermark,
             )
-            .await?;
+            .await
+            .map_err(legacy_outbox_error)?;
         let (result, resource_effect, pod_endpoint_effect, committed_resource) =
             effect.into_parts();
         Ok(crate::datastore::CommittedOutboxApply::new(
@@ -1230,27 +1138,7 @@ impl DatastoreBackend for SequencedDatastore {
     }
 
     async fn gc_applied_outbox(&self, now_ms: i64, ttl_ms: i64) -> Result<usize> {
-        let cutoff_ms = now_ms.saturating_sub(ttl_ms);
-        let prunable = self
-            .passive
-            .applied_outbox_gc_prunable_count(cutoff_ms)
-            .await?;
-        if prunable == 0 {
-            return Ok(0);
-        }
-        self.propose_command(StorageCommand::GcAppliedOutbox { cutoff_ms })
-            .await?;
-        Ok(prunable)
-    }
-
-    /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
-    async fn apply_replicated_command(
-        &self,
-        command: StorageCommand,
-        meta: CommandMeta,
-    ) -> Result<()> {
-        apply_command_to_backend(self.passive.as_ref(), command, meta).await
+        self.maintenance.gc_applied_outbox(now_ms, ttl_ms).await
     }
 }
 
@@ -1753,96 +1641,6 @@ impl crate::datastore::NetworkMetadataStore for SequencedDatastore {
 
     async fn delete_node_subnet(&self, node_name: &str) -> Result<()> {
         crate::datastore::DatastoreBackend::delete_node_subnet(self, node_name).await
-    }
-}
-
-#[async_trait]
-impl crate::datastore::ReplicationStore for SequencedDatastore {
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
-    async fn apply_replicated_command(
-        &self,
-        command: StorageCommand,
-        meta: CommandMeta,
-    ) -> Result<()> {
-        crate::datastore::DatastoreBackend::apply_replicated_command(self, command, meta).await
-    }
-
-    async fn replace_replicated_resource_state(
-        &self,
-        _entries: Vec<klights_cluster_core::SnapshotRestoreOperation>,
-        _current_rv: i64,
-        _watch_event_high_water: Option<i64>,
-        _watch_replay_floors: Option<Vec<WatchReplayFloor>>,
-        _metadata: Option<ReplicatedSnapshotMetadata>,
-    ) -> Result<()> {
-        reject_application_committed_apply("replace_replicated_resource_state")
-    }
-
-    async fn apply_log_apply_commit(
-        &self,
-        _commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<()> {
-        reject_application_committed_apply("apply_log_apply_commit")
-    }
-
-    async fn apply_raft_log_apply_commit(
-        &self,
-        _commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_cluster_store::StorageCommandResult> {
-        reject_application_committed_apply("apply_raft_log_apply_commit")
-    }
-
-    async fn apply_raft_log_apply_commit_receipt(
-        &self,
-        _commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_cluster_store::CommittedRaftApplyReceipt> {
-        reject_application_committed_apply("apply_raft_log_apply_commit_receipt")
-    }
-
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
-    async fn apply_replicated_create_resource(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        data: Value,
-        options: ReplicatedCreateOptions,
-    ) -> Result<Resource> {
-        crate::datastore::DatastoreBackend::apply_replicated_create_resource(
-            self,
-            api_version,
-            kind,
-            namespace,
-            name,
-            data,
-            options,
-        )
-        .await
-    }
-}
-
-#[async_trait]
-impl crate::datastore::DurableRecoveryStore for SequencedDatastore {
-    async fn read_durable_allocator_observation(
-        &self,
-    ) -> Result<crate::datastore::DurableAllocatorObservation> {
-        crate::datastore::DatastoreBackend::read_durable_allocator_observation(self).await
-    }
-
-    async fn read_cluster_metadata_observation(
-        &self,
-    ) -> Result<crate::datastore::ClusterMetadataObservation> {
-        crate::datastore::DatastoreBackend::read_cluster_metadata_observation(self).await
-    }
-
-    async fn begin_pinned_snapshot_capture(
-        &self,
-        request: klights_cluster_store::SnapshotCaptureRequest,
-        fence: klights_cluster_store::SnapshotExclusiveFence,
-    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
-        crate::datastore::DatastoreBackend::begin_pinned_snapshot_capture(self, request, fence)
-            .await
     }
 }
 

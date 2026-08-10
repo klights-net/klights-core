@@ -1240,9 +1240,9 @@ impl Datastore {
                 name,
                 pod_uid,
                 node_name,
-                observed_resource_version: _,
+                observed_resource_version,
             } => {
-                let Some((_current_rv, current_uid, data_bytes)) =
+                let Some((current_rv, current_uid, data_bytes)) =
                     Self::resource_row_optional_for_update_in_tx(
                         tx,
                         "v1",
@@ -1264,6 +1264,15 @@ impl Datastore {
                         current_public_rv,
                     ));
                 }
+                validate_resource_preconditions(
+                    &ResourcePreconditions {
+                        uid: Some(pod_uid.clone()),
+                        resource_version: Some(observed_resource_version),
+                    },
+                    Some(&current_uid),
+                    current_rv,
+                )
+                .map_err(Self::sqlite_conversion_error)?;
                 let data: Value =
                     serde_json::from_slice(&data_bytes).map_err(serde_to_sqlite_error)?;
                 let assigned_node = data

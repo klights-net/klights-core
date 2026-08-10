@@ -1,8 +1,5 @@
 //! Root composition adapter for the passive SQLite cluster datastore.
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
-mod applier;
-
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -480,15 +477,6 @@ impl DatastoreBackend for Datastore {
         let sink = PassiveDatastore::commit_observation_sink(self)
             .expect("test datastore must install a commit observation sink");
         sink.observe(&[pending]);
-    }
-
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
-    async fn apply_replicated_command(
-        &self,
-        command: klights_cluster_core::command::StorageCommand,
-        meta: klights_cluster_core::command::CommandMeta,
-    ) -> Result<()> {
-        self.0.apply_legacy_test_command(command, meta).await
     }
 
     #[cfg(any(test, feature = "pod-repository-test-support"))]

@@ -423,6 +423,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     passive_backend.clone(),
                     proposal,
                     Arc::new(klights_supervisor::SystemWallClock),
+                    is_leader_rx.clone(),
                 ),
             );
             let positioned_watch =

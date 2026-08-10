@@ -546,6 +546,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn gc_watch_is_noop_when_table_within_cap() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "within-cap",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "default", "name": "within-cap"},
+                "data": {"key": "value"}
+            }),
+        )
+        .await
+        .unwrap();
+        let resource_version = db.get_current_resource_version().await.unwrap();
+
+        assert_eq!(db.gc_watch_events(10, 30).await.unwrap(), 0);
+        assert_eq!(db.gc_watch_events(10, 30).await.unwrap(), 0);
+        assert_eq!(
+            db.get_current_resource_version().await.unwrap(),
+            resource_version,
+            "no-op watch GC must be idempotent and must not allocate a public RV"
+        );
+    }
+
     #[test]
     fn watch_events_scope_floor_shrinks_when_scope_count_would_exceed_global_cap() {
         assert_eq!(

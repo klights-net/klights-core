@@ -1384,6 +1384,7 @@ pub async fn run_raft_delete_mark_status_race(
             inner,
             proposal,
             Arc::new(klights_supervisor::SystemWallClock),
+            crate::control_plane::client::local::always_leader_watch(),
         ),
     );
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
@@ -2440,6 +2441,13 @@ impl IntegrationPodDeleteCasRacingProposal {
                 && kind == "Pod"
                 && namespace.as_deref() == Some("default")
                 && name == &self.pod_name
+        ) || matches!(
+            command,
+            klights_cluster_core::StorageCommand::FinalizeBoundPod {
+                namespace,
+                name,
+                ..
+            } if namespace == "default" && name == &self.pod_name
         )
     }
 
@@ -2591,6 +2599,7 @@ async fn integration_pod_delete_cas_race_store(
             inner,
             proposal,
             Arc::new(klights_supervisor::SystemWallClock),
+            crate::control_plane::client::local::always_leader_watch(),
         ),
     );
     let persistence =

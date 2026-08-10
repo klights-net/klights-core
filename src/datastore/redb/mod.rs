@@ -8,8 +8,6 @@ use std::sync::Arc;
 mod backend_impl;
 mod snapshot;
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
-mod applier;
 /// Root composition identity around the destination-owned Redb store.
 #[derive(Clone)]
 pub struct RedbDatastore(PassiveRedbDatastore);

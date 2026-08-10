@@ -4935,6 +4935,69 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
 }
 
 #[tokio::test]
+async fn actor_finalize_bound_pod_rejects_stale_observed_rv_and_preserves_uid() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let original = db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "finalize-stale-rv",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "finalize-stale-rv",
+                    "uid": "finalize-stale-rv-uid",
+                    "deletionTimestamp": "2026-07-24T00:00:00Z"
+                },
+                "spec": {"nodeName": "worker-a"},
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .unwrap();
+    let mut refreshed_data = (*original.data).clone();
+    refreshed_data["status"] = json!({"phase": "Running", "podIP": "10.42.0.77"});
+    let refreshed = db
+        .update_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "finalize-stale-rv",
+            refreshed_data,
+            original.resource_version,
+        )
+        .await
+        .unwrap();
+
+    let error = db
+        .build_log_apply_commit_for_command(
+            StorageCommand::FinalizeBoundPod {
+                namespace: "default".to_string(),
+                name: "finalize-stale-rv".to_string(),
+                pod_uid: "finalize-stale-rv-uid".to_string(),
+                node_name: "worker-a".to_string(),
+                observed_resource_version: original.resource_version,
+            },
+            "PodMetadata",
+            "worker-a",
+        )
+        .await
+        .expect_err("stale actor observation must fail strict RV CAS");
+    assert!(error.to_string().to_ascii_lowercase().contains("conflict"));
+
+    let live = db
+        .get_resource("v1", "Pod", Some("default"), "finalize-stale-rv")
+        .await
+        .unwrap()
+        .expect("stale actor finalization must preserve the Pod");
+    assert_eq!(live.uid, "finalize-stale-rv-uid");
+    assert_eq!(live.resource_version, refreshed.resource_version);
+}
+
+#[tokio::test]
 async fn actor_finalize_bound_pod_serializes_a_status_write_after_proposal_build() {
     let db = Datastore::new_in_memory().await.unwrap();
     let observed = db

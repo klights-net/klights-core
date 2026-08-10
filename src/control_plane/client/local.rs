@@ -14,7 +14,8 @@ use klights_leader_api::{
     PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest, PodCleanupIntentError,
     PodCleanupIntentFuture, PodCleanupIntentListRequest, ProjectedServiceAccountTokenError,
     ProjectedServiceAccountTokenFuture, ProjectedServiceAccountTokenRequest, ResourceGetRequest,
-    ResourceListRequest, ResourceListResult, ResourceQueryFuture, WatchRequest,
+    ResourceListRequest, ResourceListResult, ResourceQueryConsistency, ResourceQueryFuture,
+    WatchRequest,
 };
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_leader_api::{
@@ -28,6 +29,7 @@ use crate::control_plane::client::{
     focused_dataplane, focused_node_subnet, query_error, query_list_result,
 };
 use crate::datastore::{DatastoreHandle, Resource};
+use async_trait::async_trait;
 use klights_auth::projected_service_account_token::{
     authorize_projected_service_account_token, sign_authorized_projected_service_account_token,
 };
@@ -37,6 +39,35 @@ use klights_controllers::ControllerDispatcher;
 #[cfg(test)]
 use klights_kubelet::node_outbox::payload::OutboxOperationExt as _;
 use klights_kubelet::pod_repository::store::PodStore;
+use klights_replication::proposal::RaftProposal;
+
+pub(crate) fn ensure_mark_delete_timestamps(
+    data: &mut serde_json::Value,
+    grace_seconds: i64,
+    operation_now: chrono::DateTime<chrono::Utc>,
+) {
+    let Some(metadata) = data
+        .get_mut("metadata")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    if metadata
+        .get("deletionTimestamp")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        metadata.insert(
+            "deletionTimestamp".to_string(),
+            serde_json::Value::String(klights_cluster_core::k8s_time::format_legacy_timestamp(
+                operation_now,
+            )),
+        );
+    }
+    metadata
+        .entry("deletionGracePeriodSeconds".to_string())
+        .or_insert_with(|| serde_json::Value::from(grace_seconds));
+}
 
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 type ProjectedTokenAsyncBoundary = Arc<
@@ -118,7 +149,7 @@ fn projected_token_issue_test_probe(namespace: &str) -> Option<ProjectedTokenIss
 }
 
 #[cfg(test)]
-use klights_leader_api::{ResourceQueryConsistency, pod_get_request};
+use klights_leader_api::pod_get_request;
 
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 fn test_watch_signals(db: &DatastoreHandle) -> Arc<dyn klights_watch::WatchSignalSubscribe> {
@@ -132,6 +163,287 @@ fn test_watch_signals(db: &DatastoreHandle) -> Arc<dyn klights_watch::WatchSigna
 pub(crate) struct LocalApiPersistencePorts {
     db: DatastoreHandle,
     positioned_watch: klights_watch::PositionedWatchService,
+}
+
+/// Focused leader-query adapter over the selected passive cluster store.
+///
+/// This adapter is constructed before the legacy P9 compatibility shell so
+/// canonical resource commands can resolve idempotent committed results
+/// without a dependency cycle through `LocalApiClient`.
+pub(crate) struct ClusterStoreLeaderResourceQuery {
+    db: DatastoreHandle,
+    is_leader_rx: watch::Receiver<bool>,
+}
+
+impl ClusterStoreLeaderResourceQuery {
+    pub(crate) fn new(db: DatastoreHandle, is_leader_rx: watch::Receiver<bool>) -> Self {
+        Self { db, is_leader_rx }
+    }
+
+    fn sample_leader_fresh(
+        &self,
+        consistency: ResourceQueryConsistency,
+    ) -> Result<Option<watch::Receiver<bool>>, klights_leader_api::ResourceQueryError> {
+        if consistency != ResourceQueryConsistency::LeaderFresh {
+            return Ok(None);
+        }
+        let mut receiver = self.is_leader_rx.clone();
+        if !*receiver.borrow_and_update() {
+            return Err(klights_leader_api::ResourceQueryError::retryable(
+                "leader-fresh resource query reached a non-leader local store",
+            ));
+        }
+        Ok(Some(receiver))
+    }
+}
+
+impl LeaderResourceQuery for ClusterStoreLeaderResourceQuery {
+    fn get_resource(
+        &self,
+        request: ResourceGetRequest,
+    ) -> ResourceQueryFuture<'_, Option<Resource>> {
+        Box::pin(async move {
+            let leadership = self.sample_leader_fresh(request.consistency())?;
+            let key = request.key();
+            let resource = self
+                .db
+                .get_resource(
+                    &key.api_version,
+                    &key.kind,
+                    key.namespace.as_deref(),
+                    &key.name,
+                )
+                .await
+                .map_err(query_error)?;
+            if leadership
+                .as_ref()
+                .is_some_and(|receiver| receiver.has_changed().unwrap_or(true))
+            {
+                return Err(klights_leader_api::ResourceQueryError::retryable(
+                    "leadership changed during local leader-fresh resource query",
+                ));
+            }
+            Ok(resource)
+        })
+    }
+
+    fn list_resources(
+        &self,
+        request: ResourceListRequest,
+    ) -> ResourceQueryFuture<'_, ResourceListResult> {
+        Box::pin(async move {
+            let leadership = self.sample_leader_fresh(request.consistency())?;
+            let list = self
+                .db
+                .list_resources(
+                    request.api_version(),
+                    request.kind(),
+                    request.namespace(),
+                    crate::datastore::ResourceListQuery::new(
+                        request.label_selector(),
+                        request.field_selector(),
+                        request.limit(),
+                        request.continue_token(),
+                    ),
+                )
+                .await
+                .map_err(query_error)?;
+            if leadership
+                .as_ref()
+                .is_some_and(|receiver| receiver.has_changed().unwrap_or(true))
+            {
+                return Err(klights_leader_api::ResourceQueryError::retryable(
+                    "leadership changed during local leader-fresh resource query",
+                ));
+            }
+            query_list_result(list)
+        })
+    }
+}
+
+pub(crate) struct ClusterStoreLeaderNetwork {
+    db: DatastoreHandle,
+    proposal: Arc<dyn RaftProposal>,
+    is_leader_rx: watch::Receiver<bool>,
+}
+
+impl ClusterStoreLeaderNetwork {
+    pub(crate) fn new(
+        db: DatastoreHandle,
+        proposal: Arc<dyn RaftProposal>,
+        is_leader_rx: watch::Receiver<bool>,
+    ) -> Self {
+        Self {
+            db,
+            proposal,
+            is_leader_rx,
+        }
+    }
+
+    fn require_leader(&self) -> Result<(), NetworkTopologyError> {
+        if *self.is_leader_rx.borrow() {
+            Ok(())
+        } else {
+            Err(NetworkTopologyError::NotLeader)
+        }
+    }
+
+    pub(crate) async fn update_node_peer_attributes(
+        &self,
+        node_name: &str,
+        mode: klights_types::NodePeerMode,
+        hostport_range: Option<klights_types::HostPortRange>,
+    ) -> Result<(), NetworkTopologyError> {
+        self.require_leader()?;
+        self.proposal
+            .propose_command(StorageCommand::UpdateNodePeerAttributes {
+                node_name: node_name.to_string(),
+                mode: match mode {
+                    klights_types::NodePeerMode::Root => "root",
+                    klights_types::NodePeerMode::Rootless => "rootless",
+                }
+                .to_string(),
+                hostport_range: hostport_range.map(|range| range.to_string()),
+            })
+            .await
+            .map_err(|error| NetworkTopologyError::query_failed(error.to_string()))?;
+        Ok(())
+    }
+
+    pub(crate) async fn delete_node_subnet(
+        &self,
+        node_name: &str,
+    ) -> Result<(), NetworkTopologyError> {
+        self.require_leader()?;
+        self.proposal
+            .propose_command(StorageCommand::DeleteNodeSubnet {
+                node_name: node_name.to_string(),
+            })
+            .await
+            .map_err(|error| NetworkTopologyError::query_failed(error.to_string()))?;
+        Ok(())
+    }
+}
+
+impl LeaderNodeSubnetAllocation for ClusterStoreLeaderNetwork {
+    fn allocate_node_subnet(
+        &self,
+        request: NodeSubnetAllocationRequest,
+    ) -> NodeSubnetAllocationFuture<'_, NodeSubnetAllocationResult> {
+        Box::pin(async move {
+            self.require_leader()
+                .map_err(|_| NodeSubnetAllocationError::NotLeader)?;
+            let (node_name, cluster_cidr, node_ip) = request.into_parts();
+            self.proposal
+                .propose_command(StorageCommand::AllocateNodeSubnet {
+                    node_name: node_name.clone(),
+                    subnet: cluster_cidr.clone(),
+                    node_ip: node_ip.to_string(),
+                })
+                .await
+                .map_err(|error| {
+                    let message = error.to_string();
+                    if super::node_subnet_allocation_is_exhausted(&message) {
+                        NodeSubnetAllocationError::exhausted(cluster_cidr.clone())
+                    } else if message.to_ascii_lowercase().contains("conflict") {
+                        NodeSubnetAllocationError::conflict(message)
+                    } else {
+                        NodeSubnetAllocationError::allocation_failed(message)
+                    }
+                })?;
+            let subnet = self
+                .db
+                .get_node_subnet(&node_name)
+                .await
+                .map_err(|error| NodeSubnetAllocationError::allocation_failed(error.to_string()))?
+                .map(focused_node_subnet)
+                .transpose()
+                .map_err(|error| NodeSubnetAllocationError::corrupt_response(error.to_string()))?;
+            NodeSubnetAllocationResult::try_from_wire(&node_name, subnet)
+        })
+    }
+}
+
+impl LeaderNetworkTopologyQuery for ClusterStoreLeaderNetwork {
+    fn get_node_subnet(
+        &self,
+        request: NodeSubnetQuery,
+    ) -> NetworkTopologyFuture<'_, NodeSubnetResult> {
+        Box::pin(async move {
+            self.require_leader()?;
+            let node_name = request.into_node_name();
+            let subnet = self
+                .db
+                .get_node_subnet(&node_name)
+                .await
+                .map_err(|error| NetworkTopologyError::query_failed(error.to_string()))?
+                .map(focused_node_subnet)
+                .transpose()?;
+            NodeSubnetResult::try_from_wire(&node_name, subnet.is_some(), subnet)
+        })
+    }
+
+    fn list_peer_subnets(
+        &self,
+        request: PeerSubnetsQuery,
+    ) -> NetworkTopologyFuture<'_, PeerSubnetsResult> {
+        Box::pin(async move {
+            self.require_leader()?;
+            let node_name = request.into_node_name();
+            let rows = self
+                .db
+                .list_peer_subnets(
+                    klights_cluster_store::PeerTopologyRequest::excluding(&node_name)
+                        .map_err(|error| NetworkTopologyError::query_failed(error.to_string()))?,
+                )
+                .await
+                .map_err(|error| NetworkTopologyError::query_failed(error.to_string()))?;
+            let subnets = rows
+                .into_iter()
+                .map(focused_node_subnet)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            PeerSubnetsResult::try_new(&node_name, subnets)
+        })
+    }
+
+    fn get_node_dataplane(
+        &self,
+        request: NodeDataplaneQuery,
+    ) -> NetworkTopologyFuture<'_, NodeDataplaneResult> {
+        Box::pin(async move {
+            self.require_leader()?;
+            let node_name = request.into_node_name();
+            let metadata = self
+                .db
+                .get_node_dataplane(&node_name)
+                .await
+                .map_err(|error| NetworkTopologyError::query_failed(error.to_string()))?
+                .map(focused_dataplane)
+                .transpose()?;
+            NodeDataplaneResult::try_from_wire(&node_name, metadata.is_some(), metadata)
+        })
+    }
+}
+
+impl LeaderNetworkTopologyCommand for ClusterStoreLeaderNetwork {
+    fn register_node_dataplane(&self, metadata: NetworkDataplane) -> NetworkTopologyFuture<'_, ()> {
+        Box::pin(async move {
+            self.require_leader()?;
+            let metadata = crate::control_plane::client::legacy_dataplane(metadata)?;
+            self.proposal
+                .propose_command(StorageCommand::UpdateNodeDataplane {
+                    node_name: metadata.node_name,
+                    mode: metadata.mode.as_str().to_string(),
+                    encryption: metadata.encryption.as_str().to_string(),
+                    public_key: metadata.public_key.as_ref().map(ToString::to_string),
+                    endpoint: metadata.endpoint.to_string(),
+                    port: metadata.port,
+                })
+                .await
+                .map_err(|error| NetworkTopologyError::query_failed(error.to_string()))?;
+            Ok(())
+        })
+    }
 }
 
 impl LocalApiPersistencePorts {
@@ -204,6 +516,228 @@ pub(crate) fn focused_pod_cleanup_intent(
         intent.created_at_ms,
         snapshot,
     )
+}
+
+pub(crate) fn legacy_pod_cleanup_intent(intent: PodCleanupIntent) -> StoredPodCleanupIntent {
+    let (node_name, namespace, pod_name, pod_uid, reason, resource_version, created_at_ms, pod) =
+        intent.into_parts();
+    StoredPodCleanupIntent {
+        node_name,
+        namespace,
+        pod_name,
+        pod_uid,
+        reason,
+        resource_version,
+        created_at_ms,
+        pod_data: (*pod.data).clone(),
+    }
+}
+
+pub(crate) struct ClusterStoreLeaderPodCleanup {
+    db: DatastoreHandle,
+    proposal: Arc<dyn RaftProposal>,
+    is_leader_rx: watch::Receiver<bool>,
+}
+
+impl ClusterStoreLeaderPodCleanup {
+    pub(crate) fn new(
+        db: DatastoreHandle,
+        proposal: Arc<dyn RaftProposal>,
+        is_leader_rx: watch::Receiver<bool>,
+    ) -> Self {
+        Self {
+            db,
+            proposal,
+            is_leader_rx,
+        }
+    }
+
+    fn require_leader(&self) -> Result<(), PodCleanupIntentError> {
+        if *self.is_leader_rx.borrow() {
+            Ok(())
+        } else {
+            Err(PodCleanupIntentError::NotLeader)
+        }
+    }
+
+    pub(crate) async fn move_intent(
+        &self,
+        node_name: &str,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        reason: &str,
+    ) -> Result<(), PodCleanupIntentError> {
+        self.require_leader()?;
+        self.proposal
+            .propose_command(StorageCommand::MovePodToCleanupIntent {
+                node_name: node_name.to_string(),
+                namespace: namespace.to_string(),
+                pod_name: pod_name.to_string(),
+                pod_uid: pod_uid.to_string(),
+                reason: reason.to_string(),
+            })
+            .await
+            .map_err(|error| PodCleanupIntentError::unavailable(error.to_string()))?;
+        Ok(())
+    }
+
+    pub(crate) async fn delete_all_for_node(
+        &self,
+        node_name: &str,
+    ) -> Result<(), PodCleanupIntentError> {
+        self.require_leader()?;
+        self.proposal
+            .propose_command(StorageCommand::DeletePodCleanupIntentsForNode {
+                node_name: node_name.to_string(),
+            })
+            .await
+            .map_err(|error| PodCleanupIntentError::unavailable(error.to_string()))?;
+        Ok(())
+    }
+}
+
+impl LeaderPodCleanupIntents for ClusterStoreLeaderPodCleanup {
+    fn list_pod_cleanup_intents(
+        &self,
+        request: PodCleanupIntentListRequest,
+    ) -> PodCleanupIntentFuture<'_, Vec<PodCleanupIntent>> {
+        Box::pin(async move {
+            self.require_leader()?;
+            self.db
+                .list_pod_cleanup_intents_for_node(request.node_name())
+                .await
+                .map_err(|error| PodCleanupIntentError::unavailable(error.to_string()))?
+                .into_iter()
+                .map(focused_pod_cleanup_intent)
+                .collect()
+        })
+    }
+
+    fn acknowledge_pod_cleanup_intent(
+        &self,
+        request: PodCleanupIntentAckRequest,
+    ) -> PodCleanupIntentFuture<'_, ()> {
+        Box::pin(async move {
+            self.require_leader()?;
+            let (node_name, namespace, pod_name, pod_uid, reason) = request.into_parts();
+            self.proposal
+                .propose_command(StorageCommand::DeletePodCleanupIntent {
+                    node_name,
+                    namespace,
+                    pod_name,
+                    pod_uid,
+                    reason,
+                })
+                .await
+                .map_err(|error| PodCleanupIntentError::unavailable(error.to_string()))?;
+            Ok(())
+        })
+    }
+}
+
+pub(crate) struct ClusterStoreLeaderMaintenance {
+    db: DatastoreHandle,
+    proposal: Arc<dyn RaftProposal>,
+    is_leader_rx: watch::Receiver<bool>,
+}
+
+impl ClusterStoreLeaderMaintenance {
+    pub(crate) fn new(
+        db: DatastoreHandle,
+        proposal: Arc<dyn RaftProposal>,
+        is_leader_rx: watch::Receiver<bool>,
+    ) -> Self {
+        Self {
+            db,
+            proposal,
+            is_leader_rx,
+        }
+    }
+
+    fn require_leader(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            *self.is_leader_rx.borrow(),
+            "operation requires current raft leader"
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn gc_applied_outbox(
+        &self,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> anyhow::Result<usize> {
+        self.require_leader()?;
+        let cutoff_ms = now_ms.saturating_sub(ttl_ms);
+        let prunable = self.db.applied_outbox_gc_prunable_count(cutoff_ms).await?;
+        if prunable == 0 {
+            return Ok(0);
+        }
+        self.proposal
+            .propose_command(StorageCommand::GcAppliedOutbox { cutoff_ms })
+            .await?;
+        Ok(prunable)
+    }
+}
+
+#[async_trait]
+impl klights_cluster_store::ClusterWatchMaintenance for ClusterStoreLeaderMaintenance {
+    async fn advance_resource_version_after(&self, min_rv: i64) -> anyhow::Result<i64> {
+        self.require_leader()?;
+        let before = self.db.get_current_resource_version().await?;
+        let new_rv = before.saturating_add(1).max(min_rv.saturating_add(1));
+        self.proposal
+            .propose_command(StorageCommand::AdvanceResourceVersion { min_rv, new_rv })
+            .await?;
+        self.db.get_current_resource_version().await.or(Ok(new_rv))
+    }
+
+    async fn watch_events_gc_prunable_count(
+        &self,
+        max_rows: i64,
+        batch_cap: i64,
+    ) -> anyhow::Result<usize> {
+        self.db
+            .watch_events_gc_prunable_count(max_rows, batch_cap)
+            .await
+    }
+
+    async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> anyhow::Result<usize> {
+        self.require_leader()?;
+        let prunable = self
+            .db
+            .watch_events_gc_prunable_count(max_rows, batch_cap)
+            .await?;
+        if prunable == 0 {
+            return Ok(0);
+        }
+        self.proposal
+            .propose_command(StorageCommand::GcWatchEvents {
+                max_rows,
+                batch_cap,
+            })
+            .await?;
+        Ok(prunable)
+    }
+}
+
+#[async_trait]
+impl klights_cluster_store::ClusterMetadataMutation for ClusterStoreLeaderMaintenance {
+    async fn get_klights_meta(&self, key: &str) -> anyhow::Result<Option<String>> {
+        self.db.get_klights_meta(key).await
+    }
+
+    async fn set_klights_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        self.require_leader()?;
+        self.proposal
+            .propose_command(StorageCommand::SetKlightsMeta {
+                key: key.to_string(),
+                value: value.to_string(),
+            })
+            .await?;
+        Ok(())
+    }
 }
 
 pub(crate) struct RootOutboxSideEffectState {
@@ -415,6 +949,7 @@ struct LocalApiTestServices {
 #[derive(Clone)]
 pub struct LocalApiClient {
     db: DatastoreHandle,
+    resource_query: Arc<dyn LeaderResourceQuery>,
     positioned_watch: klights_watch::PositionedWatchService,
     pod_store: Arc<PodStore>,
     #[cfg(any(test, feature = "pod-repository-test-support"))]
@@ -702,6 +1237,9 @@ impl LocalApiClient {
         let pod_store = Arc::new(crate::bootstrap::pod_repository_composition::new_pod_store(
             db.clone(),
         ));
+        let resource_query: Arc<dyn LeaderResourceQuery> = Arc::new(
+            ClusterStoreLeaderResourceQuery::new(db.clone(), is_leader_rx.clone()),
+        );
         let crypto = file_process.crypto_executor();
         let outbox_side_effects = Arc::new(RootOutboxSideEffectState::new(db.clone()));
         #[cfg(any(test, feature = "pod-repository-test-support"))]
@@ -744,6 +1282,7 @@ impl LocalApiClient {
             #[cfg(any(test, feature = "pod-repository-test-support"))]
             test_services,
             db: db.clone(),
+            resource_query,
             positioned_watch,
             pod_store,
             authoring_node,
@@ -816,72 +1355,14 @@ impl LeaderResourceQuery for LocalApiClient {
         &self,
         request: ResourceGetRequest,
     ) -> ResourceQueryFuture<'_, Option<Resource>> {
-        Box::pin(async move {
-            let leader_fresh =
-                request.consistency() == klights_leader_api::ResourceQueryConsistency::LeaderFresh;
-            let mut leadership_rx = self.is_leader_rx.clone();
-            let sampled_is_leader = *leadership_rx.borrow_and_update();
-            if leader_fresh && !sampled_is_leader {
-                return Err(klights_leader_api::ResourceQueryError::retryable(
-                    "leader-fresh resource query reached a non-leader local client",
-                ));
-            }
-            let key = request.key();
-            let resource = self
-                .db
-                .get_resource(
-                    &key.api_version,
-                    &key.kind,
-                    key.namespace.as_deref(),
-                    &key.name,
-                )
-                .await
-                .map_err(query_error)?;
-            if leader_fresh && leadership_rx.has_changed().unwrap_or(true) {
-                return Err(klights_leader_api::ResourceQueryError::retryable(
-                    "leadership changed during local leader-fresh resource query",
-                ));
-            }
-            Ok(resource)
-        })
+        self.resource_query.get_resource(request)
     }
 
     fn list_resources(
         &self,
         request: ResourceListRequest,
     ) -> ResourceQueryFuture<'_, ResourceListResult> {
-        Box::pin(async move {
-            let leader_fresh =
-                request.consistency() == klights_leader_api::ResourceQueryConsistency::LeaderFresh;
-            let mut leadership_rx = self.is_leader_rx.clone();
-            let sampled_is_leader = *leadership_rx.borrow_and_update();
-            if leader_fresh && !sampled_is_leader {
-                return Err(klights_leader_api::ResourceQueryError::retryable(
-                    "leader-fresh resource query reached a non-leader local client",
-                ));
-            }
-            let list = self
-                .db
-                .list_resources(
-                    request.api_version(),
-                    request.kind(),
-                    request.namespace(),
-                    crate::datastore::ResourceListQuery::new(
-                        request.label_selector(),
-                        request.field_selector(),
-                        request.limit(),
-                        request.continue_token(),
-                    ),
-                )
-                .await
-                .map_err(query_error)?;
-            if leader_fresh && leadership_rx.has_changed().unwrap_or(true) {
-                return Err(klights_leader_api::ResourceQueryError::retryable(
-                    "leadership changed during local leader-fresh resource query",
-                ));
-            }
-            query_list_result(list)
-        })
+        self.resource_query.list_resources(request)
     }
 }
 

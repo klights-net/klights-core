@@ -81,8 +81,6 @@ use super::types::{
 };
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 use crate::datastore::ReplicatedCreateOptions;
-#[cfg(any(test, feature = "pod-repository-test-support"))]
-use klights_cluster_core::command::CommandMeta;
 use klights_cluster_core::{
     LogApplyAppliedOutboxRow, LogApplyPodCleanupIntentRow, PatchKind, Resource,
     ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
@@ -153,20 +151,6 @@ pub trait DatastoreBackend: Send + Sync {
     #[cfg(any(test, feature = "pod-repository-test-support"))]
     fn broadcast_watch_event(&self, pending: StagedPostCommit);
 
-    /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
-    ///
-    /// Apply a replicated command locally without going through role-based
-    /// public write admission.  Leaders use this for forwarded writes after
-    /// bootstrap-token validation; replicas use it for snapshot and stream apply.
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
-    async fn apply_replicated_command(
-        &self,
-        command: StorageCommand,
-        meta: CommandMeta,
-    ) -> Result<()> {
-        crate::bootstrap::sequenced_datastore::apply_command_to_backend(self, command, meta).await
-    }
-
     /// Atomically replace Kubernetes resource tables from a full leader snapshot.
     ///
     /// This is used during replica bootstrap before local API/kubelet work starts.
@@ -217,8 +201,12 @@ pub trait DatastoreBackend: Send + Sync {
     /// results without aborting learner catch-up.
     async fn apply_raft_log_apply_commit(
         &self,
-        commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_cluster_store::StorageCommandResult>;
+        _commit: klights_cluster_core::LogApplyCommit,
+    ) -> Result<klights_cluster_store::StorageCommandResult> {
+        Err(anyhow::anyhow!(
+            "datastore backend does not expose application-side committed raft apply"
+        ))
+    }
 
     /// Apply one committed Raft entry and return the canonical outcome derived
     /// inside the same datastore transaction. Backends must fail before
@@ -1517,13 +1505,6 @@ pub trait NamespaceContentStore: Send + Sync {
 /// Replication and snapshot-apply entry points.
 #[async_trait]
 pub trait ReplicationStore: Send + Sync {
-    /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
-    async fn apply_replicated_command(
-        &self,
-        command: StorageCommand,
-        meta: CommandMeta,
-    ) -> Result<()>;
     async fn replace_replicated_resource_state(
         &self,
         entries: Vec<klights_cluster_core::SnapshotRestoreOperation>,
@@ -1558,15 +1539,6 @@ pub trait ReplicationStore: Send + Sync {
 
 #[async_trait]
 impl<T: ReplicationStore + ?Sized> ReplicationStore for std::sync::Arc<T> {
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
-    async fn apply_replicated_command(
-        &self,
-        command: StorageCommand,
-        meta: CommandMeta,
-    ) -> Result<()> {
-        self.as_ref().apply_replicated_command(command, meta).await
-    }
-
     async fn replace_replicated_resource_state(
         &self,
         entries: Vec<klights_cluster_core::SnapshotRestoreOperation>,

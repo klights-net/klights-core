@@ -18,8 +18,6 @@ use crate::datastore::{
     WatchStore, WatchTarget, WatchTargetScope,
 };
 use klights_cluster_core::LogApplyPodCleanupIntentRow;
-#[cfg(any(test, feature = "pod-repository-test-support"))]
-use klights_cluster_core::command::{CommandMeta, StorageCommand};
 use klights_cluster_store::{ReplayAvailability, ReplayRetentionBoundary};
 use klights_kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use klights_kubelet::pod_lifecycle_router::PodLifecycleRouter;
@@ -1254,15 +1252,6 @@ impl crate::datastore::ResourceListStore for WorkerStoreAdapter {
 
 #[async_trait]
 impl crate::datastore::ReplicationStore for WorkerStoreAdapter {
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
-    async fn apply_replicated_command(
-        &self,
-        _command: StorageCommand,
-        _meta: CommandMeta,
-    ) -> Result<()> {
-        self.unsupported("apply_replicated_command")
-    }
-
     async fn replace_replicated_resource_state(
         &self,
         _entries: Vec<klights_cluster_core::SnapshotRestoreOperation>,

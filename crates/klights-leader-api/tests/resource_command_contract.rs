@@ -108,6 +108,26 @@ fn request_rejects_pod_hard_delete_commands() {
 }
 
 #[test]
+fn request_accepts_uid_and_rv_bound_pod_actor_compatibility_command() {
+    let command = StorageCommand::DeleteResource {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some("default".to_string()),
+        name: "web".to_string(),
+        preconditions: ResourcePreconditions {
+            uid: Some("pod-uid".to_string()),
+            resource_version: Some(17),
+        },
+    };
+    assert_eq!(
+        ResourceCommandRequest::try_new(command.clone())
+            .expect("actor-qualified Pod delete request")
+            .into_command(),
+        command
+    );
+}
+
+#[test]
 fn request_validates_identity_and_tombstone_grace() {
     let missing_name = StorageCommand::DeleteResource {
         api_version: "v1".to_string(),

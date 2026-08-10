@@ -850,11 +850,16 @@ impl ResourceCommandRequest {
         match &command {
             StorageCommand::CreateNamespace { name, .. }
             | StorageCommand::UpdateNamespace { name, .. }
-            | StorageCommand::DeleteNamespace { name } => {
+            | StorageCommand::DeleteNamespace { name }
+            | StorageCommand::DeleteNamespaceContents { name } => {
                 validate_command_identity("v1", "Namespace", None, name)?;
                 return Ok(Self { command });
             }
             _ => {}
+        }
+        if matches!(&command, StorageCommand::ApplyResourceBatch { operations } if !operations.is_empty())
+        {
+            return Ok(Self { command });
         }
         let (api_version, kind, namespace, name) = match &command {
             StorageCommand::CreateResource {
@@ -906,14 +911,20 @@ impl ResourceCommandRequest {
             }
         };
         validate_command_identity(api_version, kind, namespace.as_deref(), name)?;
-        if kind == "Pod"
-            && matches!(
-                command,
+        if kind == "Pod" {
+            match &command {
+                StorageCommand::DeleteResource { preconditions, .. }
+                    if preconditions
+                        .uid
+                        .as_deref()
+                        .is_some_and(|uid| !uid.is_empty())
+                        && preconditions.resource_version.is_some_and(|rv| rv > 0) => {}
                 StorageCommand::DeleteResource { .. }
-                    | StorageCommand::DeleteResourceWithTombstone { .. }
-            )
-        {
-            return Err(ResourceCommandError::PodDeletionForbidden);
+                | StorageCommand::DeleteResourceWithTombstone { .. } => {
+                    return Err(ResourceCommandError::PodDeletionForbidden);
+                }
+                _ => {}
+            }
         }
         if let StorageCommand::DeleteResourceWithTombstone { grace_seconds, .. } = &command
             && *grace_seconds < 0

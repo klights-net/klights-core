@@ -10,7 +10,7 @@ use klights_cluster_store::{AppliedMutation, StorageCommandResult};
 use klights_leader_api::{
     LeaderResourceCommand, LeaderResourceQuery, OutboxDeliveryError, OutboxDeliveryOperation,
     ResourceCommandError, ResourceCommandFuture, ResourceCommandRequest, ResourceCommandResult,
-    ResourceGetRequest, ResourceQueryConsistency,
+    ResourceGetRequest, ResourceListRequest, ResourceQueryConsistency,
 };
 use klights_types::ResourceKey;
 
@@ -34,6 +34,104 @@ impl EmbeddedLeaderResourceCommand {
             is_leader_rx,
         }
     }
+
+    /// Preserve the narrow Pod hard-delete boundary while legacy datastore
+    /// consumers move to the focused Pod lifecycle capabilities. Bound Pods
+    /// are always translated to the actor command; only an observed
+    /// unscheduled Pod retains the strict UID/RV delete command.
+    async fn submit_actor_pod_delete(
+        &self,
+        command: StorageCommand,
+    ) -> Result<i64, ResourceCommandError> {
+        if !*self.is_leader_rx.borrow() {
+            return Err(ResourceCommandError::NotLeader);
+        }
+        klights_leader_api::validate_authority_if_scoped()
+            .map_err(|_| ResourceCommandError::NotLeader)?;
+        klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
+            ResourceCommandError::retryable(format!(
+                "controller authority rejected actor Pod deletion: {error}"
+            ))
+        })?;
+        let StorageCommand::DeleteResource {
+            api_version,
+            kind,
+            namespace: Some(namespace),
+            name,
+            preconditions,
+        } = command
+        else {
+            return Err(ResourceCommandError::UnsupportedCommand {
+                command: command.variant_name(),
+            });
+        };
+        if api_version != "v1" || kind != "Pod" {
+            return Err(ResourceCommandError::UnsupportedCommand {
+                command: "DeleteResource",
+            });
+        }
+        let expected_uid = preconditions
+            .uid
+            .as_deref()
+            .filter(|uid| !uid.is_empty())
+            .ok_or_else(|| ResourceCommandError::invalid_request("pod.uid", "must not be empty"))?;
+        let expected_rv = preconditions
+            .resource_version
+            .filter(|rv| *rv > 0)
+            .ok_or_else(|| {
+                ResourceCommandError::invalid_request("pod.resource_version", "must be positive")
+            })?;
+        let key = ResourceKey::new("v1", "Pod", Some(namespace.clone()), name.clone());
+        let current = self
+            .resource_query
+            .get_resource(
+                ResourceGetRequest::try_new(key, ResourceQueryConsistency::LeaderFresh).map_err(
+                    |error| ResourceCommandError::invalid_request("pod", error.to_string()),
+                )?,
+            )
+            .await
+            .map_err(|error| ResourceCommandError::retryable(error.to_string()))?
+            .ok_or_else(|| ResourceCommandError::NotFound {
+                message: format!("Pod {namespace}/{name} not found"),
+            })?;
+        if current.uid != expected_uid || current.resource_version != expected_rv {
+            return Err(ResourceCommandError::Conflict {
+                message: format!("Pod {namespace}/{name} changed before actor deletion"),
+            });
+        }
+        let routed = match current
+            .data
+            .pointer("/spec/nodeName")
+            .and_then(serde_json::Value::as_str)
+            .filter(|node_name| !node_name.is_empty())
+        {
+            Some(node_name) => StorageCommand::FinalizeBoundPod {
+                namespace,
+                name,
+                pod_uid: current.uid,
+                node_name: node_name.to_string(),
+                observed_resource_version: current.resource_version,
+            },
+            None => StorageCommand::DeleteResource {
+                api_version,
+                kind,
+                namespace: Some(namespace),
+                name,
+                preconditions,
+            },
+        };
+        let result = self
+            .proposal
+            .propose_command(routed)
+            .await
+            .map_err(resource_command_submission_error)?;
+        match resource_command_result(result, false)? {
+            ResourceCommandResult::Ack { resource_version } => Ok(resource_version),
+            ResourceCommandResult::Resource(_) => Err(ResourceCommandError::corrupt_response(
+                "actor Pod deletion returned a resource",
+            )),
+        }
+    }
 }
 
 impl LeaderResourceCommand for EmbeddedLeaderResourceCommand {
@@ -42,6 +140,20 @@ impl LeaderResourceCommand for EmbeddedLeaderResourceCommand {
         request: ResourceCommandRequest,
     ) -> ResourceCommandFuture<'_, ResourceCommandResult> {
         Box::pin(async move {
+            if matches!(
+                request.command(),
+                StorageCommand::DeleteResource {
+                    api_version,
+                    kind,
+                    namespace: Some(_),
+                    ..
+                } if api_version == "v1" && kind == "Pod"
+            ) {
+                return self
+                    .submit_actor_pod_delete(request.into_command())
+                    .await
+                    .map(|resource_version| ResourceCommandResult::Ack { resource_version });
+            }
             if !*self.is_leader_rx.borrow() {
                 return Err(ResourceCommandError::NotLeader);
             }
@@ -55,7 +167,10 @@ impl LeaderResourceCommand for EmbeddedLeaderResourceCommand {
             let command = request.into_command();
             let expects_resource = !matches!(
                 command,
-                StorageCommand::DeleteResource { .. } | StorageCommand::DeleteNamespace { .. }
+                StorageCommand::DeleteResource { .. }
+                    | StorageCommand::DeleteNamespace { .. }
+                    | StorageCommand::DeleteNamespaceContents { .. }
+                    | StorageCommand::ApplyResourceBatch { .. }
             );
             let result = self
                 .proposal
@@ -107,6 +222,43 @@ async fn resource_command_result_or_current(
                 )
             });
     }
+    let query_ack_position =
+        !expects_resource && result.applied_rv.is_none() && result.error_message.is_none();
+    if query_ack_position {
+        if matches!(command, StorageCommand::ApplyResourceBatch { .. }) {
+            return Ok(ResourceCommandResult::Ack {
+                resource_version: 0,
+            });
+        }
+        let key = resource_command_key(command).ok_or_else(|| {
+            ResourceCommandError::corrupt_response(format!(
+                "resource-deleting {} command has no collection identity",
+                command.variant_name()
+            ))
+        })?;
+        let request = ResourceListRequest::try_new(
+            key.api_version,
+            key.kind,
+            key.namespace,
+            None,
+            None,
+            Some(0),
+            None,
+            ResourceQueryConsistency::LeaderFresh,
+        )
+        .map_err(|error| ResourceCommandError::corrupt_response(error.to_string()))?;
+        let current = resource_query
+            .list_resources(request)
+            .await
+            .map_err(|error| {
+                ResourceCommandError::retryable(format!(
+                    "read collection position after resource delete commit: {error}"
+                ))
+            })?;
+        return Ok(ResourceCommandResult::Ack {
+            resource_version: current.resource_version(),
+        });
+    }
     resource_command_result(result, expects_resource)
 }
 
@@ -156,6 +308,22 @@ fn resource_command_key(command: &StorageCommand) -> Option<ResourceKey> {
         | StorageCommand::UpdateNamespace { name, .. } => {
             Some(ResourceKey::new("v1", "Namespace", None, name.clone()))
         }
+        StorageCommand::DeleteResource {
+            api_version,
+            kind,
+            namespace,
+            name,
+            ..
+        } => Some(ResourceKey::new(
+            api_version.clone(),
+            kind.clone(),
+            namespace.clone(),
+            name.clone(),
+        )),
+        StorageCommand::DeleteNamespace { name }
+        | StorageCommand::DeleteNamespaceContents { name } => {
+            Some(ResourceKey::new("v1", "Namespace", None, name.clone()))
+        }
         _ => None,
     }
 }
@@ -198,8 +366,23 @@ fn resource_command_result(
             },
         );
     }
+    let applied_rv = result.applied_rv;
     let resource = result.applied_mutation.map(|mutation| match mutation {
-        AppliedMutation::Resource(resource) => resource,
+        AppliedMutation::Resource(mut resource) => {
+            if let Some(resource_version) = applied_rv {
+                resource.resource_version = resource_version;
+                if let Some(metadata) = std::sync::Arc::make_mut(&mut resource.data)
+                    .get_mut("metadata")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    metadata.insert(
+                        "resourceVersion".to_string(),
+                        serde_json::Value::String(resource_version.to_string()),
+                    );
+                }
+            }
+            resource
+        }
     });
     if expects_resource {
         return resource
@@ -210,8 +393,7 @@ fn resource_command_result(
                 )
             });
     }
-    result
-        .applied_rv
+    applied_rv
         .map(|resource_version| ResourceCommandResult::Ack { resource_version })
         .ok_or_else(|| {
             ResourceCommandError::corrupt_response(
@@ -250,7 +432,7 @@ impl EmbeddedOutboxDelivery {
         if !*self.is_leader_rx.borrow() {
             return Err(OutboxDeliveryError::NotLeader);
         }
-        let command = match decoded_command {
+        let mut command = match decoded_command {
             Ok(command) => command,
             Err(error) => {
                 if !error.is_terminal() {
@@ -276,21 +458,25 @@ impl EmbeddedOutboxDelivery {
             .await?;
             return Err(error);
         }
-        if operation == OutboxDeliveryOperation::PodMetadata
-            && let Err(error) = self
-                .authorize_live_pod_metadata(&command, &authenticated_node)
+        if operation == OutboxDeliveryOperation::PodMetadata {
+            match self
+                .authorize_live_pod_metadata(command, &authenticated_node)
                 .await
-        {
-            if error.is_terminal() {
-                self.consume_terminal_sequence(
-                    &idempotency_key,
-                    operation,
-                    &authenticated_node,
-                    watermark,
-                )
-                .await?;
+            {
+                Ok(authorized) => command = authorized,
+                Err(error) => {
+                    if error.is_terminal() {
+                        self.consume_terminal_sequence(
+                            &idempotency_key,
+                            operation,
+                            &authenticated_node,
+                            watermark,
+                        )
+                        .await?;
+                    }
+                    return Err(error);
+                }
             }
-            return Err(error);
         }
         if operation == OutboxDeliveryOperation::NodeStatus
             && let Err(error) = klights_leader_api::NodeSelfStatusRequest::validate_command(
@@ -369,16 +555,16 @@ impl EmbeddedOutboxDelivery {
 
     async fn authorize_live_pod_metadata(
         &self,
-        command: &StorageCommand,
+        command: StorageCommand,
         authenticated_node: &str,
-    ) -> Result<(), OutboxDeliveryError> {
+    ) -> Result<StorageCommand, OutboxDeliveryError> {
         if let StorageCommand::FinalizeBoundPod {
             namespace,
             name,
             pod_uid,
             node_name,
             observed_resource_version,
-        } = command
+        } = &command
         {
             if namespace.is_empty()
                 || name.is_empty()
@@ -390,9 +576,42 @@ impl EmbeddedOutboxDelivery {
                     "bound Pod finalization carries invalid actor observation",
                 ));
             }
-            return Ok(());
+            let query = klights_leader_api::pod_get_request(
+                namespace,
+                name,
+                ResourceQueryConsistency::LeaderFresh,
+            )
+            .map_err(|error| OutboxDeliveryError::unavailable(error.to_string()))?;
+            let live = self
+                .resource_query
+                .get_resource(query)
+                .await
+                .map_err(|error| OutboxDeliveryError::unavailable(error.to_string()))?
+                .ok_or_else(|| {
+                    OutboxDeliveryError::not_found(format!("Pod {namespace}/{name} not found"))
+                })?;
+            if live.uid != *pod_uid {
+                return Err(OutboxDeliveryError::uid_mismatch(pod_uid, live.uid));
+            }
+            let assigned_node = live
+                .data
+                .pointer("/spec/nodeName")
+                .and_then(serde_json::Value::as_str)
+                .filter(|assigned| !assigned.is_empty());
+            if assigned_node != Some(authenticated_node) {
+                return Err(OutboxDeliveryError::conflict(format!(
+                    "PodMetadata delivery for {namespace}/{name} is restricted to its assigned node"
+                )));
+            }
+            return Ok(StorageCommand::FinalizeBoundPod {
+                namespace: namespace.clone(),
+                name: name.clone(),
+                pod_uid: pod_uid.clone(),
+                node_name: node_name.clone(),
+                observed_resource_version: live.resource_version,
+            });
         }
-        let Some((namespace, name, preconditions)) = pod_target(command) else {
+        let Some((namespace, name, preconditions)) = pod_target(&command) else {
             return Err(OutboxDeliveryError::conflict(
                 "PodMetadata delivery must target one namespaced v1/Pod",
             ));
@@ -429,7 +648,7 @@ impl EmbeddedOutboxDelivery {
                 "PodMetadata delivery for {namespace}/{name} is restricted to its assigned node"
             )));
         }
-        Ok(())
+        Ok(command)
     }
 }
 
@@ -824,6 +1043,33 @@ mod tests {
         result: StorageCommandResult,
     }
 
+    struct RecordingProposal {
+        result: StorageCommandResult,
+        commands: std::sync::Mutex<Vec<StorageCommand>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RaftProposal for RecordingProposal {
+        async fn propose_command(
+            &self,
+            command: StorageCommand,
+        ) -> anyhow::Result<StorageCommandResult> {
+            self.commands.lock().unwrap().push(command);
+            Ok(self.result.clone())
+        }
+
+        async fn propose_outbox_command(
+            &self,
+            _idempotency_key: &str,
+            _operation: &str,
+            _command: StorageCommand,
+            _authoring_node: &str,
+            _watermark: Option<OutboxStreamWatermark>,
+        ) -> Result<klights_cluster_core::OutboxApplyOutcome, OutboxApplyError> {
+            unreachable!("actor Pod delete does not submit an outbox command")
+        }
+    }
+
     #[async_trait::async_trait]
     impl RaftProposal for FixedProposal {
         async fn propose_command(
@@ -843,6 +1089,62 @@ mod tests {
         ) -> Result<klights_cluster_core::OutboxApplyOutcome, OutboxApplyError> {
             unreachable!("resource-command tests do not submit outbox commands")
         }
+    }
+
+    #[tokio::test]
+    async fn actor_pod_delete_routes_bound_identity_through_finalize_command() {
+        let pod = klights_cluster_core::Resource::try_from_data(Arc::new(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "web",
+                "namespace": "default",
+                "uid": "pod-uid",
+                "resourceVersion": "17",
+                "deletionTimestamp": "2026-08-10T00:00:00Z"
+            },
+            "spec": {"nodeName": "worker-1"}
+        })))
+        .expect("bound Pod resource");
+        let query = Arc::new(FixedResourceQuery {
+            resource: pod.clone(),
+            gets: AtomicUsize::new(0),
+        });
+        let proposal = Arc::new(RecordingProposal {
+            result: command_result(Some(18), None, None, None),
+            commands: Default::default(),
+        });
+        let service = EmbeddedLeaderResourceCommand::new(
+            proposal.clone(),
+            query,
+            tokio::sync::watch::channel(true).1,
+        );
+
+        let resource_version = service
+            .submit_actor_pod_delete(StorageCommand::DeleteResource {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: "web".to_string(),
+                preconditions: ResourcePreconditions::from_resource(&pod),
+            })
+            .await
+            .expect("actor delete");
+
+        assert_eq!(resource_version, 18);
+        assert!(matches!(
+            proposal.commands.lock().unwrap().as_slice(),
+            [StorageCommand::FinalizeBoundPod {
+                namespace,
+                name,
+                pod_uid,
+                node_name,
+                observed_resource_version: 17,
+            }] if namespace == "default"
+                && name == "web"
+                && pod_uid == "pod-uid"
+                && node_name == "worker-1"
+        ));
     }
 
     #[tokio::test]
