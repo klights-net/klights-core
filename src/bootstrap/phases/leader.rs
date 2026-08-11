@@ -25,6 +25,7 @@ pub struct LeaderStart<'a> {
     /// (not the raft leader), controller startup is skipped cleanly.
     pub leader_coordination: Option<Arc<dyn ControllerCoordination>>,
     pub db_handle: &'a DatastoreHandle,
+    pub leader_bootstrap_store: Arc<crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore>,
     pub watch_maintenance: Arc<dyn klights_cluster_store::ClusterWatchMaintenance>,
     pub positioned_watch: klights_watch::PositionedWatchService,
     pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
@@ -44,6 +45,7 @@ pub struct LeaderStart<'a> {
 struct LeaderScopedTaskContext {
     config: Arc<KlightsConfig>,
     db_handle: DatastoreHandle,
+    leader_bootstrap_store: Arc<crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore>,
     watch_maintenance: Arc<dyn klights_cluster_store::ClusterWatchMaintenance>,
     positioned_watch: klights_watch::PositionedWatchService,
     pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
@@ -63,6 +65,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
         config,
         leader_coordination,
         db_handle,
+        leader_bootstrap_store,
         watch_maintenance,
         positioned_watch,
         pod_network_cache,
@@ -91,6 +94,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
     let leader_context = LeaderScopedTaskContext {
         config: config.clone(),
         db_handle: db_handle.clone(),
+        leader_bootstrap_store,
         watch_maintenance,
         positioned_watch,
         pod_network_cache,
@@ -182,13 +186,17 @@ mod tests {
 
         let first_leader_datapath = MockNetworkProvider::new();
         first_leader_datapath.set_pod_gateway_ip(Ipv4Addr::new(10, 50, 0, 1));
-        reconcile_kubernetes_service_for_leader(&config, &db_handle, &first_leader_datapath)
-            .await
-            .expect("first leader should seed kubernetes service endpoints");
+        reconcile_kubernetes_service_for_leader(
+            &config,
+            db_handle.as_ref(),
+            &first_leader_datapath,
+        )
+        .await
+        .expect("first leader should seed kubernetes service endpoints");
 
         let next_leader_datapath = MockNetworkProvider::new();
         next_leader_datapath.set_pod_gateway_ip(Ipv4Addr::new(10, 50, 4, 1));
-        reconcile_kubernetes_service_for_leader(&config, &db_handle, &next_leader_datapath)
+        reconcile_kubernetes_service_for_leader(&config, db_handle.as_ref(), &next_leader_datapath)
             .await
             .expect("new leader should reconcile kubernetes service endpoints");
 
@@ -224,6 +232,7 @@ async fn start_leader_scoped_tasks(
     let LeaderScopedTaskContext {
         config,
         db_handle,
+        leader_bootstrap_store,
         watch_maintenance,
         positioned_watch,
         pod_network_cache,
@@ -240,9 +249,13 @@ async fn start_leader_scoped_tasks(
 
     tracing::info!("Acquired leader lease");
 
-    reconcile_kubernetes_service_for_leader(config.as_ref(), &db_handle, datapath.as_ref())
-        .await
-        .context("reconcile kubernetes Service endpoint for active leader")?;
+    reconcile_kubernetes_service_for_leader(
+        config.as_ref(),
+        leader_bootstrap_store.as_ref(),
+        datapath.as_ref(),
+    )
+    .await
+    .context("reconcile kubernetes Service endpoint for active leader")?;
 
     let scheduler =
         crate::bootstrap::controller_adapters::cronjob_scheduler_adapter::new_leader_scheduler(
@@ -369,24 +382,23 @@ async fn start_leader_scoped_tasks(
     Ok(())
 }
 
-async fn reconcile_kubernetes_service_for_leader(
+async fn reconcile_kubernetes_service_for_leader<
+    S: klights_controllers::kube_service::KubernetesBootstrapStore + ?Sized,
+>(
     config: &KlightsConfig,
-    db_handle: &DatastoreHandle,
+    store: &S,
     datapath: &dyn klights_network_api::Datapath,
 ) -> Result<()> {
     klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
         anyhow::anyhow!("controller authority rejected Service bootstrap: {error}")
     })?;
-    klights_controllers::kube_service::bootstrap_default_service_cidr(
-        db_handle.as_ref(),
-        &config.service_cidr,
-    )
-    .await?;
+    klights_controllers::kube_service::bootstrap_default_service_cidr(store, &config.service_cidr)
+        .await?;
     klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
         anyhow::anyhow!("controller authority rejected Service bootstrap: {error}")
     })?;
     klights_controllers::kube_service::bootstrap_kubernetes_service(
-        db_handle.as_ref(),
+        store,
         &config.service_cidr,
         config.tls_port,
         datapath,

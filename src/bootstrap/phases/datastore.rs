@@ -110,6 +110,7 @@ pub struct DatastorePhase {
     pub leader_watch_maintenance: Arc<dyn klights_cluster_store::ClusterWatchMaintenance>,
     pub network_topology_command: Arc<dyn klights_leader_api::LeaderNetworkTopologyCommand>,
     pub resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
+    pub leader_bootstrap_store: Arc<crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore>,
     pub remote_api_client: Option<Arc<klights_leader_rpc::client::RemoteApiClient>>,
     /// Bootstrap-owned committed-outbox side-effect state shared by the
     /// canonical local delivery adapter and the later dispatcher wiring.
@@ -566,6 +567,11 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     remote_parts.node_lease_renewals.clone(),
                 ),
             );
+            let seed_bootstrap_store =
+                crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
+                    db_handle.clone(),
+                    leader_proxy.clone(),
+                );
             // Seed branch: no --leader on Controlplane (or any
             // seed Leader boot) bootstraps as the sole voter.
             // Joining controlplane (--leader non-empty) skips this and
@@ -642,24 +648,49 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                         "T7.1: cluster identity committed via raft"
                     );
 
-                    let db_for_membership: &dyn crate::datastore::DatastoreBackend = &*db_handle;
-                    crate::bootstrap::cluster_meta::write_cluster_membership(
-                        db_for_membership,
-                        &klights_cluster_core::ClusterMembership {
-                            cluster_id,
-                            voters: initial_voters_for_role(role, &config.node_name),
-                            term: 0,
-                            leader_hint: Some(config.node_name.clone()),
-                        },
-                    )
-                    .await
-                    .context("Failed to initialize cluster membership metadata")?;
+                    let membership = klights_cluster_core::ClusterMembership {
+                        cluster_id: cluster_id.clone(),
+                        voters: initial_voters_for_role(role, &config.node_name),
+                        term: 0,
+                        leader_hint: Some(config.node_name.clone()),
+                    };
+                    for (key, value) in [
+                        (
+                            klights_cluster_store::CLUSTER_ID_META_KEY,
+                            membership.cluster_id.clone(),
+                        ),
+                        (
+                            klights_cluster_store::RAFT_VOTERS_META_KEY,
+                            serde_json::to_string(&membership.voters)?,
+                        ),
+                        (
+                            klights_cluster_store::RAFT_TERM_META_KEY,
+                            membership.term.to_string(),
+                        ),
+                        (
+                            klights_cluster_store::RAFT_LEADER_HINT_META_KEY,
+                            membership.leader_hint.clone().unwrap_or_default(),
+                        ),
+                    ] {
+                        raft.propose_command(
+                            klights_cluster_core::command::StorageCommand::SetKlightsMeta {
+                                key: key.to_string(),
+                                value,
+                            },
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("Failed to initialize cluster metadata key {key}")
+                        })?;
+                    }
 
                     // Bootstrap token Secret: create through the replicated
                     // datastore (now raft-backed since the proposer is attached).
-                    crate::bootstrap::bootstrap_token::ensure_bootstrap_tokens(db_for_membership)
-                        .await
-                        .context("Failed to create bootstrap tokens")?;
+                    crate::bootstrap::bootstrap_token::ensure_bootstrap_tokens(
+                        &seed_bootstrap_store,
+                    )
+                    .await
+                    .context("Failed to create bootstrap tokens")?;
                     tracing::info!("T7.1: bootstrap tokens created via raft-backed datastore");
                 } else if !needs_seed_metadata {
                     tracing::info!(
@@ -1010,6 +1041,12 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         leader_proxy.clone();
     let resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand> =
         leader_proxy.clone();
+    let leader_bootstrap_store = Arc::new(
+        crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
+            db_handle.clone(),
+            resource_commands.clone(),
+        ),
+    );
     let node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal> =
         leader_proxy.clone();
     let replication_metadata: Arc<dyn klights_cluster_store::ClusterMetadataRead> = sqlite_recovery;
@@ -1098,6 +1135,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         leader_watch_maintenance,
         network_topology_command,
         resource_commands,
+        leader_bootstrap_store,
         remote_api_client: remote_parts.remote_api_client,
         local_side_effects,
         authenticated_outbox_delivery,

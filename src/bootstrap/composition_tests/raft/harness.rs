@@ -78,14 +78,59 @@ impl IntegrationRaftComposition {
         node: Arc<klights_replication::node::RaftNode>,
     ) -> Arc<dyn klights_leader_api::ControlplaneJoinHandler> {
         let db: IntegrationDatastoreHandle = self.db.clone();
-        crate::bootstrap::controlplane_join_adapters::build_controlplane_join_handler(node, db)
+        let authority =
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+        let query =
+            crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+                db.clone(), authority.clone(),
+            );
+        let commands = Arc::new(
+            klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
+                Arc::new(
+                    crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()),
+                ),
+                query,
+                authority,
+            ),
+        );
+        let store = Arc::new(
+            crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
+                db.clone(),
+                commands,
+            ),
+        );
+        crate::bootstrap::controlplane_join_adapters::build_controlplane_join_handler(
+            node, db, store,
+        )
     }
 
-    pub async fn write_cluster_membership(
+    pub fn controlplane_join_handler_with_raft_store(
         &self,
-        membership: &klights_cluster_core::ClusterMembership,
-    ) -> anyhow::Result<()> {
-        crate::bootstrap::cluster_meta::write_cluster_membership(self.db.as_ref(), membership).await
+        node: Arc<klights_replication::node::RaftNode>,
+    ) -> Arc<dyn klights_leader_api::ControlplaneJoinHandler> {
+        let db: IntegrationDatastoreHandle = self.db.clone();
+        let authority =
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+        let query =
+            crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+                db.clone(), authority.clone(),
+            );
+        let commands = Arc::new(
+            klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
+                node.proposal(),
+                query,
+                authority,
+            ),
+        );
+        let store = Arc::new(
+            crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
+                db.clone(),
+                commands,
+            ),
+        );
+        crate::bootstrap::controlplane_join_adapters::build_controlplane_join_handler(
+            node, db, store,
+        )
     }
 
     pub async fn read_cluster_membership(

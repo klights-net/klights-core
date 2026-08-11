@@ -225,6 +225,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     let leader_network_topology = ds.leader_network_topology;
     let leader_watch_maintenance = ds.leader_watch_maintenance;
     let resource_commands = ds.resource_commands;
+    let leader_bootstrap_store = ds.leader_bootstrap_store;
     let remote_api_client = ds.remote_api_client;
     let replication_service_for_router = ds.replication_service.clone();
     let _replication_service = ds.replication_service;
@@ -292,6 +293,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         // cross-node WireGuard tunnel never forms.
         let published = publish_local_dataplane_metadata_self_heal(
             db,
+            network_topology_command.as_ref(),
             &config,
             &node_mode,
             task_supervisor.as_ref(),
@@ -396,6 +398,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         leader_node_subnet_allocation: leader_node_subnet_allocation.clone(),
         leader_network_topology: leader_network_topology.clone(),
         resource_commands,
+        leader_bootstrap_store: leader_bootstrap_store.clone(),
         remote_api_client: remote_api_client.clone(),
         pod_network_cache,
         pod_runtime_store,
@@ -448,6 +451,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         config: &config,
         leader_coordination: controller_coordination,
         db_handle: &db_handle,
+        leader_bootstrap_store,
         watch_maintenance: leader_watch_maintenance.clone(),
         positioned_watch,
         pod_network_cache: node_local.pod_network_cache(),
@@ -779,9 +783,16 @@ mod tests {
         let supervisor = klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         );
+        let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
+        let command = crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
+            db_handle.clone(),
+            Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db_handle)),
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+        );
 
         let published = super::publish_local_dataplane_metadata_self_heal(
             &db,
+            &command,
             &config,
             &crate::bootstrap::NodeMode::Root,
             &supervisor,

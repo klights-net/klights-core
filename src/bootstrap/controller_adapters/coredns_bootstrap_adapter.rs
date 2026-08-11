@@ -6,13 +6,14 @@ use klights_cluster_core::Resource;
 use serde_json::Value;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::DatastoreBackend;
 use klights_controllers::coredns::{
     CoreDnsBootstrapStore, CoreDnsResourceKind, bootstrap_coredns_with_store,
 };
+use klights_controllers::kube_service::KubernetesBootstrapStore;
 
 struct CoreDnsBootstrapAdapter<'a> {
-    db: &'a dyn DatastoreBackend,
+    bootstrap: &'a crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore,
+    deployment_store: &'a dyn klights_controllers::deployment::DeploymentStore,
     pod_reader: Arc<dyn klights_pod_api::PodQuery>,
     pod_mutation: Arc<dyn klights_controllers::DeploymentControllerPodMutation>,
     pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
@@ -28,10 +29,9 @@ impl CoreDnsBootstrapStore for CoreDnsBootstrapAdapter<'_> {
         kind: CoreDnsResourceKind,
     ) -> klights_reconcile_api::ControllerStoreResult<Option<Resource>> {
         let (api_version, kind, namespace, name) = kind.coordinates();
-        self.db
-            .get_resource(api_version, kind, namespace, name)
+        self.bootstrap
+            .get_bootstrap_resource(api_version, kind, namespace, name)
             .await
-            .map_err(map_controller_store_error)
     }
 
     async fn create_coredns_resource(
@@ -40,10 +40,9 @@ impl CoreDnsBootstrapStore for CoreDnsBootstrapAdapter<'_> {
         value: Value,
     ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
         let (api_version, kind, namespace, name) = kind.coordinates();
-        self.db
-            .create_resource(api_version, kind, namespace, name, value)
+        self.bootstrap
+            .create_bootstrap_resource(api_version, kind, namespace, name, value)
             .await
-            .map_err(map_controller_store_error)
     }
 
     async fn update_coredns_resource(
@@ -53,8 +52,8 @@ impl CoreDnsBootstrapStore for CoreDnsBootstrapAdapter<'_> {
         expected_resource_version: i64,
     ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
         let (api_version, kind, namespace, name) = kind.coordinates();
-        self.db
-            .update_resource(
+        self.bootstrap
+            .update_bootstrap_resource(
                 api_version,
                 kind,
                 namespace,
@@ -63,7 +62,6 @@ impl CoreDnsBootstrapStore for CoreDnsBootstrapAdapter<'_> {
                 expected_resource_version,
             )
             .await
-            .map_err(map_controller_store_error)
     }
 
     async fn reconcile_coredns_deployment(
@@ -79,7 +77,7 @@ impl CoreDnsBootstrapStore for CoreDnsBootstrapAdapter<'_> {
             self.identity,
         );
         klights_controllers::deployment::reconcile_deployment(
-            self.db,
+            self.deployment_store,
             self.pod_reader.as_ref(),
             self.pod_mutation.as_ref(),
             self.identity,
@@ -102,7 +100,8 @@ pub(crate) struct CoreDnsBootstrapConfig<'a> {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn bootstrap_coredns(
-    db: &dyn DatastoreBackend,
+    bootstrap: &crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore,
+    deployment_store: &dyn klights_controllers::deployment::DeploymentStore,
     pod_reader: Arc<dyn klights_pod_api::PodQuery>,
     pod_mutation: Arc<dyn klights_controllers::DeploymentControllerPodMutation>,
     pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
@@ -113,7 +112,8 @@ pub(crate) async fn bootstrap_coredns(
 ) -> Result<()> {
     bootstrap_coredns_with_store(
         &CoreDnsBootstrapAdapter {
-            db,
+            bootstrap,
+            deployment_store,
             pod_reader,
             pod_mutation,
             pod_delete_sink,

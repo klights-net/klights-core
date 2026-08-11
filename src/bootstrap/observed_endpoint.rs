@@ -15,6 +15,7 @@ use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 pub(crate) struct LeaderPeerEndpointObserverDeps {
     query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     node_status: Arc<dyn klights_leader_api::LeaderNodeSelfStatus>,
+    network_command: Arc<dyn klights_leader_api::LeaderNetworkTopologyCommand>,
     config: Arc<crate::KlightsConfig>,
     node_mode: NodeMode,
 }
@@ -23,12 +24,14 @@ impl LeaderPeerEndpointObserverDeps {
     pub(crate) fn new(
         query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
         node_status: Arc<dyn klights_leader_api::LeaderNodeSelfStatus>,
+        network_command: Arc<dyn klights_leader_api::LeaderNetworkTopologyCommand>,
         config: Arc<crate::KlightsConfig>,
         node_mode: NodeMode,
     ) -> Self {
         Self {
             query,
             node_status,
+            network_command,
             config,
             node_mode,
         }
@@ -86,6 +89,7 @@ async fn run_leader_peer_endpoint_observer(
     // entirely, leaving node_dataplane empty and the WireGuard tunnel unformed.
     if ensure_published_if_local_has_external_ip(
         db.as_ref(),
+        deps.network_command.as_ref(),
         &deps.config,
         &deps.node_mode,
         supervisor.as_ref(),
@@ -125,6 +129,7 @@ async fn run_leader_peer_endpoint_observer(
                 }
                 if ensure_published_if_local_has_external_ip(
                     db.as_ref(),
+                    deps.network_command.as_ref(),
                     &deps.config,
                     &deps.node_mode,
                     supervisor.as_ref(),
@@ -232,6 +237,7 @@ async fn observe_from_peer(
         // peers can configure the WireGuard tunnel back to us.
         crate::bootstrap::init::dataplane::ensure_node_dataplane_published(
             db,
+            deps.network_command.as_ref(),
             &deps.config,
             &deps.node_mode,
             &endpoint_ip,
@@ -260,6 +266,7 @@ async fn local_node_external_ip(
 /// keep observing peers.
 async fn ensure_published_if_local_has_external_ip(
     db: &dyn crate::datastore::DatastoreBackend,
+    network_command: &dyn klights_leader_api::LeaderNetworkTopologyCommand,
     config: &crate::KlightsConfig,
     node_mode: &NodeMode,
     supervisor: &TaskSupervisor,
@@ -268,6 +275,7 @@ async fn ensure_published_if_local_has_external_ip(
         Ok(Some(external_ip)) => {
             if let Err(err) = crate::bootstrap::init::dataplane::ensure_node_dataplane_published(
                 db,
+                network_command,
                 config,
                 node_mode,
                 &external_ip,
@@ -344,6 +352,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn test_dataplane_command(
+        db: crate::datastore::DatastoreHandle,
+    ) -> crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork{
+        crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
+            db.clone(),
+            Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db)),
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+        )
+    }
+
     #[tokio::test]
     async fn ensure_published_self_heals_when_local_node_has_external_ip() {
         let db = crate::datastore::sqlite::Datastore::new_in_memory()
@@ -371,6 +389,7 @@ mod tests {
 
         let done = super::ensure_published_if_local_has_external_ip(
             &db,
+            &test_dataplane_command(Arc::new(db.clone())),
             &config,
             &NodeMode::Root,
             &supervisor,
@@ -416,6 +435,7 @@ mod tests {
 
         let done = super::ensure_published_if_local_has_external_ip(
             &db,
+            &test_dataplane_command(Arc::new(db.clone())),
             &config,
             &NodeMode::Root,
             &supervisor,

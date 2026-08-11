@@ -21,6 +21,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use klights::datastore::DatastoreBackend;
+    use klights_cluster_core::StorageCommand;
     use klights_cluster_store::{
         COMMAND_CODEC_ACTIVATION_VERSION_META_KEY as KEY_COMMAND_CODEC_ACTIVATION_VERSION,
         COMMAND_CODEC_V3_ACTIVATION_VALUE as COMMAND_CODEC_ACTIVATION_VALUE,
@@ -1183,6 +1184,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn voter_join_replays_seed_bootstrap_commands_authored_before_admission() {
+        let registry = LoopbackRegistry::new();
+        let (leader, leader_db) = fresh_voter_in_registry_with_backend(31, &registry).await;
+        let leader = Arc::new(leader.into_node());
+        let (joiner, joiner_db) = fresh_voter_in_registry_with_backend(32, &registry).await;
+        leader
+            .bootstrap_single_voter("https://10.99.0.31:7679".into())
+            .await
+            .expect("bootstrap seed");
+        wait_for_leader(&leader, std::time::Duration::from_secs(5))
+            .await
+            .expect("seed leader election");
+
+        let commands = [
+            StorageCommand::CreateNamespace {
+                name: "kube-system".into(),
+                data: serde_json::json!({
+                    "apiVersion": "v1", "kind": "Namespace",
+                    "metadata": {"name": "kube-system", "uid": "seed-ns"}
+                }),
+            },
+            StorageCommand::CreateResource {
+                api_version: "rbac.authorization.k8s.io/v1".into(),
+                kind: "ClusterRole".into(),
+                namespace: None,
+                name: "system:seed-proof".into(),
+                data: serde_json::json!({
+                    "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
+                    "metadata": {"name": "system:seed-proof", "uid": "seed-rbac"},
+                    "rules": []
+                }),
+            },
+            StorageCommand::CreateResource {
+                api_version: "v1".into(),
+                kind: "Secret".into(),
+                namespace: Some("kube-system".into()),
+                name: "bootstrap-token-seed-proof".into(),
+                data: serde_json::json!({
+                    "apiVersion": "v1", "kind": "Secret",
+                    "metadata": {"namespace": "kube-system", "name": "bootstrap-token-seed-proof", "uid": "seed-token"},
+                    "type": "bootstrap.kubernetes.io/token"
+                }),
+            },
+            StorageCommand::CreateResource {
+                api_version: "networking.k8s.io/v1".into(),
+                kind: "ServiceCIDR".into(),
+                namespace: None,
+                name: "kubernetes".into(),
+                data: serde_json::json!({
+                    "apiVersion": "networking.k8s.io/v1", "kind": "ServiceCIDR",
+                    "metadata": {"name": "kubernetes", "uid": "seed-service-cidr"},
+                    "spec": {"cidrs": ["10.43.0.0/16"]}
+                }),
+            },
+            StorageCommand::SetKlightsMeta {
+                key: klights_cluster_store::RAFT_VOTERS_META_KEY.into(),
+                value: "[\"n31\"]".into(),
+            },
+            StorageCommand::SetKlightsMeta {
+                key: klights_cluster_store::CLUSTER_ID_META_KEY.into(),
+                value: "seed-cluster".into(),
+            },
+            StorageCommand::SetKlightsMeta {
+                key: klights_cluster_store::RAFT_TERM_META_KEY.into(),
+                value: "0".into(),
+            },
+            StorageCommand::SetKlightsMeta {
+                key: klights_cluster_store::RAFT_LEADER_HINT_META_KEY.into(),
+                value: "n31".into(),
+            },
+        ];
+        for command in commands {
+            leader
+                .propose_command(command)
+                .await
+                .expect("commit seed bootstrap command");
+        }
+        let handler = IntegrationRaftComposition::new(leader_db.clone())
+            .controlplane_join_handler_with_raft_store(leader.clone());
+        handler
+            .join(test_controlplane_join_request(
+                32,
+                "https://10.99.0.32:7679",
+                "n32",
+                false,
+                joiner.storage_incarnation(),
+                None,
+                "seed-joiner-hash",
+            ))
+            .await
+            .expect("admit voter through production join handler after seed writes");
+        wait_for_voter_count(&leader, 2).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let caught_up = joiner_db
+                .get_resource("networking.k8s.io/v1", "ServiceCIDR", None, "kubernetes")
+                .await
+                .expect("read joiner bootstrap state")
+                .is_some()
+                && joiner_db
+                    .get_klights_meta(klights_cluster_store::RAFT_VOTERS_META_KEY)
+                    .await
+                    .expect("read joiner membership metadata")
+                    .as_deref()
+                    == Some("[\"n31\",\"n32\"]")
+                && joiner_db
+                    .get_resource("v1", "Node", None, "n32")
+                    .await
+                    .expect("read replicated joiner Node")
+                    .is_some();
+            if caught_up {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "joining voter did not replay seed bootstrap commands"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        for (api_version, kind, namespace, name) in [
+            ("v1", "Namespace", None, "kube-system"),
+            (
+                "rbac.authorization.k8s.io/v1",
+                "ClusterRole",
+                None,
+                "system:seed-proof",
+            ),
+            (
+                "v1",
+                "Secret",
+                Some("kube-system"),
+                "bootstrap-token-seed-proof",
+            ),
+            ("networking.k8s.io/v1", "ServiceCIDR", None, "kubernetes"),
+            ("v1", "Node", None, "n32"),
+        ] {
+            let leader_resource = leader_db
+                .get_resource(api_version, kind, namespace, name)
+                .await
+                .unwrap();
+            let joiner_resource = joiner_db
+                .get_resource(api_version, kind, namespace, name)
+                .await
+                .unwrap();
+            assert_eq!(
+                joiner_resource, leader_resource,
+                "seed state drift for {kind}/{name}"
+            );
+        }
+        assert_eq!(
+            joiner_db.get_current_resource_version().await.unwrap(),
+            leader_db.get_current_resource_version().await.unwrap(),
+            "joining voter must preserve the leader's public resourceVersion sequence"
+        );
+
+        drop(handler);
+        match Arc::try_unwrap(leader) {
+            Ok(leader) => leader.shutdown().await.unwrap(),
+            Err(_) => panic!("join handler retained the seed Raft node"),
+        }
+        joiner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn concurrent_node_subnet_proposals_do_not_close_apply_channel() {
         let (node, backend) = fresh_node(90).await;
         node.bootstrap_single_voter("https://10.99.0.90:7679".into())
@@ -1652,8 +1818,9 @@ mod tests {
     async fn join_handler_voter_admission_updates_cluster_membership_metadata() {
         use klights_leader_api::ControlplaneJoinOutcome;
         let registry = LoopbackRegistry::new();
-        let leader = Arc::new(fresh_voter_in_registry(52, &registry).await.into_node());
-        let follower = fresh_voter_in_registry(53, &registry).await;
+        let (leader, leader_db) = fresh_voter_in_registry_with_backend(52, &registry).await;
+        let leader = Arc::new(leader.into_node());
+        let (follower, follower_db) = fresh_voter_in_registry_with_backend(53, &registry).await;
         leader
             .bootstrap_single_voter("https://10.99.0.52:7679".into())
             .await
@@ -1661,19 +1828,29 @@ mod tests {
         wait_for_leader(&leader, std::time::Duration::from_secs(5))
             .await
             .unwrap();
-        let leader_db = test_db().await;
-        IntegrationRaftComposition::new(leader_db.clone())
-            .write_cluster_membership(&klights_cluster_core::ClusterMembership {
-                cluster_id: "cluster-a".to_string(),
-                voters: vec!["mn-controlplane1".to_string()],
-                term: 0,
-                leader_hint: Some("mn-controlplane1".to_string()),
-            })
-            .await
-            .unwrap();
+        for (key, value) in [
+            (klights_cluster_store::CLUSTER_ID_META_KEY, "cluster-a"),
+            (
+                klights_cluster_store::RAFT_VOTERS_META_KEY,
+                "[\"mn-controlplane1\"]",
+            ),
+            (klights_cluster_store::RAFT_TERM_META_KEY, "0"),
+            (
+                klights_cluster_store::RAFT_LEADER_HINT_META_KEY,
+                "mn-controlplane1",
+            ),
+        ] {
+            leader
+                .propose_command(StorageCommand::SetKlightsMeta {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                })
+                .await
+                .unwrap();
+        }
 
         let composition = IntegrationRaftComposition::new(leader_db.clone());
-        let handler = composition.controlplane_join_handler(leader.clone());
+        let handler = composition.controlplane_join_handler_with_raft_store(leader.clone());
         let outcome = handler
             .join(test_controlplane_join_request(
                 53,
@@ -1703,6 +1880,28 @@ mod tests {
             vec!["mn-controlplane1", "mn-controlplane2"],
             "admitted voters must be reflected in replicated membership metadata"
         );
+        let follower_composition = IntegrationRaftComposition::new(follower_db.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let follower_membership = follower_composition.read_cluster_membership().await;
+            if follower_membership
+                .as_ref()
+                .is_ok_and(|replicated| replicated.voters == membership.voters)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "joining voter did not apply replicated membership metadata"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drop(handler);
+        match Arc::try_unwrap(leader) {
+            Ok(leader) => leader.shutdown().await.unwrap(),
+            Err(_) => panic!("join handler retained the seed Raft node"),
+        }
+        follower.shutdown().await.unwrap();
     }
 
     #[tokio::test]

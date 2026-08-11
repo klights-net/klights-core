@@ -13,6 +13,7 @@ use klights_replication::node::RaftNode;
 
 struct ClusterControlplaneJoinRegistration {
     db: DatastoreHandle,
+    store: Arc<crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore>,
 }
 
 impl ControlplaneJoinRegistration for ClusterControlplaneJoinRegistration {
@@ -130,8 +131,8 @@ impl ClusterControlplaneJoinRegistration {
             klights_networking::dataplane_health::DataplaneHealth::new_healthy();
         pending_dataplane.set_peers_pending();
         let pending_dataplane = pending_dataplane.snapshot();
-        crate::bootstrap::node_registration_adapter::register_node_snapshot(
-            self.db.as_ref(),
+        crate::bootstrap::node_registration_adapter::register_leader_node_snapshot(
+            self.store.as_ref(),
             None,
             Some(&pending_dataplane),
             &snapshot,
@@ -196,17 +197,44 @@ impl ClusterControlplaneJoinMetadata {
             as_learner,
             self.node.authoring_node(),
         );
-        crate::bootstrap::cluster_meta::write_cluster_membership(self.db.as_ref(), &membership)
-            .await
-            .with_context(|| {
-                format!("failed to refresh cluster membership metadata after admitting {node_name}")
-            })
+        for (key, value) in [
+            (
+                klights_cluster_store::CLUSTER_ID_META_KEY,
+                membership.cluster_id,
+            ),
+            (
+                klights_cluster_store::RAFT_VOTERS_META_KEY,
+                serde_json::to_string(&membership.voters)?,
+            ),
+            (
+                klights_cluster_store::RAFT_TERM_META_KEY,
+                membership.term.to_string(),
+            ),
+            (
+                klights_cluster_store::RAFT_LEADER_HINT_META_KEY,
+                membership.leader_hint.unwrap_or_default(),
+            ),
+        ] {
+            self.node
+                .propose_command(klights_cluster_core::StorageCommand::SetKlightsMeta {
+                    key: key.to_string(),
+                    value,
+                })
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to replicate membership metadata key {key} after admitting {node_name}"
+                    )
+                })?;
+        }
+        Ok(())
     }
 }
 
 pub(crate) fn build_controlplane_join_handler(
     node: Arc<RaftNode>,
     db: DatastoreHandle,
+    store: Arc<crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore>,
 ) -> Arc<dyn ControlplaneJoinHandler> {
     let membership = node.membership();
     Arc::new(klights_replication::join::ControlplaneJoinCoordinator::new(
@@ -220,7 +248,10 @@ pub(crate) fn build_controlplane_join_handler(
         Arc::new(klights_replication::join::RaftControlplaneMemberQuery::new(
             membership,
         )),
-        Arc::new(ClusterControlplaneJoinRegistration { db: db.clone() }),
+        Arc::new(ClusterControlplaneJoinRegistration {
+            db: db.clone(),
+            store: store.clone(),
+        }),
         Arc::new(ClusterControlplaneJoinMetadata {
             node,
             db,

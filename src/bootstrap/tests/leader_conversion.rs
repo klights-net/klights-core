@@ -112,6 +112,98 @@ fn concrete_leader_clients_implement_focused_pod_effect_ports() {
 }
 
 #[test]
+fn seed_bootstrap_adapter_is_limited_to_focused_controller_stores() {
+    fn assert_seed_ports<T>()
+    where
+        T: klights_controllers::namespace::NamespaceBootstrapStore
+            + klights_controllers::rbac_reconcile::RbacPolicyStore
+            + klights_controllers::kube_service::KubernetesBootstrapStore,
+    {
+    }
+
+    assert_seed_ports::<
+        crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore,
+    >();
+}
+
+struct RecordingBootstrapCommands {
+    commands: std::sync::Mutex<Vec<StorageCommand>>,
+}
+
+impl klights_leader_api::LeaderResourceCommand for RecordingBootstrapCommands {
+    fn submit_resource_command(
+        &self,
+        request: klights_leader_api::ResourceCommandRequest,
+    ) -> klights_leader_api::ResourceCommandFuture<'_, klights_leader_api::ResourceCommandResult>
+    {
+        Box::pin(async move {
+            let command = request.into_command();
+            self.commands.lock().unwrap().push(command.clone());
+            let StorageCommand::CreateResource { mut data, .. } = command else {
+                panic!("test expects a create command")
+            };
+            data["metadata"]["uid"] = serde_json::json!("seed-uid");
+            data["metadata"]["resourceVersion"] = serde_json::json!("1");
+            Ok(klights_leader_api::ResourceCommandResult::Resource(
+                klights_cluster_core::Resource::try_from_data(Arc::new(data)).unwrap(),
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn seed_bootstrap_mutation_uses_command_port_without_passive_write() {
+    use klights_controllers::kube_service::KubernetesBootstrapStore as _;
+
+    let passive = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
+    let passive_handle: crate::datastore::DatastoreHandle = Arc::new(passive.clone());
+    let commands = Arc::new(RecordingBootstrapCommands {
+        commands: std::sync::Mutex::new(Vec::new()),
+    });
+    let store = crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
+        passive_handle,
+        commands.clone(),
+    );
+
+    store
+        .create_bootstrap_resource(
+            "rbac.authorization.k8s.io/v1",
+            "ClusterRole",
+            None,
+            "system:test",
+            serde_json::json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "ClusterRole",
+                "metadata": {"name": "system:test"},
+                "rules": []
+            }),
+        )
+        .await
+        .expect("submit seed mutation");
+
+    assert!(
+        passive
+            .get_resource(
+                "rbac.authorization.k8s.io/v1",
+                "ClusterRole",
+                None,
+                "system:test",
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "bootstrap adapter must never mutate the passive apply store directly"
+    );
+    assert!(matches!(
+        commands.commands.lock().unwrap().as_slice(),
+        [StorageCommand::CreateResource { kind, name, .. }]
+            if kind == "ClusterRole" && name == "system:test"
+    ));
+}
+
+#[test]
 fn node_effect_ports_have_the_frozen_authority_split() {
     fn assert_lease<T: klights_leader_api::LeaderNodeLeaseRenewal>() {}
     fn assert_local_lifecycle<T: klights_leader_api::LeaderNodeLifecycleStatus>() {}

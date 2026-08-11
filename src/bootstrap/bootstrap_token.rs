@@ -9,6 +9,118 @@ use klights_auth::bootstrap_token::{
 use crate::datastore::Resource;
 use crate::datastore::backend::DatastoreBackend;
 
+#[async_trait::async_trait]
+pub(crate) trait BootstrapTokenStore: Send + Sync {
+    async fn get_bootstrap_token_secret(
+        &self,
+        scope: BootstrapTokenScope,
+    ) -> Result<Option<Resource>>;
+    async fn create_bootstrap_token_secret(
+        &self,
+        scope: BootstrapTokenScope,
+        data: serde_json::Value,
+    ) -> Result<Resource>;
+    async fn update_bootstrap_token_secret(
+        &self,
+        resource: &Resource,
+        data: serde_json::Value,
+    ) -> Result<Resource>;
+}
+
+#[async_trait::async_trait]
+impl<T: DatastoreBackend> BootstrapTokenStore for T {
+    async fn get_bootstrap_token_secret(
+        &self,
+        scope: BootstrapTokenScope,
+    ) -> Result<Option<Resource>> {
+        self.get_resource(
+            "v1",
+            "Secret",
+            Some(BOOTSTRAP_TOKEN_NAMESPACE),
+            scope.secret_name(),
+        )
+        .await
+    }
+
+    async fn create_bootstrap_token_secret(
+        &self,
+        scope: BootstrapTokenScope,
+        data: serde_json::Value,
+    ) -> Result<Resource> {
+        self.create_resource(
+            "v1",
+            "Secret",
+            Some(BOOTSTRAP_TOKEN_NAMESPACE),
+            scope.secret_name(),
+            data,
+        )
+        .await
+    }
+
+    async fn update_bootstrap_token_secret(
+        &self,
+        resource: &Resource,
+        data: serde_json::Value,
+    ) -> Result<Resource> {
+        self.update_resource(
+            "v1",
+            "Secret",
+            Some(BOOTSTRAP_TOKEN_NAMESPACE),
+            &resource.name,
+            data,
+            resource.resource_version,
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl BootstrapTokenStore for dyn DatastoreBackend + '_ {
+    async fn get_bootstrap_token_secret(
+        &self,
+        scope: BootstrapTokenScope,
+    ) -> Result<Option<Resource>> {
+        self.get_resource(
+            "v1",
+            "Secret",
+            Some(BOOTSTRAP_TOKEN_NAMESPACE),
+            scope.secret_name(),
+        )
+        .await
+    }
+
+    async fn create_bootstrap_token_secret(
+        &self,
+        scope: BootstrapTokenScope,
+        data: serde_json::Value,
+    ) -> Result<Resource> {
+        self.create_resource(
+            "v1",
+            "Secret",
+            Some(BOOTSTRAP_TOKEN_NAMESPACE),
+            scope.secret_name(),
+            data,
+        )
+        .await
+    }
+
+    async fn update_bootstrap_token_secret(
+        &self,
+        resource: &Resource,
+        data: serde_json::Value,
+    ) -> Result<Resource> {
+        self.update_resource(
+            "v1",
+            "Secret",
+            Some(BOOTSTRAP_TOKEN_NAMESPACE),
+            &resource.name,
+            data,
+            resource.resource_version,
+        )
+        .await
+    }
+}
+
 pub(crate) fn generate_random_bootstrap_token() -> String {
     use rand_core::RngCore;
 
@@ -46,24 +158,28 @@ impl klights_leader_api::BootstrapTokenValidation for DatastoreBootstrapTokenVal
     }
 }
 
-pub(crate) async fn ensure_worker_bootstrap_token(db: &dyn DatastoreBackend) -> Result<String> {
+pub(crate) async fn ensure_worker_bootstrap_token<S: BootstrapTokenStore + ?Sized>(
+    db: &S,
+) -> Result<String> {
     ensure_bootstrap_token_for_scope(db, BootstrapTokenScope::Worker).await
 }
 
 pub(crate) async fn ensure_controlplane_bootstrap_token(
-    db: &dyn DatastoreBackend,
+    db: &(impl BootstrapTokenStore + ?Sized),
 ) -> Result<String> {
     ensure_bootstrap_token_for_scope(db, BootstrapTokenScope::Controlplane).await
 }
 
-pub(crate) async fn ensure_bootstrap_tokens(db: &dyn DatastoreBackend) -> Result<(String, String)> {
+pub(crate) async fn ensure_bootstrap_tokens<S: BootstrapTokenStore + ?Sized>(
+    db: &S,
+) -> Result<(String, String)> {
     let worker = ensure_worker_bootstrap_token(db).await?;
     let controlplane = ensure_controlplane_bootstrap_token(db).await?;
     Ok((worker, controlplane))
 }
 
 pub(crate) async fn ensure_bootstrap_token_for_scope(
-    db: &dyn DatastoreBackend,
+    db: &(impl BootstrapTokenStore + ?Sized),
     scope: BootstrapTokenScope,
 ) -> Result<String> {
     if let Some(secret) = read_secret(db, scope).await? {
@@ -82,7 +198,7 @@ pub(crate) async fn ensure_bootstrap_token_for_scope(
 }
 
 async fn write_scoped_bootstrap_token_secret(
-    db: &dyn DatastoreBackend,
+    db: &(impl BootstrapTokenStore + ?Sized),
     scope: BootstrapTokenScope,
     token: &str,
     ttl: std::time::Duration,
@@ -94,24 +210,9 @@ async fn write_scoped_bootstrap_token_secret(
         time::OffsetDateTime::now_utc(),
     )?;
     if let Some(existing) = read_secret(db, scope).await? {
-        db.update_resource(
-            "v1",
-            "Secret",
-            Some(BOOTSTRAP_TOKEN_NAMESPACE),
-            scope.secret_name(),
-            data,
-            existing.resource_version,
-        )
-        .await?;
+        db.update_bootstrap_token_secret(&existing, data).await?;
     } else {
-        db.create_resource(
-            "v1",
-            "Secret",
-            Some(BOOTSTRAP_TOKEN_NAMESPACE),
-            scope.secret_name(),
-            data,
-        )
-        .await?;
+        db.create_bootstrap_token_secret(scope, data).await?;
     }
     Ok(())
 }
@@ -244,16 +345,10 @@ fn resource_view(resource: &Resource) -> BootstrapTokenSecret<'_> {
 }
 
 async fn read_secret(
-    db: &dyn DatastoreBackend,
+    db: &(impl BootstrapTokenStore + ?Sized),
     scope: BootstrapTokenScope,
 ) -> Result<Option<Resource>> {
-    db.get_resource(
-        "v1",
-        "Secret",
-        Some(BOOTSTRAP_TOKEN_NAMESPACE),
-        scope.secret_name(),
-    )
-    .await
+    db.get_bootstrap_token_secret(scope).await
 }
 
 async fn read_fixed_secret(
@@ -266,21 +361,13 @@ async fn read_fixed_secret(
 }
 
 async fn rewrite_fixed_bootstrap_token_secret_to_single_field(
-    db: &dyn DatastoreBackend,
+    db: &(impl BootstrapTokenStore + ?Sized),
     resource: &Resource,
     token: &str,
 ) -> Result<()> {
     let mut data = resource.data.as_ref().clone();
     bootstrap_token::migrate_legacy_token_fields(&mut data, token)?;
-    db.update_resource(
-        "v1",
-        "Secret",
-        Some(BOOTSTRAP_TOKEN_NAMESPACE),
-        &resource.name,
-        data,
-        resource.resource_version,
-    )
-    .await?;
+    db.update_bootstrap_token_secret(resource, data).await?;
     Ok(())
 }
 

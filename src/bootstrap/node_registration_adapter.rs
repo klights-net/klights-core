@@ -1,8 +1,10 @@
 use anyhow::Result;
 
+#[cfg(test)]
 use crate::datastore::DatastoreBackend;
 use klights_kubelet::node_registration::{NodeRegistrationSnapshot, NodeRegistrationStore};
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl NodeRegistrationStore for DatastoreNodeRegistrationStore<'_> {
     async fn get_node(&self, node_name: &str) -> Result<Option<klights_cluster_core::Resource>> {
@@ -40,6 +42,7 @@ impl NodeRegistrationStore for DatastoreNodeRegistrationStore<'_> {
     }
 }
 
+#[cfg(test)]
 struct DatastoreNodeRegistrationStore<'a> {
     db: &'a dyn DatastoreBackend,
 }
@@ -79,6 +82,7 @@ impl NodeRegistrationStore for WorkerNodeRegistrationStore<'_> {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn register_node_snapshot(
     db: &dyn DatastoreBackend,
     outbox: Option<&klights_kubelet::node_outbox::Outbox>,
@@ -88,6 +92,22 @@ pub(crate) async fn register_node_snapshot(
     let store = DatastoreNodeRegistrationStore { db };
     klights_kubelet::node_registration::register_node_snapshot(
         &store,
+        outbox.map(|outbox| outbox as &dyn klights_leader_api::NodeOutbox),
+        dataplane_health,
+        snapshot,
+        klights_supervisor::SystemWallClock::now_utc(),
+    )
+    .await
+}
+
+pub(crate) async fn register_leader_node_snapshot(
+    store: &crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore,
+    outbox: Option<&klights_kubelet::node_outbox::Outbox>,
+    dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,
+    snapshot: &NodeRegistrationSnapshot,
+) -> Result<()> {
+    klights_kubelet::node_registration::register_node_snapshot(
+        store,
         outbox.map(|outbox| outbox as &dyn klights_leader_api::NodeOutbox),
         dataplane_health,
         snapshot,

@@ -78,6 +78,7 @@ pub async fn read_cluster_metadata(db: &dyn DatastoreBackend) -> Result<ClusterM
     })
 }
 
+#[cfg(test)]
 pub async fn write_cluster_membership(
     db: &dyn DatastoreBackend,
     membership: &ClusterMembership,

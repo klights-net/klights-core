@@ -82,6 +82,7 @@ pub struct BootstrapRunArgs<'a> {
     pub leader_node_subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
     pub leader_network_topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery>,
     pub resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
+    pub leader_bootstrap_store: Arc<crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore>,
     pub remote_api_client: Option<Arc<klights_leader_rpc::client::RemoteApiClient>>,
     pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
     pub pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
@@ -133,36 +134,6 @@ pub struct BootstrapRunArgs<'a> {
     /// adapters that have not yet migrated to the authority contract.
     pub leader_authority: Arc<klights_replication::authority::WatchLeaderAuthority>,
     pub authority_publisher: klights_replication::authority::AuthorityPublisher,
-}
-
-struct BootstrapNodeLeaderLabelStore {
-    db: DatastoreHandle,
-}
-
-#[async_trait::async_trait]
-impl klights_kubelet::node_leader_labels::NodeLeaderLabelStore for BootstrapNodeLeaderLabelStore {
-    async fn list_nodes(&self) -> Result<Vec<klights_cluster_core::Resource>> {
-        self.db
-            .list_resources(
-                "v1",
-                "Node",
-                None,
-                crate::datastore::ResourceListQuery::all(),
-            )
-            .await
-            .map(|list| list.items)
-    }
-
-    async fn update_node_with_preconditions(
-        &self,
-        name: &str,
-        data: serde_json::Value,
-        preconditions: crate::datastore::ResourcePreconditions,
-    ) -> Result<crate::datastore::Resource> {
-        self.db
-            .update_resource_with_preconditions("v1", "Node", None, name, data, preconditions)
-            .await
-    }
 }
 
 async fn activate_committed_apply_rv_v1_if_possible(
@@ -352,6 +323,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         leader_node_subnet_allocation,
         leader_network_topology,
         resource_commands,
+        leader_bootstrap_store,
         remote_api_client,
         pod_network_cache,
         pod_runtime_store: node_pod_runtime_store,
@@ -432,7 +404,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     if leader_lease.is_some() {
         klights_controllers::namespace::init_default_namespaces_with_ca_path(
             &klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
-            db,
+            leader_bootstrap_store.as_ref(),
             api_runtime_paths.ca_cert(),
             chrono::Utc::now(),
             controller_identity.as_ref(),
@@ -443,9 +415,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
 
     // Seed and reconcile default RBAC objects (only on leader).
     if leader_lease.is_some() {
-        klights_controllers::rbac_reconcile::reconcile_default_rbac_objects(db_handle.as_ref())
-            .await
-            .context("Failed to seed default RBAC objects")?;
+        klights_controllers::rbac_reconcile::reconcile_default_rbac_objects(
+            leader_bootstrap_store.as_ref(),
+        )
+        .await
+        .context("Failed to seed default RBAC objects")?;
     }
 
     let crd_registry = klights_controllers::crd::CrdRegistry::new();
@@ -865,7 +839,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             controller_pod_port.clone(),
         ));
     let controller_leader_ports = Arc::new(
-        crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(db_handle.clone()),
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
+            db_handle.clone(),
+            resource_commands.clone(),
+        ),
     );
     let controller_dependencies = klights_controllers::ControllerRuntimeDependencies {
         wall_time: chrono::Utc::now,
@@ -880,7 +857,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         pdb_store: controller_leader_ports.clone(),
         replicationcontroller_store: controller_leader_ports.clone(),
         apiservice_store: controller_leader_ports.clone(),
-        csr_status_store: controller_leader_ports,
+        csr_status_store: controller_leader_ports.clone(),
         pod_query: api_pod_repository.clone(),
         deployment_pod_mutation: controller_pod_mutations.clone(),
         replicaset_pod_mutation: controller_pod_mutations.clone(),
@@ -1129,8 +1106,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         )
         .await;
         let registration_health = dataplane_health.snapshot();
-        crate::bootstrap::node_registration_adapter::register_node_snapshot(
-            db,
+        crate::bootstrap::node_registration_adapter::register_leader_node_snapshot(
+            leader_bootstrap_store.as_ref(),
             Some(&outbox_runtime),
             Some(&registration_health),
             &registration,
@@ -1156,6 +1133,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             crate::bootstrap::observed_endpoint::LeaderPeerEndpointObserverDeps::new(
                 endpoint_query,
                 endpoint_status,
+                network_topology_command.clone(),
                 config.clone(),
                 node_mode.clone(),
             ),
@@ -1187,7 +1165,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     if let Some(raft) = raft_node.as_ref() {
         let raft_task = raft.clone();
         let outbox_task = outbox_runtime.clone();
-        let db_handle_task = db_handle.clone();
         let node_name = config.node_name.clone();
         let node_ip_task = node_ip.to_string();
         let external_endpoint_task = config.external_endpoint.clone();
@@ -1203,6 +1180,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let control_plane_lease_client_for_leader_updates = control_plane_lease_client.clone();
         let authority_publisher_task = authority_publisher;
         let member_feature_probe_task = member_feature_probe.clone();
+        let leader_bootstrap_store_task = leader_bootstrap_store.clone();
         let mut last_shape = initial_raft_shape.clone();
         supervisor
             .spawn_async(
@@ -1310,8 +1288,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                         )
                         .await;
                         let res =
-                            crate::bootstrap::node_registration_adapter::register_node_snapshot(
-                            db_handle_task.as_ref(),
+                            crate::bootstrap::node_registration_adapter::register_leader_node_snapshot(
+                            leader_bootstrap_store_task.as_ref(),
                             Some(&outbox_task),
                             None,
                             &registration,
@@ -1325,9 +1303,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                         }
                         if shape.is_leader
                             && let Err(err) = klights_kubelet::node::clear_leader_label_from_other_nodes(
-                                &BootstrapNodeLeaderLabelStore {
-                                    db: db_handle_task.clone(),
-                                },
+                                leader_bootstrap_store_task.as_ref(),
                                 &node_name,
                             )
                             .await
@@ -1355,11 +1331,14 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     // ServiceCIDR + kubernetes Service (skip on joining controlplanes —
     // raft AppendEntries delivers these from the seed).
     if leader_lease.is_some() {
-        klights_controllers::kube_service::bootstrap_default_service_cidr(db, &config.service_cidr)
-            .await
-            .context("Failed to bootstrap default ServiceCIDR")?;
+        klights_controllers::kube_service::bootstrap_default_service_cidr(
+            leader_bootstrap_store.as_ref(),
+            &config.service_cidr,
+        )
+        .await
+        .context("Failed to bootstrap default ServiceCIDR")?;
         klights_controllers::kube_service::bootstrap_kubernetes_service(
-            db,
+            leader_bootstrap_store.as_ref(),
             &config.service_cidr,
             config.tls_port,
             network.datapath().as_ref(),
@@ -1371,7 +1350,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
 
     if leader_lease.is_some() {
         crate::bootstrap::controller_adapters::coredns_bootstrap_adapter::bootstrap_coredns(
-            db,
+            leader_bootstrap_store.as_ref(),
+            controller_leader_ports.as_ref(),
             api_pod_repository.clone(),
             controller_pod_port.clone(),
             controller_gc_delete.clone(),
@@ -1827,6 +1807,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     crate::bootstrap::controlplane_join_adapters::build_controlplane_join_handler(
                         rn.clone(),
                         db_handle.clone(),
+                        leader_bootstrap_store.clone(),
                     );
                 (Some(router), Some(handler))
             }

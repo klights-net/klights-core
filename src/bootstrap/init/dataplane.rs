@@ -175,6 +175,7 @@ pub async fn resolve_local_external_endpoint(
 /// existed.
 pub async fn ensure_node_dataplane_published(
     db: &dyn datastore::DatastoreBackend,
+    command: &dyn klights_leader_api::LeaderNetworkTopologyCommand,
     config: &KlightsConfig,
     node_mode: &NodeMode,
     endpoint: &str,
@@ -186,7 +187,12 @@ pub async fn ensure_node_dataplane_published(
     let metadata =
         local_dataplane_peer_metadata_with_endpoint(config, node_mode, endpoint, supervisor)
             .await?;
-    db.update_node_dataplane(metadata).await?;
+    command
+        .register_node_dataplane(
+            crate::bootstrap::leader_conversions::topology::focused_dataplane(metadata)?,
+        )
+        .await
+        .map_err(anyhow::Error::new)?;
     tracing::info!(
         node = %config.node_name,
         endpoint = %endpoint.trim(),
@@ -204,6 +210,7 @@ pub async fn ensure_node_dataplane_published(
 /// publish it later once an endpoint becomes known).
 pub async fn publish_local_dataplane_metadata_self_heal(
     db: &dyn datastore::DatastoreBackend,
+    command: &dyn klights_leader_api::LeaderNetworkTopologyCommand,
     config: &KlightsConfig,
     node_mode: &NodeMode,
     supervisor: &klights_supervisor::TaskSupervisor,
@@ -214,7 +221,12 @@ pub async fn publish_local_dataplane_metadata_self_heal(
     let metadata =
         local_dataplane_peer_metadata_with_endpoint(config, node_mode, &endpoint, supervisor)
             .await?;
-    db.update_node_dataplane(metadata).await?;
+    command
+        .register_node_dataplane(
+            crate::bootstrap::leader_conversions::topology::focused_dataplane(metadata)?,
+        )
+        .await
+        .map_err(anyhow::Error::new)?;
     tracing::info!(
         node = %config.node_name,
         endpoint = %endpoint,
@@ -244,6 +256,16 @@ pub async fn enqueue_worker_dataplane_metadata_outbox(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_dataplane_command(
+        db: crate::datastore::DatastoreHandle,
+    ) -> crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork{
+        crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
+            db.clone(),
+            std::sync::Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db)),
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+        )
+    }
 
     #[tokio::test]
     async fn local_join_dataplane_metadata_without_external_endpoint_does_not_advertise_internal_ip()
@@ -420,10 +442,15 @@ mod tests {
         .await
         .unwrap();
 
-        let published =
-            publish_local_dataplane_metadata_self_heal(&db, &config, &NodeMode::Root, &supervisor)
-                .await
-                .expect("self-heal publish must succeed");
+        let published = publish_local_dataplane_metadata_self_heal(
+            &db,
+            &test_dataplane_command(std::sync::Arc::new(db.clone())),
+            &config,
+            &NodeMode::Root,
+            &supervisor,
+        )
+        .await
+        .expect("self-heal publish must succeed");
         assert!(
             published,
             "self-heal must publish when an ExternalIP exists"
@@ -452,6 +479,7 @@ mod tests {
 
         let wrote = ensure_node_dataplane_published(
             &db,
+            &test_dataplane_command(std::sync::Arc::new(db.clone())),
             &config,
             &NodeMode::Root,
             "198.51.100.47",
@@ -498,6 +526,7 @@ mod tests {
 
         let wrote = ensure_node_dataplane_published(
             &db,
+            &test_dataplane_command(std::sync::Arc::new(db.clone())),
             &config,
             &NodeMode::Root,
             "198.51.100.47",
@@ -531,10 +560,15 @@ mod tests {
             klights_supervisor::TaskCategoryConfig::default(),
         );
 
-        let published =
-            publish_local_dataplane_metadata_self_heal(&db, &config, &NodeMode::Root, &supervisor)
-                .await
-                .expect("self-heal must not error when no endpoint is resolvable");
+        let published = publish_local_dataplane_metadata_self_heal(
+            &db,
+            &test_dataplane_command(std::sync::Arc::new(db.clone())),
+            &config,
+            &NodeMode::Root,
+            &supervisor,
+        )
+        .await
+        .expect("self-heal must not error when no endpoint is resolvable");
         assert!(!published, "self-heal must be a no-op without an endpoint");
         assert!(
             db.get_node_dataplane("leader-a").await.unwrap().is_none(),

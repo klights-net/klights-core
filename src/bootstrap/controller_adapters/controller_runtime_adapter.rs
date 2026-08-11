@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use klights_cluster_core::{Resource, ResourceBatchOperation, ResourcePreconditions};
+use klights_cluster_core::{
+    PatchKind, Resource, ResourceBatchOperation, ResourcePreconditions, StorageCommand,
+};
 use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult as Result};
 
 use crate::datastore::DatastoreHandle;
@@ -17,11 +19,84 @@ fn validate_controller_effect() -> Result<()> {
 
 pub(crate) struct RootControllerLeaderPort {
     store: DatastoreHandle,
+    commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
 }
 
 impl RootControllerLeaderPort {
+    #[cfg(any(test, feature = "native-api-test-support"))]
     pub(crate) fn new(store: DatastoreHandle) -> Self {
-        Self { store }
+        let authority =
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+            store.clone(),
+            authority.clone(),
+        );
+        let proposal = Arc::new(
+            crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(store.clone()),
+        );
+        let commands = Arc::new(
+            klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
+                proposal, query, authority,
+            ),
+        );
+        Self { store, commands }
+    }
+
+    pub(crate) fn new_with_commands(
+        store: DatastoreHandle,
+        commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
+    ) -> Self {
+        Self { store, commands }
+    }
+
+    async fn submit_resource(&self, command: StorageCommand) -> Result<Resource> {
+        let request = klights_leader_api::ResourceCommandRequest::try_new(command)
+            .map_err(map_resource_command_error)?;
+        match self
+            .commands
+            .submit_resource_command(request)
+            .await
+            .map_err(map_resource_command_error)?
+        {
+            klights_leader_api::ResourceCommandResult::Resource(resource) => Ok(resource),
+            klights_leader_api::ResourceCommandResult::Ack { .. } => Err(
+                ControllerStoreError::internal("controller mutation returned no resource"),
+            ),
+        }
+    }
+
+    async fn submit_ack(&self, command: StorageCommand) -> Result<()> {
+        let request = klights_leader_api::ResourceCommandRequest::try_new(command)
+            .map_err(map_resource_command_error)?;
+        self.commands
+            .submit_resource_command(request)
+            .await
+            .map(|_| ())
+            .map_err(map_resource_command_error)
+    }
+}
+
+fn map_resource_command_error(
+    error: klights_leader_api::ResourceCommandError,
+) -> ControllerStoreError {
+    let message = error.to_string();
+    match error {
+        klights_leader_api::ResourceCommandError::AlreadyExists { .. } => {
+            ControllerStoreError::already_exists(message)
+        }
+        klights_leader_api::ResourceCommandError::Conflict { .. } => {
+            ControllerStoreError::conflict(message)
+        }
+        klights_leader_api::ResourceCommandError::NotFound { .. } => {
+            ControllerStoreError::not_found(message)
+        }
+        klights_leader_api::ResourceCommandError::NotLeader
+        | klights_leader_api::ResourceCommandError::Retryable { .. }
+        | klights_leader_api::ResourceCommandError::Timeout
+        | klights_leader_api::ResourceCommandError::Cancelled => {
+            ControllerStoreError::unavailable(message)
+        }
+        _ => ControllerStoreError::internal(message),
     }
 }
 
@@ -185,11 +260,16 @@ impl klights_controllers::replicaset::ReplicaSetStore for RootControllerLeaderPo
         status: serde_json::Value,
     ) -> Result<()> {
         validate_controller_effect()?;
-        klights_controllers::replicaset::ReplicaSetStore::update_replicaset_status(
-            self.store.as_ref(),
-            resource,
+        self.submit_ack(StorageCommand::UpdateStatus {
+            api_version: "apps/v1".into(),
+            kind: "ReplicaSet".into(),
+            namespace: resource.namespace.clone(),
+            name: resource.name.clone(),
             status,
-        )
+            expected_rv: Some(resource.resource_version),
+            preconditions: ResourcePreconditions::from_resource(resource),
+            observed_status_stamp: None,
+        })
         .await
     }
 }
@@ -213,14 +293,12 @@ impl klights_controllers::deployment::DeploymentFinalizeStore for RootController
         expected_uid: String,
     ) -> Result<()> {
         validate_controller_effect()?;
-        klights_controllers::deployment::DeploymentFinalizeStore::patch_deployment_revision(
-            self.store.as_ref(),
-            namespace,
-            name,
-            revision,
-            expected_uid,
-        )
-        .await
+        self.submit_ack(StorageCommand::PatchResource {
+            api_version: "apps/v1".into(), kind: "Deployment".into(),
+            namespace: Some(namespace.into()), name: name.into(), patch_kind: PatchKind::Merge,
+            patch: serde_json::json!({"metadata":{"annotations":{"deployment.kubernetes.io/revision":revision}}}),
+            preconditions: ResourcePreconditions::uid(expected_uid), strict_resource_version: false,
+        }).await
     }
 
     async fn delete_replicaset(
@@ -230,12 +308,13 @@ impl klights_controllers::deployment::DeploymentFinalizeStore for RootController
         expected_uid: String,
     ) -> Result<()> {
         validate_controller_effect()?;
-        klights_controllers::deployment::DeploymentFinalizeStore::delete_replicaset(
-            self.store.as_ref(),
-            namespace,
-            name,
-            expected_uid,
-        )
+        self.submit_ack(StorageCommand::DeleteResource {
+            api_version: "apps/v1".into(),
+            kind: "ReplicaSet".into(),
+            namespace: Some(namespace.into()),
+            name: name.into(),
+            preconditions: ResourcePreconditions::uid(expected_uid),
+        })
         .await
     }
 }
@@ -257,12 +336,13 @@ impl klights_controllers::deployment::DeploymentStore for RootControllerLeaderPo
         replicaset: serde_json::Value,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        klights_controllers::deployment::DeploymentStore::create_replicaset(
-            self.store.as_ref(),
-            namespace,
-            name,
-            replicaset,
-        )
+        self.submit_resource(StorageCommand::CreateResource {
+            api_version: "apps/v1".into(),
+            kind: "ReplicaSet".into(),
+            namespace: Some(namespace.into()),
+            name: name.into(),
+            data: replicaset,
+        })
         .await
     }
 
@@ -274,14 +354,18 @@ impl klights_controllers::deployment::DeploymentStore for RootControllerLeaderPo
         expected_uid: String,
     ) -> Result<Option<Resource>> {
         validate_controller_effect()?;
-        klights_controllers::deployment::DeploymentStore::patch_replicaset_scale(
-            self.store.as_ref(),
-            namespace,
-            name,
+        self.submit_resource(StorageCommand::PatchResource {
+            api_version: "apps/v1".into(),
+            kind: "ReplicaSet".into(),
+            namespace: Some(namespace.into()),
+            name: name.into(),
+            patch_kind: PatchKind::Merge,
             patch,
-            expected_uid,
-        )
+            preconditions: ResourcePreconditions::uid(expected_uid),
+            strict_resource_version: false,
+        })
         .await
+        .map(Some)
     }
 
     async fn update_deployment_status(
@@ -290,11 +374,16 @@ impl klights_controllers::deployment::DeploymentStore for RootControllerLeaderPo
         status: serde_json::Value,
     ) -> Result<()> {
         validate_controller_effect()?;
-        klights_controllers::deployment::DeploymentStore::update_deployment_status(
-            self.store.as_ref(),
-            resource,
+        self.submit_ack(StorageCommand::UpdateStatus {
+            api_version: "apps/v1".into(),
+            kind: "Deployment".into(),
+            namespace: resource.namespace.clone(),
+            name: resource.name.clone(),
             status,
-        )
+            expected_rv: Some(resource.resource_version),
+            preconditions: ResourcePreconditions::from_resource(resource),
+            observed_status_stamp: None,
+        })
         .await
     }
 }

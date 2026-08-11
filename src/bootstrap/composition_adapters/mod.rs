@@ -6,6 +6,7 @@ pub(crate) mod cni_socket_adapter;
 pub(crate) mod committed_outbox_delivery_adapter;
 pub(crate) mod custom_resource_read_adapter;
 pub(crate) mod generated_handler_adapter;
+pub(crate) mod leader_bootstrap_store_adapter;
 pub(crate) mod leader_maintenance_adapter;
 pub(crate) mod leader_topology_cleanup_adapter;
 pub(crate) mod list_query_adapter;
