@@ -319,12 +319,27 @@ where
         meta: &SnapshotMeta<NodeId, RaftMemberNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
-        let bytes = snapshot.into_inner();
         let _snapshot_mutation = self
             .lifecycle
             .acquire_snapshot_mutation_fence()
             .await
             .map_err(ioerr_write)?;
+        let current_last_applied = self.read_last_applied().await?;
+        let snapshot_is_stale = match (meta.last_log_id, current_last_applied) {
+            (None, Some(_)) => true,
+            (Some(snapshot), Some(current)) => snapshot.index < current.index,
+            _ => false,
+        };
+        if snapshot_is_stale {
+            tracing::warn!(
+                snapshot_id = %meta.snapshot_id,
+                snapshot_last_applied = ?meta.last_log_id,
+                current_last_applied = ?current_last_applied,
+                "ignored delayed Raft snapshot older than the applied state machine"
+            );
+            return Ok(());
+        }
+        let bytes = snapshot.into_inner();
         // Raft snapshot install semantics: the destination state machine
         // must become byte/key-identical to the leader snapshot at the
         // snapshot index. Applying snapshot commits over the existing local

@@ -173,6 +173,87 @@ async fn test_statefulset_ordered_scale_down_halts_when_unhealthy() {
         3,
         "OrderedReady scale-down must halt when any pod is unhealthy"
     );
+
+    let halted_status = db
+        .get_resource("apps/v1", "StatefulSet", Some("test-ns"), "ordered-halt")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        halted_status.data.pointer("/status/replicas"),
+        Some(&json!(3))
+    );
+    assert_eq!(
+        halted_status.data.pointer("/status/readyReplicas"),
+        Some(&json!(2)),
+        "status must report the unhealthy member while scale-down is halted"
+    );
+
+    let recovering = db
+        .get_resource("v1", "Pod", Some("test-ns"), "ordered-halt-1")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut recovered_pod = (*recovering.data).clone();
+    recovered_pod["status"] = json!({
+        "phase": "Running",
+        "conditions": [{"type": "Ready", "status": "True"}]
+    });
+    db.update_resource(
+        "v1",
+        "Pod",
+        Some("test-ns"),
+        "ordered-halt-1",
+        recovered_pod,
+        recovering.resource_version,
+    )
+    .await
+    .unwrap();
+
+    let mut deletion_order = Vec::new();
+    for expected_ordinal in (0..=2).rev() {
+        let latest = db
+            .get_resource("apps/v1", "StatefulSet", Some("test-ns"), "ordered-halt")
+            .await
+            .unwrap()
+            .unwrap();
+        reconcile_statefulset_test(&db, latest.data.as_ref(), "test-node")
+            .await
+            .unwrap();
+
+        let expected_name = format!("ordered-halt-{expected_ordinal}");
+        let pods = db
+            .list_resources(
+                "v1",
+                "Pod",
+                Some("test-ns"),
+                crate::test_support::ResourceListQuery::all(),
+            )
+            .await
+            .unwrap();
+        let terminating: Vec<_> = pods
+            .items
+            .iter()
+            .filter(|pod| pod.data.pointer("/metadata/deletionTimestamp").is_some())
+            .collect();
+        assert_eq!(terminating.len(), 1);
+        assert_eq!(
+            terminating[0].data.pointer("/metadata/name"),
+            Some(&json!(expected_name))
+        );
+        deletion_order.push(expected_name.clone());
+
+        // Test-only actor completion: production hard-delete ownership remains
+        // in the Pod lifecycle actor; this advances the controller oracle to
+        // the next OrderedReady reconcile.
+        db.delete_resource("v1", "Pod", Some("test-ns"), &expected_name)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        deletion_order,
+        ["ordered-halt-2", "ordered-halt-1", "ordered-halt-0"]
+    );
 }
 
 #[tokio::test]

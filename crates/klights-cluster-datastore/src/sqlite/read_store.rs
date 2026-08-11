@@ -353,65 +353,38 @@ impl DurableWatchHistoryRead for SqliteReadStore {
                     return Ok(WatchHistoryRead::Expired);
                 }
 
-                let start = if position.event_id == 0 {
-                    0
-                } else {
-                    position.event_id
-                };
-                let mut statement = transaction.prepare(
-                    "SELECT api_version, kind, namespace, name, resource_version,
-                            event_type, data, id
-                     FROM watch_events
-                     WHERE id > ?1 AND id <= ?2
-                     ORDER BY id",
-                )?;
-                let mut rows = statement.query(rusqlite::params![start, current.event_id])?;
-                let mut events = Vec::with_capacity(limit.get().min(4096));
-                while let Some(row) = rows.next()? {
-                    if events.len() >= limit.get() {
-                        break;
-                    }
-                    let api_version: String = row.get(0)?;
-                    let kind: String = row.get(1)?;
-                    let namespace: Option<String> = row.get(2)?;
-                    if !sqlite_target_matches(&targets, &api_version, &kind, namespace.as_deref()) {
-                        continue;
-                    }
-                    let resource_version: i64 = row.get(4)?;
-                    let event_id: i64 = row.get(7)?;
-                    if (position.resource_version_filter_through_event_id > 0
-                        && event_id <= position.resource_version_filter_through_event_id
-                        && resource_version <= position.resource_version)
-                        || (position.event_id == 0
-                            && position.resource_version_filter_through_event_id == 0
-                            && resource_version <= position.resource_version)
-                    {
-                        continue;
-                    }
-                    let name: String = row.get(3)?;
+                let (query, parameters) =
+                    sqlite_positioned_watch_query(&targets, position, current.event_id, limit);
+                let references: Vec<&dyn rusqlite::ToSql> = parameters
+                    .iter()
+                    .map(|parameter| parameter.as_ref())
+                    .collect();
+                let mut statement = transaction.prepare(&query)?;
+                let rows = statement.query_map(&references[..], |row| {
+                    let resource_version = row.get(4)?;
+                    let event_id = row.get(7)?;
                     let event_type: String = row.get(5)?;
                     let data = decode_json_column(row, 6)?;
                     let resource = Resource {
                         id: 0,
-                        api_version,
-                        kind,
-                        namespace,
-                        name,
+                        api_version: row.get(0)?,
+                        kind: row.get(1)?,
+                        namespace: row.get(2)?,
+                        name: row.get(3)?,
                         uid: Resource::uid_from_data(&data),
                         resource_version,
                         data: std::sync::Arc::new(data),
                     };
-                    events.push(PositionedWatchEvent {
+                    Ok(PositionedWatchEvent {
                         position: WatchReplayPosition {
                             resource_version,
                             event_id,
                             resource_version_filter_through_event_id: 0,
                         },
                         event: DurableWatchEvent::new(event_type, resource),
-                    });
-                }
-                drop(rows);
-                drop(statement);
+                    })
+                })?;
+                let events = rows.collect::<rusqlite::Result<Vec<_>>>()?;
                 let next_position =
                     WatchReplayPosition::after_page(position, &events, current.event_id, limit);
                 let page = WatchHistoryPage::try_new(events, next_position)
@@ -851,23 +824,6 @@ fn watch_row_to_raw_watch_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Dur
         resource_version: row.get(4)?,
         event_type: std::borrow::Cow::Owned(event_type),
         object_json: Bytes::from(row.get::<_, Vec<u8>>(6)?),
-    })
-}
-
-fn sqlite_target_matches(
-    targets: &[klights_cluster_store::DurableWatchTarget],
-    api_version: &str,
-    kind: &str,
-    namespace: Option<&str>,
-) -> bool {
-    targets.iter().any(|target| {
-        target.api_version() == api_version
-            && target.kind() == kind
-            && match target.scope() {
-                DurableWatchScope::Cluster => namespace.is_none(),
-                DurableWatchScope::Namespaced(Some(expected)) => namespace == Some(expected),
-                DurableWatchScope::Namespaced(None) => namespace.is_some(),
-            }
     })
 }
 

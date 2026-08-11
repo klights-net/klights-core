@@ -224,3 +224,29 @@ async fn apply_membership_entry_stores_membership() {
     assert_eq!(stored.membership().voter_ids().count(), 3);
     assert_eq!(stored.log_id().unwrap().index, 7);
 }
+
+#[tokio::test]
+async fn delayed_stale_snapshot_cannot_roll_back_an_applied_state_machine() {
+    let mut state_machine = fresh_sm().await;
+    state_machine
+        .apply(vec![Entry::<TypeConfig> {
+            log_id: LogId::new(LeaderId::new(3, 10), 10),
+            payload: EntryPayload::Blank,
+        }])
+        .await
+        .unwrap();
+
+    let stale_log_id = LogId::new(LeaderId::new(3, 10), 7);
+    let stale_meta = openraft::SnapshotMeta {
+        last_log_id: Some(stale_log_id),
+        last_membership: openraft::StoredMembership::default(),
+        snapshot_id: "delayed-stale-snapshot".to_string(),
+    };
+    state_machine
+        .install_snapshot(&stale_meta, Box::new(std::io::Cursor::new(vec![1, 2, 3])))
+        .await
+        .expect("an obsolete in-flight snapshot is an idempotent no-op");
+
+    let (last, _) = state_machine.applied_state().await.unwrap();
+    assert_eq!(last.unwrap().index, 10);
+}
