@@ -9,11 +9,12 @@ use std::sync::Arc;
 use klights_leader_api::{
     CacheReadinessFuture, CacheReadinessRequest, LeaderAuthenticatedProjectedServiceAccountToken,
     LeaderCacheReadiness, LeaderNodeLeaseRenewal, LeaderNodeLifecycleStatus,
-    LeaderProjectedServiceAccountToken, LeaderResourceQuery, NodeLeaseRenewalError,
-    NodeLeaseRenewalFuture, NodeLeaseRenewalRequest, NodeLeaseRenewalResult,
+    LeaderProjectedServiceAccountToken, LeaderResourceCommand, LeaderResourceQuery,
+    NodeLeaseRenewalError, NodeLeaseRenewalFuture, NodeLeaseRenewalRequest, NodeLeaseRenewalResult,
     NodeLifecycleStatusError, NodeLifecycleStatusFuture, NodeLifecycleStatusRequest,
     NodeLifecycleStatusResult, ProjectedServiceAccountTokenError,
-    ProjectedServiceAccountTokenFuture, ProjectedServiceAccountTokenRequest,
+    ProjectedServiceAccountTokenFuture, ProjectedServiceAccountTokenRequest, ResourceCommandError,
+    ResourceCommandRequest, ResourceCommandResult,
 };
 
 use crate::bootstrap::authority::AuthorityHandle;
@@ -97,20 +98,20 @@ pub(crate) type LocalNodeLeaseRenewalAdapter = LocalNodeLeaseRenewal;
 
 /// Bootstrap-owned Node status CAS publisher.
 pub(crate) struct LocalNodeLifecycleStatus {
-    db: DatastoreHandle,
     resource_query: Arc<dyn LeaderResourceQuery>,
+    resource_commands: Arc<dyn LeaderResourceCommand>,
     authority: AuthorityHandle,
 }
 
 impl LocalNodeLifecycleStatus {
     pub(crate) fn new<A: Into<AuthorityHandle>>(
-        db: DatastoreHandle,
         resource_query: Arc<dyn LeaderResourceQuery>,
+        resource_commands: Arc<dyn LeaderResourceCommand>,
         authority: A,
     ) -> Self {
         Self {
-            db,
             resource_query,
+            resource_commands,
             authority: authority.into(),
         }
     }
@@ -146,53 +147,34 @@ impl LeaderNodeLifecycleStatus for LocalNodeLifecycleStatus {
                     current.resource_version
                 )));
             }
-            let command = request.into_command();
-            let klights_cluster_core::command::StorageCommand::UpdateStatus {
-                api_version,
-                kind,
-                namespace,
-                name,
-                status,
-                preconditions,
-                ..
-            } = command
-            else {
-                unreachable!("NodeLifecycleStatusRequest admits only UpdateStatus")
-            };
-            let resource = self
-                .db
-                .update_status_only_with_preconditions(
-                    &api_version,
-                    &kind,
-                    namespace.as_deref(),
-                    &name,
-                    status,
-                    preconditions,
-                )
+            let command = ResourceCommandRequest::try_new(request.into_command())
+                .map_err(node_lifecycle_status_command_error)?;
+            let result = self
+                .resource_commands
+                .submit_resource_command(command)
                 .await
-                .map_err(node_lifecycle_status_store_error)?;
-            Ok(NodeLifecycleStatusResult::Updated {
-                resource_version: resource.resource_version,
-            })
+                .map_err(node_lifecycle_status_command_error)?;
+            let resource_version = match result {
+                ResourceCommandResult::Resource(resource) => resource.resource_version,
+                ResourceCommandResult::Ack { resource_version } => resource_version,
+            };
+            Ok(NodeLifecycleStatusResult::Updated { resource_version })
         })
     }
 }
 
 pub(crate) type LocalNodeLifecycleStatusAdapter = LocalNodeLifecycleStatus;
 
-fn node_lifecycle_status_store_error(error: anyhow::Error) -> NodeLifecycleStatusError {
-    let message = format!("{error:#}");
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("uid mismatch") {
-        NodeLifecycleStatusError::UidMismatch
-    } else if lower.contains("not found") || lower.contains("query returned no rows") {
-        NodeLifecycleStatusError::NotFound
-    } else if lower.contains("conflict") || lower.contains("precondition") {
-        NodeLifecycleStatusError::conflict(message)
-    } else if lower.contains("not raft leader") || lower.contains("follower") {
-        NodeLifecycleStatusError::NotLeader
-    } else {
-        NodeLifecycleStatusError::apply_failed(message)
+fn node_lifecycle_status_command_error(error: ResourceCommandError) -> NodeLifecycleStatusError {
+    let message = error.to_string();
+    match error {
+        ResourceCommandError::NotLeader => NodeLifecycleStatusError::NotLeader,
+        ResourceCommandError::NotFound { .. } => NodeLifecycleStatusError::NotFound,
+        ResourceCommandError::Conflict { .. } => NodeLifecycleStatusError::conflict(message),
+        ResourceCommandError::Retryable { .. } => NodeLifecycleStatusError::retryable(message),
+        ResourceCommandError::Timeout => NodeLifecycleStatusError::Timeout,
+        ResourceCommandError::Cancelled => NodeLifecycleStatusError::Cancelled,
+        _ => NodeLifecycleStatusError::apply_failed(message),
     }
 }
 

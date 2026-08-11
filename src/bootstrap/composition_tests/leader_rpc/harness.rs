@@ -378,8 +378,8 @@ impl IntegrationLeaderRpcComposition {
         );
         let lifecycle_status =
             crate::bootstrap::local_leader_adapters::LocalNodeLifecycleStatusAdapter::new(
-                db,
                 resource_query.clone(),
+                crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(db),
                 authority,
             );
         (resource_query, Arc::new(lifecycle_status))

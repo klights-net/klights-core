@@ -484,13 +484,6 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     leader_authority.clone(),
                 ),
             );
-            let local_node_lifecycle_status = Arc::new(
-                crate::bootstrap::local_leader_adapters::LocalNodeLifecycleStatusAdapter::new(
-                    db_handle.clone(),
-                    local_resource_query.clone(),
-                    leader_authority.clone(),
-                ),
-            );
             let local_projected_token = Arc::new(
                 crate::bootstrap::local_leader_adapters::LocalProjectedTokenAdapter::new(
                     db_handle.clone(),
@@ -518,6 +511,13 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     embedded_proposal.clone(),
                     local_resource_query.clone(),
                     is_leader_rx.clone(),
+                ),
+            );
+            let local_node_lifecycle_status = Arc::new(
+                crate::bootstrap::local_leader_adapters::LocalNodeLifecycleStatusAdapter::new(
+                    local_resource_query.clone(),
+                    local_resource_commands.clone(),
+                    leader_authority.clone(),
                 ),
             );
             let embedded_outbox_delivery = Arc::new(

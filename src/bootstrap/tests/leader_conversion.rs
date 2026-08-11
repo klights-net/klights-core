@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
@@ -332,7 +332,8 @@ async fn node_effect_lifecycle_status_preserves_spec_metadata_and_conflicts_stal
         db_handle.clone(),
         authority.clone(),
     );
-    let client = LocalNodeLifecycleStatusAdapter::new(db_handle, resource_query, authority);
+    let resource_commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(db_handle);
+    let client = LocalNodeLifecycleStatusAdapter::new(resource_query, resource_commands, authority);
     let command = StorageCommand::UpdateStatus {
         api_version: "v1".to_string(),
         kind: "Node".to_string(),
@@ -385,6 +386,102 @@ async fn node_effect_lifecycle_status_preserves_spec_metadata_and_conflicts_stal
             .await,
             Err(klights_leader_api::NodeLifecycleStatusError::Conflict { .. })
         ));
+}
+
+struct RecordingNodeLifecycleCommands {
+    commands: Mutex<Vec<StorageCommand>>,
+    resource_version: i64,
+}
+
+impl klights_leader_api::LeaderResourceCommand for RecordingNodeLifecycleCommands {
+    fn submit_resource_command(
+        &self,
+        request: klights_leader_api::ResourceCommandRequest,
+    ) -> klights_leader_api::ResourceCommandFuture<'_, klights_leader_api::ResourceCommandResult>
+    {
+        Box::pin(async move {
+            self.commands
+                .lock()
+                .expect("record Node lifecycle command")
+                .push(request.into_command());
+            Ok(klights_leader_api::ResourceCommandResult::Ack {
+                resource_version: self.resource_version,
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn node_lifecycle_status_cannot_mutate_the_passive_cluster_store() {
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
+    let created = db
+        .create_resource(
+            "v1",
+            "Node",
+            None,
+            "fake-node",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": "fake-node", "uid": "fake-node-uid"},
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+            }),
+        )
+        .await
+        .expect("create Node");
+    let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
+    let authority =
+        crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+    let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+        db_handle.clone(),
+        authority.clone(),
+    );
+    let resource_commands = Arc::new(RecordingNodeLifecycleCommands {
+        commands: Mutex::new(Vec::new()),
+        resource_version: created.resource_version + 1,
+    });
+    let client =
+        LocalNodeLifecycleStatusAdapter::new(resource_query, resource_commands.clone(), authority);
+    let command = StorageCommand::UpdateStatus {
+        api_version: "v1".to_string(),
+        kind: "Node".to_string(),
+        namespace: None,
+        name: "fake-node".to_string(),
+        status: serde_json::json!({
+            "conditions": [{
+                "type": "Ready",
+                "status": "Unknown",
+                "reason": "NodeStatusUnknown"
+            }]
+        }),
+        expected_rv: Some(created.resource_version),
+        preconditions: ResourcePreconditions::from_resource(&created),
+        observed_status_stamp: None,
+    };
+    let request = klights_leader_api::NodeLifecycleStatusRequest::try_new(command.clone())
+        .expect("valid lifecycle status command");
+
+    klights_leader_api::LeaderNodeLifecycleStatus::submit_node_lifecycle_status(&client, request)
+        .await
+        .expect("leader accepts lifecycle status");
+
+    let unchanged = db
+        .get_resource("v1", "Node", None, "fake-node")
+        .await
+        .expect("read Node")
+        .expect("Node exists");
+    assert_eq!(unchanged.resource_version, created.resource_version);
+    assert_eq!(unchanged.data, created.data);
+    assert_eq!(
+        resource_commands
+            .commands
+            .lock()
+            .expect("read Node lifecycle commands")
+            .as_slice(),
+        &[command]
+    );
 }
 use crate::bootstrap::composition_tests::support::OutboxPayload;
 use crate::datastore::ResourcePreconditions;
