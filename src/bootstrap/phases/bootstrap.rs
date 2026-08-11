@@ -1737,7 +1737,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         ),
         crd_registry.clone(),
         crate::bootstrap::service_adapters::ApiServiceWriteAllocator::new(
-            db_handle.clone(),
+            controller_leader_ports.clone(),
             service_ipam.clone(),
             nodeport_alloc.clone(),
             controller_identity.clone(),

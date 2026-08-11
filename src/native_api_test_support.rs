@@ -1575,7 +1575,11 @@ impl NativeApiTestHarness {
             api_pod_repository.clone(),
             crd_registry.clone(),
             crate::bootstrap::service_adapters::ApiServiceWriteAllocator::new(
-                datastore.clone(),
+                Arc::new(
+                    crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(
+                        datastore.clone(),
+                    ),
+                ),
                 service_ipam,
                 nodeport_alloc.clone(),
                 controller_identity,
