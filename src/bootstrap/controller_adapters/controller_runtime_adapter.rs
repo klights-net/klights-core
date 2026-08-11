@@ -178,15 +178,15 @@ impl klights_controllers::gc::GcResourceStore for RootControllerLeaderPort {
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        klights_controllers::gc::GcResourceStore::update_resource_with_preconditions(
-            self.store.as_ref(),
-            api_version,
-            kind,
-            namespace,
-            name,
+        self.submit_resource(StorageCommand::UpdateResource {
+            api_version: api_version.into(),
+            kind: kind.into(),
+            namespace: namespace.map(Into::into),
+            name: name.into(),
             data,
+            expected_rv: preconditions.resource_version.unwrap_or_default(),
             preconditions,
-        )
+        })
         .await
     }
 
@@ -200,15 +200,15 @@ impl klights_controllers::gc::GcResourceStore for RootControllerLeaderPort {
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        klights_controllers::gc::GcResourceStore::update_main_resource_with_preconditions(
-            self.store.as_ref(),
-            api_version,
-            kind,
-            namespace,
-            name,
+        self.submit_resource(StorageCommand::UpdateResource {
+            api_version: api_version.into(),
+            kind: kind.into(),
+            namespace: namespace.map(Into::into),
+            name: name.into(),
             data,
+            expected_rv: preconditions.resource_version.unwrap_or_default(),
             preconditions,
-        )
+        })
         .await
     }
 
@@ -405,11 +405,16 @@ impl klights_controllers::statefulset::StatefulSetStore for RootControllerLeader
         status: serde_json::Value,
     ) -> Result<()> {
         validate_controller_effect()?;
-        klights_controllers::statefulset::StatefulSetStore::update_statefulset_status(
-            self.store.as_ref(),
-            resource,
+        self.submit_ack(StorageCommand::UpdateStatus {
+            api_version: "apps/v1".into(),
+            kind: "StatefulSet".into(),
+            namespace: resource.namespace.clone(),
+            name: resource.name.clone(),
             status,
-        )
+            expected_rv: Some(resource.resource_version),
+            preconditions: ResourcePreconditions::from_resource(resource),
+            observed_status_stamp: None,
+        })
         .await
     }
 }
@@ -431,12 +436,13 @@ impl klights_controllers::daemonset::DaemonSetStore for RootControllerLeaderPort
         revision: serde_json::Value,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        klights_controllers::daemonset::DaemonSetStore::create_controller_revision(
-            self.store.as_ref(),
-            namespace,
-            name,
-            revision,
-        )
+        self.submit_resource(StorageCommand::CreateResource {
+            api_version: "apps/v1".into(),
+            kind: "ControllerRevision".into(),
+            namespace: Some(namespace.into()),
+            name: name.into(),
+            data: revision,
+        })
         .await
     }
 
@@ -450,11 +456,16 @@ impl klights_controllers::daemonset::DaemonSetStore for RootControllerLeaderPort
         status: serde_json::Value,
     ) -> Result<()> {
         validate_controller_effect()?;
-        klights_controllers::daemonset::DaemonSetStore::update_daemonset_status(
-            self.store.as_ref(),
-            resource,
+        self.submit_ack(StorageCommand::UpdateStatus {
+            api_version: "apps/v1".into(),
+            kind: "DaemonSet".into(),
+            namespace: resource.namespace.clone(),
+            name: resource.name.clone(),
             status,
-        )
+            expected_rv: Some(resource.resource_version),
+            preconditions: ResourcePreconditions::from_resource(resource),
+            observed_status_stamp: None,
+        })
         .await
     }
 }
@@ -471,8 +482,17 @@ impl klights_controllers::job::JobStore for RootControllerLeaderPort {
         status: serde_json::Value,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        klights_controllers::job::JobStore::update_job_status(self.store.as_ref(), resource, status)
-            .await
+        self.submit_resource(StorageCommand::UpdateStatus {
+            api_version: "batch/v1".into(),
+            kind: "Job".into(),
+            namespace: resource.namespace.clone(),
+            name: resource.name.clone(),
+            status,
+            expected_rv: Some(resource.resource_version),
+            preconditions: ResourcePreconditions::from_resource(resource),
+            observed_status_stamp: None,
+        })
+        .await
     }
 }
 
@@ -500,13 +520,15 @@ impl klights_controllers::service::ServiceReconcileStore for RootControllerLeade
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        klights_controllers::service::ServiceReconcileStore::update_service(
-            self.store.as_ref(),
-            namespace,
-            name,
+        self.submit_resource(StorageCommand::UpdateResource {
+            api_version: "v1".into(),
+            kind: "Service".into(),
+            namespace: Some(namespace.into()),
+            name: name.into(),
             data,
+            expected_rv: preconditions.resource_version.unwrap_or_default(),
             preconditions,
-        )
+        })
         .await
     }
 }
@@ -560,14 +582,13 @@ impl klights_controllers::endpoints::EndpointReconcileStore for RootControllerLe
         data: serde_json::Value,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        klights_controllers::endpoints::EndpointReconcileStore::create_resource(
-            self.store.as_ref(),
-            api_version,
-            kind,
-            namespace,
-            name,
+        self.submit_resource(StorageCommand::CreateResource {
+            api_version: api_version.into(),
+            kind: kind.into(),
+            namespace: namespace.map(Into::into),
+            name: name.into(),
             data,
-        )
+        })
         .await
     }
 
@@ -581,15 +602,15 @@ impl klights_controllers::endpoints::EndpointReconcileStore for RootControllerLe
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        klights_controllers::endpoints::EndpointReconcileStore::update_resource_with_preconditions(
-            self.store.as_ref(),
-            api_version,
-            kind,
-            namespace,
-            name,
+        self.submit_resource(StorageCommand::UpdateResource {
+            api_version: api_version.into(),
+            kind: kind.into(),
+            namespace: namespace.map(Into::into),
+            name: name.into(),
             data,
+            expected_rv: preconditions.resource_version.unwrap_or_default(),
             preconditions,
-        )
+        })
         .await
     }
 
@@ -602,24 +623,20 @@ impl klights_controllers::endpoints::EndpointReconcileStore for RootControllerLe
         preconditions: ResourcePreconditions,
     ) -> Result<()> {
         validate_controller_effect()?;
-        klights_controllers::endpoints::EndpointReconcileStore::delete_resource_with_preconditions(
-            self.store.as_ref(),
-            api_version,
-            kind,
-            namespace,
-            name,
+        self.submit_ack(StorageCommand::DeleteResource {
+            api_version: api_version.into(),
+            kind: kind.into(),
+            namespace: namespace.map(Into::into),
+            name: name.into(),
             preconditions,
-        )
+        })
         .await
     }
 
     async fn apply_resource_batch(&self, operations: Vec<ResourceBatchOperation>) -> Result<()> {
         validate_controller_effect()?;
-        klights_controllers::endpoints::EndpointReconcileStore::apply_resource_batch(
-            self.store.as_ref(),
-            operations,
-        )
-        .await
+        self.submit_ack(StorageCommand::ApplyResourceBatch { operations })
+            .await
     }
 }
 
@@ -652,15 +669,16 @@ impl klights_controllers::common::ControllerStatusStore for RootControllerLeader
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        klights_controllers::common::ControllerStatusStore::update_status(
-            self.store.as_ref(),
-            api_version,
-            kind,
-            namespace,
-            name,
+        self.submit_resource(StorageCommand::UpdateStatus {
+            api_version: api_version.into(),
+            kind: kind.into(),
+            namespace: namespace.map(Into::into),
+            name: name.into(),
             status,
+            expected_rv: preconditions.resource_version,
             preconditions,
-        )
+            observed_status_stamp: None,
+        })
         .await
     }
 
@@ -699,11 +717,13 @@ impl klights_controllers::pvc::PvcStore for RootControllerLeaderPort {
         value: serde_json::Value,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        klights_controllers::pvc::PvcStore::create_persistent_volume(
-            self.store.as_ref(),
-            name,
-            value,
-        )
+        self.submit_resource(StorageCommand::CreateResource {
+            api_version: "v1".into(),
+            kind: "PersistentVolume".into(),
+            namespace: None,
+            name: name.into(),
+            data: value,
+        })
         .await
     }
 
@@ -714,12 +734,15 @@ impl klights_controllers::pvc::PvcStore for RootControllerLeaderPort {
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
         validate_controller_effect()?;
-        klights_controllers::pvc::PvcStore::update_persistent_volume(
-            self.store.as_ref(),
-            name,
-            value,
+        self.submit_resource(StorageCommand::UpdateResource {
+            api_version: "v1".into(),
+            kind: "PersistentVolume".into(),
+            namespace: None,
+            name: name.into(),
+            data: value,
+            expected_rv: preconditions.resource_version.unwrap_or_default(),
             preconditions,
-        )
+        })
         .await
     }
 }
@@ -762,11 +785,16 @@ impl klights_controllers::replicationcontroller::ReplicationControllerStore
         status: serde_json::Value,
     ) -> Result<()> {
         validate_controller_effect()?;
-        klights_controllers::replicationcontroller::ReplicationControllerStore::update_replication_controller_status(
-            self.store.as_ref(),
-            resource,
+        self.submit_ack(StorageCommand::UpdateStatus {
+            api_version: "v1".into(),
+            kind: "ReplicationController".into(),
+            namespace: resource.namespace.clone(),
+            name: resource.name.clone(),
             status,
-        )
+            expected_rv: Some(resource.resource_version),
+            preconditions: ResourcePreconditions::from_resource(resource),
+            observed_status_stamp: None,
+        })
         .await
     }
 }
@@ -815,11 +843,16 @@ impl klights_controllers::apiservice::ApiServiceStore for RootControllerLeaderPo
         status: serde_json::Value,
     ) -> Result<()> {
         validate_controller_effect()?;
-        klights_controllers::apiservice::ApiServiceStore::update_apiservice_status(
-            self.store.as_ref(),
-            current,
+        self.submit_ack(StorageCommand::UpdateStatus {
+            api_version: "apiregistration.k8s.io/v1".into(),
+            kind: "APIService".into(),
+            namespace: None,
+            name: current.name.clone(),
             status,
-        )
+            expected_rv: Some(current.resource_version),
+            preconditions: ResourcePreconditions::from_resource(current),
+            observed_status_stamp: None,
+        })
         .await
     }
 }
@@ -838,13 +871,19 @@ impl klights_controllers::csr_signer::CsrStatusStore for RootControllerLeaderPor
         status: serde_json::Value,
     ) -> Result<()> {
         validate_controller_effect()?;
-        klights_controllers::csr_signer::CsrStatusStore::update_csr_status(
-            self.store.as_ref(),
-            name,
-            uid,
-            resource_version,
+        self.submit_ack(StorageCommand::UpdateStatus {
+            api_version: "certificates.k8s.io/v1".into(),
+            kind: "CertificateSigningRequest".into(),
+            namespace: None,
+            name: name.into(),
             status,
-        )
+            expected_rv: Some(resource_version),
+            preconditions: ResourcePreconditions {
+                uid: Some(uid.into()),
+                resource_version: Some(resource_version),
+            },
+            observed_status_stamp: None,
+        })
         .await
     }
 }
@@ -1239,6 +1278,7 @@ fn runtime_dependencies_for_test(
             scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
+            resource_commands: None,
             remote_delivery_required: false,
             controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
             scheduler_bind_gate: None,

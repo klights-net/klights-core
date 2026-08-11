@@ -74,6 +74,7 @@ pub(crate) struct PodRepositoryBuildConfig {
     pub scheduling_mode: PodSchedulingMode,
     pub outbox: Option<Arc<klights_kubelet::node_outbox::Outbox>>,
     pub cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
+    pub resource_commands: Option<Arc<dyn klights_leader_api::LeaderResourceCommand>>,
     pub remote_delivery_required: bool,
     pub controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     #[cfg(not(test))]
@@ -1779,6 +1780,7 @@ fn build_pod_repository_parts_inner(
         scheduling_mode,
         outbox,
         cluster_api,
+        resource_commands,
         remote_delivery_required,
         controller_identity,
         #[cfg(not(test))]
@@ -1818,11 +1820,14 @@ fn build_pod_repository_parts_inner(
     });
     let wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock> =
         Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock);
-    let persistence_parts =
-        crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
-            db.clone(),
-            wall_clock.clone(),
-        );
+    let persistence_parts = match resource_commands {
+        Some(commands) => crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_raft_root_parts(
+            db.clone(), commands, wall_clock.clone(),
+        ),
+        None => crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
+            db.clone(), wall_clock.clone(),
+        ),
+    };
     let store = persistence_parts.store.clone();
     let local_bound_finalization = persistence_parts.bound_finalization;
     let unscheduled_deletion = persistence_parts.unscheduled_deletion;

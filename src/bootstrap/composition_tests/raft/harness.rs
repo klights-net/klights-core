@@ -133,6 +133,67 @@ impl IntegrationRaftComposition {
         )
     }
 
+    pub async fn create_pod_through_root_persistence(
+        &self,
+        node: Arc<klights_replication::node::RaftNode>,
+        namespace: &str,
+        name: &str,
+        body: serde_json::Value,
+    ) -> anyhow::Result<klights_cluster_core::Resource> {
+        let db: IntegrationDatastoreHandle = self.db.clone();
+        let authority =
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+            db.clone(), authority.clone(),
+        );
+        let commands = Arc::new(
+            klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
+                node.proposal(),
+                query,
+                authority,
+            ),
+        );
+        let parts = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_raft_root_parts(
+            self.db.clone(),
+            commands,
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        );
+        parts.store.create(namespace, name, body).await
+    }
+
+    pub async fn approve_csr_through_controller(
+        &self,
+        node: Arc<klights_replication::node::RaftNode>,
+        name: &str,
+        uid: &str,
+        resource_version: i64,
+    ) -> klights_reconcile_api::ControllerStoreResult<()> {
+        let db: IntegrationDatastoreHandle = self.db.clone();
+        let authority =
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+            db.clone(), authority.clone(),
+        );
+        let commands = Arc::new(
+            klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
+                node.proposal(),
+                query,
+                authority,
+            ),
+        );
+        let port = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
+            db, commands,
+        );
+        klights_controllers::csr_signer::CsrStatusStore::update_csr_status(
+            &port,
+            name,
+            uid,
+            resource_version,
+            serde_json::json!({"conditions": [{"type": "Approved", "status": "True"}]}),
+        )
+        .await
+    }
+
     pub async fn read_cluster_membership(
         &self,
     ) -> anyhow::Result<klights_cluster_core::ClusterMembership> {

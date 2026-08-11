@@ -592,6 +592,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 scheduling_mode,
                 outbox: Some(outbox_runtime.clone()),
                 cluster_api: Some(leader_resource_query.clone()),
+                resource_commands: Some(resource_commands.clone()),
                 remote_delivery_required: false,
                 controller_identity: controller_identity.clone(),
                 #[cfg(not(test))]
@@ -761,6 +762,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 scheduling_mode,
                 outbox: Some(outbox_runtime.clone()),
                 cluster_api: Some(leader_resource_query.clone()),
+                resource_commands: Some(resource_commands.clone()),
                 remote_delivery_required: false,
                 controller_identity: controller_identity.clone(),
                 #[cfg(not(test))]

@@ -1349,6 +1349,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_join_controller_pod_and_csr_status_mutations_converge_through_raft() {
+        let registry = LoopbackRegistry::new();
+        let (leader, leader_db) = fresh_voter_in_registry_with_backend(33, &registry).await;
+        let leader = Arc::new(leader.into_node());
+        let (joiner, joiner_db) = fresh_voter_in_registry_with_backend(34, &registry).await;
+        leader
+            .bootstrap_single_voter("https://10.99.0.33:7679".into())
+            .await
+            .expect("bootstrap seed");
+        wait_for_leader(&leader, std::time::Duration::from_secs(5))
+            .await
+            .expect("seed leader election");
+        leader
+            .propose_command(StorageCommand::CreateNamespace {
+                name: "kube-system".into(),
+                data: serde_json::json!({
+                    "apiVersion": "v1", "kind": "Namespace",
+                    "metadata": {"name": "kube-system", "uid": "system-ns"}
+                }),
+            })
+            .await
+            .expect("create namespace");
+        let handler = IntegrationRaftComposition::new(leader_db.clone())
+            .controlplane_join_handler_with_raft_store(leader.clone());
+        handler
+            .join(test_controlplane_join_request(
+                34,
+                "https://10.99.0.34:7679",
+                "n34",
+                false,
+                joiner.storage_incarnation(),
+                None,
+                "controller-joiner-hash",
+            ))
+            .await
+            .expect("admit voter");
+        wait_for_voter_count(&leader, 2).await;
+
+        let composition = IntegrationRaftComposition::new(leader_db.clone());
+        composition
+            .create_pod_through_root_persistence(
+                leader.clone(),
+                "kube-system",
+                "coredns-convergence",
+                serde_json::json!({
+                    "apiVersion": "v1", "kind": "Pod",
+                    "metadata": {
+                        "namespace": "kube-system",
+                        "name": "coredns-convergence",
+                        "uid": "coredns-pod-uid"
+                    },
+                    "spec": {"containers": [{"name": "coredns", "image": "coredns:1.11.1"}]},
+                    "status": {"phase": "Pending"}
+                }),
+            )
+            .await
+            .expect("create controller Pod");
+        leader
+            .propose_command(StorageCommand::CreateResource {
+                api_version: "certificates.k8s.io/v1".into(),
+                kind: "CertificateSigningRequest".into(),
+                namespace: None,
+                name: "node-client-convergence".into(),
+                data: serde_json::json!({
+                    "apiVersion": "certificates.k8s.io/v1",
+                    "kind": "CertificateSigningRequest",
+                    "metadata": {"name": "node-client-convergence", "uid": "csr-uid"},
+                    "spec": {"request": "AA==", "signerName": "kubernetes.io/kube-apiserver-client-kubelet"}
+                }),
+            })
+            .await
+            .expect("create CSR");
+        let csr = leader_db
+            .get_resource(
+                "certificates.k8s.io/v1",
+                "CertificateSigningRequest",
+                None,
+                "node-client-convergence",
+            )
+            .await
+            .expect("read CSR")
+            .expect("created CSR resource");
+        composition
+            .approve_csr_through_controller(
+                leader.clone(),
+                &csr.name,
+                &csr.uid,
+                csr.resource_version,
+            )
+            .await
+            .expect("approve CSR");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let pod = joiner_db
+                .get_resource("v1", "Pod", Some("kube-system"), "coredns-convergence")
+                .await
+                .unwrap();
+            let csr = joiner_db
+                .get_resource(
+                    "certificates.k8s.io/v1",
+                    "CertificateSigningRequest",
+                    None,
+                    "node-client-convergence",
+                )
+                .await
+                .unwrap();
+            if pod.is_some()
+                && csr.as_ref().is_some_and(|resource| {
+                    resource.data.pointer("/status/conditions/0/type")
+                        == Some(&serde_json::json!("Approved"))
+                })
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "joined voter did not receive controller Pod creation and CSR approval"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            joiner_db.get_current_resource_version().await.unwrap(),
+            leader_db.get_current_resource_version().await.unwrap(),
+            "controller mutations must preserve exact public resourceVersion convergence"
+        );
+
+        drop(handler);
+        match Arc::try_unwrap(leader) {
+            Ok(leader) => leader.shutdown().await.unwrap(),
+            Err(_) => panic!("controller convergence fixture retained the Raft node"),
+        }
+        joiner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn concurrent_node_subnet_proposals_do_not_close_apply_channel() {
         let (node, backend) = fresh_node(90).await;
         node.bootstrap_single_voter("https://10.99.0.90:7679".into())

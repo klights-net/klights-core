@@ -9,6 +9,9 @@ use klights_kubelet::unscheduled_deletion::{
     UnscheduledPodDeletionObservation, UnscheduledPodDeletionPort,
     UnscheduledPodDeletionPortFuture, UnscheduledPodDeletionService,
 };
+use klights_leader_api::{
+    LeaderResourceCommand, ResourceCommandError, ResourceCommandRequest, ResourceCommandResult,
+};
 #[cfg(feature = "pod-repository-test-support")]
 use klights_pod_api::BoundPodFinalization;
 use klights_pod_api::{
@@ -29,9 +32,55 @@ use klights_kubelet::pod_repository::store::{ActorPodDeleteObservation, PodStore
 
 struct RootPodRepositoryPersistenceAdapter {
     db: DatastoreHandle,
+    commands: Option<Arc<dyn LeaderResourceCommand>>,
     sandbox_gc_dirty: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "pod-repository-test-support"))]
     delete_cas_hook: Option<Arc<dyn PodDeleteCasTestHook>>,
+}
+
+impl RootPodRepositoryPersistenceAdapter {
+    async fn submit_resource(
+        &self,
+        command: klights_cluster_core::StorageCommand,
+        namespace: &str,
+        name: &str,
+    ) -> Result<klights_cluster_core::Resource, PodRepositoryError> {
+        let commands = self.commands.as_ref().ok_or_else(|| {
+            PodRepositoryError::unavailable(
+                "Raft resource command capability is unavailable for root Pod persistence",
+            )
+        })?;
+        let request = ResourceCommandRequest::try_new(command)
+            .map_err(|error| pod_command_error(error, namespace, name))?;
+        match commands
+            .submit_resource_command(request)
+            .await
+            .map_err(|error| pod_command_error(error, namespace, name))?
+        {
+            ResourceCommandResult::Resource(resource) => Ok(resource),
+            ResourceCommandResult::Ack { .. } => Err(PodRepositoryError::internal(
+                "root Pod persistence command returned no resource",
+            )),
+        }
+    }
+}
+
+fn pod_command_error(
+    error: ResourceCommandError,
+    namespace: &str,
+    name: &str,
+) -> PodRepositoryError {
+    let message = error.to_string();
+    match error {
+        ResourceCommandError::AlreadyExists { .. } => PodRepositoryError::already_exists(message),
+        ResourceCommandError::Conflict { .. } => PodRepositoryError::conflict(message),
+        ResourceCommandError::NotFound { .. } => PodRepositoryError::not_found(namespace, name),
+        ResourceCommandError::NotLeader
+        | ResourceCommandError::Retryable { .. }
+        | ResourceCommandError::Timeout
+        | ResourceCommandError::Cancelled => PodRepositoryError::unavailable(message),
+        _ => PodRepositoryError::internal(message),
+    }
 }
 
 #[cfg(any(test, feature = "pod-repository-test-support"))]
@@ -199,6 +248,21 @@ impl PodRepositoryWritePersistence for RootPodRepositoryPersistenceAdapter {
         request: PodRepositoryCreateRequest,
     ) -> PodRepositoryFuture<'_, klights_cluster_core::Resource> {
         Box::pin(async move {
+            if self.commands.is_some() {
+                return self
+                    .submit_resource(
+                        klights_cluster_core::StorageCommand::CreateResource {
+                            api_version: "v1".into(),
+                            kind: "Pod".into(),
+                            namespace: Some(request.namespace.clone()),
+                            name: request.name.clone(),
+                            data: request.body,
+                        },
+                        &request.namespace,
+                        &request.name,
+                    )
+                    .await;
+            }
             self.db
                 .create_resource(
                     "v1",
@@ -217,6 +281,23 @@ impl PodRepositoryWritePersistence for RootPodRepositoryPersistenceAdapter {
         request: PodRepositoryReplaceRequest,
     ) -> PodRepositoryFuture<'_, klights_cluster_core::Resource> {
         Box::pin(async move {
+            if self.commands.is_some() {
+                return self
+                    .submit_resource(
+                        klights_cluster_core::StorageCommand::UpdateResource {
+                            api_version: "v1".into(),
+                            kind: "Pod".into(),
+                            namespace: Some(request.namespace.clone()),
+                            name: request.name.clone(),
+                            data: request.body,
+                            expected_rv: request.preconditions.resource_version.unwrap_or_default(),
+                            preconditions: request.preconditions,
+                        },
+                        &request.namespace,
+                        &request.name,
+                    )
+                    .await;
+            }
             self.db
                 .update_resource_with_preconditions(
                     "v1",
@@ -236,6 +317,28 @@ impl PodRepositoryWritePersistence for RootPodRepositoryPersistenceAdapter {
         request: PodRepositoryPatchRequest,
     ) -> PodRepositoryFuture<'_, Option<klights_cluster_core::Resource>> {
         Box::pin(async move {
+            if self.commands.is_some() {
+                return self
+                    .submit_resource(
+                        klights_cluster_core::StorageCommand::PatchResource {
+                            api_version: "v1".into(),
+                            kind: "Pod".into(),
+                            namespace: Some(request.namespace.clone()),
+                            name: request.name.clone(),
+                            patch_kind: request.patch_kind,
+                            patch: request.patch,
+                            strict_resource_version: request
+                                .preconditions
+                                .resource_version
+                                .is_some(),
+                            preconditions: request.preconditions,
+                        },
+                        &request.namespace,
+                        &request.name,
+                    )
+                    .await
+                    .map(Some);
+            }
             self.db
                 .patch_resource_latest_with_preconditions(
                     "v1",
@@ -258,6 +361,24 @@ impl PodRepositoryWritePersistence for RootPodRepositoryPersistenceAdapter {
         request: PodRepositoryStatusRequest,
     ) -> PodRepositoryFuture<'_, klights_cluster_core::Resource> {
         Box::pin(async move {
+            if self.commands.is_some() {
+                return self
+                    .submit_resource(
+                        klights_cluster_core::StorageCommand::UpdateStatus {
+                            api_version: "v1".into(),
+                            kind: "Pod".into(),
+                            namespace: Some(request.namespace.clone()),
+                            name: request.name.clone(),
+                            status: request.status,
+                            expected_rv: request.preconditions.resource_version,
+                            preconditions: request.preconditions,
+                            observed_status_stamp: None,
+                        },
+                        &request.namespace,
+                        &request.name,
+                    )
+                    .await;
+            }
             self.db
                 .update_status_only_with_preconditions(
                     "v1",
@@ -496,6 +617,7 @@ impl UnscheduledPodDeletionPort for RootPodRepositoryPersistenceAdapter {
 
 fn concrete_adapter(
     db: DatastoreHandle,
+    commands: Option<Arc<dyn LeaderResourceCommand>>,
     sandbox_gc_dirty: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "pod-repository-test-support"))] delete_cas_hook: Option<
         Arc<dyn PodDeleteCasTestHook>,
@@ -503,6 +625,7 @@ fn concrete_adapter(
 ) -> Arc<RootPodRepositoryPersistenceAdapter> {
     Arc::new(RootPodRepositoryPersistenceAdapter {
         db,
+        commands,
         sandbox_gc_dirty,
         #[cfg(any(test, feature = "pod-repository-test-support"))]
         delete_cas_hook,
@@ -516,6 +639,7 @@ pub(crate) fn new_root_parts(
     let sandbox_gc_dirty = Arc::new(AtomicUsize::new(1));
     let concrete = concrete_adapter(
         db,
+        None,
         sandbox_gc_dirty.clone(),
         #[cfg(any(test, feature = "pod-repository-test-support"))]
         None,
@@ -540,13 +664,46 @@ pub(crate) fn new_root_parts(
     }
 }
 
+pub(crate) fn new_raft_root_parts(
+    db: DatastoreHandle,
+    commands: Arc<dyn LeaderResourceCommand>,
+    _wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+) -> RootPodRepositoryPersistenceParts {
+    let sandbox_gc_dirty = Arc::new(AtomicUsize::new(1));
+    let concrete = concrete_adapter(
+        db,
+        Some(commands),
+        sandbox_gc_dirty.clone(),
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        None,
+    );
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    let store = Arc::new(PodStore::from_persistence_with_watch(
+        concrete.clone(),
+        concrete.clone(),
+        sandbox_gc_dirty,
+        Some(concrete.clone()),
+    ));
+    #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+    let store = Arc::new(PodStore::from_persistence(
+        concrete.clone(),
+        concrete.clone(),
+        sandbox_gc_dirty,
+    ));
+    RootPodRepositoryPersistenceParts {
+        store,
+        bound_finalization: concrete.clone(),
+        unscheduled_deletion: Arc::new(UnscheduledPodDeletionService::new(concrete)),
+    }
+}
+
 #[cfg(feature = "pod-repository-test-support")]
 pub(crate) fn new_root_parts_with_delete_cas_hook(
     db: DatastoreHandle,
     delete_cas_hook: Arc<dyn PodDeleteCasTestHook>,
 ) -> RootPodRepositoryPersistenceParts {
     let sandbox_gc_dirty = Arc::new(AtomicUsize::new(1));
-    let concrete = concrete_adapter(db, sandbox_gc_dirty.clone(), Some(delete_cas_hook));
+    let concrete = concrete_adapter(db, None, sandbox_gc_dirty.clone(), Some(delete_cas_hook));
     let store = Arc::new(PodStore::from_persistence_with_watch(
         concrete.clone(),
         concrete.clone(),
@@ -564,6 +721,7 @@ pub(crate) fn new_store(db: DatastoreHandle) -> PodStore {
     let sandbox_gc_dirty = Arc::new(AtomicUsize::new(1));
     let concrete = concrete_adapter(
         db,
+        None,
         sandbox_gc_dirty.clone(),
         #[cfg(any(test, feature = "pod-repository-test-support"))]
         None,

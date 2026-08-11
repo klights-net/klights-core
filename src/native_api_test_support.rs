@@ -1259,6 +1259,7 @@ impl NativeApiTestHarness {
             scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: Some(outbox),
             cluster_api: Some(resource_query.clone()),
+            resource_commands: None,
             remote_delivery_required: false,
             controller_identity: controller_identity.clone(),
             #[cfg(not(test))]

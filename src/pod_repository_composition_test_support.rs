@@ -2740,6 +2740,7 @@ impl PodRepositoryScenarioOwner {
                 scheduling_mode,
                 outbox,
                 cluster_api: repository_cluster_api,
+                resource_commands: None,
                 remote_delivery_required,
                 controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
                 #[cfg(not(test))]
