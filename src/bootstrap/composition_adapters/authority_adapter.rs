@@ -126,8 +126,10 @@ mod tests {
         let AuthorityRoute::Local(permit) = authority.route() else {
             panic!("initial authority");
         };
-        publisher.publish(false, Some("https://leader".to_string()));
-        publisher.publish(true, None);
+        publisher
+            .publish(false, Some("https://leader".to_string()))
+            .await;
+        publisher.publish(true, None).await;
         assert_eq!(
             authority.validate(&permit),
             Err(AuthorityError::StalePermit)

@@ -69,6 +69,7 @@ pub mod unscheduled_deletion;
 pub mod volume_registry;
 pub mod volume_sources;
 pub mod volumes;
+pub mod worker_store;
 
 #[cfg(test)]
 mod node_conditions_tests;

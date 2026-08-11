@@ -86,6 +86,11 @@ pub struct OpenLeaderArgs<'a> {
     pub grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
     pub shutdown_token: CancellationToken,
     pub is_leader_rx: tokio::sync::watch::Receiver<bool>,
+    /// Opaque authority used by local and switching leader clients.  The
+    /// legacy leadership watch remains here only for the sequenced datastore
+    /// and embedded replication adapters that still consume that signal.
+    pub leader_authority: Arc<klights_replication::authority::WatchLeaderAuthority>,
+    pub authority_publisher: klights_replication::authority::AuthorityPublisher,
     pub local_dataplane: klights_leader_rpc::client::JoinDataplaneMetadata,
     pub node_ip: &'a str,
 }
@@ -127,6 +132,8 @@ pub struct DatastorePhase {
     /// Lease renew fallback for control-plane joiners while follower.
     /// Used by heartbeat to send `renew_node_lease` RPCs to the leader.
     pub control_plane_lease_client: Option<Arc<klights_leader_rpc::client::ReplicationGrpcClient>>,
+    pub leader_authority: Arc<klights_replication::authority::WatchLeaderAuthority>,
+    pub authority_publisher: klights_replication::authority::AuthorityPublisher,
 }
 
 struct RemoteForwarderParts {
@@ -163,6 +170,8 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         grpc_transport_policy,
         shutdown_token,
         is_leader_rx,
+        leader_authority,
+        authority_publisher,
         local_dataplane,
         node_ip,
     } = args;
@@ -445,9 +454,10 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     config.containerd_namespace.clone(),
                     runtime_paths.service_account_signing_key(),
                     node_lease_tracker.clone(),
-                    is_leader_rx.clone(),
+                    leader_authority.clone(),
                     klights_supervisor::FileProcessExecutor::from_supervisor(supervisor.as_ref()),
-                ),
+                )
+                .with_authority_signing_fence(leader_authority.signing_fence()),
             );
             let local_resource_commands = Arc::new(
                 klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
@@ -478,7 +488,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                         local_api_client.clone(),
                     ),
                     remote_parts.leader_ports.clone(),
-                    is_leader_rx.clone(),
+                    leader_authority.clone(),
                 )
                 .with_resource_command_targets(
                     local_resource_commands,
@@ -998,6 +1008,8 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         member_feature_probe,
         skip_seed_bootstrap,
         control_plane_lease_client: remote_parts.lease_client,
+        leader_authority,
+        authority_publisher,
     })
 }
 

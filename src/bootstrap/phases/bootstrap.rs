@@ -68,8 +68,7 @@ pub struct BootstrapRunArgs<'a> {
     pub pod_workqueue_store: Arc<dyn klights_node_store::PodWorkqueueStore>,
     pub pod_slot_store: Arc<dyn klights_node_store::PodSlotAdmissionStore>,
     pub pod_slot_events: Arc<dyn klights_node_store::PodSlotAdmissionEventSource>,
-    pub worker_store_adapter:
-        Option<Arc<crate::control_plane::client::worker_store::WorkerStoreAdapter>>,
+    pub worker_store_adapter: Option<Arc<klights_kubelet::worker_store::WorkerStoreAdapter>>,
     pub kubelet_uses_worker_store_adapter: bool,
     pub db: &'a dyn crate::datastore::DatastoreBackend,
     pub leader_ports: crate::control_plane::client::LeaderClientPorts,
@@ -116,6 +115,11 @@ pub struct BootstrapRunArgs<'a> {
     /// to `open_leader` so it's wired into the datastore phase.
     pub is_leader_tx: tokio::sync::watch::Sender<bool>,
     pub is_leader_rx: tokio::sync::watch::Receiver<bool>,
+    /// Opaque authority shared with the local and switching leader clients.
+    /// The boolean watch remains only for legacy replication/bootstrap
+    /// adapters that have not yet migrated to the authority contract.
+    pub leader_authority: Arc<klights_replication::authority::WatchLeaderAuthority>,
+    pub authority_publisher: klights_replication::authority::AuthorityPublisher,
 }
 
 struct BootstrapNodeLeaderLabelStore {
@@ -353,6 +357,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         member_feature_probe,
         is_leader_tx,
         is_leader_rx,
+        leader_authority,
+        authority_publisher,
     } = args;
     #[cfg(not(test))]
     let service_account_signing_key_path = runtime_paths.service_account_signing_key();
@@ -594,6 +600,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 api_identity: api_identity.clone(),
                 #[cfg(any(test, feature = "pod-repository-test-support"))]
                 scheduler_bind_gate: None,
+                #[cfg(any(test, feature = "pod-repository-test-support"))]
+                post_write_maintenance_notify: None,
                 #[cfg(not(test))]
                 gc_coordination: controller_coordination.clone(),
             },
@@ -761,6 +769,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 api_identity: api_identity.clone(),
                 #[cfg(any(test, feature = "pod-repository-test-support"))]
                 scheduler_bind_gate: None,
+                #[cfg(any(test, feature = "pod-repository-test-support"))]
+                post_write_maintenance_notify: None,
                 #[cfg(not(test))]
                 gc_coordination: controller_coordination.clone(),
             },
@@ -933,11 +943,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     ) {
         lease_client.set_current_leader_endpoint(Some(leader_addr.clone()));
     }
-    let (leader_authority, authority_publisher) =
-        klights_replication::authority::WatchLeaderAuthority::channel(
-            initial_is_leader,
-            initial_leader_addr.clone(),
-        );
+    authority_publisher
+        .publish(initial_is_leader, initial_leader_addr.clone())
+        .await;
     start_controlplane_remote_informers_if_present(remote_api_client, shutdown_token.clone())
         .await
         .context("control-plane remote API informers")?;
@@ -1247,7 +1255,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                                 None
                             }
                         };
-                        authority_publisher_task.publish(is_leader, leader_endpoint);
+                        authority_publisher_task
+                            .publish(is_leader, leader_endpoint)
+                            .await;
                         let shape = raft_task.current_shape();
                         if Some(&shape) == last_shape.as_ref() {
                             continue;

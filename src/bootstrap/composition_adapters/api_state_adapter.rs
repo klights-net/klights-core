@@ -691,8 +691,8 @@ mod tests {
         });
         let transition = async {
             reached_effect_boundary.notified().await;
-            publisher.publish(false, None);
-            publisher.publish(true, None);
+            publisher.publish(false, None).await;
+            publisher.publish(true, None).await;
             resume_effect.notify_one();
         };
         let (result, ()) = tokio::join!(operation, transition);

@@ -7,26 +7,22 @@ pub(crate) async fn start_worker_store_adapter(
     shutdown_token: tokio_util::sync::CancellationToken,
     discovery_client: Option<std::sync::Arc<klights_leader_rpc::client::ReplicationGrpcClient>>,
     initial_leader_endpoints: Vec<String>,
-) -> anyhow::Result<std::sync::Arc<crate::control_plane::client::worker_store::WorkerStoreAdapter>>
-{
+) -> anyhow::Result<std::sync::Arc<klights_kubelet::worker_store::WorkerStoreAdapter>> {
     remote_api_client
         .start_required_worker_informers(shutdown_token.clone())
         .await
         .context("worker informers")?;
 
     let worker_store = std::sync::Arc::new(
-        crate::control_plane::client::worker_store::WorkerStoreAdapter::from_ports(
-            crate::control_plane::client::worker_store::WorkerStorePorts {
+        klights_kubelet::worker_store::WorkerStoreAdapter::from_focused_ports(
+            klights_kubelet::worker_store::WorkerStorePorts {
                 resource_query: remote_api_client.clone(),
                 leader_watch: remote_api_client.clone(),
                 subnet_allocation: remote_api_client.clone(),
                 network_topology: remote_api_client.clone(),
                 cleanup_intents: remote_api_client,
-                transition_projectors: std::sync::Arc::new(
-                    crate::bootstrap::composition_adapters::remote_informer_cache_adapter::WatchCacheAdapter::new(),
-                ),
                 watch_events: std::sync::Arc::new(
-                    crate::control_plane::client::worker_store::WorkerWatchBus::new(),
+                    klights_kubelet::worker_store::WorkerWatchBus::new(),
                 ),
             },
             node_name,
@@ -62,16 +58,16 @@ pub(crate) async fn start_worker_store_adapter(
                                 continue;
                             }
                         };
-                        let nodes = match <crate::control_plane::client::worker_store::WorkerStoreAdapter as crate::datastore::ResourceListStore>::list_resources_page(
-                            discovery_store.as_ref(),
-                            "v1",
-                            "Node",
-                            None,
-                            None,
-                            None,
-                            crate::datastore::ListPageRequest::unbounded(),
-                        )
-                        .await
+                        let nodes = match discovery_store
+                            .list_resources(
+                                "v1",
+                                "Node",
+                                None,
+                                None,
+                                None,
+                                klights_kubelet::worker_store::WorkerListPage::unbounded(),
+                            )
+                            .await
                         {
                             Ok(nodes) => nodes,
                             Err(err) => {

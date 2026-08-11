@@ -11,14 +11,14 @@
 //! - **Pod cleanup intent reads/deletes** prefer the remote leader path.
 //!   Startup recovery may run before a rejoining old leader has observed
 //!   its demotion, so the local leadership watch can briefly be stale.
-//! - **Writes** consult `is_leader_rx` on entry: when `true` they
-//!   dispatch to the local client (which routes through the local
-//!   datastore → raft proposer → raft → state-machine apply); when
-//!   `false` they dispatch to the remote forwarder, which carries the
-//!   call to the current elected leader's API server over gRPC.
+//! - **Writes** consult the backend-neutral authority route on entry: local
+//!   authority dispatches to the local client (which routes through the local
+//!   datastore → raft proposer → raft → state-machine apply); forwarded or
+//!   temporarily unavailable authority dispatches to the remote arm, which
+//!   carries the call to the current elected leader's API server over gRPC.
 //!
 //! Leadership change is a state flip on the same instance — no
-//! re-construction, no rewiring. The proxy reads `is_leader_rx` per
+//! re-construction, no rewiring. The proxy samples authority per
 //! call, so the next read or write after promotion / demotion picks the new
 //! dispatch target without any setup.
 //!
@@ -34,24 +34,24 @@ use futures::StreamExt as _;
 #[cfg(test)]
 use klights_kubelet::node_outbox::payload::OutboxOperationExt as _;
 use klights_leader_api::{
-    CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderCacheReadiness,
-    LeaderNetworkTopologyQuery, LeaderNodeLeaseRenewal, LeaderNodeSubnetAllocation,
-    LeaderOutboxDelivery, LeaderPodCleanupIntents, LeaderProjectedServiceAccountToken,
-    LeaderResourceCommand, LeaderResourceQuery, LeaderWatch, LeaderWatchError, LeaderWatchFuture,
-    NetworkTopologyError, NetworkTopologyFuture, NodeDataplaneQuery, NodeDataplaneResult,
-    NodeLeaseRenewalError, NodeLeaseRenewalFuture, NodeLeaseRenewalRequest, NodeLeaseRenewalResult,
-    NodeSubnetAllocationError, NodeSubnetAllocationFuture, NodeSubnetAllocationRequest,
-    NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult, OutboxDeliveryError,
-    OutboxDeliveryFuture, OutboxDeliveryRequest, PeerSubnetsQuery, PeerSubnetsResult,
-    PodCleanupIntent, PodCleanupIntentAckRequest, PodCleanupIntentError, PodCleanupIntentFuture,
+    AuthorityRoute, CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest,
+    LeaderCacheReadiness, LeaderNetworkTopologyQuery, LeaderNodeLeaseRenewal,
+    LeaderNodeSubnetAllocation, LeaderOutboxDelivery, LeaderPodCleanupIntents,
+    LeaderProjectedServiceAccountToken, LeaderResourceCommand, LeaderResourceQuery, LeaderWatch,
+    LeaderWatchError, LeaderWatchFuture, NetworkTopologyError, NetworkTopologyFuture,
+    NodeDataplaneQuery, NodeDataplaneResult, NodeLeaseRenewalError, NodeLeaseRenewalFuture,
+    NodeLeaseRenewalRequest, NodeLeaseRenewalResult, NodeSubnetAllocationError,
+    NodeSubnetAllocationFuture, NodeSubnetAllocationRequest, NodeSubnetAllocationResult,
+    NodeSubnetQuery, NodeSubnetResult, OutboxDeliveryError, OutboxDeliveryFuture,
+    OutboxDeliveryRequest, PeerSubnetsQuery, PeerSubnetsResult, PodCleanupIntent,
+    PodCleanupIntentAckRequest, PodCleanupIntentError, PodCleanupIntentFuture,
     PodCleanupIntentListRequest, ProjectedServiceAccountTokenFuture,
     ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandFuture,
     ResourceCommandRequest, ResourceCommandResult, ResourceGetRequest, ResourceListRequest,
     ResourceListResult, ResourceQueryConsistency, ResourceQueryFuture, WatchRequest, WatchStream,
 };
-use tokio::sync::watch;
 
-use super::LeaderClientPorts;
+use super::{AuthorityHandle, LeaderClientPorts};
 use klights_cluster_core::Resource;
 
 #[cfg(test)]
@@ -84,11 +84,10 @@ impl<T: ?Sized> ArcPair<T> {
         self.remote = Some(remote);
     }
 
-    fn target(&self, is_leader: bool) -> Option<&Arc<T>> {
-        if is_leader {
-            self.local.as_ref()
-        } else {
-            self.remote.as_ref()
+    fn target(&self, route: &AuthorityRoute) -> Option<&Arc<T>> {
+        match route {
+            AuthorityRoute::Local(_) => self.local.as_ref(),
+            AuthorityRoute::Forward { .. } | AuthorityRoute::Unavailable => self.remote.as_ref(),
         }
     }
 }
@@ -113,8 +112,8 @@ impl FocusedLeaderTargets {
 /// Leader-aware `LeaderApiClient` that dispatches each call to a local
 /// `LocalApiClient` (reads, plus writes when self is the elected
 /// leader) or a remote forwarder (writes when self is a follower /
-/// learner). The decision is per-call; promotion / demotion flips the
-/// watch and the next write picks the new target without rewiring.
+/// learner). The decision is per-call; promotion / demotion changes the
+/// authority route and the next write picks the new target without rewiring.
 pub struct LeaderProxyApiClient {
     resource_queries: ArcPair<dyn LeaderResourceQuery>,
     watches: ArcPair<dyn LeaderWatch>,
@@ -124,7 +123,7 @@ pub struct LeaderProxyApiClient {
     node_subnet_allocations: ArcPair<dyn LeaderNodeSubnetAllocation>,
     network_topology: ArcPair<dyn LeaderNetworkTopologyQuery>,
     focused_targets: Option<Arc<FocusedLeaderTargets>>,
-    is_leader_rx: watch::Receiver<bool>,
+    authority: AuthorityHandle,
 }
 
 impl LeaderProxyApiClient {
@@ -132,13 +131,12 @@ impl LeaderProxyApiClient {
     ///
     /// `local` handles all reads and writes-while-leader. `remote`
     /// handles writes-while-follower (forwarding to the current
-    /// elected leader). `is_leader_rx` is the bootstrap's leadership
-    /// watch — the SAME receiver fed to `LocalApiClient`'s gate, so
-    /// the two layers can never disagree about who the leader is.
-    pub fn new(
+    /// elected leader). The authority handle is the same backend-neutral
+    /// capability fed to `LocalApiClient`, so the two layers cannot disagree.
+    pub(crate) fn new(
         local: LeaderClientPorts,
         remote: LeaderClientPorts,
-        is_leader_rx: watch::Receiver<bool>,
+        authority: impl Into<AuthorityHandle>,
     ) -> Self {
         Self {
             resource_queries: ArcPair {
@@ -170,7 +168,7 @@ impl LeaderProxyApiClient {
                 remote: Some(remote.network_topology),
             },
             focused_targets: None,
-            is_leader_rx,
+            authority: authority.into(),
         }
     }
 
@@ -178,7 +176,7 @@ impl LeaderProxyApiClient {
     fn from_clients<L, R>(
         local: Arc<L>,
         remote: Arc<R>,
-        is_leader_rx: watch::Receiver<bool>,
+        authority: impl Into<AuthorityHandle>,
     ) -> Self
     where
         L: LeaderResourceQuery
@@ -205,7 +203,7 @@ impl LeaderProxyApiClient {
         Self::new(
             LeaderClientPorts::from_client(local),
             LeaderClientPorts::from_client(remote),
-            is_leader_rx,
+            authority,
         )
     }
 
@@ -249,12 +247,8 @@ impl LeaderProxyApiClient {
         Arc::make_mut(targets)
     }
 
-    fn is_leader(&self) -> bool {
-        *self.is_leader_rx.borrow()
-    }
-
-    fn target<'a, T: ?Sized>(&self, pair: &'a ArcPair<T>) -> &'a Arc<T> {
-        pair.target(self.is_leader())
+    fn target<'a, T: ?Sized>(&self, pair: &'a ArcPair<T>, route: &AuthorityRoute) -> &'a Arc<T> {
+        pair.target(route)
             .expect("leader proxy focused target is wired at construction")
     }
 
@@ -288,18 +282,22 @@ impl LeaderResourceCommand for LeaderProxyApiClient {
         &self,
         request: ResourceCommandRequest,
     ) -> ResourceCommandFuture<'_, ResourceCommandResult> {
-        let mut leadership_rx = self.is_leader_rx.clone();
-        let generation_is_leader = *leadership_rx.borrow_and_update();
-        let target = self.focused_targets.as_ref().and_then(|targets| {
-            targets
-                .resource_commands
-                .target(generation_is_leader)
-                .cloned()
-        });
+        let authority = self.authority.clone();
+        let route = authority.route();
+        let permit = match &route {
+            AuthorityRoute::Local(permit) => Some(permit.clone()),
+            AuthorityRoute::Forward { .. } | AuthorityRoute::Unavailable => None,
+        };
+        let target = self
+            .focused_targets
+            .as_ref()
+            .and_then(|targets| targets.resource_commands.target(&route).cloned());
         Box::pin(async move {
-            if leadership_rx.has_changed().unwrap_or(true) {
+            if let Some(permit) = permit.as_ref()
+                && authority.validate(permit).is_err()
+            {
                 return Err(ResourceCommandError::retryable(
-                    "leadership changed before resource-command dispatch",
+                    "leader authority changed before resource-command dispatch",
                 ));
             }
             match target {
@@ -317,10 +315,11 @@ impl LeaderNodeLeaseRenewal for LeaderProxyApiClient {
         &self,
         request: NodeLeaseRenewalRequest,
     ) -> NodeLeaseRenewalFuture<'_, NodeLeaseRenewalResult> {
+        let route = self.authority.route();
         let target = self
             .focused_targets
             .as_ref()
-            .and_then(|targets| targets.node_lease_renewals.target(self.is_leader()));
+            .and_then(|targets| targets.node_lease_renewals.target(&route));
         match target {
             Some(target) => target.renew_node_lease(request),
             None => Box::pin(async {
@@ -332,22 +331,21 @@ impl LeaderNodeLeaseRenewal for LeaderProxyApiClient {
     }
 }
 
-fn terminate_watch_on_leadership_change(
+fn terminate_watch_on_authority_change(
     stream: WatchStream,
-    leadership_rx: watch::Receiver<bool>,
+    authority: AuthorityHandle,
+    permit: Option<klights_leader_api::AuthorityPermit>,
 ) -> WatchStream {
     stream.map_inner(|stream| {
         Box::pin(futures::stream::unfold(
-            (stream, leadership_rx),
-            move |(mut stream, mut leadership_rx)| async move {
+            (stream, authority, permit),
+            move |(mut stream, authority, permit)| async move {
+                let authority_change = wait_for_authority_change(authority.clone(), permit.clone());
                 tokio::select! {
                     biased;
-                    changed = leadership_rx.changed() => {
-                        let _ = changed;
-                        None
-                    }
+                    _ = authority_change => None,
                     item = stream.next() => {
-                        item.map(|item| (item, (stream, leadership_rx)))
+                        item.map(|item| (item, (stream, authority, permit)))
                     }
                 }
             },
@@ -355,26 +353,43 @@ fn terminate_watch_on_leadership_change(
     })
 }
 
+async fn wait_for_authority_change(
+    authority: AuthorityHandle,
+    permit: Option<klights_leader_api::AuthorityPermit>,
+) {
+    match permit {
+        Some(permit) => authority.wait_for_revocation(&permit).await,
+        None => {
+            let _ = authority.acquire().await;
+        }
+    }
+}
+
 impl LeaderResourceQuery for LeaderProxyApiClient {
     fn get_resource(
         &self,
         request: ResourceGetRequest,
     ) -> ResourceQueryFuture<'_, Option<Resource>> {
-        let mut leadership_rx = self.is_leader_rx.clone();
-        let initial_is_leader = *leadership_rx.borrow_and_update();
+        let authority = self.authority.clone();
+        let route = authority.route();
+        let permit = match &route {
+            AuthorityRoute::Local(permit) => Some(permit.clone()),
+            AuthorityRoute::Forward { .. } | AuthorityRoute::Unavailable => None,
+        };
         let target = self
             .resource_queries
-            .target(initial_is_leader)
+            .target(&route)
             .expect("resource-query targets are wired")
             .clone();
         Box::pin(async move {
             let consistency = request.consistency();
             let result = target.get_resource(request).await?;
             if consistency == ResourceQueryConsistency::LeaderFresh
-                && leadership_rx.has_changed().unwrap_or(true)
+                && let Some(permit) = permit.as_ref()
+                && authority.validate(permit).is_err()
             {
                 return Err(klights_leader_api::ResourceQueryError::retryable(
-                    "leadership changed during leader-fresh resource query",
+                    "leader authority changed during leader-fresh resource query",
                 ));
             }
             Ok(result)
@@ -385,21 +400,26 @@ impl LeaderResourceQuery for LeaderProxyApiClient {
         &self,
         request: ResourceListRequest,
     ) -> ResourceQueryFuture<'_, ResourceListResult> {
-        let mut leadership_rx = self.is_leader_rx.clone();
-        let initial_is_leader = *leadership_rx.borrow_and_update();
+        let authority = self.authority.clone();
+        let route = authority.route();
+        let permit = match &route {
+            AuthorityRoute::Local(permit) => Some(permit.clone()),
+            AuthorityRoute::Forward { .. } | AuthorityRoute::Unavailable => None,
+        };
         let target = self
             .resource_queries
-            .target(initial_is_leader)
+            .target(&route)
             .expect("resource-query targets are wired")
             .clone();
         Box::pin(async move {
             let consistency = request.consistency();
             let result = target.list_resources(request).await?;
             if consistency == ResourceQueryConsistency::LeaderFresh
-                && leadership_rx.has_changed().unwrap_or(true)
+                && let Some(permit) = permit.as_ref()
+                && authority.validate(permit).is_err()
             {
                 return Err(klights_leader_api::ResourceQueryError::retryable(
-                    "leadership changed during leader-fresh resource query",
+                    "leader authority changed during leader-fresh resource query",
                 ));
             }
             Ok(result)
@@ -409,28 +429,38 @@ impl LeaderResourceQuery for LeaderProxyApiClient {
 
 impl LeaderWatch for LeaderProxyApiClient {
     fn watch_resources(&self, req: WatchRequest) -> LeaderWatchFuture<'_> {
-        let mut leadership_rx = self.is_leader_rx.clone();
-        let initial_is_leader = *leadership_rx.borrow_and_update();
+        let authority = self.authority.clone();
+        let route = authority.route();
+        let permit = match &route {
+            AuthorityRoute::Local(permit) => Some(permit.clone()),
+            AuthorityRoute::Forward { .. } | AuthorityRoute::Unavailable => None,
+        };
         let target = self
             .watches
-            .target(initial_is_leader)
+            .target(&route)
             .expect("watch targets are wired")
             .clone();
         Box::pin(async move {
             let stream = LeaderWatch::watch_resources(target.as_ref(), req).await?;
-            if leadership_rx.has_changed().unwrap_or(true) {
+            if let Some(permit) = permit.as_ref()
+                && authority.validate(permit).is_err()
+            {
                 return Err(LeaderWatchError::unavailable(
-                    "leadership changed while establishing watch",
+                    "leader authority changed while establishing watch",
                 ));
             }
-            Ok(terminate_watch_on_leadership_change(stream, leadership_rx))
+            Ok(terminate_watch_on_authority_change(
+                stream, authority, permit,
+            ))
         })
     }
 }
 
 impl LeaderCacheReadiness for LeaderProxyApiClient {
     fn wait_cache_ready(&self, scope: CacheReadinessRequest) -> CacheReadinessFuture<'_> {
-        self.target(&self.cache_readiness).wait_cache_ready(scope)
+        let route = self.authority.route();
+        self.target(&self.cache_readiness, &route)
+            .wait_cache_ready(scope)
     }
 }
 
@@ -439,7 +469,8 @@ impl LeaderProjectedServiceAccountToken for LeaderProxyApiClient {
         &self,
         request: ProjectedServiceAccountTokenRequest,
     ) -> ProjectedServiceAccountTokenFuture<'_> {
-        self.target(&self.projected_tokens)
+        let route = self.authority.route();
+        self.target(&self.projected_tokens, &route)
             .issue_projected_service_account_token(request)
     }
 }
@@ -450,7 +481,7 @@ impl LeaderPodCleanupIntents for LeaderProxyApiClient {
         request: PodCleanupIntentListRequest,
     ) -> PodCleanupIntentFuture<'_, Vec<PodCleanupIntent>> {
         Box::pin(async move {
-            let local_is_leader = self.is_leader();
+            let route = self.authority.route();
             let remote = self
                 .pod_cleanup_intents
                 .remote
@@ -458,15 +489,17 @@ impl LeaderPodCleanupIntents for LeaderProxyApiClient {
                 .expect("remote cleanup-intent target is wired");
             match remote.list_pod_cleanup_intents(request.clone()).await {
                 Ok(intents) => Ok(intents),
-                Err(_) if local_is_leader => {
-                    self.pod_cleanup_intents
-                        .local
-                        .as_ref()
-                        .expect("local cleanup-intent target is wired")
-                        .list_pod_cleanup_intents(request)
-                        .await
-                }
-                Err(error) => Err(error),
+                Err(error) => match route {
+                    AuthorityRoute::Local(_) => {
+                        self.pod_cleanup_intents
+                            .local
+                            .as_ref()
+                            .expect("local cleanup-intent target is wired")
+                            .list_pod_cleanup_intents(request)
+                            .await
+                    }
+                    AuthorityRoute::Forward { .. } | AuthorityRoute::Unavailable => Err(error),
+                },
             }
         })
     }
@@ -476,6 +509,7 @@ impl LeaderPodCleanupIntents for LeaderProxyApiClient {
         request: PodCleanupIntentAckRequest,
     ) -> PodCleanupIntentFuture<'_, ()> {
         Box::pin(async move {
+            let route = self.authority.route();
             let remote = self
                 .pod_cleanup_intents
                 .remote
@@ -483,15 +517,17 @@ impl LeaderPodCleanupIntents for LeaderProxyApiClient {
                 .expect("remote cleanup-intent target is wired");
             match remote.acknowledge_pod_cleanup_intent(request.clone()).await {
                 Ok(()) => Ok(()),
-                Err(_) if self.is_leader() => {
-                    self.pod_cleanup_intents
-                        .local
-                        .as_ref()
-                        .expect("local cleanup-intent target is wired")
-                        .acknowledge_pod_cleanup_intent(request)
-                        .await
-                }
-                Err(error) => Err(error),
+                Err(error) => match route {
+                    AuthorityRoute::Local(_) => {
+                        self.pod_cleanup_intents
+                            .local
+                            .as_ref()
+                            .expect("local cleanup-intent target is wired")
+                            .acknowledge_pod_cleanup_intent(request)
+                            .await
+                    }
+                    AuthorityRoute::Forward { .. } | AuthorityRoute::Unavailable => Err(error),
+                },
             }
         })
     }
@@ -502,7 +538,8 @@ impl LeaderNodeSubnetAllocation for LeaderProxyApiClient {
         &self,
         request: NodeSubnetAllocationRequest,
     ) -> NodeSubnetAllocationFuture<'_, NodeSubnetAllocationResult> {
-        self.target(&self.node_subnet_allocations)
+        let route = self.authority.route();
+        self.target(&self.node_subnet_allocations, &route)
             .allocate_node_subnet(request)
     }
 }
@@ -512,14 +549,17 @@ impl LeaderNetworkTopologyQuery for LeaderProxyApiClient {
         &self,
         request: NodeSubnetQuery,
     ) -> NetworkTopologyFuture<'_, NodeSubnetResult> {
-        self.target(&self.network_topology).get_node_subnet(request)
+        let route = self.authority.route();
+        self.target(&self.network_topology, &route)
+            .get_node_subnet(request)
     }
 
     fn list_peer_subnets(
         &self,
         request: PeerSubnetsQuery,
     ) -> NetworkTopologyFuture<'_, PeerSubnetsResult> {
-        self.target(&self.network_topology)
+        let route = self.authority.route();
+        self.target(&self.network_topology, &route)
             .list_peer_subnets(request)
     }
 
@@ -527,17 +567,19 @@ impl LeaderNetworkTopologyQuery for LeaderProxyApiClient {
         &self,
         request: NodeDataplaneQuery,
     ) -> NetworkTopologyFuture<'_, NodeDataplaneResult> {
-        self.target(&self.network_topology)
+        let route = self.authority.route();
+        self.target(&self.network_topology, &route)
             .get_node_dataplane(request)
     }
 }
 
 impl LeaderOutboxDelivery for LeaderProxyApiClient {
     fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
+        let route = self.authority.route();
         let target = self
             .focused_targets
             .as_ref()
-            .and_then(|targets| targets.outbox_deliveries.target(self.is_leader()));
+            .and_then(|targets| targets.outbox_deliveries.target(&route));
         match target {
             Some(target) => target.deliver_outbox(request),
             None => Box::pin(async {

@@ -1153,6 +1153,7 @@ fn runtime_dependencies_for_test(
             remote_delivery_required: false,
             controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
             scheduler_bind_gate: None,
+            post_write_maintenance_notify: None,
         },
         None,
     );

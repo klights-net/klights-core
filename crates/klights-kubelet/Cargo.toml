@@ -10,7 +10,7 @@ publish.workspace = true
 
 [features]
 default = []
-test-support = ["dep:klights-watch"]
+test-support = ["klights-watch/integration-test-harness"]
 
 [lints]
 workspace = true
@@ -37,7 +37,7 @@ klights-pod-api = { workspace = true }
 klights-reconcile-api = { workspace = true }
 klights-supervisor = { workspace = true }
 klights-types = { workspace = true }
-klights-watch = { workspace = true, optional = true }
+klights-watch = { workspace = true, default-features = false }
 libc = { workspace = true }
 nix = { workspace = true }
 reqwest = { workspace = true }
@@ -55,7 +55,7 @@ uuid = { workspace = true, features = ["std", "v4"] }
 
 [dev-dependencies]
 klights-node-datastore = { workspace = true }
-klights-watch = { workspace = true }
+klights-watch = { workspace = true, default-features = false, features = ["integration-test-harness"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }

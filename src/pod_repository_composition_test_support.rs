@@ -1139,6 +1139,7 @@ struct PodRepositoryScenarioOwner {
     node_local: Option<Arc<crate::bootstrap::node_store::NodeLocalStores>>,
     outbox_delivery: Option<Arc<dyn klights_leader_api::LeaderOutboxDelivery>>,
     delete_observation: Option<Arc<tokio::sync::Mutex<Option<(bool, bool)>>>>,
+    post_write_maintenance_notify: Arc<tokio::sync::Notify>,
 }
 
 struct IntegrationEmptyPodNetworkCache;
@@ -1430,6 +1431,7 @@ pub async fn run_raft_delete_mark_status_race(
             #[cfg(not(test))]
             gc_coordination: Arc::new(klights_controllers::ControllerCoordination::new()),
             scheduler_bind_gate: None,
+            post_write_maintenance_notify: None,
         }, local_query,
     );
     use klights_pod_api::PodApiMutation as _;
@@ -2946,6 +2948,7 @@ impl PodRepositoryScenarioOwner {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
+        let post_write_maintenance_notify = Arc::new(tokio::sync::Notify::new());
         let local_client = Arc::new(
             crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_and_passive_reads(
                 db.clone(),
@@ -3067,6 +3070,7 @@ impl PodRepositoryScenarioOwner {
                 #[cfg(not(test))]
                 gc_coordination: Arc::new(klights_controllers::ControllerCoordination::new()),
                 scheduler_bind_gate,
+                post_write_maintenance_notify: Some(post_write_maintenance_notify.clone()),
             },
             native_resource_query,
         );
@@ -3103,6 +3107,7 @@ impl PodRepositoryScenarioOwner {
             node_local,
             outbox_delivery: with_outbox.then_some(local_client),
             delete_observation,
+            post_write_maintenance_notify,
         }
     }
 
@@ -3180,6 +3185,10 @@ impl PodRepositoryScenarioOwner {
 
     pub fn active_supervised_task_count(&self) -> usize {
         self.supervisor.active_tasks(None).len()
+    }
+
+    pub async fn wait_for_post_write_maintenance(&self) {
+        self.post_write_maintenance_notify.notified().await;
     }
 
     pub async fn request_gc_pod_delete(
@@ -3810,6 +3819,10 @@ impl IntegrationPodStatusFixture {
 
     pub async fn pending_reconcile_keys(&self) -> Vec<klights_reconcile_api::ReconcileKey> {
         self.owner.pending_reconcile_keys().await
+    }
+
+    pub async fn wait_for_post_write_maintenance(&self) {
+        self.owner.wait_for_post_write_maintenance().await;
     }
 
     pub async fn enqueue_reconcile_key(&self, key: klights_reconcile_api::ReconcileKey) {

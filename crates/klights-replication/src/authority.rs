@@ -1,6 +1,9 @@
 //! Embedded leader-authority and controller-coordination adapters.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use klights_leader_api::{
     AuthorityAcquireFuture, AuthorityError, AuthorityPermit, AuthorityPermitIssuer,
@@ -22,10 +25,14 @@ struct AuthorityState {
 
 pub struct AuthorityPublisher {
     sender: tokio::sync::watch::Sender<AuthorityState>,
+    transition_gate: Arc<tokio::sync::RwLock<()>>,
+    pending_transitions: Arc<AtomicUsize>,
 }
 
 impl AuthorityPublisher {
-    pub fn publish(&self, local: bool, endpoint: Option<String>) {
+    pub async fn publish(&self, local: bool, endpoint: Option<String>) {
+        let _pending = PendingTransition::begin(&self.pending_transitions);
+        let _transition = self.transition_gate.write().await;
         self.sender.send_if_modified(|state| {
             if state.local == local && state.endpoint == endpoint {
                 return false;
@@ -38,13 +45,52 @@ impl AuthorityPublisher {
     }
 }
 
+/// Adapter-owned read side of the authority transition gate.
+///
+/// The concrete handle is intentionally separate from [`LeaderAuthority`].
+/// Its blocking acquisition is used only in the supervised crypto worker,
+/// never on a Tokio runtime thread.
+#[derive(Clone)]
+pub struct AuthoritySigningFence {
+    gate: Arc<tokio::sync::RwLock<()>>,
+}
+
+impl AuthoritySigningFence {
+    pub fn blocking_read(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.gate.blocking_read()
+    }
+}
+
 pub struct WatchLeaderAuthority {
     receiver: tokio::sync::watch::Receiver<AuthorityState>,
     issuer: AuthorityPermitIssuer,
+    transition_gate: Arc<tokio::sync::RwLock<()>>,
+    pending_transitions: Arc<AtomicUsize>,
+}
+
+struct PendingTransition {
+    pending_transitions: Arc<AtomicUsize>,
+}
+
+impl PendingTransition {
+    fn begin(pending_transitions: &Arc<AtomicUsize>) -> Self {
+        pending_transitions.fetch_add(1, Ordering::AcqRel);
+        Self {
+            pending_transitions: pending_transitions.clone(),
+        }
+    }
+}
+
+impl Drop for PendingTransition {
+    fn drop(&mut self) {
+        self.pending_transitions.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl WatchLeaderAuthority {
     pub fn channel(local: bool, endpoint: Option<String>) -> (Arc<Self>, AuthorityPublisher) {
+        let transition_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let pending_transitions = Arc::new(AtomicUsize::new(0));
         let (sender, receiver) = tokio::sync::watch::channel(AuthorityState {
             generation: 1,
             local,
@@ -54,14 +100,29 @@ impl WatchLeaderAuthority {
             Arc::new(Self {
                 receiver,
                 issuer: AuthorityPermitIssuer::new(),
+                transition_gate: transition_gate.clone(),
+                pending_transitions: pending_transitions.clone(),
             }),
-            AuthorityPublisher { sender },
+            AuthorityPublisher {
+                sender,
+                transition_gate,
+                pending_transitions,
+            },
         )
+    }
+
+    pub fn signing_fence(&self) -> AuthoritySigningFence {
+        AuthoritySigningFence {
+            gate: self.transition_gate.clone(),
+        }
     }
 }
 
 impl LeaderAuthority for WatchLeaderAuthority {
     fn route(&self) -> AuthorityRoute {
+        if self.pending_transitions.load(Ordering::Acquire) != 0 {
+            return AuthorityRoute::Unavailable;
+        }
         let state = self.receiver.borrow();
         if state.local {
             AuthorityRoute::Local(self.issuer.issue(state.generation))
@@ -73,6 +134,9 @@ impl LeaderAuthority for WatchLeaderAuthority {
     }
 
     fn validate(&self, permit: &AuthorityPermit) -> Result<(), AuthorityError> {
+        if self.pending_transitions.load(Ordering::Acquire) != 0 {
+            return Err(AuthorityError::StalePermit);
+        }
         let state = self.receiver.borrow();
         if !state.local {
             Err(AuthorityError::NotAuthoritative)
@@ -235,22 +299,24 @@ mod tests {
         let _coordination: fn(&dyn ControllerCoordination) = assert_coordination_object_safe;
     }
 
-    #[test]
-    fn watch_authority_rejects_stale_permits() {
+    #[tokio::test]
+    async fn watch_authority_rejects_stale_permits() {
         let (authority, publisher) = WatchLeaderAuthority::channel(true, None);
         let AuthorityRoute::Local(permit) = authority.route() else {
             panic!("expected local permit");
         };
         assert!(authority.validate(&permit).is_ok());
-        publisher.publish(false, Some("https://leader.example".to_string()));
+        publisher
+            .publish(false, Some("https://leader.example".to_string()))
+            .await;
         assert_eq!(
             authority.validate(&permit),
             Err(AuthorityError::NotAuthoritative)
         );
     }
 
-    #[test]
-    fn identical_authority_publication_preserves_live_permit() {
+    #[tokio::test]
+    async fn identical_authority_publication_preserves_live_permit() {
         let endpoint = Some("https://leader.example".to_string());
         let (authority, publisher) = WatchLeaderAuthority::channel(true, endpoint.clone());
         let AuthorityRoute::Local(permit) = authority.route() else {
@@ -259,7 +325,7 @@ mod tests {
         let mut revocation = authority.wait_for_revocation(&permit);
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
 
-        publisher.publish(true, endpoint);
+        publisher.publish(true, endpoint).await;
 
         assert!(
             authority.validate(&permit).is_ok(),
@@ -270,22 +336,26 @@ mod tests {
             "the long-lived watch permit must remain active after an identical observation"
         );
 
-        publisher.publish(true, Some("https://new-leader.example".to_string()));
+        publisher
+            .publish(true, Some("https://new-leader.example".to_string()))
+            .await;
         assert!(
             std::future::Future::poll(revocation.as_mut(), &mut context).is_ready(),
             "a real authority change must promptly revoke the old watch permit"
         );
     }
 
-    #[test]
-    fn changed_authority_endpoint_revokes_live_permit() {
+    #[tokio::test]
+    async fn changed_authority_endpoint_revokes_live_permit() {
         let (authority, publisher) =
             WatchLeaderAuthority::channel(true, Some("https://leader-a.example".to_string()));
         let AuthorityRoute::Local(permit) = authority.route() else {
             panic!("expected local permit");
         };
 
-        publisher.publish(true, Some("https://leader-b.example".to_string()));
+        publisher
+            .publish(true, Some("https://leader-b.example".to_string()))
+            .await;
 
         assert_eq!(
             authority.validate(&permit),

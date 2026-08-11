@@ -1349,4 +1349,208 @@ mod tests {
             Err(OutboxDeliveryError::ConflictTerminal(_))
         ));
     }
+
+    fn pod_status_command(uid: Option<&str>) -> StorageCommand {
+        StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "web".to_string(),
+            status: serde_json::json!({"phase": "Running"}),
+            expected_rv: None,
+            preconditions: ResourcePreconditions {
+                uid: uid.map(str::to_owned),
+                resource_version: None,
+            },
+            observed_status_stamp: Some(41),
+        }
+    }
+
+    #[test]
+    fn outbox_authorization_admits_operation_specific_worker_command() {
+        for operation in [
+            OutboxDeliveryOperation::PodStatus,
+            OutboxDeliveryOperation::RuntimeReconcile,
+            OutboxDeliveryOperation::ProbeReadiness,
+            OutboxDeliveryOperation::DeadlineExceeded,
+            OutboxDeliveryOperation::ContainerStatusSnapshot,
+            OutboxDeliveryOperation::EphemeralContainerStatuses,
+        ] {
+            authorize_outbox_command(operation, &pod_status_command(Some("pod-uid")), "worker-a")
+                .expect("UID-bound Pod status is authorized");
+        }
+
+        let pod_patch = StorageCommand::PatchResource {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "web".to_string(),
+            patch_kind: PatchKind::Merge,
+            patch: serde_json::json!({
+                "metadata": {
+                    "deletionTimestamp": "2026-07-18T00:00:00Z",
+                    "deletionGracePeriodSeconds": 0
+                }
+            }),
+            preconditions: ResourcePreconditions::uid("pod-uid"),
+            strict_resource_version: false,
+        };
+        authorize_outbox_command(OutboxDeliveryOperation::PodMetadata, &pod_patch, "worker-a")
+            .expect("UID-bound actor delete-mark patch is authorized");
+
+        let node_status = StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: "worker-a".to_string(),
+            status: serde_json::json!({"conditions": []}),
+            expected_rv: None,
+            preconditions: ResourcePreconditions::uid("node-uid"),
+            observed_status_stamp: None,
+        };
+        authorize_outbox_command(
+            OutboxDeliveryOperation::NodeStatus,
+            &node_status,
+            "worker-a",
+        )
+        .expect("a node may update its own UID-bound status");
+
+        let node_registration = StorageCommand::CreateResource {
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: "worker-a".to_string(),
+            data: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": "worker-a"}
+            }),
+        };
+        authorize_outbox_command(
+            OutboxDeliveryOperation::NodeRegistration,
+            &node_registration,
+            "worker-a",
+        )
+        .expect("a node may register only its own identity");
+
+        let event = StorageCommand::CreateResource {
+            api_version: "events.k8s.io/v1".to_string(),
+            kind: "Event".to_string(),
+            namespace: Some("default".to_string()),
+            name: "started.123".to_string(),
+            data: serde_json::json!({
+                "apiVersion": "events.k8s.io/v1",
+                "kind": "Event",
+                "metadata": {"namespace": "default", "name": "started.123"},
+                "reportingInstance": "worker-a"
+            }),
+        };
+        authorize_outbox_command(OutboxDeliveryOperation::EventCreate, &event, "worker-a")
+            .expect("a node may create only an Event attributed to itself");
+    }
+
+    #[test]
+    fn pod_metadata_authorization_rejects_unfocused_commands() {
+        let rejected = [
+            StorageCommand::UpdateResource {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: "web".to_string(),
+                data: serde_json::json!({"apiVersion": "v1", "kind": "Pod"}),
+                expected_rv: 7,
+                preconditions: ResourcePreconditions::uid_and_resource_version("pod-uid", 7),
+            },
+            StorageCommand::PatchResource {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: "web".to_string(),
+                patch_kind: PatchKind::Merge,
+                patch: serde_json::json!({"spec": {"nodeName": "worker-b"}}),
+                preconditions: ResourcePreconditions::uid_and_resource_version("pod-uid", 7),
+                strict_resource_version: true,
+            },
+            StorageCommand::DeleteResource {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: "web".to_string(),
+                preconditions: ResourcePreconditions::uid_and_resource_version("pod-uid", 7),
+            },
+        ];
+        for command in rejected {
+            assert!(
+                matches!(
+                    authorize_outbox_command(
+                        OutboxDeliveryOperation::PodMetadata,
+                        &command,
+                        "worker-a"
+                    ),
+                    Err(OutboxDeliveryError::ConflictTerminal(_))
+                ),
+                "unfocused Pod mutation must be terminally rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pod_metadata_authorization_accepts_structural_finalize() {
+        let pod = klights_cluster_core::Resource::try_from_data(Arc::new(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "web",
+                "namespace": "default",
+                "uid": "pod-uid",
+                "resourceVersion": "17"
+            },
+            "spec": {"nodeName": "worker-a"}
+        })))
+        .expect("bound Pod resource");
+        let query = Arc::new(FixedResourceQuery {
+            resource: pod,
+            gets: AtomicUsize::new(0),
+        });
+        let service = EmbeddedOutboxDelivery::new(
+            Arc::new(FixedProposal {
+                result: command_result(Some(18), None, None, None),
+            }),
+            query,
+            tokio::sync::watch::channel(true).1,
+        );
+        let command = StorageCommand::FinalizeBoundPod {
+            namespace: "default".to_string(),
+            name: "web".to_string(),
+            pod_uid: "pod-uid".to_string(),
+            node_name: "worker-a".to_string(),
+            observed_resource_version: 7,
+        };
+        let authorized = service
+            .authorize_live_pod_metadata(command, "worker-a")
+            .await
+            .expect("structurally valid finalize is authorized");
+        assert!(matches!(
+            authorized,
+            StorageCommand::FinalizeBoundPod {
+                observed_resource_version: 17,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn finalize_bound_pod_subject_is_uid_scoped() {
+        let command = StorageCommand::FinalizeBoundPod {
+            namespace: "team-a".to_string(),
+            name: "web-0".to_string(),
+            pod_uid: "uid-web-0".to_string(),
+            node_name: "worker-a".to_string(),
+            observed_resource_version: 41,
+        };
+        assert_eq!(
+            klights_cluster_core::subject_key_for_command(&command),
+            "v1/Pod/team-a/web-0/uid-web-0"
+        );
+    }
 }

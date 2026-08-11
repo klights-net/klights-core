@@ -82,6 +82,8 @@ pub(crate) struct PodRepositoryBuildConfig {
     pub(crate) scheduler_bind_gate: Option<
         Arc<crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest>,
     >,
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    pub(crate) post_write_maintenance_notify: Option<Arc<tokio::sync::Notify>>,
     #[cfg(not(test))]
     pub gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
 }
@@ -107,6 +109,8 @@ pub(crate) struct PodRepositoryRuntimeDependencies {
     pub supervisor: Arc<TaskSupervisor>,
     pub metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
     pub wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    pub post_write_maintenance_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 pub(crate) struct PodRepositoryCoreDependencies {
@@ -1168,6 +1172,8 @@ pub(crate) struct RootPodStatusWriterAdapter {
     mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     supervisor: Arc<TaskSupervisor>,
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    post_write_maintenance_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl RootPodStatusWriterAdapter {
@@ -1179,7 +1185,9 @@ impl RootPodStatusWriterAdapter {
     async fn spawn_post_write_maintenance(&self, namespace: &str) {
         let namespace_termination = self.namespace_termination.clone();
         let ns = namespace.to_string();
-        let _ = self
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        let completion = self.post_write_maintenance_notify.clone();
+        let spawn_result = self
             .supervisor
             .spawn_async(
                 klights_supervisor::TaskCategory::Background,
@@ -1200,9 +1208,21 @@ impl RootPodStatusWriterAdapter {
                             "post-write namespace termination reconcile failed"
                         );
                     }
+                    #[cfg(any(test, feature = "pod-repository-test-support"))]
+                    if let Some(completion) = completion {
+                        completion.notify_one();
+                    }
                 },
             )
             .await;
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        if spawn_result.is_err()
+            && let Some(completion) = self.post_write_maintenance_notify.as_ref()
+        {
+            completion.notify_one();
+        }
+        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+        let _ = spawn_result;
     }
 
     async fn finish_status_write(
@@ -1765,6 +1785,8 @@ fn build_pod_repository_parts_inner(
         api_identity,
         #[cfg(any(test, feature = "pod-repository-test-support"))]
         scheduler_bind_gate,
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        post_write_maintenance_notify,
         #[cfg(not(test))]
         gc_coordination,
     } = config;
@@ -1886,6 +1908,8 @@ fn build_pod_repository_parts_inner(
             supervisor,
             metrics: metrics.clone(),
             wall_clock,
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            post_write_maintenance_notify,
         },
         PodRepositoryNetworkDependencies {
             assignment_query,
@@ -1976,6 +2000,8 @@ pub(crate) fn build_worker_pod_repository_parts(
             supervisor: config.supervisor,
             metrics: config.metrics,
             wall_clock,
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            post_write_maintenance_notify: None,
         },
         PodRepositoryNetworkDependencies {
             assignment_query,
@@ -2023,6 +2049,8 @@ fn assemble_pod_services(
         supervisor,
         metrics,
         wall_clock,
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        post_write_maintenance_notify,
     } = runtime;
     let PodRepositoryNetworkDependencies {
         assignment_query,
@@ -2107,6 +2135,8 @@ fn assemble_pod_services(
         mutation_reconcile: mutation_reconcile.clone(),
         namespace_termination: namespace_termination.clone(),
         supervisor: supervisor.clone(),
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        post_write_maintenance_notify,
     });
     let background = PodRepositoryBackground::new(workqueue.clone());
     #[cfg(any(test, feature = "pod-repository-test-support"))]

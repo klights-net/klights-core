@@ -1,18 +1,29 @@
 use super::*;
 use crate::control_plane::client::local::LocalApiClient;
-use crate::datastore::{NetworkMetadataStore, Resource, ResourceListStore, ResourceStore};
+use crate::datastore::Resource;
+use async_trait::async_trait;
+use klights_cluster_core::WatchReplayPosition;
+use klights_kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use klights_kubelet::pod_lifecycle_router::{
     PodLifecycleDiagnostics, PodLifecycleRouteBackend, PodLifecycleRouteError,
-    PodLifecycleRouteMode,
+    PodLifecycleRouteMode, PodLifecycleRouter,
 };
+use klights_kubelet::worker_store::reflector::ReflectorState;
+use klights_kubelet::worker_store::watch::is_watch_window_expired;
+use klights_kubelet::worker_store::{WorkerListPage, WorkerStoreAdapter};
 use klights_leader_api::{
     CacheReadinessFuture, CacheReadinessRequest, LeaderCacheReadiness, LeaderResourceQuery,
-    LeaderWatch, LeaderWatchFuture, ResourceEvent, ResourceListResult, ResourceQueryFuture,
-    WatchEventType, WatchStream,
+    LeaderWatch, LeaderWatchError, LeaderWatchFuture, ResourceEvent, ResourceGetRequest,
+    ResourceListResult, ResourceQueryConsistency, ResourceQueryFuture, WatchEventType,
+    WatchRequest, WatchStream,
 };
 use klights_node_store::OutboxClaimRequest;
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
-use std::sync::atomic::AtomicUsize;
+use klights_watch::{EventType, WatchEvent, WatchTarget, WatchTopic};
+use serde_json::Value;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn worker_pod_watch_request() -> WatchRequest {
     WatchRequest::try_new(
@@ -27,120 +38,49 @@ fn worker_pod_watch_request() -> WatchRequest {
     .expect("valid worker Pod watch")
 }
 
-#[test]
-fn worker_replay_position_filter_matches_shared_position_semantics() {
-    struct Case {
-        name: &'static str,
-        position: WatchReplayPosition,
-        event_id: i64,
-        resource_version: Option<i64>,
-        expected: bool,
-    }
-
-    let cases = [
-        Case {
-            name: "scalar filters older rv",
-            position: WatchReplayPosition::from_resource_version(50),
-            event_id: 11,
-            resource_version: Some(40),
-            expected: false,
-        },
-        Case {
-            name: "scalar includes newer rv",
-            position: WatchReplayPosition::from_resource_version(50),
-            event_id: 11,
-            resource_version: Some(51),
-            expected: true,
-        },
-        Case {
-            name: "exact includes later lower rv",
-            position: WatchReplayPosition {
-                resource_version: 50,
-                event_id: 10,
-                resource_version_filter_through_event_id: 0,
-            },
-            event_id: 11,
-            resource_version: Some(40),
-            expected: true,
-        },
-        Case {
-            name: "composite filters lower rv through anchor",
-            position: WatchReplayPosition::from_resource_version_through_event_id(50, 12),
-            event_id: 11,
-            resource_version: Some(40),
-            expected: false,
-        },
-        Case {
-            name: "composite includes lower rv after anchor",
-            position: WatchReplayPosition::from_resource_version_through_event_id(50, 12),
-            event_id: 13,
-            resource_version: Some(40),
-            expected: true,
-        },
-        Case {
-            name: "missing rv fails closed",
-            position: WatchReplayPosition::default(),
-            event_id: 1,
-            resource_version: None,
-            expected: false,
-        },
-    ];
-
-    for case in cases {
-        let event = WatchEvent {
-            event_type: EventType::Modified,
-            object: Arc::new(serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "ConfigMap",
-                "metadata": {
-                    "namespace": "default",
-                    "name": case.name,
-                    "resourceVersion": case.resource_version.map(|rv| rv.to_string()),
-                }
-            })),
-            encoded_payload: None,
-        };
-        assert_eq!(
-            worker_replay_event_follows_position(case.position, case.event_id, &event),
-            case.expected,
-            "{}",
-            case.name
-        );
-    }
+async fn worker_replay_since_checked_bounded(
+    adapter: &WorkerStoreAdapter,
+    targets: &[WatchTarget],
+    resource_version: i64,
+    limit: NonZeroUsize,
+) -> anyhow::Result<crate::datastore::WatchReplayRead> {
+    let read = adapter.list_watch_events_after_position_checked_bounded(
+        targets,
+        WatchReplayPosition::from_resource_version(resource_version),
+        limit,
+    );
+    Ok(match read {
+        klights_watch::PositionedWatchReplayRead::Expired => {
+            crate::datastore::WatchReplayRead::Expired
+        }
+        klights_watch::PositionedWatchReplayRead::Events(replay) => {
+            crate::datastore::WatchReplayRead::Events(
+                replay
+                    .events
+                    .into_iter()
+                    .map(|positioned| crate::datastore::CatchUpResource {
+                        resource: positioned.event.resource,
+                        event_type: std::borrow::Cow::Owned(positioned.event.event_type),
+                    })
+                    .collect(),
+            )
+        }
+    })
 }
 
-#[test]
-fn worker_retention_boundary_keeps_newer_position_available() {
-    let topic = WatchTopic::new("v1", "ConfigMap");
-    let mut history = WorkerWatchHistory::default();
-    ReplayRetentionBoundary::retain_exact(
-        history
-            .floors
-            .entry((topic.clone(), Some("default".into())))
-            .or_default(),
-        WatchReplayPosition {
-            resource_version: 10,
-            event_id: 40,
-            resource_version_filter_through_event_id: 0,
-        },
-    );
-    let target = WatchTarget {
-        api_version: "v1".into(),
-        kind: "ConfigMap".into(),
-        scope: WatchTargetScope::Namespaced(Some("default".into())),
-    };
-
-    assert_eq!(
-        ReplayRetentionBoundary::classify_all(
-            worker_replay_boundaries(&history, &target),
-            WatchReplayPosition {
-                resource_version: 10,
-                event_id: 40,
-                resource_version_filter_through_event_id: 0,
-            },
-        ),
-        ReplayAvailability::Available
-    );
+fn worker_replay_since(
+    adapter: &WorkerStoreAdapter,
+    targets: &[WatchTarget],
+    resource_version: i64,
+) -> Vec<crate::datastore::CatchUpResource> {
+    adapter
+        .list_watch_events_since(targets, resource_version)
+        .into_iter()
+        .map(|event| crate::datastore::CatchUpResource {
+            resource: event.resource,
+            event_type: std::borrow::Cow::Owned(event.event_type),
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -148,7 +88,7 @@ async fn network_metadata_surfaces_forward_through_focused_leader_ports() {
     let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
-    let dataplane = klights_cluster_store::DataplanePeerMetadata::try_new(
+    let stored_dataplane = klights_cluster_store::DataplanePeerMetadata::try_new(
         "worker-b".to_string(),
         klights_cluster_store::DataplaneMode::Root,
         klights_cluster_store::DataplaneEncryption::Disabled,
@@ -158,7 +98,7 @@ async fn network_metadata_surfaces_forward_through_focused_leader_ports() {
     )
     .expect("valid direct-route dataplane metadata");
     cluster_db
-        .update_node_dataplane(dataplane.clone())
+        .update_node_dataplane(stored_dataplane.clone())
         .await
         .expect("seed leader dataplane metadata");
     let cluster_api = Arc::new(LocalApiClient::new(
@@ -178,64 +118,59 @@ async fn network_metadata_surfaces_forward_through_focused_leader_ports() {
     .expect("open node-local");
     let adapter = WorkerStoreAdapter::new(cluster_api, "worker-a".to_string());
 
-    let worker_a = NetworkMetadataStore::allocate_node_subnet(
-        &adapter,
-        "worker-a",
-        "10.77.0.0/16",
-        "192.0.2.10",
-    )
-    .await
-    .expect("allocate through focused network metadata surface");
-    let worker_b = crate::datastore::NetworkMetadataStore::allocate_node_subnet(
-        &adapter,
-        "worker-b",
-        "10.77.0.0/16",
-        "192.0.2.11",
-    )
-    .await
-    .expect("allocate through focused datastore surface");
+    let worker_a = adapter
+        .allocate_node_subnet("worker-a", "10.77.0.0/16", "192.0.2.10")
+        .await
+        .expect("allocate through focused network metadata surface");
+    let worker_b = adapter
+        .allocate_node_subnet("worker-b", "10.77.0.0/16", "192.0.2.11")
+        .await
+        .expect("allocate through focused datastore surface");
 
     assert_eq!(
-        crate::datastore::NetworkMetadataStore::get_node_subnet(&adapter, "worker-a")
+        adapter
+            .get_node_subnet("worker-a")
             .await
             .expect("query focused surface"),
         Some(worker_a.clone())
     );
     assert_eq!(
-        NetworkMetadataStore::get_node_subnet(&adapter, "worker-b")
+        adapter
+            .get_node_subnet("worker-b")
             .await
             .expect("query focused surface"),
         Some(worker_b.clone())
     );
     assert_eq!(
-        NetworkMetadataStore::list_peer_subnets(
-            &adapter,
-            klights_cluster_store::PeerTopologyRequest::excluding("worker-a").unwrap(),
-        )
-        .await
-        .expect("list focused peers"),
+        adapter
+            .list_peer_subnets("worker-a")
+            .await
+            .expect("list focused peers"),
         vec![worker_b]
     );
     assert_eq!(
-        crate::datastore::NetworkMetadataStore::list_peer_subnets(
-            &adapter,
-            klights_cluster_store::PeerTopologyRequest::excluding("worker-b").unwrap(),
-        )
-        .await
-        .expect("list focused peers"),
+        adapter
+            .list_peer_subnets("worker-b")
+            .await
+            .expect("list focused peers"),
         vec![worker_a]
     );
     assert_eq!(
-        NetworkMetadataStore::get_node_dataplane(&adapter, "worker-b")
+        adapter
+            .get_node_dataplane("worker-b")
             .await
             .expect("query focused dataplane"),
-        Some(dataplane.clone())
-    );
-    assert_eq!(
-        crate::datastore::NetworkMetadataStore::get_node_dataplane(&adapter, "worker-b")
-            .await
-            .expect("query focused dataplane"),
-        Some(dataplane)
+        Some(
+            klights_leader_api::NetworkDataplane::try_new(
+                "worker-b",
+                klights_leader_api::NetworkNodeMode::Root,
+                klights_leader_api::DataplaneEncryption::Direct,
+                None,
+                "192.0.2.11".parse().expect("valid endpoint"),
+                None,
+            )
+            .expect("valid focused dataplane metadata"),
+        )
     );
 }
 
@@ -355,7 +290,7 @@ async fn failed_local_pod_route_is_not_published_by_worker_mirror() {
         "a Pod event whose lifecycle route failed must not be locally published"
     );
     assert_eq!(
-        adapter.current_rv.load(Ordering::Acquire),
+        adapter.current_resource_version().await,
         0,
         "a failed route must not advance worker mirror state"
     );
@@ -411,28 +346,25 @@ async fn failed_snapshot_pod_route_retries_without_committing_reflector_or_membe
     )));
     let req = worker_pod_watch_request();
     let mut state = ReflectorState::default();
-    let mut membership = adapter.transition_projectors.projector(&req).unwrap();
+    let mut membership = adapter.transition_projector_for_test(&req).unwrap();
     let mut watch = adapter.watch_topic(WatchTopic::new("v1", "Pod"));
 
     let first = adapter
-        .reconcile_watch_snapshot(&req, &mut state, membership.as_mut())
+        .reconcile_watch_snapshot_for_test(&req, &mut state, membership.as_mut())
         .await;
     assert!(
         first.is_err(),
         "the initial snapshot route failure must propagate"
     );
-    assert!(
-        state.resources.is_empty(),
-        "reflector state must remain uncommitted"
-    );
-    assert_eq!(adapter.current_rv.load(Ordering::Acquire), 0);
+    assert!(state.is_empty(), "reflector state must remain uncommitted");
+    assert_eq!(adapter.current_resource_version().await, 0);
     assert!(
         watch.try_recv().is_err(),
         "failed snapshot must not publish"
     );
 
     adapter
-        .reconcile_watch_snapshot(&req, &mut state, membership.as_mut())
+        .reconcile_watch_snapshot_for_test(&req, &mut state, membership.as_mut())
         .await
         .expect("the same snapshot must replay after the route recovers");
     let replayed = watch.try_recv().expect("replayed snapshot event");
@@ -444,7 +376,7 @@ async fn failed_snapshot_pod_route_retries_without_committing_reflector_or_membe
             .and_then(Value::as_str),
         Some("snapshot-replay")
     );
-    assert_eq!(state.resources.len(), 1);
+    assert_eq!(state.len(), 1);
     assert_eq!(
         backend.route_attempts(),
         2,
@@ -475,150 +407,6 @@ fn is_watch_window_expired_requires_typed_replay_expiry() {
             "{name} must not trigger a relist"
         );
     }
-}
-
-fn reflected_resource(name: &str, uid: &str, rv: i64) -> Resource {
-    Resource {
-        id: rv,
-        api_version: "v1".to_string(),
-        kind: "ConfigMap".to_string(),
-        namespace: Some("default".to_string()),
-        name: name.to_string(),
-        uid: uid.to_string(),
-        resource_version: rv,
-        data: Arc::new(serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": {
-                "namespace": "default",
-                "name": name,
-                "uid": uid,
-                "resourceVersion": rv.to_string()
-            }
-        })),
-    }
-}
-
-#[test]
-fn reflector_relist_diff_synthesizes_missed_delete_at_snapshot_rv() {
-    let mut state = ReflectorState::default();
-    let initial = state.replace_snapshot(vec![reflected_resource("removed", "uid-1", 41)], 41);
-    assert_eq!(initial.len(), 1);
-    assert_eq!(initial[0].event_type, EventType::Added);
-
-    let replacement = state.replace_snapshot(Vec::new(), 52);
-    assert_eq!(replacement.len(), 1);
-    assert_eq!(replacement[0].event_type, EventType::Deleted);
-    assert_eq!(replacement[0].resource_version(), Some(52));
-    assert_eq!(
-        replacement[0]
-            .object
-            .pointer("/metadata/name")
-            .and_then(Value::as_str),
-        Some("removed")
-    );
-}
-
-#[test]
-fn reflector_snapshot_keeps_distinct_objects_with_the_same_rv() {
-    let mut state = ReflectorState::default();
-    let events = state.replace_snapshot(
-        vec![
-            reflected_resource("first", "uid-first", 41),
-            reflected_resource("second", "uid-second", 41),
-        ],
-        41,
-    );
-
-    assert_eq!(events.len(), 2);
-    assert_eq!(
-        events
-            .iter()
-            .map(|event| event
-                .object
-                .pointer("/metadata/name")
-                .and_then(Value::as_str)
-                .unwrap())
-            .collect::<std::collections::HashSet<_>>(),
-        std::collections::HashSet::from(["first", "second"])
-    );
-}
-
-#[test]
-fn reflector_snapshot_diff_order_is_stable_by_resource_key() {
-    let mut state = ReflectorState::default();
-    let names = [
-        "hotel", "alpha", "golf", "bravo", "foxtrot", "charlie", "echo", "delta",
-    ];
-    let events = state.replace_snapshot(
-        names
-            .iter()
-            .map(|name| reflected_resource(name, &format!("uid-{name}"), 41))
-            .collect(),
-        41,
-    );
-
-    assert_eq!(
-        events
-            .iter()
-            .map(|event| event.object["metadata"]["name"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        vec![
-            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"
-        ],
-        "authoritative relist diffs must be deterministic for replay and tests"
-    );
-}
-
-#[test]
-fn reflector_relist_replaces_same_name_uid_with_delete_then_add() {
-    let mut state = ReflectorState::default();
-    state.replace_snapshot(vec![reflected_resource("same-name", "uid-old", 41)], 41);
-
-    let replacement =
-        state.replace_snapshot(vec![reflected_resource("same-name", "uid-new", 52)], 52);
-
-    assert_eq!(
-        replacement
-            .iter()
-            .map(|event| event.event_type)
-            .collect::<Vec<_>>(),
-        vec![EventType::Deleted, EventType::Added]
-    );
-    assert_eq!(
-        replacement[0]
-            .object
-            .pointer("/metadata/uid")
-            .and_then(Value::as_str),
-        Some("uid-old")
-    );
-    assert_eq!(
-        replacement[1]
-            .object
-            .pointer("/metadata/uid")
-            .and_then(Value::as_str),
-        Some("uid-new")
-    );
-}
-
-#[test]
-fn reflector_relist_marks_same_uid_changes_modified_and_ignores_unchanged_objects() {
-    let mut state = ReflectorState::default();
-    let initial = reflected_resource("updated", "uid-stable", 41);
-    state.replace_snapshot(vec![initial.clone()], 41);
-
-    assert!(state.replace_snapshot(vec![initial], 41).is_empty());
-
-    let mut updated = reflected_resource("updated", "uid-stable", 52);
-    Arc::make_mut(&mut updated.data)
-        .as_object_mut()
-        .unwrap()
-        .insert("data".to_string(), serde_json::json!({"key": "new"}));
-    let events = state.replace_snapshot(vec![updated], 52);
-
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].event_type, EventType::Modified);
-    assert_eq!(events[0].resource_version(), Some(52));
 }
 
 #[derive(Default)]
@@ -802,7 +590,11 @@ async fn failed_pod_route_reconnects_and_replays_from_prior_exact_position() {
             "worker_store_route_replay_position_test",
             async move {
                 driver_adapter
-                    .run_watch_mirror(worker_pod_watch_request(), driver_supervisor, driver_cancel)
+                    .run_watch_mirror_for_test(
+                        worker_pod_watch_request(),
+                        driver_supervisor,
+                        driver_cancel,
+                    )
                     .await;
             },
         )
@@ -1035,7 +827,7 @@ async fn worker_store_pod_events_use_fresh_namespace_state_before_outbox_enqueue
     });
 
     let query = crate::bootstrap::composition_adapters::pod_event_adapter::LeaderPodEventQuery::new(
-        adapter.resource_query.as_ref(),
+        adapter.resource_query_for_test(),
     );
     klights_kubelet::pod_events::emit_worker_pod_event(
         &query,
@@ -1085,13 +877,13 @@ async fn worker_pod_lists_are_constrained_to_local_node() {
     let adapter = WorkerStoreAdapter::new(Arc::new(HandoffLeaderApi), "worker-a".to_string());
 
     let list = adapter
-        .list_resources_page(
+        .list_resources(
             "v1",
             "Pod",
             Some("default"),
             None,
             None,
-            ListPageRequest::unbounded(),
+            WorkerListPage::unbounded(),
         )
         .await
         .expect("list local pods");
@@ -1144,13 +936,16 @@ async fn worker_list_page_preserves_continuation_metadata() {
     let adapter = WorkerStoreAdapter::new(cluster_api, "worker-a".to_string());
 
     let first = adapter
-        .list_resources_page(
+        .list_resources(
             "v1",
             "ConfigMap",
             Some("default"),
             None,
             None,
-            ListPageRequest::try_new(Some(2), None).expect("page request"),
+            WorkerListPage {
+                limit: Some(2),
+                continue_token: None,
+            },
         )
         .await
         .expect("list first page");
@@ -1170,13 +965,16 @@ async fn worker_list_page_preserves_continuation_metadata() {
     assert_eq!(first.remaining_item_count, Some(1));
 
     let second = adapter
-        .list_resources_page(
+        .list_resources(
             "v1",
             "ConfigMap",
             Some("default"),
             None,
             None,
-            ListPageRequest::try_new(Some(2), first.continue_token.clone()).expect("page request"),
+            WorkerListPage {
+                limit: Some(2),
+                continue_token: first.continue_token.clone(),
+            },
         )
         .await
         .expect("list second page");
@@ -1232,7 +1030,7 @@ async fn worker_watch_replay_respects_resume_resource_version() {
     .expect("open node-local");
     let adapter = WorkerStoreAdapter::new(cluster_api, "worker-a".to_string());
     for (index, name) in ["cm-a", "cm-b", "cm-c"].into_iter().enumerate() {
-        adapter.publish_watch(WatchEvent::added(serde_json::json!({
+        adapter.publish_watch_for_test(WatchEvent::added(serde_json::json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
             "metadata": {
@@ -1250,11 +1048,9 @@ async fn worker_watch_replay_respects_resume_resource_version() {
     )];
     let limit = std::num::NonZeroUsize::new(3).expect("non-zero limit");
 
-    let first = crate::datastore::WatchStore::list_watch_events_since_checked_bounded(
-        &adapter, &targets, 0, limit,
-    )
-    .await
-    .expect("initial watch replay");
+    let first = worker_replay_since_checked_bounded(&adapter, &targets, 0, limit)
+        .await
+        .expect("initial watch replay");
     let crate::datastore::WatchReplayRead::Events(first_events) = first else {
         panic!("worker adapter replay should not expire");
     };
@@ -1265,11 +1061,9 @@ async fn worker_watch_replay_respects_resume_resource_version() {
         .max()
         .expect("initial replay should have a max rv");
 
-    let second = crate::datastore::WatchStore::list_watch_events_since_checked_bounded(
-        &adapter, &targets, max_rv, limit,
-    )
-    .await
-    .expect("resumed watch replay");
+    let second = worker_replay_since_checked_bounded(&adapter, &targets, max_rv, limit)
+        .await
+        .expect("resumed watch replay");
     let crate::datastore::WatchReplayRead::Events(second_events) = second else {
         panic!("worker adapter replay should not expire");
     };
@@ -1318,7 +1112,7 @@ async fn worker_scalar_watch_replay_never_synthesizes_events_from_live_list_stat
     .expect("open node-local");
     let adapter = WorkerStoreAdapter::new(cluster_api, "worker-a".to_string());
 
-    let replay = crate::datastore::WatchStore::list_watch_events_since(
+    let replay = worker_replay_since(
         &adapter,
         &[WatchTarget::namespaced_in_namespace(
             "v1",
@@ -1326,9 +1120,7 @@ async fn worker_scalar_watch_replay_never_synthesizes_events_from_live_list_stat
             "default",
         )],
         0,
-    )
-    .await
-    .expect("scalar replay");
+    );
 
     assert!(
         replay.is_empty(),
@@ -1376,15 +1168,15 @@ async fn worker_watch_replay_preserves_mirrored_delete_events() {
             "data": {"data-1": "value-1"}
         }),
     );
-    adapter.publish_watch(
+    adapter.publish_watch_for_test(
         crate::datastore::staged_test_event(&pending).expect("staged test watch event"),
     );
 
-    let replay = crate::datastore::WatchStore::list_watch_events_since_checked_bounded(
+    let replay = worker_replay_since_checked_bounded(
         &adapter,
         &[WatchTarget::namespaced("v1", "ConfigMap")],
         0,
-        std::num::NonZeroUsize::new(8).expect("non-zero limit"),
+        NonZeroUsize::new(8).expect("non-zero limit"),
     )
     .await
     .expect("watch replay should succeed");
@@ -1452,15 +1244,13 @@ async fn worker_watch_replay_marks_resumed_bound_pod_snapshot_changes_modified()
     let mut created_event = (*created.data).clone();
     created_event["metadata"]["resourceVersion"] =
         serde_json::json!(created.resource_version.to_string());
-    adapter.publish_watch(WatchEvent::added(created_event));
+    adapter.publish_watch_for_test(WatchEvent::added(created_event));
     let targets = [WatchTarget::namespaced_in_namespace("v1", "Pod", "default")];
     let limit = std::num::NonZeroUsize::new(4).expect("non-zero limit");
 
-    let first = crate::datastore::WatchStore::list_watch_events_since_checked_bounded(
-        &adapter, &targets, 0, limit,
-    )
-    .await
-    .expect("initial watch replay");
+    let first = worker_replay_since_checked_bounded(&adapter, &targets, 0, limit)
+        .await
+        .expect("initial watch replay");
     let crate::datastore::WatchReplayRead::Events(first_events) = first else {
         panic!("worker adapter replay should not expire");
     };
@@ -1497,16 +1287,12 @@ async fn worker_watch_replay_marks_resumed_bound_pod_snapshot_changes_modified()
     let mut updated_event = (*updated.data).clone();
     updated_event["metadata"]["resourceVersion"] =
         serde_json::json!(updated.resource_version.to_string());
-    adapter.publish_watch(WatchEvent::modified(updated_event));
+    adapter.publish_watch_for_test(WatchEvent::modified(updated_event));
 
-    let resumed = crate::datastore::WatchStore::list_watch_events_since_checked_bounded(
-        &adapter,
-        &targets,
-        created.resource_version,
-        limit,
-    )
-    .await
-    .expect("resumed watch replay");
+    let resumed =
+        worker_replay_since_checked_bounded(&adapter, &targets, created.resource_version, limit)
+            .await
+            .expect("resumed watch replay");
     let crate::datastore::WatchReplayRead::Events(resumed_events) = resumed else {
         panic!("worker adapter replay should not expire");
     };
@@ -1859,7 +1645,11 @@ async fn watch_mirror_unmarked_out_of_range_reconnects_without_relist() {
             "worker_store_watch_unmarked_out_of_range_test",
             async move {
                 driver_adapter
-                    .run_watch_mirror(worker_pod_watch_request(), driver_supervisor, driver_cancel)
+                    .run_watch_mirror_for_test(
+                        worker_pod_watch_request(),
+                        driver_supervisor,
+                        driver_cancel,
+                    )
                     .await;
             },
         )
@@ -1910,7 +1700,11 @@ async fn watch_mirror_repeated_expiry_backs_off_before_next_relist() {
             "worker_store_watch_repeated_expiry_test",
             async move {
                 driver_adapter
-                    .run_watch_mirror(worker_pod_watch_request(), driver_supervisor, driver_cancel)
+                    .run_watch_mirror_for_test(
+                        worker_pod_watch_request(),
+                        driver_supervisor,
+                        driver_cancel,
+                    )
                     .await;
             },
         )

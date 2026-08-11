@@ -23,10 +23,11 @@ use klights_leader_api::{
 };
 use std::sync::Arc;
 use tokio::sync::OnceCell;
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use tokio::sync::watch;
 
 use crate::control_plane::client::{
-    focused_dataplane, focused_node_subnet, query_error, query_list_result,
+    AuthorityHandle, focused_dataplane, focused_node_subnet, query_error, query_list_result,
 };
 use crate::datastore::{DatastoreHandle, Resource};
 use async_trait::async_trait;
@@ -39,7 +40,7 @@ use klights_controllers::ControllerDispatcher;
 #[cfg(test)]
 use klights_kubelet::node_outbox::payload::OutboxOperationExt as _;
 use klights_kubelet::pod_repository::store::PodStore;
-use klights_replication::proposal::RaftProposal;
+use klights_replication::{authority::AuthoritySigningFence, proposal::RaftProposal};
 
 pub(crate) fn ensure_mark_delete_timestamps(
     data: &mut serde_json::Value,
@@ -172,28 +173,30 @@ pub(crate) struct LocalApiPersistencePorts {
 /// without a dependency cycle through `LocalApiClient`.
 pub(crate) struct ClusterStoreLeaderResourceQuery {
     db: DatastoreHandle,
-    is_leader_rx: watch::Receiver<bool>,
+    authority: AuthorityHandle,
 }
 
 impl ClusterStoreLeaderResourceQuery {
-    pub(crate) fn new(db: DatastoreHandle, is_leader_rx: watch::Receiver<bool>) -> Self {
-        Self { db, is_leader_rx }
+    pub(crate) fn new<A: Into<AuthorityHandle>>(db: DatastoreHandle, authority: A) -> Self {
+        Self {
+            db,
+            authority: authority.into(),
+        }
     }
 
     fn sample_leader_fresh(
         &self,
         consistency: ResourceQueryConsistency,
-    ) -> Result<Option<watch::Receiver<bool>>, klights_leader_api::ResourceQueryError> {
+    ) -> Result<Option<klights_leader_api::AuthorityPermit>, klights_leader_api::ResourceQueryError>
+    {
         if consistency != ResourceQueryConsistency::LeaderFresh {
             return Ok(None);
         }
-        let mut receiver = self.is_leader_rx.clone();
-        if !*receiver.borrow_and_update() {
-            return Err(klights_leader_api::ResourceQueryError::retryable(
-                "leader-fresh resource query reached a non-leader local store",
-            ));
-        }
-        Ok(Some(receiver))
+        self.authority.local_permit().map(Some).map_err(|_| {
+            klights_leader_api::ResourceQueryError::retryable(
+                "leader-fresh resource query reached a non-authoritative local store",
+            )
+        })
     }
 }
 
@@ -217,10 +220,10 @@ impl LeaderResourceQuery for ClusterStoreLeaderResourceQuery {
                 .map_err(query_error)?;
             if leadership
                 .as_ref()
-                .is_some_and(|receiver| receiver.has_changed().unwrap_or(true))
+                .is_some_and(|permit| self.authority.validate(permit).is_err())
             {
                 return Err(klights_leader_api::ResourceQueryError::retryable(
-                    "leadership changed during local leader-fresh resource query",
+                    "leader authority changed during local leader-fresh resource query",
                 ));
             }
             Ok(resource)
@@ -250,10 +253,10 @@ impl LeaderResourceQuery for ClusterStoreLeaderResourceQuery {
                 .map_err(query_error)?;
             if leadership
                 .as_ref()
-                .is_some_and(|receiver| receiver.has_changed().unwrap_or(true))
+                .is_some_and(|permit| self.authority.validate(permit).is_err())
             {
                 return Err(klights_leader_api::ResourceQueryError::retryable(
-                    "leadership changed during local leader-fresh resource query",
+                    "leader authority changed during local leader-fresh resource query",
                 ));
             }
             query_list_result(list)
@@ -264,28 +267,27 @@ impl LeaderResourceQuery for ClusterStoreLeaderResourceQuery {
 pub(crate) struct ClusterStoreLeaderNetwork {
     db: DatastoreHandle,
     proposal: Arc<dyn RaftProposal>,
-    is_leader_rx: watch::Receiver<bool>,
+    authority: AuthorityHandle,
 }
 
 impl ClusterStoreLeaderNetwork {
-    pub(crate) fn new(
+    pub(crate) fn new<A: Into<AuthorityHandle>>(
         db: DatastoreHandle,
         proposal: Arc<dyn RaftProposal>,
-        is_leader_rx: watch::Receiver<bool>,
+        authority: A,
     ) -> Self {
         Self {
             db,
             proposal,
-            is_leader_rx,
+            authority: authority.into(),
         }
     }
 
     fn require_leader(&self) -> Result<(), NetworkTopologyError> {
-        if *self.is_leader_rx.borrow() {
-            Ok(())
-        } else {
-            Err(NetworkTopologyError::NotLeader)
-        }
+        self.authority
+            .local_permit()
+            .map(|_| ())
+            .map_err(|_| NetworkTopologyError::NotLeader)
     }
 
     pub(crate) async fn update_node_peer_attributes(
@@ -475,7 +477,7 @@ impl LocalApiPersistencePorts {
     }
 }
 
-/// T6 step 1: builds a `watch::Receiver<bool>` that is permanently true.
+/// Test-only compatibility input that starts with local authority.
 ///
 /// Use cases:
 /// - Tests that exercise leader-only write paths (the only role they
@@ -488,6 +490,7 @@ impl LocalApiPersistencePorts {
 /// it must subscribe to the bootstrap's real `is_leader_tx` watch so the
 /// gate tracks live raft state. A source guard added in T6 step 5 will
 /// enforce that.
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 pub fn always_leader_watch() -> watch::Receiver<bool> {
     let (tx, rx) = watch::channel(true);
     // Keep the sender alive forever so the receiver never observes a
@@ -536,28 +539,27 @@ pub(crate) fn legacy_pod_cleanup_intent(intent: PodCleanupIntent) -> StoredPodCl
 pub(crate) struct ClusterStoreLeaderPodCleanup {
     db: DatastoreHandle,
     proposal: Arc<dyn RaftProposal>,
-    is_leader_rx: watch::Receiver<bool>,
+    authority: AuthorityHandle,
 }
 
 impl ClusterStoreLeaderPodCleanup {
-    pub(crate) fn new(
+    pub(crate) fn new<A: Into<AuthorityHandle>>(
         db: DatastoreHandle,
         proposal: Arc<dyn RaftProposal>,
-        is_leader_rx: watch::Receiver<bool>,
+        authority: A,
     ) -> Self {
         Self {
             db,
             proposal,
-            is_leader_rx,
+            authority: authority.into(),
         }
     }
 
     fn require_leader(&self) -> Result<(), PodCleanupIntentError> {
-        if *self.is_leader_rx.borrow() {
-            Ok(())
-        } else {
-            Err(PodCleanupIntentError::NotLeader)
-        }
+        self.authority
+            .local_permit()
+            .map(|_| ())
+            .map_err(|_| PodCleanupIntentError::NotLeader)
     }
 
     pub(crate) async fn move_intent(
@@ -639,28 +641,27 @@ impl LeaderPodCleanupIntents for ClusterStoreLeaderPodCleanup {
 pub(crate) struct ClusterStoreLeaderMaintenance {
     db: DatastoreHandle,
     proposal: Arc<dyn RaftProposal>,
-    is_leader_rx: watch::Receiver<bool>,
+    authority: AuthorityHandle,
 }
 
 impl ClusterStoreLeaderMaintenance {
-    pub(crate) fn new(
+    pub(crate) fn new<A: Into<AuthorityHandle>>(
         db: DatastoreHandle,
         proposal: Arc<dyn RaftProposal>,
-        is_leader_rx: watch::Receiver<bool>,
+        authority: A,
     ) -> Self {
         Self {
             db,
             proposal,
-            is_leader_rx,
+            authority: authority.into(),
         }
     }
 
     fn require_leader(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            *self.is_leader_rx.borrow(),
-            "operation requires current raft leader"
-        );
-        Ok(())
+        self.authority
+            .local_permit()
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!("operation requires current raft leader: {error}"))
     }
 
     pub(crate) async fn gc_applied_outbox(
@@ -966,39 +967,47 @@ pub struct LocalApiClient {
     /// reconcile keys that the gRPC `Replication::apply_outbox` handler
     /// fires for remote-worker forwarded writes.
     outbox_side_effects: Arc<RootOutboxSideEffectState>,
-    /// T6 step 1 inner gate: every mutation method on this client first
-    /// reads `*is_leader_rx.borrow()`. When false (this node is not the
-    /// elected raft leader) the call is refused with
-    /// `WriteRejection::FollowerWrite`; reads stay allowed. Promotion is
-    /// a watch flip — no rewiring needed. The receiver is mandatory in
-    /// the constructor so the gate cannot be skipped by accident.
-    is_leader_rx: watch::Receiver<bool>,
+    /// Every leader-owned mutation samples and validates this opaque
+    /// authority capability. Passive reads remain available on followers.
+    authority: AuthorityHandle,
+    /// Concrete adapter-owned signing fence. It is acquired only inside the
+    /// supervised crypto worker, so authority transitions never block Tokio.
+    signing_fence: Option<AuthoritySigningFence>,
 }
 
 /// A one-operation leadership generation fence. `watch` versions advance on
 /// every send, so `has_changed` detects both ordinary demotion and a
 /// demote/promote ABA even when the latest boolean is `true` again.
 struct LeadershipGenerationFence {
-    receiver: watch::Receiver<bool>,
+    authority: AuthorityHandle,
+    permit: klights_leader_api::AuthorityPermit,
+    signing_fence: Option<AuthoritySigningFence>,
 }
 
 impl LeadershipGenerationFence {
-    fn sample(
-        mut receiver: watch::Receiver<bool>,
+    fn sample<A: Into<AuthorityHandle>>(
+        authority: A,
     ) -> Result<Self, ProjectedServiceAccountTokenError> {
-        if !*receiver.borrow_and_update() {
-            return Err(ProjectedServiceAccountTokenError::NotLeader);
-        }
-        Ok(Self { receiver })
+        let authority = authority.into();
+        let permit = authority
+            .local_permit()
+            .map_err(|_| ProjectedServiceAccountTokenError::NotLeader)?;
+        Ok(Self {
+            authority,
+            permit,
+            signing_fence: None,
+        })
+    }
+
+    fn with_signing_fence(mut self, signing_fence: Option<AuthoritySigningFence>) -> Self {
+        self.signing_fence = signing_fence;
+        self
     }
 
     fn ensure_unchanged(&self) -> Result<(), ProjectedServiceAccountTokenError> {
-        let current = self.receiver.borrow();
-        if !*current || self.receiver.has_changed().unwrap_or(true) {
-            Err(ProjectedServiceAccountTokenError::NotLeader)
-        } else {
-            Ok(())
-        }
+        self.authority
+            .validate(&self.permit)
+            .map_err(|_| ProjectedServiceAccountTokenError::NotLeader)
     }
 
     #[cfg(test)]
@@ -1006,10 +1015,16 @@ impl LeadershipGenerationFence {
         &self,
         sign: impl FnOnce() -> T,
     ) -> Result<T, ProjectedServiceAccountTokenError> {
-        let current = self.receiver.borrow();
-        if !*current || self.receiver.has_changed().unwrap_or(true) {
-            return Err(ProjectedServiceAccountTokenError::NotLeader);
-        }
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        let legacy_watch = self.authority.legacy_watch_for_test();
+        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        let _legacy_current = legacy_watch.as_ref().map(|receiver| receiver.borrow());
+        #[cfg(test)]
+        let _authority_read = self
+            .signing_fence
+            .as_ref()
+            .map(AuthoritySigningFence::blocking_read);
+        self.ensure_unchanged()?;
         Ok(sign())
     }
 }
@@ -1020,7 +1035,8 @@ impl LocalApiClient {
         request: ProjectedServiceAccountTokenRequest,
     ) -> ProjectedServiceAccountTokenFuture<'_> {
         Box::pin(async move {
-            let leadership = LeadershipGenerationFence::sample(self.is_leader_rx.clone())?;
+            let leadership = LeadershipGenerationFence::sample(self.authority.clone())?
+                .with_signing_fence(self.signing_fence.clone());
             #[cfg(any(test, feature = "pod-repository-test-support"))]
             if let Some(probe) = projected_token_issue_test_probe(&self.containerd_namespace) {
                 (probe.async_boundary)().await;
@@ -1052,8 +1068,18 @@ impl LocalApiClient {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             let crypto: &klights_supervisor::CryptoExecutor = &self.crypto;
+            leadership.ensure_unchanged()?;
+            let signing_fence = leadership.signing_fence.clone();
+            let authority = leadership.authority.clone();
+            let permit = leadership.permit.clone();
             let token = crypto
                 .run_blocking("sign-projected-service-account-token", move || {
+                    let _authority_read = signing_fence
+                        .as_ref()
+                        .map(AuthoritySigningFence::blocking_read);
+                    if authority.validate(&permit).is_err() {
+                        return Err(ProjectedServiceAccountTokenError::NotLeader);
+                    }
                     sign_authorized_projected_service_account_token(
                         &signing_key_pem,
                         claims,
@@ -1072,25 +1098,25 @@ impl LocalApiClient {
     }
 
     #[cfg(any(test, feature = "pod-repository-test-support"))]
-    pub(crate) fn new(
+    pub(crate) fn new<A: Into<AuthorityHandle>>(
         db: DatastoreHandle,
         authoring_node: String,
-        is_leader_rx: watch::Receiver<bool>,
+        authority: A,
     ) -> Self {
         Self::new_with_file_process(
             db,
             authoring_node,
-            is_leader_rx,
+            authority,
             crate::bootstrap::file_blocking::test_file_process_executor(),
         )
     }
 
     #[cfg(test)]
-    pub(crate) fn new_with_passive_reads(
+    pub(crate) fn new_with_passive_reads<A: Into<AuthorityHandle>>(
         db: DatastoreHandle,
         passive_reads: crate::datastore::selector::PassiveReadPorts,
         authoring_node: String,
-        is_leader_rx: watch::Receiver<bool>,
+        authority: A,
     ) -> Self {
         Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process_with_reads(
             db,
@@ -1100,16 +1126,16 @@ impl LocalApiClient {
             Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
                 chrono::Utc::now(),
             )),
-            is_leader_rx,
+            authority,
             crate::bootstrap::file_blocking::test_file_process_executor(),
         )
     }
 
     #[cfg(any(test, feature = "pod-repository-test-support"))]
-    pub(crate) fn new_with_file_process(
+    pub(crate) fn new_with_file_process<A: Into<AuthorityHandle>>(
         db: DatastoreHandle,
         authoring_node: String,
-        is_leader_rx: watch::Receiver<bool>,
+        authority: A,
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
         Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
@@ -1119,34 +1145,34 @@ impl LocalApiClient {
             Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
                 chrono::Utc::now(),
             )),
-            is_leader_rx,
+            authority,
             file_process,
         )
     }
 
     #[cfg(test)]
-    pub(crate) fn new_with_node_lease_tracker(
+    pub(crate) fn new_with_node_lease_tracker<A: Into<AuthorityHandle>>(
         db: DatastoreHandle,
         authoring_node: String,
         node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
-        is_leader_rx: watch::Receiver<bool>,
+        authority: A,
     ) -> Self {
         Self::new_with_node_lease_tracker_and_file_process(
             db,
             authoring_node,
             node_lease_tracker,
-            is_leader_rx,
+            authority,
             crate::bootstrap::file_blocking::test_file_process_executor(),
         )
     }
 
     #[cfg(any(test, feature = "pod-repository-test-support"))]
-    pub(crate) fn new_with_node_lease_tracker_and_passive_reads(
+    pub(crate) fn new_with_node_lease_tracker_and_passive_reads<A: Into<AuthorityHandle>>(
         db: DatastoreHandle,
         passive_reads: crate::datastore::selector::PassiveReadPorts,
         authoring_node: String,
         node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
-        is_leader_rx: watch::Receiver<bool>,
+        authority: A,
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
         Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process_with_reads(
@@ -1155,17 +1181,17 @@ impl LocalApiClient {
             authoring_node,
             std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string()),
             node_lease_tracker,
-            is_leader_rx,
+            authority,
             file_process,
         )
     }
 
     #[cfg(test)]
-    pub(crate) fn new_with_node_lease_tracker_and_file_process(
+    pub(crate) fn new_with_node_lease_tracker_and_file_process<A: Into<AuthorityHandle>>(
         db: DatastoreHandle,
         authoring_node: String,
         node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
-        is_leader_rx: watch::Receiver<bool>,
+        authority: A,
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
         Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
@@ -1173,18 +1199,20 @@ impl LocalApiClient {
             authoring_node,
             std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string()),
             node_lease_tracker,
-            is_leader_rx,
+            authority,
             file_process,
         )
     }
 
     #[cfg(any(test, feature = "pod-repository-test-support"))]
-    pub(crate) fn new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
+    pub(crate) fn new_with_node_lease_tracker_and_containerd_namespace_and_file_process<
+        A: Into<AuthorityHandle>,
+    >(
         db: DatastoreHandle,
         authoring_node: String,
         containerd_namespace: String,
         node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
-        is_leader_rx: watch::Receiver<bool>,
+        authority: A,
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
         Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process_with_reads(
@@ -1193,19 +1221,21 @@ impl LocalApiClient {
             authoring_node,
             containerd_namespace,
             node_lease_tracker,
-            is_leader_rx,
+            authority,
             file_process,
         )
     }
 
     #[cfg(any(test, feature = "pod-repository-test-support"))]
-    fn new_with_node_lease_tracker_and_containerd_namespace_and_file_process_with_reads(
+    fn new_with_node_lease_tracker_and_containerd_namespace_and_file_process_with_reads<
+        A: Into<AuthorityHandle>,
+    >(
         db: DatastoreHandle,
         passive_reads: crate::datastore::selector::PassiveReadPorts,
         authoring_node: String,
         containerd_namespace: String,
         node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
-        is_leader_rx: watch::Receiver<bool>,
+        authority: A,
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
         let signing_key_path =
@@ -1216,20 +1246,23 @@ impl LocalApiClient {
             containerd_namespace,
             signing_key_path,
             node_lease_tracker,
-            is_leader_rx,
+            authority,
             file_process,
         )
     }
 
-    pub(crate) fn new_with_node_lease_tracker_namespace_signing_key_and_file_process(
+    pub(crate) fn new_with_node_lease_tracker_namespace_signing_key_and_file_process<
+        A: Into<AuthorityHandle>,
+    >(
         persistence: LocalApiPersistencePorts,
         authoring_node: String,
         containerd_namespace: String,
         service_account_signing_key_path: std::path::PathBuf,
         node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
-        is_leader_rx: watch::Receiver<bool>,
+        authority: A,
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
+        let authority = authority.into();
         let LocalApiPersistencePorts {
             db,
             positioned_watch,
@@ -1238,7 +1271,7 @@ impl LocalApiClient {
             db.clone(),
         ));
         let resource_query: Arc<dyn LeaderResourceQuery> = Arc::new(
-            ClusterStoreLeaderResourceQuery::new(db.clone(), is_leader_rx.clone()),
+            ClusterStoreLeaderResourceQuery::new(db.clone(), authority.clone()),
         );
         let crypto = file_process.crypto_executor();
         let outbox_side_effects = Arc::new(RootOutboxSideEffectState::new(db.clone()));
@@ -1250,21 +1283,27 @@ impl LocalApiClient {
             let resource_query: Arc<dyn LeaderResourceQuery> = Arc::new(
                 crate::bootstrap::outbox_apply_adapter::BackendResourceQueryFixture::new(
                     db.clone(),
-                    is_leader_rx.clone(),
+                    authority
+                        .legacy_watch_for_test()
+                        .expect("test authority retains its source watch"),
                 ),
             );
             let resource_command = Arc::new(
                 klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                     proposal.clone(),
                     resource_query.clone(),
-                    is_leader_rx.clone(),
+                    authority
+                        .legacy_watch_for_test()
+                        .expect("test authority retains its source watch"),
                 ),
             );
             let embedded_outbox = Arc::new(
                 klights_replication::leader_api::EmbeddedOutboxDelivery::new(
                     proposal,
                     resource_query,
-                    is_leader_rx.clone(),
+                    authority
+                        .legacy_watch_for_test()
+                        .expect("test authority retains its source watch"),
                 ),
             );
             let committed_outbox = Arc::new(RootCommittedOutboxDelivery::new(
@@ -1292,8 +1331,17 @@ impl LocalApiClient {
             crypto,
             node_lease_tracker,
             outbox_side_effects,
-            is_leader_rx,
+            authority,
+            signing_fence: None,
         }
+    }
+
+    pub(crate) fn with_authority_signing_fence(
+        mut self,
+        signing_fence: AuthoritySigningFence,
+    ) -> Self {
+        self.signing_fence = Some(signing_fence);
+        self
     }
 
     #[cfg(test)]
@@ -1403,7 +1451,7 @@ impl LeaderNodeLeaseRenewal for LocalApiClient {
         request: NodeLeaseRenewalRequest,
     ) -> NodeLeaseRenewalFuture<'_, NodeLeaseRenewalResult> {
         Box::pin(async move {
-            if !*self.is_leader_rx.borrow() {
+            if self.authority.local_permit().is_err() {
                 return Err(NodeLeaseRenewalError::NotLeader);
             }
             let (node_name, renew_time, lease_duration_seconds) = request.into_parts();
@@ -1438,7 +1486,7 @@ impl LeaderNodeLifecycleStatus for LocalApiClient {
         request: NodeLifecycleStatusRequest,
     ) -> NodeLifecycleStatusFuture<'_, NodeLifecycleStatusResult> {
         Box::pin(async move {
-            if !*self.is_leader_rx.borrow() {
+            if self.authority.local_permit().is_err() {
                 return Err(NodeLifecycleStatusError::NotLeader);
             }
             let get = klights_leader_api::node_get_request(
@@ -1564,7 +1612,7 @@ impl LeaderPodCleanupIntents for LocalApiClient {
         request: PodCleanupIntentListRequest,
     ) -> PodCleanupIntentFuture<'_, Vec<PodCleanupIntent>> {
         Box::pin(async move {
-            if !*self.is_leader_rx.borrow() {
+            if self.authority.local_permit().is_err() {
                 return Err(PodCleanupIntentError::NotLeader);
             }
             if request.node_name() != self.authoring_node {
@@ -1585,7 +1633,7 @@ impl LeaderPodCleanupIntents for LocalApiClient {
         request: PodCleanupIntentAckRequest,
     ) -> PodCleanupIntentFuture<'_, ()> {
         Box::pin(async move {
-            if !*self.is_leader_rx.borrow() {
+            if self.authority.local_permit().is_err() {
                 return Err(PodCleanupIntentError::NotLeader);
             }
             if request.node_name() != self.authoring_node {
@@ -1606,7 +1654,7 @@ impl LeaderNodeSubnetAllocation for LocalApiClient {
         request: NodeSubnetAllocationRequest,
     ) -> NodeSubnetAllocationFuture<'_, NodeSubnetAllocationResult> {
         Box::pin(async move {
-            if !*self.is_leader_rx.borrow() {
+            if self.authority.local_permit().is_err() {
                 return Err(NodeSubnetAllocationError::NotLeader);
             }
             let (node_name, cluster_cidr, node_ip) = request.into_parts();
@@ -1637,7 +1685,7 @@ impl LeaderNetworkTopologyQuery for LocalApiClient {
         request: NodeSubnetQuery,
     ) -> NetworkTopologyFuture<'_, NodeSubnetResult> {
         Box::pin(async move {
-            if !*self.is_leader_rx.borrow() {
+            if self.authority.local_permit().is_err() {
                 return Err(NetworkTopologyError::NotLeader);
             }
             let node_name = request.into_node_name();
@@ -1657,7 +1705,7 @@ impl LeaderNetworkTopologyQuery for LocalApiClient {
         request: PeerSubnetsQuery,
     ) -> NetworkTopologyFuture<'_, PeerSubnetsResult> {
         Box::pin(async move {
-            if !*self.is_leader_rx.borrow() {
+            if self.authority.local_permit().is_err() {
                 return Err(NetworkTopologyError::NotLeader);
             }
             let node_name = request.into_node_name();
@@ -1681,7 +1729,7 @@ impl LeaderNetworkTopologyQuery for LocalApiClient {
         request: NodeDataplaneQuery,
     ) -> NetworkTopologyFuture<'_, NodeDataplaneResult> {
         Box::pin(async move {
-            if !*self.is_leader_rx.borrow() {
+            if self.authority.local_permit().is_err() {
                 return Err(NetworkTopologyError::NotLeader);
             }
             let node_name = request.into_node_name();
@@ -1700,7 +1748,7 @@ impl LeaderNetworkTopologyQuery for LocalApiClient {
 impl LeaderNetworkTopologyCommand for LocalApiClient {
     fn register_node_dataplane(&self, metadata: NetworkDataplane) -> NetworkTopologyFuture<'_, ()> {
         Box::pin(async move {
-            if !*self.is_leader_rx.borrow() {
+            if self.authority.local_permit().is_err() {
                 return Err(NetworkTopologyError::NotLeader);
             }
             let metadata = crate::control_plane::client::legacy_dataplane(metadata)?;

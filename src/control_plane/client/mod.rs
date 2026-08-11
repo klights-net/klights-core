@@ -1,12 +1,13 @@
-#[cfg(test)]
-pub mod apply;
 pub mod leader_proxy;
 pub mod local;
-pub mod worker_store;
 
 #[cfg(test)]
 #[path = "tests/remote.rs"]
 mod remote_tests;
+
+#[cfg(test)]
+#[path = "tests/worker.rs"]
+mod worker_tests;
 
 #[cfg(test)]
 use klights_leader_api::ResourceListRequest;
@@ -14,13 +15,196 @@ use klights_leader_api::{
     DataplaneEncryption, HostPortRange as LeaderHostPortRange, LeaderCacheReadiness,
     LeaderNetworkTopologyQuery, LeaderNodeSubnetAllocation, LeaderPodCleanupIntents,
     LeaderProjectedServiceAccountToken, LeaderResourceQuery, LeaderWatch, NetworkDataplane,
-    NetworkNodeMode, NetworkTopologyError, ResourceEvent, ResourceListResult, ResourceQueryError,
-    WatchEventType,
+    NetworkNodeMode, NetworkTopologyError, ResourceListResult, ResourceQueryError,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::datastore::ResourceList;
-use klights_watch::WatchEvent;
+use tokio::sync::watch;
+
+/// Small composition-time handle for the existing backend-neutral authority
+/// contract.  Client implementations route through permits, never through
+/// a raw leadership boolean.
+#[derive(Clone)]
+pub(crate) struct AuthorityHandle {
+    authority: Arc<dyn klights_leader_api::LeaderAuthority>,
+    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    legacy_watch: Option<watch::Receiver<bool>>,
+}
+
+impl AuthorityHandle {
+    pub(crate) fn route(&self) -> klights_leader_api::AuthorityRoute {
+        self.authority.route()
+    }
+
+    pub(crate) fn local_permit(
+        &self,
+    ) -> Result<klights_leader_api::AuthorityPermit, klights_leader_api::AuthorityError> {
+        match self.authority.route() {
+            klights_leader_api::AuthorityRoute::Local(permit) => {
+                self.authority.validate(&permit)?;
+                Ok(permit)
+            }
+            klights_leader_api::AuthorityRoute::Forward { .. }
+            | klights_leader_api::AuthorityRoute::Unavailable => {
+                Err(klights_leader_api::AuthorityError::NotAuthoritative)
+            }
+        }
+    }
+
+    pub(crate) fn validate(
+        &self,
+        permit: &klights_leader_api::AuthorityPermit,
+    ) -> Result<(), klights_leader_api::AuthorityError> {
+        self.authority.validate(permit)
+    }
+
+    pub(crate) fn acquire(&self) -> klights_leader_api::AuthorityAcquireFuture<'_> {
+        self.authority.acquire()
+    }
+
+    pub(crate) fn wait_for_revocation<'a>(
+        &'a self,
+        permit: &'a klights_leader_api::AuthorityPermit,
+    ) -> klights_leader_api::AuthorityRevocationFuture<'a> {
+        self.authority.wait_for_revocation(permit)
+    }
+}
+
+impl<T> From<Arc<T>> for AuthorityHandle
+where
+    T: klights_leader_api::LeaderAuthority + 'static,
+{
+    fn from(authority: Arc<T>) -> Self {
+        Self {
+            authority: authority as Arc<dyn klights_leader_api::LeaderAuthority>,
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            legacy_watch: None,
+        }
+    }
+}
+
+impl From<Arc<dyn klights_leader_api::LeaderAuthority>> for AuthorityHandle {
+    fn from(authority: Arc<dyn klights_leader_api::LeaderAuthority>) -> Self {
+        Self {
+            authority,
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            legacy_watch: None,
+        }
+    }
+}
+
+impl From<watch::Receiver<bool>> for AuthorityHandle {
+    fn from(receiver: watch::Receiver<bool>) -> Self {
+        let authority = Arc::new(WatchReceiverAuthority::new(receiver.clone()));
+        Self {
+            authority,
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            legacy_watch: Some(receiver),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "pod-repository-test-support"))]
+impl AuthorityHandle {
+    pub(crate) fn legacy_watch_for_test(&self) -> Option<watch::Receiver<bool>> {
+        self.legacy_watch.clone()
+    }
+}
+
+/// Compatibility input adapter for existing bootstrap/test construction. It
+/// translates the legacy signal at the composition boundary into the same
+/// opaque permit contract consumed by local and proxy clients.
+struct WatchReceiverAuthority {
+    receiver: Mutex<watch::Receiver<bool>>,
+    generation: std::sync::atomic::AtomicU64,
+    issuer: klights_leader_api::AuthorityPermitIssuer,
+}
+
+impl WatchReceiverAuthority {
+    fn new(receiver: watch::Receiver<bool>) -> Self {
+        Self {
+            receiver: Mutex::new(receiver),
+            generation: std::sync::atomic::AtomicU64::new(1),
+            issuer: klights_leader_api::AuthorityPermitIssuer::new(),
+        }
+    }
+
+    fn state(&self) -> (bool, u64) {
+        use std::sync::atomic::Ordering;
+        let mut receiver = self
+            .receiver
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if receiver.has_changed().unwrap_or(true) {
+            let _ = receiver.borrow_and_update();
+            let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            (*receiver.borrow(), generation)
+        } else {
+            (*receiver.borrow(), self.generation.load(Ordering::Acquire))
+        }
+    }
+}
+
+impl klights_leader_api::LeaderAuthority for WatchReceiverAuthority {
+    fn route(&self) -> klights_leader_api::AuthorityRoute {
+        let (local, generation) = self.state();
+        if local {
+            klights_leader_api::AuthorityRoute::Local(self.issuer.issue(generation))
+        } else {
+            klights_leader_api::AuthorityRoute::Unavailable
+        }
+    }
+
+    fn validate(
+        &self,
+        permit: &klights_leader_api::AuthorityPermit,
+    ) -> Result<(), klights_leader_api::AuthorityError> {
+        let (local, generation) = self.state();
+        if !local {
+            return Err(klights_leader_api::AuthorityError::NotAuthoritative);
+        }
+        self.issuer.validate(permit, generation)
+    }
+
+    fn acquire(&self) -> klights_leader_api::AuthorityAcquireFuture<'_> {
+        let mut receiver = self
+            .receiver
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        Box::pin(async move {
+            loop {
+                if let klights_leader_api::AuthorityRoute::Local(permit) = self.route() {
+                    return Ok(permit);
+                }
+                receiver
+                    .changed()
+                    .await
+                    .map_err(|_| klights_leader_api::AuthorityError::Closed)?;
+            }
+        })
+    }
+
+    fn wait_for_revocation<'a>(
+        &'a self,
+        permit: &'a klights_leader_api::AuthorityPermit,
+    ) -> klights_leader_api::AuthorityRevocationFuture<'a> {
+        let mut receiver = self
+            .receiver
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let permit = permit.clone();
+        Box::pin(async move {
+            loop {
+                if self.validate(&permit).is_err() || receiver.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+}
 
 pub(crate) fn focused_node_subnet(
     subnet: klights_cluster_store::StoredNodeSubnet,
@@ -157,32 +341,6 @@ pub(crate) fn query_list_result(
         list.continue_token,
         list.remaining_item_count,
     )
-}
-
-pub(crate) fn legacy_list_response(result: ResourceListResult) -> ResourceList {
-    let (items, resource_version, position, continue_token, remaining_item_count) =
-        result.into_parts();
-    ResourceList {
-        items,
-        resource_version,
-        watch_replay_position: position,
-        continue_token,
-        remaining_item_count,
-    }
-}
-
-pub(crate) fn legacy_watch_event(event: &ResourceEvent) -> WatchEvent {
-    WatchEvent {
-        event_type: match event.event_type() {
-            WatchEventType::Added => klights_watch::EventType::Added,
-            WatchEventType::Modified => klights_watch::EventType::Modified,
-            WatchEventType::Deleted => klights_watch::EventType::Deleted,
-            WatchEventType::Bookmark => klights_watch::EventType::Bookmark,
-            WatchEventType::Error => klights_watch::EventType::Error,
-        },
-        object: event.resource().data.clone(),
-        encoded_payload: None,
-    }
 }
 
 /// Focused leader capabilities assembled only at a composition root.

@@ -1264,6 +1264,7 @@ impl NativeApiTestHarness {
             #[cfg(not(test))]
             gc_coordination: gc_coordination.clone(),
             scheduler_bind_gate: None,
+            post_write_maintenance_notify: None,
         };
         let (
             pod_query,

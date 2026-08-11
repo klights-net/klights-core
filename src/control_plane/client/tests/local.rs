@@ -1256,11 +1256,13 @@ fn projected_token_leadership_fence_rejects_demotion_and_aba() {
     }
 }
 
-#[test]
-fn projected_token_signing_fence_blocks_demotion_until_signing_finishes() {
-    let (leadership_tx, leadership_rx) = watch::channel(true);
-    let _leadership_keepalive = leadership_rx.clone();
-    let fence = LeadershipGenerationFence::sample(leadership_rx).expect("initial leader");
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn projected_token_signing_fence_blocks_demotion_until_signing_finishes() {
+    let (authority, publisher) =
+        klights_replication::authority::WatchLeaderAuthority::channel(true, None);
+    let fence = LeadershipGenerationFence::sample(authority.clone())
+        .expect("initial leader")
+        .with_signing_fence(Some(authority.signing_fence()));
     let (signing_entered_tx, signing_entered_rx) = std::sync::mpsc::channel();
     let (release_signing_tx, release_signing_rx) = std::sync::mpsc::channel();
     let signing = std::thread::spawn(move || {
@@ -1274,30 +1276,73 @@ fn projected_token_signing_fence_blocks_demotion_until_signing_finishes() {
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("signing operation did not enter its fenced section");
 
-    let (transition_started_tx, transition_started_rx) = std::sync::mpsc::channel();
-    let (transition_done_tx, transition_done_rx) = std::sync::mpsc::channel();
-    let transition = std::thread::spawn(move || {
-        transition_started_tx.send(()).unwrap();
-        leadership_tx.send(false).unwrap();
-        leadership_tx.send(true).unwrap();
-        transition_done_tx.send(()).unwrap();
+    let mut transition = tokio::spawn(async move {
+        publisher.publish(false, None).await;
+        publisher.publish(true, None).await;
     });
-    transition_started_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .expect("leadership transition did not start");
-    assert!(
-        transition_done_rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err(),
-        "demotion must not linearize while synchronous signing holds the fence"
+    tokio::select! {
+        result = &mut transition => panic!("leadership transition completed before signing released: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+    }
+    assert_eq!(
+        klights_leader_api::LeaderAuthority::route(authority.as_ref()),
+        klights_leader_api::AuthorityRoute::Unavailable,
+        "new authority calls must fail closed while the transition waits for signing"
     );
 
     release_signing_tx.send(()).unwrap();
     assert_eq!(signing.join().unwrap(), Ok("signed"));
-    transition_done_rx
+    transition.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn projected_token_crypto_worker_revalidates_after_acquiring_signing_fence() {
+    let (authority, publisher) =
+        klights_replication::authority::WatchLeaderAuthority::channel(true, None);
+    let permit = match klights_leader_api::LeaderAuthority::route(authority.as_ref()) {
+        klights_leader_api::AuthorityRoute::Local(permit) => permit,
+        route => panic!("expected local authority, got {route:?}"),
+    };
+    let signing_fence = authority.signing_fence();
+    let crypto = crate::bootstrap::file_blocking::test_file_process_executor().crypto_executor();
+    let (signing_entered_tx, signing_entered_rx) = std::sync::mpsc::channel();
+    let (release_signing_tx, release_signing_rx) = std::sync::mpsc::channel();
+    let signing = tokio::spawn({
+        let authority = authority.clone();
+        async move {
+            crypto
+                .run_blocking("test-projected-token-signing-fence", move || {
+                    let _authority_read = signing_fence.blocking_read();
+                    klights_leader_api::LeaderAuthority::validate(authority.as_ref(), &permit)
+                        .map_err(|_| ProjectedServiceAccountTokenError::NotLeader)?;
+                    signing_entered_tx.send(()).unwrap();
+                    release_signing_rx.recv().unwrap();
+                    Ok::<_, ProjectedServiceAccountTokenError>("signed")
+                })
+                .await
+                .expect("supervised signing worker")
+        }
+    });
+    signing_entered_rx
         .recv_timeout(std::time::Duration::from_secs(2))
-        .expect("leadership transition did not finish after signing released the fence");
-    transition.join().unwrap();
+        .expect("signing worker did not acquire and validate its authority fence");
+
+    let mut transition = tokio::spawn(async move {
+        publisher.publish(false, None).await;
+    });
+    tokio::select! {
+        result = &mut transition => panic!("demotion completed before signing released: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+    }
+    assert_eq!(
+        klights_leader_api::LeaderAuthority::route(authority.as_ref()),
+        klights_leader_api::AuthorityRoute::Unavailable,
+        "new authority calls must fail closed while signing holds the read fence"
+    );
+
+    release_signing_tx.send(()).unwrap();
+    assert_eq!(signing.await.unwrap().unwrap(), "signed");
+    transition.await.unwrap();
 }
 
 #[test]

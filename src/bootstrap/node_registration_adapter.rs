@@ -45,14 +45,13 @@ struct DatastoreNodeRegistrationStore<'a> {
 }
 
 struct WorkerNodeRegistrationStore<'a> {
-    store: &'a crate::control_plane::client::worker_store::WorkerStoreAdapter,
+    store: &'a klights_kubelet::worker_store::WorkerStoreAdapter,
 }
 
 #[async_trait::async_trait]
 impl NodeRegistrationStore for WorkerNodeRegistrationStore<'_> {
     async fn get_node(&self, node_name: &str) -> Result<Option<klights_cluster_core::Resource>> {
-        crate::datastore::ResourceStore::get_resource(self.store, "v1", "Node", None, node_name)
-            .await
+        self.store.get_resource("v1", "Node", None, node_name).await
     }
 
     async fn stamp_routing_metadata(
@@ -60,7 +59,7 @@ impl NodeRegistrationStore for WorkerNodeRegistrationStore<'_> {
         node_name: &str,
         node: &mut serde_json::Value,
     ) -> Result<bool> {
-        crate::bootstrap::composition_adapters::node_routing_metadata::stamp_from_network_metadata(
+        crate::bootstrap::composition_adapters::node_routing_metadata::stamp_from_worker_store(
             self.store, node_name, node,
         )
         .await
@@ -98,7 +97,7 @@ pub(crate) async fn register_node_snapshot(
 }
 
 pub(crate) async fn register_worker_node_snapshot(
-    store: &crate::control_plane::client::worker_store::WorkerStoreAdapter,
+    store: &klights_kubelet::worker_store::WorkerStoreAdapter,
     outbox: &klights_kubelet::node_outbox::Outbox,
     dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,
     snapshot: &NodeRegistrationSnapshot,

@@ -17,6 +17,7 @@ use klights_leader_api::{
 use klights_types::ResourceKey;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::watch;
 
 /// Recording stub: each method bumps a counter and returns a
 /// minimal Ok value. Used on both sides of the proxy to assert
@@ -1093,19 +1094,19 @@ fn pod_status_minimal_payload() -> Bytes {
 }
 
 /// The proxy never spawns or sleeps; per-call dispatch is a
-/// single `watch::Receiver::borrow` plus an arc deref. This is a
+/// single authority route sample plus an arc deref. This is a
 /// structural check that the impl above does no I/O on its own —
 /// dispatch happens inline.
 #[test]
 fn leader_proxy_holds_no_background_resources() {
     // The dispatcher has exactly four thin fields: two public API
     // trait-object Arcs, one optional Arc to the focused target bundle,
-    // and one watch receiver. Both target pairs live behind that single
+    // and one authority handle. Both target pairs live behind that single
     // heap pointer. There is no supervisor, spawn handle, timer, or
     // background task state.
     use std::mem::size_of;
     let thin_dispatcher_fields = size_of::<ArcPair<dyn LeaderResourceQuery>>() * 7
-        + size_of::<watch::Receiver<bool>>()
+        + size_of::<AuthorityHandle>()
         + size_of::<Option<Arc<FocusedLeaderTargets>>>();
     assert_eq!(
         size_of::<LeaderProxyApiClient>(),

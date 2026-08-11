@@ -192,6 +192,8 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         crate::bootstrap::NodeRole::Worker { .. } => false,
     };
     let (is_leader_tx, is_leader_rx) = tokio::sync::watch::channel::<bool>(initial_is_leader);
+    let (leader_authority, authority_publisher) =
+        klights_replication::authority::WatchLeaderAuthority::channel(initial_is_leader, None);
 
     let ds = phases::datastore::open_leader(phases::datastore::OpenLeaderArgs {
         config: &config,
@@ -202,6 +204,8 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         grpc_transport_policy: grpc_transport_policy.clone(),
         shutdown_token: shutdown_token.clone(),
         is_leader_rx: is_leader_rx.clone(),
+        leader_authority: leader_authority.clone(),
+        authority_publisher,
         local_dataplane: local_dataplane.clone(),
         node_ip: &node_ip,
     })
@@ -222,6 +226,8 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     let control_plane_lease_client = ds.control_plane_lease_client;
     let raft_node = ds.raft_node;
     let member_feature_probe = ds.member_feature_probe;
+    let leader_authority = ds.leader_authority;
+    let authority_publisher = ds.authority_publisher;
     if let Some(rn) = raft_node.as_ref() {
         let metrics = rn.raft.metrics().borrow().clone();
         tracing::info!(
@@ -401,6 +407,8 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         raft_node: raft_node.clone(),
         is_leader_tx: is_leader_tx.clone(),
         is_leader_rx: is_leader_rx.clone(),
+        leader_authority,
+        authority_publisher,
     })
     .await?;
     let pod_query = bp.pod_query;
