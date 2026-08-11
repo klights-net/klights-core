@@ -203,6 +203,54 @@ async fn seed_bootstrap_mutation_uses_command_port_without_passive_write() {
     ));
 }
 
+struct RecordingNodeCleanupCommands {
+    commands: Mutex<Vec<StorageCommand>>,
+}
+
+impl klights_leader_api::LeaderResourceCommand for RecordingNodeCleanupCommands {
+    fn submit_resource_command(
+        &self,
+        request: klights_leader_api::ResourceCommandRequest,
+    ) -> klights_leader_api::ResourceCommandFuture<'_, klights_leader_api::ResourceCommandResult>
+    {
+        Box::pin(async move {
+            self.commands.lock().unwrap().push(request.into_command());
+            Ok(klights_leader_api::ResourceCommandResult::Ack {
+                resource_version: 196,
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn node_hard_delete_cleanup_routes_one_raft_command_without_passive_rv_mutation() {
+    let passive = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
+    let before_rv = passive.get_current_resource_version().await.unwrap();
+    let commands = Arc::new(RecordingNodeCleanupCommands {
+        commands: Mutex::new(Vec::new()),
+    });
+
+    crate::bootstrap::composition_adapters::generated_handler_adapter::submit_node_cleanup_intents(
+        commands.as_ref(),
+        "e2e-fake-node",
+    )
+    .await
+    .expect("submit node cleanup through raft owner");
+
+    assert_eq!(
+        passive.get_current_resource_version().await.unwrap(),
+        before_rv,
+        "passive cluster store must not consume a leader-only resourceVersion"
+    );
+    assert!(matches!(
+        commands.commands.lock().unwrap().as_slice(),
+        [StorageCommand::DeletePodCleanupIntentsForNode { node_name }]
+            if node_name == "e2e-fake-node"
+    ));
+}
+
 #[test]
 fn node_effect_ports_have_the_frozen_authority_split() {
     fn assert_lease<T: klights_leader_api::LeaderNodeLeaseRenewal>() {}

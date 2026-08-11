@@ -83,6 +83,20 @@ fn request_admits_exact_generic_resource_commands_without_rewriting_them() {
 }
 
 #[test]
+fn request_admits_node_cleanup_intent_bulk_delete_without_rewriting_it() {
+    let command = StorageCommand::DeletePodCleanupIntentsForNode {
+        node_name: "e2e-fake-node".to_string(),
+    };
+
+    assert_eq!(
+        ResourceCommandRequest::try_new(command.clone())
+            .expect("node cleanup must route through the leader command port")
+            .into_command(),
+        command
+    );
+}
+
+#[test]
 fn request_rejects_pod_hard_delete_commands() {
     for command in [
         StorageCommand::DeleteResource {

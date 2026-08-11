@@ -855,6 +855,10 @@ impl ResourceCommandRequest {
                 validate_command_identity("v1", "Namespace", None, name)?;
                 return Ok(Self { command });
             }
+            StorageCommand::DeletePodCleanupIntentsForNode { node_name } => {
+                validate_command_identity("v1", "Node", None, node_name)?;
+                return Ok(Self { command });
+            }
             _ => {}
         }
         if matches!(&command, StorageCommand::ApplyResourceBatch { operations } if !operations.is_empty())

@@ -902,12 +902,14 @@ fn stamp_provisional_resource_version_in_tx(
     mut commit: ApplyCommit,
     context: &super::TransactionContext<'_>,
 ) -> tokio_rusqlite::Result<ApplyCommit> {
-    let is_outbox_ledger_only = !commit.mutations.is_empty()
-        && commit
+    let does_not_advance_public_rv = commit.mutations.is_empty()
+        || commit
             .mutations
             .iter()
             .all(|mutation| matches!(mutation, LogApplyMutation::PutAppliedOutbox(_)));
-    let rv = if commit.resource_version == 0 && !is_outbox_ledger_only {
+    let rv = if commit.resource_version == 0 && does_not_advance_public_rv {
+        transaction_primitives::current_resource_version(tx)?
+    } else if commit.resource_version == 0 {
         transaction_primitives::next_resource_version_in_tx(tx)?
     } else {
         commit.resource_version

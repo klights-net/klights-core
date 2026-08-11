@@ -4553,6 +4553,37 @@ async fn watch_event_count(db: &Datastore) -> i64 {
 }
 
 #[tokio::test]
+async fn no_op_node_cleanup_intent_bulk_delete_does_not_advance_rv_or_watch() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    db.create_resource(
+        "v1",
+        "ConfigMap",
+        Some("default"),
+        "rv-baseline",
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "namespace": "default",
+                "name": "rv-baseline",
+                "uid": "rv-baseline-uid"
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let before_rv = db.get_current_resource_version().await.unwrap();
+    let before_watch = watch_event_count(&db).await;
+
+    db.delete_pod_cleanup_intents_for_node("e2e-fake-node")
+        .await
+        .unwrap();
+
+    assert_eq!(db.get_current_resource_version().await.unwrap(), before_rv);
+    assert_eq!(watch_event_count(&db).await, before_watch);
+}
+
+#[tokio::test]
 async fn legacy_move_pod_to_cleanup_intent_captures_without_deleting_bound_pod() {
     let db = Datastore::new_in_memory().await.unwrap();
     db.create_resource(

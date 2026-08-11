@@ -11,6 +11,23 @@ use k8s_native_service::generic_command::{
 };
 use k8s_native_service::ports::{GeneratedWatchPort, GeneratedWatchRequest};
 
+pub(crate) async fn submit_node_cleanup_intents(
+    commands: &dyn klights_leader_api::LeaderResourceCommand,
+    node_name: &str,
+) -> Result<(), AppError> {
+    let request = klights_leader_api::ResourceCommandRequest::try_new(
+        klights_cluster_core::StorageCommand::DeletePodCleanupIntentsForNode {
+            node_name: node_name.to_string(),
+        },
+    )
+    .map_err(AppError::from)?;
+    commands
+        .submit_resource_command(request)
+        .await
+        .map(|_| ())
+        .map_err(AppError::from)
+}
+
 pub(crate) struct GeneratedHandlerAdapter {
     db: DatastoreHandle,
     commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
@@ -251,12 +268,9 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
     }
 
     fn delete_node_cleanup_intents(&self, node_name: String) -> GenericCommandFuture<'_, ()> {
-        Box::pin(async move {
-            self.db
-                .delete_pod_cleanup_intents_for_node(&node_name)
-                .await
-                .map_err(AppError::from)
-        })
+        Box::pin(
+            async move { submit_node_cleanup_intents(self.commands.as_ref(), &node_name).await },
+        )
     }
 
     fn maybe_finalize_pod_after_finalizers_drained(

@@ -170,6 +170,7 @@ impl LeaderResourceCommand for EmbeddedLeaderResourceCommand {
                 StorageCommand::DeleteResource { .. }
                     | StorageCommand::DeleteNamespace { .. }
                     | StorageCommand::DeleteNamespaceContents { .. }
+                    | StorageCommand::DeletePodCleanupIntentsForNode { .. }
                     | StorageCommand::ApplyResourceBatch { .. }
             );
             let result = self
@@ -1089,6 +1090,43 @@ mod tests {
         ) -> Result<klights_cluster_core::OutboxApplyOutcome, OutboxApplyError> {
             unreachable!("resource-command tests do not submit outbox commands")
         }
+    }
+
+    #[tokio::test]
+    async fn node_cleanup_bulk_delete_routes_exactly_once_through_raft_proposal() {
+        let query = Arc::new(FixedResourceQuery {
+            resource: sample_resource(),
+            gets: AtomicUsize::new(0),
+        });
+        let proposal = Arc::new(RecordingProposal {
+            result: command_result(Some(196), None, None, None),
+            commands: std::sync::Mutex::new(Vec::new()),
+        });
+        let command = StorageCommand::DeletePodCleanupIntentsForNode {
+            node_name: "e2e-fake-node".to_string(),
+        };
+        let client = EmbeddedLeaderResourceCommand::new(
+            proposal.clone(),
+            query.clone(),
+            tokio::sync::watch::channel(true).1,
+        );
+
+        let result = client
+            .submit_resource_command(
+                ResourceCommandRequest::try_new(command.clone())
+                    .expect("node cleanup command must be admitted"),
+            )
+            .await
+            .expect("node cleanup command must be proposed");
+
+        assert_eq!(
+            result,
+            ResourceCommandResult::Ack {
+                resource_version: 196
+            }
+        );
+        assert_eq!(proposal.commands.lock().unwrap().as_slice(), &[command]);
+        assert_eq!(query.gets.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

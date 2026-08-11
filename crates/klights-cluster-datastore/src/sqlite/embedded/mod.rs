@@ -1796,6 +1796,21 @@ impl Datastore {
             ),
 
             StorageCommand::DeletePodCleanupIntentsForNode { node_name } => {
+                let exists = tx
+                    .query_row(
+                        "SELECT 1 FROM pod_cleanup_intents WHERE node_name = ?1 LIMIT 1",
+                        rusqlite::params![&node_name],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !exists {
+                    let current_public_rv = Self::current_resource_version_in_tx(tx)?;
+                    return Ok((
+                        Self::author_live_commit(current_public_rv, Vec::new())?,
+                        current_public_rv,
+                    ));
+                }
                 Self::author_live_commit_from_cluster_mutations(
                     rv,
                     vec![ClusterMutation::PodCleanup(
