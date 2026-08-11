@@ -521,6 +521,7 @@ pub async fn register_node_snapshot(
                     data: node.clone(),
                     expected_rv: existing.resource_version,
                     preconditions: ResourcePreconditions::from_resource(&existing),
+                    preserve_status: false,
                 },
                 operation_now.timestamp_millis(),
             )

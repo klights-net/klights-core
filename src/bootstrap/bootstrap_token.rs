@@ -300,7 +300,7 @@ pub(crate) async fn validate_bootstrap_token_for_scope(
 }
 
 pub(crate) async fn rotate_bootstrap_token_secret_for_get(
-    db: &dyn DatastoreBackend,
+    db: &(impl BootstrapTokenStore + ?Sized),
     resource: &Resource,
 ) -> Result<Resource> {
     let Some(scope) =
@@ -352,7 +352,7 @@ async fn read_secret(
 }
 
 async fn read_fixed_secret(
-    db: &dyn DatastoreBackend,
+    db: &(impl BootstrapTokenStore + ?Sized),
     scope: BootstrapTokenScope,
 ) -> Result<Resource> {
     read_secret(db, scope)

@@ -14,11 +14,13 @@ use klights_pod_api::PodQuery;
 /// order remains independent and pod-scoped counts always use `PodQuery`.
 struct RootResourceQuotaSideEffectPort {
     db: DatastoreHandle,
+    status_store: Arc<super::controller_runtime_adapter::RootControllerLeaderPort>,
     pod_repository: PodSideEffectPortsSlot,
 }
 
 struct BoundResourceQuotaPort<'a> {
     db: &'a dyn DatastoreBackend,
+    status_store: &'a dyn klights_controllers::common::ControllerStatusStore,
     pod_query: &'a dyn PodQuery,
 }
 
@@ -27,6 +29,7 @@ impl ResourceQuotaSideEffectPort for BoundResourceQuotaPort<'_> {
     async fn recount_namespace(&self, namespace: &str) -> Result<()> {
         crate::bootstrap::controller_adapters::resource_quota_controller_adapter::reconcile_resource_quotas_for_namespace(
             self.db,
+            self.status_store,
             self.pod_query,
             namespace,
         )
@@ -46,6 +49,7 @@ impl ResourceQuotaSideEffectPort for RootResourceQuotaSideEffectPort {
         };
         BoundResourceQuotaPort {
             db: self.db.as_ref(),
+            status_store: self.status_store.as_ref(),
             pod_query: pod_query.as_ref(),
         }
         .recount_namespace(namespace)
@@ -55,9 +59,14 @@ impl ResourceQuotaSideEffectPort for RootResourceQuotaSideEffectPort {
 
 pub(crate) fn port(
     db: DatastoreHandle,
+    status_store: Arc<super::controller_runtime_adapter::RootControllerLeaderPort>,
     pod_repository: PodSideEffectPortsSlot,
 ) -> Arc<dyn ResourceQuotaSideEffectPort> {
-    Arc::new(RootResourceQuotaSideEffectPort { db, pod_repository })
+    Arc::new(RootResourceQuotaSideEffectPort {
+        db,
+        status_store,
+        pod_repository,
+    })
 }
 
 #[cfg(test)]
@@ -67,7 +76,10 @@ mod adapter_tests {
         let (_db, db_handle) =
             crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let effect = klights_controllers::side_effects::resource_quota::effect(super::port(
-            db_handle,
+            db_handle.clone(),
+            std::sync::Arc::new(
+                crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(db_handle),
+            ),
             klights_controllers::side_effects::PodSideEffectPortsSlot::new(),
         ));
         assert_eq!(effect.name(), "resource_quota_recount");

@@ -26,6 +26,7 @@ fn direct_node_resource_update_is_not_classified_as_node_status() {
         }),
         expected_rv: 1,
         preconditions: ResourcePreconditions::resource_version(1),
+        preserve_status: false,
     };
 
     assert_ne!(

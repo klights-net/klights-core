@@ -61,6 +61,43 @@ pub(crate) struct LeaderPodEventQuery<'a> {
     query: &'a dyn klights_leader_api::LeaderResourceQuery,
 }
 
+pub(crate) struct LeaderPodEventEffect {
+    commands: std::sync::Arc<dyn klights_leader_api::LeaderResourceCommand>,
+}
+
+impl LeaderPodEventEffect {
+    pub(crate) fn new(
+        commands: std::sync::Arc<dyn klights_leader_api::LeaderResourceCommand>,
+    ) -> Self {
+        Self { commands }
+    }
+}
+
+#[async_trait::async_trait]
+impl klights_kubelet::pod_events::PodEventEffect for LeaderPodEventEffect {
+    async fn create_event(
+        &self,
+        namespace: &str,
+        name: &str,
+        event: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let request = klights_leader_api::ResourceCommandRequest::try_new(
+            klights_cluster_core::StorageCommand::CreateResource {
+                api_version: "v1".to_string(),
+                kind: "Event".to_string(),
+                namespace: Some(namespace.to_string()),
+                name: name.to_string(),
+                data: event,
+            },
+        )?;
+        self.commands
+            .submit_resource_command(request)
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::new)
+    }
+}
+
 impl<'a> LeaderPodEventQuery<'a> {
     pub(crate) const fn new(query: &'a dyn klights_leader_api::LeaderResourceQuery) -> Self {
         Self { query }

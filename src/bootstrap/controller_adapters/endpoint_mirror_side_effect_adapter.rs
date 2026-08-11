@@ -4,12 +4,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::datastore::DatastoreHandle;
 use klights_controllers::endpoints;
 use klights_controllers::side_effects::endpoint_mirror::EndpointMirrorStore;
 
 struct RootEndpointMirrorStore {
-    db: DatastoreHandle,
+    store: Arc<super::controller_runtime_adapter::RootControllerLeaderPort>,
     identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
 }
 
@@ -17,7 +16,7 @@ struct RootEndpointMirrorStore {
 impl EndpointMirrorStore for RootEndpointMirrorStore {
     async fn mirror_endpoints(&self, resource: &Value) -> Result<()> {
         endpoints::mirror_endpoints_to_endpointslice_at(
-            self.db.as_ref(),
+            self.store.as_ref(),
             resource,
             chrono::Utc::now(),
             self.identity.as_ref(),
@@ -26,15 +25,15 @@ impl EndpointMirrorStore for RootEndpointMirrorStore {
     }
 
     async fn delete_mirrored_endpointslice(&self, resource: &Value) -> Result<()> {
-        endpoints::delete_mirrored_endpointslice_for_endpoints(self.db.as_ref(), resource).await
+        endpoints::delete_mirrored_endpointslice_for_endpoints(self.store.as_ref(), resource).await
     }
 }
 
 pub(crate) fn port(
-    db: DatastoreHandle,
+    store: Arc<super::controller_runtime_adapter::RootControllerLeaderPort>,
     identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
 ) -> Arc<dyn EndpointMirrorStore> {
-    Arc::new(RootEndpointMirrorStore { db, identity })
+    Arc::new(RootEndpointMirrorStore { store, identity })
 }
 
 #[cfg(test)]
@@ -76,7 +75,9 @@ mod tests {
         });
 
         klights_controllers::side_effects::endpoint_mirror::effect(port(
-            db_handle,
+            Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(
+                db_handle,
+            )),
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         ))
         .apply_delete(&endpoints)

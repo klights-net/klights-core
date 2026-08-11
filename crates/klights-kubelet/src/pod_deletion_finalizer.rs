@@ -34,6 +34,45 @@ pub trait PodDeletionFinalizer: Send + Sync {
     ) -> anyhow::Result<PodDeletionFinalizeResult>;
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub trait PostWriteMaintenanceObserver: Send + Sync {
+    fn launch(&self) -> u64;
+    fn complete(&self, sequence: u64);
+}
+
+#[derive(Clone, Default)]
+pub struct PostWriteMaintenanceObserverHandle {
+    #[cfg(any(test, feature = "test-support"))]
+    observer: Option<Arc<dyn PostWriteMaintenanceObserver>>,
+}
+
+impl PostWriteMaintenanceObserverHandle {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new(observer: Arc<dyn PostWriteMaintenanceObserver>) -> Self {
+        Self {
+            observer: Some(observer),
+        }
+    }
+
+    fn launch(&self) -> Option<u64> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            return self.observer.as_ref().map(|observer| observer.launch());
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        None
+    }
+
+    fn complete(&self, sequence: Option<u64>) {
+        #[cfg(any(test, feature = "test-support"))]
+        if let (Some(observer), Some(sequence)) = (self.observer.as_ref(), sequence) {
+            observer.complete(sequence);
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = sequence;
+    }
+}
+
 /// Production actor-owned Pod deletion finalizer.
 ///
 /// Keeps bound-Pod finalization behind the focused `PodDeletionFinalizer`
@@ -51,6 +90,7 @@ pub struct RealPodDeletionFinalizer {
     mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    post_write_maintenance_observer: PostWriteMaintenanceObserverHandle,
 }
 
 pub struct RealPodDeletionFinalizerDependencies {
@@ -66,6 +106,7 @@ pub struct RealPodDeletionFinalizerDependencies {
     pub mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     pub metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
     pub supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    pub post_write_maintenance_observer: PostWriteMaintenanceObserverHandle,
 }
 
 impl RealPodDeletionFinalizer {
@@ -83,6 +124,7 @@ impl RealPodDeletionFinalizer {
             mutation_reconcile,
             metrics,
             supervisor,
+            post_write_maintenance_observer,
         } = dependencies;
         Self {
             pod_query,
@@ -97,6 +139,7 @@ impl RealPodDeletionFinalizer {
             mutation_reconcile,
             metrics,
             supervisor,
+            post_write_maintenance_observer,
         }
     }
 
@@ -104,7 +147,9 @@ impl RealPodDeletionFinalizer {
         let pdb_reconcile = self.pdb_reconcile.clone();
         let namespace_termination = self.namespace_termination.clone();
         let ns = namespace.to_string();
-        let _ = self
+        let completion = self.post_write_maintenance_observer.clone();
+        let completion_sequence = completion.launch();
+        let spawn_result = self
             .supervisor
             .spawn_async(
                 klights_supervisor::TaskCategory::Background,
@@ -130,9 +175,14 @@ impl RealPodDeletionFinalizer {
                             "post-write namespace termination reconcile failed"
                         );
                     }
+                    completion.complete(completion_sequence);
                 },
             )
             .await;
+        if spawn_result.is_err() {
+            self.post_write_maintenance_observer
+                .complete(completion_sequence);
+        }
     }
 
     async fn delete_status_checkpoint_after_finalization(&self, uid: &str) {
@@ -495,6 +545,7 @@ mod policy_tests {
             mutation_reconcile: Arc::new(NoopMutationReconcile),
             metrics: Arc::new(NoopMetrics),
             supervisor: supervisor.clone(),
+            post_write_maintenance_observer: PostWriteMaintenanceObserverHandle::default(),
         });
 
         let result = finalizer

@@ -47,6 +47,7 @@ impl Datastore {
                 data,
                 expected_rv,
                 preconditions,
+                preserve_status: _,
             } => {
                 let mut preconditions = preconditions;
                 if preconditions.resource_version.is_none() {

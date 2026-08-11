@@ -22,6 +22,11 @@ pub struct RedbOrdinaryResourceStore {
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
+struct ResourceUpdate {
+    data: Value,
+    preserve_status: bool,
+}
+
 impl RedbOrdinaryResourceStore {
     pub fn new(
         accessor: Arc<RedbAccessor>,
@@ -496,6 +501,56 @@ impl RedbOrdinaryResourceStore {
         data: Value,
         preconditions: ResourcePreconditions,
     ) -> Result<(Resource, Option<klights_cluster_store::StagedPostCommit>)> {
+        self.update_resource_with_preconditions_impl(
+            av,
+            kind,
+            ns,
+            name,
+            ResourceUpdate {
+                data,
+                preserve_status: false,
+            },
+            preconditions,
+        )
+        .await
+    }
+
+    pub async fn update_main_resource_with_preconditions(
+        &self,
+        av: &str,
+        kind: &str,
+        ns: Option<&str>,
+        name: &str,
+        data: Value,
+        preconditions: ResourcePreconditions,
+    ) -> Result<(Resource, Option<klights_cluster_store::StagedPostCommit>)> {
+        self.update_resource_with_preconditions_impl(
+            av,
+            kind,
+            ns,
+            name,
+            ResourceUpdate {
+                data,
+                preserve_status: true,
+            },
+            preconditions,
+        )
+        .await
+    }
+
+    async fn update_resource_with_preconditions_impl(
+        &self,
+        av: &str,
+        kind: &str,
+        ns: Option<&str>,
+        name: &str,
+        update: ResourceUpdate,
+        preconditions: ResourcePreconditions,
+    ) -> Result<(Resource, Option<klights_cluster_store::StagedPostCommit>)> {
+        let ResourceUpdate {
+            data,
+            preserve_status,
+        } = update;
         let key = resource_key(av, kind, ns, name);
         let av_owned = av.to_string();
         let kind_owned = kind.to_string();
@@ -535,6 +590,11 @@ impl RedbOrdinaryResourceStore {
                             &mut data,
                             &current,
                         );
+                        if preserve_status {
+                            klights_types::preserve_status_subresource_on_main_update(
+                                &av_o, &kind_o, &current, &mut data,
+                            );
+                        }
                         (cur_rv, old_body, current)
                     }
                 }

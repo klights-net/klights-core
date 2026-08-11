@@ -91,6 +91,7 @@ impl LeaderBootstrapStore {
             data: value,
             expected_rv: expected_resource_version,
             preconditions: ResourcePreconditions::resource_version(expected_resource_version),
+            preserve_status: false,
         })
         .await
     }
@@ -132,6 +133,7 @@ impl klights_kubelet::node_registration::NodeRegistrationStore for LeaderBootstr
             data: node,
             expected_rv,
             preconditions,
+            preserve_status: false,
         })
         .await
         .map(|_| ())
@@ -170,6 +172,7 @@ impl klights_kubelet::node_leader_labels::NodeLeaderLabelStore for LeaderBootstr
             data,
             expected_rv,
             preconditions,
+            preserve_status: false,
         })
         .await
         .map_err(anyhow::Error::new)

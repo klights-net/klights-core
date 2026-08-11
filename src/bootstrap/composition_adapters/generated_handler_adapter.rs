@@ -13,6 +13,8 @@ use k8s_native_service::ports::{GeneratedWatchPort, GeneratedWatchRequest};
 
 pub(crate) struct GeneratedHandlerAdapter {
     db: DatastoreHandle,
+    commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
+    namespace_bootstrap: super::leader_bootstrap_store_adapter::LeaderBootstrapStore,
     watch_source: Arc<super::watch_stream_adapter::DatastoreWatchStreamAdapter>,
     file_process: klights_supervisor::FileProcessExecutor,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
@@ -20,9 +22,23 @@ pub(crate) struct GeneratedHandlerAdapter {
     identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
 }
 
-impl GeneratedHandlerAdapter {
+pub(crate) struct GeneratedHandlerStorage {
+    db: DatastoreHandle,
+    commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
+}
+
+impl GeneratedHandlerStorage {
     pub(crate) fn new(
         db: DatastoreHandle,
+        commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
+    ) -> Self {
+        Self { db, commands }
+    }
+}
+
+impl GeneratedHandlerAdapter {
+    pub(crate) fn new(
+        storage: GeneratedHandlerStorage,
         watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
         positioned_watch: klights_watch::PositionedWatchService,
         file_process: klights_supervisor::FileProcessExecutor,
@@ -30,6 +46,7 @@ impl GeneratedHandlerAdapter {
         ca_cert_path: std::path::PathBuf,
         identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Arc<Self> {
+        let GeneratedHandlerStorage { db, commands } = storage;
         Arc::new(Self {
             watch_source: Arc::new(
                 super::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
@@ -38,7 +55,12 @@ impl GeneratedHandlerAdapter {
                     positioned_watch,
                 ),
             ),
+            namespace_bootstrap: super::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
+                db.clone(),
+                commands.clone(),
+            ),
             db,
+            commands,
             file_process,
             task_supervisor,
             ca_cert_path,
@@ -147,7 +169,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
     ) -> GenericCommandFuture<'_, Resource> {
         Box::pin(async move {
             crate::bootstrap::bootstrap_token::rotate_bootstrap_token_secret_for_get(
-                self.db.as_ref(),
+                &self.namespace_bootstrap,
                 &resource,
             )
             .await
@@ -168,7 +190,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
     fn create_default_service_account(&self, namespace: String) -> GenericCommandFuture<'_, ()> {
         Box::pin(async move {
             klights_controllers::namespace::create_default_service_account_at(
-                self.db.as_ref(),
+                &self.namespace_bootstrap,
                 &namespace,
                 chrono::Utc::now(),
                 self.identity.as_ref(),
@@ -187,7 +209,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
             .await
             .map_err(|error| AppError::Internal(error.to_string()))?;
             klights_controllers::namespace::create_kube_root_ca_configmap_at(
-                self.db.as_ref(),
+                &self.namespace_bootstrap,
                 &namespace,
                 &ca_cert_pem,
                 chrono::Utc::now(),
@@ -202,7 +224,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
         Box::pin(async move {
             klights_controllers::namespace::reconcile_kube_root_ca_data_with_path(
                 &self.file_process,
-                self.db.as_ref(),
+                &self.namespace_bootstrap,
                 &namespace,
                 &self.ca_cert_path,
                 chrono::Utc::now(),
@@ -217,7 +239,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
         Box::pin(async move {
             klights_controllers::namespace::reconcile_kube_root_ca_with_path(
                 &self.file_process,
-                self.db.as_ref(),
+                &self.namespace_bootstrap,
                 &namespace,
                 &self.ca_cert_path,
                 chrono::Utc::now(),
@@ -275,17 +297,33 @@ impl GeneratedResourceMutationPort for GeneratedHandlerAdapter {
         preconditions: klights_cluster_core::ResourcePreconditions,
     ) -> GenericCommandFuture<'_, Resource> {
         Box::pin(async move {
-            self.db
-                .update_main_resource_with_preconditions(
-                    &api_version,
-                    &kind,
-                    namespace.as_deref(),
-                    &name,
+            let expected_rv = preconditions.resource_version.unwrap_or_default();
+            let request = klights_leader_api::ResourceCommandRequest::try_new(
+                klights_cluster_core::StorageCommand::UpdateResource {
+                    api_version,
+                    kind,
+                    namespace,
+                    name,
                     data,
+                    expected_rv,
                     preconditions,
-                )
+                    preserve_status: true,
+                },
+            )
+            .map_err(AppError::from)?;
+            match self
+                .commands
+                .submit_resource_command(request)
                 .await
-                .map_err(AppError::from)
+                .map_err(AppError::from)?
+            {
+                klights_leader_api::ResourceCommandResult::Resource(resource) => Ok(resource),
+                klights_leader_api::ResourceCommandResult::Ack { .. } => {
+                    Err(AppError::InternalError(
+                        "generated resource update returned no resource".to_string(),
+                    ))
+                }
+            }
         })
     }
 }

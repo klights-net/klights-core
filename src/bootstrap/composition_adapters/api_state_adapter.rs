@@ -31,11 +31,96 @@ fn validate_pod_effect_authority() -> Result<(), klights_pod_api::PodRepositoryE
 
 pub(crate) struct RootNamespaceTerminationStore {
     inner: DatastoreHandle,
+    commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
 }
 
 impl RootNamespaceTerminationStore {
+    #[cfg(any(
+        test,
+        feature = "native-api-test-support",
+        feature = "pod-repository-test-support"
+    ))]
     pub(crate) fn new(inner: DatastoreHandle) -> Arc<Self> {
-        Arc::new(Self { inner })
+        let authority = super::authority_adapter::always_leader_watch();
+        let query = super::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+            inner.clone(),
+            authority.clone(),
+        );
+        let commands = Arc::new(
+            klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
+                Arc::new(
+                    crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                        inner.clone(),
+                    ),
+                ),
+                query,
+                authority,
+            ),
+        );
+        Self::new_with_commands(inner, commands)
+    }
+
+    pub(crate) fn new_with_commands(
+        inner: DatastoreHandle,
+        commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
+    ) -> Arc<Self> {
+        Arc::new(Self { inner, commands })
+    }
+
+    async fn submit_resource(
+        &self,
+        command: klights_cluster_core::StorageCommand,
+    ) -> Result<Resource, klights_reconcile_api::NamespaceLifecycleError> {
+        let request = klights_leader_api::ResourceCommandRequest::try_new(command)
+            .map_err(map_namespace_command_error)?;
+        match self
+            .commands
+            .submit_resource_command(request)
+            .await
+            .map_err(map_namespace_command_error)?
+        {
+            klights_leader_api::ResourceCommandResult::Resource(resource) => Ok(resource),
+            klights_leader_api::ResourceCommandResult::Ack { .. } => {
+                Err(klights_reconcile_api::NamespaceLifecycleError::Internal {
+                    message: "namespace mutation returned no resource".to_string(),
+                })
+            }
+        }
+    }
+
+    async fn submit_ack(
+        &self,
+        command: klights_cluster_core::StorageCommand,
+    ) -> Result<(), klights_reconcile_api::NamespaceLifecycleError> {
+        let request = klights_leader_api::ResourceCommandRequest::try_new(command)
+            .map_err(map_namespace_command_error)?;
+        self.commands
+            .submit_resource_command(request)
+            .await
+            .map(|_| ())
+            .map_err(map_namespace_command_error)
+    }
+}
+
+fn map_namespace_command_error(
+    error: klights_leader_api::ResourceCommandError,
+) -> klights_reconcile_api::NamespaceLifecycleError {
+    let message = error.to_string();
+    match error {
+        klights_leader_api::ResourceCommandError::NotFound { .. } => {
+            klights_reconcile_api::NamespaceLifecycleError::NotFound { message }
+        }
+        klights_leader_api::ResourceCommandError::AlreadyExists { .. }
+        | klights_leader_api::ResourceCommandError::Conflict { .. } => {
+            klights_reconcile_api::NamespaceLifecycleError::Conflict { message }
+        }
+        klights_leader_api::ResourceCommandError::NotLeader
+        | klights_leader_api::ResourceCommandError::Retryable { .. }
+        | klights_leader_api::ResourceCommandError::Timeout
+        | klights_leader_api::ResourceCommandError::Cancelled => {
+            klights_reconcile_api::NamespaceLifecycleError::Unavailable { message }
+        }
+        _ => klights_reconcile_api::NamespaceLifecycleError::Internal { message },
     }
 }
 
@@ -89,17 +174,17 @@ impl klights_reconcile_api::NamespaceLifecycleStore for RootNamespaceTermination
                     message: error.to_string(),
                 }
             })?;
-            self.inner
-                .update_resource_with_preconditions(
-                    &pod.api_version,
-                    &pod.kind,
-                    Some(&namespace),
-                    &pod.name,
-                    body,
-                    klights_cluster_core::ResourcePreconditions::from_resource(&pod),
-                )
-                .await
-                .map_err(map_namespace_lifecycle_error)?;
+            self.submit_resource(klights_cluster_core::StorageCommand::UpdateResource {
+                api_version: pod.api_version.clone(),
+                kind: pod.kind.clone(),
+                namespace: Some(namespace),
+                name: pod.name.clone(),
+                data: body,
+                expected_rv: pod.resource_version,
+                preconditions: klights_cluster_core::ResourcePreconditions::from_resource(&pod),
+                preserve_status: false,
+            })
+            .await?;
             Ok(())
         })
     }
@@ -116,10 +201,12 @@ impl klights_reconcile_api::NamespaceLifecycleStore for RootNamespaceTermination
                     message: error.to_string(),
                 }
             })?;
-            self.inner
-                .update_namespace(&namespace, body, expected_resource_version)
-                .await
-                .map_err(map_namespace_lifecycle_error)
+            self.submit_resource(klights_cluster_core::StorageCommand::UpdateNamespace {
+                name: namespace,
+                data: body,
+                expected_rv: expected_resource_version,
+            })
+            .await
         })
     }
 
@@ -146,15 +233,16 @@ impl klights_reconcile_api::NamespaceLifecycleStore for RootNamespaceTermination
                     message: error.to_string(),
                 }
             })?;
-            self.inner
-                .delete_resource(
-                    &resource.api_version,
-                    &resource.kind,
-                    Some(&namespace),
-                    &resource.name,
-                )
-                .await
-                .map_err(map_namespace_lifecycle_error)
+            self.submit_ack(klights_cluster_core::StorageCommand::DeleteResource {
+                api_version: resource.api_version.clone(),
+                kind: resource.kind.clone(),
+                namespace: Some(namespace),
+                name: resource.name.clone(),
+                preconditions: klights_cluster_core::ResourcePreconditions::from_resource(
+                    &resource,
+                ),
+            })
+            .await
         })
     }
 
@@ -180,10 +268,10 @@ impl klights_reconcile_api::NamespaceLifecycleStore for RootNamespaceTermination
                     message: error.to_string(),
                 }
             })?;
-            self.inner
-                .delete_namespace(&namespace)
-                .await
-                .map_err(map_namespace_lifecycle_error)
+            self.submit_ack(klights_cluster_core::StorageCommand::DeleteNamespace {
+                name: namespace,
+            })
+            .await
         })
     }
 }

@@ -203,6 +203,8 @@ pub struct ProtoUpdateResource {
     pub expected_rv: i64,
     #[prost(message, optional, tag = "7")]
     pub preconditions: Option<ProtoResourcePreconditions>,
+    #[prost(bool, tag = "8")]
+    pub preserve_status: bool,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

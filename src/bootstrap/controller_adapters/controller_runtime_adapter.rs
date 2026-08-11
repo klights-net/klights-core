@@ -25,6 +25,14 @@ pub(crate) struct RootControllerLeaderPort {
 impl RootControllerLeaderPort {
     #[cfg(any(test, feature = "native-api-test-support"))]
     pub(crate) fn new(store: DatastoreHandle) -> Self {
+        let commands = Self::resource_commands_for_test(store.clone());
+        Self { store, commands }
+    }
+
+    #[cfg(any(test, feature = "native-api-test-support"))]
+    pub(crate) fn resource_commands_for_test(
+        store: DatastoreHandle,
+    ) -> Arc<dyn klights_leader_api::LeaderResourceCommand> {
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
         let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
@@ -34,12 +42,11 @@ impl RootControllerLeaderPort {
         let proposal = Arc::new(
             crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(store.clone()),
         );
-        let commands = Arc::new(
+        Arc::new(
             klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                 proposal, query, authority,
             ),
-        );
-        Self { store, commands }
+        )
     }
 
     pub(crate) fn new_with_commands(
@@ -186,6 +193,7 @@ impl klights_controllers::gc::GcResourceStore for RootControllerLeaderPort {
             data,
             expected_rv: preconditions.resource_version.unwrap_or_default(),
             preconditions,
+            preserve_status: false,
         })
         .await
     }
@@ -208,6 +216,7 @@ impl klights_controllers::gc::GcResourceStore for RootControllerLeaderPort {
             data,
             expected_rv: preconditions.resource_version.unwrap_or_default(),
             preconditions,
+            preserve_status: true,
         })
         .await
     }
@@ -528,6 +537,7 @@ impl klights_controllers::service::ServiceReconcileStore for RootControllerLeade
             data,
             expected_rv: preconditions.resource_version.unwrap_or_default(),
             preconditions,
+            preserve_status: false,
         })
         .await
     }
@@ -610,6 +620,7 @@ impl klights_controllers::endpoints::EndpointReconcileStore for RootControllerLe
             data,
             expected_rv: preconditions.resource_version.unwrap_or_default(),
             preconditions,
+            preserve_status: false,
         })
         .await
     }
@@ -742,6 +753,7 @@ impl klights_controllers::pvc::PvcStore for RootControllerLeaderPort {
             data: value,
             expected_rv: preconditions.resource_version.unwrap_or_default(),
             preconditions,
+            preserve_status: false,
         })
         .await
     }

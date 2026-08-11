@@ -57,6 +57,7 @@ impl SchedulerBindGateForTest {
 pub(crate) struct RootPodNativeAdapter {
     store: Arc<PodStore>,
     db: DatastoreHandle,
+    event_effect: crate::bootstrap::composition_adapters::pod_event_adapter::LeaderPodEventEffect,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
     #[cfg(any(test, feature = "pod-repository-test-support"))]
     scheduler_bind_gate: Option<Arc<SchedulerBindGateForTest>>,
@@ -66,6 +67,7 @@ impl RootPodNativeAdapter {
     pub(crate) fn new(
         store: Arc<PodStore>,
         db: DatastoreHandle,
+        resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
         #[cfg(any(test, feature = "pod-repository-test-support"))] scheduler_bind_gate: Option<
             Arc<SchedulerBindGateForTest>,
@@ -74,6 +76,10 @@ impl RootPodNativeAdapter {
         Arc::new(Self {
             store,
             db,
+            event_effect:
+                crate::bootstrap::composition_adapters::pod_event_adapter::LeaderPodEventEffect::new(
+                    resource_commands,
+                ),
             wall_clock,
             #[cfg(any(test, feature = "pod-repository-test-support"))]
             scheduler_bind_gate,
@@ -220,7 +226,7 @@ impl PodControlPlaneEventSink for RootPodNativeAdapter {
             );
             klights_kubelet::pod_events::emit_control_plane_pod_event(
                 &adapter,
-                &adapter,
+                &self.event_effect,
                 klights_kubelet::pod_events::PodEventRecord {
                     pod: request.pod.as_ref(),
                     reason: &request.reason,

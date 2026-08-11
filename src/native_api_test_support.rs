@@ -287,10 +287,10 @@ pub async fn mark_foreground_deletion_for_integration(
     initial_resource: klights_cluster_core::Resource,
     delete_preconditions: klights_cluster_core::ResourcePreconditions,
 ) -> Result<klights_cluster_core::Resource, k8s_native_service::AppError> {
-    let lifecycle =
-        crate::bootstrap::finalizer_lifecycle_adapter::BorrowedFinalizerLifecycleStore::new(
-            db.as_ref(),
-        );
+    let lifecycle = crate::bootstrap::finalizer_lifecycle_adapter::CommandFinalizerLifecycleStore::new(
+        db.clone(),
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(db),
+    );
     k8s_native_service::generic_command::mark_foreground_deletion_with_retry(
         &lifecycle,
         target.api_version,
@@ -308,10 +308,10 @@ pub async fn complete_non_foreground_delete_for_integration(
     db: IntegrationDatastoreHandle,
     request: k8s_native_service::generic_command::NonForegroundDeleteRequest<'_>,
 ) -> Result<k8s_native_service::generic_command::DeleteCompletion, k8s_native_service::AppError> {
-    let lifecycle =
-        crate::bootstrap::finalizer_lifecycle_adapter::BorrowedFinalizerLifecycleStore::new(
-            db.as_ref(),
-        );
+    let lifecycle = crate::bootstrap::finalizer_lifecycle_adapter::CommandFinalizerLifecycleStore::new(
+        db.clone(),
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(db),
+    );
     k8s_native_service::generic_command::complete_non_foreground_delete_with_live_recheck(
         &lifecycle, request,
     )
@@ -331,10 +331,10 @@ pub async fn delete_collection_listed_resource_for_integration(
         db.clone(),
         leader_rx,
     );
-    let lifecycle =
-        crate::bootstrap::finalizer_lifecycle_adapter::BorrowedFinalizerLifecycleStore::new(
-            db.as_ref(),
-        );
+    let lifecycle = crate::bootstrap::finalizer_lifecycle_adapter::CommandFinalizerLifecycleStore::new(
+        db.clone(),
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(db),
+    );
     let strategy = k8s_native_service::generic_command::FinalizerAwareDeleteStrategy {
         resource_query: &resource_query,
         lifecycle: &lifecycle,
@@ -1328,6 +1328,7 @@ impl NativeApiTestHarness {
         let finalizer_lifecycle = crate::bootstrap::finalizer_lifecycle_adapter::
             DatastoreFinalizerLifecycleAdapter::new_with_coordination(
                 datastore.clone(),
+                resource_command.clone(),
                 gc_delete.clone(),
                 side_effects.clone(),
                 metrics.clone(),
@@ -1347,7 +1348,10 @@ impl NativeApiTestHarness {
             );
         let watch_signals = crate::bootstrap::watch_commit_wiring::test_signal_source(&datastore);
         let generated = crate::bootstrap::composition_adapters::generated_handler_adapter::GeneratedHandlerAdapter::new(
-            datastore.clone(),
+            crate::bootstrap::composition_adapters::generated_handler_adapter::GeneratedHandlerStorage::new(
+                datastore.clone(),
+                crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(datastore.clone()),
+            ),
             watch_signals.clone(),
             positioned_watch.clone(),
             klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
@@ -1538,7 +1542,7 @@ impl NativeApiTestHarness {
             ),
             crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(datastore.clone()),
             resource_query,
-            resource_command,
+            resource_command.clone(),
             finalizer_lifecycle,
             mutation_effects,
             crate::bootstrap::composition_adapters::list_query_adapter::DatastoreListResourceVersionPort::new(datastore.clone()),
@@ -1563,6 +1567,7 @@ impl NativeApiTestHarness {
             Arc::new(
                 crate::bootstrap::controller_adapters::gc_delete_adapter::GcOwnerLifecycleAdapter::new_with_coordination(
                     datastore.clone(),
+                    resource_command,
                     gc_delete.clone(),
                     gc_coordination,
                 ),

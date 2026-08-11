@@ -100,6 +100,27 @@ impl RedbResourceStore {
             .await
     }
 
+    pub async fn update_main_res_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: Value,
+        preconditions: ResourcePreconditions,
+    ) -> Result<(Resource, Option<klights_cluster_store::StagedPostCommit>)> {
+        self.ordinary
+            .update_main_resource_with_preconditions(
+                api_version,
+                kind,
+                namespace,
+                name,
+                data,
+                preconditions,
+            )
+            .await
+    }
+
     pub async fn delete_res(
         &self,
         api_version: &str,

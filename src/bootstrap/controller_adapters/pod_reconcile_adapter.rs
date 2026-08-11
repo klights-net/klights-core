@@ -20,6 +20,8 @@ use klights_controllers::side_effects::ControllerDispatcherSlot;
 
 pub(crate) struct PodReconcileAdapter {
     db: DatastoreHandle,
+    controller_store: std::sync::Arc<super::controller_runtime_adapter::RootControllerLeaderPort>,
+    namespace_bootstrap: crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore,
     namespace_lifecycle: std::sync::Arc<dyn klights_reconcile_api::NamespaceLifecycleStore>,
     dispatcher: ControllerDispatcherSlot,
     metrics: std::sync::Arc<klights_controllers::side_effects::SideEffectMetrics>,
@@ -29,6 +31,23 @@ pub(crate) struct PodReconcileAdapter {
         crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter,
     coordination: std::sync::Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
     identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
+}
+
+pub(crate) struct PodReconcileStorage {
+    db: DatastoreHandle,
+    resource_commands: std::sync::Arc<dyn klights_leader_api::LeaderResourceCommand>,
+}
+
+impl PodReconcileStorage {
+    pub(crate) fn new(
+        db: DatastoreHandle,
+        resource_commands: std::sync::Arc<dyn klights_leader_api::LeaderResourceCommand>,
+    ) -> Self {
+        Self {
+            db,
+            resource_commands,
+        }
+    }
 }
 
 impl PodReconcileAdapter {
@@ -41,8 +60,12 @@ impl PodReconcileAdapter {
         pod_reader: std::sync::Arc<dyn klights_pod_api::PodQuery>,
         identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Self {
+        let resource_commands =
+            super::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
+                db.clone(),
+            );
         Self::new_with_coordination(
-            db,
+            PodReconcileStorage::new(db, resource_commands),
             dispatcher,
             metrics,
             side_effects,
@@ -53,7 +76,7 @@ impl PodReconcileAdapter {
     }
 
     pub(crate) fn new_with_coordination(
-        db: DatastoreHandle,
+        storage: PodReconcileStorage,
         dispatcher: ControllerDispatcherSlot,
         metrics: std::sync::Arc<klights_controllers::side_effects::SideEffectMetrics>,
         side_effects: std::sync::Arc<klights_controllers::side_effects::SideEffectRegistry>,
@@ -61,18 +84,29 @@ impl PodReconcileAdapter {
         coordination: std::sync::Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
         identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Self {
+        let PodReconcileStorage {
+            db,
+            resource_commands,
+        } = storage;
+        let controller_store = std::sync::Arc::new(
+            super::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
+                db.clone(),
+                resource_commands.clone(),
+            ),
+        );
         Self {
-            non_pod_finalization: crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
-                db.clone(),
+            non_pod_finalization: crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new_with_commands(
+                db.clone(), resource_commands.clone(),
             ),
-            #[cfg(not(test))]
-            namespace_lifecycle: crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(
+            namespace_lifecycle: crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new_with_commands(
                 db.clone(),
+                resource_commands.clone(),
             ),
-            #[cfg(test)]
-            namespace_lifecycle: crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(
+            namespace_bootstrap: crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
                 db.clone(),
+                resource_commands,
             ),
+            controller_store,
             db,
             dispatcher,
             metrics,
@@ -293,7 +327,7 @@ impl NamespaceBootstrapSink for PodReconcileAdapter {
     fn create_default_service_account(&self, namespace: String) -> ReconcileSinkFuture<'_> {
         Box::pin(async move {
             klights_controllers::namespace::create_default_service_account_at(
-                self.db.as_ref(),
+                &self.namespace_bootstrap,
                 &namespace,
                 chrono::Utc::now(),
                 self.identity.as_ref(),
@@ -310,7 +344,7 @@ impl NamespaceBootstrapSink for PodReconcileAdapter {
     ) -> ReconcileSinkFuture<'_> {
         Box::pin(async move {
             klights_controllers::namespace::create_kube_root_ca_configmap_at(
-                self.db.as_ref(),
+                &self.namespace_bootstrap,
                 &namespace,
                 &ca_certificate,
                 chrono::Utc::now(),
@@ -330,7 +364,7 @@ impl PodGcReconcileSink for PodReconcileAdapter {
     ) -> ReconcileSinkFuture<'a> {
         Box::pin(async move {
             klights_controllers::gc::reconcile_owner_references(
-                self.db.as_ref(),
+                self.controller_store.as_ref(),
                 pod,
                 pod_delete_sink,
                 &self.non_pod_finalization,
@@ -349,7 +383,7 @@ impl PodGcReconcileSink for PodReconcileAdapter {
     ) -> ReconcileSinkFuture<'a> {
         Box::pin(async move {
             klights_controllers::gc::cascade_delete_with_uid(
-                self.db.as_ref(),
+                self.controller_store.as_ref(),
                 &owner.uid,
                 "v1",
                 &owner.name,
@@ -371,7 +405,7 @@ impl PodGcReconcileSink for PodReconcileAdapter {
     ) -> ReconcileSinkFuture<'a> {
         Box::pin(async move {
             klights_controllers::gc::finalize_foreground_owners_after_dependent_delete(
-                self.db.as_ref(),
+                self.controller_store.as_ref(),
                 &deleted_dependent,
                 pod_delete_sink,
                 &self.non_pod_finalization,
@@ -388,7 +422,7 @@ impl PodPdbReconcileSink for PodReconcileAdapter {
         Box::pin(async move {
             let now = chrono::Utc::now();
             klights_controllers::pdb::reconcile_pdbs_for_namespace(
-                self.db.as_ref(),
+                self.controller_store.as_ref(),
                 self.pod_reader.as_ref(),
                 &namespace,
                 now,
@@ -410,7 +444,7 @@ impl PodEvictionAdmissionSink for PodReconcileAdapter {
                 ReconcileSinkError::unavailable("stored Pod is missing metadata.namespace")
             })?;
             klights_controllers::pdb::reconcile_pdbs_for_namespace_checked(
-                self.db.as_ref(),
+                self.controller_store.as_ref(),
                 self.pod_reader.as_ref(),
                 namespace,
                 now,
@@ -418,7 +452,7 @@ impl PodEvictionAdmissionSink for PodReconcileAdapter {
             .await
             .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))?;
             klights_controllers::pdb::admit_pod_eviction_at(
-                self.db.as_ref(),
+                self.controller_store.as_ref(),
                 &request.pod,
                 request.dry_run,
                 now,
@@ -430,19 +464,19 @@ impl PodEvictionAdmissionSink for PodReconcileAdapter {
 }
 
 pub(crate) struct PersistentVolumeReconcileAdapter<'a> {
-    db: &'a dyn crate::datastore::DatastoreBackend,
+    store: &'a dyn klights_controllers::pvc::PvcStore,
     file_process: &'a klights_supervisor::FileProcessExecutor,
     local_path_provisioner_root: &'a std::path::Path,
 }
 
 impl<'a> PersistentVolumeReconcileAdapter<'a> {
     pub(crate) fn new(
-        db: &'a dyn crate::datastore::DatastoreBackend,
+        store: &'a dyn klights_controllers::pvc::PvcStore,
         file_process: &'a klights_supervisor::FileProcessExecutor,
         local_path_provisioner_root: &'a std::path::Path,
     ) -> Self {
         Self {
-            db,
+            store,
             file_process,
             local_path_provisioner_root,
         }
@@ -455,7 +489,7 @@ impl PvcReconcileSink for PersistentVolumeReconcileAdapter<'_> {
             let updated = klights_controllers::pvc::reconcile_pvc(
                 self.file_process,
                 self.local_path_provisioner_root,
-                self.db,
+                self.store,
                 &pvc.data,
             )
             .await

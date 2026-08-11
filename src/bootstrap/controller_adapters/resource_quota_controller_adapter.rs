@@ -12,6 +12,7 @@ use klights_controllers::resource_quota::{
 
 struct ResourceQuotaControllerAdapter<'a> {
     db: &'a dyn DatastoreBackend,
+    status_store: &'a dyn klights_controllers::common::ControllerStatusStore,
     pod_query: &'a dyn PodQuery,
 }
 
@@ -56,7 +57,7 @@ impl ResourceQuotaRuntime for ResourceQuotaControllerAdapter<'_> {
         resource: &Resource,
         status: &Value,
     ) -> klights_reconcile_api::ControllerStoreResult<()> {
-        klights_controllers::common::write_status_for_resource(self.db, resource, status)
+        klights_controllers::common::write_status_for_resource(self.status_store, resource, status)
             .await
             .map(|_| ())
             .map_err(map_controller_store_error)
@@ -65,11 +66,16 @@ impl ResourceQuotaRuntime for ResourceQuotaControllerAdapter<'_> {
 
 pub async fn reconcile_resource_quotas_for_namespace(
     db: &dyn DatastoreBackend,
+    status_store: &dyn klights_controllers::common::ControllerStatusStore,
     pod_query: &dyn PodQuery,
     namespace: &str,
 ) -> Result<()> {
     reconcile_resource_quotas_with_runtime(
-        &ResourceQuotaControllerAdapter { db, pod_query },
+        &ResourceQuotaControllerAdapter {
+            db,
+            status_store,
+            pod_query,
+        },
         namespace,
     )
     .await

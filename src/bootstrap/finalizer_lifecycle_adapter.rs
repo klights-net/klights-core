@@ -6,12 +6,14 @@ use klights_reconcile_api::{
     FinalizerTombstoneDeleteRequest, FinalizerUpdateRequest, GcPodDeleteSink,
 };
 
-use crate::datastore::DatastoreBackend;
+use klights_cluster_core::StorageCommand;
+use klights_leader_api::{LeaderResourceCommand, ResourceCommandRequest, ResourceCommandResult};
+
 use crate::datastore::DatastoreHandle;
 use klights_cluster_datastore::errors::DatastoreError;
 
 pub(crate) struct DatastoreFinalizerLifecycleAdapter {
-    db: DatastoreHandle,
+    lifecycle: CommandFinalizerLifecycleStore,
     pod_delete_sink: Arc<dyn GcPodDeleteSink>,
     side_effects: Arc<klights_controllers::side_effects::SideEffectRegistry>,
     metrics: Arc<klights_controllers::side_effects::SideEffectMetrics>,
@@ -28,8 +30,10 @@ impl DatastoreFinalizerLifecycleAdapter {
         side_effects: Arc<klights_controllers::side_effects::SideEffectRegistry>,
         metrics: Arc<klights_controllers::side_effects::SideEffectMetrics>,
     ) -> Arc<Self> {
+        let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(db.clone());
         Self::new_with_coordination(
             db,
+            commands,
             pod_delete_sink,
             side_effects,
             metrics,
@@ -39,21 +43,77 @@ impl DatastoreFinalizerLifecycleAdapter {
 
     pub(crate) fn new_with_coordination(
         db: DatastoreHandle,
+        resource_commands: Arc<dyn LeaderResourceCommand>,
         pod_delete_sink: Arc<dyn GcPodDeleteSink>,
         side_effects: Arc<klights_controllers::side_effects::SideEffectRegistry>,
         metrics: Arc<klights_controllers::side_effects::SideEffectMetrics>,
         coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            non_pod_finalization: crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
-                db.clone(),
+            non_pod_finalization: crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new_with_commands(
+                db.clone(), resource_commands.clone(),
             ),
-            db,
+            lifecycle: CommandFinalizerLifecycleStore::new(db, resource_commands),
             pod_delete_sink,
             side_effects,
             metrics,
             coordination,
         })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CommandFinalizerLifecycleStore {
+    db: DatastoreHandle,
+    commands: Arc<dyn LeaderResourceCommand>,
+    gc: Arc<
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort,
+    >,
+}
+
+impl CommandFinalizerLifecycleStore {
+    pub(crate) fn new(db: DatastoreHandle, commands: Arc<dyn LeaderResourceCommand>) -> Self {
+        Self {
+            gc: Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
+                db.clone(), commands.clone(),
+            )),
+            db,
+            commands,
+        }
+    }
+
+    async fn submit(
+        &self,
+        command: StorageCommand,
+    ) -> Result<klights_cluster_core::Resource, FinalizerLifecycleError> {
+        let request = ResourceCommandRequest::try_new(command).map_err(command_lifecycle_error)?;
+        match self
+            .commands
+            .submit_resource_command(request)
+            .await
+            .map_err(command_lifecycle_error)?
+        {
+            ResourceCommandResult::Resource(resource) => Ok(resource),
+            ResourceCommandResult::Ack { .. } => Err(FinalizerLifecycleError::Internal(
+                "finalizer mutation returned no resource".to_string(),
+            )),
+        }
+    }
+}
+
+fn command_lifecycle_error(
+    error: klights_leader_api::ResourceCommandError,
+) -> FinalizerLifecycleError {
+    let message = error.to_string();
+    match error {
+        klights_leader_api::ResourceCommandError::NotFound { .. } => {
+            FinalizerLifecycleError::NotFound(message)
+        }
+        klights_leader_api::ResourceCommandError::AlreadyExists { .. }
+        | klights_leader_api::ResourceCommandError::Conflict { .. } => {
+            FinalizerLifecycleError::Conflict(message)
+        }
+        _ => FinalizerLifecycleError::Internal(message),
     }
 }
 
@@ -89,68 +149,25 @@ impl FinalizerLifecyclePort for DatastoreFinalizerLifecycleAdapter {
         &self,
         target: FinalizerResourceTarget,
     ) -> FinalizerLifecycleFuture<'_, Option<klights_cluster_core::Resource>> {
-        Box::pin(async move {
-            let (api_version, kind, namespace, name) = target_parts(&target);
-            self.db
-                .get_resource(api_version, kind, namespace, name)
-                .await
-                .map_err(lifecycle_error)
-        })
+        Box::pin(async move { self.lifecycle.get_resource(target).await })
     }
 
     fn update_resource(
         &self,
         request: FinalizerUpdateRequest,
     ) -> FinalizerLifecycleFuture<'_, klights_cluster_core::Resource> {
-        Box::pin(async move {
-            let (api_version, kind, namespace, name) = target_parts(&request.target);
-            self.db
-                .update_resource_with_preconditions(
-                    api_version,
-                    kind,
-                    namespace,
-                    name,
-                    request.data,
-                    request.preconditions,
-                )
-                .await
-                .map_err(lifecycle_error)
-        })
+        Box::pin(async move { self.lifecycle.update_resource(request).await })
     }
 
     fn delete_with_tombstone(
         &self,
         request: FinalizerTombstoneDeleteRequest,
     ) -> FinalizerLifecycleFuture<'_, klights_cluster_core::Resource> {
-        Box::pin(async move {
-            let (api_version, kind, namespace, name) = target_parts(&request.target);
-            self.db
-                .delete_resource_without_watch_with_tombstone(
-                    api_version,
-                    kind,
-                    namespace,
-                    name,
-                    request.preconditions,
-                    request.grace_seconds,
-                )
-                .await
-                .map_err(lifecycle_error)
-        })
+        Box::pin(async move { self.lifecycle.delete_with_tombstone(request).await })
     }
 
     fn orphan_children(&self, request: FinalizerOrphanRequest) -> FinalizerLifecycleFuture<'_, ()> {
-        Box::pin(async move {
-            klights_controllers::gc::orphan_children(
-                self.db.as_ref(),
-                &request.owner_uid,
-                request.target.api_version(),
-                request.target.name(),
-                request.target.kind(),
-                request.target.namespace().map(str::to_string),
-            )
-            .await
-            .map_err(|error| FinalizerLifecycleError::Internal(error.to_string()))
-        })
+        Box::pin(async move { self.lifecycle.orphan_children(request).await })
     }
 
     fn run_finalized_effects(
@@ -160,7 +177,7 @@ impl FinalizerLifecyclePort for DatastoreFinalizerLifecycleAdapter {
         Box::pin(async move {
             let resource = request.resource;
             if let Err(error) = klights_controllers::gc::cascade_delete_with_uid(
-                self.db.as_ref(),
+                self.lifecycle.gc.as_ref(),
                 &resource.uid,
                 &resource.api_version,
                 &resource.name,
@@ -188,17 +205,7 @@ impl FinalizerLifecyclePort for DatastoreFinalizerLifecycleAdapter {
     }
 }
 
-pub(crate) struct BorrowedFinalizerLifecycleStore<'a> {
-    db: &'a dyn DatastoreBackend,
-}
-
-impl<'a> BorrowedFinalizerLifecycleStore<'a> {
-    pub(crate) fn new(db: &'a dyn DatastoreBackend) -> Self {
-        Self { db }
-    }
-}
-
-impl FinalizerLifecyclePort for BorrowedFinalizerLifecycleStore<'_> {
+impl FinalizerLifecyclePort for CommandFinalizerLifecycleStore {
     fn get_resource(
         &self,
         target: FinalizerResourceTarget,
@@ -218,17 +225,18 @@ impl FinalizerLifecyclePort for BorrowedFinalizerLifecycleStore<'_> {
     ) -> FinalizerLifecycleFuture<'_, klights_cluster_core::Resource> {
         Box::pin(async move {
             let (api_version, kind, namespace, name) = target_parts(&request.target);
-            self.db
-                .update_resource_with_preconditions(
-                    api_version,
-                    kind,
-                    namespace,
-                    name,
-                    request.data,
-                    request.preconditions,
-                )
-                .await
-                .map_err(lifecycle_error)
+            let expected_rv = request.preconditions.resource_version.unwrap_or_default();
+            self.submit(StorageCommand::UpdateResource {
+                api_version: api_version.to_string(),
+                kind: kind.to_string(),
+                namespace: namespace.map(str::to_string),
+                name: name.to_string(),
+                data: request.data,
+                expected_rv,
+                preconditions: request.preconditions,
+                preserve_status: false,
+            })
+            .await
         })
     }
 
@@ -238,24 +246,22 @@ impl FinalizerLifecyclePort for BorrowedFinalizerLifecycleStore<'_> {
     ) -> FinalizerLifecycleFuture<'_, klights_cluster_core::Resource> {
         Box::pin(async move {
             let (api_version, kind, namespace, name) = target_parts(&request.target);
-            self.db
-                .delete_resource_without_watch_with_tombstone(
-                    api_version,
-                    kind,
-                    namespace,
-                    name,
-                    request.preconditions,
-                    request.grace_seconds,
-                )
-                .await
-                .map_err(lifecycle_error)
+            self.submit(StorageCommand::DeleteResourceWithTombstone {
+                api_version: api_version.to_string(),
+                kind: kind.to_string(),
+                namespace: namespace.map(str::to_string),
+                name: name.to_string(),
+                preconditions: request.preconditions,
+                grace_seconds: request.grace_seconds,
+            })
+            .await
         })
     }
 
     fn orphan_children(&self, request: FinalizerOrphanRequest) -> FinalizerLifecycleFuture<'_, ()> {
         Box::pin(async move {
             klights_controllers::gc::orphan_children(
-                self.db,
+                self.gc.as_ref(),
                 &request.owner_uid,
                 request.target.api_version(),
                 request.target.name(),
@@ -273,7 +279,7 @@ impl FinalizerLifecyclePort for BorrowedFinalizerLifecycleStore<'_> {
     ) -> FinalizerLifecycleFuture<'_, ()> {
         Box::pin(async {
             Err(FinalizerLifecycleError::Internal(
-                "borrowed finalizer store has no post-delete effects".to_string(),
+                "command finalizer store has no post-delete effects".to_string(),
             ))
         })
     }

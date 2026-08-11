@@ -26,6 +26,25 @@ impl IntegrationRaftComposition {
         )
     }
 
+    fn resource_commands(
+        &self,
+        node: Arc<klights_replication::node::RaftNode>,
+    ) -> Arc<dyn klights_leader_api::LeaderResourceCommand> {
+        let db: IntegrationDatastoreHandle = self.db.clone();
+        let authority =
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+            db, authority.clone(),
+        );
+        Arc::new(
+            klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
+                node.proposal(),
+                query,
+                authority,
+            ),
+        )
+    }
+
     pub fn commit_materializer(
         &self,
     ) -> Arc<dyn klights_replication::materializer::RaftCommitMaterializer> {
@@ -192,6 +211,60 @@ impl IntegrationRaftComposition {
             serde_json::json!({"conditions": [{"type": "Approved", "status": "True"}]}),
         )
         .await
+    }
+
+    pub async fn create_namespace_defaults_through_root_adapters(
+        &self,
+        node: Arc<klights_replication::node::RaftNode>,
+        namespace: &str,
+    ) -> anyhow::Result<()> {
+        let identity =
+            crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity();
+        let store = crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
+            self.db.clone(),
+            self.resource_commands(node),
+        );
+        klights_controllers::namespace::create_default_service_account_at(
+            &store,
+            namespace,
+            chrono::Utc::now(),
+            identity.as_ref(),
+        )
+        .await?;
+        klights_controllers::namespace::create_kube_root_ca_configmap_at(
+            &store,
+            namespace,
+            "test-cluster-ca",
+            chrono::Utc::now(),
+            identity.as_ref(),
+        )
+        .await
+    }
+
+    pub async fn reconcile_namespace_termination_through_root_adapters(
+        &self,
+        node: Arc<klights_replication::node::RaftNode>,
+        namespace: &str,
+        namespace_uid: &str,
+    ) -> anyhow::Result<bool> {
+        let db: IntegrationDatastoreHandle = self.db.clone();
+        let store = crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new_with_commands(
+            db,
+            self.resource_commands(node),
+        );
+        let outcome = k8s_native_service::reconcile_namespace_termination_for_uid_with_outcome_at(
+            store.as_ref(),
+            namespace,
+            namespace_uid,
+            klights_controllers::side_effects::SideEffectMetrics::new().as_ref(),
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        Ok(matches!(
+            outcome,
+            k8s_native_service::NamespaceTerminationOutcome::Finalized
+        ))
     }
 
     pub async fn read_cluster_membership(

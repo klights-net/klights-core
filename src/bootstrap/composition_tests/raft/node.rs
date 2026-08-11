@@ -1485,6 +1485,251 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn joined_voter_and_learner_converge_namespace_defaults_and_full_teardown() {
+        let registry = LoopbackRegistry::new();
+        let (leader, leader_db) = fresh_voter_in_registry_with_backend(35, &registry).await;
+        let leader = Arc::new(leader.into_node());
+        let (voter, voter_db) = fresh_voter_in_registry_with_backend(36, &registry).await;
+        let (learner, learner_db) = fresh_voter_in_registry_with_backend(37, &registry).await;
+        leader
+            .bootstrap_single_voter("https://10.99.0.35:7679".into())
+            .await
+            .expect("bootstrap seed");
+        wait_for_leader(&leader, std::time::Duration::from_secs(5))
+            .await
+            .expect("seed leader election");
+        leader
+            .propose_command(StorageCommand::CreateNamespace {
+                name: "namespace-lifecycle-convergence".into(),
+                data: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": {
+                        "name": "namespace-lifecycle-convergence",
+                        "uid": "namespace-lifecycle-uid"
+                    },
+                    "spec": {"finalizers": ["kubernetes"]},
+                    "status": {"phase": "Active"}
+                }),
+            })
+            .await
+            .expect("create namespace through Raft");
+
+        let composition = IntegrationRaftComposition::new(leader_db.clone());
+        let handler = composition.controlplane_join_handler_with_raft_store(leader.clone());
+        handler
+            .join(test_controlplane_join_request(
+                36,
+                "https://10.99.0.36:7679",
+                "n36",
+                false,
+                voter.storage_incarnation(),
+                None,
+                "namespace-voter-hash",
+            ))
+            .await
+            .expect("admit second voter");
+        handler
+            .join(test_controlplane_join_request(
+                37,
+                "https://10.99.0.37:7679",
+                "n37",
+                true,
+                learner.storage_incarnation(),
+                None,
+                "namespace-learner-hash",
+            ))
+            .await
+            .expect("admit learner");
+        wait_for_voter_count(&leader, 2).await;
+
+        composition
+            .create_namespace_defaults_through_root_adapters(
+                leader.clone(),
+                "namespace-lifecycle-convergence",
+            )
+            .await
+            .expect("create namespace defaults through production root adapters");
+        leader
+            .propose_command(StorageCommand::CreateResource {
+                api_version: "v1".into(),
+                kind: "Pod".into(),
+                namespace: Some("namespace-lifecycle-convergence".into()),
+                name: "bound-pod".into(),
+                data: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "namespace-lifecycle-convergence",
+                        "name": "bound-pod",
+                        "uid": "bound-pod-uid"
+                    },
+                    "spec": {
+                        "nodeName": "n35",
+                        "containers": [{"name": "pause", "image": "pause"}]
+                    }
+                }),
+            })
+            .await
+            .expect("create bound Pod through Raft");
+        leader
+            .propose_command(StorageCommand::CreateResource {
+                api_version: "v1".into(),
+                kind: "Event".into(),
+                namespace: Some("namespace-lifecycle-convergence".into()),
+                name: "bound-pod.scheduled".into(),
+                data: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Event",
+                    "metadata": {
+                        "namespace": "namespace-lifecycle-convergence",
+                        "name": "bound-pod.scheduled",
+                        "uid": "bound-pod-event-uid"
+                    },
+                    "reason": "Scheduled"
+                }),
+            })
+            .await
+            .expect("create Pod Event through Raft");
+        let namespace = leader_db
+            .get_resource("v1", "Namespace", None, "namespace-lifecycle-convergence")
+            .await
+            .expect("read namespace")
+            .expect("namespace exists");
+        let mut terminating_namespace = (*namespace.data).clone();
+        terminating_namespace["metadata"]["deletionTimestamp"] =
+            serde_json::json!("2026-08-11T13:25:10Z");
+        terminating_namespace["status"]["phase"] = serde_json::json!("Terminating");
+        leader
+            .propose_command(StorageCommand::UpdateNamespace {
+                name: namespace.name,
+                data: terminating_namespace,
+                expected_rv: namespace.resource_version,
+            })
+            .await
+            .expect("mark namespace terminating through Raft");
+
+        assert!(
+            !composition
+                .reconcile_namespace_termination_through_root_adapters(
+                    leader.clone(),
+                    "namespace-lifecycle-convergence",
+                    "namespace-lifecycle-uid",
+                )
+                .await
+                .expect("first namespace termination reconcile"),
+            "namespace with a live Pod must remain pending",
+        );
+        let terminating_pod = leader_db
+            .get_resource(
+                "v1",
+                "Pod",
+                Some("namespace-lifecycle-convergence"),
+                "bound-pod",
+            )
+            .await
+            .expect("read terminating Pod")
+            .expect("Pod remains until actor finalization");
+        leader
+            .propose_command(StorageCommand::FinalizeBoundPod {
+                namespace: "namespace-lifecycle-convergence".into(),
+                name: "bound-pod".into(),
+                pod_uid: "bound-pod-uid".into(),
+                node_name: "n35".into(),
+                observed_resource_version: terminating_pod.resource_version,
+            })
+            .await
+            .expect("actor-finalize bound Pod through Raft");
+        assert!(
+            composition
+                .reconcile_namespace_termination_through_root_adapters(
+                    leader.clone(),
+                    "namespace-lifecycle-convergence",
+                    "namespace-lifecycle-uid",
+                )
+                .await
+                .expect("final namespace termination reconcile"),
+            "namespace must finalize after its bound Pod actor finalizes",
+        );
+
+        let convergence_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let voter_done = voter_db
+                .get_resource("v1", "Namespace", None, "namespace-lifecycle-convergence")
+                .await
+                .unwrap()
+                .is_none();
+            let learner_done = learner_db
+                .get_resource("v1", "Namespace", None, "namespace-lifecycle-convergence")
+                .await
+                .unwrap()
+                .is_none();
+            if voter_done && learner_done {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < convergence_deadline,
+                "joined voter/learner did not converge namespace teardown"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        for (member, db) in [
+            ("leader", &leader_db),
+            ("voter", &voter_db),
+            ("learner", &learner_db),
+        ] {
+            for (api_version, kind, namespace, name) in [
+                ("v1", "Namespace", None, "namespace-lifecycle-convergence"),
+                (
+                    "v1",
+                    "ServiceAccount",
+                    Some("namespace-lifecycle-convergence"),
+                    "default",
+                ),
+                (
+                    "v1",
+                    "ConfigMap",
+                    Some("namespace-lifecycle-convergence"),
+                    "kube-root-ca.crt",
+                ),
+                (
+                    "v1",
+                    "Pod",
+                    Some("namespace-lifecycle-convergence"),
+                    "bound-pod",
+                ),
+                (
+                    "v1",
+                    "Event",
+                    Some("namespace-lifecycle-convergence"),
+                    "bound-pod.scheduled",
+                ),
+            ] {
+                assert!(
+                    db.get_resource(api_version, kind, namespace, name)
+                        .await
+                        .expect("read namespace lifecycle resource")
+                        .is_none(),
+                    "{member} retained {kind}/{name} after namespace teardown"
+                );
+            }
+            assert_eq!(
+                db.get_current_resource_version().await.unwrap(),
+                leader_db.get_current_resource_version().await.unwrap(),
+                "{member} public resourceVersion diverged after namespace teardown"
+            );
+        }
+
+        drop(handler);
+        match Arc::try_unwrap(leader) {
+            Ok(leader) => leader.shutdown().await.unwrap(),
+            Err(_) => panic!("namespace convergence fixture retained the Raft node"),
+        }
+        voter.shutdown().await.unwrap();
+        learner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn concurrent_node_subnet_proposals_do_not_close_apply_channel() {
         let (node, backend) = fresh_node(90).await;
         node.bootstrap_single_voter("https://10.99.0.90:7679".into())
@@ -3358,6 +3603,7 @@ mod tests {
                 preconditions: klights::datastore::ResourcePreconditions::from_resource(
                     &stale_client_read,
                 ),
+                preserve_status: false,
             },
         )
         .await
@@ -3386,6 +3632,7 @@ mod tests {
                         preconditions: klights::datastore::ResourcePreconditions::from_resource(
                             &stale_client_read,
                         ),
+                        preserve_status: false,
                     },
                 )
                 .expect("valid stale CSI update request"),

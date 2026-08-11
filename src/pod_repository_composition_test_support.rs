@@ -1140,7 +1140,8 @@ struct PodRepositoryScenarioOwner {
     node_local: Option<Arc<crate::bootstrap::node_store::NodeLocalStores>>,
     outbox_delivery: Option<Arc<dyn klights_leader_api::LeaderOutboxDelivery>>,
     delete_observation: Option<Arc<tokio::sync::Mutex<Option<(bool, bool)>>>>,
-    post_write_maintenance_notify: Arc<tokio::sync::Notify>,
+    post_write_maintenance_notify:
+        Arc<crate::bootstrap::pod_repository_composition::PostWriteMaintenanceTracker>,
 }
 
 struct IntegrationEmptyPodNetworkCache;
@@ -2626,7 +2627,9 @@ impl PodRepositoryScenarioOwner {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let post_write_maintenance_notify = Arc::new(tokio::sync::Notify::new());
+        let post_write_maintenance_notify = Arc::new(
+            crate::bootstrap::pod_repository_composition::PostWriteMaintenanceTracker::new(),
+        );
         let authority = crate::bootstrap::authority::AuthorityHandle::from(
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         );
@@ -2868,7 +2871,7 @@ impl PodRepositoryScenarioOwner {
     }
 
     pub async fn wait_for_post_write_maintenance(&self) {
-        self.post_write_maintenance_notify.notified().await;
+        self.post_write_maintenance_notify.wait_for_latest().await;
     }
 
     pub async fn request_gc_pod_delete(

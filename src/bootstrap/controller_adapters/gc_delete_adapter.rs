@@ -3,7 +3,7 @@ use klights_cluster_core::{Resource, ResourcePreconditions};
 use crate::datastore::DatastoreHandle;
 
 pub(crate) struct GcOwnerLifecycleAdapter {
-    db: DatastoreHandle,
+    gc: std::sync::Arc<super::controller_runtime_adapter::RootControllerLeaderPort>,
     pod_delete_sink: std::sync::Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
     non_pod_finalization: GcNonPodFinalizationAdapter,
     coordination: std::sync::Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
@@ -12,12 +12,22 @@ pub(crate) struct GcOwnerLifecycleAdapter {
 impl GcOwnerLifecycleAdapter {
     pub(crate) fn new_with_coordination(
         db: DatastoreHandle,
+        resource_commands: std::sync::Arc<dyn klights_leader_api::LeaderResourceCommand>,
         pod_delete_sink: std::sync::Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
         coordination: std::sync::Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
     ) -> Self {
+        let gc = std::sync::Arc::new(
+            super::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
+                db.clone(),
+                resource_commands.clone(),
+            ),
+        );
         Self {
-            non_pod_finalization: GcNonPodFinalizationAdapter::new(db.clone()),
-            db,
+            non_pod_finalization: GcNonPodFinalizationAdapter::new_with_commands(
+                db.clone(),
+                resource_commands,
+            ),
+            gc,
             pod_delete_sink,
             coordination,
         }
@@ -35,7 +45,7 @@ impl klights_reconcile_api::GcOwnerLifecyclePort for GcOwnerLifecycleAdapter {
     ) -> klights_reconcile_api::ReconcileSinkFuture<'_> {
         Box::pin(async move {
             klights_controllers::gc::reconcile_owner_references(
-                self.db.as_ref(),
+                self.gc.as_ref(),
                 resource,
                 self.pod_delete_sink.as_ref(),
                 &self.non_pod_finalization,
@@ -53,7 +63,7 @@ impl klights_reconcile_api::GcOwnerLifecyclePort for GcOwnerLifecycleAdapter {
     ) -> klights_reconcile_api::ReconcileSinkFuture<'_> {
         Box::pin(async move {
             klights_controllers::gc::cascade_delete_with_uid(
-                self.db.as_ref(),
+                self.gc.as_ref(),
                 &owner.uid,
                 &owner.api_version,
                 &owner.name,
@@ -74,7 +84,7 @@ impl klights_reconcile_api::GcOwnerLifecyclePort for GcOwnerLifecycleAdapter {
     ) -> klights_reconcile_api::GcOwnerBoolFuture<'_> {
         Box::pin(async move {
             klights_controllers::gc::owner_cascade_sweep_once(
-                self.db.as_ref(),
+                self.gc.as_ref(),
                 &owner.uid,
                 &owner.api_version,
                 &owner.name,
@@ -95,7 +105,7 @@ impl klights_reconcile_api::GcOwnerLifecyclePort for GcOwnerLifecycleAdapter {
     ) -> klights_reconcile_api::GcOwnerBoolFuture<'_> {
         Box::pin(async move {
             klights_controllers::gc::finalize_foreground_owner_if_ready(
-                self.db.as_ref(),
+                self.gc.as_ref(),
                 &owner,
                 self.pod_delete_sink.as_ref(),
                 &self.non_pod_finalization,
@@ -108,12 +118,33 @@ impl klights_reconcile_api::GcOwnerLifecyclePort for GcOwnerLifecycleAdapter {
 }
 
 pub(crate) struct GcNonPodFinalizationAdapter {
-    db: DatastoreHandle,
+    lifecycle: crate::bootstrap::finalizer_lifecycle_adapter::CommandFinalizerLifecycleStore,
 }
 
 impl GcNonPodFinalizationAdapter {
+    #[cfg(any(
+        test,
+        feature = "native-api-test-support",
+        feature = "pod-repository-test-support"
+    ))]
     pub(crate) fn new(db: DatastoreHandle) -> Self {
-        Self { db }
+        let commands =
+            super::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
+                db.clone(),
+            );
+        Self::new_with_commands(db, commands)
+    }
+
+    pub(crate) fn new_with_commands(
+        db: DatastoreHandle,
+        commands: std::sync::Arc<dyn klights_leader_api::LeaderResourceCommand>,
+    ) -> Self {
+        Self {
+            lifecycle:
+                crate::bootstrap::finalizer_lifecycle_adapter::CommandFinalizerLifecycleStore::new(
+                    db, commands,
+                ),
+        }
     }
 }
 
@@ -128,10 +159,6 @@ impl klights_reconcile_api::GcNonPodFinalizationPort for GcNonPodFinalizationAda
                     "GC non-Pod finalization port rejects v1/Pod",
                 ));
             }
-            let lifecycle =
-                crate::bootstrap::finalizer_lifecycle_adapter::BorrowedFinalizerLifecycleStore::new(
-                    self.db.as_ref(),
-                );
             let delete = k8s_native_service::generic_command::NonForegroundDeleteRequest {
                 target: k8s_native_service::generic_command::ResourceDeleteTarget {
                     api_version: &request.resource.api_version,
@@ -147,7 +174,7 @@ impl klights_reconcile_api::GcNonPodFinalizationPort for GcNonPodFinalizationAda
                 operation_now: klights_supervisor::SystemWallClock::now_utc(),
             };
             match k8s_native_service::generic_command::complete_non_foreground_delete_with_live_recheck(
-                &lifecycle,
+                &self.lifecycle,
                 delete,
             )
             .await

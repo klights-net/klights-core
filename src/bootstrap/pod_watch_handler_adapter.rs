@@ -3,6 +3,9 @@ use klights_kubelet::pod_watch_source::PodWatchEvent;
 
 pub(crate) struct LeaderPersistentVolumeEventHandler {
     db: crate::datastore::DatastoreHandle,
+    controller_store: std::sync::Arc<
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort,
+    >,
     is_leader_rx: tokio::sync::watch::Receiver<bool>,
     file_process: klights_supervisor::FileProcessExecutor,
     local_path_provisioner_root: std::path::PathBuf,
@@ -11,12 +14,19 @@ pub(crate) struct LeaderPersistentVolumeEventHandler {
 impl LeaderPersistentVolumeEventHandler {
     pub fn new(
         db: crate::datastore::DatastoreHandle,
+        resource_commands: std::sync::Arc<dyn klights_leader_api::LeaderResourceCommand>,
         is_leader_rx: tokio::sync::watch::Receiver<bool>,
         file_process: klights_supervisor::FileProcessExecutor,
         local_path_provisioner_root: std::path::PathBuf,
     ) -> Self {
+        let controller_store = std::sync::Arc::new(
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
+                db.clone(), resource_commands,
+            ),
+        );
         Self {
             db,
+            controller_store,
             is_leader_rx,
             file_process,
             local_path_provisioner_root,
@@ -27,7 +37,7 @@ impl LeaderPersistentVolumeEventHandler {
         use klights_reconcile_api::PvcReconcileSink;
 
         let reconcile = crate::bootstrap::controller_adapters::pod_reconcile_adapter::PersistentVolumeReconcileAdapter::new(
-            self.db.as_ref(),
+            self.controller_store.as_ref(),
             &self.file_process,
             &self.local_path_provisioner_root,
         );
@@ -153,7 +163,8 @@ mod tests {
         authority: tokio::sync::watch::Receiver<bool>,
     ) -> LeaderPersistentVolumeEventHandler {
         LeaderPersistentVolumeEventHandler::new(
-            db,
+            db.clone(),
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(db),
             authority,
             crate::bootstrap::file_blocking::test_file_process_executor(),
             crate::KlightsConfig::test_default()

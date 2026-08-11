@@ -107,15 +107,18 @@ impl ClusterResourceMutation for RedbDatastore {
         data: Value,
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
-        self.update_resource_with_preconditions(
-            api_version,
-            kind,
-            namespace,
-            name,
-            data,
-            preconditions,
-        )
-        .await
+        let committed = self
+            .resources
+            .update_main_res_with_preconditions(
+                api_version,
+                kind,
+                namespace,
+                name,
+                data,
+                preconditions,
+            )
+            .await?;
+        Ok(self.finish_post_commit(committed))
     }
 
     async fn apply_resource_batch(&self, operations: Vec<ResourceBatchOperation>) -> Result<()> {

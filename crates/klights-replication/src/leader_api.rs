@@ -1460,6 +1460,7 @@ mod tests {
                 data: serde_json::json!({"apiVersion": "v1", "kind": "Pod"}),
                 expected_rv: 7,
                 preconditions: ResourcePreconditions::uid_and_resource_version("pod-uid", 7),
+                preserve_status: false,
             },
             StorageCommand::PatchResource {
                 api_version: "v1".to_string(),

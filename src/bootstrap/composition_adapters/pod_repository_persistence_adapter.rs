@@ -292,6 +292,7 @@ impl PodRepositoryWritePersistence for RootPodRepositoryPersistenceAdapter {
                             data: request.body,
                             expected_rv: request.preconditions.resource_version.unwrap_or_default(),
                             preconditions: request.preconditions,
+                            preserve_status: false,
                         },
                         &request.namespace,
                         &request.name,

@@ -687,6 +687,7 @@ impl Datastore {
                 mut data,
                 expected_rv,
                 preconditions,
+                preserve_status,
             } => {
                 if api_version == "v1" && kind == "Namespace" {
                     if namespace.is_some() {
@@ -840,7 +841,8 @@ impl Datastore {
                 ensure_resource_type_meta(&mut data, &api_version, &kind);
                 ensure_metadata_identity(&mut data, namespace.as_deref(), &name);
                 ensure_pod_status_ip_arrays(&mut data, &api_version, &kind);
-                if status_rebased_against_latest
+                if preserve_status
+                    || status_rebased_against_latest
                     || operation == klights_cluster_core::OutboxOperation::PodMetadata.as_str()
                 {
                     klights_types::preserve_status_subresource_on_main_update(

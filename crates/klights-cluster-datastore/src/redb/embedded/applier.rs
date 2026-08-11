@@ -47,22 +47,35 @@ impl RedbDatastore {
                 data,
                 expected_rv,
                 preconditions,
+                preserve_status,
             } => {
                 let mut preconditions = preconditions;
-                if preconditions.resource_version.is_none() {
+                if preconditions.resource_version.is_none() && expected_rv > 0 {
                     preconditions.resource_version = Some(expected_rv);
                 }
-                let committed = self
-                    .resources
-                    .update_res_with_preconditions(
-                        &api_version,
-                        &kind,
-                        namespace.as_deref(),
-                        &name,
-                        data,
-                        preconditions,
-                    )
-                    .await?;
+                let committed = if preserve_status {
+                    self.resources
+                        .update_main_res_with_preconditions(
+                            &api_version,
+                            &kind,
+                            namespace.as_deref(),
+                            &name,
+                            data,
+                            preconditions,
+                        )
+                        .await?
+                } else {
+                    self.resources
+                        .update_res_with_preconditions(
+                            &api_version,
+                            &kind,
+                            namespace.as_deref(),
+                            &name,
+                            data,
+                            preconditions,
+                        )
+                        .await?
+                };
                 self.finish_post_commit(committed);
             }
             StorageCommand::DeleteResource {
@@ -282,5 +295,86 @@ impl RedbDatastore {
 impl DatastoreApplier for RedbDatastore {
     async fn apply_command(&self, cmd: StorageCommand, meta: CommandMeta) -> Result<()> {
         self.apply_legacy_test_command(cmd, meta).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use klights_cluster_core::{COMMAND_CODEC_VERSION, CommandId, ResourcePreconditions};
+
+    #[tokio::test]
+    async fn legacy_committed_apply_main_update_preserves_live_status() {
+        let db = RedbDatastore::new_in_memory().await.unwrap();
+        let created = db.finish_post_commit(
+            db.resources
+                .create_res(
+                    "apps/v1",
+                    "Deployment",
+                    Some("default"),
+                    "web",
+                    serde_json::json!({
+                        "apiVersion": "apps/v1",
+                        "kind": "Deployment",
+                        "metadata": {"name": "web", "namespace": "default", "uid": "web-uid"},
+                        "spec": {"replicas": 1},
+                        "status": {"replicas": 1}
+                    }),
+                )
+                .await
+                .unwrap(),
+        );
+        db.finish_post_commit(
+            db.resources
+                .update_status_only_impl(
+                    "apps/v1",
+                    "Deployment",
+                    Some("default"),
+                    "web",
+                    serde_json::json!({"replicas": 6}),
+                    Some(created.resource_version),
+                )
+                .await
+                .unwrap(),
+        );
+        let mut stale_main = (*created.data).clone();
+        stale_main["spec"]["replicas"] = serde_json::json!(2);
+        db.apply_legacy_test_command(
+            StorageCommand::UpdateResource {
+                api_version: "apps/v1".into(),
+                kind: "Deployment".into(),
+                namespace: Some("default".into()),
+                name: "web".into(),
+                data: stale_main,
+                expected_rv: 0,
+                preconditions: ResourcePreconditions::default(),
+                preserve_status: true,
+            },
+            CommandMeta {
+                command_id: CommandId("redb-main-update".into()),
+                codec_version: COMMAND_CODEC_VERSION,
+                resource_version: 0,
+                uid: Some("web-uid".into()),
+                timestamp_ms: 0,
+                authoring_node: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let updated = db
+            .resources
+            .get_res("apps/v1", "Deployment", Some("default"), "web")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.data.pointer("/spec/replicas"),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            updated.data.pointer("/status/replicas"),
+            Some(&serde_json::json!(6))
+        );
     }
 }

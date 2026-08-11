@@ -129,6 +129,11 @@ pub enum StorageCommand {
         data: serde_json::Value,
         expected_rv: i64,
         preconditions: ResourcePreconditions,
+        /// Preserve the live status subtree while replacing client-owned fields.
+        /// Generic main-resource PUT uses this; status subresources remain
+        /// independently owned and may advance concurrently.
+        #[serde(default)]
+        preserve_status: bool,
     },
 
     /// Delete a K8s resource by key.
@@ -422,6 +427,7 @@ impl StorageCommand {
                 uid: None,
                 resource_version: Some(expected_rv),
             },
+            preserve_status: false,
         }
     }
 
@@ -758,6 +764,19 @@ mod tests {
                 .unwrap(),
             command
         );
+    }
+
+    #[test]
+    fn existing_v3_update_json_defaults_status_preservation_off() {
+        let fixture = r#"{"UpdateResource":{"api_version":"apps/v1","kind":"Deployment","namespace":"default","name":"web","data":{"metadata":{"name":"web"}},"expected_rv":7,"preconditions":{"uid":null,"resource_version":7}}}"#;
+        let command: StorageCommand = serde_json::from_str(fixture).unwrap();
+        assert!(matches!(
+            command,
+            StorageCommand::UpdateResource {
+                preserve_status: false,
+                ..
+            }
+        ));
     }
 
     #[test]

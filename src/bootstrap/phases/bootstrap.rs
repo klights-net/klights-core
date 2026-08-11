@@ -507,23 +507,29 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
 
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let namespace_lifecycle_store =
-        crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(db_handle.clone());
+        crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new_with_commands(
+            db_handle.clone(),
+            resource_commands.clone(),
+        );
     local_side_effects.set_namespace_termination(
         crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationReconciler::new(
             namespace_lifecycle_store.clone(),
             metrics.clone(),
         ),
     );
-    let side_effects = Arc::new(crate::bootstrap::side_effects::default_registry(
-        metrics.clone(),
-        Some(services.clone()),
-        Some(supervisor.clone()),
-        Some(db_handle.clone()),
-        controller_identity.clone(),
-    ));
-    let non_pod_finalization: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort> = Arc::new(
-        crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
+    let side_effects = Arc::new(
+        crate::bootstrap::side_effects::default_registry_with_commands(
+            metrics.clone(),
+            Some(services.clone()),
+            Some(supervisor.clone()),
             db_handle.clone(),
+            resource_commands.clone(),
+            controller_identity.clone(),
+        ),
+    );
+    let non_pod_finalization: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort> = Arc::new(
+        crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new_with_commands(
+            db_handle.clone(), resource_commands.clone(),
         ),
     );
     let controller_coordination = Arc::new(klights_controllers::ControllerCoordination::new());
@@ -1005,6 +1011,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let finalizer_lifecycle =
         crate::bootstrap::finalizer_lifecycle_adapter::DatastoreFinalizerLifecycleAdapter::new_with_coordination(
             db_handle.clone(),
+            resource_commands.clone(),
             controller_gc_delete.clone(),
             side_effects.clone(),
             metrics.clone(),
@@ -1019,11 +1026,14 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let gc_owner_lifecycle =
         crate::bootstrap::controller_adapters::gc_delete_adapter::GcOwnerLifecycleAdapter::new_with_coordination(
             db_handle.clone(),
+            resource_commands.clone(),
             controller_gc_delete.clone(),
             controller_coordination.clone(),
         );
     let generated_handler_adapter = crate::bootstrap::composition_adapters::generated_handler_adapter::GeneratedHandlerAdapter::new(
-        db_handle.clone(),
+        crate::bootstrap::composition_adapters::generated_handler_adapter::GeneratedHandlerStorage::new(
+            db_handle.clone(), resource_commands.clone(),
+        ),
         watch_signals.clone(),
         positioned_watch.clone(),
         klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
@@ -1357,7 +1367,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             api_pod_repository.clone(),
             controller_pod_port.clone(),
             controller_gc_delete.clone(),
-            &crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db_handle.clone()),
+            &crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new_with_commands(db_handle.clone(), resource_commands.clone()),
             controller_coordination.as_ref(),
             controller_identity.as_ref(),
             crate::bootstrap::controller_adapters::coredns_bootstrap_adapter::CoreDnsBootstrapConfig {
@@ -1426,6 +1436,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let volume_events = Arc::new(
             crate::bootstrap::pod_watch_handler_adapter::LeaderPersistentVolumeEventHandler::new(
                 db_handle.clone(),
+                resource_commands.clone(),
                 is_leader_rx.clone(),
                 ctx.local_execution().file_process,
                 config.data_root.join("local-path-provisioner"),

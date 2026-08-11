@@ -36,6 +36,7 @@ fn request_admits_exact_generic_resource_commands_without_rewriting_them() {
             data: json!({"data": {"mode": "relaxed"}}),
             expected_rv: 41,
             preconditions: ResourcePreconditions::uid_and_resource_version("uid-a", 41),
+            preserve_status: false,
         },
         StorageCommand::PatchResource {
             api_version: "v1".to_string(),

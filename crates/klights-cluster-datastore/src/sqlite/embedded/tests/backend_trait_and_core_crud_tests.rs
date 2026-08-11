@@ -984,6 +984,7 @@ async fn raft_commit_builder_rejects_update_for_deleted_resource() {
         data: stale_update,
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
+        preserve_status: false,
     };
     let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()
@@ -1391,6 +1392,7 @@ async fn strict_committed_apply_rejects_divergent_follower_resource_version() {
         data: bound,
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
+        preserve_status: false,
     };
     let update_payload =
         crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(update_command)
@@ -1548,6 +1550,7 @@ async fn raft_apply_rejects_stale_resource_version_built_before_prior_apply() {
                 data,
                 expected_rv: created.resource_version,
                 preconditions: ResourcePreconditions::resource_version(created.resource_version),
+                preserve_status: false,
             };
             let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
                 .encode_protobuf()
@@ -1991,6 +1994,7 @@ async fn stale_committed_pod_bind_preserves_live_owner_references() {
         data: bind_snapshot,
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
+        preserve_status: false,
     };
     let bind_payload =
         crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(bind_command)
@@ -2115,6 +2119,7 @@ async fn stale_committed_pod_bind_preserves_stale_owner_ref_subset() {
         data: bind_snapshot,
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
+        preserve_status: false,
     };
     let bind_payload =
         crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(bind_command)
@@ -2248,6 +2253,7 @@ async fn stale_committed_pod_put_same_node_preserves_live_owner_references() {
         data: stale_same_node_snapshot,
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
+        preserve_status: false,
     };
     let stale_same_node_payload =
         crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(stale_same_node_command)
@@ -2374,6 +2380,7 @@ async fn stale_committed_pod_put_with_explicit_empty_owner_references_clears_liv
         data: stale_clear_snapshot,
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
+        preserve_status: false,
     };
     let stale_clear_payload =
         crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(stale_clear_command)
@@ -2469,6 +2476,7 @@ async fn stale_committed_pod_bind_does_not_rebind_already_bound_pod() {
         data: stale_bind_snapshot,
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
+        preserve_status: false,
     };
     let stale_bind_payload =
         crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(stale_bind_command)
@@ -4313,6 +4321,7 @@ async fn raft_commit_builder_does_not_treat_api_node_update_as_node_status_refre
         data: api_update,
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::resource_version(created.resource_version),
+        preserve_status: false,
     };
     let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
         .encode_protobuf()

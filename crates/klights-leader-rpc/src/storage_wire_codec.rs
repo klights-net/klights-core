@@ -419,6 +419,7 @@ impl BoundaryTryFrom<StorageCommand> for ProtoStorageCommand {
                 data,
                 expected_rv,
                 preconditions,
+                preserve_status,
             } => proto_storage_command::Command::UpdateResource(ProtoUpdateResource {
                 api_version,
                 kind,
@@ -427,6 +428,7 @@ impl BoundaryTryFrom<StorageCommand> for ProtoStorageCommand {
                 data: json_to_bytes(&data),
                 expected_rv,
                 preconditions: Some(ProtoResourcePreconditions::boundary_from(preconditions)),
+                preserve_status,
             }),
             StorageCommand::DeleteResource {
                 api_version,
@@ -711,6 +713,7 @@ impl BoundaryTryFrom<ProtoStorageCommand> for StorageCommand {
                 data: bytes_to_json(&p.data)?,
                 expected_rv: p.expected_rv,
                 preconditions: decode_preconditions(p.preconditions, "UpdateResource")?,
+                preserve_status: p.preserve_status,
             },
             proto_storage_command::Command::DeleteResource(p) => StorageCommand::DeleteResource {
                 api_version: p.api_version,
@@ -1083,6 +1086,36 @@ mod tests {
     }
 
     #[test]
+    fn existing_v3_update_protobuf_without_status_flag_defaults_off() {
+        let old_wire = ProtoStorageCommand {
+            command: Some(proto_storage_command::Command::UpdateResource(
+                ProtoUpdateResource {
+                    api_version: "apps/v1".into(),
+                    kind: "Deployment".into(),
+                    namespace: Some("default".into()),
+                    name: "web".into(),
+                    data: br#"{"metadata":{"name":"web"}}"#.to_vec(),
+                    expected_rv: 7,
+                    preconditions: Some(ProtoResourcePreconditions {
+                        uid: None,
+                        resource_version: Some(7),
+                    }),
+                    preserve_status: false,
+                },
+            )),
+        }
+        .encode_to_vec();
+
+        assert!(matches!(
+            decode_command_protobuf(&old_wire).unwrap(),
+            StorageCommand::UpdateResource {
+                preserve_status: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn apply_resource_batch_round_trips_json_and_protobuf() {
         let cmd = StorageCommand::apply_resource_batch(vec![
             ResourceBatchOperation::Put {
@@ -1180,6 +1213,7 @@ mod tests {
                         uid: Some("uid-abc-123".into()),
                         resource_version: Some(42),
                     },
+                    preserve_status: true,
                 },
                 "UpdateResource",
             ),
@@ -2056,6 +2090,7 @@ mod tests {
                     uid: Some("uid-a".into()),
                     resource_version: Some(42),
                 },
+                preserve_status: false,
             },
             StorageCommand::UpdateStatus {
                 api_version: "v1".into(),
