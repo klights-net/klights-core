@@ -2,6 +2,16 @@
 use std::sync::Arc;
 
 use klights_leader_api::NodeRoleProjection;
+
+#[cfg(any(test, feature = "pod-repository-test-support"))]
+pub(crate) fn always_leader_watch() -> tokio::sync::watch::Receiver<bool> {
+    let (tx, rx) = tokio::sync::watch::channel(true);
+    // Keep the sender alive for the duration of the focused test process so
+    // authority-backed adapters never observe a synthetic source shutdown.
+    Box::leak(Box::new(tx));
+    rx
+}
+
 #[cfg(test)]
 use klights_leader_api::{
     AuthorityAcquireFuture, AuthorityError, AuthorityPermit, AuthorityPermitIssuer,

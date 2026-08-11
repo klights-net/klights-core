@@ -1811,11 +1811,10 @@ fn build_pod_repository_parts_inner(
     let _ = resource_query_override;
     #[cfg(any(test, feature = "pod-repository-test-support"))]
     let resource_query = cluster_api.clone().unwrap_or_else(|| {
-        Arc::new(crate::control_plane::client::local::LocalApiClient::new(
+        crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
             db.clone(),
-            "local-node".to_string(),
-            crate::control_plane::client::local::always_leader_watch(),
-        ))
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+        )
     });
     let wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock> =
         Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock);

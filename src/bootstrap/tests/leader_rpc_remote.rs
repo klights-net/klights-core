@@ -511,7 +511,7 @@ async fn grpc_network_metadata_uses_typed_unary_rpcs() {
     assert_eq!(
         fetched_metadata,
         Some(
-            crate::control_plane::client::focused_dataplane(stored_metadata)
+            crate::bootstrap::leader_conversions::topology::focused_dataplane(stored_metadata)
                 .expect("valid focused metadata"),
         )
     );

@@ -470,19 +470,11 @@ pub async fn run_worker_actor_finalization_delivery_scenario()
         }),
     )
     .await?;
-    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
-        klights_supervisor::TaskCategoryConfig::default(),
-    ));
-    let cluster_api = Arc::new(
-        crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_and_passive_reads(
+    let cluster_api = crate::bootstrap::composition_adapters::resource_query_adapter::
+        DatastoreResourceQueryAdapter::new(
             db.clone(),
-            crate::datastore::selector::sqlite_passive_read_ports(&sqlite),
-            "worker-1".to_string(),
-            Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(chrono::Utc::now())),
-            crate::control_plane::client::local::always_leader_watch(),
-            klights_supervisor::FileProcessExecutor::new(supervisor),
-        ),
-    );
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+        );
     let repository = IntegrationPodWorkerFixture::new(cluster_api).await;
     let queued = repository
         .finalize_pod_deletion_after_actor_cleanup(
@@ -521,16 +513,18 @@ pub async fn run_worker_actor_finalization_delivery_scenario()
             && node_name == "worker-1"
             && *observed_resource_version > 0
     );
-    let applied = crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
-        db.as_ref(),
-        row.idempotency_key(),
-        klights_kubelet::outbox::OutboxOperation::PodMetadata,
-        command,
-        "worker-1",
-        None,
-    )
-    .await
-    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    use klights_replication::proposal::RaftProposal as _;
+    let proposal = crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone());
+    let applied = proposal
+        .propose_outbox_command_effect(
+            row.idempotency_key(),
+            klights_kubelet::outbox::OutboxOperation::PodMetadata.as_str(),
+            command,
+            "worker-1",
+            None,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let (_, _, _, committed_resource) = applied.into_parts();
     let authoritative_pod_removed = db
         .get_resource("v1", "Pod", Some("default"), "leader-finalize")
@@ -572,19 +566,26 @@ pub async fn run_worker_actor_finalization_race()
             }),
         )
         .await?;
-    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
-        klights_supervisor::TaskCategoryConfig::default(),
-    ));
-    let cluster_api = Arc::new(
-        crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_and_passive_reads(
+    let cluster_api = crate::bootstrap::composition_adapters::resource_query_adapter::
+        DatastoreResourceQueryAdapter::new(
             db.clone(),
-            crate::datastore::selector::sqlite_passive_read_ports(&sqlite),
-            "worker-1".to_string(),
-            Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(chrono::Utc::now())),
-            crate::control_plane::client::local::always_leader_watch(),
-            klights_supervisor::FileProcessExecutor::new(supervisor),
-        ),
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+        );
+    let authority = crate::bootstrap::authority::AuthorityHandle::from(
+        crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
     );
+    let delivery = crate::bootstrap::composition_adapters::
+        committed_outbox_delivery_adapter::test_outbox_delivery(
+            db.clone(),
+            &authority,
+            Arc::new(
+                crate::bootstrap::composition_adapters::
+                    committed_outbox_delivery_adapter::RootOutboxSideEffectState::new(
+                    db.clone(),
+                ),
+            ),
+            "worker-1".to_string(),
+        );
     let repository = IntegrationPodWorkerFixture::new(cluster_api.clone()).await;
     let initially_pending = repository
         .finalize_pod_deletion_after_actor_cleanup(
@@ -604,7 +605,7 @@ pub async fn run_worker_actor_finalization_race()
             Some(created.resource_version),
         )
         .await?;
-    let dispatched = repository.dispatch_due_once(cluster_api.clone()).await?
+    let dispatched = repository.dispatch_due_once(delivery.clone()).await?
         == klights_kubelet::node_outbox::DispatchOutcome::Dispatched;
     let removed_after_dispatch = db
         .get_resource("v1", "Pod", Some("default"), "rv-retry-finalize")
@@ -647,7 +648,7 @@ pub async fn run_worker_actor_finalization_race()
             "uid-wrong-node-finalize",
         )
         .await?;
-    let _ = repository.dispatch_due_once(cluster_api).await?;
+    let _ = repository.dispatch_due_once(delivery).await?;
     let node_mismatch_rejected = db
         .get_resource("v1", "Pod", Some("default"), "wrong-node-finalize")
         .await?
@@ -1233,247 +1234,11 @@ pub struct IntegrationApiDeleteStatusRaceOutcome {
     pub status_bumps: usize,
 }
 
-struct IntegrationDeleteStatusRacingRaftProposal {
-    inner: crate::datastore::DatastoreHandle,
-    pod_name: String,
-    bumps: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl IntegrationDeleteStatusRacingRaftProposal {
-    async fn apply(
-        &self,
-        command: klights_cluster_core::StorageCommand,
-        idempotency_key: &str,
-        operation: klights_kubelet::outbox::OutboxOperation,
-        authoring_node: &str,
-    ) -> Result<
-        klights_replication::proposal::RaftProposalEffect,
-        klights_cluster_core::OutboxApplyError,
-    > {
-        let targets_delete_mark = match &command {
-            klights_cluster_core::StorageCommand::UpdateResource {
-                api_version,
-                kind,
-                namespace,
-                name,
-                data,
-                ..
-            } => {
-                api_version == "v1"
-                    && kind == "Pod"
-                    && namespace.as_deref() == Some("default")
-                    && name == &self.pod_name
-                    && data
-                        .pointer("/metadata/deletionTimestamp")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some()
-            }
-            klights_cluster_core::StorageCommand::PatchResource {
-                api_version,
-                kind,
-                namespace,
-                name,
-                patch,
-                ..
-            } => {
-                api_version == "v1"
-                    && kind == "Pod"
-                    && namespace.as_deref() == Some("default")
-                    && name == &self.pod_name
-                    && patch
-                        .pointer("/metadata/deletionTimestamp")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some()
-            }
-            _ => false,
-        };
-        if targets_delete_mark {
-            let bump = self.bumps.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            if let Some(current) = self
-                .inner
-                .get_resource("v1", "Pod", Some("default"), &self.pod_name)
-                .await
-                .map_err(|error| {
-                    klights_cluster_core::OutboxApplyError::Retryable(error.to_string())
-                })?
-            {
-                self.inner.update_status_only_with_preconditions(
-                    "v1", "Pod", Some("default"), &self.pod_name,
-                    serde_json::json!({"phase": "Running", "podIP": "10.42.0.55", "raceBump": bump}),
-                    crate::datastore::ResourcePreconditions::uid(current.uid),
-                ).await.map_err(|error| klights_cluster_core::OutboxApplyError::Retryable(error.to_string()))?;
-            }
-        }
-        crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
-            self.inner.as_ref(),
-            idempotency_key,
-            operation,
-            command,
-            authoring_node,
-            None,
-        )
-        .await
-    }
-}
-
-#[async_trait::async_trait]
-impl klights_replication::proposal::RaftProposal for IntegrationDeleteStatusRacingRaftProposal {
-    async fn propose_command(
-        &self,
-        command: klights_cluster_core::StorageCommand,
-    ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
-        let effect = self
-            .apply(
-                command,
-                &format!("delete-race-{}", uuid::Uuid::new_v4()),
-                klights_kubelet::outbox::OutboxOperation::PodStatus,
-                "delete-race-leader",
-            )
-            .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let (result, resource_effect, pod_endpoint_effect, committed_resource) =
-            effect.into_parts();
-        let applied_rv = match result {
-            klights_cluster_core::OutboxApplyOutcome::Applied { applied_rv } => Some(applied_rv),
-            klights_cluster_core::OutboxApplyOutcome::AlreadyApplied { applied_rv } => applied_rv,
-        };
-        Ok(klights_cluster_store::StorageCommandResult::new(
-            applied_rv,
-            None,
-            None,
-            resource_effect == klights_cluster_core::ResourceMutationEffect::Changed,
-            committed_resource.map(klights_cluster_store::AppliedMutation::Resource),
-            pod_endpoint_effect,
-        ))
-    }
-
-    async fn propose_outbox_command(
-        &self,
-        idempotency_key: &str,
-        operation: &str,
-        command: klights_cluster_core::StorageCommand,
-        authoring_node: &str,
-        _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
-    ) -> Result<klights_cluster_core::OutboxApplyOutcome, klights_cluster_core::OutboxApplyError>
-    {
-        let operation =
-            klights_kubelet::outbox::OutboxOperation::try_from(operation).map_err(|error| {
-                klights_cluster_core::OutboxApplyError::Retryable(error.to_string())
-            })?;
-        Ok(self
-            .apply(command, idempotency_key, operation, authoring_node)
-            .await?
-            .into_parts()
-            .0)
-    }
-}
-
 pub async fn run_raft_delete_mark_status_race(
     pod_name: &str,
     grace_period_seconds: Option<i64>,
 ) -> anyhow::Result<IntegrationApiDeleteStatusRaceOutcome> {
-    let sqlite = crate::datastore::sqlite::Datastore::new_in_memory().await?;
-    let inner: crate::datastore::DatastoreHandle = Arc::new(sqlite.clone());
-    let bumps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let proposal = Arc::new(IntegrationDeleteStatusRacingRaftProposal {
-        inner: inner.clone(),
-        pod_name: pod_name.to_string(),
-        bumps: bumps.clone(),
-    });
-    let db: crate::datastore::DatastoreHandle = Arc::new(
-        crate::bootstrap::sequenced_datastore::SequencedDatastore::new_with_clock(
-            inner,
-            proposal,
-            Arc::new(klights_supervisor::SystemWallClock),
-            crate::control_plane::client::local::always_leader_watch(),
-        ),
-    );
-    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
-        klights_supervisor::TaskCategoryConfig::default(),
-    ));
-    let local_query: Arc<dyn klights_leader_api::LeaderResourceQuery> = Arc::new(crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_and_passive_reads(
-        db.clone(), crate::datastore::selector::sqlite_passive_read_ports(&sqlite), "delete-race-leader".to_string(),
-        Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(chrono::Utc::now())), crate::control_plane::client::local::always_leader_watch(), klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
-    ));
-    let (
-        _pod_query,
-        _pod_snapshot,
-        _pod_update,
-        _pod_status_writer,
-        _pod_workqueue,
-        _pod_network_assignment,
-        _pod_host_ip,
-        _background,
-        _deletion_finalizer,
-        _dirty_counter,
-        _mutation_reconcile,
-        _gc_delete,
-        _eviction_admission,
-        _namespace_bootstrap,
-        _namespace_termination_queue,
-        api,
-        _subresource,
-        _scheduling,
-        _watch_source,
-        _bound_finalization,
-        _deferred_runtime,
-        _test_api,
-        _test_subresource,
-    ) = crate::bootstrap::pod_repository_composition::build_integration_pod_repository_parts(
-        crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
-            db: db.clone(), pod_workqueue_store: None, supervisor, side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
-            metrics: klights_controllers::side_effects::SideEffectMetrics::new(), pod_network_cache: Arc::new(IntegrationEmptyPodNetworkCache), assignment_waiter: Arc::new(klights_networking::PodNetworkAssignmentBus::new()),
-            scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode, outbox: None, cluster_api: None,
-            remote_delivery_required: false,
-            controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
-            #[cfg(not(test))]
-            api_identity: Arc::new(crate::bootstrap::controller_adapters::system_identity_adapter::SystemIdentityGenerator),
-            #[cfg(not(test))]
-            gc_coordination: Arc::new(klights_controllers::ControllerCoordination::new()),
-            scheduler_bind_gate: None,
-            post_write_maintenance_notify: None,
-        }, local_query,
-    );
-    use klights_pod_api::PodApiMutation as _;
-    let created = api
-        .as_ref()
-        .expect("integration root Pod API")
-        .create_pod(klights_pod_api::PodApiCreateRequest { namespace: "default".to_string(), body: serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":pod_name},"spec":{"containers":[{"name":"c","image":"busybox"}]}}), dry_run: false })
-        .await
-        .map_err(anyhow::Error::new)?
-        .resource
-        .expect("race create persists");
-    let deleted = match api
-        .expect("integration root Pod API")
-        .delete_pod(klights_pod_api::PodApiDeleteRequest {
-            namespace: "default".to_string(),
-            name: pod_name.to_string(),
-            options: k8s_native_service::DeleteOptions {
-                _grace_period_seconds: grace_period_seconds,
-                preconditions: None,
-                ..Default::default()
-            }
-            .into(),
-            dry_run: false,
-        })
-        .await
-        .map_err(anyhow::Error::new)?
-    {
-        klights_pod_api::PodApiDeleteOutcome::GracefulSet(resource) => resource,
-        klights_pod_api::PodApiDeleteOutcome::DryRun(_) => {
-            anyhow::bail!("raft delete race unexpectedly dry-ran")
-        }
-    };
-    let persisted = db
-        .get_resource("v1", "Pod", Some("default"), pod_name)
-        .await?
-        .expect("actor-owned row remains");
-    Ok(IntegrationApiDeleteStatusRaceOutcome {
-        created,
-        deleted,
-        persisted,
-        status_bumps: bumps.load(std::sync::atomic::Ordering::SeqCst),
-    })
+    run_api_delete_status_race(pod_name, grace_period_seconds).await
 }
 
 #[allow(dead_code)]
@@ -1499,7 +1264,7 @@ pub async fn run_api_delete_status_race(
         .resource
         .expect("delete race Pod create persists");
     let pause = repo._sqlite.install_resource_mutation_pause(
-        IntegrationResourceMutationPauseOperation::BuildPatchCommand,
+        IntegrationResourceMutationPauseOperation::PatchLatest,
         "v1",
         "Pod",
         Some("default"),
@@ -2422,37 +2187,14 @@ pub struct IntegrationBoundPodDeleteCasRaceOutcome {
     pub live: crate::datastore::Resource,
 }
 
-struct IntegrationPodDeleteCasRacingProposal {
+struct IntegrationPodDeleteCasRaceHook {
     inner: crate::datastore::DatastoreHandle,
     pod_name: String,
     race: IntegrationPodDeleteCasRaceKind,
     raced: Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl IntegrationPodDeleteCasRacingProposal {
-    fn targets_pod_delete(&self, command: &klights_cluster_core::StorageCommand) -> bool {
-        matches!(
-            command,
-            klights_cluster_core::StorageCommand::DeleteResource {
-                api_version,
-                kind,
-                namespace,
-                name,
-                ..
-            } if api_version == "v1"
-                && kind == "Pod"
-                && namespace.as_deref() == Some("default")
-                && name == &self.pod_name
-        ) || matches!(
-            command,
-            klights_cluster_core::StorageCommand::FinalizeBoundPod {
-                namespace,
-                name,
-                ..
-            } if namespace == "default" && name == &self.pod_name
-        )
-    }
-
+impl IntegrationPodDeleteCasRaceHook {
     async fn inject_race(&self) -> anyhow::Result<()> {
         let current = self
             .inner
@@ -2497,83 +2239,26 @@ impl IntegrationPodDeleteCasRacingProposal {
         self.raced.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
-
-    async fn apply(
-        &self,
-        command: klights_cluster_core::StorageCommand,
-        idempotency_key: &str,
-        operation: klights_kubelet::outbox::OutboxOperation,
-        authoring_node: &str,
-    ) -> Result<
-        klights_replication::proposal::RaftProposalEffect,
-        klights_cluster_core::OutboxApplyError,
-    > {
-        if self.targets_pod_delete(&command) {
-            self.inject_race().await.map_err(|error| {
-                klights_cluster_core::OutboxApplyError::Retryable(error.to_string())
-            })?;
-        }
-        crate::bootstrap::outbox_apply_adapter::propose_outbox_command_on_backend(
-            self.inner.as_ref(),
-            idempotency_key,
-            operation,
-            command,
-            authoring_node,
-            None,
-        )
-        .await
-    }
 }
 
-#[async_trait::async_trait]
-impl klights_replication::proposal::RaftProposal for IntegrationPodDeleteCasRacingProposal {
-    async fn propose_command(
-        &self,
-        command: klights_cluster_core::StorageCommand,
-    ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
-        let effect = self
-            .apply(
-                command,
-                &format!("delete-cas-race-{}", uuid::Uuid::new_v4()),
-                klights_kubelet::outbox::OutboxOperation::PodStatus,
-                "delete-cas-race-leader",
-            )
-            .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let (result, resource_effect, pod_endpoint_effect, committed_resource) =
-            effect.into_parts();
-        let applied_resource_version = match result {
-            klights_cluster_core::OutboxApplyOutcome::Applied { applied_rv } => Some(applied_rv),
-            klights_cluster_core::OutboxApplyOutcome::AlreadyApplied { applied_rv } => applied_rv,
-        };
-        Ok(klights_cluster_store::StorageCommandResult::new(
-            applied_resource_version,
-            None,
-            None,
-            resource_effect == klights_cluster_core::ResourceMutationEffect::Changed,
-            committed_resource.map(klights_cluster_store::AppliedMutation::Resource),
-            pod_endpoint_effect,
-        ))
-    }
-
-    async fn propose_outbox_command(
-        &self,
-        idempotency_key: &str,
-        operation: &str,
-        command: klights_cluster_core::StorageCommand,
-        authoring_node: &str,
-        _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
-    ) -> Result<klights_cluster_core::OutboxApplyOutcome, klights_cluster_core::OutboxApplyError>
-    {
-        let operation =
-            klights_kubelet::outbox::OutboxOperation::try_from(operation).map_err(|error| {
-                klights_cluster_core::OutboxApplyError::Retryable(error.to_string())
-            })?;
-        Ok(self
-            .apply(command, idempotency_key, operation, authoring_node)
-            .await?
-            .into_parts()
-            .0)
+impl
+    crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::PodDeleteCasTestHook
+    for IntegrationPodDeleteCasRaceHook
+{
+    fn before_delete_cas<'a>(
+        &'a self,
+        identity: &'a klights_types::PodIdentity,
+        _observed_resource_version: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            anyhow::ensure!(
+                identity.namespace == "default" && identity.name == self.pod_name,
+                "unexpected Pod delete CAS target {}/{}",
+                identity.namespace,
+                identity.name
+            );
+            self.inject_race().await
+        })
     }
 }
 
@@ -2590,24 +2275,17 @@ async fn integration_pod_delete_cas_race_store(
         .expect("delete CAS race datastore");
     let inner: crate::datastore::DatastoreHandle = Arc::new(sqlite);
     let raced = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let proposal = Arc::new(IntegrationPodDeleteCasRacingProposal {
+    let hook = Arc::new(IntegrationPodDeleteCasRaceHook {
         inner: inner.clone(),
         pod_name: pod_name.to_string(),
         race,
         raced: raced.clone(),
     });
-    let datastore: crate::datastore::DatastoreHandle = Arc::new(
-        crate::bootstrap::sequenced_datastore::SequencedDatastore::new_with_clock(
-            inner,
-            proposal,
-            Arc::new(klights_supervisor::SystemWallClock),
-            crate::control_plane::client::local::always_leader_watch(),
-        ),
-    );
-    let persistence =
-        crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
+    let datastore: crate::datastore::DatastoreHandle = inner;
+    let persistence = crate::bootstrap::composition_adapters::
+        pod_repository_persistence_adapter::new_root_parts_with_delete_cas_hook(
             datastore.clone(),
-            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+            hook,
         );
     (persistence, datastore, raced)
 }
@@ -2949,19 +2627,20 @@ impl PodRepositoryScenarioOwner {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let post_write_maintenance_notify = Arc::new(tokio::sync::Notify::new());
-        let local_client = Arc::new(
-            crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_and_passive_reads(
-                db.clone(),
-                crate::datastore::selector::sqlite_passive_read_ports(&sqlite),
-                "pod-repository-composition".to_string(),
-                Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
-                    chrono::Utc::now(),
-                )),
-                crate::control_plane::client::local::always_leader_watch(),
-                klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
-            ),
+        let authority = crate::bootstrap::authority::AuthorityHandle::from(
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         );
-        let local_query: Arc<dyn klights_leader_api::LeaderResourceQuery> = local_client.clone();
+        let local_query = crate::bootstrap::composition_adapters::resource_query_adapter::
+            DatastoreResourceQueryAdapter::new(db.clone(), authority.clone());
+        let local_outbox_delivery = crate::bootstrap::composition_adapters::
+            committed_outbox_delivery_adapter::test_outbox_delivery(
+                db.clone(),
+                &authority,
+                crate::bootstrap::local_leader_adapters::new_local_outbox_side_effect_state(
+                    db.clone(),
+                ),
+                "pod-repository-composition".to_string(),
+            );
         let native_resource_query = repository_cluster_api.clone().unwrap_or(local_query);
         let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
         let controller_dispatcher =
@@ -3105,7 +2784,7 @@ impl PodRepositoryScenarioOwner {
             watch_source,
             controller_dispatcher,
             node_local,
-            outbox_delivery: with_outbox.then_some(local_client),
+            outbox_delivery: with_outbox.then_some(local_outbox_delivery),
             delete_observation,
             post_write_maintenance_notify,
         }

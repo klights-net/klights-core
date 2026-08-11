@@ -325,7 +325,8 @@ pub async fn delete_collection_listed_resource_for_integration(
     namespace: Option<&str>,
     resource: klights_cluster_core::Resource,
 ) -> Result<bool, k8s_native_service::AppError> {
-    let leader_rx = crate::control_plane::client::local::always_leader_watch();
+    let leader_rx =
+        crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
     let resource_query = crate::bootstrap::outbox_apply_adapter::BackendResourceQueryFixture::new(
         db.clone(),
         leader_rx,
@@ -1176,7 +1177,8 @@ impl NativeApiTestHarness {
         let nodeport_alloc = Arc::new(klights_controllers::service::NodePortAllocator::new());
         nodeport_alloc.set_ready();
         let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-        let leader_rx = crate::control_plane::client::local::always_leader_watch();
+        let leader_rx =
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
         let resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery> = Arc::new(
             crate::bootstrap::outbox_apply_adapter::BackendResourceQueryFixture::new(
                 datastore.clone(),

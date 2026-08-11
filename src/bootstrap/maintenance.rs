@@ -2,7 +2,7 @@
 //!
 //! Feature behavior stays with its canonical owner: kubelet owns sandbox
 //! cleanup and cluster-store owns watch-history retention. Root only composes
-//! those focused capabilities with the sequenced datastore and supervised
+//! those focused capabilities with supervised
 //! timer lifecycle.
 
 use std::sync::Arc;
@@ -13,41 +13,7 @@ use async_trait::async_trait;
 use klights_cluster_store::ClusterWatchMaintenance;
 use tokio_util::sync::CancellationToken;
 
-use crate::datastore::{DatastoreBackend, DatastoreHandle};
-
 const WATCH_EVENT_BATCH_CAP: i64 = 5_000;
-
-/// Focused private bridge from the root's sequenced datastore facade to the
-/// canonical cluster-store maintenance capability.
-struct SequencedWatchMaintenanceAdapter {
-    sequenced: DatastoreHandle,
-}
-
-impl SequencedWatchMaintenanceAdapter {
-    fn new(sequenced: DatastoreHandle) -> Self {
-        Self { sequenced }
-    }
-}
-
-#[async_trait]
-impl ClusterWatchMaintenance for SequencedWatchMaintenanceAdapter {
-    async fn advance_resource_version_after(&self, min_rv: i64) -> Result<i64> {
-        DatastoreBackend::advance_resource_version_after(self.sequenced.as_ref(), min_rv).await
-    }
-
-    async fn watch_events_gc_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
-        DatastoreBackend::watch_events_gc_prunable_count(
-            self.sequenced.as_ref(),
-            max_rows,
-            batch_cap,
-        )
-        .await
-    }
-
-    async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
-        DatastoreBackend::gc_watch_events(self.sequenced.as_ref(), max_rows, batch_cap).await
-    }
-}
 
 #[async_trait]
 trait SandboxMaintenance: Send + Sync {
@@ -71,7 +37,7 @@ pub(crate) struct MaintenanceRunner {
 
 impl MaintenanceRunner {
     pub(crate) fn new(
-        sequenced: DatastoreHandle,
+        watch: Arc<dyn ClusterWatchMaintenance>,
         sandbox: Option<Arc<klights_kubelet::sandbox_gc::SandboxGc>>,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
         interval: Duration,
@@ -81,8 +47,6 @@ impl MaintenanceRunner {
             max_watch_events > 0,
             "watch event retention limit must be positive"
         );
-        let watch: Arc<dyn ClusterWatchMaintenance> =
-            Arc::new(SequencedWatchMaintenanceAdapter::new(sequenced));
         let sandbox = sandbox.map(|sandbox| -> Arc<dyn SandboxMaintenance> { sandbox });
         Ok(Self {
             watch,
@@ -291,15 +255,14 @@ mod tests {
 
     #[tokio::test]
     async fn maintenance_rejects_nonpositive_watch_retention() {
-        let (_db, sequenced) =
-            crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
+        let watch = Arc::new(RecordingWatchMaintenance::new());
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
 
         assert!(
             MaintenanceRunner::new(
-                sequenced.clone(),
+                watch.clone(),
                 None,
                 supervisor.clone(),
                 Duration::from_secs(1),
@@ -308,8 +271,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            MaintenanceRunner::new(sequenced, None, supervisor, Duration::from_secs(1), -1)
-                .is_err()
+            MaintenanceRunner::new(watch, None, supervisor, Duration::from_secs(1), -1).is_err()
         );
     }
 

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 
 #[cfg(any(test, feature = "pod-repository-test-support"))]
+#[allow(dead_code)]
 pub(crate) fn test_file_process_executor() -> klights_supervisor::FileProcessExecutor {
     klights_supervisor::FileProcessExecutor::new(std::sync::Arc::new(
         klights_supervisor::TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default()),

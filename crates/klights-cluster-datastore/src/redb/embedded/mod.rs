@@ -1,7 +1,7 @@
 //! `RedbDatastore` — redb backend composed from focused domain stores.
 //!
-//! Production composes `SequencedDatastore` above this passive backend; `RedbDatastore` implements
-//! `DatastoreBackend` by delegating to composed stores. Legacy local
+//! Production composes focused bootstrap capabilities above this passive backend;
+//! `RedbDatastore` implements `DatastoreBackend` by delegating to composed stores. Legacy local
 //! `StorageCommand` apply support is test-only cleanup debt.
 
 use std::sync::Arc;

@@ -25,6 +25,7 @@ pub struct LeaderStart<'a> {
     /// (not the raft leader), controller startup is skipped cleanly.
     pub leader_coordination: Option<Arc<dyn ControllerCoordination>>,
     pub db_handle: &'a DatastoreHandle,
+    pub watch_maintenance: Arc<dyn klights_cluster_store::ClusterWatchMaintenance>,
     pub positioned_watch: klights_watch::PositionedWatchService,
     pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
     pub pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
@@ -43,6 +44,7 @@ pub struct LeaderStart<'a> {
 struct LeaderScopedTaskContext {
     config: Arc<KlightsConfig>,
     db_handle: DatastoreHandle,
+    watch_maintenance: Arc<dyn klights_cluster_store::ClusterWatchMaintenance>,
     positioned_watch: klights_watch::PositionedWatchService,
     pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
     pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
@@ -61,6 +63,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
         config,
         leader_coordination,
         db_handle,
+        watch_maintenance,
         positioned_watch,
         pod_network_cache,
         pod_runtime_store,
@@ -88,6 +91,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
     let leader_context = LeaderScopedTaskContext {
         config: config.clone(),
         db_handle: db_handle.clone(),
+        watch_maintenance,
         positioned_watch,
         pod_network_cache,
         pod_runtime_store,
@@ -220,6 +224,7 @@ async fn start_leader_scoped_tasks(
     let LeaderScopedTaskContext {
         config,
         db_handle,
+        watch_maintenance,
         positioned_watch,
         pod_network_cache,
         pod_runtime_store,
@@ -334,7 +339,7 @@ async fn start_leader_scoped_tasks(
         ))
     });
     let maintenance = crate::bootstrap::maintenance::MaintenanceRunner::new(
-        db_handle.clone(),
+        watch_maintenance,
         sandbox_maintenance,
         task_supervisor.clone(),
         config.gc_interval,

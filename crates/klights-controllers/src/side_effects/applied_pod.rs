@@ -10,7 +10,7 @@
 //!
 //! Two callers wire into this:
 //!
-//!  * `LocalApiClient::apply_outbox` — leader-bundled-worker writes through
+//!  * the leader-bundled-worker committed-outbox capability — writes through
 //!    the in-process outbox.
 //!  * `replication::grpc::server::Replication::apply_outbox` — remote worker
 //!    writes forwarded over gRPC.

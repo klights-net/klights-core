@@ -99,7 +99,7 @@ fn inventory_resource(
 impl FreshServiceInventoryClient {
     async fn fresh_list_for_test(
         &self,
-        req: crate::control_plane::client::ListRequest,
+        req: crate::bootstrap::leader_conversions::resource::ListRequest,
     ) -> anyhow::Result<crate::datastore::ResourceList> {
         if req.api_version == "discovery.k8s.io/v1" && req.kind == "EndpointSlice" {
             self.endpointslice_list_calls
@@ -265,7 +265,9 @@ impl klights_leader_api::LeaderResourceQuery for FreshServiceInventoryClient {
             }
             self.fresh_get_for_test(request.into_key())
                 .await
-                .map_err(crate::control_plane::client::query_error)
+                .map_err(|error| {
+                    klights_leader_api::ResourceQueryError::query_failed(error.to_string())
+                })
         })
     }
 
@@ -285,12 +287,18 @@ impl klights_leader_api::LeaderResourceQuery for FreshServiceInventoryClient {
                     None,
                 );
             }
-            let legacy = crate::control_plane::client::legacy_list_request(&request);
-            let list = self
-                .fresh_list_for_test(legacy)
-                .await
-                .map_err(crate::control_plane::client::query_error)?;
-            crate::control_plane::client::query_list_result(list)
+            let legacy =
+                crate::bootstrap::leader_conversions::resource::legacy_list_request(&request);
+            let list = self.fresh_list_for_test(legacy).await.map_err(|error| {
+                klights_leader_api::ResourceQueryError::query_failed(error.to_string())
+            })?;
+            klights_leader_api::ResourceListResult::try_new(
+                list.items,
+                list.resource_version,
+                list.watch_replay_position,
+                list.continue_token,
+                list.remaining_item_count,
+            )
         })
     }
 }
@@ -317,7 +325,9 @@ impl klights_leader_api::LeaderCacheReadiness for FreshServiceInventoryClient {
     }
 }
 
-crate::control_plane::client::impl_unavailable_leader_pod_effects!(FreshServiceInventoryClient);
+crate::bootstrap::leader_test_support::impl_unavailable_leader_pod_effects!(
+    FreshServiceInventoryClient
+);
 
 #[tokio::test]
 async fn service_specs_from_api_uses_fresh_reads_for_routing_snapshot() {

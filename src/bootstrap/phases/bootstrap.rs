@@ -65,13 +65,22 @@ pub struct BootstrapRunArgs<'a> {
     pub db_handle: &'a DatastoreHandle,
     pub watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     pub positioned_watch: klights_watch::PositionedWatchService,
+    pub local_resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    pub network_topology_command: Arc<dyn klights_leader_api::LeaderNetworkTopologyCommand>,
     pub pod_workqueue_store: Arc<dyn klights_node_store::PodWorkqueueStore>,
     pub pod_slot_store: Arc<dyn klights_node_store::PodSlotAdmissionStore>,
     pub pod_slot_events: Arc<dyn klights_node_store::PodSlotAdmissionEventSource>,
     pub worker_store_adapter: Option<Arc<klights_kubelet::worker_store::WorkerStoreAdapter>>,
     pub kubelet_uses_worker_store_adapter: bool,
     pub db: &'a dyn crate::datastore::DatastoreBackend,
-    pub leader_ports: crate::control_plane::client::LeaderClientPorts,
+    pub leader_resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    pub leader_watch: Arc<dyn klights_leader_api::LeaderWatch>,
+    pub leader_cache_readiness: Arc<dyn klights_leader_api::LeaderCacheReadiness>,
+    pub leader_projected_tokens:
+        Arc<dyn klights_leader_api::LeaderProjectedServiceAccountToken>,
+    pub leader_pod_cleanup_intents: Arc<dyn klights_leader_api::LeaderPodCleanupIntents>,
+    pub leader_node_subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
+    pub leader_network_topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery>,
     pub resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     pub remote_api_client: Option<Arc<klights_leader_rpc::client::RemoteApiClient>>,
     pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
@@ -82,9 +91,14 @@ pub struct BootstrapRunArgs<'a> {
     pub outbox_runtime: Arc<klights_kubelet::node_outbox::Outbox>,
     pub node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
     pub node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
+    pub local_node_lease_renewal: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
+    pub node_lifecycle_status: Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>,
     pub network: Arc<crate::bootstrap::networking::Network>,
     pub services: Arc<dyn klights_network_api::ServiceRouter>,
-    pub local_api_client: Arc<crate::control_plane::client::local::LocalApiClient>,
+    pub local_side_effects: Arc<crate::bootstrap::composition_adapters::
+        committed_outbox_delivery_adapter::RootOutboxSideEffectState>,
+    pub authenticated_projected_token:
+        Arc<dyn klights_leader_api::LeaderAuthenticatedProjectedServiceAccountToken>,
     pub authenticated_outbox_delivery:
         Arc<dyn klights_leader_api::LeaderAuthenticatedOutboxDelivery>,
     pub control_plane_lease_client: Option<Arc<klights_leader_rpc::client::ReplicationGrpcClient>>,
@@ -109,10 +123,9 @@ pub struct BootstrapRunArgs<'a> {
     >,
     /// T6 step 4: leadership watch sender, created in runtime.rs before
     /// `open_leader`. The shape watcher inside this phase updates it on
-    /// every `Raft::metrics()` change so `LocalApiClient`'s inner gate
-    /// (step 1) and the switching `LeaderProxyApiClient` (step 3) see
-    /// the live leader state. The matching receiver was already passed
-    /// to `open_leader` so it's wired into the datastore phase.
+    /// every `Raft::metrics()` change so the authority-routed capabilities
+    /// see the live leader state. The matching receiver was already passed
+    /// to `open_leader` for legacy replication/bootstrap adapters.
     pub is_leader_tx: tokio::sync::watch::Sender<bool>,
     pub is_leader_rx: tokio::sync::watch::Receiver<bool>,
     /// Opaque authority shared with the local and switching leader clients.
@@ -323,13 +336,21 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         db_handle,
         watch_signals,
         positioned_watch,
+        local_resource_query,
+        network_topology_command,
         pod_workqueue_store,
         pod_slot_store,
         pod_slot_events,
         worker_store_adapter,
         kubelet_uses_worker_store_adapter,
         db,
-        leader_ports,
+        leader_resource_query,
+        leader_watch,
+        leader_cache_readiness,
+        leader_projected_tokens,
+        leader_pod_cleanup_intents,
+        leader_node_subnet_allocation,
+        leader_network_topology,
         resource_commands,
         remote_api_client,
         pod_network_cache,
@@ -340,10 +361,13 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         outbox_runtime,
         node_lease_tracker,
         node_lease_renewal_client,
+        local_node_lease_renewal,
+        node_lifecycle_status,
         control_plane_lease_client,
         network,
         services,
-        local_api_client,
+        local_side_effects,
+        authenticated_projected_token,
         authenticated_outbox_delivery,
         dataplane_health,
         cri_for_pod_watcher,
@@ -510,7 +534,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let namespace_lifecycle_store =
         crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(db_handle.clone());
-    local_api_client.set_namespace_termination(
+    local_side_effects.set_namespace_termination(
         crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationReconciler::new(
             namespace_lifecycle_store.clone(),
             metrics.clone(),
@@ -529,7 +553,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         ),
     );
     let controller_coordination = Arc::new(klights_controllers::ControllerCoordination::new());
-    local_api_client.set_non_pod_finalization(non_pod_finalization.clone());
+    local_side_effects.set_non_pod_finalization(non_pod_finalization.clone());
 
     let scheduling_mode = if has_leader_coordination {
         crate::bootstrap::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader
@@ -572,7 +596,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     ) = if kubelet_uses_worker_store_adapter {
         crate::bootstrap::pod_repository_composition::build_worker_pod_repository_parts(
             crate::bootstrap::pod_repository_composition::WorkerPodRepositoryBuildConfig {
-                resource_query: leader_ports.resource_query.clone(),
+                resource_query: leader_resource_query.clone(),
                 pod_workqueue_store: pod_workqueue_store.clone(),
                 supervisor: supervisor.clone(),
                 metrics: metrics.clone(),
@@ -593,7 +617,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 assignment_waiter: assignment_waiter.clone(),
                 scheduling_mode,
                 outbox: Some(outbox_runtime.clone()),
-                cluster_api: Some(leader_ports.resource_query.clone()),
+                cluster_api: Some(leader_resource_query.clone()),
                 remote_delivery_required: false,
                 controller_identity: controller_identity.clone(),
                 #[cfg(not(test))]
@@ -627,10 +651,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         services.clone(),
     );
     let kubelet_status_delivery = klights_kubelet::context::StatusDeliveryServices::new(
-        leader_ports.resource_query.clone(),
-        leader_ports.cache_readiness.clone(),
-        leader_ports.pod_cleanup_intents.clone(),
-        leader_ports.projected_tokens.clone(),
+        leader_resource_query.clone(),
+        leader_cache_readiness.clone(),
+        leader_pod_cleanup_intents.clone(),
+        leader_projected_tokens.clone(),
         outbox_runtime.clone() as Arc<klights_kubelet::outbox::Outbox>,
     );
     let pod_subsystem = klights_kubelet::pod_subsystem::PodSubsystem::new(
@@ -683,7 +707,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             event_sink: if kubelet_uses_worker_store_adapter {
                 Arc::new(crate::bootstrap::kubelet_ports::WorkerPodEventSink::new(
                     outbox_runtime.clone(),
-                    leader_ports.resource_query.clone(),
+                    leader_resource_query.clone(),
                     Arc::new(klights_supervisor::SystemWallClock),
                 ))
             } else {
@@ -762,7 +786,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 assignment_waiter: assignment_waiter.clone(),
                 scheduling_mode,
                 outbox: Some(outbox_runtime.clone()),
-                cluster_api: Some(leader_ports.resource_query.clone()),
+                cluster_api: Some(leader_resource_query.clone()),
                 remote_delivery_required: false,
                 controller_identity: controller_identity.clone(),
                 #[cfg(not(test))]
@@ -903,7 +927,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         controller_identity.clone(),
     ));
     side_effects.set_controller_dispatcher(controller_dispatcher.clone());
-    local_api_client.set_controller_dispatcher(controller_dispatcher.clone());
+    local_side_effects.set_controller_dispatcher(controller_dispatcher.clone());
     let pod_start_retry_state: klights_kubelet::pod_creation_state::PodStartRetryTracker = Arc::new(
         tokio::sync::Mutex::new(klights_kubelet::pod_creation_state::PodStartRetryState::new()),
     );
@@ -916,9 +940,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .context("failed to build webhook authenticator")?;
 
     // T6 step 4: the `(is_leader_tx, is_leader_rx)` pair is created in
-    // `runtime.rs` BEFORE `open_leader` so the same receiver flows into
-    // `LocalApiClient`'s inner gate (step 1) and the switching
-    // `LeaderProxyApiClient` (step 3). Here we take ownership of the
+    // `runtime.rs` BEFORE `open_leader` so the same receiver remains
+    // available to legacy replication adapters and the authority-routed
+    // leader capabilities. Here we take ownership of the
     // sender and refresh the initial value from live raft metrics in
     // case the raft node initialized between the runtime constructor
     // (which guesses) and now.
@@ -1118,7 +1142,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     }
 
     let leader_peer_endpoint_observer_handle = if replication_service_for_router.is_some() {
-        let endpoint_query = leader_ports.resource_query.clone();
+        let endpoint_query = leader_resource_query.clone();
         let endpoint_status: Arc<dyn klights_leader_api::LeaderNodeSelfStatus> =
             Arc::new(klights_kubelet::node::OutboxNodeSelfStatusPublisher::new(
                 config.node_name.clone(),
@@ -1413,7 +1437,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             } else {
                 Arc::new(
                     crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
-                        leader_ports.watch.clone(),
+                        leader_watch.clone(),
                     ),
                 )
             };
@@ -1454,9 +1478,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     // Heartbeat
     let heartbeat_handle = {
         let watch_source = Arc::new(
-            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
-                leader_ports.watch.clone(),
-            ),
+            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(leader_watch.clone()),
         );
         let cfg = Arc::clone(config);
         let cancel = shutdown_token.clone();
@@ -1490,9 +1512,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let node_subnet_watch_handle = {
         let cancel = shutdown_token.clone();
         let health = dataplane_health.clone();
-        let topology = leader_ports.network_topology.clone();
-        let query = leader_ports.resource_query.clone();
-        let watch = leader_ports.watch.clone();
+        let topology = leader_network_topology.clone();
+        let query = leader_resource_query.clone();
+        let watch = leader_watch.clone();
         let projection =
             crate::bootstrap::controller_adapters::node_subnet_controller_adapter::DatastorePeerTopologyProjection::new(
                 db_handle.clone(),
@@ -1550,7 +1572,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let should_run_node_lifecycle = has_leader_coordination;
     let node_lifecycle_handle = if should_run_node_lifecycle {
         let cancel = shutdown_token.clone();
-        let node_lifecycle_status = local_api_client.clone();
+        let node_lifecycle_status_for_task = node_lifecycle_status.clone();
+        let node_lifecycle_watch: Arc<dyn klights_leader_api::LeaderWatch> =
+            Arc::new(positioned_watch.clone());
         let node_lifecycle_db = db_handle.clone();
         let node_lifecycle_pod_repository = controller_pod_port.clone();
         let node_lifecycle_pod_mutations = pod_mutation_reconcile.clone();
@@ -1575,8 +1599,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                                 pod_lifecycle: node_lifecycle_pod_router,
                                 lease_observations: node_lifecycle_lease_tracker,
                                 supervisor: node_lifecycle_supervisor,
-                                node_status: node_lifecycle_status.clone(),
-                                watch: node_lifecycle_status,
+                                node_status: node_lifecycle_status_for_task,
+                                watch: node_lifecycle_watch,
                                 coordination: node_lifecycle_coordination,
                                 pod_eviction_grace: node_lifecycle_pod_eviction_grace,
                             },
@@ -1629,7 +1653,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 clock.clone(),
                 klights_kubelet::node_api::logs::PodLogFollowWatchSource::new(Arc::new(
                     crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
-                        leader_ports.watch.clone(),
+                        leader_watch.clone(),
                     ),
                 )),
             ),
@@ -1684,7 +1708,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             ),
         ),
         namespace_lifecycle_store,
-        leader_ports.resource_query.clone(),
+        leader_resource_query.clone(),
         resource_commands.clone(),
         finalizer_lifecycle,
         mutation_effects,
@@ -1700,7 +1724,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         crate::bootstrap::composition_adapters::custom_resource_read_adapter::CustomResourceReadAdapter::new(
             db_handle.clone(),
             watch_signals.clone(),
-            positioned_watch,
+            positioned_watch.clone(),
             supervisor.clone(),
         ),
         generated_handler_adapter.clone(),
@@ -1808,8 +1832,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             }
             None => (None, None),
         };
-        let grpc_node_query: Arc<dyn klights_leader_api::LeaderResourceQuery> =
-            local_api_client.clone();
+        let grpc_node_query = local_resource_query.clone();
         let grpc_node_status: Arc<dyn klights_leader_api::LeaderNodeSelfStatus> =
             Arc::new(klights_kubelet::node::OutboxNodeSelfStatusPublisher::new(
                 config.node_name.clone(),
@@ -1818,16 +1841,17 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             ));
         {
-            let authenticated_projected_token = Arc::new(
-                crate::control_plane::client::local::AuthenticatedProjectedTokenIssuer::new(
-                    local_api_client.clone(),
-                ),
-            );
-            let grpc_ports = klights_leader_rpc::server::ReplicationServerPorts::from_split(
-                local_api_client.clone(),
+            let grpc_ports = klights_leader_rpc::server::ReplicationServerPorts::from_focused(
+                grpc_node_query.clone(),
                 resource_commands,
+                Arc::new(positioned_watch.clone()),
                 authenticated_outbox_delivery,
-                authenticated_projected_token,
+                authenticated_projected_token.clone(),
+                leader_pod_cleanup_intents.clone(),
+                local_node_lease_renewal.clone(),
+                leader_node_subnet_allocation.clone(),
+                leader_network_topology.clone(),
+                network_topology_command.clone(),
             );
             klights_leader_rpc::server::mount_service_full_production(
                 api_router,
@@ -1860,7 +1884,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 Some(config.node_name.clone()),
                 Some(grpc_node_query),
                 Some(grpc_node_status),
-                Some(local_api_client),
+                Some(node_lifecycle_status),
                 grpc_transport_policy,
             )
         }

@@ -3036,7 +3036,7 @@ mod tests {
             Arc::new(BackendResourceQuery {
                 backend: backend.clone(),
             }),
-            klights::control_plane::client::local::always_leader_watch(),
+            klights::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         );
         let error = command_service
             .submit_resource_command(

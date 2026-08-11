@@ -8,25 +8,42 @@ pub struct IntegrationPassiveReadPorts {
     ports: crate::datastore::selector::PassiveReadPorts,
 }
 
+struct UnavailableLeaderWatchForTest;
+
+impl klights_leader_api::LeaderWatch for UnavailableLeaderWatchForTest {
+    fn watch_resources(
+        &self,
+        _request: klights_leader_api::WatchRequest,
+    ) -> klights_leader_api::LeaderWatchFuture<'_> {
+        Box::pin(async {
+            Err(klights_leader_api::LeaderWatchError::Unavailable {
+                message: "positioned watch was not configured for this test server".to_string(),
+            })
+        })
+    }
+}
+
 pub struct IntegrationLeaderRpcRuntime {
     runtime: Arc<crate::bootstrap::grpc_runtime_adapter::GrpcReplicationRuntimeAdapter>,
 }
 
 pub struct IntegrationLeaderRpcLocalNetworkPorts {
-    local: Arc<crate::control_plane::client::local::LocalApiClient>,
+    network: Arc<crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork>,
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
 }
 
 pub struct IntegrationLeaderRpcNodePorts {
-    local: Arc<crate::control_plane::client::local::LocalApiClient>,
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    lifecycle_status: Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>,
 }
 
 impl IntegrationLeaderRpcNodePorts {
     pub fn resource_query(&self) -> Arc<dyn klights_leader_api::LeaderResourceQuery> {
-        self.local.clone()
+        self.resource_query.clone()
     }
 
     pub fn lifecycle_status(&self) -> Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus> {
-        self.local.clone()
+        self.lifecycle_status.clone()
     }
 }
 
@@ -81,7 +98,7 @@ impl IntegrationLeaderRpcNodeLocal {
 
 impl IntegrationLeaderRpcLocalNetworkPorts {
     pub fn resource_query(&self) -> Arc<dyn klights_leader_api::LeaderResourceQuery> {
-        self.local.clone()
+        self.resource_query.clone()
     }
 
     pub async fn register_node_dataplane(
@@ -89,7 +106,7 @@ impl IntegrationLeaderRpcLocalNetworkPorts {
         dataplane: klights_leader_api::NetworkDataplane,
     ) -> Result<(), klights_leader_api::NetworkTopologyError> {
         klights_leader_api::LeaderNetworkTopologyCommand::register_node_dataplane(
-            self.local.as_ref(),
+            self.network.as_ref(),
             dataplane,
         )
         .await
@@ -292,8 +309,10 @@ impl IntegrationLeaderRpcComposition {
         db: IntegrationDatastoreHandle,
         node_name: String,
     ) -> IntegrationLeaderRpcNodePorts {
+        let (resource_query, lifecycle_status) = Self::local_client_with_query(db, node_name);
         IntegrationLeaderRpcNodePorts {
-            local: Arc::new(Self::local_client(db, node_name)),
+            resource_query,
+            lifecycle_status,
         }
     }
 
@@ -301,8 +320,23 @@ impl IntegrationLeaderRpcComposition {
         db: IntegrationDatastoreHandle,
         node_name: String,
     ) -> IntegrationLeaderRpcLocalNetworkPorts {
+        let (resource_query, _lifecycle_status) =
+            Self::local_client_with_query(db.clone(), node_name);
+        let authority =
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+        let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
+            crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()),
+        );
+        let network = Arc::new(
+            crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
+                db,
+                proposal,
+                authority,
+            ),
+        );
         IntegrationLeaderRpcLocalNetworkPorts {
-            local: Arc::new(Self::local_client(db, node_name)),
+            network,
+            resource_query,
         }
     }
 
@@ -310,7 +344,7 @@ impl IntegrationLeaderRpcComposition {
         dataplane: klights_cluster_store::DataplanePeerMetadata,
     ) -> Result<klights_leader_api::NetworkDataplane, klights_leader_api::NetworkTopologyError>
     {
-        crate::control_plane::client::focused_dataplane(dataplane)
+        crate::bootstrap::leader_conversions::topology::focused_dataplane(dataplane)
     }
 
     pub async fn open_node_local(
@@ -329,20 +363,26 @@ impl IntegrationLeaderRpcComposition {
         })
     }
 
-    fn local_client(
+    fn local_client_with_query(
         db: IntegrationDatastoreHandle,
-        node_name: String,
-    ) -> crate::control_plane::client::local::LocalApiClient {
-        crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_and_passive_reads(
-            db,
-            crate::datastore::selector::unused_fail_closed_passive_read_ports(),
-            node_name,
-            Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
-                chrono::Utc::now(),
-            )),
-            crate::control_plane::client::local::always_leader_watch(),
-            Self::file_process_executor(),
-        )
+        _node_name: String,
+    ) -> (
+        Arc<dyn klights_leader_api::LeaderResourceQuery>,
+        Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>,
+    ) {
+        let authority =
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+        let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+            db.clone(),
+            authority.clone(),
+        );
+        let lifecycle_status =
+            crate::bootstrap::local_leader_adapters::LocalNodeLifecycleStatusAdapter::new(
+                db,
+                resource_query.clone(),
+                authority,
+            );
+        (resource_query, Arc::new(lifecycle_status))
     }
 
     pub async fn initialize_default_namespaces(&self) -> anyhow::Result<()> {
@@ -500,9 +540,6 @@ impl IntegrationLeaderRpcComposition {
         controller_dispatcher: Option<Arc<klights_controllers::ControllerDispatcher>>,
         node_lease_tracker: Option<Arc<klights_controllers::node_lease::NodeLeaseTracker>>,
     ) -> klights_leader_rpc::server::GrpcReplicationServer {
-        let passive_reads = passive_reads.unwrap_or_else(|| IntegrationPassiveReadPorts {
-            ports: crate::datastore::selector::unused_fail_closed_passive_read_ports(),
-        });
         let (runtime, ports, peer_auth, credential_issuer, clock) = self.server_parts(
             service,
             passive_reads,
@@ -547,9 +584,6 @@ impl IntegrationLeaderRpcComposition {
         node_lifecycle_status: Option<Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>>,
         transport_policy: Arc<klights_leader_rpc::transport_policy::GrpcTransportPolicy>,
     ) -> axum::Router {
-        let passive_reads = passive_reads.unwrap_or_else(|| IntegrationPassiveReadPorts {
-            ports: crate::datastore::selector::unused_fail_closed_passive_read_ports(),
-        });
         let (runtime, ports, peer_auth, credential_issuer, clock) = self.server_parts(
             service,
             passive_reads,
@@ -587,7 +621,7 @@ impl IntegrationLeaderRpcComposition {
     fn server_parts(
         &self,
         service: Arc<klights_replication::ReplicationService>,
-        passive_reads: IntegrationPassiveReadPorts,
+        passive_reads: Option<IntegrationPassiveReadPorts>,
         controller_dispatcher: Option<Arc<klights_controllers::ControllerDispatcher>>,
         node_lease_tracker: Option<Arc<klights_controllers::node_lease::NodeLeaseTracker>>,
     ) -> (
@@ -602,31 +636,94 @@ impl IntegrationLeaderRpcComposition {
                 chrono::Utc::now(),
             ))
         });
-        let local = Arc::new(
-            crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_and_passive_reads(
+        let authority =
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+        let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
+            crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(self.db.clone()),
+        );
+        let network = Arc::new(
+            crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
                 self.db.clone(),
-                passive_reads.ports,
-                "grpc-test".to_string(),
-                node_lease_tracker,
-                crate::control_plane::client::local::always_leader_watch(),
-                Self::file_process_executor(),
+                proposal.clone(),
+                authority.clone(),
             ),
         );
+        let pod_cleanup = Arc::new(
+            crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup::new(
+                self.db.clone(),
+                proposal,
+                authority.clone(),
+            ),
+        );
+        let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+            self.db.clone(),
+            authority.clone(),
+        );
+        let authority_handle =
+            crate::bootstrap::authority::AuthorityHandle::from(authority.clone());
+        let side_effects =
+            crate::bootstrap::local_leader_adapters::new_local_outbox_side_effect_state(
+                self.db.clone(),
+            );
         if let Some(dispatcher) = controller_dispatcher {
-            local.set_controller_dispatcher(dispatcher);
+            side_effects.set_controller_dispatcher(dispatcher);
         }
-        local.set_non_pod_finalization(Arc::new(
+        side_effects.set_non_pod_finalization(Arc::new(
             crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
                 self.db.clone(),
             ),
         ));
-        let projected_token = Arc::new(
-            crate::control_plane::client::local::AuthenticatedProjectedTokenIssuer::new(
-                local.clone(),
+        let resource_command = crate::bootstrap::composition_adapters::
+            committed_outbox_delivery_adapter::test_resource_command(
+                self.db.clone(),
+                &authority_handle,
+            );
+        let authenticated_outbox = crate::bootstrap::composition_adapters::
+            committed_outbox_delivery_adapter::test_outbox_delivery(
+                self.db.clone(),
+                &authority_handle,
+                side_effects,
+                "grpc-test".to_string(),
+            );
+        let local_node_lease = Arc::new(
+            crate::bootstrap::local_leader_adapters::LocalNodeLeaseRenewalAdapter::new(
+                node_lease_tracker,
+                authority.clone(),
             ),
         );
-        let ports =
-            klights_leader_rpc::server::ReplicationServerPorts::from_shared(local, projected_token);
+        let local_projected_token = Arc::new(
+            crate::bootstrap::local_leader_adapters::LocalProjectedTokenAdapter::new(
+                self.db.clone(),
+                "grpc-test".to_string(),
+                crate::paths::runtime_namespace(),
+                crate::paths::service_account_signing_key_path(&crate::paths::runtime_namespace()),
+                authority.clone(),
+                Self::file_process_executor(),
+            ),
+        );
+        let projected_token = Arc::new(
+            crate::bootstrap::local_leader_adapters::AuthenticatedProjectedTokenIssuer::new(
+                local_projected_token,
+            ),
+        );
+        let positioned_watch: Arc<dyn klights_leader_api::LeaderWatch> = match passive_reads {
+            Some(passive_reads) => {
+                Arc::new(Self::positioned_watch(&passive_reads, self.db.clone()))
+            }
+            None => Arc::new(UnavailableLeaderWatchForTest),
+        };
+        let ports = klights_leader_rpc::server::ReplicationServerPorts::from_focused(
+            resource_query,
+            resource_command,
+            positioned_watch,
+            authenticated_outbox,
+            projected_token,
+            pod_cleanup,
+            local_node_lease,
+            network.clone(),
+            network.clone(),
+            network,
+        );
         let supervisor = service.task_supervisor();
         (
             klights_leader_rpc::server::GrpcReplicationRuntimePorts::from_shared(

@@ -171,8 +171,8 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     let grpc_ca_cert_path = identity.grpc_ca_cert_path;
     let is_leader_runtime = uses_leader_runtime(&cli.role);
     // T6 step 4: leadership watch is created before `open_leader` so the
-    // real `is_leader_rx` flows into `LocalApiClient`'s inner gate
-    // (step 1) and the switching `LeaderProxyApiClient` (step 3). The
+    // real `is_leader_rx` remains available to legacy replication adapters
+    // and the authority-routed leader capabilities. The
     // initial value reflects what each role expects at boot:
     //   - Seed control-plane / single-node leader: `true` because
     //     `bootstrap_single_voter` makes this node the leader during
@@ -213,8 +213,17 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     let db_handle = ds.db_handle;
     let watch_signals = ds.watch_signals;
     let positioned_watch = ds.positioned_watch;
+    let local_resource_query = ds.local_resource_query;
+    let network_topology_command = ds.network_topology_command;
     let db: &dyn datastore::DatastoreBackend = &*db_handle;
-    let leader_ports = ds.leader_ports;
+    let leader_resource_query = ds.leader_resource_query;
+    let leader_watch = ds.leader_watch;
+    let leader_cache_readiness = ds.leader_cache_readiness;
+    let leader_projected_tokens = ds.leader_projected_tokens;
+    let leader_pod_cleanup_intents = ds.leader_pod_cleanup_intents;
+    let leader_node_subnet_allocation = ds.leader_node_subnet_allocation;
+    let leader_network_topology = ds.leader_network_topology;
+    let leader_watch_maintenance = ds.leader_watch_maintenance;
     let resource_commands = ds.resource_commands;
     let remote_api_client = ds.remote_api_client;
     let replication_service_for_router = ds.replication_service.clone();
@@ -223,6 +232,9 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     let outbox_runtime = ds.outbox;
     let node_lease_tracker = ds.node_lease_tracker;
     let node_lease_renewal_client = ds.node_lease_renewal_client;
+    let local_node_lease_renewal = ds.local_node_lease_renewal;
+    let node_lifecycle_status = ds.node_lifecycle_status;
+    let authenticated_projected_token = ds.authenticated_projected_token;
     let control_plane_lease_client = ds.control_plane_lease_client;
     let raft_node = ds.raft_node;
     let member_feature_probe = ds.member_feature_probe;
@@ -251,13 +263,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     };
 
     let _ = grpc_ca_cert_path.clone();
-    // Reuse the same LocalApiClient instance the outbox dispatcher was
-    // wired with in the datastore phase. Creating a second instance here
-    // would mean `set_controller_dispatcher` (called later in the bootstrap
-    // phase) lands on a different OnceCell than the outbox dispatcher's
-    // apply client reads — silently dropping every pod-status side effect
-    // (RS readyReplicas, Service endpoint reconcile).
-    let local_api_client = ds.local_api_client;
+    let local_side_effects = ds.local_side_effects;
     let authenticated_outbox_delivery = ds.authenticated_outbox_delivery;
     let kubelet_uses_worker_store_adapter = should_use_worker_store_adapter_for_kubelet(&cli.role);
     let worker_store_adapter = if kubelet_uses_worker_store_adapter {
@@ -304,10 +310,10 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         config: &config,
         node_mode: &node_mode,
         node_ip: &node_ip,
-        resource_query: leader_ports.resource_query.clone(),
-        watch: leader_ports.watch.clone(),
-        subnet_allocation: leader_ports.node_subnet_allocation.clone(),
-        network_topology: leader_ports.network_topology.clone(),
+        resource_query: leader_resource_query.clone(),
+        watch: leader_watch.clone(),
+        subnet_allocation: leader_node_subnet_allocation.clone(),
+        network_topology: leader_network_topology.clone(),
         pod_network_cache: node_local.pod_network_cache(),
         pod_ipam: node_local.pod_ipam(),
         pod_runtime: node_local.pod_runtime(),
@@ -354,7 +360,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
                 .unwrap_or_else(|| {
                     std::sync::Arc::new(
                         crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
-                            leader_ports.watch.clone(),
+                            leader_watch.clone(),
                         ),
                     )
                 }),
@@ -374,13 +380,21 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         db_handle: &db_handle,
         watch_signals: watch_signals.clone(),
         positioned_watch: positioned_watch.clone(),
+        local_resource_query: local_resource_query.clone(),
+        network_topology_command: network_topology_command.clone(),
         pod_workqueue_store: node_local.pod_workqueue(),
         pod_slot_store: node_local.pod_slots(),
         pod_slot_events: node_local.pod_slot_events(),
         worker_store_adapter: worker_store_adapter.clone(),
         kubelet_uses_worker_store_adapter,
         db,
-        leader_ports: leader_ports.clone(),
+        leader_resource_query: leader_resource_query.clone(),
+        leader_watch: leader_watch.clone(),
+        leader_cache_readiness: leader_cache_readiness.clone(),
+        leader_projected_tokens: leader_projected_tokens.clone(),
+        leader_pod_cleanup_intents: leader_pod_cleanup_intents.clone(),
+        leader_node_subnet_allocation: leader_node_subnet_allocation.clone(),
+        leader_network_topology: leader_network_topology.clone(),
         resource_commands,
         remote_api_client: remote_api_client.clone(),
         pod_network_cache,
@@ -392,9 +406,12 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         control_plane_lease_client: control_plane_lease_client.clone(),
         node_lease_tracker: node_lease_tracker.clone(),
         node_lease_renewal_client: node_lease_renewal_client.clone(),
+        local_node_lease_renewal: local_node_lease_renewal.clone(),
+        node_lifecycle_status: node_lifecycle_status.clone(),
         network: network.clone(),
         services: services.clone(),
-        local_api_client: local_api_client.clone(),
+        local_side_effects: local_side_effects.clone(),
+        authenticated_projected_token,
         authenticated_outbox_delivery,
         dataplane_health: &dataplane_health,
         cri_for_pod_watcher,
@@ -431,6 +448,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         config: &config,
         leader_coordination: controller_coordination,
         db_handle: &db_handle,
+        watch_maintenance: leader_watch_maintenance.clone(),
         positioned_watch,
         pod_network_cache: node_local.pod_network_cache(),
         pod_runtime_store: node_local.pod_runtime(),

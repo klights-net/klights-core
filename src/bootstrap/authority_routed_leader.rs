@@ -1,8 +1,8 @@
-//! T6 step 3: switching `LeaderApiClient` for non-leader leader-class boots.
+//! Private bootstrap authority-routed leader capability dispatcher.
 //!
 //! Every leader-class member (cp + replica) holds the same `cluster_api`
-//! binding — a `LeaderProxyApiClient` that wraps a local
-//! `LocalApiClient` and a remote forwarder. Per-call dispatch:
+//! binding — an `AuthorityRoutedLeader` that wraps a local
+//! a local capability set and a remote forwarder. Per-call dispatch:
 //!
 //! - **Kubernetes API reads and watches** go to the elected leader. When this
 //!   member is leader they use the local client; otherwise they use the remote
@@ -18,12 +18,12 @@
 //!   carries the call to the current elected leader's API server over gRPC.
 //!
 //! Leadership change is a state flip on the same instance — no
-//! re-construction, no rewiring. The proxy samples authority per
+//! re-construction, no rewiring. The adapter samples authority per
 //! call, so the next read or write after promotion / demotion picks the new
 //! dispatch target without any setup.
 //!
 //! Every capability is stored as its own focused trait object. Tests inject
-//! recording fakes through `LeaderClientPorts` and assert the dispatch table
+//! recording fakes through the individual focused capabilities and assert the dispatch table
 //! without spinning up a real cluster.
 
 use std::sync::Arc;
@@ -51,7 +51,7 @@ use klights_leader_api::{
     ResourceListResult, ResourceQueryConsistency, ResourceQueryFuture, WatchRequest, WatchStream,
 };
 
-use super::{AuthorityHandle, LeaderClientPorts};
+use crate::bootstrap::authority::AuthorityHandle;
 use klights_cluster_core::Resource;
 
 #[cfg(test)]
@@ -110,11 +110,11 @@ impl FocusedLeaderTargets {
 }
 
 /// Leader-aware `LeaderApiClient` that dispatches each call to a local
-/// `LocalApiClient` (reads, plus writes when self is the elected
+/// the local capability set (reads, plus writes when self is the elected
 /// leader) or a remote forwarder (writes when self is a follower /
 /// learner). The decision is per-call; promotion / demotion changes the
 /// authority route and the next write picks the new target without rewiring.
-pub struct LeaderProxyApiClient {
+pub(crate) struct AuthorityRoutedLeader {
     resource_queries: ArcPair<dyn LeaderResourceQuery>,
     watches: ArcPair<dyn LeaderWatch>,
     cache_readiness: ArcPair<dyn LeaderCacheReadiness>,
@@ -126,88 +126,68 @@ pub struct LeaderProxyApiClient {
     authority: AuthorityHandle,
 }
 
-impl LeaderProxyApiClient {
+impl AuthorityRoutedLeader {
     /// Construct a switching proxy.
     ///
     /// `local` handles all reads and writes-while-leader. `remote`
     /// handles writes-while-follower (forwarding to the current
     /// elected leader). The authority handle is the same backend-neutral
-    /// capability fed to `LocalApiClient`, so the two layers cannot disagree.
+    /// capability fed by bootstrap, so the two layers cannot disagree.
+    // Keep every capability explicit: bundling these arguments would recreate
+    // the deleted god client and weaken per-capability route ownership.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        local: LeaderClientPorts,
-        remote: LeaderClientPorts,
+        local_resource_query: Arc<dyn LeaderResourceQuery>,
+        local_watch: Arc<dyn LeaderWatch>,
+        local_cache_readiness: Arc<dyn LeaderCacheReadiness>,
+        local_projected_tokens: Arc<dyn LeaderProjectedServiceAccountToken>,
+        local_pod_cleanup_intents: Arc<dyn LeaderPodCleanupIntents>,
+        local_node_subnet_allocation: Arc<dyn LeaderNodeSubnetAllocation>,
+        local_network_topology: Arc<dyn LeaderNetworkTopologyQuery>,
+        remote_resource_query: Arc<dyn LeaderResourceQuery>,
+        remote_watch: Arc<dyn LeaderWatch>,
+        remote_cache_readiness: Arc<dyn LeaderCacheReadiness>,
+        remote_projected_tokens: Arc<dyn LeaderProjectedServiceAccountToken>,
+        remote_pod_cleanup_intents: Arc<dyn LeaderPodCleanupIntents>,
+        remote_node_subnet_allocation: Arc<dyn LeaderNodeSubnetAllocation>,
+        remote_network_topology: Arc<dyn LeaderNetworkTopologyQuery>,
         authority: impl Into<AuthorityHandle>,
     ) -> Self {
         Self {
             resource_queries: ArcPair {
-                local: Some(local.resource_query),
-                remote: Some(remote.resource_query),
+                local: Some(local_resource_query),
+                remote: Some(remote_resource_query),
             },
             watches: ArcPair {
-                local: Some(local.watch),
-                remote: Some(remote.watch),
+                local: Some(local_watch),
+                remote: Some(remote_watch),
             },
             cache_readiness: ArcPair {
-                local: Some(local.cache_readiness),
-                remote: Some(remote.cache_readiness),
+                local: Some(local_cache_readiness),
+                remote: Some(remote_cache_readiness),
             },
             projected_tokens: ArcPair {
-                local: Some(local.projected_tokens),
-                remote: Some(remote.projected_tokens),
+                local: Some(local_projected_tokens),
+                remote: Some(remote_projected_tokens),
             },
             pod_cleanup_intents: ArcPair {
-                local: Some(local.pod_cleanup_intents),
-                remote: Some(remote.pod_cleanup_intents),
+                local: Some(local_pod_cleanup_intents),
+                remote: Some(remote_pod_cleanup_intents),
             },
             node_subnet_allocations: ArcPair {
-                local: Some(local.node_subnet_allocation),
-                remote: Some(remote.node_subnet_allocation),
+                local: Some(local_node_subnet_allocation),
+                remote: Some(remote_node_subnet_allocation),
             },
             network_topology: ArcPair {
-                local: Some(local.network_topology),
-                remote: Some(remote.network_topology),
+                local: Some(local_network_topology),
+                remote: Some(remote_network_topology),
             },
             focused_targets: None,
             authority: authority.into(),
         }
     }
 
-    #[cfg(test)]
-    fn from_clients<L, R>(
-        local: Arc<L>,
-        remote: Arc<R>,
-        authority: impl Into<AuthorityHandle>,
-    ) -> Self
-    where
-        L: LeaderResourceQuery
-            + LeaderWatch
-            + LeaderCacheReadiness
-            + LeaderProjectedServiceAccountToken
-            + LeaderPodCleanupIntents
-            + LeaderNodeSubnetAllocation
-            + LeaderNetworkTopologyQuery
-            + Send
-            + Sync
-            + 'static,
-        R: LeaderResourceQuery
-            + LeaderWatch
-            + LeaderCacheReadiness
-            + LeaderProjectedServiceAccountToken
-            + LeaderPodCleanupIntents
-            + LeaderNodeSubnetAllocation
-            + LeaderNetworkTopologyQuery
-            + Send
-            + Sync
-            + 'static,
-    {
-        Self::new(
-            LeaderClientPorts::from_client(local),
-            LeaderClientPorts::from_client(remote),
-            authority,
-        )
-    }
-
-    pub fn with_resource_command_targets(
+    pub(crate) fn with_resource_command_targets(
         mut self,
         local: Arc<dyn LeaderResourceCommand>,
         remote: Arc<dyn LeaderResourceCommand>,
@@ -218,7 +198,7 @@ impl LeaderProxyApiClient {
         self
     }
 
-    pub fn with_outbox_delivery_targets(
+    pub(crate) fn with_outbox_delivery_targets(
         mut self,
         local: Arc<dyn LeaderOutboxDelivery>,
         remote: Arc<dyn LeaderOutboxDelivery>,
@@ -229,7 +209,7 @@ impl LeaderProxyApiClient {
         self
     }
 
-    pub fn with_node_lease_renewal_targets(
+    pub(crate) fn with_node_lease_renewal_targets(
         mut self,
         local: Arc<dyn LeaderNodeLeaseRenewal>,
         remote: Arc<dyn LeaderNodeLeaseRenewal>,
@@ -277,7 +257,7 @@ impl LeaderProxyApiClient {
     }
 }
 
-impl LeaderResourceCommand for LeaderProxyApiClient {
+impl LeaderResourceCommand for AuthorityRoutedLeader {
     fn submit_resource_command(
         &self,
         request: ResourceCommandRequest,
@@ -310,7 +290,7 @@ impl LeaderResourceCommand for LeaderProxyApiClient {
     }
 }
 
-impl LeaderNodeLeaseRenewal for LeaderProxyApiClient {
+impl LeaderNodeLeaseRenewal for AuthorityRoutedLeader {
     fn renew_node_lease(
         &self,
         request: NodeLeaseRenewalRequest,
@@ -365,7 +345,7 @@ async fn wait_for_authority_change(
     }
 }
 
-impl LeaderResourceQuery for LeaderProxyApiClient {
+impl LeaderResourceQuery for AuthorityRoutedLeader {
     fn get_resource(
         &self,
         request: ResourceGetRequest,
@@ -427,7 +407,7 @@ impl LeaderResourceQuery for LeaderProxyApiClient {
     }
 }
 
-impl LeaderWatch for LeaderProxyApiClient {
+impl LeaderWatch for AuthorityRoutedLeader {
     fn watch_resources(&self, req: WatchRequest) -> LeaderWatchFuture<'_> {
         let authority = self.authority.clone();
         let route = authority.route();
@@ -456,7 +436,7 @@ impl LeaderWatch for LeaderProxyApiClient {
     }
 }
 
-impl LeaderCacheReadiness for LeaderProxyApiClient {
+impl LeaderCacheReadiness for AuthorityRoutedLeader {
     fn wait_cache_ready(&self, scope: CacheReadinessRequest) -> CacheReadinessFuture<'_> {
         let route = self.authority.route();
         self.target(&self.cache_readiness, &route)
@@ -464,7 +444,7 @@ impl LeaderCacheReadiness for LeaderProxyApiClient {
     }
 }
 
-impl LeaderProjectedServiceAccountToken for LeaderProxyApiClient {
+impl LeaderProjectedServiceAccountToken for AuthorityRoutedLeader {
     fn issue_projected_service_account_token(
         &self,
         request: ProjectedServiceAccountTokenRequest,
@@ -475,7 +455,7 @@ impl LeaderProjectedServiceAccountToken for LeaderProxyApiClient {
     }
 }
 
-impl LeaderPodCleanupIntents for LeaderProxyApiClient {
+impl LeaderPodCleanupIntents for AuthorityRoutedLeader {
     fn list_pod_cleanup_intents(
         &self,
         request: PodCleanupIntentListRequest,
@@ -533,7 +513,7 @@ impl LeaderPodCleanupIntents for LeaderProxyApiClient {
     }
 }
 
-impl LeaderNodeSubnetAllocation for LeaderProxyApiClient {
+impl LeaderNodeSubnetAllocation for AuthorityRoutedLeader {
     fn allocate_node_subnet(
         &self,
         request: NodeSubnetAllocationRequest,
@@ -544,7 +524,7 @@ impl LeaderNodeSubnetAllocation for LeaderProxyApiClient {
     }
 }
 
-impl LeaderNetworkTopologyQuery for LeaderProxyApiClient {
+impl LeaderNetworkTopologyQuery for AuthorityRoutedLeader {
     fn get_node_subnet(
         &self,
         request: NodeSubnetQuery,
@@ -573,7 +553,7 @@ impl LeaderNetworkTopologyQuery for LeaderProxyApiClient {
     }
 }
 
-impl LeaderOutboxDelivery for LeaderProxyApiClient {
+impl LeaderOutboxDelivery for AuthorityRoutedLeader {
     fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
         let route = self.authority.route();
         let target = self
@@ -603,12 +583,12 @@ impl LeaderOutboxDelivery for LeaderProxyApiClient {
 /// non-leader members stays unchanged: writes pile up in the outbox
 /// until either promotion (local arm opens) or step 4b ships (remote
 /// arm forwards). No silent local-only writes happen.
-pub struct StubRemoteForwarder {
+pub(crate) struct StubRemoteForwarder {
     node_name: String,
 }
 
 impl StubRemoteForwarder {
-    pub fn new(node_name: String) -> Self {
+    pub(crate) fn new(node_name: String) -> Self {
         Self { node_name }
     }
 
@@ -765,5 +745,5 @@ impl LeaderOutboxDelivery for StubRemoteForwarder {
 }
 
 #[cfg(test)]
-#[path = "tests/authority.rs"]
+#[path = "tests/authority_routed_leader.rs"]
 mod tests;

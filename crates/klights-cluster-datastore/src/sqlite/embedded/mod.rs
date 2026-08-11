@@ -3236,8 +3236,9 @@ impl Datastore {
         if let Some(pod_cidr) = pod_cidr.as_deref() {
             changed |= klights_cluster_core::set_node_pod_cidr(&mut node, pod_cidr);
         }
-        changed |=
-            klights_cluster_core::set_node_external_ip(&mut node, &metadata.endpoint.to_string());
+        // Dataplane registration owns routing metadata only. Node addresses
+        // are status and must be published through the focused lifecycle
+        // status capability after this metadata CAS commits.
         changed |= klights_types::set_node_dataplane_annotations(
             &mut node,
             &metadata.endpoint.to_string(),

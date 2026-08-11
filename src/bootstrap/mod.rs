@@ -1,4 +1,6 @@
 pub(crate) mod auth_adapters;
+pub(crate) mod authority;
+pub(crate) mod authority_routed_leader;
 pub(crate) mod bootstrap_token;
 pub(crate) mod certificate_bootstrap;
 pub mod cluster_meta;
@@ -13,6 +15,10 @@ pub(crate) mod grpc_raft_transport_adapter;
 pub(crate) mod grpc_runtime_adapter;
 pub mod init;
 pub(crate) mod kubelet_ports;
+pub(crate) mod leader_conversions;
+#[cfg(test)]
+pub(crate) mod leader_test_support;
+pub(crate) mod local_leader_adapters;
 pub mod logging;
 pub(crate) mod maintenance;
 pub(crate) mod network_adapters;
@@ -32,7 +38,6 @@ pub(crate) mod pod_watch_handler_adapter;
 pub mod runtime;
 pub(crate) mod runtime_inputs;
 pub(crate) mod scheduler_adapter;
-pub(crate) mod sequenced_datastore;
 pub(crate) mod service_adapters;
 pub(crate) mod side_effects;
 pub(crate) mod watch_commit_wiring;
@@ -41,6 +46,15 @@ pub mod worker_store_adapter;
 
 #[cfg(test)]
 pub(crate) mod composition_tests;
+#[cfg(test)]
+#[path = "tests/leader_conversion.rs"]
+mod leader_conversion_tests;
+#[cfg(test)]
+#[path = "tests/leader_rpc_remote.rs"]
+mod leader_rpc_remote_tests;
+#[cfg(test)]
+#[path = "tests/worker_store.rs"]
+mod worker_store_tests;
 
 pub use node_mode::NodeMode;
 pub use node_role::NodeRole;

@@ -14,7 +14,6 @@ use crate::bootstrap::credential_store::BootstrapCredentialStore;
 use crate::datastore::DatastoreHandle;
 use crate::datastore::backend_kind::BackendKind;
 use crate::datastore::selector::PassiveStoreOpenRequest;
-use klights_replication::proposal::RaftProposal;
 use klights_supervisor::TaskSupervisor;
 
 #[derive(Debug, thiserror::Error)]
@@ -99,15 +98,23 @@ pub struct DatastorePhase {
     pub db_handle: DatastoreHandle,
     pub watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     pub positioned_watch: klights_watch::PositionedWatchService,
-    pub leader_ports: crate::control_plane::client::LeaderClientPorts,
+    pub local_resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    pub leader_resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    pub leader_watch: Arc<dyn klights_leader_api::LeaderWatch>,
+    pub leader_cache_readiness: Arc<dyn klights_leader_api::LeaderCacheReadiness>,
+    pub leader_projected_tokens:
+        Arc<dyn klights_leader_api::LeaderProjectedServiceAccountToken>,
+    pub leader_pod_cleanup_intents: Arc<dyn klights_leader_api::LeaderPodCleanupIntents>,
+    pub leader_node_subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
+    pub leader_network_topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery>,
+    pub leader_watch_maintenance: Arc<dyn klights_cluster_store::ClusterWatchMaintenance>,
+    pub network_topology_command: Arc<dyn klights_leader_api::LeaderNetworkTopologyCommand>,
     pub resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     pub remote_api_client: Option<Arc<klights_leader_rpc::client::RemoteApiClient>>,
-    /// The concrete leader-side LocalApiClient that the outbox dispatcher
-    /// uses as its apply client. Must be reused (not re-created) by later
-    /// bootstrap phases so that `set_controller_dispatcher` lands on the
-    /// same instance the outbox calls into — otherwise pod-status side
-    /// effects (RS/Service reconcile) silently no-op.
-    pub local_api_client: Arc<crate::control_plane::client::local::LocalApiClient>,
+    /// Bootstrap-owned committed-outbox side-effect state shared by the
+    /// canonical local delivery adapter and the later dispatcher wiring.
+    pub local_side_effects: Arc<crate::bootstrap::composition_adapters::
+        committed_outbox_delivery_adapter::RootOutboxSideEffectState>,
     pub authenticated_outbox_delivery:
         Arc<dyn klights_leader_api::LeaderAuthenticatedOutboxDelivery>,
     pub replication_service: Option<Arc<klights_replication::ReplicationService>>,
@@ -115,6 +122,10 @@ pub struct DatastorePhase {
     pub outbox: Arc<klights_kubelet::node_outbox::Outbox>,
     pub node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
     pub node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
+    pub local_node_lease_renewal: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
+    pub node_lifecycle_status: Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>,
+    pub authenticated_projected_token:
+        Arc<dyn klights_leader_api::LeaderAuthenticatedProjectedServiceAccountToken>,
     /// P3-11c: when this node is a leader-class boot under raft mode,
     /// `raft_node` holds the live `RaftNode` so later phases (kubelet
     /// label task — Step D — and the gRPC server's RaftRpcRouter /
@@ -137,7 +148,13 @@ pub struct DatastorePhase {
 }
 
 struct RemoteForwarderParts {
-    leader_ports: crate::control_plane::client::LeaderClientPorts,
+    leader_resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    leader_watch: Arc<dyn klights_leader_api::LeaderWatch>,
+    leader_cache_readiness: Arc<dyn klights_leader_api::LeaderCacheReadiness>,
+    leader_projected_tokens: Arc<dyn klights_leader_api::LeaderProjectedServiceAccountToken>,
+    leader_pod_cleanup_intents: Arc<dyn klights_leader_api::LeaderPodCleanupIntents>,
+    leader_node_subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
+    leader_network_topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery>,
     resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     outbox_deliveries: Arc<dyn klights_leader_api::LeaderOutboxDelivery>,
     node_lease_renewals: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
@@ -285,7 +302,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     // (quorum = 1). Workers do not enter this composition path and route
     // writes through the outbox/leader proxy.
     let member_feature_probe;
-    let (raft_node, db_handle, local_services, leader_proxy, leader_ports) = match (
+    let (raft_node, db_handle, local_services, leader_proxy, leader_watch_maintenance) = match (
         role,
         leader_node_local.as_ref(),
     ) {
@@ -426,68 +443,114 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 );
             }
             let embedded_proposal = raft.proposal();
-            let proposal: Arc<dyn RaftProposal> = embedded_proposal.clone();
-            let db_handle: DatastoreHandle = Arc::new(
-                crate::bootstrap::sequenced_datastore::SequencedDatastore::new_with_clock(
-                    passive_backend.clone(),
-                    proposal,
-                    Arc::new(klights_supervisor::SystemWallClock),
-                    is_leader_rx.clone(),
-                ),
-            );
+            let db_handle: DatastoreHandle = passive_backend.clone();
             let positioned_watch =
                 crate::bootstrap::composition_adapters::positioned_watch_adapter::datastore_positioned_watch_service(
                     &passive_read_ports,
                     db_handle.clone(),
                     watch_commit_wiring.signals.clone(),
                 );
-            // The local command client is built only from the fully constructed
-            // sequenced facade. It never receives the passive backend used by
-            // Raft proposal materialization and committed apply.
-            let local_api_client = Arc::new(
-                crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_namespace_signing_key_and_file_process(
-                    crate::control_plane::client::local::LocalApiPersistencePorts::new_with_positioned_watch(
-                        db_handle.clone(),
-                        positioned_watch.clone(),
+            let local_resource_query = crate::bootstrap::composition_adapters::
+                resource_query_adapter::DatastoreResourceQueryAdapter::new(
+                    db_handle.clone(),
+                    leader_authority.clone(),
+                );
+            let local_network = Arc::new(
+                crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
+                    passive_backend.clone(),
+                    embedded_proposal.clone(),
+                    leader_authority.clone(),
+                ),
+            );
+            let leader_watch_maintenance: Arc<dyn klights_cluster_store::ClusterWatchMaintenance> =
+                Arc::new(
+                    crate::bootstrap::composition_adapters::leader_maintenance_adapter::ClusterStoreLeaderMaintenance::new(
+                        passive_backend.clone(),
+                        embedded_proposal.clone(),
+                        leader_authority.clone(),
                     ),
+                );
+            let local_pod_cleanup = Arc::new(
+                crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup::new(
+                    passive_backend.clone(),
+                    embedded_proposal.clone(),
+                    leader_authority.clone(),
+                ),
+            );
+            let local_node_lease_renewal = Arc::new(
+                crate::bootstrap::local_leader_adapters::LocalNodeLeaseRenewalAdapter::new(
+                    node_lease_tracker.clone(),
+                    leader_authority.clone(),
+                ),
+            );
+            let local_node_lifecycle_status = Arc::new(
+                crate::bootstrap::local_leader_adapters::LocalNodeLifecycleStatusAdapter::new(
+                    db_handle.clone(),
+                    local_resource_query.clone(),
+                    leader_authority.clone(),
+                ),
+            );
+            let local_projected_token = Arc::new(
+                crate::bootstrap::local_leader_adapters::LocalProjectedTokenAdapter::new(
+                    db_handle.clone(),
                     config.node_name.clone(),
                     config.containerd_namespace.clone(),
                     runtime_paths.service_account_signing_key(),
-                    node_lease_tracker.clone(),
                     leader_authority.clone(),
                     klights_supervisor::FileProcessExecutor::from_supervisor(supervisor.as_ref()),
                 )
                 .with_authority_signing_fence(leader_authority.signing_fence()),
             );
+            let authenticated_projected_token = Arc::new(
+                crate::bootstrap::local_leader_adapters::AuthenticatedProjectedTokenIssuer::new(
+                    local_projected_token.clone(),
+                ),
+            );
+            let local_side_effects =
+                crate::bootstrap::local_leader_adapters::new_local_outbox_side_effect_state(
+                    db_handle.clone(),
+                );
+            let local_cache_readiness =
+                Arc::new(crate::bootstrap::local_leader_adapters::LocalCacheReadinessAdapter);
             let local_resource_commands = Arc::new(
                 klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                     embedded_proposal.clone(),
-                    local_api_client.clone(),
+                    local_resource_query.clone(),
                     is_leader_rx.clone(),
                 ),
             );
             let embedded_outbox_delivery = Arc::new(
                 klights_replication::leader_api::EmbeddedOutboxDelivery::new(
                     embedded_proposal,
-                    local_api_client.clone(),
+                    local_resource_query.clone(),
                     is_leader_rx.clone(),
                 ),
             );
             let local_outbox_delivery = Arc::new(
-                crate::control_plane::client::local::RootCommittedOutboxDelivery::new(
+                crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::RootCommittedOutboxDelivery::new(
                     embedded_outbox_delivery,
-                    local_api_client.outbox_side_effect_state(),
+                    local_side_effects.clone(),
                     crate::bootstrap::composition_adapters::outbox_payload_codec_adapter::new_codec(
                     ),
                     config.node_name.clone(),
                 ),
             );
             let leader_proxy = Arc::new(
-                crate::control_plane::client::leader_proxy::LeaderProxyApiClient::new(
-                    crate::control_plane::client::LeaderClientPorts::from_client(
-                        local_api_client.clone(),
-                    ),
-                    remote_parts.leader_ports.clone(),
+                crate::bootstrap::authority_routed_leader::AuthorityRoutedLeader::new(
+                    local_resource_query.clone(),
+                    Arc::new(positioned_watch.clone()),
+                    local_cache_readiness.clone(),
+                    local_projected_token.clone(),
+                    local_pod_cleanup,
+                    local_network.clone(),
+                    local_network.clone(),
+                    remote_parts.leader_resource_query.clone(),
+                    remote_parts.leader_watch.clone(),
+                    remote_parts.leader_cache_readiness.clone(),
+                    remote_parts.leader_projected_tokens.clone(),
+                    remote_parts.leader_pod_cleanup_intents.clone(),
+                    remote_parts.leader_node_subnet_allocation.clone(),
+                    remote_parts.leader_network_topology.clone(),
                     leader_authority.clone(),
                 )
                 .with_resource_command_targets(
@@ -499,12 +562,10 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     remote_parts.outbox_deliveries.clone(),
                 )
                 .with_node_lease_renewal_targets(
-                    local_api_client.clone(),
+                    local_node_lease_renewal.clone(),
                     remote_parts.node_lease_renewals.clone(),
                 ),
             );
-            let leader_ports =
-                crate::control_plane::client::LeaderClientPorts::from_client(leader_proxy.clone());
             // Seed branch: no --leader on Controlplane (or any
             // seed Leader boot) bootstraps as the sole voter.
             // Joining controlplane (--leader non-empty) skips this and
@@ -515,8 +576,8 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             // protection make a follower proposal structurally safe:
             //   1. cluster_api dispatches non-leader writes to the
             //      switching proxy's remote arm (step 3), never to local.
-            //   2. LocalApiClient's inner gate (step 1) refuses local
-            //      writes when `is_leader_rx=false`.
+            //   2. The local authority permit refuses local writes when
+            //      `is_leader_rx=false`.
             //   3. If a write somehow reaches the proposer on a
             //      non-leader (defense-in-depth bug), openraft's
             //      `client_write` returns ForwardToLeader and refuses.
@@ -707,7 +768,8 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                         join_supervisor.clone(),
                         config.data_root.join("etc"),
                     );
-                let join_resource_query = leader_ports.resource_query.clone();
+                let join_resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery> =
+                    leader_proxy.clone();
                 let join_resource_commands = leader_proxy.clone();
                 supervisor
                     .spawn_delay(
@@ -906,13 +968,22 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 Some(raft),
                 db_handle,
                 (
-                    local_api_client,
+                    local_side_effects,
+                    local_resource_query,
                     positioned_watch,
                     local_outbox_delivery
                         as Arc<dyn klights_leader_api::LeaderAuthenticatedOutboxDelivery>,
+                    local_network as Arc<dyn klights_leader_api::LeaderNetworkTopologyCommand>,
+                    local_node_lease_renewal as Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
+                    local_node_lifecycle_status
+                        as Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>,
+                    authenticated_projected_token
+                        as Arc<
+                            dyn klights_leader_api::LeaderAuthenticatedProjectedServiceAccountToken,
+                        >,
                 ),
                 leader_proxy,
-                leader_ports,
+                leader_watch_maintenance,
             )
         }
         _ => {
@@ -922,6 +993,19 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         }
     };
 
+    let leader_resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery> =
+        leader_proxy.clone();
+    let leader_watch: Arc<dyn klights_leader_api::LeaderWatch> = leader_proxy.clone();
+    let leader_cache_readiness: Arc<dyn klights_leader_api::LeaderCacheReadiness> =
+        leader_proxy.clone();
+    let leader_projected_tokens: Arc<dyn klights_leader_api::LeaderProjectedServiceAccountToken> =
+        leader_proxy.clone();
+    let leader_pod_cleanup_intents: Arc<dyn klights_leader_api::LeaderPodCleanupIntents> =
+        leader_proxy.clone();
+    let leader_node_subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation> =
+        leader_proxy.clone();
+    let leader_network_topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> =
+        leader_proxy.clone();
     let outbox_delivery_client: Arc<dyn klights_leader_api::LeaderOutboxDelivery> =
         leader_proxy.clone();
     let resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand> =
@@ -974,7 +1058,16 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         .await;
         ob
     };
-    let (local_api_client, positioned_watch, authenticated_outbox_delivery) = local_services;
+    let (
+        local_side_effects,
+        local_resource_query,
+        positioned_watch,
+        authenticated_outbox_delivery,
+        network_topology_command,
+        local_node_lease_renewal,
+        node_lifecycle_status,
+        authenticated_projected_token,
+    ) = local_services;
 
     match crate::bootstrap::composition_adapters::node_admin_adapter::start_node_admin(
         node_local.dead_letters(),
@@ -994,16 +1087,28 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         db_handle,
         watch_signals: watch_commit_wiring.signals,
         positioned_watch,
-        leader_ports,
+        local_resource_query,
+        leader_resource_query,
+        leader_watch,
+        leader_cache_readiness,
+        leader_projected_tokens,
+        leader_pod_cleanup_intents,
+        leader_node_subnet_allocation,
+        leader_network_topology,
+        leader_watch_maintenance,
+        network_topology_command,
         resource_commands,
         remote_api_client: remote_parts.remote_api_client,
-        local_api_client,
+        local_side_effects,
         authenticated_outbox_delivery,
         replication_service,
         node_local,
         outbox,
         node_lease_tracker,
         node_lease_renewal_client,
+        local_node_lease_renewal,
+        node_lifecycle_status,
+        authenticated_projected_token,
         raft_node,
         member_feature_probe,
         skip_seed_bootstrap,
@@ -1031,7 +1136,7 @@ fn build_remote_forwarder(
     local_dataplane: klights_leader_rpc::client::JoinDataplaneMetadata,
     grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
 ) -> RemoteForwarderParts {
-    use crate::control_plane::client::leader_proxy::StubRemoteForwarder;
+    use crate::bootstrap::authority_routed_leader::StubRemoteForwarder;
     use klights_leader_rpc::client::RemoteApiClient;
     use klights_leader_rpc::client::{GrpcClientConfig, ReplicationGrpcClient};
 
@@ -1058,9 +1163,13 @@ fn build_remote_forwarder(
             // remote forwarding target is available in this role.
             let stub = Arc::new(StubRemoteForwarder::new(config.node_name.clone()));
             return RemoteForwarderParts {
-                leader_ports: crate::control_plane::client::LeaderClientPorts::from_client(
-                    stub.clone(),
-                ),
+                leader_resource_query: stub.clone(),
+                leader_watch: stub.clone(),
+                leader_cache_readiness: stub.clone(),
+                leader_projected_tokens: stub.clone(),
+                leader_pod_cleanup_intents: stub.clone(),
+                leader_node_subnet_allocation: stub.clone(),
+                leader_network_topology: stub.clone(),
                 resource_commands: stub.clone(),
                 outbox_deliveries: stub.clone(),
                 node_lease_renewals: stub,
@@ -1111,7 +1220,13 @@ fn build_remote_forwarder(
         ),
     ));
     RemoteForwarderParts {
-        leader_ports: crate::control_plane::client::LeaderClientPorts::from_client(remote.clone()),
+        leader_resource_query: remote.clone(),
+        leader_watch: remote.clone(),
+        leader_cache_readiness: remote.clone(),
+        leader_projected_tokens: remote.clone(),
+        leader_pod_cleanup_intents: remote.clone(),
+        leader_node_subnet_allocation: remote.clone(),
+        leader_network_topology: remote.clone(),
         resource_commands: remote.clone(),
         outbox_deliveries: remote.clone(),
         node_lease_renewals: remote.clone(),
@@ -1726,8 +1841,8 @@ mod tests {
             test_dataplane(),
             test_transport_policy(),
         )
-        .leader_ports;
-        let _: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery> = ports.resource_query;
+        .leader_resource_query;
+        let _: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery> = ports;
     }
 
     #[test]

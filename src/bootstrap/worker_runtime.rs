@@ -12,6 +12,7 @@
 //! stack, with kubelet storage supplied by the shared worker-store adapter.
 
 use anyhow::Context;
+use std::sync::Arc;
 
 use crate::bootstrap::phases;
 use crate::bootstrap::{CliFlags, NodeRole};
@@ -191,8 +192,19 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             ),
         ),
     );
-    let leader_ports =
-        crate::control_plane::client::LeaderClientPorts::from_client(remote_api_client.clone());
+    let leader_resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery> =
+        remote_api_client.clone();
+    let leader_watch: Arc<dyn klights_leader_api::LeaderWatch> = remote_api_client.clone();
+    let leader_cache_readiness: Arc<dyn klights_leader_api::LeaderCacheReadiness> =
+        remote_api_client.clone();
+    let leader_projected_tokens: Arc<dyn klights_leader_api::LeaderProjectedServiceAccountToken> =
+        remote_api_client.clone();
+    let leader_pod_cleanup_intents: Arc<dyn klights_leader_api::LeaderPodCleanupIntents> =
+        remote_api_client.clone();
+    let leader_node_subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation> =
+        remote_api_client.clone();
+    let leader_network_topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> =
+        remote_api_client.clone();
 
     let nldb: Option<&std::path::Path> = if config.in_memory {
         None
@@ -270,10 +282,10 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         config: &config,
         node_mode: &node_mode,
         node_ip: &node_ip,
-        resource_query: leader_ports.resource_query.clone(),
-        watch: leader_ports.watch.clone(),
-        subnet_allocation: leader_ports.node_subnet_allocation.clone(),
-        network_topology: leader_ports.network_topology.clone(),
+        resource_query: leader_resource_query.clone(),
+        watch: leader_watch.clone(),
+        subnet_allocation: leader_node_subnet_allocation.clone(),
+        network_topology: leader_network_topology.clone(),
         pod_network_cache: node_local.pod_network_cache(),
         pod_ipam: node_local.pod_ipam(),
         pod_runtime: node_local.pod_runtime(),
@@ -472,7 +484,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         ..,
     ) = crate::bootstrap::pod_repository_composition::build_worker_pod_repository_parts(
         crate::bootstrap::pod_repository_composition::WorkerPodRepositoryBuildConfig {
-            resource_query: leader_ports.resource_query.clone(),
+            resource_query: leader_resource_query.clone(),
             pod_workqueue_store: node_local.pod_workqueue(),
             supervisor: task_supervisor.clone(),
             metrics: metrics.clone(),
@@ -496,10 +508,10 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         services.clone(),
     );
     let kubelet_status_delivery = klights_kubelet::context::StatusDeliveryServices::new(
-        leader_ports.resource_query.clone(),
-        leader_ports.cache_readiness.clone(),
-        leader_ports.pod_cleanup_intents.clone(),
-        leader_ports.projected_tokens.clone(),
+        leader_resource_query.clone(),
+        leader_cache_readiness.clone(),
+        leader_pod_cleanup_intents.clone(),
+        leader_projected_tokens.clone(),
         outbox.clone() as std::sync::Arc<klights_kubelet::outbox::Outbox>,
     );
     let pod_slot_store = node_local.pod_slots();
@@ -558,7 +570,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             event_sink: std::sync::Arc::new(
                 crate::bootstrap::kubelet_ports::WorkerPodEventSink::new(
                     outbox.clone(),
-                    leader_ports.resource_query.clone(),
+                    leader_resource_query.clone(),
                     std::sync::Arc::new(klights_supervisor::SystemWallClock),
                 ),
             ),

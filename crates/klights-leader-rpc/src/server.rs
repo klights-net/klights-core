@@ -442,6 +442,42 @@ pub trait ControlplaneCredentialIssuer: Send + Sync {
 }
 
 impl ReplicationServerPorts {
+    /// Build the server surface from independently owned focused capabilities.
+    ///
+    /// Passive resource reads and positioned watches are composition inputs;
+    /// they are intentionally not required to be implemented by the local
+    /// mutation client.
+    // Keep the independent arguments explicit: combining them would recreate
+    // the broad leader-client service locator this boundary replaces.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_focused(
+        resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+        resource_command: Arc<dyn klights_leader_api::LeaderResourceCommand>,
+        watch: Arc<dyn klights_leader_api::LeaderWatch>,
+        authenticated_outbox: Arc<dyn klights_leader_api::LeaderAuthenticatedOutboxDelivery>,
+        projected_token: Arc<
+            dyn klights_leader_api::LeaderAuthenticatedProjectedServiceAccountToken,
+        >,
+        pod_cleanup: Arc<dyn klights_leader_api::LeaderPodCleanupIntents>,
+        node_lease: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
+        node_subnet: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
+        topology_query: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery>,
+        topology_command: Arc<dyn klights_leader_api::LeaderNetworkTopologyCommand>,
+    ) -> Self {
+        Self {
+            resource_query,
+            resource_command,
+            watch,
+            projected_token,
+            pod_cleanup,
+            node_lease,
+            node_subnet,
+            topology_query,
+            topology_command,
+            authenticated_outbox,
+        }
+    }
+
     pub fn from_split<T>(
         shared: Arc<T>,
         resource_command: Arc<dyn klights_leader_api::LeaderResourceCommand>,

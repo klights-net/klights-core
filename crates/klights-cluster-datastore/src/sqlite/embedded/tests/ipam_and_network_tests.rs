@@ -258,17 +258,15 @@ async fn build_update_node_dataplane_log_apply_does_not_mutate_leader_node() {
         applied_node.data["metadata"]["annotations"]["klights.io/dataplane-endpoint"],
         json!("10.99.0.10")
     );
-    let addresses = applied_node
-        .data
-        .pointer("/status/addresses")
-        .and_then(|value| value.as_array())
-        .expect("NodeDataplane apply should preserve status.addresses");
     assert!(
-        addresses.iter().any(|address| {
-            address.get("type").and_then(|value| value.as_str()) == Some("ExternalIP")
-                && address.get("address").and_then(|value| value.as_str()) == Some("10.99.0.10")
-        }),
-        "raft-applied NodeDataplane metadata must publish the observed ExternalIP: {addresses:?}",
+        applied_node
+            .data
+            .pointer("/status/addresses")
+            .and_then(|value| value.as_array())
+            .is_none_or(|addresses| addresses.iter().all(|address| {
+                address.get("type").and_then(|value| value.as_str()) != Some("ExternalIP")
+            })),
+        "raft-applied NodeDataplane metadata must not bypass the focused Node status capability",
     );
 }
 

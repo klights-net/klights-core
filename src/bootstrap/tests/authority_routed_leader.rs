@@ -1,4 +1,4 @@
-//! T6 step 3: switching `LeaderProxyApiClient` dispatch coverage.
+//! Authority-routed leader capability dispatch coverage.
 //!
 //! Each test uses a `RecordingApiClient` fake on both sides
 //! (local and remote) so we can assert which arm received the
@@ -233,13 +233,59 @@ impl LeaderOutboxDelivery for RecordingApiClient {
     }
 }
 
+fn make_routed_leader<L, R>(
+    local: Arc<L>,
+    remote: Arc<R>,
+    authority: impl Into<AuthorityHandle>,
+) -> AuthorityRoutedLeader
+where
+    L: LeaderResourceQuery
+        + LeaderWatch
+        + LeaderCacheReadiness
+        + LeaderProjectedServiceAccountToken
+        + LeaderPodCleanupIntents
+        + LeaderNodeSubnetAllocation
+        + LeaderNetworkTopologyQuery
+        + Send
+        + Sync
+        + 'static,
+    R: LeaderResourceQuery
+        + LeaderWatch
+        + LeaderCacheReadiness
+        + LeaderProjectedServiceAccountToken
+        + LeaderPodCleanupIntents
+        + LeaderNodeSubnetAllocation
+        + LeaderNetworkTopologyQuery
+        + Send
+        + Sync
+        + 'static,
+{
+    AuthorityRoutedLeader::new(
+        local.clone(),
+        local.clone(),
+        local.clone(),
+        local.clone(),
+        local.clone(),
+        local.clone(),
+        local,
+        remote.clone(),
+        remote.clone(),
+        remote.clone(),
+        remote.clone(),
+        remote.clone(),
+        remote.clone(),
+        remote,
+        authority,
+    )
+}
+
 fn make_proxy(
     local: Arc<RecordingApiClient>,
     remote: Arc<RecordingApiClient>,
     initial_leader: bool,
-) -> (LeaderProxyApiClient, watch::Sender<bool>) {
+) -> (AuthorityRoutedLeader, watch::Sender<bool>) {
     let (tx, rx) = watch::channel(initial_leader);
-    let proxy = LeaderProxyApiClient::from_clients(local.clone(), remote.clone(), rx)
+    let proxy = make_routed_leader(local.clone(), remote.clone(), rx)
         .with_resource_command_targets(local.clone(), remote.clone())
         .with_outbox_delivery_targets(local.clone(), remote.clone())
         .with_node_lease_renewal_targets(local, remote);
@@ -347,7 +393,7 @@ async fn stub_resource_command_is_retryable_and_never_falls_back() {
 
 /// Self-is-leader: every write lands on the local client.
 #[tokio::test]
-async fn leader_proxy_dispatches_local_when_self_is_leader() {
+async fn authority_routed_leader_dispatches_local_when_self_is_leader() {
     let local = RecordingApiClient::new("local");
     let remote = RecordingApiClient::new("remote");
     let (proxy, _tx) = make_proxy(local.clone(), remote.clone(), true);
@@ -379,7 +425,7 @@ async fn leader_proxy_dispatches_local_when_self_is_leader() {
 /// Self-is-follower: writes land on
 /// remote so the call reaches the current elected leader.
 #[tokio::test]
-async fn leader_proxy_dispatches_remote_when_follower() {
+async fn authority_routed_leader_dispatches_remote_when_follower() {
     let local = RecordingApiClient::new("local");
     let remote = RecordingApiClient::new("remote");
     let (proxy, _tx) = make_proxy(local.clone(), remote.clone(), false);
@@ -410,7 +456,7 @@ async fn leader_proxy_dispatches_remote_when_follower() {
 }
 
 #[tokio::test]
-async fn leader_proxy_dispatches_projected_serviceaccount_token_as_write() {
+async fn authority_routed_leader_dispatches_projected_serviceaccount_token_as_write() {
     let request = ProjectedServiceAccountTokenRequest::try_new(
         "kube-system",
         "coredns",
@@ -425,8 +471,8 @@ async fn leader_proxy_dispatches_projected_serviceaccount_token_as_write() {
 
     let local = RecordingApiClient::new("local");
     let remote = RecordingApiClient::new("remote");
-    let (leader_proxy, _tx) = make_proxy(local.clone(), remote.clone(), true);
-    let leader_token = leader_proxy
+    let (authority_routed_leader, _tx) = make_proxy(local.clone(), remote.clone(), true);
+    let leader_token = authority_routed_leader
         .issue_projected_service_account_token(request.clone())
         .await
         .expect("leader token");
@@ -467,7 +513,7 @@ async fn leader_proxy_dispatches_projected_serviceaccount_token_as_write() {
 }
 
 #[tokio::test]
-async fn leader_proxy_lists_cleanup_intents_from_remote_when_follower() {
+async fn authority_routed_leader_lists_cleanup_intents_from_remote_when_follower() {
     let local = RecordingApiClient::new("local");
     let remote = RecordingApiClient::new("remote");
     let (proxy, _tx) = make_proxy(local.clone(), remote.clone(), false);
@@ -482,7 +528,7 @@ async fn leader_proxy_lists_cleanup_intents_from_remote_when_follower() {
 }
 
 #[tokio::test]
-async fn leader_proxy_reads_cleanup_intents_from_remote_when_local_leader_is_stale() {
+async fn authority_routed_leader_reads_cleanup_intents_from_remote_when_local_leader_is_stale() {
     let local = RecordingApiClient::new("local");
     let remote = RecordingApiClient::new("remote");
     remote.with_cleanup_intent(
@@ -523,7 +569,8 @@ async fn leader_proxy_reads_cleanup_intents_from_remote_when_local_leader_is_sta
 }
 
 #[tokio::test]
-async fn leader_proxy_deletes_cleanup_intent_through_remote_when_local_leader_is_stale() {
+async fn authority_routed_leader_deletes_cleanup_intent_through_remote_when_local_leader_is_stale()
+{
     let local = RecordingApiClient::new("local");
     let remote = RecordingApiClient::new("remote");
     let (proxy, _tx) = make_proxy(local.clone(), remote.clone(), true);
@@ -547,7 +594,7 @@ async fn leader_proxy_deletes_cleanup_intent_through_remote_when_local_leader_is
 }
 
 #[tokio::test]
-async fn leader_proxy_reads_dispatch_remote_when_follower_local_when_leader() {
+async fn authority_routed_leader_reads_dispatch_remote_when_follower_local_when_leader() {
     let local = RecordingApiClient::new("local");
     let remote = RecordingApiClient::new("remote");
     let (proxy, _tx) = make_proxy(local.clone(), remote.clone(), false);
@@ -579,7 +626,7 @@ async fn leader_proxy_reads_dispatch_remote_when_follower_local_when_leader() {
     assert_eq!(remote.list_resources.load(Ordering::Relaxed), 0);
 }
 
-async fn exercise_read_dispatch(proxy: &LeaderProxyApiClient) {
+async fn exercise_read_dispatch(proxy: &AuthorityRoutedLeader) {
     proxy
         .get_resource(
             ResourceGetRequest::try_new(
@@ -627,7 +674,7 @@ async fn exercise_read_dispatch(proxy: &LeaderProxyApiClient) {
 }
 
 #[tokio::test]
-async fn leader_proxy_watch_terminates_on_leadership_change() {
+async fn authority_routed_leader_watch_terminates_on_leadership_change() {
     use futures::StreamExt as _;
     use tokio::time::{Duration, timeout};
 
@@ -664,7 +711,7 @@ async fn leader_proxy_watch_terminates_on_leadership_change() {
 }
 
 #[tokio::test]
-async fn leader_proxy_rejects_samples_and_watches_when_demoted_during_open() {
+async fn authority_routed_leader_rejects_samples_and_watches_when_demoted_during_open() {
     let local = RecordingApiClient::new("local");
     let remote = RecordingApiClient::new("remote");
     let (proxy, tx) = make_proxy(local.clone(), remote, true);
@@ -691,7 +738,7 @@ async fn leader_proxy_rejects_samples_and_watches_when_demoted_during_open() {
 }
 
 #[tokio::test]
-async fn leader_proxy_rejects_transient_leadership_flaps_during_fresh_open() {
+async fn authority_routed_leader_rejects_transient_leadership_flaps_during_fresh_open() {
     let local = RecordingApiClient::new("local");
     let remote = RecordingApiClient::new("remote");
     let (proxy, tx) = make_proxy(local.clone(), remote, true);
@@ -720,7 +767,7 @@ async fn leader_proxy_rejects_transient_leadership_flaps_during_fresh_open() {
 /// proxy, different watch value, next write dispatches to the
 /// new target. No reconstruction, no rewiring.
 #[tokio::test]
-async fn leader_proxy_flips_dispatch_on_leader_change_event() {
+async fn authority_routed_leader_flips_dispatch_on_leader_change_event() {
     let local = RecordingApiClient::new("local");
     let remote = RecordingApiClient::new("remote");
     let (proxy, tx) = make_proxy(local.clone(), remote.clone(), true);
@@ -781,7 +828,7 @@ async fn leader_proxy_flips_dispatch_on_leader_change_event() {
 /// leader-finding logic (and retry/backoff if any); the proxy
 /// only dispatches.
 #[tokio::test]
-async fn leader_proxy_returns_no_leader_error_during_election_window() {
+async fn authority_routed_leader_returns_no_leader_error_during_election_window() {
     /// Stub remote that always fails with a "no leader" error,
     /// modeling the gRPC client during an election window or
     /// when every known leader endpoint is unreachable.
@@ -892,7 +939,7 @@ async fn leader_proxy_returns_no_leader_error_during_election_window() {
     let local = RecordingApiClient::new("local");
     let remote = Arc::new(NoLeaderRemote);
     let (_tx, rx) = watch::channel(false); // follower
-    let proxy = LeaderProxyApiClient::from_clients(local.clone(), remote.clone(), rx)
+    let proxy = make_routed_leader(local.clone(), remote.clone(), rx)
         .with_outbox_delivery_targets(local.clone(), remote);
 
     // apply_outbox must surface the remote's Retryable, not panic
@@ -940,11 +987,11 @@ async fn leader_proxy_returns_no_leader_error_during_election_window() {
 
 /// Every focused capability remains independently object-safe.
 #[test]
-fn leader_proxy_focused_ports_are_object_safe() {
+fn authority_routed_leader_focused_ports_are_object_safe() {
     let local = RecordingApiClient::new("local");
     let remote = RecordingApiClient::new("remote");
     let (_tx, rx) = watch::channel(true);
-    let proxy = Arc::new(LeaderProxyApiClient::from_clients(local, remote, rx));
+    let proxy = Arc::new(make_routed_leader(local, remote, rx));
     let _: Arc<dyn LeaderResourceQuery> = proxy.clone();
     let _: Arc<dyn LeaderWatch> = proxy.clone();
     let _: Arc<dyn LeaderCacheReadiness> = proxy.clone();
@@ -1002,21 +1049,86 @@ async fn stub_remote_forwarder_refuses_writes_with_retryable() {
 
 /// T6 step 4: open_leader composes the switching proxy correctly.
 /// This unit test exercises the same composition the bootstrap
-/// does: LocalApiClient (with the real is_leader_rx) + a stub
-/// remote + the same watch → LeaderProxyApiClient. It proves the
+/// does: focused local bootstrap capabilities + a stub remote + the same
+/// watch → AuthorityRoutedLeader. It proves the
 /// boot-time wiring of the three pieces is sound at the type and
 /// dispatch level without standing up the full bootstrap.
 #[tokio::test]
 async fn bootstrap_style_proxy_composition_dispatches_correctly() {
-    use crate::control_plane::client::local::LocalApiClient;
-    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+    let concrete_db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
+    let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&concrete_db);
+    let db: crate::datastore::DatastoreHandle = Arc::new(concrete_db);
     let (tx, rx) = watch::channel(true); // simulate seed cp1
-    let local_real = Arc::new(LocalApiClient::new(Arc::new(db), "cp1".into(), rx.clone()));
+    let authority = crate::bootstrap::authority::AuthorityHandle::from(rx.clone());
+    let local_cache_readiness =
+        Arc::new(crate::bootstrap::local_leader_adapters::LocalCacheReadinessAdapter);
+    let local_projected_token = Arc::new(
+        crate::bootstrap::local_leader_adapters::LocalProjectedTokenAdapter::new(
+            db.clone(),
+            "cp1".to_string(),
+            "klights".to_string(),
+            crate::paths::service_account_signing_key_path("klights"),
+            rx.clone(),
+            crate::bootstrap::file_blocking::test_file_process_executor(),
+        ),
+    );
+    let proposal =
+        Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()));
+    let network = Arc::new(
+        crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
+            db.clone(),
+            proposal.clone(),
+            rx.clone(),
+        ),
+    );
+    let pod_cleanup = Arc::new(
+        crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup::new(
+            db.clone(),
+            proposal,
+            rx.clone(),
+        ),
+    );
     let stub_remote = Arc::new(StubRemoteForwarder::new("cp1".into()));
-    let proxy = LeaderProxyApiClient::from_clients(local_real.clone(), stub_remote.clone(), rx)
-        .with_outbox_delivery_targets(local_real, stub_remote);
+    let local_resource_query =
+        crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+            db.clone(),
+            rx.clone(),
+        );
+    let local_watch = Arc::new(
+        crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
+            &passive_reads,
+            db.clone(),
+        ),
+    );
+    let local_side_effects =
+        crate::bootstrap::local_leader_adapters::new_local_outbox_side_effect_state(db.clone());
+    let local_outbox_delivery = crate::bootstrap::composition_adapters::
+        committed_outbox_delivery_adapter::test_outbox_delivery(
+            db.clone(),
+            &authority,
+            local_side_effects,
+            "cp1".to_string(),
+    );
+    let proxy = AuthorityRoutedLeader::new(
+        local_resource_query,
+        local_watch,
+        local_cache_readiness,
+        local_projected_token,
+        pod_cleanup,
+        network.clone(),
+        network,
+        stub_remote.clone(),
+        stub_remote.clone(),
+        stub_remote.clone(),
+        stub_remote.clone(),
+        stub_remote.clone(),
+        stub_remote.clone(),
+        stub_remote.clone(),
+        rx,
+    )
+    .with_outbox_delivery_targets(local_outbox_delivery, stub_remote);
 
     // As leader: write reaches local, succeeds (no Pod precondition).
     let res = proxy
@@ -1098,7 +1210,7 @@ fn pod_status_minimal_payload() -> Bytes {
 /// structural check that the impl above does no I/O on its own —
 /// dispatch happens inline.
 #[test]
-fn leader_proxy_holds_no_background_resources() {
+fn authority_routed_leader_holds_no_background_resources() {
     // The dispatcher has exactly four thin fields: two public API
     // trait-object Arcs, one optional Arc to the focused target bundle,
     // and one authority handle. Both target pairs live behind that single
@@ -1109,9 +1221,9 @@ fn leader_proxy_holds_no_background_resources() {
         + size_of::<AuthorityHandle>()
         + size_of::<Option<Arc<FocusedLeaderTargets>>>();
     assert_eq!(
-        size_of::<LeaderProxyApiClient>(),
+        size_of::<AuthorityRoutedLeader>(),
         thin_dispatcher_fields,
-        "LeaderProxyApiClient must stay a thin per-call dispatcher; \
+        "AuthorityRoutedLeader must stay a thin per-call dispatcher; \
              field growth probably introduced spawn / timer / supervisor state \
              that violates HR #1 (zero idle CPU)."
     );
@@ -1138,7 +1250,7 @@ fn leader_proxy_holds_no_background_resources() {
 
 /// `cluster_db_converges_after_multinode_write_through_proxy`:
 /// model 3 cluster members (1 leader + 2 followers). All three
-/// have a `LeaderProxyApiClient` as their `cluster_api`. The
+/// have a `AuthorityRoutedLeader` as their `cluster_api`. The
 /// followers' remote arm points at a shared "leader API" mock
 /// (modeling the leader's API server reached via gRPC). When a
 /// follower issues a write through its proxy, the shared backend
@@ -1150,7 +1262,7 @@ fn leader_proxy_holds_no_background_resources() {
 async fn cluster_db_converges_after_multinode_write_through_proxy() {
     // The shared "leader apply" surface — both the leader's local
     // arm AND every follower's remote arm route writes here. In
-    // production this is the leader's LocalApiClient → raft
+    // production this is the leader's private bootstrap capability → raft
     // proposer → raft → state-machine apply on every member.
     let leader_backend = RecordingApiClient::new("leader-shared");
 
@@ -1158,12 +1270,9 @@ async fn cluster_db_converges_after_multinode_write_through_proxy() {
     // shared leader backend. is_leader=true.
     let (_tx_l, rx_l) = watch::channel(true);
     let leader_unused_remote = RecordingApiClient::new("leader-unused-remote");
-    let leader_proxy = LeaderProxyApiClient::from_clients(
-        leader_backend.clone(),
-        leader_unused_remote.clone(),
-        rx_l,
-    )
-    .with_outbox_delivery_targets(leader_backend.clone(), leader_unused_remote);
+    let authority_routed_leader =
+        make_routed_leader(leader_backend.clone(), leader_unused_remote.clone(), rx_l)
+            .with_outbox_delivery_targets(leader_backend.clone(), leader_unused_remote);
 
     // Follower 1: cluster_api proxy whose REMOTE arm is the
     // shared leader backend (modeling the gRPC forward).
@@ -1171,19 +1280,19 @@ async fn cluster_db_converges_after_multinode_write_through_proxy() {
     let (_tx_f1, rx_f1) = watch::channel(false);
     let follower1_local = RecordingApiClient::new("f1-local-unused");
     let follower1_proxy =
-        LeaderProxyApiClient::from_clients(follower1_local.clone(), leader_backend.clone(), rx_f1)
+        make_routed_leader(follower1_local.clone(), leader_backend.clone(), rx_f1)
             .with_outbox_delivery_targets(follower1_local, leader_backend.clone());
 
     // Follower 2: same shape as follower 1.
     let (_tx_f2, rx_f2) = watch::channel(false);
     let follower2_local = RecordingApiClient::new("f2-local-unused");
     let follower2_proxy =
-        LeaderProxyApiClient::from_clients(follower2_local.clone(), leader_backend.clone(), rx_f2)
+        make_routed_leader(follower2_local.clone(), leader_backend.clone(), rx_f2)
             .with_outbox_delivery_targets(follower2_local, leader_backend.clone());
 
     // Each member issues one write. All three calls must reach
     // the shared leader backend.
-    leader_proxy
+    authority_routed_leader
         .deliver_test_outbox(
             "leader-write",
             OutboxOperation::PodStatus,

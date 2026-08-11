@@ -220,15 +220,19 @@ mod tests {
         .expect("open node-local test db")
     }
 
-    fn cluster_api_for_test(
+    fn network_port_for_test(
         db: crate::datastore::sqlite::Datastore,
-        node_name: &str,
-    ) -> Arc<crate::control_plane::client::local::LocalApiClient> {
-        Arc::new(crate::control_plane::client::local::LocalApiClient::new(
-            Arc::new(db),
-            node_name.to_string(),
-            crate::control_plane::client::local::always_leader_watch(),
-        ))
+    ) -> Arc<
+        crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork,
+    >{
+        let db: crate::datastore::DatastoreHandle = Arc::new(db);
+        Arc::new(
+            crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
+                db.clone(),
+                Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db)),
+                crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+            ),
+        )
     }
 
     #[tokio::test]
@@ -244,10 +248,10 @@ mod tests {
         let node_network = Arc::new(node_local);
         let assignment_bus = Arc::new(klights_networking::PodNetworkAssignmentBus::new());
         let cancel = tokio_util::sync::CancellationToken::new();
-        let cluster_api = cluster_api_for_test(db.clone(), &cfg.node_name);
+        let network = network_port_for_test(db.clone());
         let subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation> =
-            cluster_api.clone();
-        let topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> = cluster_api;
+            network.clone();
+        let topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> = network;
         let focused = crate::bootstrap::networking::NetworkBootConfig::try_new(
             crate::bootstrap::networking::NetworkMode::Rootless,
             &cfg.bridge_name,

@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use anyhow::Context as _;
 use async_trait::async_trait;
 use klights_cluster_core::{
     OutboxApplyError, OutboxApplyOutcome, OutboxStreamWatermark, StorageCommand,
@@ -94,7 +93,13 @@ impl klights_leader_api::LeaderResourceQuery for BackendResourceQueryFixture {
                 .map_err(|error| {
                     klights_leader_api::ResourceQueryError::query_failed(error.to_string())
                 })?;
-            crate::control_plane::client::query_list_result(list)
+            klights_leader_api::ResourceListResult::try_new(
+                list.items,
+                list.resource_version,
+                list.watch_replay_position,
+                list.continue_token,
+                list.remaining_item_count,
+            )
         })
     }
 }
@@ -103,73 +108,79 @@ impl BackendProposalFixture {
     pub(crate) fn new(backend: Arc<dyn DatastoreBackend>) -> Self {
         Self { backend }
     }
-}
 
-pub(crate) async fn propose_command_on_backend(
-    backend: &dyn DatastoreBackend,
-    command: StorageCommand,
-) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
-    let return_key = command_return_key(&command);
-    let operation = klights_replication::proposal::derive_operation_label(&command);
-    let commit = backend
-        .build_log_apply_commit_for_command(command, operation.as_str(), "test-proposer")
-        .await
-        .map_err(
-            crate::bootstrap::composition_adapters::cluster_store_replication_adapter::map_storage_mutation_error_for_test,
-        )?;
-    let receipt = backend
-        .apply_raft_log_apply_commit_receipt(commit)
-        .await
-        .context("test committed apply")?;
-    let mut result =
-        klights_replication::committed_apply::storage_command_result_from_committed_outcome(
-            &receipt,
-        );
-    if result.error_message.is_none()
-        && result.applied_mutation.is_none()
-        && let Some((api_version, kind, namespace, name)) = return_key
-        && let Some(resource) = backend
-            .get_resource(&api_version, &kind, namespace.as_deref(), &name)
-            .await?
-    {
-        result.applied_mutation = Some(klights_cluster_store::AppliedMutation::Resource(resource));
-    }
-    Ok(result)
-}
-
-pub(crate) async fn propose_outbox_command_on_backend(
-    backend: &dyn DatastoreBackend,
-    idempotency_key: &str,
-    operation: klights_cluster_core::OutboxOperation,
-    command: StorageCommand,
-    authoring_node: &str,
-    watermark: Option<OutboxStreamWatermark>,
-) -> Result<RaftProposalEffect, OutboxApplyError> {
-    let return_key = command_return_key(&command);
-    let effect = backend
-        .apply_outbox_transactionally_with_watermark_effect(
-            idempotency_key,
-            operation.as_str(),
-            command,
-            authoring_node,
-            watermark,
-        )
-        .await?;
-    let (result, resource_effect, pod_endpoint_effect, mut committed_resource) =
-        effect.into_parts();
-    if committed_resource.is_none()
-        && resource_effect == klights_cluster_core::ResourceMutationEffect::Changed
-        && let Some((api_version, kind, namespace, name)) = return_key
-    {
-        committed_resource = backend
-            .get_resource(&api_version, &kind, namespace.as_deref(), &name)
+    async fn apply_command(
+        &self,
+        command: StorageCommand,
+    ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
+        let return_key = command_return_key(&command);
+        let operation = klights_replication::proposal::derive_operation_label(&command);
+        let commit = self
+            .backend
+            .build_log_apply_commit_for_command(command, operation.as_str(), "test-proposer")
             .await
-            .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?;
+            .map_err(
+                crate::bootstrap::composition_adapters::cluster_store_replication_adapter::map_storage_mutation_error_for_test,
+            )?;
+        let receipt = self
+            .backend
+            .apply_raft_log_apply_commit_receipt(commit)
+            .await
+            .map_err(|error| anyhow::anyhow!("test committed apply: {error:#}"))?;
+        let mut result =
+            klights_replication::committed_apply::storage_command_result_from_committed_outcome(
+                &receipt,
+            );
+        if result.error_message.is_none()
+            && result.applied_mutation.is_none()
+            && let Some((api_version, kind, namespace, name)) = return_key
+            && let Some(resource) = self
+                .backend
+                .get_resource(&api_version, &kind, namespace.as_deref(), &name)
+                .await?
+        {
+            result.applied_mutation =
+                Some(klights_cluster_store::AppliedMutation::Resource(resource));
+        }
+        Ok(result)
     }
-    Ok(
-        RaftProposalEffect::new(result, resource_effect, pod_endpoint_effect)
-            .with_committed_resource(committed_resource),
-    )
+
+    async fn apply_outbox_effect(
+        &self,
+        idempotency_key: &str,
+        operation: klights_cluster_core::OutboxOperation,
+        command: StorageCommand,
+        authoring_node: &str,
+        watermark: Option<OutboxStreamWatermark>,
+    ) -> Result<RaftProposalEffect, OutboxApplyError> {
+        let return_key = command_return_key(&command);
+        let effect = self
+            .backend
+            .apply_outbox_transactionally_with_watermark_effect(
+                idempotency_key,
+                operation.as_str(),
+                command,
+                authoring_node,
+                watermark,
+            )
+            .await?;
+        let (result, resource_effect, pod_endpoint_effect, mut committed_resource) =
+            effect.into_parts();
+        if committed_resource.is_none()
+            && resource_effect == klights_cluster_core::ResourceMutationEffect::Changed
+            && let Some((api_version, kind, namespace, name)) = return_key
+        {
+            committed_resource = self
+                .backend
+                .get_resource(&api_version, &kind, namespace.as_deref(), &name)
+                .await
+                .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?;
+        }
+        Ok(
+            RaftProposalEffect::new(result, resource_effect, pod_endpoint_effect)
+                .with_committed_resource(committed_resource),
+        )
+    }
 }
 
 fn command_return_key(
@@ -233,7 +244,7 @@ impl RaftProposal for BackendProposalFixture {
         &self,
         command: StorageCommand,
     ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
-        propose_command_on_backend(self.backend.as_ref(), command).await
+        self.apply_command(command).await
     }
 
     async fn propose_outbox_command(
@@ -265,8 +276,7 @@ impl RaftProposal for BackendProposalFixture {
     ) -> Result<RaftProposalEffect, OutboxApplyError> {
         let operation = klights_cluster_core::OutboxOperation::try_from(operation)
             .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?;
-        propose_outbox_command_on_backend(
-            self.backend.as_ref(),
+        self.apply_outbox_effect(
             idempotency_key,
             operation,
             command,
@@ -279,10 +289,13 @@ impl RaftProposal for BackendProposalFixture {
 
 #[cfg(test)]
 mod review_regressions {
+    use std::sync::Arc;
+
     use klights_cluster_core::{
         OutboxApplyError, OutboxOperation, OutboxStreamWatermark, ResourcePreconditions,
         StorageCommand,
     };
+    use klights_replication::proposal::RaftProposal;
     use serde_json::json;
 
     #[tokio::test]
@@ -311,27 +324,28 @@ mod review_regressions {
             stream_seq: 1,
         };
 
-        let result = super::propose_outbox_command_on_backend(
-            &db,
-            "missing-pod-status",
-            OutboxOperation::PodStatus,
-            StorageCommand::UpdateStatus {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                namespace: Some("default".to_string()),
-                name: "already-gone".to_string(),
-                status: json!({"phase": "Running"}),
-                expected_rv: None,
-                preconditions: ResourcePreconditions {
-                    uid: Some("gone-uid".to_string()),
-                    resource_version: None,
+        let fixture = super::BackendProposalFixture::new(Arc::new(db.clone()));
+        let result = fixture
+            .propose_outbox_command_effect(
+                "missing-pod-status",
+                OutboxOperation::PodStatus.as_str(),
+                StorageCommand::UpdateStatus {
+                    api_version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "already-gone".to_string(),
+                    status: json!({"phase": "Running"}),
+                    expected_rv: None,
+                    preconditions: ResourcePreconditions {
+                        uid: Some("gone-uid".to_string()),
+                        resource_version: None,
+                    },
+                    observed_status_stamp: Some(42),
                 },
-                observed_status_stamp: Some(42),
-            },
-            "worker-a",
-            Some(watermark.clone()),
-        )
-        .await;
+                "worker-a",
+                Some(watermark.clone()),
+            )
+            .await;
         let Err(error) = result else {
             panic!("missing UID-bound Pod status must return its typed durable decision")
         };
@@ -350,27 +364,27 @@ mod review_regressions {
             "ledger/watermark-only terminal decisions must not append public watch history"
         );
 
-        super::propose_outbox_command_on_backend(
-            &db,
-            "next-stream-entry",
-            OutboxOperation::PodMetadata,
-            StorageCommand::CreateNamespace {
-                name: "after-stale-gap".to_string(),
-                data: json!({
-                    "apiVersion": "v1",
-                    "kind": "Namespace",
-                    "metadata": {"name": "after-stale-gap"}
+        fixture
+            .propose_outbox_command_effect(
+                "next-stream-entry",
+                OutboxOperation::PodMetadata.as_str(),
+                StorageCommand::CreateNamespace {
+                    name: "after-stale-gap".to_string(),
+                    data: json!({
+                        "apiVersion": "v1",
+                        "kind": "Namespace",
+                        "metadata": {"name": "after-stale-gap"}
+                    }),
+                },
+                "worker-a",
+                Some(OutboxStreamWatermark {
+                    client_id: "worker-client".to_string(),
+                    stream_id: 11,
+                    stream_seq: 2,
                 }),
-            },
-            "worker-a",
-            Some(OutboxStreamWatermark {
-                client_id: "worker-client".to_string(),
-                stream_id: 11,
-                stream_seq: 2,
-            }),
-        )
-        .await
-        .expect("the next ordered entry must not wedge behind a stale Pod decision");
+            )
+            .await
+            .expect("the next ordered entry must not wedge behind a stale Pod decision");
 
         assert!(db.get_namespace("after-stale-gap").await.unwrap().is_some());
         assert_eq!(

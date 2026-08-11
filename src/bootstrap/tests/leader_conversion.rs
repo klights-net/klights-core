@@ -2,26 +2,113 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::control_plane::client::local::LocalApiClient;
-use klights_leader_api::{
-    LeaderNetworkTopologyQuery, LeaderNodeSubnetAllocation, LeaderPodCleanupIntents,
-    LeaderResourceQuery, NodeDataplaneQuery, NodeSubnetAllocationRequest, NodeSubnetQuery,
-    PeerSubnetsQuery, PodCleanupIntentAckRequest, ResourceQueryConsistency, pod_get_request,
+use crate::bootstrap::local_leader_adapters::{
+    LocalNodeLeaseRenewalAdapter, LocalNodeLifecycleStatusAdapter, LocalProjectedTokenAdapter,
 };
+use klights_leader_api::{
+    LeaderNetworkTopologyQuery, LeaderNodeSubnetAllocation, LeaderOutboxDelivery,
+    LeaderPodCleanupIntents, LeaderResourceQuery, NodeDataplaneQuery, NodeSubnetAllocationRequest,
+    NodeSubnetQuery, OutboxDeliveryRequest, PeerSubnetsQuery, PodCleanupIntentAckRequest,
+    ResourceQueryConsistency, pod_get_request,
+};
+
+fn test_outbox_delivery(
+    db: crate::datastore::DatastoreHandle,
+    local_node: &str,
+) -> (
+    Arc<crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::RootCommittedOutboxDelivery>,
+    Arc<crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::RootOutboxSideEffectState>,
+){
+    let authority = crate::bootstrap::authority::AuthorityHandle::from(
+        crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+    );
+    let side_effects =
+        crate::bootstrap::local_leader_adapters::new_local_outbox_side_effect_state(db.clone());
+    let delivery = crate::bootstrap::composition_adapters::
+        committed_outbox_delivery_adapter::test_outbox_delivery(
+            db,
+            &authority,
+            side_effects.clone(),
+            local_node.to_string(),
+        );
+    (delivery, side_effects)
+}
+
+async fn deliver_test_outbox(
+    delivery: &dyn LeaderOutboxDelivery,
+    idempotency_key: &str,
+    operation: OutboxOperation,
+    payload: Bytes,
+    client_id: &str,
+    stream_id: i64,
+    stream_seq: i64,
+) -> Result<OutboxApplyResult, OutboxApplyError> {
+    use klights_kubelet::node_outbox::payload::OutboxOperationExt as _;
+
+    let request = OutboxDeliveryRequest::try_new(
+        idempotency_key,
+        operation.try_delivery_operation()?,
+        Arc::<[u8]>::from(payload.to_vec()),
+        client_id,
+        stream_id,
+        stream_seq,
+    )?;
+    delivery.deliver_outbox(request).await
+}
+
+fn test_network_port(
+    db: crate::datastore::DatastoreHandle,
+) -> Arc<crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork>
+{
+    Arc::new(
+        crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
+            db.clone(),
+            Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db)),
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+        ),
+    )
+}
+
+fn test_cleanup_port(
+    db: crate::datastore::DatastoreHandle,
+) -> Arc<crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup>
+{
+    Arc::new(
+        crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup::new(
+            db.clone(),
+            Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db)),
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+        ),
+    )
+}
 
 #[test]
 fn concrete_leader_clients_implement_focused_pod_effect_ports() {
     fn assert_ports<T>()
     where
-        T: klights_leader_api::LeaderProjectedServiceAccountToken
-            + klights_leader_api::LeaderPodCleanupIntents,
+        T: klights_leader_api::LeaderProjectedServiceAccountToken,
     {
     }
 
-    assert_ports::<crate::control_plane::client::local::LocalApiClient>();
+    assert_ports::<LocalProjectedTokenAdapter>();
     assert_ports::<klights_leader_rpc::client::RemoteApiClient>();
-    assert_ports::<crate::control_plane::client::leader_proxy::LeaderProxyApiClient>();
-    assert_ports::<crate::control_plane::client::leader_proxy::StubRemoteForwarder>();
+    assert_ports::<crate::bootstrap::authority_routed_leader::AuthorityRoutedLeader>();
+    assert_ports::<crate::bootstrap::authority_routed_leader::StubRemoteForwarder>();
+
+    fn assert_network<T>()
+    where
+        T: klights_leader_api::LeaderNodeSubnetAllocation
+            + klights_leader_api::LeaderNetworkTopologyQuery
+            + klights_leader_api::LeaderNetworkTopologyCommand,
+    {
+    }
+    assert_network::<
+        crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork,
+    >();
+    fn assert_cleanup<T: klights_leader_api::LeaderPodCleanupIntents>() {}
+    assert_cleanup::<
+        crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup,
+    >();
 }
 
 #[test]
@@ -29,30 +116,20 @@ fn node_effect_ports_have_the_frozen_authority_split() {
     fn assert_lease<T: klights_leader_api::LeaderNodeLeaseRenewal>() {}
     fn assert_local_lifecycle<T: klights_leader_api::LeaderNodeLifecycleStatus>() {}
 
-    assert_lease::<crate::control_plane::client::local::LocalApiClient>();
+    assert_lease::<LocalNodeLeaseRenewalAdapter>();
     assert_lease::<klights_leader_rpc::client::RemoteApiClient>();
-    assert_lease::<crate::control_plane::client::leader_proxy::LeaderProxyApiClient>();
-    assert_lease::<crate::control_plane::client::leader_proxy::StubRemoteForwarder>();
-    assert_local_lifecycle::<crate::control_plane::client::local::LocalApiClient>();
+    assert_lease::<crate::bootstrap::authority_routed_leader::AuthorityRoutedLeader>();
+    assert_lease::<crate::bootstrap::authority_routed_leader::StubRemoteForwarder>();
+    assert_local_lifecycle::<LocalNodeLifecycleStatusAdapter>();
 }
 
 #[tokio::test]
 async fn node_effect_ports_gate_follower_lease_before_tracker_mutation() {
-    let db: crate::datastore::DatastoreHandle = Arc::new(
-        crate::datastore::sqlite::Datastore::new_in_memory()
-            .await
-            .unwrap(),
-    );
     let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         chrono::Utc::now(),
     ));
     let (_leader_tx, follower_rx) = tokio::sync::watch::channel(false);
-    let local = crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker(
-        db,
-        "cp-1".to_string(),
-        tracker.clone(),
-        follower_rx,
-    );
+    let local = LocalNodeLeaseRenewalAdapter::new(tracker.clone(), follower_rx);
     let request = klights_leader_api::NodeLeaseRenewalRequest::try_new(
         "cp-1",
         klights_cluster_core::k8s_time::format_time(chrono::Utc::now()),
@@ -98,11 +175,9 @@ async fn node_effect_lease_renewal_has_no_cluster_rv_watch_or_lease_row() {
     let tracker = Arc::new(klights_controllers::node_lease::NodeLeaseTracker::new_at(
         chrono::Utc::now(),
     ));
-    let client = crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker(
-        Arc::new(db.clone()),
-        "cp-1".to_string(),
+    let client = LocalNodeLeaseRenewalAdapter::new(
         tracker.clone(),
-        crate::control_plane::client::local::always_leader_watch(),
+        crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
     );
     let before_rv = db.get_current_resource_version().await.expect("read RV");
     let request = klights_leader_api::NodeLeaseRenewalRequest::try_new(
@@ -158,11 +233,14 @@ async fn node_effect_lifecycle_status_preserves_spec_metadata_and_conflicts_stal
         )
         .await
         .expect("create Node");
-    let client = crate::control_plane::client::local::LocalApiClient::new(
-        Arc::new(db.clone()),
-        "cp-1".to_string(),
-        crate::control_plane::client::local::always_leader_watch(),
+    let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
+    let authority =
+        crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+    let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+        db_handle.clone(),
+        authority.clone(),
     );
+    let client = LocalNodeLifecycleStatusAdapter::new(db_handle, resource_query, authority);
     let command = StorageCommand::UpdateStatus {
         api_version: "v1".to_string(),
         kind: "Node".to_string(),
@@ -232,16 +310,15 @@ fn positioned_watch_adapters_implement_focused_ports() {
     >() {
     }
 
-    assert_focused::<crate::control_plane::client::local::LocalApiClient>();
     assert_focused::<klights_leader_rpc::client::RemoteApiClient>();
-    assert_focused::<crate::control_plane::client::leader_proxy::LeaderProxyApiClient>();
-    assert_focused::<crate::control_plane::client::leader_proxy::StubRemoteForwarder>();
+    assert_focused::<crate::bootstrap::authority_routed_leader::AuthorityRoutedLeader>();
+    assert_focused::<crate::bootstrap::authority_routed_leader::StubRemoteForwarder>();
 }
 
 #[tokio::test]
 async fn stub_watch_and_readiness_are_typed_unavailable() {
     let stub =
-        crate::control_plane::client::leader_proxy::StubRemoteForwarder::new("cp-stub".to_string());
+        crate::bootstrap::authority_routed_leader::StubRemoteForwarder::new("cp-stub".to_string());
     let watch =
         klights_leader_api::WatchRequest::try_new("v1", "Pod", None, None, None, Some(41), None)
             .expect("valid watch");
@@ -332,14 +409,14 @@ async fn local_client_reads_pods_through_focused_resource_query() {
     )
     .await
     .expect("create pod");
-    let client = LocalApiClient::new(
-        Arc::new(db),
-        "node-a".to_string(),
-        crate::control_plane::client::local::always_leader_watch(),
+    let db: crate::datastore::DatastoreHandle = Arc::new(db);
+    let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+        db,
+        crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
     );
 
     assert!(
-        client
+        resource_query
             .get_resource(
                 pod_get_request("default", "web", ResourceQueryConsistency::Cached)
                     .expect("valid Pod request"),
@@ -377,11 +454,6 @@ async fn cleanup_intent_ack_is_idempotent_and_never_touches_same_name_pod_row() 
         )
         .await
         .expect("create same-name replacement Pod");
-    let client = LocalApiClient::new(
-        Arc::new(db.clone()),
-        "node-a".to_string(),
-        crate::control_plane::client::local::always_leader_watch(),
-    );
     let ack = PodCleanupIntentAckRequest::try_new(
         "node-a",
         "default",
@@ -392,7 +464,7 @@ async fn cleanup_intent_ack_is_idempotent_and_never_touches_same_name_pod_row() 
     .unwrap();
 
     for _ in 0..2 {
-        client
+        test_cleanup_port(Arc::new(db.clone()))
             .acknowledge_pod_cleanup_intent(ack.clone())
             .await
             .expect("missing cleanup intent acknowledgement is idempotent");
@@ -431,12 +503,8 @@ async fn local_client_apply_outbox_is_idempotent_and_uid_bound() {
     )
     .await
     .expect("create pod");
-    let client = LocalApiClient::new(
-        Arc::new(db.clone()),
-        "node-a".to_string(),
-        crate::control_plane::client::local::always_leader_watch(),
-    );
-    client.set_controller_dispatcher(
+    let (delivery, side_effects) = test_outbox_delivery(Arc::new(db.clone()), "node-a");
+    side_effects.set_controller_dispatcher(
         crate::bootstrap::controller_adapters::controller_runtime_adapter::dispatcher_for_test(
             &db,
             Arc::new(klights_controllers::service::ServiceIpam::new(
@@ -445,28 +513,28 @@ async fn local_client_apply_outbox_is_idempotent_and_uid_bound() {
         ),
     );
 
-    let first = client
-        .deliver_test_outbox(
-            "stable-key",
-            OutboxOperation::PodStatus,
-            pod_status_payload("uid-1"),
-            "client",
-            1,
-            1,
-        )
-        .await
-        .expect("first apply");
-    let duplicate = client
-        .deliver_test_outbox(
-            "stable-key",
-            OutboxOperation::PodStatus,
-            pod_status_payload("uid-1"),
-            "client",
-            1,
-            1,
-        )
-        .await
-        .expect("duplicate apply");
+    let first = deliver_test_outbox(
+        delivery.as_ref(),
+        "stable-key",
+        OutboxOperation::PodStatus,
+        pod_status_payload("uid-1"),
+        "client",
+        1,
+        1,
+    )
+    .await
+    .expect("first apply");
+    let duplicate = deliver_test_outbox(
+        delivery.as_ref(),
+        "stable-key",
+        OutboxOperation::PodStatus,
+        pod_status_payload("uid-1"),
+        "client",
+        1,
+        1,
+    )
+    .await
+    .expect("duplicate apply");
     assert!(matches!(first, OutboxApplyResult::Applied { .. }));
     assert!(matches!(
         duplicate,
@@ -490,17 +558,17 @@ async fn local_client_apply_outbox_is_idempotent_and_uid_bound() {
         .await
         .expect("watch position before assigned UID mismatch");
 
-    let err = client
-        .deliver_test_outbox(
-            "uid-mismatch-key",
-            OutboxOperation::PodStatus,
-            pod_status_payload("uid-2"),
-            "client",
-            1,
-            2,
-        )
-        .await
-        .expect_err("assigned uid mismatch");
+    let err = deliver_test_outbox(
+        delivery.as_ref(),
+        "uid-mismatch-key",
+        OutboxOperation::PodStatus,
+        pod_status_payload("uid-2"),
+        "client",
+        1,
+        2,
+    )
+    .await
+    .expect_err("assigned uid mismatch");
     assert!(matches!(err, OutboxApplyError::UidMismatch { .. }));
     assert_eq!(
         db.get_current_resource_version().await.expect("read RV"),
@@ -558,12 +626,8 @@ async fn local_client_apply_outbox_returns_committed_resource_version() {
     )
     .await
     .expect("create pod");
-    let client = LocalApiClient::new(
-        Arc::new(db.clone()),
-        "node-a".to_string(),
-        crate::control_plane::client::local::always_leader_watch(),
-    );
-    client.set_controller_dispatcher(
+    let (delivery, side_effects) = test_outbox_delivery(Arc::new(db.clone()), "node-a");
+    side_effects.set_controller_dispatcher(
         crate::bootstrap::controller_adapters::controller_runtime_adapter::dispatcher_for_test(
             &db,
             Arc::new(klights_controllers::service::ServiceIpam::new(
@@ -572,17 +636,17 @@ async fn local_client_apply_outbox_returns_committed_resource_version() {
         ),
     );
 
-    let applied = client
-        .deliver_test_outbox(
-            "raft-client-key",
-            OutboxOperation::PodStatus,
-            pod_status_payload("uid-1"),
-            "client",
-            1,
-            1,
-        )
-        .await
-        .expect("apply outbox through local client");
+    let applied = deliver_test_outbox(
+        delivery.as_ref(),
+        "raft-client-key",
+        OutboxOperation::PodStatus,
+        pod_status_payload("uid-1"),
+        "client",
+        1,
+        1,
+    )
+    .await
+    .expect("apply outbox through local client");
 
     let OutboxApplyResult::Applied { applied_rv } = applied else {
         panic!("first local apply must commit a new write");
@@ -671,18 +735,14 @@ async fn local_client_pod_delete_outbox_reconciles_terminating_namespace() {
         .await
         .expect("create terminating pod");
 
-    let client = LocalApiClient::new(
-        Arc::new(db.clone()),
-        "worker-a".to_string(),
-        crate::control_plane::client::local::always_leader_watch(),
-    );
-    client.set_namespace_termination(
+    let (delivery, side_effects) = test_outbox_delivery(Arc::new(db.clone()), "worker-a");
+    side_effects.set_namespace_termination(
             crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationReconciler::new(
                 crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(Arc::new(db.clone())),
                 klights_controllers::side_effects::SideEffectMetrics::new(),
             ),
         );
-    client.set_non_pod_finalization(Arc::new(
+    side_effects.set_non_pod_finalization(Arc::new(
         crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
             Arc::new(db.clone()),
         ),
@@ -694,23 +754,23 @@ async fn local_client_pod_delete_outbox_reconciles_terminating_namespace() {
                 "10.43.128.0/17",
             )),
         );
-    client.set_controller_dispatcher(dispatcher);
-    let applied = client
-        .deliver_test_outbox(
-            "worker-pod-actor-finalize-delete",
-            OutboxOperation::PodMetadata,
-            pod_delete_payload_for(
-                "worker-finalize-ns",
-                "worker-pod",
-                "worker-pod-uid",
-                observed_pod.resource_version,
-            ),
-            "client",
-            1,
-            1,
-        )
-        .await
-        .expect("apply worker pod delete outbox");
+    side_effects.set_controller_dispatcher(dispatcher);
+    let applied = deliver_test_outbox(
+        delivery.as_ref(),
+        "worker-pod-actor-finalize-delete",
+        OutboxOperation::PodMetadata,
+        pod_delete_payload_for(
+            "worker-finalize-ns",
+            "worker-pod",
+            "worker-pod-uid",
+            observed_pod.resource_version,
+        ),
+        "client",
+        1,
+        1,
+    )
+    .await
+    .expect("apply worker pod delete outbox");
     assert!(matches!(applied, OutboxApplyResult::Applied { .. }));
 
     assert!(
@@ -785,12 +845,8 @@ async fn local_client_pod_delete_outbox_finalizes_ready_foreground_owner() {
         .await
         .expect("create foreground child");
 
-    let client = LocalApiClient::new(
-        Arc::new(db.clone()),
-        "worker-a".to_string(),
-        crate::control_plane::client::local::always_leader_watch(),
-    );
-    client.set_non_pod_finalization(Arc::new(
+    let (delivery, side_effects) = test_outbox_delivery(Arc::new(db.clone()), "worker-a");
+    side_effects.set_non_pod_finalization(Arc::new(
         crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
             Arc::new(db.clone()),
         ),
@@ -802,23 +858,23 @@ async fn local_client_pod_delete_outbox_finalizes_ready_foreground_owner() {
                 "10.43.128.0/17",
             )),
         );
-    client.set_controller_dispatcher(dispatcher);
+    side_effects.set_controller_dispatcher(dispatcher);
 
-    let applied = client
-        .deliver_test_outbox(
-            "foreground-child-actor-finalize-delete",
-            OutboxOperation::PodMetadata,
-            pod_delete_payload(
-                "foreground-child",
-                "foreground-child-uid",
-                observed_child.resource_version,
-            ),
-            "client",
-            1,
-            1,
-        )
-        .await
-        .expect("apply pod delete outbox");
+    let applied = deliver_test_outbox(
+        delivery.as_ref(),
+        "foreground-child-actor-finalize-delete",
+        OutboxOperation::PodMetadata,
+        pod_delete_payload(
+            "foreground-child",
+            "foreground-child-uid",
+            observed_child.resource_version,
+        ),
+        "client",
+        1,
+        1,
+    )
+    .await
+    .expect("apply pod delete outbox");
     assert!(matches!(applied, OutboxApplyResult::Applied { .. }));
 
     assert!(
@@ -847,13 +903,9 @@ async fn local_client_serves_network_metadata_without_calling_forwarder() {
     let db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
-    let client = LocalApiClient::new(
-        Arc::new(db.clone()),
-        "node-a".to_string(),
-        crate::control_plane::client::local::always_leader_watch(),
-    );
+    let network = test_network_port(Arc::new(db.clone()));
 
-    let subnet = client
+    let subnet = network
         .allocate_node_subnet(
             NodeSubnetAllocationRequest::try_new("node-a", "10.42.0.0/16", "192.0.2.10")
                 .expect("valid allocation request"),
@@ -864,7 +916,7 @@ async fn local_client_serves_network_metadata_without_calling_forwarder() {
     assert_eq!(subnet.node_name(), "node-a");
     assert_eq!(subnet.subnet(), "10.42.0.0/24");
 
-    let stored = client
+    let stored = network
         .get_node_subnet(NodeSubnetQuery::try_new("node-a").expect("valid query"))
         .await
         .expect("get local subnet through leader API")
@@ -872,7 +924,7 @@ async fn local_client_serves_network_metadata_without_calling_forwarder() {
         .expect("allocated subnet should exist");
     assert_eq!(stored, subnet);
 
-    let peer = client
+    let peer = network
         .allocate_node_subnet(
             NodeSubnetAllocationRequest::try_new("node-b", "10.42.0.0/16", "192.0.2.11")
                 .expect("valid allocation request"),
@@ -880,7 +932,7 @@ async fn local_client_serves_network_metadata_without_calling_forwarder() {
         .await
         .expect("allocate peer subnet")
         .into_subnet();
-    let peers = client
+    let peers = network
         .list_peer_subnets(PeerSubnetsQuery::try_new("node-a").expect("valid query"))
         .await
         .expect("list peer subnets through leader API")
@@ -900,13 +952,13 @@ async fn local_client_serves_network_metadata_without_calling_forwarder() {
         .await
         .expect("store dataplane metadata");
     assert_eq!(
-        client
+        network
             .get_node_dataplane(NodeDataplaneQuery::try_new("node-b").expect("valid query"),)
             .await
             .expect("get dataplane metadata through leader API")
             .into_option(),
         Some(
-            crate::control_plane::client::focused_dataplane(metadata)
+            crate::bootstrap::leader_conversions::topology::focused_dataplane(metadata)
                 .expect("valid focused metadata"),
         )
     );
