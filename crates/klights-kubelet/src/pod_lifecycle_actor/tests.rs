@@ -47,6 +47,130 @@ struct DeadlineStopExecutor {
     forced_seen: tokio::sync::Notify,
 }
 
+struct StopCompletionExecutor {
+    stop_seen: tokio::sync::Notify,
+    release_stop: tokio::sync::Notify,
+    finalize_seen: tokio::sync::Notify,
+}
+
+impl StopCompletionExecutor {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            stop_seen: tokio::sync::Notify::new(),
+            release_stop: tokio::sync::Notify::new(),
+            finalize_seen: tokio::sync::Notify::new(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::pod_lifecycle_router::executor::PodWorkExecutor for StopCompletionExecutor {
+    async fn dispatch(
+        &self,
+        action: crate::pod_lifecycle_core::action::PodAction,
+        reply_to: LifecycleReplyHandle,
+    ) -> Result<(), crate::pod_lifecycle_router::executor::ExecutorError> {
+        match action {
+            crate::pod_lifecycle_core::action::PodAction::StopPod {
+                key, operation_id, ..
+            } => {
+                self.stop_seen.notify_one();
+                self.release_stop.notified().await;
+                let _ = reply_to
+                    .route(LifecycleMessage::PodWorkCompleted {
+                        key,
+                        operation_id,
+                        kind: super::message::PodLifecycleWorkKind::StopPod,
+                        sandbox_id: None,
+                    })
+                    .await;
+            }
+            crate::pod_lifecycle_core::action::PodAction::FinalizePodDeletion { .. } => {
+                self.finalize_seen.notify_one();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+struct BlockingRuntimeObservationOutbox {
+    checkpoint_attempted: tokio::sync::Notify,
+}
+
+impl BlockingRuntimeObservationOutbox {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            checkpoint_attempted: tokio::sync::Notify::new(),
+        })
+    }
+}
+
+impl klights_leader_api::NodeOutbox for BlockingRuntimeObservationOutbox {
+    fn enqueue(
+        &self,
+        _command: klights_leader_api::NodeOutboxCommand,
+    ) -> klights_leader_api::NodeOutboxFuture<'_, klights_leader_api::NodeOutboxRoute> {
+        Box::pin(async { unreachable!() })
+    }
+
+    fn next_status_stamp(&self) -> klights_leader_api::NodeOutboxFuture<'_, i64> {
+        Box::pin(async { unreachable!() })
+    }
+
+    fn record_pod_status_checkpoint<'a>(
+        &'a self,
+        _checkpoint: &'a klights_cluster_core::Resource,
+        _updated_ms: i64,
+    ) -> klights_leader_api::NodeOutboxFuture<'a, ()> {
+        Box::pin(async { unreachable!() })
+    }
+
+    fn merge_pod_status_checkpoint(
+        &self,
+        _pod: klights_cluster_core::Resource,
+    ) -> klights_leader_api::NodeOutboxFuture<'_, klights_cluster_core::Resource> {
+        Box::pin(async { unreachable!() })
+    }
+
+    fn delete_pod_status_checkpoint<'a>(
+        &'a self,
+        _pod_uid: &'a str,
+    ) -> klights_leader_api::NodeOutboxFuture<'a, ()> {
+        Box::pin(async { unreachable!() })
+    }
+
+    fn record_runtime_observation_checkpoint<'a>(
+        &'a self,
+        _pod_uid: &'a str,
+        _container_ids: Vec<String>,
+        _generation: u64,
+        _updated_ms: i64,
+    ) -> klights_leader_api::NodeOutboxFuture<'a, ()> {
+        Box::pin(async move {
+            self.checkpoint_attempted.notify_one();
+            std::future::pending().await
+        })
+    }
+
+    fn get_runtime_observation_checkpoint<'a>(
+        &'a self,
+        _pod_uid: &'a str,
+    ) -> klights_leader_api::NodeOutboxFuture<
+        'a,
+        Option<klights_leader_api::NodeRuntimeObservationCheckpoint>,
+    > {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn delete_runtime_observation_checkpoint<'a>(
+        &'a self,
+        _pod_uid: &'a str,
+    ) -> klights_leader_api::NodeOutboxFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 impl DeadlineStopExecutor {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -1207,6 +1331,74 @@ async fn supervised_deadline_shortening_cancels_graceful_and_dispatches_forced_s
 
     drop(tx);
     actor_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn cri_stop_observation_cannot_block_actor_owned_deletion_finalization() {
+    let executor = StopCompletionExecutor::new();
+    let holder =
+        Arc::new(std::sync::Mutex::new(executor.clone()
+            as Arc<
+                dyn crate::pod_lifecycle_router::executor::PodWorkExecutor,
+            >));
+    let outbox = BlockingRuntimeObservationOutbox::new();
+    let (seen_tx, _seen_rx) = tokio::sync::mpsc::channel(8);
+    let mut actor = super::actor::PodLifecycleActor::new_with_event_sink_for_test(
+        8,
+        seen_tx,
+        holder,
+        dummy_reply_handle(),
+    );
+    actor.set_local_node_name_for_test("node-a");
+    actor.set_runtime_observation_store_for_test(outbox.clone());
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let actor_task = tokio::spawn(actor.run(rx));
+    let key = PodLifecycleKey::new("default", "ss-0", "uid-0");
+    let deadline = chrono::Utc::now() + chrono::Duration::seconds(30);
+    let terminating = terminating_test_pod(
+        "uid-0",
+        serde_json::json!(klights_cluster_core::k8s_time::format_legacy_timestamp(
+            deadline,
+        )),
+    );
+
+    tx.send(LifecycleMessage::WatchModified {
+        key: key.clone(),
+        resource_version: Some(7),
+        pod: terminating,
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), executor.stop_seen.notified())
+        .await
+        .expect("terminating watch must dispatch StopPod");
+
+    tx.send(LifecycleMessage::CriEvent {
+        key,
+        container_id: "container-0".to_string(),
+        kind: crate::cri_events::KubeletEventKind::Stopped,
+    })
+    .await
+    .unwrap();
+    executor.release_stop.notify_one();
+
+    tokio::time::timeout(Duration::from_millis(200), executor.finalize_seen.notified())
+        .await
+        .expect(
+            "the StopPod-generated CRI event must not checkpoint a runtime reconcile and block deletion finalization",
+        );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            outbox.checkpoint_attempted.notified(),
+        )
+        .await
+        .is_err(),
+        "Stopping Pods must discard self-generated CRI observations"
+    );
+
+    drop(tx);
+    actor_task.abort();
 }
 
 #[test]

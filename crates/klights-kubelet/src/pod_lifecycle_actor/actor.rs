@@ -263,6 +263,11 @@ impl PodLifecycleActor {
         }
     }
 
+    #[cfg(test)]
+    pub fn set_runtime_observation_store_for_test(&mut self, store: Arc<dyn NodeOutbox>) {
+        self.runtime_observation_store = Some(store);
+    }
+
     pub fn new_with_shared_trace_and_state(runtime: PodLifecycleActorRuntime) -> Self {
         Self {
             slot: Some(runtime.slot),
@@ -903,6 +908,13 @@ impl PodLifecycleActor {
         deletion_deadline: Option<chrono::DateTime<chrono::Utc>>,
         mode: PodStopMode,
     ) -> PodAction {
+        // Runtime events observed before or during teardown cannot inform a
+        // useful status reconcile: StopPod owns the terminal CRI/CNI state
+        // transition and actor-owned finalization removes the API row. Drop
+        // any queued observation before entering Stopping so a best-effort
+        // checkpoint write cannot hold the actor mailbox ahead of StopPod's
+        // completion or the hard deletion deadline.
+        let _ = self.state.take_runtime_reconcile_hint();
         self.state.pending_stop_pod = Some(crate::pod_lifecycle_core::state::PendingStopPod {
             key: key.clone(),
             pod: pod.clone(),
@@ -987,6 +999,17 @@ impl PodLifecycleActor {
         container_id: Option<&str>,
         event_kind: Option<crate::cri_events::KubeletEventKind>,
     ) -> PodAction {
+        if matches!(self.state.phase, PodPhase::Stopping | PodPhase::Terminated) {
+            tracing::debug!(
+                namespace = %key.namespace,
+                pod = %key.name,
+                uid = %key.uid,
+                phase = ?self.state.phase,
+                container_id,
+                "lifecycle-actor: discarding runtime observation during Pod teardown"
+            );
+            return PodAction::Noop;
+        }
         let in_flight = self.state.in_flight_kind_for_uid(&key.uid);
         let defer = in_flight.is_some()
             || matches!(

@@ -453,9 +453,38 @@ impl LocalBoundPodFinalizationPersistence for RootPodRepositoryPersistenceAdapte
                     .map_err(|error| BoundPodFinalizationError::unavailable(error.to_string()))?;
             }
             let preconditions = klights_cluster_core::ResourcePreconditions {
-                uid: Some(identity.uid),
+                uid: Some(identity.uid.clone()),
                 resource_version: Some(observed_resource_version),
             };
+            if let Some(commands) = &self.commands {
+                let command = klights_cluster_core::StorageCommand::DeleteResource {
+                    api_version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                    namespace: Some(identity.namespace.clone()),
+                    name: identity.name.clone(),
+                    preconditions,
+                };
+                let request = ResourceCommandRequest::try_new(command)
+                    .map_err(|error| BoundPodFinalizationError::unavailable(error.to_string()))?;
+                return match commands.submit_resource_command(request).await {
+                    Ok(ResourceCommandResult::Ack { .. }) => {
+                        self.sandbox_gc_dirty.fetch_add(1, Ordering::Release);
+                        Ok(BoundPodFinalizationOutcome::Removed)
+                    }
+                    Ok(ResourceCommandResult::Resource(_)) => {
+                        Err(BoundPodFinalizationError::unavailable(
+                            "Raft actor Pod finalization unexpectedly returned a resource",
+                        ))
+                    }
+                    Err(ResourceCommandError::Conflict { .. }) => {
+                        Ok(BoundPodFinalizationOutcome::Retry)
+                    }
+                    Err(ResourceCommandError::NotFound { .. }) => {
+                        Ok(BoundPodFinalizationOutcome::IdentityChanged)
+                    }
+                    Err(error) => Err(BoundPodFinalizationError::unavailable(error.to_string())),
+                };
+            }
             match self
                 .db
                 .delete_resource_with_preconditions(
@@ -742,9 +771,109 @@ pub(crate) fn new_store(db: DatastoreHandle) -> PodStore {
 
 #[cfg(test)]
 mod tests {
-    use klights_cluster_core::{StorageCommandRejectionCode, StorageMutationError};
+    use std::sync::{Arc, Mutex};
 
-    use super::pod_persistence_error;
+    use klights_cluster_core::{
+        ResourcePreconditions, StorageCommand, StorageCommandRejectionCode, StorageMutationError,
+    };
+    use klights_leader_api::{
+        LeaderResourceCommand, ResourceCommandFuture, ResourceCommandRequest, ResourceCommandResult,
+    };
+    use klights_pod_api::{BoundPodFinalizationOutcome, BoundPodFinalizationRequest};
+    use klights_types::PodIdentity;
+
+    use super::{new_raft_root_parts, pod_persistence_error};
+
+    struct RecordingResourceCommands {
+        commands: Mutex<Vec<StorageCommand>>,
+    }
+
+    impl LeaderResourceCommand for RecordingResourceCommands {
+        fn submit_resource_command(
+            &self,
+            request: ResourceCommandRequest,
+        ) -> ResourceCommandFuture<'_, ResourceCommandResult> {
+            Box::pin(async move {
+                self.commands.lock().unwrap().push(request.into_command());
+                Ok(ResourceCommandResult::Ack {
+                    resource_version: 2,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn raft_root_actor_finalization_submits_uid_bound_delete_without_local_mutation() {
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let created = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "ordered-2",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "ordered-2",
+                        "uid": "ordered-2-uid",
+                        "deletionTimestamp": "2026-08-12T00:00:00Z"
+                    },
+                    "spec": {
+                        "nodeName": "worker-a",
+                        "containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10"}]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        let commands = Arc::new(RecordingResourceCommands {
+            commands: Mutex::new(Vec::new()),
+        });
+        let parts = new_raft_root_parts(
+            Arc::new(db.clone()),
+            commands.clone(),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        );
+
+        let outcome = parts
+            .bound_finalization
+            .finalize_bound_pod(
+                BoundPodFinalizationRequest::try_new(PodIdentity::new(
+                    "default",
+                    "ordered-2",
+                    "ordered-2-uid",
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, BoundPodFinalizationOutcome::Removed);
+        assert_eq!(
+            commands.commands.lock().unwrap().as_slice(),
+            &[StorageCommand::DeleteResource {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: "ordered-2".to_string(),
+                preconditions: ResourcePreconditions {
+                    uid: Some("ordered-2-uid".to_string()),
+                    resource_version: Some(created.resource_version),
+                },
+            }]
+        );
+        assert!(
+            db.get_resource("v1", "Pod", Some("default"), "ordered-2")
+                .await
+                .unwrap()
+                .is_some(),
+            "Raft-root actor finalization must wait for committed apply to remove the Pod"
+        );
+    }
 
     #[test]
     fn neutral_rejections_preserve_pod_repository_categories() {
