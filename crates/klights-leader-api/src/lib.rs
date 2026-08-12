@@ -152,6 +152,24 @@ pub trait LeaderAuthority: Send + Sync {
         &'a self,
         permit: &'a AuthorityPermit,
     ) -> AuthorityRevocationFuture<'a>;
+
+    /// Wait until the complete routing decision changes. Implementations that
+    /// publish an endpoint must wake this future for endpoint A→B and
+    /// Forward→Unavailable transitions, not only for local permit revocation.
+    /// The default preserves compatibility for authority providers whose
+    /// non-local route has no event source; concrete watch-backed providers
+    /// should override it with their route event stream.
+    fn wait_for_route_change<'a>(
+        &'a self,
+        route: &'a AuthorityRoute,
+    ) -> AuthorityRevocationFuture<'a> {
+        match route {
+            AuthorityRoute::Local(permit) => self.wait_for_revocation(permit),
+            AuthorityRoute::Forward { .. } | AuthorityRoute::Unavailable => Box::pin(async move {
+                let _ = self.acquire().await;
+            }),
+        }
+    }
 }
 
 struct AuthorityExecutionScope {

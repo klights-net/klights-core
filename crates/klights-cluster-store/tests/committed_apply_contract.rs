@@ -3,8 +3,9 @@ use klights_cluster_core::{
     LogApplyAppliedOutboxRow, LogApplyCommit, OutboxStreamWatermark, WatchReplayPosition,
 };
 use klights_cluster_store::{
-    AppliedOutboxLookup, CommittedApplyError, CommittedApplyFuture, CommittedRaftApplyReceipt,
-    CommittedRaftApplyRequest, DurableApplyLedgerRead, PrivilegedCommittedRaftApply,
+    AppliedOutboxLedger, AppliedOutboxLookup, ClusterResourceMutation, CommittedApplyError,
+    CommittedApplyFuture, CommittedRaftApplyReceipt, CommittedRaftApplyRequest,
+    DurableApplyLedgerRead, PrivilegedCommittedRaftApply,
 };
 
 struct FakeCommittedStore;
@@ -74,6 +75,26 @@ fn committed_apply_and_ledger_read_capabilities_are_distinct_and_object_safe() {
     let store = FakeCommittedStore;
     assert_privileged_apply_object_safe(&store);
     assert_ledger_read_object_safe(&store);
+}
+
+#[test]
+fn sequenced_facade_rejects_committed_apply_through_both_trait_views() {
+    let resource_view = std::any::type_name::<&dyn ClusterResourceMutation>();
+    let outbox_view = std::any::type_name::<&dyn AppliedOutboxLedger>();
+    let privileged_view = std::any::type_name::<&dyn PrivilegedCommittedRaftApply>();
+
+    assert_ne!(
+        resource_view, privileged_view,
+        "application resource mutation capability must not expose committed apply"
+    );
+    assert_ne!(
+        outbox_view, privileged_view,
+        "application outbox capability must not expose committed apply"
+    );
+    assert!(
+        privileged_view.contains("PrivilegedCommittedRaftApply"),
+        "committed apply must remain available only through its privileged trait"
+    );
 }
 
 #[test]

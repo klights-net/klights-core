@@ -29,8 +29,8 @@ pub use event_bus::WatchReceiver;
 pub use filter::WatchEventFilter;
 pub use klights_cluster_core::{PositionedWatchEvent, WatchReplayPosition};
 pub use remote_cache::{
-    PreparedWatchTransition, RemoteInformerCache, WatchTransitionProjector,
-    WatchTransitionProjectorFactory,
+    PreparedWatchTransition, RemoteInformerCache, SelectorWatchTransitionProjector,
+    SelectorWatchTransitionProjectors, WatchTransitionProjector, WatchTransitionProjectorFactory,
 };
 pub use replay::{
     PositionedWatchReplay, PositionedWatchReplayRead, WatchReplayRead, WatchTarget,

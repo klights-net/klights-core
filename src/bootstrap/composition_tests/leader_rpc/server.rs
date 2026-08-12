@@ -35,16 +35,6 @@ struct RecordingNodeLifecycleStatus {
     requests: Mutex<Vec<klights_leader_api::NodeLifecycleStatusRequest>>,
 }
 
-impl RecordingNodeLifecycleStatus {
-    fn take_request(&self) -> klights_leader_api::NodeLifecycleStatusRequest {
-        self.requests
-            .lock()
-            .expect("recording Node lifecycle status mutex poisoned")
-            .pop()
-            .expect("one Node lifecycle status request")
-    }
-}
-
 impl klights_leader_api::LeaderNodeLifecycleStatus for RecordingNodeLifecycleStatus {
     fn submit_node_lifecycle_status(
         &self,
@@ -2780,7 +2770,7 @@ async fn node_effect_observed_leader_endpoint_enqueues_external_ip_status() {
 }
 
 #[tokio::test]
-async fn node_effect_join_external_ip_uses_fresh_exact_status_after_metadata_cas() {
+async fn node_effect_join_external_ip_is_atomic_with_metadata_cas_without_redundant_status() {
     let db = Arc::new(
         klights::datastore::sqlite::Datastore::new_in_memory()
             .await
@@ -2859,42 +2849,19 @@ async fn node_effect_join_external_ip_uses_fresh_exact_status_after_metadata_cas
             .and_then(serde_json::Value::as_array)
             .expect("stored Node addresses")
             .iter()
-            .all(|address| address["type"] != "ExternalIP"),
-        "metadata CAS must not full-update Node status"
-    );
-
-    let request = status.take_request();
-    assert_eq!(request.node_name(), "worker-1");
-    assert_eq!(request.node_uid(), node_uid);
-    assert_eq!(request.resource_version(), stored.resource_version);
-    let StorageCommand::UpdateStatus {
-        status,
-        preconditions,
-        expected_rv,
-        ..
-    } = request.into_command()
-    else {
-        panic!("join ExternalIP must use status-only authority")
-    };
-    assert_eq!(expected_rv, Some(stored.resource_version));
-    assert_eq!(
-        preconditions,
-        ResourcePreconditions::uid_and_resource_version(created.uid, stored.resource_version,)
-    );
-    assert_eq!(
-        status.pointer("/conditions/0/status"),
-        Some(&serde_json::json!("True")),
-        "fresh post-metadata status must preserve concurrent condition state"
-    );
-    assert!(
-        status
-            .pointer("/addresses")
-            .and_then(serde_json::Value::as_array)
-            .expect("published status addresses")
-            .iter()
             .any(|address| {
                 address["type"] == "ExternalIP" && address["address"] == "192.0.2.80"
-            })
+            }),
+        "the Raft-routed metadata CAS must preserve the atomic ExternalIP projection"
+    );
+    assert_eq!(stored.uid, node_uid);
+    assert!(
+        status
+            .requests
+            .lock()
+            .expect("recording Node lifecycle status mutex poisoned")
+            .is_empty(),
+        "the post-CAS publisher must not emit a redundant status command"
     );
 }
 

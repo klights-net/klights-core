@@ -257,3 +257,124 @@ impl LeaderPodCleanupIntents for ClusterStoreLeaderPodCleanup {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use klights_cluster_core::{OutboxApplyError, OutboxApplyOutcome, OutboxStreamWatermark};
+    use klights_cluster_store::StorageCommandResult;
+    use klights_leader_api::{DataplaneEncryption, NetworkNodeMode};
+    use std::sync::Mutex;
+
+    struct RecordingApplyingProposal {
+        inner: crate::bootstrap::outbox_apply_adapter::BackendProposalFixture,
+        commands: Mutex<Vec<StorageCommand>>,
+    }
+
+    #[async_trait]
+    impl RaftProposal for RecordingApplyingProposal {
+        async fn propose_command(
+            &self,
+            command: StorageCommand,
+        ) -> anyhow::Result<StorageCommandResult> {
+            self.commands.lock().unwrap().push(command.clone());
+            self.inner.propose_command(command).await
+        }
+
+        async fn propose_outbox_command(
+            &self,
+            _idempotency_key: &str,
+            _operation: &str,
+            _command: StorageCommand,
+            _authoring_node: &str,
+            _watermark: Option<OutboxStreamWatermark>,
+        ) -> Result<OutboxApplyOutcome, OutboxApplyError> {
+            unreachable!("network topology does not submit outbox commands")
+        }
+    }
+
+    fn authority(is_leader: bool) -> Arc<dyn klights_leader_api::LeaderAuthority> {
+        klights_replication::authority::WatchLeaderAuthority::channel(is_leader, None).0
+    }
+
+    async fn fixture(
+        is_leader: bool,
+    ) -> (
+        crate::datastore::sqlite::Datastore,
+        Arc<RecordingApplyingProposal>,
+        ClusterStoreLeaderNetwork,
+    ) {
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let handle: DatastoreHandle = Arc::new(db.clone());
+        let proposal = Arc::new(RecordingApplyingProposal {
+            inner: crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                handle.clone(),
+            ),
+            commands: Default::default(),
+        });
+        let adapter =
+            ClusterStoreLeaderNetwork::new(handle, proposal.clone(), authority(is_leader));
+        (db, proposal, adapter)
+    }
+
+    #[tokio::test]
+    async fn network_cluster_writes_with_proposer_route_through_raft() {
+        let (db, proposal, adapter) = fixture(true).await;
+        adapter
+            .allocate_node_subnet(
+                NodeSubnetAllocationRequest::try_new("worker-1", "10.50.0.0/16", "192.0.2.10")
+                    .unwrap(),
+            )
+            .await
+            .expect("subnet allocation must apply through Raft");
+        adapter
+            .register_node_dataplane(
+                NetworkDataplane::try_new(
+                    "worker-1",
+                    NetworkNodeMode::Root,
+                    DataplaneEncryption::Direct,
+                    None,
+                    "192.0.2.10".parse().unwrap(),
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .expect("dataplane update must apply through Raft");
+
+        assert!(matches!(
+            proposal.commands.lock().unwrap().as_slice(),
+            [StorageCommand::AllocateNodeSubnet { node_name, .. }, StorageCommand::UpdateNodeDataplane { node_name: dataplane_node, .. }]
+                if node_name == "worker-1" && dataplane_node == "worker-1"
+        ));
+        assert!(db.get_node_subnet("worker-1").await.unwrap().is_some());
+        assert!(db.get_node_dataplane("worker-1").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn raft_mode_follower_proposer_rejects_network_cluster_writes_no_local_mutation() {
+        let (db, proposal, adapter) = fixture(false).await;
+        let error = adapter
+            .register_node_dataplane(
+                NetworkDataplane::try_new(
+                    "worker-1",
+                    NetworkNodeMode::Root,
+                    DataplaneEncryption::Direct,
+                    None,
+                    "192.0.2.10".parse().unwrap(),
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .expect_err("follower topology write must be rejected");
+
+        assert_eq!(error, NetworkTopologyError::NotLeader);
+        assert!(proposal.commands.lock().unwrap().is_empty());
+        assert!(db.get_node_subnet("worker-1").await.unwrap().is_none());
+        assert!(db.get_node_dataplane("worker-1").await.unwrap().is_none());
+    }
+}

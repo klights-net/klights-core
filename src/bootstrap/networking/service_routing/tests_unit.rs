@@ -99,12 +99,12 @@ fn inventory_resource(
 impl FreshServiceInventoryClient {
     async fn fresh_list_for_test(
         &self,
-        req: crate::bootstrap::leader_conversions::resource::ListRequest,
+        req: klights_leader_api::ResourceListRequest,
     ) -> anyhow::Result<crate::datastore::ResourceList> {
-        if req.api_version == "discovery.k8s.io/v1" && req.kind == "EndpointSlice" {
+        if req.api_version() == "discovery.k8s.io/v1" && req.kind() == "EndpointSlice" {
             self.endpointslice_list_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if req.label_selector.is_some() {
+            if req.label_selector().is_some() {
                 self.filtered_endpointslice_list_calls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -143,7 +143,7 @@ impl FreshServiceInventoryClient {
             });
         }
 
-        if req.api_version == "v1" && req.kind == "Endpoints" {
+        if req.api_version() == "v1" && req.kind() == "Endpoints" {
             self.endpoints_list_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let legacy_addresses = self.legacy_endpoint_addresses();
@@ -179,8 +179,8 @@ impl FreshServiceInventoryClient {
             });
         }
 
-        assert_eq!(req.api_version, "v1");
-        assert_eq!(req.kind, "Service");
+        assert_eq!(req.api_version(), "v1");
+        assert_eq!(req.kind(), "Service");
         self.service_list_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let service_ports = self.service_ports();
@@ -287,9 +287,7 @@ impl klights_leader_api::LeaderResourceQuery for FreshServiceInventoryClient {
                     None,
                 );
             }
-            let legacy =
-                crate::bootstrap::leader_conversions::resource::legacy_list_request(&request);
-            let list = self.fresh_list_for_test(legacy).await.map_err(|error| {
+            let list = self.fresh_list_for_test(request).await.map_err(|error| {
                 klights_leader_api::ResourceQueryError::query_failed(error.to_string())
             })?;
             klights_leader_api::ResourceListResult::try_new(

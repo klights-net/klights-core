@@ -7,9 +7,7 @@ use klights_leader_api::{
 use klights_types::ResourceKey;
 
 use klights_watch::RemoteInformerCache;
-use klights_watch::{
-    PreparedWatchTransition, WatchTransitionProjector, WatchTransitionProjectorFactory,
-};
+use klights_watch::{WatchTransitionProjector, WatchTransitionProjectorFactory};
 
 #[derive(Clone, Default)]
 pub(crate) struct WatchCacheAdapter {
@@ -69,43 +67,11 @@ impl RemoteInformerCache for WatchCacheAdapter {
     }
 }
 
-struct RootWatchTransitionProjector {
-    membership: klights_watch::WatchSelectorMembership,
-}
-
-impl WatchTransitionProjector for RootWatchTransitionProjector {
-    fn replace(&mut self, resources: &[Resource]) {
-        self.membership.replace(resources);
-    }
-
-    fn prepare(
-        &self,
-        event: ResourceEvent,
-    ) -> Result<PreparedWatchTransition, klights_leader_api::LeaderWatchError> {
-        let pending = self.membership.prepare(event)?;
-        Ok(PreparedWatchTransition::new(
-            pending.event().cloned(),
-            pending,
-        ))
-    }
-
-    fn commit(
-        &mut self,
-        prepared: PreparedWatchTransition,
-    ) -> Result<(), klights_leader_api::LeaderWatchError> {
-        self.membership
-            .commit(prepared.into_token::<klights_watch::PendingWatchSelectorTransition>()?);
-        Ok(())
-    }
-}
-
 impl WatchTransitionProjectorFactory for WatchCacheAdapter {
     fn projector(
         &self,
         request: &klights_leader_api::WatchRequest,
     ) -> Result<Box<dyn WatchTransitionProjector>, klights_leader_api::LeaderWatchError> {
-        Ok(Box::new(RootWatchTransitionProjector {
-            membership: klights_watch::WatchSelectorMembership::try_new(request)?,
-        }))
+        klights_watch::SelectorWatchTransitionProjectors.projector(request)
     }
 }

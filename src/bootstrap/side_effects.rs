@@ -23,7 +23,7 @@ pub(crate) fn default_registry(
 ) -> SideEffectRegistry {
     let db = db.expect("default side-effect registry requires a datastore handle");
     let authority =
-        crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+        crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
     let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
         db.clone(), authority.clone(),
     );

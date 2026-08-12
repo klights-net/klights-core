@@ -14,6 +14,7 @@ use klights_leader_api::{
     LeaderResourceCommand, ResourceCommandError, ResourceCommandFuture, ResourceCommandRequest,
     ResourceCommandResult,
 };
+use klights_replication::authority::{AuthorityPublisher, WatchLeaderAuthority};
 use klights_types::ResourceKey;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,8 +39,8 @@ struct RecordingApiClient {
     apply_outbox: AtomicUsize,
     submit_resource_command: AtomicUsize,
     renew_node_lease: AtomicUsize,
-    demote_on_get: Mutex<Option<(watch::Sender<bool>, bool)>>,
-    demote_on_watch: Mutex<Option<(watch::Sender<bool>, bool)>>,
+    demote_on_get: Mutex<Option<(AuthorityPublisher, bool)>>,
+    demote_on_watch: Mutex<Option<(AuthorityPublisher, bool)>>,
 }
 
 impl RecordingApiClient {
@@ -54,19 +55,19 @@ impl RecordingApiClient {
         self.cleanup_intents.lock().unwrap().push(intent);
     }
 
-    fn demote_during_get(&self, sender: watch::Sender<bool>) {
+    fn demote_during_get(&self, sender: AuthorityPublisher) {
         *self.demote_on_get.lock().unwrap() = Some((sender, false));
     }
 
-    fn demote_during_watch(&self, sender: watch::Sender<bool>) {
+    fn demote_during_watch(&self, sender: AuthorityPublisher) {
         *self.demote_on_watch.lock().unwrap() = Some((sender, false));
     }
 
-    fn flap_during_get(&self, sender: watch::Sender<bool>) {
+    fn flap_during_get(&self, sender: AuthorityPublisher) {
         *self.demote_on_get.lock().unwrap() = Some((sender, true));
     }
 
-    fn flap_during_watch(&self, sender: watch::Sender<bool>) {
+    fn flap_during_watch(&self, sender: AuthorityPublisher) {
         *self.demote_on_watch.lock().unwrap() = Some((sender, true));
     }
 }
@@ -87,13 +88,16 @@ impl LeaderResourceQuery for RecordingApiClient {
                 self.get_resource.fetch_add(1, Ordering::Relaxed);
             }
         }
-        if let Some((sender, restore)) = self.demote_on_get.lock().unwrap().take() {
-            sender.send(false).expect("demote during get");
-            if restore {
-                sender.send(true).expect("restore after transient demotion");
+        let transition = self.demote_on_get.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some((publisher, restore)) = transition {
+                publisher.publish(false, Some("remote-A".to_string())).await;
+                if restore {
+                    publisher.publish(true, None).await;
+                }
             }
-        }
-        Box::pin(async { Ok(None) })
+            Ok(None)
+        })
     }
 
     fn list_resources(
@@ -132,13 +136,14 @@ impl LeaderNodeLeaseRenewal for RecordingApiClient {
 impl LeaderWatch for RecordingApiClient {
     fn watch_resources(&self, _req: WatchRequest) -> LeaderWatchFuture<'_> {
         self.watch_resources.fetch_add(1, Ordering::Relaxed);
-        if let Some((sender, restore)) = self.demote_on_watch.lock().unwrap().take() {
-            sender.send(false).expect("demote during watch open");
-            if restore {
-                sender.send(true).expect("restore after transient demotion");
+        let transition = self.demote_on_watch.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some((publisher, restore)) = transition {
+                publisher.publish(false, Some("remote-A".to_string())).await;
+                if restore {
+                    publisher.publish(true, None).await;
+                }
             }
-        }
-        Box::pin(async {
             Ok(WatchStream::unpositioned_test_stream(
                 futures::stream::pending(),
             ))
@@ -283,13 +288,172 @@ fn make_proxy(
     local: Arc<RecordingApiClient>,
     remote: Arc<RecordingApiClient>,
     initial_leader: bool,
-) -> (AuthorityRoutedLeader, watch::Sender<bool>) {
-    let (tx, rx) = watch::channel(initial_leader);
-    let proxy = make_routed_leader(local.clone(), remote.clone(), rx)
+) -> (AuthorityRoutedLeader, AuthorityPublisher) {
+    let (authority, publisher) = WatchLeaderAuthority::channel(
+        initial_leader,
+        (!initial_leader).then(|| "remote-A".to_string()),
+    );
+    let proxy = make_routed_leader(local.clone(), remote.clone(), authority)
         .with_resource_command_targets(local.clone(), remote.clone())
         .with_outbox_delivery_targets(local.clone(), remote.clone())
-        .with_node_lease_renewal_targets(local, remote);
-    (proxy, tx)
+        .with_node_lease_renewal_targets(local.clone(), remote.clone())
+        .with_forward_endpoint(
+            "remote-A",
+            remote.clone(),
+            remote.clone(),
+            remote.clone(),
+            remote.clone(),
+            remote.clone(),
+            remote.clone(),
+            remote.clone(),
+            remote.clone(),
+            remote.clone(),
+            remote,
+        );
+    (proxy, publisher)
+}
+
+fn add_recording_forward_endpoint(
+    proxy: AuthorityRoutedLeader,
+    endpoint: &str,
+    remote: Arc<RecordingApiClient>,
+) -> AuthorityRoutedLeader {
+    proxy.with_forward_endpoint(
+        endpoint,
+        remote.clone(),
+        remote.clone(),
+        remote.clone(),
+        remote.clone(),
+        remote.clone(),
+        remote.clone(),
+        remote.clone(),
+        remote.clone(),
+        remote.clone(),
+        remote,
+    )
+}
+
+#[tokio::test]
+async fn forward_route_uses_exact_endpoint_and_unavailable_calls_no_arm() {
+    let local = RecordingApiClient::new("local");
+    let remote_a = RecordingApiClient::new("remote-A");
+    let remote_b = RecordingApiClient::new("remote-B");
+    let (authority, publisher) = WatchLeaderAuthority::channel(false, Some("remote-A".to_string()));
+    let proxy = add_recording_forward_endpoint(
+        add_recording_forward_endpoint(
+            make_routed_leader(local.clone(), remote_a.clone(), authority)
+                .with_resource_command_targets(local.clone(), remote_a.clone())
+                .with_outbox_delivery_targets(local.clone(), remote_a.clone())
+                .with_node_lease_renewal_targets(local, remote_a.clone()),
+            "remote-A",
+            remote_a.clone(),
+        ),
+        "remote-B",
+        remote_b.clone(),
+    );
+
+    proxy
+        .get_resource(pod_get_request("default", "web", ResourceQueryConsistency::Cached).unwrap())
+        .await
+        .expect("route A");
+    assert_eq!(remote_a.get_pod.load(Ordering::Relaxed), 1);
+    assert_eq!(remote_b.get_pod.load(Ordering::Relaxed), 0);
+
+    publisher.publish(false, Some("remote-B".to_string())).await;
+    proxy
+        .get_resource(pod_get_request("default", "web", ResourceQueryConsistency::Cached).unwrap())
+        .await
+        .expect("route B");
+    assert_eq!(remote_a.get_pod.load(Ordering::Relaxed), 1);
+    assert_eq!(remote_b.get_pod.load(Ordering::Relaxed), 1);
+
+    publisher.publish(false, None).await;
+    assert!(matches!(
+        proxy
+            .get_resource(
+                pod_get_request("default", "web", ResourceQueryConsistency::Cached).unwrap(),
+            )
+            .await,
+        Err(klights_leader_api::ResourceQueryError::Retryable { .. })
+    ));
+    assert_eq!(remote_a.get_pod.load(Ordering::Relaxed), 1);
+    assert_eq!(remote_b.get_pod.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn cleanup_routes_local_forward_endpoint_and_unavailable_without_fallback() {
+    let local = RecordingApiClient::new("local");
+    let remote_a = RecordingApiClient::new("remote-A");
+    let remote_b = RecordingApiClient::new("remote-B");
+    let (authority, publisher) = WatchLeaderAuthority::channel(true, None);
+    let proxy = add_recording_forward_endpoint(
+        add_recording_forward_endpoint(
+            make_routed_leader(local.clone(), remote_a.clone(), authority),
+            "remote-A",
+            remote_a.clone(),
+        ),
+        "remote-B",
+        remote_b.clone(),
+    );
+    let request = PodCleanupIntentListRequest::try_new("cp-1").unwrap();
+
+    proxy
+        .list_pod_cleanup_intents(request.clone())
+        .await
+        .expect("local cleanup");
+    assert_eq!(local.list_pod_cleanup_intents.load(Ordering::Relaxed), 1);
+    assert_eq!(remote_a.list_pod_cleanup_intents.load(Ordering::Relaxed), 0);
+
+    publisher.publish(false, Some("remote-B".to_string())).await;
+    proxy
+        .list_pod_cleanup_intents(request.clone())
+        .await
+        .expect("forwarded cleanup");
+    assert_eq!(remote_b.list_pod_cleanup_intents.load(Ordering::Relaxed), 1);
+
+    publisher.publish(false, None).await;
+    assert!(matches!(
+        proxy.list_pod_cleanup_intents(request).await,
+        Err(PodCleanupIntentError::Unavailable { .. })
+    ));
+    assert_eq!(local.list_pod_cleanup_intents.load(Ordering::Relaxed), 1);
+    assert_eq!(remote_a.list_pod_cleanup_intents.load(Ordering::Relaxed), 0);
+    assert_eq!(remote_b.list_pod_cleanup_intents.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn forwarded_watch_terminates_on_endpoint_change_and_reconnects_to_new_endpoint() {
+    use futures::StreamExt as _;
+    use tokio::time::{Duration, timeout};
+
+    let local = RecordingApiClient::new("local");
+    let remote_a = RecordingApiClient::new("remote-A");
+    let remote_b = RecordingApiClient::new("remote-B");
+    let (authority, publisher) = WatchLeaderAuthority::channel(false, Some("remote-A".to_string()));
+    let proxy = add_recording_forward_endpoint(
+        add_recording_forward_endpoint(
+            make_routed_leader(local, remote_a.clone(), authority),
+            "remote-A",
+            remote_a.clone(),
+        ),
+        "remote-B",
+        remote_b.clone(),
+    );
+    let request = WatchRequest::try_new("v1", "Pod", None, None, None, None, None).unwrap();
+    let mut stream = proxy.watch_resources(request.clone()).await.unwrap();
+    assert_eq!(remote_a.watch_resources.load(Ordering::Relaxed), 1);
+
+    publisher.publish(false, Some("remote-B".to_string())).await;
+    assert!(
+        timeout(Duration::from_millis(100), stream.next())
+            .await
+            .expect("A watch terminates promptly")
+            .is_none()
+    );
+
+    let _stream_b = proxy.watch_resources(request).await.unwrap();
+    assert_eq!(remote_a.watch_resources.load(Ordering::Relaxed), 1);
+    assert_eq!(remote_b.watch_resources.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]
@@ -307,7 +471,7 @@ async fn node_effect_lease_dispatch_switches_per_call_without_local_follower_mut
     assert_eq!(local.renew_node_lease.load(Ordering::Relaxed), 0);
     assert_eq!(remote.renew_node_lease.load(Ordering::Relaxed), 1);
 
-    tx.send(true).expect("promote proxy");
+    tx.publish(true, None).await;
     proxy
         .renew_node_lease(request)
         .await
@@ -343,7 +507,7 @@ async fn resource_command_dispatch_tracks_leadership_without_local_fallback() {
     assert_eq!(local.submit_resource_command.load(Ordering::Relaxed), 1);
     assert_eq!(remote.submit_resource_command.load(Ordering::Relaxed), 0);
 
-    tx.send(false).expect("demote");
+    tx.publish(false, Some("remote-A".to_string())).await;
     LeaderResourceCommand::submit_resource_command(&proxy, config_map_create_request())
         .await
         .expect("remote command");
@@ -358,7 +522,7 @@ async fn resource_command_refuses_stale_leadership_generation_before_target_invo
     let (proxy, tx) = make_proxy(local.clone(), remote.clone(), true);
 
     let stale = LeaderResourceCommand::submit_resource_command(&proxy, config_map_create_request());
-    tx.send(false).expect("demote before polling command");
+    tx.publish(false, Some("remote-A".to_string())).await;
 
     let error = stale
         .await
@@ -528,10 +692,10 @@ async fn authority_routed_leader_lists_cleanup_intents_from_remote_when_follower
 }
 
 #[tokio::test]
-async fn authority_routed_leader_reads_cleanup_intents_from_remote_when_local_leader_is_stale() {
+async fn authority_routed_leader_reads_cleanup_intents_locally_when_authoritative() {
     let local = RecordingApiClient::new("local");
     let remote = RecordingApiClient::new("remote");
-    remote.with_cleanup_intent(
+    local.with_cleanup_intent(
         PodCleanupIntent::try_new(
             "mn-controlplane1",
             "kube-system",
@@ -564,13 +728,12 @@ async fn authority_routed_leader_reads_cleanup_intents_from_remote_when_local_le
 
     assert_eq!(intents.len(), 1);
     assert_eq!(intents[0].pod_uid(), "uid-old");
-    assert_eq!(remote.list_pod_cleanup_intents.load(Ordering::Relaxed), 1);
-    assert_eq!(local.list_pod_cleanup_intents.load(Ordering::Relaxed), 0);
+    assert_eq!(remote.list_pod_cleanup_intents.load(Ordering::Relaxed), 0);
+    assert_eq!(local.list_pod_cleanup_intents.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]
-async fn authority_routed_leader_deletes_cleanup_intent_through_remote_when_local_leader_is_stale()
-{
+async fn authority_routed_leader_acknowledges_cleanup_intent_locally_when_authoritative() {
     let local = RecordingApiClient::new("local");
     let remote = RecordingApiClient::new("remote");
     let (proxy, _tx) = make_proxy(local.clone(), remote.clone(), true);
@@ -589,8 +752,8 @@ async fn authority_routed_leader_deletes_cleanup_intent_through_remote_when_loca
         .await
         .expect("delete cleanup intent");
 
-    assert_eq!(remote.delete_pod_cleanup_intents.load(Ordering::Relaxed), 1);
-    assert_eq!(local.delete_pod_cleanup_intents.load(Ordering::Relaxed), 0);
+    assert_eq!(remote.delete_pod_cleanup_intents.load(Ordering::Relaxed), 0);
+    assert_eq!(local.delete_pod_cleanup_intents.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]
@@ -698,7 +861,11 @@ async fn authority_routed_leader_watch_terminates_on_leadership_change() {
             assert_eq!(local.watch_resources.load(Ordering::Relaxed), 0);
         }
 
-        tx.send(!initial_leader).expect("flip leadership");
+        tx.publish(
+            !initial_leader,
+            initial_leader.then(|| "remote-A".to_string()),
+        )
+        .await;
 
         let ended = timeout(Duration::from_millis(100), stream.next())
             .await
@@ -725,7 +892,7 @@ async fn authority_routed_leader_rejects_samples_and_watches_when_demoted_during
         Err(klights_leader_api::ResourceQueryError::Retryable { .. })
     ));
 
-    tx.send(true).expect("promote for watch race");
+    tx.publish(true, None).await;
     local.demote_during_watch(tx);
     assert!(matches!(
         proxy
@@ -788,7 +955,7 @@ async fn authority_routed_leader_flips_dispatch_on_leader_change_event() {
     assert_eq!(remote.apply_outbox.load(Ordering::Relaxed), 0);
 
     // Lose leadership: next write goes remote.
-    tx.send(false).expect("send loss");
+    tx.publish(false, Some("remote-A".to_string())).await;
     proxy
         .deliver_test_outbox(
             "lost",
@@ -804,7 +971,7 @@ async fn authority_routed_leader_flips_dispatch_on_leader_change_event() {
     assert_eq!(remote.apply_outbox.load(Ordering::Relaxed), 1);
 
     // Regain leadership: next write goes local again.
-    tx.send(true).expect("send regain");
+    tx.publish(true, None).await;
     proxy
         .deliver_test_outbox(
             "regain",
@@ -938,8 +1105,8 @@ async fn authority_routed_leader_returns_no_leader_error_during_election_window(
 
     let local = RecordingApiClient::new("local");
     let remote = Arc::new(NoLeaderRemote);
-    let (_tx, rx) = watch::channel(false); // follower
-    let proxy = make_routed_leader(local.clone(), remote.clone(), rx)
+    let (authority, _publisher) = WatchLeaderAuthority::channel(false, Some("remote".to_string()));
+    let proxy = make_routed_leader(local.clone(), remote.clone(), authority)
         .with_outbox_delivery_targets(local.clone(), remote);
 
     // apply_outbox must surface the remote's Retryable, not panic
@@ -1062,6 +1229,7 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
     let db: crate::datastore::DatastoreHandle = Arc::new(concrete_db);
     let (tx, rx) = watch::channel(true); // simulate seed cp1
     let authority = crate::bootstrap::authority::AuthorityHandle::from(rx.clone());
+    let (route_authority, route_publisher) = WatchLeaderAuthority::channel(true, None);
     let local_cache_readiness =
         Arc::new(crate::bootstrap::local_leader_adapters::LocalCacheReadinessAdapter);
     let local_projected_token = Arc::new(
@@ -1126,7 +1294,7 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
         stub_remote.clone(),
         stub_remote.clone(),
         stub_remote.clone(),
-        rx,
+        route_authority,
     )
     .with_outbox_delivery_targets(local_outbox_delivery, stub_remote);
 
@@ -1159,6 +1327,9 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
 
     // Lose leadership: the same instance now routes to remote.
     tx.send(false).expect("demote");
+    route_publisher
+        .publish(false, Some("stub-remote".to_string()))
+        .await;
     let err = proxy
         .deliver_test_outbox(
             "boot-2",
@@ -1268,27 +1439,38 @@ async fn cluster_db_converges_after_multinode_write_through_proxy() {
 
     // Leader member: cluster_api proxy whose local arm IS the
     // shared leader backend. is_leader=true.
-    let (_tx_l, rx_l) = watch::channel(true);
+    let (leader_authority, _leader_publisher) = WatchLeaderAuthority::channel(true, None);
     let leader_unused_remote = RecordingApiClient::new("leader-unused-remote");
-    let authority_routed_leader =
-        make_routed_leader(leader_backend.clone(), leader_unused_remote.clone(), rx_l)
-            .with_outbox_delivery_targets(leader_backend.clone(), leader_unused_remote);
+    let authority_routed_leader = make_routed_leader(
+        leader_backend.clone(),
+        leader_unused_remote.clone(),
+        leader_authority,
+    )
+    .with_outbox_delivery_targets(leader_backend.clone(), leader_unused_remote);
 
     // Follower 1: cluster_api proxy whose REMOTE arm is the
     // shared leader backend (modeling the gRPC forward).
     // is_leader=false.
-    let (_tx_f1, rx_f1) = watch::channel(false);
+    let (follower1_authority, _follower1_publisher) =
+        WatchLeaderAuthority::channel(false, Some("leader".to_string()));
     let follower1_local = RecordingApiClient::new("f1-local-unused");
-    let follower1_proxy =
-        make_routed_leader(follower1_local.clone(), leader_backend.clone(), rx_f1)
-            .with_outbox_delivery_targets(follower1_local, leader_backend.clone());
+    let follower1_proxy = make_routed_leader(
+        follower1_local.clone(),
+        leader_backend.clone(),
+        follower1_authority,
+    )
+    .with_outbox_delivery_targets(follower1_local, leader_backend.clone());
 
     // Follower 2: same shape as follower 1.
-    let (_tx_f2, rx_f2) = watch::channel(false);
+    let (follower2_authority, _follower2_publisher) =
+        WatchLeaderAuthority::channel(false, Some("leader".to_string()));
     let follower2_local = RecordingApiClient::new("f2-local-unused");
-    let follower2_proxy =
-        make_routed_leader(follower2_local.clone(), leader_backend.clone(), rx_f2)
-            .with_outbox_delivery_targets(follower2_local, leader_backend.clone());
+    let follower2_proxy = make_routed_leader(
+        follower2_local.clone(),
+        leader_backend.clone(),
+        follower2_authority,
+    )
+    .with_outbox_delivery_targets(follower2_local, leader_backend.clone());
 
     // Each member issues one write. All three calls must reach
     // the shared leader backend.
@@ -1367,7 +1549,7 @@ async fn promotion_does_not_rewire_cluster_api_or_proposer() {
     assert_eq!(local.apply_outbox.load(Ordering::Relaxed), 0);
 
     // Promotion: pure state flip, no construction.
-    tx.send(true).expect("promote");
+    tx.publish(true, None).await;
 
     // Same proxy instance now dispatches writes to local.
     proxy
@@ -1394,8 +1576,8 @@ async fn promotion_does_not_rewire_cluster_api_or_proposer() {
     assert_eq!(remote_addr_before, remote_addr_after);
 }
 
-/// T7.6: verify that when is_leader_rx flips to false, the
-/// switching proxy routes writes to the remote arm instead of
+/// T7.6: verify that when authority changes from local to the exact
+/// forward endpoint, the switching proxy routes writes to that arm instead of
 /// the local arm. This proves that seed identity is not a
 /// permanent write permission — the proxy respects live
 /// raft leadership state.
@@ -1421,7 +1603,7 @@ async fn seed_loses_leadership_proxies_writes_to_remote() {
     assert_eq!(remote.apply_outbox.load(Ordering::Relaxed), 0);
 
     // Simulate leadership loss
-    tx.send(false).unwrap();
+    tx.publish(false, Some("remote-A".to_string())).await;
 
     // After leadership loss, writes go to remote
     proxy

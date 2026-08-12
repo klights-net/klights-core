@@ -16,6 +16,766 @@ use klights_cluster_store::{
 };
 use serde_json::json;
 
+async fn apply_exact_storage_command(
+    db: &Datastore,
+    command: StorageCommand,
+) -> klights_cluster_store::StorageCommandResult {
+    let commit = db
+        .build_log_apply_commit_for_command(command, "s11-exact-regression", "leader")
+        .await
+        .expect("command must materialize");
+    db.apply_raft_log_apply_commit(commit)
+        .await
+        .expect("committed command must apply")
+}
+
+#[tokio::test]
+async fn ensure_cluster_metadata_command_applies_cluster_id_once() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    apply_exact_storage_command(
+        &db,
+        StorageCommand::EnsureClusterMetadata {
+            cluster_id: "test-uuid-001".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        db.get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("test-uuid-001")
+    );
+    assert_eq!(
+        db.get_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("0")
+    );
+
+    apply_exact_storage_command(
+        &db,
+        StorageCommand::EnsureClusterMetadata {
+            cluster_id: "different-uuid".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        db.get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("test-uuid-001"),
+        "cluster_id must not be overwritten by a second command"
+    );
+}
+
+#[tokio::test]
+async fn leader_outbox_create_log_apply_preserves_generated_uid() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let command = StorageCommand::CreateResource {
+        api_version: "v1".into(),
+        kind: "ConfigMap".into(),
+        namespace: Some("default".into()),
+        name: "from-outbox".into(),
+        data: json!({"metadata":{"name":"from-outbox","namespace":"default"}}),
+    };
+    let payload = crate::test_fixtures::outbox::EncodedOutboxCommand::from_command(command)
+        .encode_protobuf()
+        .unwrap();
+    let outcome = db
+        .build_log_apply_commit_for_outbox(
+            "create-from-outbox-key",
+            "CreateResource",
+            crate::test_fixtures::outbox::test_outbox_command(payload.as_ref()),
+            "worker-1",
+        )
+        .await
+        .expect("leader must build outbox create");
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+        panic!("expected first outbox delivery to need a proposal");
+    };
+    db.apply_raft_log_apply_commit(commit).await.unwrap();
+
+    let stored = db
+        .get_resource("v1", "ConfigMap", Some("default"), "from-outbox")
+        .await
+        .unwrap()
+        .expect("leader resource must exist");
+    assert!(
+        !stored.uid.is_empty(),
+        "leader resource must have a generated UID"
+    );
+    assert_eq!(
+        stored
+            .data
+            .pointer("/metadata/uid")
+            .and_then(|v| v.as_str()),
+        Some(stored.uid.as_str()),
+        "the committed object must preserve the generated UID in JSON"
+    );
+    assert!(
+        db.get_applied_outbox("create-from-outbox-key")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn no_op_applied_outbox_gc_does_not_allocate_local_raft_rv() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let before = db.get_current_resource_version().await.unwrap();
+    let result = apply_exact_storage_command(
+        &db,
+        StorageCommand::GcAppliedOutbox {
+            cutoff_ms: i64::MAX,
+        },
+    )
+    .await;
+
+    assert_eq!(result.applied_rv, Some(before));
+    assert_eq!(db.list_applied_outbox().await.unwrap().len(), 0);
+    assert_eq!(
+        db.get_current_resource_version().await.unwrap(),
+        before,
+        "no-op applied_outbox GC must not allocate a public RV"
+    );
+}
+
+#[tokio::test]
+async fn raft_mode_identical_normal_patch_does_not_advance_rv_or_watch() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "raft-identical-patch",
+            json!({"metadata":{"name":"raft-identical-patch","namespace":"default","uid":"raft-identical-patch-uid","annotations":{"example.test/value":"unchanged"}},"data":{"value":"before"}}),
+        )
+        .await
+        .unwrap();
+    let before_rv = db.get_current_resource_version().await.unwrap();
+    let before_events = db.list_all_watch_events_since(0).await.unwrap().len();
+    let unchanged = apply_exact_storage_command(
+        &db,
+        StorageCommand::PatchResource {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: Some("default".into()),
+            name: "raft-identical-patch".into(),
+            patch_kind: klights_cluster_core::PatchKind::Merge,
+            patch: json!({"metadata":{"annotations":{"example.test/value":"unchanged"}}}),
+            preconditions: ResourcePreconditions::from_resource(&created),
+            strict_resource_version: false,
+        },
+    )
+    .await;
+    assert_eq!(unchanged.applied_rv, Some(before_rv));
+    let stored = db
+        .get_resource("v1", "ConfigMap", Some("default"), "raft-identical-patch")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.resource_version, created.resource_version);
+    assert_eq!(stored.data, created.data);
+    assert_eq!(
+        db.get_current_resource_version().await.unwrap(),
+        before_rv,
+        "identical patch must not consume RV"
+    );
+    assert_eq!(
+        db.list_all_watch_events_since(0).await.unwrap().len(),
+        before_events,
+        "identical patch must not append MODIFIED"
+    );
+
+    apply_exact_storage_command(
+        &db,
+        StorageCommand::PatchResource {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: Some("default".into()),
+            name: "raft-identical-patch".into(),
+            patch_kind: klights_cluster_core::PatchKind::Merge,
+            patch: json!({"data":{"value":"after"}}),
+            preconditions: ResourcePreconditions::from_resource(&stored),
+            strict_resource_version: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        db.get_current_resource_version().await.unwrap(),
+        before_rv + 1
+    );
+    assert_eq!(
+        db.list_all_watch_events_since(0).await.unwrap().len(),
+        before_events + 1,
+        "real patch must append exactly one MODIFIED event"
+    );
+}
+
+async fn run_status_only_rv_advance_main_case(name: &str) -> (i64, i64, serde_json::Value) {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "apps/v1", "Deployment", Some("default"), name,
+            json!({"metadata":{"name":name,"namespace":"default","uid":format!("{name}-uid")},"spec":{"replicas":1},"status":{"availableReplicas":0}}),
+        ).await.unwrap();
+    let status_advanced = db
+        .update_status_only(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            name,
+            json!({"availableReplicas":1}),
+            Some(created.resource_version),
+        )
+        .await
+        .unwrap();
+    let mut proposed = (*created.data).clone();
+    proposed["spec"]["replicas"] = json!(2);
+    let applied = apply_exact_storage_command(
+        &db,
+        StorageCommand::UpdateResource {
+            api_version: "apps/v1".into(),
+            kind: "Deployment".into(),
+            namespace: Some("default".into()),
+            name: name.into(),
+            data: proposed,
+            expected_rv: created.resource_version,
+            preconditions: ResourcePreconditions::from_resource(&created),
+            preserve_status: true,
+        },
+    )
+    .await;
+    let stored = db
+        .get_resource("apps/v1", "Deployment", Some("default"), name)
+        .await
+        .unwrap()
+        .unwrap();
+    (
+        status_advanced.resource_version,
+        applied.applied_rv.unwrap(),
+        (*stored.data).clone(),
+    )
+}
+
+async fn run_status_only_rv_advance_patch_case(name: &str) -> (i64, i64, serde_json::Value) {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "apps/v1", "Deployment", Some("default"), name,
+            json!({"metadata":{"name":name,"namespace":"default","uid":format!("{name}-uid")},"spec":{"replicas":1},"status":{"availableReplicas":0}}),
+        ).await.unwrap();
+    let status_advanced = db
+        .update_status_only(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            name,
+            json!({"availableReplicas":1}),
+            Some(created.resource_version),
+        )
+        .await
+        .unwrap();
+    let applied = apply_exact_storage_command(
+        &db,
+        StorageCommand::PatchResource {
+            api_version: "apps/v1".into(),
+            kind: "Deployment".into(),
+            namespace: Some("default".into()),
+            name: name.into(),
+            patch_kind: klights_cluster_core::PatchKind::Merge,
+            patch: json!({"spec":{"replicas":2}}),
+            preconditions: ResourcePreconditions::from_resource(&created),
+            strict_resource_version: false,
+        },
+    )
+    .await;
+    let stored = db
+        .get_resource("apps/v1", "Deployment", Some("default"), name)
+        .await
+        .unwrap()
+        .unwrap();
+    (
+        status_advanced.resource_version,
+        applied.applied_rv.unwrap(),
+        (*stored.data).clone(),
+    )
+}
+
+#[tokio::test]
+async fn raft_mode_main_update_allows_status_only_rv_advance() {
+    let (status_rv, applied_rv, stored) =
+        run_status_only_rv_advance_main_case("raft-main-status-rv").await;
+    assert!(
+        applied_rv > status_rv,
+        "main update must commit after status-only RV advance"
+    );
+    assert_eq!(stored.pointer("/spec/replicas"), Some(&json!(2)));
+    assert_eq!(
+        stored.pointer("/status/availableReplicas"),
+        Some(&json!(1)),
+        "main update must preserve newer status"
+    );
+}
+
+#[tokio::test]
+async fn raft_mode_patch_allows_status_only_rv_advance() {
+    let (status_rv, applied_rv, stored) =
+        run_status_only_rv_advance_patch_case("raft-patch-status-rv").await;
+    assert!(
+        applied_rv > status_rv,
+        "patch must commit after status-only RV advance"
+    );
+    assert_eq!(stored.pointer("/spec/replicas"), Some(&json!(2)));
+    assert_eq!(
+        stored.pointer("/status/availableReplicas"),
+        Some(&json!(1)),
+        "patch must preserve newer status"
+    );
+}
+
+#[tokio::test]
+async fn replicated_apply_main_update_allows_status_only_rv_advance() {
+    let (status_rv, applied_rv, stored) =
+        run_status_only_rv_advance_main_case("replicated-main-status-rv").await;
+    assert!(
+        applied_rv > status_rv,
+        "replicated main update must accept status-only RV drift"
+    );
+    assert_eq!(stored.pointer("/spec/replicas"), Some(&json!(2)));
+    assert_eq!(
+        stored.pointer("/status/availableReplicas"),
+        Some(&json!(1)),
+        "replicated main update must preserve status"
+    );
+}
+
+#[tokio::test]
+async fn replicated_apply_patch_allows_status_only_rv_advance() {
+    let (status_rv, applied_rv, stored) =
+        run_status_only_rv_advance_patch_case("replicated-patch-status-rv").await;
+    assert!(
+        applied_rv > status_rv,
+        "replicated patch must accept status-only RV drift"
+    );
+    assert_eq!(stored.pointer("/spec/replicas"), Some(&json!(2)));
+    assert_eq!(
+        stored.pointer("/status/availableReplicas"),
+        Some(&json!(1)),
+        "replicated patch must preserve status"
+    );
+}
+
+#[tokio::test]
+async fn replicated_apply_create_rejects_same_name_different_uid_under_strict_v3() {
+    let leader = Datastore::new_in_memory().await.unwrap();
+    let follower = Datastore::new_in_memory().await.unwrap();
+    let existing = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"replacement-create","namespace":"default","uid":"existing-uid","creationTimestamp":"2025-01-01T00:00:00Z"},"data":{"owner":"existing"}});
+    for db in [&leader, &follower] {
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "replacement-create",
+            existing.clone(),
+        )
+        .await
+        .unwrap();
+    }
+    let before_rv = leader.get_current_resource_version().await.unwrap();
+    let before_watch = leader.list_all_watch_events_since(0).await.unwrap().len();
+    let commit = crate::test_fixtures::live_apply::test_live_commit(
+        0,
+        vec![klights_cluster_core::LogApplyMutation::PutResource(
+            klights_cluster_core::LogApplyResourceRow {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: Some("default".into()),
+                name: "replacement-create".into(),
+                uid: "different-uid".into(),
+                resource_version: 0,
+                data: json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"replacement-create","namespace":"default","uid":"different-uid"},"data":{"owner":"different"}}),
+                require_absent: true,
+                require_existing: false,
+                precondition_uid: None,
+                precondition_resource_version: None,
+                status_only: false,
+            },
+        )],
+    );
+    for db in [&leader, &follower] {
+        let result = db
+            .apply_raft_log_apply_commit(commit.clone())
+            .await
+            .unwrap();
+        assert!(
+            result
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("409 Conflict")),
+            "strict v3 create must reject same-name different-UID state"
+        );
+        assert_eq!(
+            db.get_current_resource_version().await.unwrap(),
+            before_rv,
+            "rejection must not allocate RV"
+        );
+        assert_eq!(
+            db.list_all_watch_events_since(0).await.unwrap().len(),
+            before_watch,
+            "rejection must not append watch history"
+        );
+        let stored = db
+            .get_resource("v1", "ConfigMap", Some("default"), "replacement-create")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.uid, "existing-uid");
+        assert_eq!(
+            stored.data.pointer("/data/owner").and_then(|v| v.as_str()),
+            Some("existing")
+        );
+    }
+    assert_eq!(
+        leader
+            .get_resource("v1", "ConfigMap", Some("default"), "replacement-create")
+            .await
+            .unwrap(),
+        follower
+            .get_resource("v1", "ConfigMap", Some("default"), "replacement-create")
+            .await
+            .unwrap(),
+        "replicated members must converge on the existing object after identical rejection"
+    );
+}
+
+#[tokio::test]
+async fn replicated_apply_patch_rejects_same_name_replacement() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let old = db.create_resource(
+        "v1", "ConfigMap", Some("default"), "replacement-patch",
+        json!({"metadata":{"name":"replacement-patch","namespace":"default","uid":"old-patch-uid"},"data":{"owner":"old"}}),
+    ).await.unwrap();
+    db.delete_resource_with_preconditions(
+        "v1",
+        "ConfigMap",
+        Some("default"),
+        "replacement-patch",
+        ResourcePreconditions::from_resource(&old),
+    )
+    .await
+    .unwrap();
+    let replacement = db.create_resource(
+        "v1", "ConfigMap", Some("default"), "replacement-patch",
+        json!({"metadata":{"name":"replacement-patch","namespace":"default","uid":"new-patch-uid"},"data":{"owner":"new"}}),
+    ).await.unwrap();
+    let before_rv = db.get_current_resource_version().await.unwrap();
+    let error = db
+        .build_log_apply_commit_for_command(
+            StorageCommand::PatchResource {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: Some("default".into()),
+                name: "replacement-patch".into(),
+                patch_kind: klights_cluster_core::PatchKind::Merge,
+                patch: json!({"data":{"owner":"stale-patch"}}),
+                preconditions: ResourcePreconditions::from_resource(&old),
+                strict_resource_version: false,
+            },
+            "s11-exact-regression",
+            "leader",
+        )
+        .await
+        .expect_err("old UID patch must conflict with replacement");
+    assert!(
+        error.to_string().contains("409 Conflict"),
+        "expected UID conflict: {error:#}"
+    );
+    let stored = db
+        .get_resource("v1", "ConfigMap", Some("default"), "replacement-patch")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.uid, replacement.uid,
+        "replacement UID must survive stale patch"
+    );
+    assert_eq!(
+        stored.data.pointer("/data/owner").and_then(|v| v.as_str()),
+        Some("new")
+    );
+    assert_eq!(db.get_current_resource_version().await.unwrap(), before_rv);
+}
+
+async fn apply_metadata_rebased_status(
+    api_version: &str,
+    kind: &str,
+    name: &str,
+    uid: &str,
+    initial: serde_json::Value,
+    status: serde_json::Value,
+) -> serde_json::Value {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(api_version, kind, Some("default"), name, initial)
+        .await
+        .unwrap();
+    let committed_status = db
+        .build_log_apply_commit_for_command(
+            StorageCommand::UpdateStatus {
+                api_version: api_version.into(),
+                kind: kind.into(),
+                namespace: Some("default".into()),
+                name: name.into(),
+                status,
+                expected_rv: Some(created.resource_version),
+                preconditions: ResourcePreconditions::from_resource(&created),
+                observed_status_stamp: None,
+            },
+            "s11-exact-regression",
+            "leader",
+        )
+        .await
+        .unwrap();
+    db.patch_resource_latest_with_preconditions(
+        api_version,
+        kind,
+        Some("default"),
+        name,
+        ResourcePatchRequest::new(
+            klights_cluster_core::PatchKind::Merge,
+            json!({"metadata":{"annotations":{"patchedstatus":"true"}}}),
+            ResourcePreconditions::uid(uid),
+        ),
+    )
+    .await
+    .unwrap();
+    let before_rv = db.get_current_resource_version().await.unwrap();
+    let before_watch = db.list_all_watch_events_since(0).await.unwrap().len();
+    let result = db
+        .apply_raft_log_apply_commit(committed_status)
+        .await
+        .unwrap();
+    assert!(
+        result
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("409 Conflict")),
+        "strict v3 stale status must return a terminal conflict"
+    );
+    assert_eq!(
+        db.get_current_resource_version().await.unwrap(),
+        before_rv,
+        "stale status rejection must not allocate RV"
+    );
+    assert_eq!(
+        db.list_all_watch_events_since(0).await.unwrap().len(),
+        before_watch,
+        "stale status rejection must not append watch history"
+    );
+    let stored = db
+        .get_resource(api_version, kind, Some("default"), name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.data.pointer("/metadata/annotations/patchedstatus"),
+        Some(&json!("true")),
+        "status rebase must preserve metadata-only RV changes"
+    );
+    (*stored.data).clone()
+}
+
+#[tokio::test]
+async fn replicated_fresh_service_status_replaces_load_balancer_and_preserves_conditions() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db.create_resource("v1", "Service", Some("default"), "fresh-service", json!({
+        "apiVersion":"v1","kind":"Service","metadata":{"name":"fresh-service","namespace":"default","uid":"fresh-service-uid"},
+        "status":{"loadBalancer":{"ingress":[{"ip":"198.51.100.2"}]},"metadataField":"from-live","conditions":[{"type":"Ready","status":"False"},{"type":"ExternalTrafficPolicy","status":"False"}]}
+    })).await.unwrap();
+    apply_exact_storage_command(&db, StorageCommand::UpdateStatus {
+        api_version:"v1".into(), kind:"Service".into(), namespace:Some("default".into()), name:"fresh-service".into(),
+        status:json!({"loadBalancer":{"ingress":[{"ip":"198.51.100.9"}]},"conditions":[{"type":"ExternalTrafficPolicy","status":"True"}]}),
+        expected_rv:Some(created.resource_version), preconditions:ResourcePreconditions::from_resource(&created), observed_status_stamp:None,
+    }).await;
+    let data = db
+        .get_resource("v1", "Service", Some("default"), "fresh-service")
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    assert_eq!(
+        data.pointer("/status/loadBalancer/ingress/0/ip"),
+        Some(&json!("198.51.100.9")),
+        "fresh Service status must replace loadBalancer"
+    );
+    assert_eq!(
+        data.pointer("/status/metadataField"),
+        Some(&json!("from-live")),
+        "unmentioned status fields must survive"
+    );
+    let conditions = data
+        .pointer("/status/conditions")
+        .and_then(|v| v.as_array())
+        .unwrap();
+    assert!(
+        conditions
+            .iter()
+            .any(|c| c["type"] == "Ready" && c["status"] == "False"),
+        "Ready condition must survive"
+    );
+    assert!(
+        conditions
+            .iter()
+            .any(|c| c["type"] == "ExternalTrafficPolicy" && c["status"] == "True"),
+        "provided condition must replace matching type"
+    );
+}
+
+#[tokio::test]
+async fn replicated_scheduler_bind_overwrites_pod_scheduled_pending_condition() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created=db.create_resource("v1","Pod",Some("default"),"bind-me",json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"bind-me","namespace":"default","uid":"bind-me-uid"},"spec":{"containers":[{"name":"c","image":"busybox"}]},"status":{"phase":"Pending","conditions":[{"type":"PodScheduled","status":"False","reason":"SchedulingPending"},{"type":"Ready","status":"False"}]}})).await.unwrap();
+    let mut bound = (*created.data).clone();
+    bound["spec"]["nodeName"] = json!("worker-a");
+    bound["status"]["conditions"][0] = json!({"type":"PodScheduled","status":"True"});
+    apply_exact_storage_command(
+        &db,
+        StorageCommand::UpdateResource {
+            api_version: "v1".into(),
+            kind: "Pod".into(),
+            namespace: Some("default".into()),
+            name: "bind-me".into(),
+            data: bound,
+            expected_rv: created.resource_version,
+            preconditions: ResourcePreconditions::uid("bind-me-uid"),
+            preserve_status: false,
+        },
+    )
+    .await;
+    let data = db
+        .get_resource("v1", "Pod", Some("default"), "bind-me")
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
+    assert_eq!(data.pointer("/spec/nodeName"), Some(&json!("worker-a")));
+    let scheduled = data
+        .pointer("/status/conditions")
+        .and_then(|v| v.as_array())
+        .unwrap()
+        .iter()
+        .find(|c| c["type"] == "PodScheduled")
+        .unwrap();
+    assert_eq!(
+        scheduled["status"],
+        json!("True"),
+        "scheduler bind must replace pending PodScheduled"
+    );
+    assert!(
+        scheduled.get("reason").is_none(),
+        "SchedulingPending reason must be removed"
+    );
+}
+
+#[tokio::test]
+async fn strict_v3_rejects_stale_cronjob_status_after_metadata_rv_advance() {
+    let data=apply_metadata_rebased_status("batch/v1","CronJob","stale-cronjob","cronjob-uid",json!({"apiVersion":"batch/v1","kind":"CronJob","metadata":{"name":"stale-cronjob","namespace":"default","uid":"cronjob-uid"},"status":{"lastScheduleTime":"2026-07-04T06:21:59Z"}}),json!({"lastScheduleTime":"2026-07-04T06:22:00Z"})).await;
+    assert_eq!(
+        data.pointer("/status/lastScheduleTime"),
+        Some(&json!("2026-07-04T06:21:59Z")),
+        "CronJob status must remain unchanged after strict rejection"
+    );
+}
+
+#[tokio::test]
+async fn strict_v3_rejects_stale_daemonset_status_after_metadata_rv_advance() {
+    let data=apply_metadata_rebased_status("apps/v1","DaemonSet","stale-ds","ds-uid",json!({"apiVersion":"apps/v1","kind":"DaemonSet","metadata":{"name":"stale-ds","namespace":"default","uid":"ds-uid"},"status":{"numberReady":0,"desiredNumberScheduled":2}}),json!({"numberReady":1})).await;
+    assert_eq!(
+        data.pointer("/status/numberReady"),
+        Some(&json!(0)),
+        "DaemonSet status must remain unchanged after strict rejection"
+    );
+    assert_eq!(
+        data.pointer("/status/desiredNumberScheduled"),
+        Some(&json!(2)),
+        "unmentioned DaemonSet fields must survive"
+    );
+}
+
+#[tokio::test]
+async fn strict_v3_rejects_stale_pdb_status_after_metadata_rv_advance() {
+    let data=apply_metadata_rebased_status("policy/v1","PodDisruptionBudget","stale-pdb","pdb-uid",json!({"apiVersion":"policy/v1","kind":"PodDisruptionBudget","metadata":{"name":"stale-pdb","namespace":"default","uid":"pdb-uid"},"status":{"currentHealthy":1,"disruptionsAllowed":0}}),json!({"disruptedPods":{"pod-0":"2026-07-04T17:43:00Z"}})).await;
+    assert!(
+        data.pointer("/status/disruptedPods/pod-0").is_none(),
+        "stale PDB disruptedPods must not apply"
+    );
+    assert_eq!(
+        data.pointer("/status/currentHealthy"),
+        Some(&json!(1)),
+        "unmentioned PDB fields must survive"
+    );
+}
+
+#[tokio::test]
+async fn strict_v3_rejects_stale_replicaset_status_after_metadata_rv_advance() {
+    let data=apply_metadata_rebased_status("apps/v1","ReplicaSet","stale-rs","rs-uid",json!({"apiVersion":"apps/v1","kind":"ReplicaSet","metadata":{"name":"stale-rs","namespace":"default","uid":"rs-uid"},"status":{"replicas":0,"conditions":[{"type":"Available","status":"True"}]}}),json!({"conditions":[{"type":"Progressing","status":"True"}]})).await;
+    assert_eq!(
+        data.pointer("/status/conditions/0/type"),
+        Some(&json!("Available")),
+        "ReplicaSet conditions must remain unchanged after strict rejection"
+    );
+    assert_eq!(
+        data.pointer("/status/replicas"),
+        Some(&json!(0)),
+        "unmentioned ReplicaSet fields must survive"
+    );
+}
+
+#[tokio::test]
+async fn strict_v3_rejects_stale_service_status_after_metadata_rv_advance() {
+    let data=apply_metadata_rebased_status("v1","Service","stale-service","service-uid",json!({"apiVersion":"v1","kind":"Service","metadata":{"name":"stale-service","namespace":"default","uid":"service-uid"},"status":{"loadBalancer":{"ingress":[{"ip":"198.51.100.1"}]},"metadataField":"from-live","conditions":[{"type":"Ready","status":"False"},{"type":"ExternalTrafficPolicy","status":"True"}]}}),json!({"conditions":[{"type":"ExternalTrafficPolicy","status":"False"}]})).await;
+    assert_eq!(
+        data.pointer("/status/loadBalancer/ingress/0/ip"),
+        Some(&json!("198.51.100.1")),
+        "live loadBalancer must survive stale status"
+    );
+    let conditions = data
+        .pointer("/status/conditions")
+        .and_then(|v| v.as_array())
+        .unwrap();
+    assert!(
+        conditions.iter().any(|c| c["type"] == "Ready"),
+        "live Ready condition must survive"
+    );
+    assert!(
+        conditions
+            .iter()
+            .any(|c| c["type"] == "ExternalTrafficPolicy" && c["status"] == "True"),
+        "Service conditions must remain unchanged after strict rejection"
+    );
+}
+
+#[tokio::test]
+async fn strict_v3_rejects_stale_statefulset_status_after_metadata_rv_advance() {
+    let data=apply_metadata_rebased_status("apps/v1","StatefulSet","stale-sts","sts-uid",json!({"apiVersion":"apps/v1","kind":"StatefulSet","metadata":{"name":"stale-sts","namespace":"default","uid":"sts-uid"},"status":{"replicas":0,"conditions":[{"type":"Available","status":"True"}]}}),json!({"replicas":1})).await;
+    assert_eq!(
+        data.pointer("/status/replicas"),
+        Some(&json!(0)),
+        "StatefulSet replica status must remain unchanged after strict rejection"
+    );
+    assert_eq!(
+        data.pointer("/status/conditions/0/type"),
+        Some(&json!("Available")),
+        "StatefulSet conditions must survive"
+    );
+}
+
 fn apply_commit_in_tx_for_raft(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
@@ -3811,6 +4571,17 @@ async fn raft_apply_same_idempotency_key_returns_same_rv_without_reapply() {
 #[tokio::test]
 async fn build_log_apply_commit_from_gc_applied_outbox_command_maps_to_outbox_ledger_mutation() {
     let db = Datastore::new_in_memory().await.unwrap();
+    db.insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
+        idempotency_key: "gc-mapping-key".to_string(),
+        subject_key: "v1/Service/default/demo/service-uid".to_string(),
+        operation: "PodStatus".to_string(),
+        first_seen_ms: 1,
+        applied_rv: Some(1),
+        result_proto: vec![1],
+        status_stamp: None,
+    })
+    .await
+    .unwrap();
     let command = StorageCommand::GcAppliedOutbox { cutoff_ms: 42_000 };
 
     let commit = db
@@ -3927,6 +4698,369 @@ async fn raft_outbox_build_rejects_incomplete_durable_ledger_row() {
         .expect("incomplete durable row remains for operator recovery");
     assert!(row.applied_rv.is_none());
     assert!(row.result_proto.is_empty());
+}
+
+fn pod_status_outbox_command(name: &str, uid: &str, phase: &str) -> StorageCommand {
+    StorageCommand::UpdateStatus {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some("default".to_string()),
+        name: name.to_string(),
+        status: json!({"phase": phase}),
+        expected_rv: None,
+        preconditions: ResourcePreconditions {
+            uid: Some(uid.to_string()),
+            resource_version: None,
+        },
+        observed_status_stamp: None,
+    }
+}
+
+async fn create_outbox_test_pod(db: &Datastore, name: &str, uid: &str) {
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        name,
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"namespace": "default", "name": name, "uid": uid},
+            "spec": {
+                "nodeName": "worker-a",
+                "containers": [{"name": "app", "image": "nginx"}]
+            },
+            "status": {"phase": "Pending"}
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn outbox_mutation_failure_rolls_back_ledger_and_same_key_retry_succeeds() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let command = pod_status_outbox_command("rollback-pod", "rollback-uid", "Running");
+
+    let error = db
+        .apply_outbox_transactionally(
+            "mutation-rollback-key",
+            klights_cluster_core::OutboxOperation::PodStatus.as_str(),
+            command.clone(),
+            "worker-a",
+        )
+        .await
+        .expect_err("missing Pod mutation must fail atomically");
+    assert!(matches!(
+        error,
+        klights_cluster_core::OutboxApplyError::Retryable(_)
+    ));
+    assert!(
+        db.get_applied_outbox("mutation-rollback-key")
+            .await
+            .unwrap()
+            .is_none(),
+        "failed resource mutation must not consume the idempotency key"
+    );
+
+    create_outbox_test_pod(&db, "rollback-pod", "rollback-uid").await;
+    let result = db
+        .apply_outbox_transactionally(
+            "mutation-rollback-key",
+            klights_cluster_core::OutboxOperation::PodStatus.as_str(),
+            command,
+            "worker-a",
+        )
+        .await
+        .expect("same idempotency key retries after rollback");
+    assert!(matches!(
+        result,
+        klights_cluster_core::OutboxApplyOutcome::Applied { .. }
+    ));
+}
+
+#[tokio::test]
+async fn applied_outbox_insert_failure_rolls_back_resource_rv_watch_and_retries() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    create_outbox_test_pod(&db, "ledger-fault-pod", "ledger-fault-uid").await;
+    let before = db
+        .get_resource("v1", "Pod", Some("default"), "ledger-fault-pod")
+        .await
+        .unwrap()
+        .unwrap();
+    let rv_before = db.get_current_resource_version().await.unwrap();
+    let watch_before = db.current_watch_replay_position().await.unwrap();
+    db.db_call("test_install_applied_outbox_insert_fault", |conn| {
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_applied_outbox_insert \
+             BEFORE INSERT ON applied_outbox BEGIN \
+             SELECT RAISE(ABORT, 'test applied_outbox insert fault'); END;",
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let command = pod_status_outbox_command("ledger-fault-pod", "ledger-fault-uid", "Running");
+
+    let error = db
+        .apply_outbox_transactionally(
+            "ledger-fault-key",
+            klights_cluster_core::OutboxOperation::PodStatus.as_str(),
+            command.clone(),
+            "worker-a",
+        )
+        .await
+        .expect_err("ledger fault aborts the whole committed apply transaction");
+    assert!(matches!(
+        error,
+        klights_cluster_core::OutboxApplyError::Retryable(_)
+    ));
+    let after_fault = db
+        .get_resource("v1", "Pod", Some("default"), "ledger-fault-pod")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_fault, before, "resource bytes and RV must roll back");
+    assert_eq!(db.get_current_resource_version().await.unwrap(), rv_before);
+    assert_eq!(
+        db.current_watch_replay_position().await.unwrap(),
+        watch_before
+    );
+    assert!(
+        db.get_applied_outbox("ledger-fault-key")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    db.db_call("test_remove_applied_outbox_insert_fault", |conn| {
+        conn.execute_batch("DROP TRIGGER fail_applied_outbox_insert;")?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let result = db
+        .apply_outbox_transactionally(
+            "ledger-fault-key",
+            klights_cluster_core::OutboxOperation::PodStatus.as_str(),
+            command,
+            "worker-a",
+        )
+        .await
+        .expect("same key succeeds after deterministic ledger fault is removed");
+    assert!(matches!(
+        result,
+        klights_cluster_core::OutboxApplyOutcome::Applied { .. }
+    ));
+    let retried = db
+        .get_resource("v1", "Pod", Some("default"), "ledger-fault-pod")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retried
+            .data
+            .pointer("/status/phase")
+            .and_then(|v| v.as_str()),
+        Some("Running")
+    );
+    assert!(
+        db.get_applied_outbox("ledger-fault-key")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn applied_outbox_gc_then_replay_is_a_fresh_idempotent_delivery() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    create_outbox_test_pod(&db, "gc-replay-pod", "gc-replay-uid").await;
+    let command = pod_status_outbox_command("gc-replay-pod", "gc-replay-uid", "Running");
+    db.apply_outbox_transactionally(
+        "gc-replay-key",
+        klights_cluster_core::OutboxOperation::PodStatus.as_str(),
+        command.clone(),
+        "worker-a",
+    )
+    .await
+    .expect("first status delivery");
+    assert!(
+        db.get_applied_outbox("gc-replay-key")
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let gc = db
+        .build_log_apply_commit_for_command(
+            StorageCommand::GcAppliedOutbox {
+                cutoff_ms: i64::MAX,
+            },
+            "GcAppliedOutbox",
+            "leader",
+        )
+        .await
+        .unwrap();
+    db.apply_raft_log_apply_commit(gc).await.unwrap();
+    assert!(
+        db.get_applied_outbox("gc-replay-key")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let replay = db
+        .apply_outbox_transactionally(
+            "gc-replay-key",
+            klights_cluster_core::OutboxOperation::PodStatus.as_str(),
+            command,
+            "worker-a",
+        )
+        .await
+        .expect("replay after committed GC is a fresh delivery");
+    assert!(matches!(
+        replay,
+        klights_cluster_core::OutboxApplyOutcome::Applied { .. }
+    ));
+    assert!(
+        db.get_applied_outbox("gc-replay-key")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let pod = db
+        .get_resource("v1", "Pod", Some("default"), "gc-replay-pod")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pod.data.pointer("/status/phase").and_then(|v| v.as_str()),
+        Some("Running")
+    );
+}
+
+#[tokio::test]
+async fn lease_renew_is_exact_cluster_db_and_ledger_noop() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "coordination.k8s.io/v1",
+            "Lease",
+            Some("kube-node-lease"),
+            "worker-a",
+            json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": {
+                    "name": "worker-a", "namespace": "kube-node-lease", "uid": "lease-uid"
+                },
+                "spec": {"holderIdentity": "worker-a", "renewTime": "2026-08-11T00:00:00Z"}
+            }),
+        )
+        .await
+        .unwrap();
+    let mut stale = (*created.data).clone();
+    stale["spec"]["renewTime"] = json!("2026-08-11T00:01:00Z");
+    let command = StorageCommand::UpdateResource {
+        api_version: "coordination.k8s.io/v1".to_string(),
+        kind: "Lease".to_string(),
+        namespace: Some("kube-node-lease".to_string()),
+        name: "worker-a".to_string(),
+        data: stale,
+        expected_rv: created.resource_version,
+        preconditions: ResourcePreconditions::from_resource(&created),
+        preserve_status: false,
+    };
+    let rv_before = db.get_current_resource_version().await.unwrap();
+    let watch_before = db.current_watch_replay_position().await.unwrap();
+    let ledger_before = db.list_applied_outbox().await.unwrap();
+
+    let result = db
+        .apply_outbox_transactionally(
+            "lease-renew-noop-key",
+            klights_cluster_core::OutboxOperation::LeaseRenew.as_str(),
+            command,
+            "worker-a",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        klights_cluster_core::OutboxApplyOutcome::Applied { applied_rv: 0 }
+    );
+    let stored = db
+        .get_resource(
+            "coordination.k8s.io/v1",
+            "Lease",
+            Some("kube-node-lease"),
+            "worker-a",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored, created,
+        "LeaseRenew must not change cluster.db bytes or RV"
+    );
+    assert_eq!(db.get_current_resource_version().await.unwrap(), rv_before);
+    assert_eq!(
+        db.current_watch_replay_position().await.unwrap(),
+        watch_before
+    );
+    assert_eq!(db.list_applied_outbox().await.unwrap(), ledger_before);
+}
+
+#[tokio::test]
+async fn aged_incomplete_applied_outbox_row_remains_retryable_and_unchanged() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    create_outbox_test_pod(&db, "aged-incomplete-pod", "aged-incomplete-uid").await;
+    let row = klights_cluster_core::LogApplyAppliedOutboxRow {
+        idempotency_key: "aged-incomplete-key".to_string(),
+        subject_key: "v1/Pod/default/aged-incomplete-pod/aged-incomplete-uid".to_string(),
+        operation: "PodStatus".to_string(),
+        first_seen_ms: 1,
+        applied_rv: None,
+        result_proto: vec![0xAA, 0x55],
+        status_stamp: Some(7),
+    };
+    db.insert_applied_outbox(row.clone()).await.unwrap();
+    let pod_before = db
+        .get_resource("v1", "Pod", Some("default"), "aged-incomplete-pod")
+        .await
+        .unwrap()
+        .unwrap();
+    let rv_before = db.get_current_resource_version().await.unwrap();
+    let watch_before = db.current_watch_replay_position().await.unwrap();
+
+    let result = db
+        .build_log_apply_commit_for_outbox(
+            "aged-incomplete-key",
+            klights_cluster_core::OutboxOperation::PodStatus.as_str(),
+            pod_status_outbox_command("aged-incomplete-pod", "aged-incomplete-uid", "Running"),
+            "worker-a",
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(klights_cluster_core::OutboxApplyError::Retryable(_))
+    ));
+    assert_eq!(
+        db.get_applied_outbox("aged-incomplete-key").await.unwrap(),
+        Some(row)
+    );
+    assert_eq!(
+        db.get_resource("v1", "Pod", Some("default"), "aged-incomplete-pod")
+            .await
+            .unwrap()
+            .unwrap(),
+        pod_before
+    );
+    assert_eq!(db.get_current_resource_version().await.unwrap(), rv_before);
+    assert_eq!(
+        db.current_watch_replay_position().await.unwrap(),
+        watch_before
+    );
 }
 
 #[tokio::test]

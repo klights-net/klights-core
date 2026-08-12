@@ -23,6 +23,7 @@ struct AuthorityState {
     endpoint: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct AuthorityPublisher {
     sender: tokio::sync::watch::Sender<AuthorityState>,
     transition_gate: Arc<tokio::sync::RwLock<()>>,
@@ -174,6 +175,21 @@ impl LeaderAuthority for WatchLeaderAuthority {
                     !state.local || self.issuer.validate(&permit, state.generation).is_err()
                 };
                 if revoked || receiver.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    fn wait_for_route_change<'a>(
+        &'a self,
+        route: &'a AuthorityRoute,
+    ) -> AuthorityRevocationFuture<'a> {
+        let mut receiver = self.receiver.clone();
+        let route = route.clone();
+        Box::pin(async move {
+            loop {
+                if receiver.changed().await.is_err() || self.route() != route {
                     return;
                 }
             }

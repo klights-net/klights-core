@@ -13,10 +13,10 @@ use klights_leader_api::JoinRole;
 use klights_leader_api::OutboxDeliveryError as OutboxApplyError;
 use klights_leader_api::{
     CacheReadinessError, CacheReadinessRequest, LeaderCacheReadiness, LeaderNetworkTopologyQuery,
-    LeaderNodeSubnetAllocation, LeaderResourceCommand, LeaderResourceQuery, LeaderWatch,
-    NodeDataplaneQuery, NodeSubnetAllocationError, NodeSubnetAllocationRequest, NodeSubnetQuery,
-    PeerSubnetsQuery, ResourceEvent, ResourceGetRequest, ResourceListRequest,
-    ResourceQueryConsistency, WatchEventType, WatchRequest, pod_get_request,
+    LeaderNodeSubnetAllocation, LeaderResourceQuery, LeaderWatch, NodeDataplaneQuery,
+    NodeSubnetAllocationError, NodeSubnetAllocationRequest, NodeSubnetQuery, PeerSubnetsQuery,
+    ResourceEvent, ResourceGetRequest, ResourceListRequest, ResourceQueryConsistency,
+    WatchEventType, WatchRequest, pod_get_request,
 };
 use klights_leader_api::{LeaderOutboxDelivery, OutboxDeliveryRequest};
 use klights_leader_rpc::client::RemoteApiClient;
@@ -94,12 +94,6 @@ fn dataplane() -> JoinDataplaneMetadata {
         mode: klights_leader_api::NetworkNodeMode::Root,
         encryption: klights_leader_api::DataplaneEncryption::Direct,
     }
-}
-
-#[test]
-fn remote_api_client_exposes_resource_command_capability() {
-    fn assert_capability<T: LeaderResourceCommand>() {}
-    assert_capability::<RemoteApiClient>();
 }
 
 /// Self-signed `system:node:<name>` certificate (DER) for simulating the

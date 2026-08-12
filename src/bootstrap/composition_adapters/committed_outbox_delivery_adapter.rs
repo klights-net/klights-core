@@ -233,9 +233,7 @@ pub(crate) fn test_resource_command(
         klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
             proposal,
             resource_query,
-            authority
-                .legacy_watch_for_test()
-                .expect("test authority retains its source watch"),
+            authority.authority_arc(),
         ),
     )
 }
@@ -261,9 +259,7 @@ pub(crate) fn test_outbox_delivery(
         klights_replication::leader_api::EmbeddedOutboxDelivery::new(
             proposal,
             resource_query,
-            authority
-                .legacy_watch_for_test()
-                .expect("test authority retains its source watch"),
+            authority.authority_arc(),
         ),
     );
     Arc::new(RootCommittedOutboxDelivery::new(

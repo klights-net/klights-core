@@ -151,6 +151,9 @@ impl EmbeddedRaftProposal {
         &self,
         command: StorageCommand,
     ) -> Result<StorageCommandResult> {
+        klights_leader_api::validate_authority_if_scoped().map_err(|error| {
+            anyhow::anyhow!("leader authority changed before proposal: {error}")
+        })?;
         self.command_codec_v3_activation
             .ensure_command_codec_v3_activated()?;
         self.ensure_local_leader_for_commit_materialization()?;
@@ -163,6 +166,9 @@ impl EmbeddedRaftProposal {
             .map_err(map_commit_materialization_error)?;
         let entry_bytes = log_apply_wire::encode_commit_protobuf(&commit)
             .context("encode LogApplyCommit for raft propose")?;
+        klights_leader_api::validate_authority_if_scoped().map_err(|error| {
+            anyhow::anyhow!("leader authority changed before raft commit: {error}")
+        })?;
         self.propose_materialized_commit(StorageCommandPayload::from_bytes(entry_bytes))
             .await
     }
@@ -240,6 +246,8 @@ impl RaftProposal for EmbeddedRaftProposal {
         authoring_node: &str,
         watermark: Option<OutboxStreamWatermark>,
     ) -> std::result::Result<RaftProposalEffect, OutboxApplyError> {
+        klights_leader_api::validate_authority_if_scoped()
+            .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?;
         self.command_codec_v3_activation
             .ensure_command_codec_v3_activated()
             .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?;
@@ -303,6 +311,8 @@ impl RaftProposal for EmbeddedRaftProposal {
                 .with_committed_resource(committed_resource));
             }
         };
+        klights_leader_api::validate_authority_if_scoped()
+            .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?;
         let entry_bytes = log_apply_wire::encode_commit_protobuf(&commit).map_err(|error| {
             OutboxApplyError::Retryable(format!(
                 "encode LogApplyCommit for raft outbox propose: {error}"

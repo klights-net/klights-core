@@ -57,7 +57,7 @@ impl PostWriteMaintenanceObserverHandle {
     fn launch(&self) -> Option<u64> {
         #[cfg(any(test, feature = "test-support"))]
         {
-            return self.observer.as_ref().map(|observer| observer.launch());
+            self.observer.as_ref().map(|observer| observer.launch())
         }
         #[cfg(not(any(test, feature = "test-support")))]
         None

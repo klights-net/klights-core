@@ -161,6 +161,7 @@ struct RemoteForwarderParts {
     node_lease_renewals: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
     remote_api_client: Option<Arc<klights_leader_rpc::client::RemoteApiClient>>,
     lease_client: Option<Arc<klights_leader_rpc::client::ReplicationGrpcClient>>,
+    forward_endpoints: Vec<String>,
 }
 
 fn passive_store_open_request(config: &KlightsConfig) -> PassiveStoreOpenRequest<'_> {
@@ -187,7 +188,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         supervisor,
         grpc_transport_policy,
         shutdown_token,
-        is_leader_rx,
+        is_leader_rx: _is_leader_rx,
         leader_authority,
         authority_publisher,
         local_dataplane,
@@ -510,7 +511,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                     embedded_proposal.clone(),
                     local_resource_query.clone(),
-                    is_leader_rx.clone(),
+                    leader_authority.clone(),
                 ),
             );
             let local_node_lifecycle_status = Arc::new(
@@ -524,7 +525,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 klights_replication::leader_api::EmbeddedOutboxDelivery::new(
                     embedded_proposal,
                     local_resource_query.clone(),
-                    is_leader_rx.clone(),
+                    leader_authority.clone(),
                 ),
             );
             let local_outbox_delivery = Arc::new(
@@ -536,7 +537,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     config.node_name.clone(),
                 ),
             );
-            let leader_proxy = Arc::new(
+            let mut leader_proxy_builder =
                 crate::bootstrap::authority_routed_leader::AuthorityRoutedLeader::new(
                     local_resource_query.clone(),
                     Arc::new(positioned_watch.clone()),
@@ -565,8 +566,23 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 .with_node_lease_renewal_targets(
                     local_node_lease_renewal.clone(),
                     remote_parts.node_lease_renewals.clone(),
-                ),
-            );
+                );
+            for endpoint in &remote_parts.forward_endpoints {
+                leader_proxy_builder = leader_proxy_builder.with_forward_endpoint(
+                    endpoint.clone(),
+                    remote_parts.leader_resource_query.clone(),
+                    remote_parts.leader_watch.clone(),
+                    remote_parts.leader_cache_readiness.clone(),
+                    remote_parts.leader_projected_tokens.clone(),
+                    remote_parts.leader_pod_cleanup_intents.clone(),
+                    remote_parts.leader_node_subnet_allocation.clone(),
+                    remote_parts.leader_network_topology.clone(),
+                    remote_parts.resource_commands.clone(),
+                    remote_parts.outbox_deliveries.clone(),
+                    remote_parts.node_lease_renewals.clone(),
+                );
+            }
+            let leader_proxy = Arc::new(leader_proxy_builder);
             let seed_bootstrap_store =
                 crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
                     db_handle.clone(),
@@ -1213,6 +1229,7 @@ fn build_remote_forwarder(
                 node_lease_renewals: stub,
                 remote_api_client: None,
                 lease_client: None,
+                forward_endpoints: Vec::new(),
             };
         }
     };
@@ -1248,7 +1265,7 @@ fn build_remote_forwarder(
         supervisor.clone(),
         grpc_transport_policy,
     ));
-    grpc.set_all_leader_endpoints(endpoints);
+    grpc.set_all_leader_endpoints(endpoints.clone());
     let remote = Arc::new(RemoteApiClient::from_grpc(
         grpc.clone(),
         supervisor,
@@ -1270,6 +1287,7 @@ fn build_remote_forwarder(
         node_lease_renewals: remote.clone(),
         remote_api_client: Some(remote),
         lease_client: Some(grpc),
+        forward_endpoints: endpoints,
     }
 }
 

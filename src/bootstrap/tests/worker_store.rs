@@ -7,7 +7,6 @@ use klights_kubelet::pod_lifecycle_router::{
     PodLifecycleRouteMode, PodLifecycleRouter,
 };
 use klights_kubelet::worker_store::reflector::ReflectorState;
-use klights_kubelet::worker_store::watch::is_watch_window_expired;
 use klights_kubelet::worker_store::{
     WorkerListPage, WorkerStoreAdapter, WorkerStorePorts, WorkerWatchBus,
 };
@@ -421,31 +420,6 @@ async fn failed_snapshot_pod_route_retries_without_committing_reflector_or_membe
         2,
         "the failed initial-list event must be routed again on snapshot retry"
     );
-}
-
-#[test]
-fn is_watch_window_expired_requires_typed_replay_expiry() {
-    let expired = LeaderWatchError::ReplayExpired {
-        accepted_resource_version: 41,
-    };
-    assert!(
-        is_watch_window_expired(&expired),
-        "typed replay expiry must trigger a relist"
-    );
-
-    for (error, name) in [
-        (
-            LeaderWatchError::transport("expired but unmarked"),
-            "transport",
-        ),
-        (LeaderWatchError::Timeout, "timeout"),
-        (LeaderWatchError::Cancelled, "cancelled"),
-    ] {
-        assert!(
-            !is_watch_window_expired(&error),
-            "{name} must not trigger a relist"
-        );
-    }
 }
 
 #[derive(Default)]

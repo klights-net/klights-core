@@ -1871,6 +1871,21 @@ impl Datastore {
                 )],
             ),
             StorageCommand::GcAppliedOutbox { cutoff_ms } => {
+                let exists = tx
+                    .query_row(
+                        "SELECT 1 FROM applied_outbox WHERE first_seen_ms < ?1 LIMIT 1",
+                        rusqlite::params![cutoff_ms],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !exists {
+                    let current_public_rv = Self::current_resource_version_in_tx(tx)?;
+                    return Ok((
+                        Self::author_live_commit(current_public_rv, Vec::new())?,
+                        current_public_rv,
+                    ));
+                }
                 Self::author_live_commit_from_cluster_mutations(
                     rv,
                     vec![ClusterMutation::OutboxLedger(
@@ -3253,9 +3268,12 @@ impl Datastore {
         if let Some(pod_cidr) = pod_cidr.as_deref() {
             changed |= klights_cluster_core::set_node_pod_cidr(&mut node, pod_cidr);
         }
-        // Dataplane registration owns routing metadata only. Node addresses
-        // are status and must be published through the focused lifecycle
-        // status capability after this metadata CAS commits.
+        // Preserve the established Kubernetes-visible Node address behavior
+        // atomically with the routing metadata. A future split-status design
+        // requires its own durable retry/order contract and cannot be hidden
+        // inside the ownership move.
+        changed |=
+            klights_cluster_core::set_node_external_ip(&mut node, &metadata.endpoint.to_string());
         changed |= klights_types::set_node_dataplane_annotations(
             &mut node,
             &metadata.endpoint.to_string(),

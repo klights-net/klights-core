@@ -32,7 +32,7 @@ impl IntegrationRaftComposition {
     ) -> Arc<dyn klights_leader_api::LeaderResourceCommand> {
         let db: IntegrationDatastoreHandle = self.db.clone();
         let authority =
-            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
         let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
             db, authority.clone(),
         );
@@ -98,7 +98,7 @@ impl IntegrationRaftComposition {
     ) -> Arc<dyn klights_leader_api::ControlplaneJoinHandler> {
         let db: IntegrationDatastoreHandle = self.db.clone();
         let authority =
-            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
         let query =
             crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
                 db.clone(), authority.clone(),
@@ -129,7 +129,7 @@ impl IntegrationRaftComposition {
     ) -> Arc<dyn klights_leader_api::ControlplaneJoinHandler> {
         let db: IntegrationDatastoreHandle = self.db.clone();
         let authority =
-            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
         let query =
             crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
                 db.clone(), authority.clone(),
@@ -161,7 +161,7 @@ impl IntegrationRaftComposition {
     ) -> anyhow::Result<klights_cluster_core::Resource> {
         let db: IntegrationDatastoreHandle = self.db.clone();
         let authority =
-            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
         let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
             db.clone(), authority.clone(),
         );
@@ -189,7 +189,7 @@ impl IntegrationRaftComposition {
     ) -> klights_reconcile_api::ControllerStoreResult<()> {
         let db: IntegrationDatastoreHandle = self.db.clone();
         let authority =
-            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
         let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
             db.clone(), authority.clone(),
         );

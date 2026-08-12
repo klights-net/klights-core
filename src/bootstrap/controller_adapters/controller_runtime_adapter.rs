@@ -35,7 +35,7 @@ impl RootControllerLeaderPort {
         store: DatastoreHandle,
     ) -> Arc<dyn klights_leader_api::LeaderResourceCommand> {
         let authority =
-            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
         let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
             store.clone(),
             authority.clone(),

@@ -995,3 +995,9 @@ mod cases {
         }
     }
 }
+
+#[test]
+fn remote_api_client_exposes_resource_command_capability() {
+    fn assert_capability<T: klights_leader_api::LeaderResourceCommand>() {}
+    assert_capability::<crate::client::RemoteApiClient>();
+}

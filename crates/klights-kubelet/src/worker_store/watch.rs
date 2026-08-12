@@ -585,6 +585,27 @@ pub fn is_watch_window_expired(err: &LeaderWatchError) -> bool {
     matches!(err, LeaderWatchError::ReplayExpired { .. })
 }
 
+#[cfg(test)]
+mod replay_expiry_tests {
+    use super::*;
+
+    #[test]
+    fn is_watch_window_expired_requires_typed_replay_expiry() {
+        let expired = LeaderWatchError::ReplayExpired {
+            accepted_resource_version: 41,
+        };
+        assert!(is_watch_window_expired(&expired));
+
+        for error in [
+            LeaderWatchError::transport("expired but unmarked"),
+            LeaderWatchError::Timeout,
+            LeaderWatchError::Cancelled,
+        ] {
+            assert!(!is_watch_window_expired(&error));
+        }
+    }
+}
+
 fn watch_event_topic(event: &WatchEvent) -> Option<WatchTopic> {
     Some(WatchTopic::new(
         event.object.get("apiVersion")?.as_str()?,

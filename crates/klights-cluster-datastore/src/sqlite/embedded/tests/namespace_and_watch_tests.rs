@@ -2,6 +2,22 @@
 
 use super::*;
 use serde_json::json;
+
+#[tokio::test]
+async fn no_op_watch_events_gc_does_not_allocate_local_raft_rv() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let before = db.get_current_resource_version().await.unwrap();
+
+    let removed = db.gc_watch_events(100_000, 5_000).await.unwrap();
+
+    assert_eq!(removed, 0, "empty watch history should make GC a no-op");
+    assert_eq!(
+        db.get_current_resource_version().await.unwrap(),
+        before,
+        "no-op watch-events GC must not allocate a public RV"
+    );
+}
+
 #[tokio::test]
 async fn test_create_resource_injects_creation_timestamp() {
     let db = Datastore::new_in_memory().await.unwrap();

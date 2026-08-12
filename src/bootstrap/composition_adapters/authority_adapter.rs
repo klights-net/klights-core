@@ -1,4 +1,8 @@
-#[cfg(test)]
+#[cfg(any(
+    test,
+    feature = "pod-repository-test-support",
+    feature = "native-api-test-support"
+))]
 use std::sync::Arc;
 
 use klights_leader_api::NodeRoleProjection;
@@ -10,6 +14,16 @@ pub(crate) fn always_leader_watch() -> tokio::sync::watch::Receiver<bool> {
     // authority-backed adapters never observe a synthetic source shutdown.
     Box::leak(Box::new(tx));
     rx
+}
+
+#[cfg(any(
+    test,
+    feature = "pod-repository-test-support",
+    feature = "native-api-test-support"
+))]
+pub(crate) fn always_leader_authority() -> Arc<dyn klights_leader_api::LeaderAuthority> {
+    let authority = crate::bootstrap::authority::AuthorityHandle::from(always_leader_watch());
+    authority.authority_arc()
 }
 
 #[cfg(test)]

@@ -19,20 +19,30 @@ use crate::proposal::RaftProposal;
 pub struct EmbeddedLeaderResourceCommand {
     proposal: Arc<dyn RaftProposal>,
     resource_query: Arc<dyn LeaderResourceQuery>,
-    is_leader_rx: tokio::sync::watch::Receiver<bool>,
+    authority: Arc<dyn klights_leader_api::LeaderAuthority>,
 }
 
 impl EmbeddedLeaderResourceCommand {
     pub fn new(
         proposal: Arc<dyn RaftProposal>,
         resource_query: Arc<dyn LeaderResourceQuery>,
-        is_leader_rx: tokio::sync::watch::Receiver<bool>,
+        authority: Arc<dyn klights_leader_api::LeaderAuthority>,
     ) -> Self {
         Self {
             proposal,
             resource_query,
-            is_leader_rx,
+            authority,
         }
+    }
+
+    fn local_permit(&self) -> Result<klights_leader_api::AuthorityPermit, ResourceCommandError> {
+        let klights_leader_api::AuthorityRoute::Local(permit) = self.authority.route() else {
+            return Err(ResourceCommandError::NotLeader);
+        };
+        self.authority
+            .validate(&permit)
+            .map_err(|_| ResourceCommandError::NotLeader)?;
+        Ok(permit)
     }
 
     /// Preserve the narrow Pod hard-delete boundary while legacy datastore
@@ -43,10 +53,7 @@ impl EmbeddedLeaderResourceCommand {
         &self,
         command: StorageCommand,
     ) -> Result<i64, ResourceCommandError> {
-        if !*self.is_leader_rx.borrow() {
-            return Err(ResourceCommandError::NotLeader);
-        }
-        klights_leader_api::validate_authority_if_scoped()
+        klights_leader_api::validate_scoped_authority()
             .map_err(|_| ResourceCommandError::NotLeader)?;
         klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
             ResourceCommandError::retryable(format!(
@@ -120,6 +127,8 @@ impl EmbeddedLeaderResourceCommand {
                 preconditions,
             },
         };
+        klights_leader_api::validate_scoped_authority()
+            .map_err(|_| ResourceCommandError::NotLeader)?;
         let result = self
             .proposal
             .propose_command(routed)
@@ -140,50 +149,53 @@ impl LeaderResourceCommand for EmbeddedLeaderResourceCommand {
         request: ResourceCommandRequest,
     ) -> ResourceCommandFuture<'_, ResourceCommandResult> {
         Box::pin(async move {
-            if matches!(
-                request.command(),
-                StorageCommand::DeleteResource {
-                    api_version,
-                    kind,
-                    namespace: Some(_),
-                    ..
-                } if api_version == "v1" && kind == "Pod"
-            ) {
-                return self
-                    .submit_actor_pod_delete(request.into_command())
+            let permit = self.local_permit()?;
+            klights_leader_api::scope_authority(self.authority.clone(), permit, async move {
+                if matches!(
+                    request.command(),
+                    StorageCommand::DeleteResource {
+                        api_version,
+                        kind,
+                        namespace: Some(_),
+                        ..
+                    } if api_version == "v1" && kind == "Pod"
+                ) {
+                    return self
+                        .submit_actor_pod_delete(request.into_command())
+                        .await
+                        .map(|resource_version| ResourceCommandResult::Ack { resource_version });
+                }
+                klights_leader_api::validate_scoped_authority()
+                    .map_err(|_| ResourceCommandError::NotLeader)?;
+                klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
+                    ResourceCommandError::retryable(format!(
+                        "controller authority rejected resource command: {error}"
+                    ))
+                })?;
+                let command = request.into_command();
+                let expects_resource = !matches!(
+                    command,
+                    StorageCommand::DeleteResource { .. }
+                        | StorageCommand::DeleteNamespace { .. }
+                        | StorageCommand::DeleteNamespaceContents { .. }
+                        | StorageCommand::DeletePodCleanupIntentsForNode { .. }
+                        | StorageCommand::ApplyResourceBatch { .. }
+                );
+                klights_leader_api::validate_scoped_authority()
+                    .map_err(|_| ResourceCommandError::NotLeader)?;
+                let result = self
+                    .proposal
+                    .propose_command(command.clone())
                     .await
-                    .map(|resource_version| ResourceCommandResult::Ack { resource_version });
-            }
-            if !*self.is_leader_rx.borrow() {
-                return Err(ResourceCommandError::NotLeader);
-            }
-            klights_leader_api::validate_authority_if_scoped()
-                .map_err(|_| ResourceCommandError::NotLeader)?;
-            klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
-                ResourceCommandError::retryable(format!(
-                    "controller authority rejected resource command: {error}"
-                ))
-            })?;
-            let command = request.into_command();
-            let expects_resource = !matches!(
-                command,
-                StorageCommand::DeleteResource { .. }
-                    | StorageCommand::DeleteNamespace { .. }
-                    | StorageCommand::DeleteNamespaceContents { .. }
-                    | StorageCommand::DeletePodCleanupIntentsForNode { .. }
-                    | StorageCommand::ApplyResourceBatch { .. }
-            );
-            let result = self
-                .proposal
-                .propose_command(command.clone())
+                    .map_err(resource_command_submission_error)?;
+                resource_command_result_or_current(
+                    self.resource_query.as_ref(),
+                    &command,
+                    result,
+                    expects_resource,
+                )
                 .await
-                .map_err(resource_command_submission_error)?;
-            resource_command_result_or_current(
-                self.resource_query.as_ref(),
-                &command,
-                result,
-                expects_resource,
-            )
+            })
             .await
         })
     }
@@ -406,19 +418,19 @@ fn resource_command_result(
 pub struct EmbeddedOutboxDelivery {
     proposal: Arc<dyn RaftProposal>,
     resource_query: Arc<dyn LeaderResourceQuery>,
-    is_leader_rx: tokio::sync::watch::Receiver<bool>,
+    authority: Arc<dyn klights_leader_api::LeaderAuthority>,
 }
 
 impl EmbeddedOutboxDelivery {
     pub fn new(
         proposal: Arc<dyn RaftProposal>,
         resource_query: Arc<dyn LeaderResourceQuery>,
-        is_leader_rx: tokio::sync::watch::Receiver<bool>,
+        authority: Arc<dyn klights_leader_api::LeaderAuthority>,
     ) -> Self {
         Self {
             proposal,
             resource_query,
-            is_leader_rx,
+            authority,
         }
     }
 
@@ -430,9 +442,40 @@ impl EmbeddedOutboxDelivery {
         decoded_command: Result<StorageCommand, OutboxDeliveryError>,
         watermark: Option<OutboxStreamWatermark>,
     ) -> Result<crate::proposal::RaftProposalEffect, OutboxDeliveryError> {
-        if !*self.is_leader_rx.borrow() {
-            return Err(OutboxDeliveryError::NotLeader);
-        }
+        let permit = match self.authority.route() {
+            klights_leader_api::AuthorityRoute::Local(permit) => permit,
+            klights_leader_api::AuthorityRoute::Forward { .. }
+            | klights_leader_api::AuthorityRoute::Unavailable => {
+                return Err(OutboxDeliveryError::NotLeader);
+            }
+        };
+        self.authority
+            .validate(&permit)
+            .map_err(|_| OutboxDeliveryError::NotLeader)?;
+        klights_leader_api::scope_authority(
+            self.authority.clone(),
+            permit,
+            self.deliver_authenticated_outbox_command_effect_scoped(
+                authenticated_node,
+                idempotency_key,
+                operation,
+                decoded_command,
+                watermark,
+            ),
+        )
+        .await
+    }
+
+    async fn deliver_authenticated_outbox_command_effect_scoped(
+        &self,
+        authenticated_node: String,
+        idempotency_key: String,
+        operation: OutboxDeliveryOperation,
+        decoded_command: Result<StorageCommand, OutboxDeliveryError>,
+        watermark: Option<OutboxStreamWatermark>,
+    ) -> Result<crate::proposal::RaftProposalEffect, OutboxDeliveryError> {
+        klights_leader_api::validate_scoped_authority()
+            .map_err(|_| OutboxDeliveryError::NotLeader)?;
         let mut command = match decoded_command {
             Ok(command) => command,
             Err(error) => {
@@ -500,6 +543,8 @@ impl EmbeddedOutboxDelivery {
             return Err(error);
         }
 
+        klights_leader_api::validate_scoped_authority()
+            .map_err(|_| OutboxDeliveryError::NotLeader)?;
         self.proposal
             .propose_outbox_command_effect(
                 &idempotency_key,
@@ -983,6 +1028,16 @@ fn pod_target(command: &StorageCommand) -> Option<(&str, &str, &ResourcePrecondi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn always_authority() -> Arc<dyn klights_leader_api::LeaderAuthority> {
+        let (authority, _publisher) = crate::authority::WatchLeaderAuthority::channel(true, None);
+        authority
+    }
+
+    fn follower_authority() -> Arc<dyn klights_leader_api::LeaderAuthority> {
+        let (authority, _publisher) = crate::authority::WatchLeaderAuthority::channel(false, None);
+        authority
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn command_result(
@@ -1049,6 +1104,46 @@ mod tests {
         commands: std::sync::Mutex<Vec<StorageCommand>>,
     }
 
+    struct RecordingOutboxProposal {
+        calls: std::sync::Mutex<
+            Vec<(
+                String,
+                String,
+                StorageCommand,
+                String,
+                Option<OutboxStreamWatermark>,
+            )>,
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl RaftProposal for RecordingOutboxProposal {
+        async fn propose_command(
+            &self,
+            _command: StorageCommand,
+        ) -> anyhow::Result<StorageCommandResult> {
+            unreachable!("outbox routing regression must use the outbox proposal boundary")
+        }
+
+        async fn propose_outbox_command(
+            &self,
+            idempotency_key: &str,
+            operation: &str,
+            command: StorageCommand,
+            authoring_node: &str,
+            watermark: Option<OutboxStreamWatermark>,
+        ) -> Result<klights_cluster_core::OutboxApplyOutcome, OutboxApplyError> {
+            self.calls.lock().unwrap().push((
+                idempotency_key.to_string(),
+                operation.to_string(),
+                command,
+                authoring_node.to_string(),
+                watermark,
+            ));
+            Ok(klights_cluster_core::OutboxApplyOutcome::Applied { applied_rv: 55 })
+        }
+    }
+
     #[async_trait::async_trait]
     impl RaftProposal for RecordingProposal {
         async fn propose_command(
@@ -1105,11 +1200,8 @@ mod tests {
         let command = StorageCommand::DeletePodCleanupIntentsForNode {
             node_name: "e2e-fake-node".to_string(),
         };
-        let client = EmbeddedLeaderResourceCommand::new(
-            proposal.clone(),
-            query.clone(),
-            tokio::sync::watch::channel(true).1,
-        );
+        let client =
+            EmbeddedLeaderResourceCommand::new(proposal.clone(), query.clone(), always_authority());
 
         let result = client
             .submit_resource_command(
@@ -1126,6 +1218,390 @@ mod tests {
             }
         );
         assert_eq!(proposal.commands.lock().unwrap().as_slice(), &[command]);
+        assert_eq!(query.gets.load(Ordering::Relaxed), 0);
+    }
+
+    fn exact_config_map_create_command() -> StorageCommand {
+        StorageCommand::CreateResource {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: "settings".to_string(),
+            data: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "default", "name": "settings"},
+                "data": {"mode": "strict"}
+            }),
+        }
+    }
+
+    fn exact_config_map_delete_command() -> StorageCommand {
+        StorageCommand::DeleteResource {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: "settings".to_string(),
+            preconditions: ResourcePreconditions::uid_and_resource_version("uid-settings", 42),
+        }
+    }
+
+    fn fixed_query() -> Arc<FixedResourceQuery> {
+        Arc::new(FixedResourceQuery {
+            resource: sample_resource(),
+            gets: AtomicUsize::new(0),
+        })
+    }
+
+    #[tokio::test]
+    async fn single_node_create_resource_works() {
+        let command = exact_config_map_create_command();
+        let query = fixed_query();
+        let proposal = Arc::new(RecordingProposal {
+            result: command_result(Some(42), None, None, Some(sample_resource())),
+            commands: Default::default(),
+        });
+        let service =
+            EmbeddedLeaderResourceCommand::new(proposal.clone(), query.clone(), always_authority());
+
+        let result = service
+            .submit_resource_command(ResourceCommandRequest::try_new(command.clone()).unwrap())
+            .await
+            .expect("single-node leader create must return committed resource");
+
+        assert_eq!(result, ResourceCommandResult::Resource(sample_resource()));
+        assert_eq!(proposal.commands.lock().unwrap().as_slice(), &[command]);
+        assert_eq!(query.gets.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn leader_allows_writes() {
+        let command = exact_config_map_create_command();
+        let query = fixed_query();
+        let proposal = Arc::new(RecordingProposal {
+            result: command_result(Some(42), None, None, Some(sample_resource())),
+            commands: Default::default(),
+        });
+        let service =
+            EmbeddedLeaderResourceCommand::new(proposal.clone(), query.clone(), always_authority());
+
+        let result = service
+            .submit_resource_command(ResourceCommandRequest::try_new(command.clone()).unwrap())
+            .await
+            .expect("current leader must accept the write");
+
+        assert_eq!(result, ResourceCommandResult::Resource(sample_resource()));
+        assert_eq!(proposal.commands.lock().unwrap().as_slice(), &[command]);
+        assert_eq!(query.gets.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn leader_write_routes_through_proposer() {
+        let command = exact_config_map_create_command();
+        let query = fixed_query();
+        let proposal = Arc::new(RecordingProposal {
+            result: command_result(Some(42), None, None, Some(sample_resource())),
+            commands: Default::default(),
+        });
+        let service =
+            EmbeddedLeaderResourceCommand::new(proposal.clone(), query.clone(), always_authority());
+
+        service
+            .submit_resource_command(ResourceCommandRequest::try_new(command.clone()).unwrap())
+            .await
+            .expect("leader write must be proposed");
+
+        assert_eq!(proposal.commands.lock().unwrap().as_slice(), &[command]);
+        assert_eq!(query.gets.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn raft_mode_create_resource_routes_via_proposer() {
+        let command = exact_config_map_create_command();
+        let query = fixed_query();
+        let proposal = Arc::new(RecordingProposal {
+            result: command_result(Some(42), None, None, Some(sample_resource())),
+            commands: Default::default(),
+        });
+        let service =
+            EmbeddedLeaderResourceCommand::new(proposal.clone(), query.clone(), always_authority());
+
+        let result = service
+            .submit_resource_command(ResourceCommandRequest::try_new(command.clone()).unwrap())
+            .await
+            .expect("Raft create must return its committed resource");
+
+        assert_eq!(result, ResourceCommandResult::Resource(sample_resource()));
+        assert_eq!(proposal.commands.lock().unwrap().as_slice(), &[command]);
+        assert_eq!(query.gets.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn raft_mode_delete_resource_routes_via_proposer() {
+        let command = exact_config_map_delete_command();
+        let query = fixed_query();
+        let proposal = Arc::new(RecordingProposal {
+            result: command_result(Some(43), None, None, None),
+            commands: Default::default(),
+        });
+        let service =
+            EmbeddedLeaderResourceCommand::new(proposal.clone(), query.clone(), always_authority());
+
+        let result = service
+            .submit_resource_command(ResourceCommandRequest::try_new(command.clone()).unwrap())
+            .await
+            .expect("Raft delete must return its committed position");
+
+        assert_eq!(
+            result,
+            ResourceCommandResult::Ack {
+                resource_version: 43
+            }
+        );
+        assert_eq!(proposal.commands.lock().unwrap().as_slice(), &[command]);
+        assert_eq!(query.gets.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_resource_exposes_committed_rv_for_leader_log_apply() {
+        let command = exact_config_map_delete_command();
+        let query = fixed_query();
+        let proposal = Arc::new(RecordingProposal {
+            result: command_result(Some(43), None, None, None),
+            commands: Default::default(),
+        });
+        let service =
+            EmbeddedLeaderResourceCommand::new(proposal.clone(), query.clone(), always_authority());
+
+        let result = service
+            .submit_resource_command(ResourceCommandRequest::try_new(command.clone()).unwrap())
+            .await
+            .expect("delete acknowledgement must expose committed RV");
+
+        assert_eq!(
+            result,
+            ResourceCommandResult::Ack {
+                resource_version: 43
+            }
+        );
+        assert_eq!(proposal.commands.lock().unwrap().as_slice(), &[command]);
+        assert_eq!(query.gets.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn public_create_rejects_existing_name_with_different_uid() {
+        let command = exact_config_map_create_command();
+        let query = fixed_query();
+        let proposal = Arc::new(RecordingProposal {
+            result: command_result(
+                None,
+                Some("ConfigMap default/settings already exists with uid uid-settings"),
+                Some(StorageCommandRejectionCode::AlreadyExists),
+                None,
+            ),
+            commands: Default::default(),
+        });
+        let service =
+            EmbeddedLeaderResourceCommand::new(proposal.clone(), query.clone(), always_authority());
+
+        let error = service
+            .submit_resource_command(ResourceCommandRequest::try_new(command.clone()).unwrap())
+            .await
+            .expect_err("same name with a different UID must remain AlreadyExists");
+
+        assert!(matches!(error, ResourceCommandError::AlreadyExists { .. }));
+        assert_eq!(proposal.commands.lock().unwrap().as_slice(), &[command]);
+        assert_eq!(query.gets.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn raft_mode_follower_proposer_rejects_create_no_local_mutation() {
+        let command = exact_config_map_create_command();
+        let query = fixed_query();
+        let proposal = Arc::new(RecordingProposal {
+            result: command_result(Some(42), None, None, Some(sample_resource())),
+            commands: Default::default(),
+        });
+        let service = EmbeddedLeaderResourceCommand::new(
+            proposal.clone(),
+            query.clone(),
+            follower_authority(),
+        );
+
+        let error = service
+            .submit_resource_command(ResourceCommandRequest::try_new(command).unwrap())
+            .await
+            .expect_err("follower create must be rejected before proposal");
+
+        assert_eq!(error, ResourceCommandError::NotLeader);
+        assert!(proposal.commands.lock().unwrap().is_empty());
+        assert_eq!(query.gets.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn raft_mode_follower_proposer_rejects_delete_no_local_mutation() {
+        let command = exact_config_map_delete_command();
+        let query = fixed_query();
+        let proposal = Arc::new(RecordingProposal {
+            result: command_result(Some(43), None, None, None),
+            commands: Default::default(),
+        });
+        let service = EmbeddedLeaderResourceCommand::new(
+            proposal.clone(),
+            query.clone(),
+            follower_authority(),
+        );
+
+        let error = service
+            .submit_resource_command(ResourceCommandRequest::try_new(command).unwrap())
+            .await
+            .expect_err("follower delete must be rejected before proposal");
+
+        assert_eq!(error, ResourceCommandError::NotLeader);
+        assert!(proposal.commands.lock().unwrap().is_empty());
+        assert_eq!(query.gets.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn raft_mode_mark_for_delete_without_watch_reuses_mark_and_routes_through_raft() {
+        let command = StorageCommand::DeleteResourceWithTombstone {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: "settings".to_string(),
+            preconditions: ResourcePreconditions::uid_and_resource_version("uid-settings", 42),
+            grace_seconds: 30,
+        };
+        let marked = klights_cluster_core::Resource::try_from_data(Arc::new(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "settings",
+                "namespace": "default",
+                "uid": "uid-settings",
+                "resourceVersion": "43",
+                "deletionTimestamp": "2026-08-12T00:00:00Z",
+                "deletionGracePeriodSeconds": 30
+            }
+        })))
+        .unwrap();
+        let query = fixed_query();
+        let proposal = Arc::new(RecordingProposal {
+            result: command_result(Some(43), None, None, Some(marked.clone())),
+            commands: Default::default(),
+        });
+        let service =
+            EmbeddedLeaderResourceCommand::new(proposal.clone(), query.clone(), always_authority());
+
+        let result = service
+            .submit_resource_command(ResourceCommandRequest::try_new(command.clone()).unwrap())
+            .await
+            .expect("existing deletion mark must be returned from committed Raft apply");
+
+        assert_eq!(result, ResourceCommandResult::Resource(marked));
+        assert_eq!(proposal.commands.lock().unwrap().as_slice(), &[command]);
+        assert_eq!(query.gets.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn replicated_apply_preserves_preconditions_through_codec() {
+        let command = StorageCommand::UpdateResource {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: "settings".to_string(),
+            data: (*sample_resource().data).clone(),
+            expected_rv: 42,
+            preconditions: ResourcePreconditions::uid_and_resource_version("uid-settings", 42),
+            preserve_status: false,
+        };
+        let query = fixed_query();
+        let proposal = Arc::new(RecordingProposal {
+            result: command_result(Some(43), None, None, Some(sample_resource())),
+            commands: Default::default(),
+        });
+        let service =
+            EmbeddedLeaderResourceCommand::new(proposal.clone(), query.clone(), always_authority());
+
+        service
+            .submit_resource_command(ResourceCommandRequest::try_new(command.clone()).unwrap())
+            .await
+            .expect("replicated update must preserve strict preconditions");
+
+        assert!(matches!(
+            proposal.commands.lock().unwrap().as_slice(),
+            [StorageCommand::UpdateResource {
+                expected_rv: 42,
+                preconditions,
+                preserve_status: false,
+                ..
+            }] if preconditions.uid.as_deref() == Some("uid-settings")
+                && preconditions.resource_version == Some(42)
+        ));
+        assert_eq!(query.gets.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn raft_mode_apply_outbox_transactionally_routes_via_proposer() {
+        let command = pod_status_command(Some("pod-uid"));
+        let query = fixed_query();
+        let proposal = Arc::new(RecordingOutboxProposal {
+            calls: Default::default(),
+        });
+        let service =
+            EmbeddedOutboxDelivery::new(proposal.clone(), query.clone(), always_authority());
+
+        let effect = service
+            .deliver_authenticated_outbox_command_effect(
+                "worker-a".to_string(),
+                "outbox-17".to_string(),
+                OutboxDeliveryOperation::PodStatus,
+                Ok(command.clone()),
+                None,
+            )
+            .await
+            .expect("outbox apply must route through the authoritative proposer");
+
+        assert!(matches!(
+            effect.into_parts().0,
+            klights_cluster_core::OutboxApplyOutcome::Applied { applied_rv: 55 }
+        ));
+        assert!(matches!(
+            proposal.calls.lock().unwrap().as_slice(),
+            [(idempotency_key, operation, recorded, authoring_node, None)]
+                if idempotency_key == "outbox-17"
+                    && operation == "PodStatus"
+                    && recorded == &command
+                    && authoring_node == "worker-a"
+        ));
+        assert_eq!(query.gets.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn raft_mode_follower_proposer_rejects_outbox_apply_no_local_mutation() {
+        let query = fixed_query();
+        let proposal = Arc::new(RecordingOutboxProposal {
+            calls: Default::default(),
+        });
+        let service =
+            EmbeddedOutboxDelivery::new(proposal.clone(), query.clone(), follower_authority());
+
+        let error = match service
+            .deliver_authenticated_outbox_command_effect(
+                "worker-a".to_string(),
+                "outbox-18".to_string(),
+                OutboxDeliveryOperation::PodStatus,
+                Ok(pod_status_command(Some("pod-uid"))),
+                None,
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("follower outbox apply must be rejected before proposal"),
+        };
+
+        assert!(matches!(error, OutboxDeliveryError::NotLeader));
+        assert!(proposal.calls.lock().unwrap().is_empty());
         assert_eq!(query.gets.load(Ordering::Relaxed), 0);
     }
 
@@ -1152,24 +1628,29 @@ mod tests {
             result: command_result(Some(18), None, None, None),
             commands: Default::default(),
         });
-        let service = EmbeddedLeaderResourceCommand::new(
-            proposal.clone(),
-            query,
-            tokio::sync::watch::channel(true).1,
-        );
+        let service =
+            EmbeddedLeaderResourceCommand::new(proposal.clone(), query, always_authority());
 
-        let resource_version = service
-            .submit_actor_pod_delete(StorageCommand::DeleteResource {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                namespace: Some("default".to_string()),
-                name: "web".to_string(),
-                preconditions: ResourcePreconditions::from_resource(&pod),
-            })
+        let result = service
+            .submit_resource_command(
+                ResourceCommandRequest::try_new(StorageCommand::DeleteResource {
+                    api_version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "web".to_string(),
+                    preconditions: ResourcePreconditions::from_resource(&pod),
+                })
+                .expect("valid delete request"),
+            )
             .await
             .expect("actor delete");
 
-        assert_eq!(resource_version, 18);
+        assert_eq!(
+            result,
+            ResourceCommandResult::Ack {
+                resource_version: 18
+            }
+        );
         assert!(matches!(
             proposal.commands.lock().unwrap().as_slice(),
             [StorageCommand::FinalizeBoundPod {
@@ -1207,7 +1688,7 @@ mod tests {
                 result: command_result(Some(current.resource_version), None, None, None),
             }),
             query.clone(),
-            tokio::sync::watch::channel(true).1,
+            always_authority(),
         );
         let result = service
             .submit_resource_command(
@@ -1240,7 +1721,7 @@ mod tests {
                 result: command_result(Some(current.resource_version), None, None, None),
             }),
             query.clone(),
-            tokio::sync::watch::channel(true).1,
+            always_authority(),
         );
         let result = service
             .submit_resource_command(
@@ -1271,7 +1752,7 @@ mod tests {
                 result: command_result(Some(current.resource_version), None, None, None),
             }),
             query.clone(),
-            tokio::sync::watch::channel(true).1,
+            always_authority(),
         );
         let result = service
             .submit_resource_command(
@@ -1556,7 +2037,7 @@ mod tests {
                 result: command_result(Some(18), None, None, None),
             }),
             query,
-            tokio::sync::watch::channel(true).1,
+            always_authority(),
         );
         let command = StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),

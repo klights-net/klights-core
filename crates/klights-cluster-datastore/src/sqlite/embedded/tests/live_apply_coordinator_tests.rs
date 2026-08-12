@@ -1,11 +1,13 @@
 #![cfg(test)]
 
 use super::*;
+use klights_cluster_core::command::StorageCommand;
 use klights_cluster_core::{
     LogApplyAppliedOutboxRow, LogApplyCommit, LogApplyMutation, LogApplyNodeDataplaneRow,
     LogApplyNodeSubnetRow, LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow,
-    LogApplyWatchEventRow, OutboxStreamWatermark, SnapshotRestoreOperation,
+    LogApplyWatchEventRow, OutboxStreamWatermark, ResourcePreconditions, SnapshotRestoreOperation,
 };
+use klights_cluster_store::StorageCommandResult;
 use std::net::Ipv4Addr;
 
 fn committed_apply_v1(commit: LogApplyCommit) -> LogApplyCommit {
@@ -202,6 +204,361 @@ fn applied_outbox_ack_rv(row: &LogApplyAppliedOutboxRow) -> i64 {
         }
         other => panic!("expected Ack response, got {other:?}"),
     }
+}
+
+async fn apply_storage_command(db: &Datastore, command: StorageCommand) -> StorageCommandResult {
+    let commit = db
+        .build_log_apply_commit_for_command(command, "s11-exact-regression", "leader")
+        .await
+        .expect("command must materialize into one committed-apply template");
+    db.apply_raft_log_apply_commit(commit)
+        .await
+        .expect("committed apply must return a deterministic terminal result")
+}
+
+async fn assert_command_rejected_with_conflict(db: &Datastore, command: StorageCommand) {
+    let error = db
+        .build_log_apply_commit_for_command(command, "s11-exact-regression", "leader")
+        .await
+        .expect_err("stale command must be rejected before proposal");
+    assert!(
+        error.to_string().contains("409 Conflict"),
+        "expected a Kubernetes conflict, got {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn datastore_applier_maps_all_variants() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = apply_storage_command(
+        &db,
+        StorageCommand::CreateResource {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: Some("default".into()),
+            name: "mapped-variants".into(),
+            data: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "mapped-variants", "namespace": "default"}
+            }),
+        },
+    )
+    .await;
+    assert!(
+        created.applied_rv.is_some(),
+        "CreateResource must be applied"
+    );
+    let stored = db
+        .get_resource("v1", "ConfigMap", Some("default"), "mapped-variants")
+        .await
+        .unwrap()
+        .expect("CreateResource mapping must persist the object");
+
+    let deleted = apply_storage_command(
+        &db,
+        StorageCommand::DeleteResource {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: Some("default".into()),
+            name: "mapped-variants".into(),
+            preconditions: ResourcePreconditions::from_resource(&stored),
+        },
+    )
+    .await;
+    assert!(
+        deleted.applied_rv.is_some(),
+        "DeleteResource must be applied"
+    );
+    assert!(
+        db.get_resource("v1", "ConfigMap", Some("default"), "mapped-variants")
+            .await
+            .unwrap()
+            .is_none(),
+        "DeleteResource mapping must remove the same object"
+    );
+}
+
+#[tokio::test]
+async fn replicated_apply_main_update_rejects_same_name_replacement() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let old = db
+        .create_resource(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "replacement-deploy",
+            serde_json::json!({"metadata":{"name":"replacement-deploy","namespace":"default","uid":"old-uid"},"spec":{"replicas":1}}),
+        )
+        .await
+        .unwrap();
+    db.delete_resource_with_preconditions(
+        "apps/v1",
+        "Deployment",
+        Some("default"),
+        "replacement-deploy",
+        ResourcePreconditions::from_resource(&old),
+    )
+    .await
+    .unwrap();
+    let replacement = db
+        .create_resource(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "replacement-deploy",
+            serde_json::json!({"metadata":{"name":"replacement-deploy","namespace":"default","uid":"new-uid"},"spec":{"replicas":1},"status":{"availableReplicas":1}}),
+        )
+        .await
+        .unwrap();
+    let rv_before = db.get_current_resource_version().await.unwrap();
+
+    assert_command_rejected_with_conflict(
+        &db,
+        StorageCommand::UpdateResource {
+            api_version: "apps/v1".into(),
+            kind: "Deployment".into(),
+            namespace: Some("default".into()),
+            name: "replacement-deploy".into(),
+            data: serde_json::json!({"metadata":{"name":"replacement-deploy","namespace":"default","uid":"old-uid"},"spec":{"replicas":2}}),
+            expected_rv: old.resource_version,
+            preconditions: ResourcePreconditions::from_resource(&old),
+            preserve_status: false,
+        },
+    )
+    .await;
+    let stored = db
+        .get_resource(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "replacement-deploy",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.uid, replacement.uid,
+        "old UID must not replace new UID"
+    );
+    assert_eq!(
+        stored.data.pointer("/spec/replicas"),
+        Some(&serde_json::json!(1))
+    );
+    assert_eq!(db.get_current_resource_version().await.unwrap(), rv_before);
+}
+
+#[tokio::test]
+async fn replicated_apply_main_update_rejects_true_spec_conflict() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db.create_resource("apps/v1", "Deployment", Some("default"), "spec-conflict", serde_json::json!({"metadata":{"name":"spec-conflict","namespace":"default","uid":"spec-conflict-uid","generation":1},"spec":{"replicas":1}})).await.unwrap();
+    let mut live = (*created.data).clone();
+    live["metadata"]["generation"] = serde_json::json!(2);
+    live["spec"]["replicas"] = serde_json::json!(3);
+    db.update_main_resource_with_preconditions(
+        "apps/v1",
+        "Deployment",
+        Some("default"),
+        "spec-conflict",
+        live,
+        ResourcePreconditions::from_resource(&created),
+    )
+    .await
+    .unwrap();
+    let rv_before = db.get_current_resource_version().await.unwrap();
+    let mut stale = (*created.data).clone();
+    stale["metadata"]["generation"] = serde_json::json!(2);
+    stale["spec"]["replicas"] = serde_json::json!(2);
+
+    assert_command_rejected_with_conflict(
+        &db,
+        StorageCommand::UpdateResource {
+            api_version: "apps/v1".into(),
+            kind: "Deployment".into(),
+            namespace: Some("default".into()),
+            name: "spec-conflict".into(),
+            data: stale,
+            expected_rv: created.resource_version,
+            preconditions: ResourcePreconditions::from_resource(&created),
+            preserve_status: false,
+        },
+    )
+    .await;
+    let stored = db
+        .get_resource("apps/v1", "Deployment", Some("default"), "spec-conflict")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.data.pointer("/spec/replicas"),
+        Some(&serde_json::json!(3)),
+        "live spec must win"
+    );
+    assert_eq!(db.get_current_resource_version().await.unwrap(), rv_before);
+}
+
+#[tokio::test]
+async fn replicated_apply_patch_rejects_stale_resource_version() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    db.create_resource("v1", "ConfigMap", Some("default"), "stale-patch-rv", serde_json::json!({"metadata":{"name":"stale-patch-rv","namespace":"default"},"data":{"before":"true"}})).await.unwrap();
+    let rv_before = db.get_current_resource_version().await.unwrap();
+    assert_command_rejected_with_conflict(
+        &db,
+        StorageCommand::PatchResource {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: Some("default".into()),
+            name: "stale-patch-rv".into(),
+            patch_kind: klights_cluster_core::PatchKind::Merge,
+            patch: serde_json::json!({"data":{"after":"true"}}),
+            preconditions: ResourcePreconditions::resource_version(99),
+            strict_resource_version: false,
+        },
+    )
+    .await;
+    let stored = db
+        .get_resource("v1", "ConfigMap", Some("default"), "stale-patch-rv")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.data.pointer("/data/before").and_then(|v| v.as_str()),
+        Some("true")
+    );
+    assert!(
+        stored.data.pointer("/data/after").is_none(),
+        "stale patch must not mutate data"
+    );
+    assert_eq!(db.get_current_resource_version().await.unwrap(), rv_before);
+}
+
+#[tokio::test]
+async fn replicated_apply_patch_rejects_true_spec_conflict() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db.create_resource("apps/v1", "Deployment", Some("default"), "patch-spec-conflict", serde_json::json!({"metadata":{"name":"patch-spec-conflict","namespace":"default","uid":"patch-spec-uid","generation":1},"spec":{"replicas":1}})).await.unwrap();
+    let mut live = (*created.data).clone();
+    live["metadata"]["generation"] = serde_json::json!(2);
+    live["spec"]["replicas"] = serde_json::json!(3);
+    db.update_main_resource_with_preconditions(
+        "apps/v1",
+        "Deployment",
+        Some("default"),
+        "patch-spec-conflict",
+        live,
+        ResourcePreconditions::from_resource(&created),
+    )
+    .await
+    .unwrap();
+    let rv_before = db.get_current_resource_version().await.unwrap();
+    assert_command_rejected_with_conflict(
+        &db,
+        StorageCommand::PatchResource {
+            api_version: "apps/v1".into(),
+            kind: "Deployment".into(),
+            namespace: Some("default".into()),
+            name: "patch-spec-conflict".into(),
+            patch_kind: klights_cluster_core::PatchKind::Merge,
+            patch: serde_json::json!({"metadata":{"generation":2},"spec":{"replicas":2}}),
+            preconditions: ResourcePreconditions::from_resource(&created),
+            strict_resource_version: false,
+        },
+    )
+    .await;
+    let stored = db
+        .get_resource(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "patch-spec-conflict",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.data.pointer("/spec/replicas"),
+        Some(&serde_json::json!(3)),
+        "live spec must win"
+    );
+    assert_eq!(db.get_current_resource_version().await.unwrap(), rv_before);
+}
+
+#[tokio::test]
+async fn replicated_apply_status_rejects_stale_resource_version() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    db.create_resource("v1", "Pod", Some("default"), "stale-status-rv", serde_json::json!({"metadata":{"name":"stale-status-rv","namespace":"default"},"status":{"phase":"Pending"}})).await.unwrap();
+    let rv_before = db.get_current_resource_version().await.unwrap();
+    assert_command_rejected_with_conflict(
+        &db,
+        StorageCommand::UpdateStatus {
+            api_version: "v1".into(),
+            kind: "Pod".into(),
+            namespace: Some("default".into()),
+            name: "stale-status-rv".into(),
+            status: serde_json::json!({"phase":"Running"}),
+            expected_rv: Some(99),
+            preconditions: ResourcePreconditions::resource_version(99),
+            observed_status_stamp: None,
+        },
+    )
+    .await;
+    let stored = db
+        .get_resource("v1", "Pod", Some("default"), "stale-status-rv")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored
+            .data
+            .pointer("/status/phase")
+            .and_then(|v| v.as_str()),
+        Some("Pending")
+    );
+    assert_eq!(db.get_current_resource_version().await.unwrap(), rv_before);
+}
+
+#[tokio::test]
+async fn replicated_apply_status_rejects_status_only_rv_conflict() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db.create_resource("v1", "Pod", Some("default"), "status-only-conflict", serde_json::json!({"metadata":{"name":"status-only-conflict","namespace":"default","uid":"status-only-uid"},"status":{"phase":"Pending"}})).await.unwrap();
+    db.update_status_only(
+        "v1",
+        "Pod",
+        Some("default"),
+        "status-only-conflict",
+        serde_json::json!({"phase":"Running"}),
+        Some(created.resource_version),
+    )
+    .await
+    .unwrap();
+    let rv_before = db.get_current_resource_version().await.unwrap();
+    assert_command_rejected_with_conflict(
+        &db,
+        StorageCommand::UpdateStatus {
+            api_version: "v1".into(),
+            kind: "Pod".into(),
+            namespace: Some("default".into()),
+            name: "status-only-conflict".into(),
+            status: serde_json::json!({"phase":"Succeeded"}),
+            expected_rv: Some(created.resource_version),
+            preconditions: ResourcePreconditions::from_resource(&created),
+            observed_status_stamp: None,
+        },
+    )
+    .await;
+    let stored = db
+        .get_resource("v1", "Pod", Some("default"), "status-only-conflict")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored
+            .data
+            .pointer("/status/phase")
+            .and_then(|v| v.as_str()),
+        Some("Running"),
+        "newer status must win"
+    );
+    assert_eq!(db.get_current_resource_version().await.unwrap(), rv_before);
 }
 
 #[tokio::test]
@@ -1112,7 +1469,11 @@ async fn committed_apply_v1_conflict_and_duplicate_do_not_allocate_rv() {
         .unwrap();
     let before_duplicate = db.get_current_resource_version().await.unwrap();
     let duplicate = db.apply_raft_log_apply_commit(commit).await.unwrap();
-    assert_eq!(duplicate.applied_rv, Some(0));
+    assert_eq!(
+        duplicate.applied_rv,
+        Some(before_duplicate),
+        "ledger-only duplicate reports the existing public RV without allocating one"
+    );
     assert!(
         !duplicate.public_resource_changed,
         "duplicate committed ledger entries must not request downstream effects"

@@ -8,14 +8,15 @@
 //!   member is leader they use the local client; otherwise they use the remote
 //!   forwarder. Followers do not serve application reads from their local
 //!   raft-applied `cluster.db`.
-//! - **Pod cleanup intent reads/deletes** prefer the remote leader path.
-//!   Startup recovery may run before a rejoining old leader has observed
-//!   its demotion, so the local leadership watch can briefly be stale.
+//! - **Pod cleanup intent reads/deletes** use the same sampled route and keep
+//!   authoritative work local-first. A forwarded route selects only its exact
+//!   endpoint; an unavailable route invokes no arm.
 //! - **Writes** consult the backend-neutral authority route on entry: local
 //!   authority dispatches to the local client (which routes through the local
 //!   datastore → raft proposer → raft → state-machine apply); forwarded or
-//!   temporarily unavailable authority dispatches to the remote arm, which
-//!   carries the call to the current elected leader's API server over gRPC.
+//!   authority dispatches to the exact endpoint's remote arm, which carries
+//!   the call to the current elected leader's API server over gRPC. Temporary
+//!   unavailability is retryable and invokes neither local nor remote work.
 //!
 //! Leadership change is a state flip on the same instance — no
 //! re-construction, no rewiring. The adapter samples authority per
@@ -26,6 +27,7 @@
 //! recording fakes through the individual focused capabilities and assert the dispatch table
 //! without spinning up a real cluster.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -60,6 +62,7 @@ use klights_leader_api::pod_get_request;
 struct ArcPair<T: ?Sized> {
     local: Option<Arc<T>>,
     remote: Option<Arc<T>>,
+    forwards: BTreeMap<String, Arc<T>>,
 }
 
 impl<T: ?Sized> Clone for ArcPair<T> {
@@ -67,6 +70,7 @@ impl<T: ?Sized> Clone for ArcPair<T> {
         Self {
             local: self.local.clone(),
             remote: self.remote.clone(),
+            forwards: self.forwards.clone(),
         }
     }
 }
@@ -76,6 +80,7 @@ impl<T: ?Sized> ArcPair<T> {
         Self {
             local: None,
             remote: None,
+            forwards: BTreeMap::new(),
         }
     }
 
@@ -84,10 +89,21 @@ impl<T: ?Sized> ArcPair<T> {
         self.remote = Some(remote);
     }
 
+    fn set_forward(&mut self, endpoint: String, target: Arc<T>) {
+        self.forwards.insert(endpoint, target);
+    }
+
     fn target(&self, route: &AuthorityRoute) -> Option<&Arc<T>> {
         match route {
             AuthorityRoute::Local(_) => self.local.as_ref(),
-            AuthorityRoute::Forward { .. } | AuthorityRoute::Unavailable => self.remote.as_ref(),
+            AuthorityRoute::Forward { endpoint } => {
+                if self.forwards.is_empty() {
+                    self.remote.as_ref()
+                } else {
+                    self.forwards.get(endpoint)
+                }
+            }
+            AuthorityRoute::Unavailable => None,
         }
     }
 }
@@ -157,30 +173,37 @@ impl AuthorityRoutedLeader {
             resource_queries: ArcPair {
                 local: Some(local_resource_query),
                 remote: Some(remote_resource_query),
+                forwards: BTreeMap::new(),
             },
             watches: ArcPair {
                 local: Some(local_watch),
                 remote: Some(remote_watch),
+                forwards: BTreeMap::new(),
             },
             cache_readiness: ArcPair {
                 local: Some(local_cache_readiness),
                 remote: Some(remote_cache_readiness),
+                forwards: BTreeMap::new(),
             },
             projected_tokens: ArcPair {
                 local: Some(local_projected_tokens),
                 remote: Some(remote_projected_tokens),
+                forwards: BTreeMap::new(),
             },
             pod_cleanup_intents: ArcPair {
                 local: Some(local_pod_cleanup_intents),
                 remote: Some(remote_pod_cleanup_intents),
+                forwards: BTreeMap::new(),
             },
             node_subnet_allocations: ArcPair {
                 local: Some(local_node_subnet_allocation),
                 remote: Some(remote_node_subnet_allocation),
+                forwards: BTreeMap::new(),
             },
             network_topology: ArcPair {
                 local: Some(local_network_topology),
                 remote: Some(remote_network_topology),
+                forwards: BTreeMap::new(),
             },
             focused_targets: None,
             authority: authority.into(),
@@ -195,6 +218,52 @@ impl AuthorityRoutedLeader {
         self.focused_targets_mut()
             .resource_commands
             .set(local, remote);
+        self
+    }
+
+    /// Register an endpoint-specific forwarding arm. The default remote arm
+    /// remains available for bootstrap configurations that have one transport
+    /// client; once an endpoint map is populated, an exact endpoint match wins.
+    // Keep the endpoint's focused capabilities explicit for the same reason as
+    // `new`: a transport/client bundle would recreate the deleted god facade.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_forward_endpoint(
+        mut self,
+        endpoint: impl Into<String>,
+        resource_query: Arc<dyn LeaderResourceQuery>,
+        watch: Arc<dyn LeaderWatch>,
+        cache_readiness: Arc<dyn LeaderCacheReadiness>,
+        projected_tokens: Arc<dyn LeaderProjectedServiceAccountToken>,
+        pod_cleanup_intents: Arc<dyn LeaderPodCleanupIntents>,
+        node_subnet_allocation: Arc<dyn LeaderNodeSubnetAllocation>,
+        network_topology: Arc<dyn LeaderNetworkTopologyQuery>,
+        resource_commands: Arc<dyn LeaderResourceCommand>,
+        outbox_delivery: Arc<dyn LeaderOutboxDelivery>,
+        node_lease_renewal: Arc<dyn LeaderNodeLeaseRenewal>,
+    ) -> Self {
+        let endpoint = endpoint.into();
+        self.resource_queries
+            .set_forward(endpoint.clone(), resource_query);
+        self.watches.set_forward(endpoint.clone(), watch);
+        self.cache_readiness
+            .set_forward(endpoint.clone(), cache_readiness);
+        self.projected_tokens
+            .set_forward(endpoint.clone(), projected_tokens);
+        self.pod_cleanup_intents
+            .set_forward(endpoint.clone(), pod_cleanup_intents);
+        self.node_subnet_allocations
+            .set_forward(endpoint.clone(), node_subnet_allocation);
+        self.network_topology
+            .set_forward(endpoint.clone(), network_topology);
+        self.focused_targets_mut()
+            .resource_commands
+            .set_forward(endpoint.clone(), resource_commands);
+        self.focused_targets_mut()
+            .outbox_deliveries
+            .set_forward(endpoint.clone(), outbox_delivery);
+        self.focused_targets_mut()
+            .node_lease_renewals
+            .set_forward(endpoint, node_lease_renewal);
         self
     }
 
@@ -227,9 +296,16 @@ impl AuthorityRoutedLeader {
         Arc::make_mut(targets)
     }
 
-    fn target<'a, T: ?Sized>(&self, pair: &'a ArcPair<T>, route: &AuthorityRoute) -> &'a Arc<T> {
-        pair.target(route)
-            .expect("leader proxy focused target is wired at construction")
+    fn target<'a, T: ?Sized>(
+        &self,
+        pair: &'a ArcPair<T>,
+        route: &AuthorityRoute,
+    ) -> Result<&'a Arc<T>, &'static str> {
+        pair.target(route).ok_or(match route {
+            AuthorityRoute::Unavailable => "leader authority is unavailable",
+            AuthorityRoute::Forward { .. } => "leader forward endpoint is not wired",
+            AuthorityRoute::Local(_) => "leader local target is not wired",
+        })
     }
 
     #[cfg(test)]
@@ -273,6 +349,11 @@ impl LeaderResourceCommand for AuthorityRoutedLeader {
             .as_ref()
             .and_then(|targets| targets.resource_commands.target(&route).cloned());
         Box::pin(async move {
+            if matches!(&route, AuthorityRoute::Unavailable) {
+                return Err(ResourceCommandError::retryable(
+                    "leader authority is unavailable; retry after election",
+                ));
+            }
             if let Some(permit) = permit.as_ref()
                 && authority.validate(permit).is_err()
             {
@@ -281,9 +362,20 @@ impl LeaderResourceCommand for AuthorityRoutedLeader {
                 ));
             }
             match target {
-                Some(target) => target.submit_resource_command(request).await,
+                Some(target) => match permit {
+                    Some(permit) => {
+                        let authority_arc = authority.authority_arc();
+                        klights_leader_api::scope_authority(
+                            authority_arc,
+                            permit,
+                            target.submit_resource_command(request),
+                        )
+                        .await
+                    }
+                    None => target.submit_resource_command(request).await,
+                },
                 None => Err(ResourceCommandError::retryable(
-                    "leader proxy resource-command target is not wired",
+                    "leader forward endpoint is not wired",
                 )),
             }
         })
@@ -304,7 +396,7 @@ impl LeaderNodeLeaseRenewal for AuthorityRoutedLeader {
             Some(target) => target.renew_node_lease(request),
             None => Box::pin(async {
                 Err(NodeLeaseRenewalError::unavailable(
-                    "leader proxy Node lease-renewal target is not wired",
+                    "leader authority is unavailable or its forward endpoint is not wired",
                 ))
             }),
         }
@@ -314,18 +406,18 @@ impl LeaderNodeLeaseRenewal for AuthorityRoutedLeader {
 fn terminate_watch_on_authority_change(
     stream: WatchStream,
     authority: AuthorityHandle,
-    permit: Option<klights_leader_api::AuthorityPermit>,
+    route: AuthorityRoute,
 ) -> WatchStream {
     stream.map_inner(|stream| {
         Box::pin(futures::stream::unfold(
-            (stream, authority, permit),
-            move |(mut stream, authority, permit)| async move {
-                let authority_change = wait_for_authority_change(authority.clone(), permit.clone());
+            (stream, authority, route),
+            move |(mut stream, authority, route)| async move {
+                let authority_change = wait_for_authority_change(authority.clone(), route.clone());
                 tokio::select! {
                     biased;
                     _ = authority_change => None,
                     item = stream.next() => {
-                        item.map(|item| (item, (stream, authority, permit)))
+                        item.map(|item| (item, (stream, authority, route)))
                     }
                 }
             },
@@ -333,16 +425,8 @@ fn terminate_watch_on_authority_change(
     })
 }
 
-async fn wait_for_authority_change(
-    authority: AuthorityHandle,
-    permit: Option<klights_leader_api::AuthorityPermit>,
-) {
-    match permit {
-        Some(permit) => authority.wait_for_revocation(&permit).await,
-        None => {
-            let _ = authority.acquire().await;
-        }
-    }
+async fn wait_for_authority_change(authority: AuthorityHandle, route: AuthorityRoute) {
+    authority.wait_for_route_change(&route).await;
 }
 
 impl LeaderResourceQuery for AuthorityRoutedLeader {
@@ -356,14 +440,29 @@ impl LeaderResourceQuery for AuthorityRoutedLeader {
             AuthorityRoute::Local(permit) => Some(permit.clone()),
             AuthorityRoute::Forward { .. } | AuthorityRoute::Unavailable => None,
         };
-        let target = self
-            .resource_queries
-            .target(&route)
-            .expect("resource-query targets are wired")
-            .clone();
+        let target = self.resource_queries.target(&route).cloned();
         Box::pin(async move {
+            if matches!(&route, AuthorityRoute::Unavailable) {
+                return Err(klights_leader_api::ResourceQueryError::retryable(
+                    "leader authority is unavailable; retry after election",
+                ));
+            }
             let consistency = request.consistency();
-            let result = target.get_resource(request).await?;
+            let target = target.ok_or_else(|| {
+                klights_leader_api::ResourceQueryError::retryable(
+                    "leader forward endpoint is not wired",
+                )
+            })?;
+            let result = if let Some(permit) = permit.clone() {
+                klights_leader_api::scope_authority(
+                    authority.authority_arc(),
+                    permit,
+                    target.get_resource(request),
+                )
+                .await?
+            } else {
+                target.get_resource(request).await?
+            };
             if consistency == ResourceQueryConsistency::LeaderFresh
                 && let Some(permit) = permit.as_ref()
                 && authority.validate(permit).is_err()
@@ -386,14 +485,29 @@ impl LeaderResourceQuery for AuthorityRoutedLeader {
             AuthorityRoute::Local(permit) => Some(permit.clone()),
             AuthorityRoute::Forward { .. } | AuthorityRoute::Unavailable => None,
         };
-        let target = self
-            .resource_queries
-            .target(&route)
-            .expect("resource-query targets are wired")
-            .clone();
+        let target = self.resource_queries.target(&route).cloned();
         Box::pin(async move {
+            if matches!(&route, AuthorityRoute::Unavailable) {
+                return Err(klights_leader_api::ResourceQueryError::retryable(
+                    "leader authority is unavailable; retry after election",
+                ));
+            }
             let consistency = request.consistency();
-            let result = target.list_resources(request).await?;
+            let target = target.ok_or_else(|| {
+                klights_leader_api::ResourceQueryError::retryable(
+                    "leader forward endpoint is not wired",
+                )
+            })?;
+            let result = if let Some(permit) = permit.clone() {
+                klights_leader_api::scope_authority(
+                    authority.authority_arc(),
+                    permit,
+                    target.list_resources(request),
+                )
+                .await?
+            } else {
+                target.list_resources(request).await?
+            };
             if consistency == ResourceQueryConsistency::LeaderFresh
                 && let Some(permit) = permit.as_ref()
                 && authority.validate(permit).is_err()
@@ -415,13 +529,26 @@ impl LeaderWatch for AuthorityRoutedLeader {
             AuthorityRoute::Local(permit) => Some(permit.clone()),
             AuthorityRoute::Forward { .. } | AuthorityRoute::Unavailable => None,
         };
-        let target = self
-            .watches
-            .target(&route)
-            .expect("watch targets are wired")
-            .clone();
+        let target = self.watches.target(&route).cloned();
         Box::pin(async move {
-            let stream = LeaderWatch::watch_resources(target.as_ref(), req).await?;
+            if matches!(&route, AuthorityRoute::Unavailable) {
+                return Err(LeaderWatchError::unavailable(
+                    "leader authority is unavailable; retry after election",
+                ));
+            }
+            let target = target.ok_or_else(|| {
+                LeaderWatchError::unavailable("leader forward endpoint is not wired")
+            })?;
+            let stream = if let Some(permit) = permit.clone() {
+                klights_leader_api::scope_authority(
+                    authority.authority_arc(),
+                    permit,
+                    LeaderWatch::watch_resources(target.as_ref(), req),
+                )
+                .await?
+            } else {
+                LeaderWatch::watch_resources(target.as_ref(), req).await?
+            };
             if let Some(permit) = permit.as_ref()
                 && authority.validate(permit).is_err()
             {
@@ -430,7 +557,7 @@ impl LeaderWatch for AuthorityRoutedLeader {
                 ));
             }
             Ok(terminate_watch_on_authority_change(
-                stream, authority, permit,
+                stream, authority, route,
             ))
         })
     }
@@ -439,8 +566,10 @@ impl LeaderWatch for AuthorityRoutedLeader {
 impl LeaderCacheReadiness for AuthorityRoutedLeader {
     fn wait_cache_ready(&self, scope: CacheReadinessRequest) -> CacheReadinessFuture<'_> {
         let route = self.authority.route();
-        self.target(&self.cache_readiness, &route)
-            .wait_cache_ready(scope)
+        match self.target(&self.cache_readiness, &route) {
+            Ok(target) => target.wait_cache_ready(scope),
+            Err(message) => Box::pin(async move { Err(CacheReadinessError::unavailable(message)) }),
+        }
     }
 }
 
@@ -450,8 +579,12 @@ impl LeaderProjectedServiceAccountToken for AuthorityRoutedLeader {
         request: ProjectedServiceAccountTokenRequest,
     ) -> ProjectedServiceAccountTokenFuture<'_> {
         let route = self.authority.route();
-        self.target(&self.projected_tokens, &route)
-            .issue_projected_service_account_token(request)
+        match self.target(&self.projected_tokens, &route) {
+            Ok(target) => target.issue_projected_service_account_token(request),
+            Err(message) => Box::pin(async move {
+                Err(klights_leader_api::ProjectedServiceAccountTokenError::unavailable(message))
+            }),
+        }
     }
 }
 
@@ -460,56 +593,26 @@ impl LeaderPodCleanupIntents for AuthorityRoutedLeader {
         &self,
         request: PodCleanupIntentListRequest,
     ) -> PodCleanupIntentFuture<'_, Vec<PodCleanupIntent>> {
-        Box::pin(async move {
-            let route = self.authority.route();
-            let remote = self
-                .pod_cleanup_intents
-                .remote
-                .as_ref()
-                .expect("remote cleanup-intent target is wired");
-            match remote.list_pod_cleanup_intents(request.clone()).await {
-                Ok(intents) => Ok(intents),
-                Err(error) => match route {
-                    AuthorityRoute::Local(_) => {
-                        self.pod_cleanup_intents
-                            .local
-                            .as_ref()
-                            .expect("local cleanup-intent target is wired")
-                            .list_pod_cleanup_intents(request)
-                            .await
-                    }
-                    AuthorityRoute::Forward { .. } | AuthorityRoute::Unavailable => Err(error),
-                },
+        let route = self.authority.route();
+        match self.target(&self.pod_cleanup_intents, &route) {
+            Ok(target) => target.list_pod_cleanup_intents(request),
+            Err(message) => {
+                Box::pin(async move { Err(PodCleanupIntentError::unavailable(message)) })
             }
-        })
+        }
     }
 
     fn acknowledge_pod_cleanup_intent(
         &self,
         request: PodCleanupIntentAckRequest,
     ) -> PodCleanupIntentFuture<'_, ()> {
-        Box::pin(async move {
-            let route = self.authority.route();
-            let remote = self
-                .pod_cleanup_intents
-                .remote
-                .as_ref()
-                .expect("remote cleanup-intent target is wired");
-            match remote.acknowledge_pod_cleanup_intent(request.clone()).await {
-                Ok(()) => Ok(()),
-                Err(error) => match route {
-                    AuthorityRoute::Local(_) => {
-                        self.pod_cleanup_intents
-                            .local
-                            .as_ref()
-                            .expect("local cleanup-intent target is wired")
-                            .acknowledge_pod_cleanup_intent(request)
-                            .await
-                    }
-                    AuthorityRoute::Forward { .. } | AuthorityRoute::Unavailable => Err(error),
-                },
+        let route = self.authority.route();
+        match self.target(&self.pod_cleanup_intents, &route) {
+            Ok(target) => target.acknowledge_pod_cleanup_intent(request),
+            Err(message) => {
+                Box::pin(async move { Err(PodCleanupIntentError::unavailable(message)) })
             }
-        })
+        }
     }
 }
 
@@ -519,8 +622,12 @@ impl LeaderNodeSubnetAllocation for AuthorityRoutedLeader {
         request: NodeSubnetAllocationRequest,
     ) -> NodeSubnetAllocationFuture<'_, NodeSubnetAllocationResult> {
         let route = self.authority.route();
-        self.target(&self.node_subnet_allocations, &route)
-            .allocate_node_subnet(request)
+        match self.target(&self.node_subnet_allocations, &route) {
+            Ok(target) => target.allocate_node_subnet(request),
+            Err(message) => {
+                Box::pin(async move { Err(NodeSubnetAllocationError::retryable(message)) })
+            }
+        }
     }
 }
 
@@ -530,8 +637,10 @@ impl LeaderNetworkTopologyQuery for AuthorityRoutedLeader {
         request: NodeSubnetQuery,
     ) -> NetworkTopologyFuture<'_, NodeSubnetResult> {
         let route = self.authority.route();
-        self.target(&self.network_topology, &route)
-            .get_node_subnet(request)
+        match self.target(&self.network_topology, &route) {
+            Ok(target) => target.get_node_subnet(request),
+            Err(message) => Box::pin(async move { Err(NetworkTopologyError::retryable(message)) }),
+        }
     }
 
     fn list_peer_subnets(
@@ -539,8 +648,10 @@ impl LeaderNetworkTopologyQuery for AuthorityRoutedLeader {
         request: PeerSubnetsQuery,
     ) -> NetworkTopologyFuture<'_, PeerSubnetsResult> {
         let route = self.authority.route();
-        self.target(&self.network_topology, &route)
-            .list_peer_subnets(request)
+        match self.target(&self.network_topology, &route) {
+            Ok(target) => target.list_peer_subnets(request),
+            Err(message) => Box::pin(async move { Err(NetworkTopologyError::retryable(message)) }),
+        }
     }
 
     fn get_node_dataplane(
@@ -548,8 +659,10 @@ impl LeaderNetworkTopologyQuery for AuthorityRoutedLeader {
         request: NodeDataplaneQuery,
     ) -> NetworkTopologyFuture<'_, NodeDataplaneResult> {
         let route = self.authority.route();
-        self.target(&self.network_topology, &route)
-            .get_node_dataplane(request)
+        match self.target(&self.network_topology, &route) {
+            Ok(target) => target.get_node_dataplane(request),
+            Err(message) => Box::pin(async move { Err(NetworkTopologyError::retryable(message)) }),
+        }
     }
 }
 
@@ -564,7 +677,7 @@ impl LeaderOutboxDelivery for AuthorityRoutedLeader {
             Some(target) => target.deliver_outbox(request),
             None => Box::pin(async {
                 Err(OutboxDeliveryError::unavailable(
-                    "leader proxy durable-delivery target is not wired",
+                    "leader authority is unavailable or its forward endpoint is not wired",
                 ))
             }),
         }

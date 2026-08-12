@@ -1,4 +1,4 @@
 # Exact normalized compiler-derived normal public API for klights-leader-api.
 # Update only after reviewing the complete rustdoc signature/impl/type delta.
-count=4478
-sha256=84da96eb8a49257caeea5009f40931c61501f0c7e9a47212f6bb90e16831ac7a
+count=4479
+sha256=ad4cb298697568feba8ac4471eae767d1736e2dc16bee5bf94a94415aab813c1

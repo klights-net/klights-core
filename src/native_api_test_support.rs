@@ -1192,7 +1192,8 @@ impl NativeApiTestHarness {
             klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                 proposal.clone(),
                 resource_query.clone(),
-                leader_rx.clone(),
+                crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority(
+                ),
             ),
         );
         let node_local = Arc::new(
@@ -1227,7 +1228,7 @@ impl NativeApiTestHarness {
                     klights_replication::leader_api::EmbeddedOutboxDelivery::new(
                         proposal,
                         resource_query.clone(),
-                        leader_rx,
+                        crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority(),
                     ),
                 ),
                 codec: outbox_codec.clone(),

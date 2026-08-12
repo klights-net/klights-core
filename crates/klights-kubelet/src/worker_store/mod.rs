@@ -4,20 +4,15 @@
 //! node-local ports.  It intentionally has no dependency on the root crate or
 //! its cluster datastore traits.
 
-use std::collections::HashMap;
 use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex};
 
+#[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
-use klights_cluster_core::Resource;
-use klights_leader_api::{
-    LeaderWatch, LeaderWatchError, ResourceEvent, WatchEventType, WatchRequest,
-};
-use klights_types::{FieldSelector, LabelSelector};
-use klights_watch::{
-    PreparedWatchTransition, WatchBus, WatchSignal, WatchTopic, WatchTransitionProjector,
-    WatchTransitionProjectorFactory,
-};
+use klights_leader_api::{LeaderWatch, WatchRequest};
+#[cfg(any(test, feature = "test-support"))]
+use klights_watch::WatchTransitionProjector;
+use klights_watch::{WatchBus, WatchSignal, WatchTopic};
 
 use crate::pod_lifecycle_router::PodLifecycleRouter;
 
@@ -46,234 +41,6 @@ pub trait WorkerWatchEvents: Send + Sync {
 /// In-memory event bus for worker-local mirrored events.
 pub struct WorkerWatchBus {
     bus: WatchBus,
-}
-
-struct WorkerWatchTransitionProjector {
-    membership: WorkerSelectorMembership,
-}
-
-impl WatchTransitionProjector for WorkerWatchTransitionProjector {
-    fn replace(&mut self, resources: &[klights_cluster_core::Resource]) {
-        self.membership.replace(resources);
-    }
-
-    fn prepare(&self, event: ResourceEvent) -> Result<PreparedWatchTransition, LeaderWatchError> {
-        let pending = self.membership.prepare(event)?;
-        Ok(PreparedWatchTransition::new(
-            pending.event().cloned(),
-            pending,
-        ))
-    }
-
-    fn commit(&mut self, prepared: PreparedWatchTransition) -> Result<(), LeaderWatchError> {
-        self.membership
-            .commit(prepared.into_token::<PendingWorkerSelectorTransition>()?);
-        Ok(())
-    }
-}
-
-#[derive(Default)]
-struct WorkerWatchTransitionProjectors;
-
-impl WatchTransitionProjectorFactory for WorkerWatchTransitionProjectors {
-    fn projector(
-        &self,
-        request: &WatchRequest,
-    ) -> Result<Box<dyn WatchTransitionProjector>, LeaderWatchError> {
-        Ok(Box::new(WorkerWatchTransitionProjector {
-            membership: WorkerSelectorMembership::try_new(request)?,
-        }))
-    }
-}
-
-/// Selector membership used by the worker mirror.  It deliberately lives in
-/// the worker crate instead of enabling `klights-watch`'s session feature:
-/// that feature owns the leader-side durable datastore session and must not be
-/// pulled across the worker boundary.
-struct WorkerSelectorMembership {
-    filter: WorkerWatchFilter,
-    membership: HashMap<WorkerSelectorKey, Resource>,
-}
-
-impl WorkerSelectorMembership {
-    fn try_new(request: &WatchRequest) -> Result<Self, LeaderWatchError> {
-        Ok(Self {
-            filter: WorkerWatchFilter::try_new(request)?,
-            membership: HashMap::new(),
-        })
-    }
-
-    fn replace(&mut self, resources: &[Resource]) {
-        self.membership.clear();
-        self.membership.extend(
-            resources
-                .iter()
-                .cloned()
-                .map(|resource| (WorkerSelectorKey::from_resource(&resource), resource)),
-        );
-    }
-
-    fn prepare(
-        &self,
-        event: ResourceEvent,
-    ) -> Result<PendingWorkerSelectorTransition, LeaderWatchError> {
-        if matches!(
-            event.event_type(),
-            WatchEventType::Bookmark | WatchEventType::Error
-        ) {
-            return Ok(PendingWorkerSelectorTransition {
-                event: Some(event),
-                mutation: WorkerSelectorMutation::None,
-            });
-        }
-
-        let key = WorkerSelectorKey::from_resource(event.resource());
-        let prior = self.membership.get(&key).cloned();
-        let was_member = prior.is_some();
-        let matches = self.filter.matches(event.resource());
-        let position = event.resume_position();
-        let event_type = event.event_type();
-        let current = event.resource().clone();
-        let (event, mutation) = match event_type {
-            WatchEventType::Deleted => {
-                let mutation = if was_member {
-                    WorkerSelectorMutation::Remove(key)
-                } else {
-                    WorkerSelectorMutation::None
-                };
-                ((was_member || matches).then_some(event), mutation)
-            }
-            WatchEventType::Added | WatchEventType::Modified if matches => {
-                let event = if was_member || event_type == WatchEventType::Added {
-                    Some(event)
-                } else {
-                    Some(ResourceEvent::try_new(
-                        WatchEventType::Added,
-                        current.clone(),
-                        position,
-                    )?)
-                };
-                (event, WorkerSelectorMutation::Upsert(key, current))
-            }
-            WatchEventType::Added | WatchEventType::Modified if was_member => {
-                let event = ResourceEvent::try_new(
-                    WatchEventType::Deleted,
-                    prior.expect("membership was checked"),
-                    position,
-                )?;
-                (Some(event), WorkerSelectorMutation::Remove(key))
-            }
-            WatchEventType::Added | WatchEventType::Modified => {
-                (None, WorkerSelectorMutation::None)
-            }
-            WatchEventType::Bookmark | WatchEventType::Error => unreachable!(),
-        };
-        Ok(PendingWorkerSelectorTransition { event, mutation })
-    }
-
-    fn commit(&mut self, pending: PendingWorkerSelectorTransition) {
-        match pending.mutation {
-            WorkerSelectorMutation::None => {}
-            WorkerSelectorMutation::Upsert(key, resource) => {
-                self.membership.insert(key, resource);
-            }
-            WorkerSelectorMutation::Remove(key) => {
-                self.membership.remove(&key);
-            }
-        }
-    }
-}
-
-struct PendingWorkerSelectorTransition {
-    event: Option<ResourceEvent>,
-    mutation: WorkerSelectorMutation,
-}
-
-impl PendingWorkerSelectorTransition {
-    fn event(&self) -> Option<&ResourceEvent> {
-        self.event.as_ref()
-    }
-}
-
-enum WorkerSelectorMutation {
-    None,
-    Upsert(WorkerSelectorKey, Resource),
-    Remove(WorkerSelectorKey),
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct WorkerSelectorKey {
-    api_version: String,
-    kind: String,
-    namespace: Option<String>,
-    name: String,
-}
-
-impl WorkerSelectorKey {
-    fn from_resource(resource: &Resource) -> Self {
-        Self {
-            api_version: resource.api_version.clone(),
-            kind: resource.kind.clone(),
-            namespace: resource.namespace.clone(),
-            name: resource.name.clone(),
-        }
-    }
-}
-
-struct WorkerWatchFilter {
-    api_version: String,
-    kind: String,
-    namespace: Option<String>,
-    label_selector: Option<LabelSelector>,
-    field_selector: Option<FieldSelector>,
-}
-
-impl WorkerWatchFilter {
-    fn try_new(request: &WatchRequest) -> Result<Self, LeaderWatchError> {
-        let label_selector = request
-            .label_selector()
-            .filter(|selector| !selector.trim().is_empty())
-            .map(LabelSelector::parse)
-            .transpose()
-            .map_err(|error| {
-                LeaderWatchError::invalid_request("watch.label_selector", error.to_string())
-            })?;
-        let field_selector = request
-            .field_selector()
-            .filter(|selector| !selector.trim().is_empty())
-            .map(FieldSelector::parse)
-            .transpose()
-            .map_err(|error| {
-                LeaderWatchError::invalid_request("watch.field_selector", error.to_string())
-            })?;
-        Ok(Self {
-            api_version: request.api_version().to_string(),
-            kind: request.kind().to_string(),
-            namespace: request.namespace().map(str::to_owned),
-            label_selector,
-            field_selector,
-        })
-    }
-
-    fn matches(&self, resource: &Resource) -> bool {
-        resource.api_version == self.api_version
-            && resource.kind == self.kind
-            && self
-                .namespace
-                .as_deref()
-                .is_none_or(|namespace| resource.namespace.as_deref() == Some(namespace))
-            && self
-                .label_selector
-                .as_ref()
-                .is_none_or(|selector| selector.matches_resource(&resource.data))
-            && self.field_selector.as_ref().is_none_or(|selector| {
-                selector.matches_resource_with_identity(
-                    &resource.api_version,
-                    &resource.kind,
-                    &resource.data,
-                )
-            })
-    }
 }
 
 impl WorkerWatchBus {
@@ -356,7 +123,7 @@ impl WorkerStoreAdapter {
             subnet_allocation: ports.subnet_allocation,
             network_topology: ports.network_topology,
             cleanup_intents: ports.cleanup_intents,
-            transition_projectors: Arc::new(WorkerWatchTransitionProjectors),
+            transition_projectors: Arc::new(klights_watch::SelectorWatchTransitionProjectors),
             watch_events: ports.watch_events,
             node_name,
             current_rv: AtomicI64::new(0),
