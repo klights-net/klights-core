@@ -5,6 +5,67 @@ use std::task::{Context, Poll};
 
 pub use crate::pod_link::allocate_ip_with_reclaim;
 
+/// Empty focused node-network cache for tests that exercise waiter fallback.
+pub struct EmptyPodNetworkCache;
+
+impl klights_node_store::PodNetworkCache for EmptyPodNetworkCache {
+    fn get_network_for_uid(
+        &self,
+        _pod_uid: klights_node_store::PodUidKey,
+    ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
+    {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn get_network_for_pod(
+        &self,
+        _pod: klights_types::PodIdentity,
+    ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
+    {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn get_network_for_sandbox(
+        &self,
+        _sandbox_id: klights_node_store::SandboxKey,
+    ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
+    {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn get_network_for_assignment(
+        &self,
+        _sandbox_id: klights_node_store::SandboxKey,
+        _pod: klights_types::PodIdentity,
+    ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
+    {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn delete_network_for_sandbox(
+        &self,
+        _sandbox_id: klights_node_store::SandboxKey,
+    ) -> klights_node_store::CacheNetworkFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn delete_network_if_matches(
+        &self,
+        _request: klights_node_store::PodNetworkAllocationRequest,
+    ) -> klights_node_store::CacheNetworkFuture<'_, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
+    fn list_network_assignments(
+        &self,
+    ) -> klights_node_store::CacheNetworkFuture<
+        '_,
+        Vec<klights_node_store::PodNetworkAssignmentSnapshot>,
+    > {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum NetworkCall {
     CniAdd {

@@ -183,7 +183,7 @@ impl IntegrationPodWorkerFixture {
                 pod_workqueue_store: node_local.pod_workqueue(),
                 supervisor,
                 metrics: klights_controllers::side_effects::SideEffectMetrics::new(),
-                pod_network_cache: Arc::new(IntegrationEmptyPodNetworkCache),
+                pod_network_cache: Arc::new(klights_networking::test_support::EmptyPodNetworkCache),
                 assignment_waiter: Arc::new(klights_networking::PodNetworkAssignmentBus::new()),
                 outbox,
             },
@@ -594,157 +594,6 @@ pub async fn run_worker_actor_finalization_race() -> anyhow::Result<WorkerFinali
     })
 }
 
-/// Focused status capability used by integration tests.
-pub struct IntegrationPodStatusPorts {
-    writer: Arc<dyn klights_kubelet::pod_repository::status::PodStatusWriter>,
-}
-
-impl IntegrationPodStatusPorts {
-    pub async fn set_pod_status(
-        &self,
-        namespace: &str,
-        name: &str,
-        update: klights_kubelet::pod_repository::PodStatusUpdate,
-        expected_rv: Option<i64>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.writer
-            .set_pod_status(namespace, name, update, expected_rv)
-            .await
-    }
-
-    pub async fn set_pod_status_for_uid(
-        &self,
-        namespace: &str,
-        name: &str,
-        uid: &str,
-        update: klights_kubelet::pod_repository::PodStatusUpdate,
-        expected_rv: Option<i64>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.writer
-            .set_pod_status_for_uid(namespace, name, uid, update, expected_rv)
-            .await
-    }
-
-    pub async fn apply_runtime_reconcile_status(
-        &self,
-        namespace: &str,
-        name: &str,
-        update: klights_kubelet::pod_repository::RuntimeReconcileStatus,
-        expected_rv: Option<i64>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.writer
-            .apply_runtime_reconcile_status(namespace, name, update, expected_rv)
-            .await
-    }
-
-    pub async fn apply_runtime_reconcile_status_for_uid(
-        &self,
-        namespace: &str,
-        name: &str,
-        uid: &str,
-        update: klights_kubelet::pod_repository::RuntimeReconcileStatus,
-        expected_rv: Option<i64>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.writer
-            .apply_runtime_reconcile_status_for_uid(namespace, name, uid, update, expected_rv)
-            .await
-    }
-
-    pub async fn mark_start_pending_for_retry_for_uid(
-        &self,
-        namespace: &str,
-        name: &str,
-        uid: &str,
-        error_message: &str,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.writer
-            .mark_start_pending_for_retry_for_uid(namespace, name, uid, error_message)
-            .await
-    }
-
-    pub async fn set_probe_readiness(
-        &self,
-        namespace: &str,
-        name: &str,
-        container_name: &str,
-        ready: bool,
-        expected_rv: Option<i64>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.writer
-            .set_probe_readiness(namespace, name, container_name, ready, expected_rv)
-            .await
-    }
-
-    pub async fn set_probe_readiness_for_uid(
-        &self,
-        namespace: &str,
-        name: &str,
-        uid: &str,
-        container_name: &str,
-        ready: bool,
-        expected_rv: Option<i64>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.writer
-            .set_probe_readiness_for_uid(namespace, name, uid, container_name, ready, expected_rv)
-            .await
-    }
-
-    pub async fn set_deadline_exceeded(
-        &self,
-        namespace: &str,
-        name: &str,
-        message: String,
-        expected_rv: Option<i64>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.writer
-            .set_deadline_exceeded(namespace, name, message, expected_rv)
-            .await
-    }
-
-    pub async fn set_deadline_exceeded_for_uid(
-        &self,
-        namespace: &str,
-        name: &str,
-        uid: &str,
-        message: String,
-        expected_rv: Option<i64>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.writer
-            .set_deadline_exceeded_for_uid(namespace, name, uid, message, expected_rv)
-            .await
-    }
-
-    pub async fn apply_ephemeral_container_statuses_for_uid(
-        &self,
-        namespace: &str,
-        name: &str,
-        uid: &str,
-        statuses: Vec<serde_json::Value>,
-        expected_rv: Option<i64>,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.writer
-            .apply_ephemeral_container_statuses_for_uid(namespace, name, uid, statuses, expected_rv)
-            .await
-    }
-}
-
-/// Focused node-local network-assignment capability used by tests.
-pub struct IntegrationPodNetworkPorts {
-    assignment: Arc<dyn klights_kubelet::pod_repository::PodNetworkAssignmentQuery>,
-}
-
-impl IntegrationPodNetworkPorts {
-    pub async fn read(
-        &self,
-        request: klights_kubelet::pod_repository::PodNetworkAssignmentRequest,
-    ) -> anyhow::Result<klights_kubelet::pod_repository::PodNetworkAssignment> {
-        self.assignment
-            .read_pod_network_assignment(request)
-            .await
-            .map_err(anyhow::Error::new)
-    }
-}
-
 /// Focused API and subresource capabilities.  These keep API-facing tests
 /// from depending on any repository-wide trait implementation.
 pub struct IntegrationPodApiPorts {
@@ -864,8 +713,8 @@ struct PodRepositoryScenarioOwner {
     update_ports: IntegrationPodUpdatePorts,
     persistence_ports: klights_pod_api::test_support::PodFixturePersistencePorts,
     watch_ports: klights_watch::test_support::WatchFixturePorts,
-    status_ports: IntegrationPodStatusPorts,
-    network_ports: IntegrationPodNetworkPorts,
+    status_ports: klights_kubelet::test_support::pod_status::PodStatusTestPorts,
+    network_ports: klights_kubelet::test_support::pod_network::PodNetworkTestPorts,
     api_ports: IntegrationPodApiPorts,
     deletion_api: klights_kubelet::test_support::pod_deletion::PodDeletionApiTestPorts,
     api_mutations: klights_pod_api::test_support::PodApiMutationPorts,
@@ -962,82 +811,6 @@ impl klights_watch::test_support::WatchFixtureSource for IntegrationPodWatchFixt
                 })
         })
     }
-}
-
-struct IntegrationEmptyPodNetworkCache;
-
-impl klights_node_store::PodNetworkCache for IntegrationEmptyPodNetworkCache {
-    fn get_network_for_uid(
-        &self,
-        _pod_uid: klights_node_store::PodUidKey,
-    ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
-    {
-        Box::pin(async { Ok(None) })
-    }
-
-    fn get_network_for_pod(
-        &self,
-        _pod: klights_types::PodIdentity,
-    ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
-    {
-        Box::pin(async { Ok(None) })
-    }
-
-    fn get_network_for_sandbox(
-        &self,
-        _sandbox_id: klights_node_store::SandboxKey,
-    ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
-    {
-        Box::pin(async { Ok(None) })
-    }
-
-    fn get_network_for_assignment(
-        &self,
-        _sandbox_id: klights_node_store::SandboxKey,
-        _pod: klights_types::PodIdentity,
-    ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
-    {
-        Box::pin(async { Ok(None) })
-    }
-
-    fn delete_network_for_sandbox(
-        &self,
-        _sandbox_id: klights_node_store::SandboxKey,
-    ) -> klights_node_store::CacheNetworkFuture<'_, ()> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn delete_network_if_matches(
-        &self,
-        _request: klights_node_store::PodNetworkAllocationRequest,
-    ) -> klights_node_store::CacheNetworkFuture<'_, bool> {
-        Box::pin(async { Ok(false) })
-    }
-
-    fn list_network_assignments(
-        &self,
-    ) -> klights_node_store::CacheNetworkFuture<
-        '_,
-        Vec<klights_node_store::PodNetworkAssignmentSnapshot>,
-    > {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-}
-
-pub struct IntegrationStatusRaceOutcome {
-    pub attempts: usize,
-    pub resource: Option<crate::datastore::Resource>,
-    pub conflict: bool,
-}
-
-pub struct IntegrationSameNameStatusRaceOutcome {
-    pub old_uid: String,
-    pub replacement: crate::datastore::Resource,
-    pub persisted_after: crate::datastore::Resource,
-    pub persistence_attempts: usize,
-    pub reconcile_effects: usize,
-    pub outbox_enqueues: usize,
-    pub conflict: bool,
 }
 
 pub struct IntegrationApiDeleteStatusRaceOutcome {
@@ -1298,28 +1071,43 @@ enum IntegrationStatusRaceMode {
     },
 }
 
-struct IntegrationStatusRaceWriter {
+struct IntegrationStatusPersistence {
     store: Arc<IntegrationPodStoreFixture>,
-    attempts: std::sync::atomic::AtomicUsize,
-    mode: IntegrationStatusRaceMode,
 }
 
-impl klights_pod_api::PodStatusPersistence for IntegrationStatusRaceWriter {
+impl klights_pod_api::PodStatusPersistence for IntegrationStatusPersistence {
     fn write_pod_status(
         &self,
         request: klights_pod_api::PodStatusWriteRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, crate::datastore::Resource> {
         Box::pin(async move {
-            let klights_pod_api::PodStatusWriteRequest {
-                namespace,
-                name,
-                status,
-                expected_resource_version,
-            } = request;
-            let attempt = self
-                .attempts
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                + 1;
+            self.store
+                .update_pod_status(
+                    &request.namespace,
+                    &request.name,
+                    request.status,
+                    request.expected_resource_version,
+                )
+                .await
+                .map_err(|error| {
+                    klights_pod_api::PodRepositoryError::unavailable(error.to_string())
+                })
+        })
+    }
+}
+
+struct IntegrationStatusRaceHook {
+    store: Arc<IntegrationPodStoreFixture>,
+    mode: IntegrationStatusRaceMode,
+}
+
+impl klights_kubelet::test_support::pod_status::StatusWriteRaceHook for IntegrationStatusRaceHook {
+    fn before_write<'a>(
+        &'a self,
+        attempt: usize,
+        request: &'a klights_pod_api::PodStatusWriteRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'a, ()> {
+        Box::pin(async move {
             let inject = match &self.mode {
                 IntegrationStatusRaceMode::Scheduler => attempt == 1,
                 IntegrationStatusRaceMode::Probe {
@@ -1336,7 +1124,7 @@ impl klights_pod_api::PodStatusPersistence for IntegrationStatusRaceWriter {
                 let current = self
                     .store
                     .query
-                    .get_pod_by_name(&namespace, &name)
+                    .get_pod_by_name(&request.namespace, &request.name)
                     .await
                     .map_err(|error| {
                         klights_pod_api::PodRepositoryError::unavailable(error.to_string())
@@ -1361,7 +1149,12 @@ impl klights_pod_api::PodStatusPersistence for IntegrationStatusRaceWriter {
                 }
                 self.store
                     .persistence
-                    .replace_pod(&namespace, &name, raced, current.resource_version)
+                    .replace_pod(
+                        &request.namespace,
+                        &request.name,
+                        raced,
+                        current.resource_version,
+                    )
                     .await
                     .map_err(|error| {
                         klights_pod_api::PodRepositoryError::unavailable(error.to_string())
@@ -1370,12 +1163,7 @@ impl klights_pod_api::PodStatusPersistence for IntegrationStatusRaceWriter {
                     "injected status race",
                 ));
             }
-            self.store
-                .update_pod_status(&namespace, &name, status, expected_resource_version)
-                .await
-                .map_err(|error| {
-                    klights_pod_api::PodRepositoryError::unavailable(error.to_string())
-                })
+            Ok(())
         })
     }
 }
@@ -1406,47 +1194,10 @@ impl klights_reconcile_api::PodMutationReconcileSink for IntegrationCountingPodM
     }
 }
 
-struct IntegrationPausedStatusWriter {
-    store: Arc<IntegrationPodStoreFixture>,
-    entered: Arc<tokio::sync::Barrier>,
-    release: Arc<tokio::sync::Barrier>,
-    requested_status: std::sync::Mutex<Option<serde_json::Value>>,
-    attempts: std::sync::atomic::AtomicUsize,
-}
-
-impl klights_pod_api::PodStatusPersistence for IntegrationPausedStatusWriter {
-    fn write_pod_status(
-        &self,
-        request: klights_pod_api::PodStatusWriteRequest,
-    ) -> klights_pod_api::PodRepositoryFuture<'_, crate::datastore::Resource> {
-        Box::pin(async move {
-            self.attempts
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.requested_status
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .replace(request.status.clone());
-            self.entered.wait().await;
-            self.release.wait().await;
-            self.store
-                .update_pod_status(
-                    &request.namespace,
-                    &request.name,
-                    request.status,
-                    request.expected_resource_version,
-                )
-                .await
-                .map_err(|error| {
-                    klights_pod_api::PodRepositoryError::unavailable(error.to_string())
-                })
-        })
-    }
-}
-
 pub async fn run_same_name_replacement_status_race(
     mut pod: serde_json::Value,
     update: klights_kubelet::pod_repository::PodStatusUpdate,
-) -> IntegrationSameNameStatusRaceOutcome {
+) -> klights_kubelet::test_support::pod_status::SameNameStatusRaceOutcome {
     let pod_name = "same-name-status-race";
     pod["metadata"]["name"] = serde_json::json!(pod_name);
     let store = Arc::new(IntegrationPodStoreFixture::new().await);
@@ -1457,13 +1208,15 @@ pub async fn run_same_name_replacement_status_race(
         .unwrap();
     let entered = Arc::new(tokio::sync::Barrier::new(2));
     let release = Arc::new(tokio::sync::Barrier::new(2));
-    let writer = Arc::new(IntegrationPausedStatusWriter {
-        store: store.clone(),
-        entered: entered.clone(),
-        release: release.clone(),
-        requested_status: std::sync::Mutex::new(None),
-        attempts: std::sync::atomic::AtomicUsize::new(0),
-    });
+    let writer = Arc::new(
+        klights_kubelet::test_support::pod_status::PausedStatusPersistence::new(
+            Arc::new(IntegrationStatusPersistence {
+                store: store.clone(),
+            }),
+            entered.clone(),
+            release.clone(),
+        ),
+    );
     let reconcile = Arc::new(IntegrationCountingPodMutationReconcile {
         effects: std::sync::atomic::AtomicUsize::new(0),
     });
@@ -1488,12 +1241,7 @@ pub async fn run_same_name_replacement_status_race(
     );
     let replace = async {
         entered.wait().await;
-        let requested_status = writer
-            .requested_status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .expect("paused status request");
+        let requested_status = writer.requested_status().expect("paused status request");
         let mut replacement_body = created.data.as_ref().clone();
         let metadata = replacement_body["metadata"]
             .as_object_mut()
@@ -1524,11 +1272,11 @@ pub async fn run_same_name_replacement_status_race(
         .unwrap()
         .expect("replacement remains persisted");
 
-    IntegrationSameNameStatusRaceOutcome {
+    klights_kubelet::test_support::pod_status::SameNameStatusRaceOutcome {
         old_uid: created.uid,
         replacement,
         persisted_after,
-        persistence_attempts: writer.attempts.load(std::sync::atomic::Ordering::SeqCst),
+        persistence_attempts: writer.attempts(),
         reconcile_effects: reconcile.effects.load(std::sync::atomic::Ordering::SeqCst),
         // This fixture deliberately supplies neither an outbox nor a remote
         // leader query, so the local CAS path has no outbox route to invoke.
@@ -1543,7 +1291,7 @@ async fn integration_status_race_service(
     mode: IntegrationStatusRaceMode,
 ) -> (
     klights_kubelet::pod_repository::status::PodStatusService,
-    Arc<IntegrationStatusRaceWriter>,
+    Arc<klights_kubelet::test_support::pod_status::StatusRacePersistence>,
     crate::datastore::Resource,
 ) {
     let store = Arc::new(IntegrationPodStoreFixture::new().await);
@@ -1552,11 +1300,17 @@ async fn integration_status_race_service(
         .seed_pod("default", pod_name, pod)
         .await
         .unwrap();
-    let writer = Arc::new(IntegrationStatusRaceWriter {
-        store: store.clone(),
-        attempts: std::sync::atomic::AtomicUsize::new(0),
-        mode,
-    });
+    let writer = Arc::new(
+        klights_kubelet::test_support::pod_status::StatusRacePersistence::new(
+            Arc::new(IntegrationStatusPersistence {
+                store: store.clone(),
+            }),
+            Arc::new(IntegrationStatusRaceHook {
+                store: store.clone(),
+                mode,
+            }),
+        ),
+    );
     let service = klights_kubelet::pod_repository::status::PodStatusService::new(
         klights_kubelet::pod_repository::status::PodStatusServiceDependencies {
             pod_query: store.query.query_port(),
@@ -1575,7 +1329,7 @@ async fn integration_status_race_service(
 pub async fn run_scheduler_status_race(
     pod: serde_json::Value,
     update: klights_kubelet::pod_repository::PodStatusUpdate,
-) -> IntegrationStatusRaceOutcome {
+) -> klights_kubelet::test_support::pod_status::StatusRaceOutcome {
     let (service, writer, _) = integration_status_race_service(
         "scheduled-race",
         pod,
@@ -1589,8 +1343,8 @@ pub async fn run_scheduler_status_race(
         .as_ref()
         .err()
         .is_some_and(klights_cluster_datastore::errors::is_conflict_error);
-    IntegrationStatusRaceOutcome {
-        attempts: writer.attempts.load(std::sync::atomic::Ordering::SeqCst),
+    klights_kubelet::test_support::pod_status::StatusRaceOutcome {
+        attempts: writer.attempts(),
         conflict,
         resource: result.ok(),
     }
@@ -1601,7 +1355,7 @@ pub async fn run_probe_readiness_status_race(
     pod: serde_json::Value,
     conflicts: usize,
     pin_resource_version: bool,
-) -> IntegrationStatusRaceOutcome {
+) -> klights_kubelet::test_support::pod_status::StatusRaceOutcome {
     let (service, writer, created) = integration_status_race_service(
         pod_name,
         pod,
@@ -1623,8 +1377,8 @@ pub async fn run_probe_readiness_status_race(
         .as_ref()
         .err()
         .is_some_and(klights_cluster_datastore::errors::is_conflict_error);
-    IntegrationStatusRaceOutcome {
-        attempts: writer.attempts.load(std::sync::atomic::Ordering::SeqCst),
+    klights_kubelet::test_support::pod_status::StatusRaceOutcome {
+        attempts: writer.attempts(),
         conflict,
         resource: result.ok(),
     }
@@ -2050,11 +1804,13 @@ pub async fn run_bound_pod_delete_cas_race(
 }
 
 impl PodRepositoryScenarioOwner {
-    pub fn status_ports(&self) -> &IntegrationPodStatusPorts {
+    pub fn status_ports(&self) -> &klights_kubelet::test_support::pod_status::PodStatusTestPorts {
         &self.status_ports
     }
 
-    pub fn network_ports(&self) -> &IntegrationPodNetworkPorts {
+    pub fn network_ports(
+        &self,
+    ) -> &klights_kubelet::test_support::pod_network::PodNetworkTestPorts {
         &self.network_ports
     }
 
@@ -2370,7 +2126,9 @@ impl PodRepositoryScenarioOwner {
                 supervisor: supervisor.clone(),
                 side_effects: side_effects.clone(),
                 metrics,
-                pod_network_cache: Arc::new(IntegrationEmptyPodNetworkCache),
+                pod_network_cache: Arc::new(
+                    klights_networking::test_support::EmptyPodNetworkCache,
+                ),
                 assignment_waiter: Arc::new(
                     klights_networking::PodNetworkAssignmentBus::new(),
                 ),
@@ -2408,12 +2166,12 @@ impl PodRepositoryScenarioOwner {
                     source: watch_source.clone(),
                 },
             )),
-            status_ports: IntegrationPodStatusPorts {
-                writer: pod_status_writer,
-            },
-            network_ports: IntegrationPodNetworkPorts {
-                assignment: pod_network_assignment,
-            },
+            status_ports: klights_kubelet::test_support::pod_status::PodStatusTestPorts::new(
+                pod_status_writer,
+            ),
+            network_ports: klights_kubelet::test_support::pod_network::PodNetworkTestPorts::new(
+                pod_network_assignment,
+            ),
             api_ports: IntegrationPodApiPorts {
                 subresource: subresource.expect("integration root Pod subresource"),
             },
@@ -2942,7 +2700,7 @@ impl IntegrationPodNetworkScenarioFixture {
     ) -> anyhow::Result<klights_kubelet::pod_repository::PodNetworkAssignment> {
         self.owner
             .network_ports()
-            .read(
+            .read_pod_network_assignment(
                 klights_kubelet::pod_repository::PodNetworkAssignmentRequest::try_new(
                     sandbox_id,
                     klights_types::PodIdentity::new(namespace, name, uid),
@@ -2986,7 +2744,7 @@ impl IntegrationPodStatusFixture {
         }
     }
 
-    pub fn status_ports(&self) -> &IntegrationPodStatusPorts {
+    pub fn status_ports(&self) -> &klights_kubelet::test_support::pod_status::PodStatusTestPorts {
         self.owner.status_ports()
     }
 
@@ -3365,7 +3123,7 @@ impl IntegrationPodWorkerScenarioFixture {
         Self::from_owner(PodRepositoryScenarioOwner::new_cluster_backed(resource_query).await)
     }
 
-    pub fn status_ports(&self) -> &IntegrationPodStatusPorts {
+    pub fn status_ports(&self) -> &klights_kubelet::test_support::pod_status::PodStatusTestPorts {
         self.owner.status_ports()
     }
 
@@ -3568,7 +3326,7 @@ impl IntegrationPodDeletionFixture {
         Self::from_owner(PodRepositoryScenarioOwner::new_cluster_backed(resource_query).await)
     }
 
-    pub fn status_ports(&self) -> &IntegrationPodStatusPorts {
+    pub fn status_ports(&self) -> &klights_kubelet::test_support::pod_status::PodStatusTestPorts {
         self.owner.status_ports()
     }
 
