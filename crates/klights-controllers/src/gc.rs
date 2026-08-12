@@ -815,6 +815,7 @@ async fn delete_resource_for_gc(
         .finalize_non_pod(klights_reconcile_api::GcNonPodFinalizationRequest {
             resource: resource.clone(),
             orphan_children: has_finalizer(&resource.data, "orphan"),
+            remove_foreground_finalizer: false,
         })
         .await
     {
@@ -1702,39 +1703,36 @@ async fn finalize_foreground_owner_resource(
             );
         }
     }
-    let updated = db
-        .update_resource_with_preconditions(
-            &owner.api_version,
-            &owner.kind,
-            owner.namespace.as_deref(),
+    if !is_core_pod(owner) {
+        non_pod_finalization
+            .finalize_non_pod(klights_reconcile_api::GcNonPodFinalizationRequest {
+                resource: owner.clone(),
+                orphan_children: false,
+                remove_foreground_finalizer: true,
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        return Ok(());
+    }
+    db.update_resource_with_preconditions(
+        &owner.api_version,
+        &owner.kind,
+        owner.namespace.as_deref(),
+        &owner.name,
+        data,
+        ResourcePreconditions::from_resource(owner),
+    )
+    .await?;
+    let namespace = owner.namespace.as_deref().unwrap_or("default");
+    pod_delete_sink
+        .request_gc_pod_delete(GcPodDeleteRequest::new(PodIdentity::new(
+            namespace,
             &owner.name,
-            data,
-            ResourcePreconditions::from_resource(owner),
-        )
+            &owner.uid,
+        )))
         .await?;
-    if is_core_pod(owner) {
-        let namespace = owner.namespace.as_deref().unwrap_or("default");
-        pod_delete_sink
-            .request_gc_pod_delete(GcPodDeleteRequest::new(PodIdentity::new(
-                namespace,
-                &owner.name,
-                &owner.uid,
-            )))
-            .await?;
-        return Ok(());
-    }
-    if !non_foreground_finalizers.is_empty() {
-        return Ok(());
-    }
-
-    non_pod_finalization
-        .finalize_non_pod(klights_reconcile_api::GcNonPodFinalizationRequest {
-            resource: updated,
-            orphan_children: false,
-        })
-        .await
-        .map(|_| ())
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
+    Ok(())
 }
 
 #[cfg(test)]

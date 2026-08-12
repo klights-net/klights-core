@@ -634,6 +634,9 @@ pub trait GcPodDeleteSink: Send + Sync {
 pub struct GcNonPodFinalizationRequest {
     pub resource: Resource,
     pub orphan_children: bool,
+    /// The foreground-deletion coordinator has established that no blocking
+    /// dependents remain, so this operation owns removal of that finalizer.
+    pub remove_foreground_finalizer: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
