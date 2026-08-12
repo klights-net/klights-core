@@ -51,6 +51,27 @@ fn leader_endpoints_for_role(role: &NodeRole) -> Vec<String> {
     }
 }
 
+/// Seed the authority route before the Raft metrics publisher starts.
+///
+/// Joining control planes must perform leader-owned bootstrap operations such
+/// as node-subnet allocation before the later bootstrap phase can start the
+/// metrics watcher. Their validated join endpoint is therefore the initial
+/// forward route; subsequent Raft events replace it through the same watch.
+fn initial_authority_state(role: &NodeRole) -> (bool, Option<String>) {
+    match role {
+        NodeRole::Leader { .. } => (true, None),
+        NodeRole::Controlplane {
+            leader_endpoints, ..
+        } if leader_endpoints.is_empty() => (true, None),
+        NodeRole::Controlplane {
+            leader_endpoints, ..
+        }
+        | NodeRole::Worker {
+            leader_endpoints, ..
+        } => (false, leader_endpoints.first().cloned()),
+    }
+}
+
 pub(crate) async fn resolve_token_file_if_present(
     cli: &mut CliFlags,
     file_process: &klights_supervisor::FileProcessExecutor,
@@ -179,21 +200,18 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     //     open_leader, before the shape watcher (later phase) can flip
     //     the bit. Bootstrap's own initial writes (namespaces, RBAC,
     //     ServiceCIDR) must succeed during this window.
-    //   - Joining control-plane / replica learner: `false`. They are
-    //     not the leader until raft membership confirms it; the shape
-    //     watcher in bootstrap.rs flips the bit once `Raft::metrics()`
-    //     reports `current_leader == self.node_id`.
+    //   - Joining control-plane / replica learner: `false`, forwarded to the
+    //     first validated join endpoint so pre-bootstrap network allocation
+    //     can reach the seed. The shape watcher in bootstrap.rs replaces that
+    //     bootstrap route from live `Raft::metrics()` events.
     //   - Worker: irrelevant — workers don't use this watch.
-    let initial_is_leader = match &cli.role {
-        crate::bootstrap::NodeRole::Leader { .. } => true,
-        crate::bootstrap::NodeRole::Controlplane {
-            leader_endpoints, ..
-        } => leader_endpoints.is_empty(),
-        crate::bootstrap::NodeRole::Worker { .. } => false,
-    };
+    let (initial_is_leader, initial_leader_endpoint) = initial_authority_state(&cli.role);
     let (is_leader_tx, is_leader_rx) = tokio::sync::watch::channel::<bool>(initial_is_leader);
     let (leader_authority, authority_publisher) =
-        klights_replication::authority::WatchLeaderAuthority::channel(initial_is_leader, None);
+        klights_replication::authority::WatchLeaderAuthority::channel(
+            initial_is_leader,
+            initial_leader_endpoint,
+        );
 
     let ds = phases::datastore::open_leader(phases::datastore::OpenLeaderArgs {
         config: &config,
@@ -567,6 +585,47 @@ mod tests {
         assert!(!should_use_worker_store_adapter_for_kubelet(
             &seed_controlplane
         ));
+    }
+
+    #[test]
+    fn joining_controlplane_seeds_forward_authority_before_network_boot() {
+        let endpoint = "https://10.99.0.10:7679";
+        let role = NodeRole::Controlplane {
+            leader_endpoints: vec![endpoint.to_string()],
+            token: Some("token".to_string()),
+            skip_ca: false,
+            as_learner: false,
+        };
+
+        let (local, endpoint) = super::initial_authority_state(&role);
+        let (authority, _publisher) =
+            klights_replication::authority::WatchLeaderAuthority::channel(local, endpoint);
+
+        assert!(
+            matches!(
+                klights_leader_api::LeaderAuthority::route(authority.as_ref()),
+                klights_leader_api::AuthorityRoute::Forward { endpoint: route }
+                    if route == "https://10.99.0.10:7679"
+            ),
+            "a joiner must be able to route subnet allocation before its Raft metrics identify the leader"
+        );
+    }
+
+    #[test]
+    fn seed_controlplanes_start_with_local_authority() {
+        for role in [
+            NodeRole::Leader {
+                bootstrap: crate::bootstrap::node_role::LeaderBootstrap::Seed,
+            },
+            NodeRole::Controlplane {
+                leader_endpoints: Vec::new(),
+                token: None,
+                skip_ca: false,
+                as_learner: false,
+            },
+        ] {
+            assert_eq!(super::initial_authority_state(&role), (true, None));
+        }
     }
 
     #[tokio::test]
