@@ -607,6 +607,38 @@ impl UnscheduledPodDeletionPort for RootPodRepositoryPersistenceAdapter {
                         klights_pod_api::UnscheduledPodDeletionError::unavailable(error.to_string())
                     })?;
             }
+            if let Some(commands) = &self.commands {
+                let command = klights_cluster_core::StorageCommand::DeleteResource {
+                    api_version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                    namespace: Some(identity.namespace.clone()),
+                    name: identity.name.clone(),
+                    preconditions,
+                };
+                let request = ResourceCommandRequest::try_new(command).map_err(|error| {
+                    klights_pod_api::UnscheduledPodDeletionError::unavailable(error.to_string())
+                })?;
+                return match commands.submit_resource_command(request).await {
+                    Ok(ResourceCommandResult::Ack { .. }) => {
+                        self.sandbox_gc_dirty.fetch_add(1, Ordering::Release);
+                        Ok(UnscheduledPodDeleteCasOutcome::Removed)
+                    }
+                    Ok(ResourceCommandResult::Resource(_)) => {
+                        Err(klights_pod_api::UnscheduledPodDeletionError::unavailable(
+                            "Raft unscheduled Pod deletion unexpectedly returned a resource",
+                        ))
+                    }
+                    Err(ResourceCommandError::Conflict { .. }) => {
+                        Ok(UnscheduledPodDeleteCasOutcome::Conflict)
+                    }
+                    Err(ResourceCommandError::NotFound { .. }) => {
+                        Ok(UnscheduledPodDeleteCasOutcome::Gone)
+                    }
+                    Err(error) => Err(klights_pod_api::UnscheduledPodDeletionError::unavailable(
+                        error.to_string(),
+                    )),
+                };
+            }
             match self
                 .db
                 .delete_resource_with_preconditions(
@@ -777,15 +809,27 @@ mod tests {
         ResourcePreconditions, StorageCommand, StorageCommandRejectionCode, StorageMutationError,
     };
     use klights_leader_api::{
-        LeaderResourceCommand, ResourceCommandFuture, ResourceCommandRequest, ResourceCommandResult,
+        LeaderResourceCommand, ResourceCommandError, ResourceCommandFuture, ResourceCommandRequest,
+        ResourceCommandResult,
     };
-    use klights_pod_api::{BoundPodFinalizationOutcome, BoundPodFinalizationRequest};
+    use klights_pod_api::{
+        BoundPodFinalizationOutcome, BoundPodFinalizationRequest, UnscheduledPodDeletionOutcome,
+        UnscheduledPodDeletionRequest,
+    };
     use klights_types::PodIdentity;
 
     use super::{new_raft_root_parts, pod_persistence_error};
 
     struct RecordingResourceCommands {
         commands: Mutex<Vec<StorageCommand>>,
+        disposition: CommandDisposition,
+    }
+
+    #[derive(Clone, Copy)]
+    enum CommandDisposition {
+        Ack,
+        Conflict,
+        NotLeader,
     }
 
     impl LeaderResourceCommand for RecordingResourceCommands {
@@ -795,9 +839,15 @@ mod tests {
         ) -> ResourceCommandFuture<'_, ResourceCommandResult> {
             Box::pin(async move {
                 self.commands.lock().unwrap().push(request.into_command());
-                Ok(ResourceCommandResult::Ack {
-                    resource_version: 2,
-                })
+                match self.disposition {
+                    CommandDisposition::Ack => Ok(ResourceCommandResult::Ack {
+                        resource_version: 2,
+                    }),
+                    CommandDisposition::Conflict => Err(ResourceCommandError::Conflict {
+                        message: "resourceVersion precondition failed".to_string(),
+                    }),
+                    CommandDisposition::NotLeader => Err(ResourceCommandError::NotLeader),
+                }
             })
         }
     }
@@ -832,6 +882,7 @@ mod tests {
             .unwrap();
         let commands = Arc::new(RecordingResourceCommands {
             commands: Mutex::new(Vec::new()),
+            disposition: CommandDisposition::Ack,
         });
         let parts = new_raft_root_parts(
             Arc::new(db.clone()),
@@ -873,6 +924,149 @@ mod tests {
                 .is_some(),
             "Raft-root actor finalization must wait for committed apply to remove the Pod"
         );
+    }
+
+    #[tokio::test]
+    async fn raft_root_unscheduled_delete_submits_exact_cas_without_local_mutation() {
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let created = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "unscheduled",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "unscheduled",
+                        "uid": "unscheduled-uid",
+                        "deletionTimestamp": "2026-08-12T00:00:00Z"
+                    },
+                    "spec": {
+                        "containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10"}]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        let commands = Arc::new(RecordingResourceCommands {
+            commands: Mutex::new(Vec::new()),
+            disposition: CommandDisposition::Ack,
+        });
+        let parts = new_raft_root_parts(
+            Arc::new(db.clone()),
+            commands.clone(),
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        );
+
+        let outcome = parts
+            .unscheduled_deletion
+            .delete_unscheduled_pod(
+                UnscheduledPodDeletionRequest::try_new(
+                    PodIdentity::new("default", "unscheduled", "unscheduled-uid"),
+                    created.resource_version,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, UnscheduledPodDeletionOutcome::Removed);
+        assert_eq!(
+            commands.commands.lock().unwrap().as_slice(),
+            &[StorageCommand::DeleteResource {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: "unscheduled".to_string(),
+                preconditions: ResourcePreconditions {
+                    uid: Some("unscheduled-uid".to_string()),
+                    resource_version: Some(created.resource_version),
+                },
+            }]
+        );
+        assert!(
+            db.get_resource("v1", "Pod", Some("default"), "unscheduled")
+                .await
+                .unwrap()
+                .is_some(),
+            "Raft-root unscheduled deletion must wait for committed apply to remove the Pod"
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_root_unscheduled_delete_conflict_and_rejection_preserve_passive_row() {
+        for (disposition, expects_retry) in [
+            (CommandDisposition::Conflict, true),
+            (CommandDisposition::NotLeader, false),
+        ] {
+            let db = crate::datastore::sqlite::Datastore::new_in_memory()
+                .await
+                .unwrap();
+            let created = db
+                .create_resource(
+                    "v1",
+                    "Pod",
+                    Some("default"),
+                    "unscheduled",
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "namespace": "default",
+                            "name": "unscheduled",
+                            "uid": "unscheduled-uid",
+                            "deletionTimestamp": "2026-08-12T00:00:00Z"
+                        },
+                        "spec": {
+                            "containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10"}]
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+            let commands = Arc::new(RecordingResourceCommands {
+                commands: Mutex::new(Vec::new()),
+                disposition,
+            });
+            let parts = new_raft_root_parts(
+                Arc::new(db.clone()),
+                commands.clone(),
+                Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+            );
+
+            let result = parts
+                .unscheduled_deletion
+                .delete_unscheduled_pod(
+                    UnscheduledPodDeletionRequest::try_new(
+                        PodIdentity::new("default", "unscheduled", "unscheduled-uid"),
+                        created.resource_version,
+                    )
+                    .unwrap(),
+                )
+                .await;
+
+            if expects_retry {
+                assert_eq!(result.unwrap(), UnscheduledPodDeletionOutcome::Retry);
+            } else {
+                assert!(
+                    result.is_err(),
+                    "authority rejection must remain retryable upstream"
+                );
+            }
+            assert_eq!(commands.commands.lock().unwrap().len(), 1);
+            assert!(
+                db.get_resource("v1", "Pod", Some("default"), "unscheduled")
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "rejected Raft command must preserve the passive Pod row"
+            );
+        }
     }
 
     #[test]
