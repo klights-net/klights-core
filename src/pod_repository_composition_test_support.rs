@@ -4,6 +4,9 @@ use std::sync::Arc;
 
 use klights_cluster_datastore::sqlite::embedded::ResourceMutationPauseOperation as IntegrationResourceMutationPauseOperation;
 use klights_pod_api::PodSubresourceMutation as _;
+use klights_pod_api::test_support::{
+    PodQueryPorts as IntegrationPodQueryPorts, PodUpdatePorts as IntegrationPodUpdatePorts,
+};
 
 #[derive(Default)]
 struct PodRepositoryRecordingReconcileSink {
@@ -82,11 +85,12 @@ impl IntegrationSchedulerBindGate {
 /// Focused worker-status/outbox fixture.  It owns only worker-safe ports and
 /// node-local state; cluster API capabilities stay outside this type.
 pub struct IntegrationPodWorkerFixture {
-    pod_query: Arc<dyn klights_pod_api::PodQuery>,
     pod_update: Arc<dyn klights_pod_api::PodUpdate>,
     pod_status_writer: Arc<dyn klights_kubelet::pod_repository::status::PodStatusWriter>,
     deletion_finalizer: Arc<dyn klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer>,
     node_local: Arc<crate::bootstrap::node_store::NodeLocalStores>,
+    pub query: klights_pod_api::test_support::PodQueryPorts,
+    pub update: klights_pod_api::test_support::PodUpdatePorts,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,7 +154,7 @@ impl IntegrationPodWorkerFixture {
         ));
         let (
             pod_query,
-            _pod_snapshot,
+            pod_snapshot,
             pod_update,
             pod_status_writer,
             _pod_workqueue,
@@ -184,7 +188,8 @@ impl IntegrationPodWorkerFixture {
             },
         );
         Self {
-            pod_query,
+            query: IntegrationPodQueryPorts::new(pod_query.clone(), pod_snapshot),
+            update: IntegrationPodUpdatePorts::new(pod_update.clone()),
             pod_update,
             pod_status_writer,
             deletion_finalizer,
@@ -214,33 +219,6 @@ impl IntegrationPodWorkerFixture {
             uid,
         )
         .await
-    }
-
-    pub async fn get_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.pod_query
-            .get_pod(klights_pod_api::PodGetRequest::try_by_name(
-                namespace, name,
-            )?)
-            .await
-            .map_err(anyhow::Error::new)
-    }
-
-    pub async fn get_pod_for_uid(
-        &self,
-        namespace: &str,
-        name: &str,
-        uid: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.pod_query
-            .get_pod(klights_pod_api::PodGetRequest::try_by_identity(
-                klights_types::PodIdentity::new(namespace, name, uid),
-            )?)
-            .await
-            .map_err(anyhow::Error::new)
     }
 
     pub async fn set_pod_status_for_uid(
@@ -632,68 +610,6 @@ pub async fn run_worker_actor_finalization_race()
     })
 }
 
-/// Focused query capability used by the integration harness.
-pub struct IntegrationPodQueryPorts {
-    query: Arc<dyn klights_pod_api::PodQuery>,
-    snapshot: Arc<dyn klights_pod_api::PodSnapshotQuery>,
-}
-
-impl IntegrationPodQueryPorts {
-    pub async fn get_pod(
-        &self,
-        request: klights_pod_api::PodGetRequest,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.query
-            .get_pod(request)
-            .await
-            .map_err(anyhow::Error::new)
-    }
-
-    pub async fn list_pods(
-        &self,
-        request: klights_pod_api::PodListRequest,
-    ) -> anyhow::Result<klights_pod_api::PodListResult> {
-        self.query
-            .list_pods(request)
-            .await
-            .map_err(anyhow::Error::new)
-    }
-
-    pub async fn list_pods_by_owner_uid(
-        &self,
-        request: klights_pod_api::PodOwnerListRequest,
-    ) -> anyhow::Result<Vec<crate::datastore::Resource>> {
-        self.query
-            .list_pods_by_owner_uid(request)
-            .await
-            .map_err(anyhow::Error::new)
-    }
-
-    pub async fn snapshot_pods(
-        &self,
-        request: klights_pod_api::PodSnapshotListRequest,
-    ) -> anyhow::Result<klights_pod_api::PodSnapshotListOutcome> {
-        self.snapshot
-            .snapshot_pods(request)
-            .await
-            .map_err(anyhow::Error::new)
-    }
-}
-
-/// Focused metadata mutation capability used by integration tests.
-pub struct IntegrationPodUpdatePorts {
-    update: Arc<dyn klights_pod_api::PodUpdate>,
-}
-
-impl IntegrationPodUpdatePorts {
-    pub async fn update_pod(
-        &self,
-        request: klights_pod_api::PodUpdateRequest,
-    ) -> Result<crate::datastore::Resource, klights_pod_api::PodRepositoryError> {
-        self.update.update_pod(request).await
-    }
-}
-
 /// Focused status capability used by integration tests.
 pub struct IntegrationPodStatusPorts {
     writer: Arc<dyn klights_kubelet::pod_repository::status::PodStatusWriter>,
@@ -853,66 +769,6 @@ pub struct IntegrationPodApiPorts {
 }
 
 impl IntegrationPodApiPorts {
-    pub async fn create(
-        &self,
-        request: klights_pod_api::PodApiCreateRequest,
-    ) -> Result<klights_pod_api::PodApiCreateResult, klights_pod_api::PodRepositoryError> {
-        use klights_pod_api::PodApiMutation as _;
-        self.api.create_pod(request).await
-    }
-
-    pub async fn update_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        body: serde_json::Value,
-        current: crate::datastore::Resource,
-        dry_run: bool,
-    ) -> Result<klights_pod_api::PodApiWriteOutcome, klights_pod_api::PodRepositoryError> {
-        self.update(klights_pod_api::PodApiUpdateRequest {
-            namespace: namespace.to_string(),
-            name: name.to_string(),
-            body,
-            current,
-            dry_run,
-        })
-        .await
-    }
-
-    pub async fn patch_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        patch: serde_json::Value,
-        patch_type: klights_pod_api::PodStatusPatchKind,
-        dry_run: bool,
-    ) -> Result<klights_pod_api::PodApiWriteOutcome, klights_pod_api::PodRepositoryError> {
-        self.patch(klights_pod_api::PodApiPatchRequest {
-            namespace: namespace.to_string(),
-            name: name.to_string(),
-            patch,
-            patch_kind: patch_type,
-            dry_run,
-        })
-        .await
-    }
-
-    pub async fn update(
-        &self,
-        request: klights_pod_api::PodApiUpdateRequest,
-    ) -> Result<klights_pod_api::PodApiWriteOutcome, klights_pod_api::PodRepositoryError> {
-        use klights_pod_api::PodApiMutation as _;
-        self.api.update_pod(request).await
-    }
-
-    pub async fn patch(
-        &self,
-        request: klights_pod_api::PodApiPatchRequest,
-    ) -> Result<klights_pod_api::PodApiWriteOutcome, klights_pod_api::PodRepositoryError> {
-        use klights_pod_api::PodApiMutation as _;
-        self.api.patch_pod(request).await
-    }
-
     pub async fn delete(
         &self,
         request: klights_pod_api::PodApiDeleteRequest,
@@ -1094,9 +950,12 @@ struct PodRepositoryScenarioOwner {
     db: crate::datastore::DatastoreHandle,
     query_ports: IntegrationPodQueryPorts,
     update_ports: IntegrationPodUpdatePorts,
+    persistence_ports: klights_pod_api::test_support::PodFixturePersistencePorts,
+    watch_ports: klights_watch::test_support::WatchFixturePorts,
     status_ports: IntegrationPodStatusPorts,
     network_ports: IntegrationPodNetworkPorts,
     api_ports: IntegrationPodApiPorts,
+    api_mutations: klights_pod_api::test_support::PodApiMutationPorts,
     scheduling: Arc<dyn klights_pod_api::PodScheduling>,
     gc_delete: Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
     deletion_finalizer: Arc<dyn klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer>,
@@ -1104,13 +963,92 @@ struct PodRepositoryScenarioOwner {
     deferred_runtime: klights_kubelet::pod_repository::status::DeferredRuntimeReducerHandle,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
     background: klights_kubelet::pod_repository::background::PodRepositoryBackground,
-    watch_source: Arc<dyn crate::bootstrap::pod_repository_composition::PodWatchSource>,
     controller_dispatcher: Option<Arc<PodRepositoryRecordingReconcileSink>>,
     node_local: Option<Arc<crate::bootstrap::node_store::NodeLocalStores>>,
     outbox_delivery: Option<Arc<dyn klights_leader_api::LeaderOutboxDelivery>>,
     delete_observation: Option<Arc<tokio::sync::Mutex<Option<(bool, bool)>>>>,
     post_write_maintenance_notify:
         Arc<crate::bootstrap::pod_repository_composition::PostWriteMaintenanceTracker>,
+}
+
+struct IntegrationPodFixturePersistence {
+    db: crate::datastore::DatastoreHandle,
+}
+
+impl klights_pod_api::test_support::PodFixturePersistence for IntegrationPodFixturePersistence {
+    fn seed_pod(
+        &self,
+        namespace: String,
+        name: String,
+        body: serde_json::Value,
+    ) -> klights_pod_api::test_support::PodFixturePersistenceFuture<'_> {
+        Box::pin(async move {
+            self.db
+                .create_resource("v1", "Pod", Some(&namespace), &name, body)
+                .await
+                .map_err(|error| {
+                    klights_pod_api::PodRepositoryError::unavailable(error.to_string())
+                })
+        })
+    }
+
+    fn replace_pod(
+        &self,
+        namespace: String,
+        name: String,
+        body: serde_json::Value,
+        expected_resource_version: i64,
+    ) -> klights_pod_api::test_support::PodFixturePersistenceFuture<'_> {
+        Box::pin(async move {
+            self.db
+                .update_resource(
+                    "v1",
+                    "Pod",
+                    Some(&namespace),
+                    &name,
+                    body,
+                    expected_resource_version,
+                )
+                .await
+                .map_err(|error| {
+                    klights_pod_api::PodRepositoryError::unavailable(error.to_string())
+                })
+        })
+    }
+}
+
+struct IntegrationPodWatchFixtureSource {
+    db: crate::datastore::DatastoreHandle,
+    source: Arc<dyn crate::bootstrap::pod_repository_composition::PodWatchSource>,
+}
+
+impl klights_watch::test_support::WatchFixtureSource for IntegrationPodWatchFixtureSource {
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
+        self.source.subscribe_pod_watch()
+    }
+
+    fn pod_events_since(
+        &self,
+        resource_version: i64,
+    ) -> klights_watch::test_support::WatchFixtureFuture<'_> {
+        Box::pin(async move {
+            self.db
+                .list_watch_events_since(
+                    &[crate::datastore::WatchTarget::namespaced("v1", "Pod")],
+                    resource_version,
+                )
+                .await
+                .map(|events| {
+                    events
+                        .into_iter()
+                        .map(|event| klights_watch::test_support::WatchFixtureEvent {
+                            event_type: event.event_type.into_owned(),
+                            resource: event.resource,
+                        })
+                        .collect()
+                })
+        })
+    }
 }
 
 struct IntegrationEmptyPodNetworkCache;
@@ -1218,7 +1156,7 @@ pub async fn run_api_delete_status_race(
 ) -> anyhow::Result<IntegrationApiDeleteStatusRaceOutcome> {
     let repo = PodRepositoryScenarioOwner::new_inline().await;
     let created = repo
-        .api_ports()
+        .api_mutations
         .create(klights_pod_api::PodApiCreateRequest {
             namespace: "default".to_string(),
             body: serde_json::json!({
@@ -1253,7 +1191,7 @@ pub async fn run_api_delete_status_race(
     let race = async {
         pause.wait_until_reached().await;
         let current = repo
-            .query_ports()
+            .query_ports
             .get_pod(klights_pod_api::PodGetRequest::try_by_name(
                 "default", pod_name,
             )?)
@@ -1280,7 +1218,7 @@ pub async fn run_api_delete_status_race(
         }
     };
     let persisted = repo
-        .query_ports()
+        .query_ports
         .get_pod(klights_pod_api::PodGetRequest::try_by_name(
             "default", pod_name,
         )?)
@@ -1298,11 +1236,6 @@ pub struct IntegrationClaimedPodOutbox {
     pub operation: String,
     pub pod_uid: String,
     pub command: IntegrationPodOutboxCommand,
-}
-
-pub struct IntegrationPodWatchEvent {
-    pub event_type: String,
-    pub resource: crate::datastore::Resource,
 }
 
 pub struct IntegrationPodWorkqueueEntry {
@@ -1578,7 +1511,8 @@ impl klights_pod_api::PodStatusPersistence for IntegrationStatusRaceWriter {
             if inject {
                 let current = self
                     .store
-                    .read_pod(&namespace, &name)
+                    .query
+                    .get_pod_by_name(&namespace, &name)
                     .await
                     .map_err(|error| {
                         klights_pod_api::PodRepositoryError::unavailable(error.to_string())
@@ -1602,7 +1536,8 @@ impl klights_pod_api::PodStatusPersistence for IntegrationStatusRaceWriter {
                     }
                 }
                 self.store
-                    .update_pod(&namespace, &name, raced, current.resource_version)
+                    .persistence
+                    .replace_pod(&namespace, &name, raced, current.resource_version)
                     .await
                     .map_err(|error| {
                         klights_pod_api::PodRepositoryError::unavailable(error.to_string())
@@ -1691,7 +1626,11 @@ pub async fn run_same_name_replacement_status_race(
     let pod_name = "same-name-status-race";
     pod["metadata"]["name"] = serde_json::json!(pod_name);
     let store = Arc::new(IntegrationPodStoreFixture::new().await);
-    let created = store.seed_pod("default", pod_name, pod).await.unwrap();
+    let created = store
+        .persistence
+        .seed_pod("default", pod_name, pod)
+        .await
+        .unwrap();
     let entered = Arc::new(tokio::sync::Barrier::new(2));
     let release = Arc::new(tokio::sync::Barrier::new(2));
     let writer = Arc::new(IntegrationPausedStatusWriter {
@@ -1706,7 +1645,7 @@ pub async fn run_same_name_replacement_status_race(
     });
     let service = klights_kubelet::pod_repository::status::PodStatusService::new(
         klights_kubelet::pod_repository::status::PodStatusServiceDependencies {
-            pod_query: store.query_port(),
+            pod_query: store.query.query_port(),
             status_persistence: writer.clone(),
             mutation_reconcile: reconcile.clone(),
             outbox: None,
@@ -1755,7 +1694,8 @@ pub async fn run_same_name_replacement_status_race(
         .err()
         .is_some_and(|error| error.to_string().contains("409"));
     let persisted_after = store
-        .read_pod("default", pod_name)
+        .query
+        .get_pod_by_name("default", pod_name)
         .await
         .unwrap()
         .expect("replacement remains persisted");
@@ -1783,7 +1723,11 @@ async fn integration_status_race_service(
     crate::datastore::Resource,
 ) {
     let store = Arc::new(IntegrationPodStoreFixture::new().await);
-    let created = store.seed_pod("default", pod_name, pod).await.unwrap();
+    let created = store
+        .persistence
+        .seed_pod("default", pod_name, pod)
+        .await
+        .unwrap();
     let writer = Arc::new(IntegrationStatusRaceWriter {
         store: store.clone(),
         attempts: std::sync::atomic::AtomicUsize::new(0),
@@ -1791,7 +1735,7 @@ async fn integration_status_race_service(
     });
     let service = klights_kubelet::pod_repository::status::PodStatusService::new(
         klights_kubelet::pod_repository::status::PodStatusServiceDependencies {
-            pod_query: store.query_port(),
+            pod_query: store.query.query_port(),
             status_persistence: writer.clone(),
             mutation_reconcile: Arc::new(IntegrationNoopPodMutationReconcile),
             outbox: None,
@@ -1972,6 +1916,8 @@ pub struct IntegrationPodStoreFixture {
         dyn crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::LocalBoundPodFinalizationPersistence,
     >,
     unscheduled_deletion: Arc<dyn klights_pod_api::UnscheduledPodDeletion>,
+    pub query: klights_pod_api::test_support::PodQueryPorts,
+    pub persistence: klights_pod_api::test_support::PodFixturePersistencePorts,
 }
 
 impl IntegrationPodStoreFixture {
@@ -1986,52 +1932,15 @@ impl IntegrationPodStoreFixture {
         );
         Self {
             _sqlite: sqlite,
-            db: datastore,
-            store: persistence.store,
+            db: datastore.clone(),
+            store: persistence.store.clone(),
             bound_finalization: persistence.bound_finalization,
             unscheduled_deletion: persistence.unscheduled_deletion,
+            query: IntegrationPodQueryPorts::query_only(persistence.store.clone()),
+            persistence: klights_pod_api::test_support::PodFixturePersistencePorts::new(Arc::new(
+                IntegrationPodFixturePersistence { db: datastore },
+            )),
         }
-    }
-
-    pub async fn seed_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        pod: serde_json::Value,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.store.create(namespace, name, pod).await
-    }
-
-    pub fn query_port(&self) -> Arc<dyn klights_pod_api::PodQuery> {
-        self.store.clone()
-    }
-
-    pub async fn read_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.store.get(namespace, name).await
-    }
-
-    pub async fn list_pods(
-        &self,
-        namespace: Option<&str>,
-        label_selector: Option<&str>,
-    ) -> anyhow::Result<klights_pod_api::PodListResult> {
-        self.store
-            .list(namespace, label_selector, None, None, None)
-            .await
-    }
-
-    pub async fn list_pods_by_owner_uid(
-        &self,
-        namespace: &str,
-        owner_uid: &str,
-    ) -> anyhow::Result<Vec<crate::datastore::Resource>> {
-        self.store
-            .integration_list_by_owner(namespace, owner_uid)
-            .await
     }
 
     pub async fn mark_pod_deleting_for_uid(
@@ -2043,18 +1952,6 @@ impl IntegrationPodStoreFixture {
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.store
             .integration_mark_deleting_latest(namespace, name, uid, deletion_body)
-            .await
-    }
-
-    pub async fn update_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        pod: serde_json::Value,
-        expected_resource_version: i64,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.store
-            .update(namespace, name, pod, expected_resource_version)
             .await
     }
 
@@ -2366,14 +2263,6 @@ pub async fn run_bound_pod_delete_cas_race(
 }
 
 impl PodRepositoryScenarioOwner {
-    pub fn query_ports(&self) -> &IntegrationPodQueryPorts {
-        &self.query_ports
-    }
-
-    pub fn update_ports(&self) -> &IntegrationPodUpdatePorts {
-        &self.update_ports
-    }
-
     pub fn status_ports(&self) -> &IntegrationPodStatusPorts {
         &self.status_ports
     }
@@ -2388,17 +2277,6 @@ impl PodRepositoryScenarioOwner {
 
     pub fn scheduling_ports(&self) -> &dyn klights_pod_api::PodScheduling {
         self.scheduling.as_ref()
-    }
-
-    /// Test-only watch subscription over the canonical store-owned event
-    /// source. This keeps the compatibility fixture focused while avoiding
-    /// any public root repository facade.
-    pub fn subscribe_pod_watch(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
-        crate::bootstrap::pod_repository_composition::PodWatchSource::subscribe_pod_watch(
-            self.watch_source.as_ref(),
-        )
     }
 
     pub async fn new_inline() -> Self {
@@ -2696,7 +2574,7 @@ impl PodRepositoryScenarioOwner {
             watch_source,
             bound_pod_finalization,
             deferred_runtime,
-            _test_api,
+            test_api,
             _test_subresource,
         ) = crate::bootstrap::pod_repository_composition::build_integration_pod_repository_parts(
             crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
@@ -2731,12 +2609,18 @@ impl PodRepositoryScenarioOwner {
         }
         Self {
             _sqlite: sqlite,
-            db,
-            query_ports: IntegrationPodQueryPorts {
-                query: pod_query,
-                snapshot: pod_snapshot,
-            },
-            update_ports: IntegrationPodUpdatePorts { update: pod_update },
+            db: db.clone(),
+            query_ports: IntegrationPodQueryPorts::new(pod_query, pod_snapshot),
+            update_ports: IntegrationPodUpdatePorts::new(pod_update),
+            persistence_ports: klights_pod_api::test_support::PodFixturePersistencePorts::new(
+                Arc::new(IntegrationPodFixturePersistence { db: db.clone() }),
+            ),
+            watch_ports: klights_watch::test_support::WatchFixturePorts::new(Arc::new(
+                IntegrationPodWatchFixtureSource {
+                    db: db.clone(),
+                    source: watch_source.clone(),
+                },
+            )),
             status_ports: IntegrationPodStatusPorts {
                 writer: pod_status_writer,
             },
@@ -2747,6 +2631,9 @@ impl PodRepositoryScenarioOwner {
                 api: api.expect("integration root Pod API"),
                 subresource: subresource.expect("integration root Pod subresource"),
             },
+            api_mutations: klights_pod_api::test_support::PodApiMutationPorts::new(
+                test_api.expect("integration root Pod API mutation port"),
+            ),
             scheduling: scheduling.expect("integration root Pod scheduler"),
             gc_delete,
             deletion_finalizer,
@@ -2754,7 +2641,6 @@ impl PodRepositoryScenarioOwner {
             deferred_runtime,
             supervisor,
             background,
-            watch_source,
             controller_dispatcher,
             node_local,
             outbox_delivery: with_outbox.then_some(local_outbox_delivery),
@@ -2864,7 +2750,7 @@ impl PodRepositoryScenarioOwner {
             .delete_observation
             .as_ref()
             .expect("delete side-effect observation fixture");
-        self.seed_pod(
+        self.persistence_ports.seed_pod(
             "default",
             "side-effect-pod",
             serde_json::json!({
@@ -3007,17 +2893,6 @@ impl PodRepositoryScenarioOwner {
         Ok(())
     }
 
-    pub async fn seed_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        pod: serde_json::Value,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.db
-            .create_resource("v1", "Pod", Some(namespace), name, pod)
-            .await
-    }
-
     pub async fn seed_mutating_webhook_configuration(
         &self,
         name: &str,
@@ -3115,27 +2990,6 @@ impl PodRepositoryScenarioOwner {
             .await
     }
 
-    pub async fn pod_watch_events_since(
-        &self,
-        resource_version: i64,
-    ) -> anyhow::Result<Vec<IntegrationPodWatchEvent>> {
-        self.db
-            .list_watch_events_since(
-                &[crate::datastore::WatchTarget::namespaced("v1", "Pod")],
-                resource_version,
-            )
-            .await
-            .map(|events| {
-                events
-                    .into_iter()
-                    .map(|event| IntegrationPodWatchEvent {
-                        event_type: event.event_type.into_owned(),
-                        resource: event.resource,
-                    })
-                    .collect()
-            })
-    }
-
     pub async fn read_non_pod_resource(
         &self,
         api_version: &str,
@@ -3200,7 +3054,7 @@ impl PodRepositoryScenarioOwner {
     ) -> anyhow::Result<()> {
         klights_controllers::pdb::reconcile_pdb_at(
             self.db.as_ref(),
-            self.query_ports.query.as_ref(),
+            self.query_ports.as_query(),
             pdb,
             now,
         )
@@ -3238,35 +3092,18 @@ impl IntegrationPodConstructionFixture {
 /// Metadata mutation scenarios carry only Pod query/update capabilities.
 pub struct IntegrationPodMetadataFixture {
     owner: Arc<PodRepositoryScenarioOwner>,
+    pub query: klights_pod_api::test_support::PodQueryPorts,
+    pub persistence: klights_pod_api::test_support::PodFixturePersistencePorts,
 }
 
 impl IntegrationPodMetadataFixture {
     pub async fn new_inline() -> Self {
+        let owner = Arc::new(PodRepositoryScenarioOwner::new_inline().await);
         Self {
-            owner: Arc::new(PodRepositoryScenarioOwner::new_inline().await),
+            query: owner.query_ports.clone(),
+            persistence: owner.persistence_ports.clone(),
+            owner,
         }
-    }
-
-    pub async fn get_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.owner
-            .query_ports()
-            .get_pod(klights_pod_api::PodGetRequest::try_by_name(
-                namespace, name,
-            )?)
-            .await
-    }
-
-    pub async fn seed_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        pod: serde_json::Value,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.owner.seed_pod(namespace, name, pod).await
     }
 
     pub async fn update_pod_owner_references_for_uid(
@@ -3277,7 +3114,7 @@ impl IntegrationPodMetadataFixture {
         owner_references: Vec<serde_json::Value>,
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.owner
-            .update_ports()
+            .update_ports
             .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
                 klights_pod_api::PodMutationTarget::try_by_identity(
                     klights_types::PodIdentity::new(namespace, name, uid),
@@ -3296,7 +3133,7 @@ impl IntegrationPodMetadataFixture {
         labels: Vec<(String, String)>,
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.owner
-            .update_ports()
+            .update_ports
             .update_pod(klights_pod_api::PodUpdateRequest::merge_labels(
                 klights_pod_api::PodMutationTarget::try_by_identity(
                     klights_types::PodIdentity::new(namespace, name, uid),
@@ -3350,27 +3187,33 @@ impl IntegrationPodNetworkScenarioFixture {
 /// handles needed by those tests.
 pub struct IntegrationPodStatusFixture {
     owner: Arc<PodRepositoryScenarioOwner>,
+    pub query: klights_pod_api::test_support::PodQueryPorts,
+    pub update: klights_pod_api::test_support::PodUpdatePorts,
+    pub persistence: klights_pod_api::test_support::PodFixturePersistencePorts,
+    pub api_mutations: klights_pod_api::test_support::PodApiMutationPorts,
 }
 
 impl IntegrationPodStatusFixture {
     pub async fn new_inline() -> Self {
+        let owner = Arc::new(PodRepositoryScenarioOwner::new_inline().await);
         Self {
-            owner: Arc::new(PodRepositoryScenarioOwner::new_inline().await),
+            query: owner.query_ports.clone(),
+            update: owner.update_ports.clone(),
+            persistence: owner.persistence_ports.clone(),
+            api_mutations: owner.api_mutations.clone(),
+            owner,
         }
     }
 
     pub async fn new_with_status_dispatcher() -> Self {
+        let owner = Arc::new(PodRepositoryScenarioOwner::new_with_status_dispatcher().await);
         Self {
-            owner: Arc::new(PodRepositoryScenarioOwner::new_with_status_dispatcher().await),
+            query: owner.query_ports.clone(),
+            update: owner.update_ports.clone(),
+            persistence: owner.persistence_ports.clone(),
+            api_mutations: owner.api_mutations.clone(),
+            owner,
         }
-    }
-
-    pub fn query_ports(&self) -> &IntegrationPodQueryPorts {
-        self.owner.query_ports()
-    }
-
-    pub fn update_ports(&self) -> &IntegrationPodUpdatePorts {
-        self.owner.update_ports()
     }
 
     pub fn status_ports(&self) -> &IntegrationPodStatusPorts {
@@ -3379,27 +3222,6 @@ impl IntegrationPodStatusFixture {
 
     pub fn api_ports(&self) -> &IntegrationPodApiPorts {
         self.owner.api_ports()
-    }
-
-    pub async fn get_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.query_ports()
-            .get_pod(klights_pod_api::PodGetRequest::try_by_name(
-                namespace, name,
-            )?)
-            .await
-    }
-
-    pub async fn seed_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        pod: serde_json::Value,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.owner.seed_pod(namespace, name, pod).await
     }
 
     pub async fn seed_non_pod_resource(
@@ -3502,7 +3324,7 @@ impl IntegrationPodStatusFixture {
         name: &str,
         sandbox_id: &str,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.update_ports()
+        self.update
             .update_pod(klights_pod_api::PodUpdateRequest::try_record_sandbox_id(
                 klights_pod_api::PodMutationTarget::try_by_name(namespace, name)?,
                 sandbox_id,
@@ -3518,7 +3340,7 @@ impl IntegrationPodStatusFixture {
         uid: &str,
         sandbox_id: &str,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.update_ports()
+        self.update
             .update_pod(klights_pod_api::PodUpdateRequest::try_record_sandbox_id(
                 klights_pod_api::PodMutationTarget::try_by_identity(
                     klights_types::PodIdentity::new(namespace, name, uid),
@@ -3533,91 +3355,33 @@ impl IntegrationPodStatusFixture {
 /// Watch/store scenarios own a query handle and the canonical watch source;
 /// no mutation, status or controller family is exposed.
 pub struct IntegrationPodStoreWatchFixture {
-    owner: Arc<PodRepositoryScenarioOwner>,
+    _owner: Arc<PodRepositoryScenarioOwner>,
+    pub query: klights_pod_api::test_support::PodQueryPorts,
+    pub persistence: klights_pod_api::test_support::PodFixturePersistencePorts,
+    pub watch: klights_watch::test_support::WatchFixturePorts,
 }
 
 impl IntegrationPodStoreWatchFixture {
     pub async fn new_inline() -> Self {
+        let owner = Arc::new(PodRepositoryScenarioOwner::new_inline().await);
         Self {
-            owner: Arc::new(PodRepositoryScenarioOwner::new_inline().await),
+            query: owner.query_ports.clone(),
+            persistence: owner.persistence_ports.clone(),
+            watch: owner.watch_ports.clone(),
+            _owner: owner,
         }
     }
 
     pub async fn new_cluster_backed(
         resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     ) -> Self {
+        let owner = Arc::new(PodRepositoryScenarioOwner::new_cluster_backed(resource_query).await);
         Self {
-            owner: Arc::new(PodRepositoryScenarioOwner::new_cluster_backed(resource_query).await),
+            query: owner.query_ports.clone(),
+            persistence: owner.persistence_ports.clone(),
+            watch: owner.watch_ports.clone(),
+            _owner: owner,
         }
-    }
-
-    pub fn query_ports(&self) -> &IntegrationPodQueryPorts {
-        self.owner.query_ports()
-    }
-
-    pub async fn get_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.query_ports()
-            .get_pod(klights_pod_api::PodGetRequest::try_by_name(
-                namespace, name,
-            )?)
-            .await
-    }
-
-    pub async fn list_pods(
-        &self,
-        namespace: Option<&str>,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        limit: Option<i64>,
-        continue_token: Option<&str>,
-    ) -> anyhow::Result<klights_pod_api::PodListResult> {
-        self.query_ports()
-            .list_pods(klights_pod_api::PodListRequest::try_new(
-                namespace.map(str::to_string),
-                label_selector.map(str::to_string),
-                field_selector.map(str::to_string),
-                limit,
-                continue_token.map(str::to_string),
-            )?)
-            .await
-    }
-
-    pub async fn list_pods_by_owner_uid(
-        &self,
-        namespace: &str,
-        owner_uid: &str,
-    ) -> anyhow::Result<Vec<crate::datastore::Resource>> {
-        self.query_ports()
-            .list_pods_by_owner_uid(klights_pod_api::PodOwnerListRequest::try_new(
-                namespace, owner_uid,
-            )?)
-            .await
-    }
-
-    pub async fn seed_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        pod: serde_json::Value,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.owner.seed_pod(namespace, name, pod).await
-    }
-
-    pub fn subscribe_pod_watch(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
-        self.owner.subscribe_pod_watch()
-    }
-
-    pub async fn pod_watch_events_since(
-        &self,
-        resource_version: i64,
-    ) -> anyhow::Result<Vec<IntegrationPodWatchEvent>> {
-        self.owner.pod_watch_events_since(resource_version).await
     }
 }
 
@@ -3625,37 +3389,24 @@ impl IntegrationPodStoreWatchFixture {
 /// to seed a Pod and inspect its canonical watch history.
 pub struct IntegrationPodApiFixture {
     owner: Arc<PodRepositoryScenarioOwner>,
+    pub query: klights_pod_api::test_support::PodQueryPorts,
+    pub persistence: klights_pod_api::test_support::PodFixturePersistencePorts,
+    pub watch: klights_watch::test_support::WatchFixturePorts,
 }
 
 impl IntegrationPodApiFixture {
     pub async fn new_inline() -> Self {
+        let owner = Arc::new(PodRepositoryScenarioOwner::new_inline().await);
         Self {
-            owner: Arc::new(PodRepositoryScenarioOwner::new_inline().await),
+            query: owner.query_ports.clone(),
+            persistence: owner.persistence_ports.clone(),
+            watch: owner.watch_ports.clone(),
+            owner,
         }
-    }
-
-    pub fn query_ports(&self) -> &IntegrationPodQueryPorts {
-        self.owner.query_ports()
     }
 
     pub fn api_ports(&self) -> &IntegrationPodApiPorts {
         self.owner.api_ports()
-    }
-
-    pub async fn seed_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        pod: serde_json::Value,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.owner.seed_pod(namespace, name, pod).await
-    }
-
-    pub async fn pod_watch_events_since(
-        &self,
-        resource_version: i64,
-    ) -> anyhow::Result<Vec<IntegrationPodWatchEvent>> {
-        self.owner.pod_watch_events_since(resource_version).await
     }
 }
 
@@ -3663,26 +3414,44 @@ impl IntegrationPodApiFixture {
 /// delivery helpers, but no status, network, deletion or lifecycle facade.
 pub struct IntegrationPodSchedulingFixture {
     owner: Arc<PodRepositoryScenarioOwner>,
+    pub query: klights_pod_api::test_support::PodQueryPorts,
+    pub persistence: klights_pod_api::test_support::PodFixturePersistencePorts,
+    pub watch: klights_watch::test_support::WatchFixturePorts,
+    pub api_mutations: klights_pod_api::test_support::PodApiMutationPorts,
 }
 
 impl IntegrationPodSchedulingFixture {
     pub async fn new_inline() -> Self {
+        let owner = Arc::new(PodRepositoryScenarioOwner::new_inline().await);
         Self {
-            owner: Arc::new(PodRepositoryScenarioOwner::new_inline().await),
+            query: owner.query_ports.clone(),
+            persistence: owner.persistence_ports.clone(),
+            watch: owner.watch_ports.clone(),
+            api_mutations: owner.api_mutations.clone(),
+            owner,
         }
     }
 
     pub async fn new_deferred_leader() -> Self {
+        let owner = Arc::new(PodRepositoryScenarioOwner::new_deferred_leader().await);
         Self {
-            owner: Arc::new(PodRepositoryScenarioOwner::new_deferred_leader().await),
+            query: owner.query_ports.clone(),
+            persistence: owner.persistence_ports.clone(),
+            watch: owner.watch_ports.clone(),
+            api_mutations: owner.api_mutations.clone(),
+            owner,
         }
     }
 
     pub async fn new_deferred_leader_with_node_outbox() -> Self {
+        let owner =
+            Arc::new(PodRepositoryScenarioOwner::new_deferred_leader_with_node_outbox().await);
         Self {
-            owner: Arc::new(
-                PodRepositoryScenarioOwner::new_deferred_leader_with_node_outbox().await,
-            ),
+            query: owner.query_ports.clone(),
+            persistence: owner.persistence_ports.clone(),
+            watch: owner.watch_ports.clone(),
+            api_mutations: owner.api_mutations.clone(),
+            owner,
         }
     }
 
@@ -3690,6 +3459,10 @@ impl IntegrationPodSchedulingFixture {
         let (owner, gate) = PodRepositoryScenarioOwner::new_deferred_leader_with_bind_gate().await;
         (
             Self {
+                query: owner.query_ports.clone(),
+                persistence: owner.persistence_ports.clone(),
+                watch: owner.watch_ports.clone(),
+                api_mutations: owner.api_mutations.clone(),
                 owner: Arc::new(owner),
             },
             gate,
@@ -3697,13 +3470,14 @@ impl IntegrationPodSchedulingFixture {
     }
 
     pub async fn new_with_status_dispatcher() -> Self {
+        let owner = Arc::new(PodRepositoryScenarioOwner::new_with_status_dispatcher().await);
         Self {
-            owner: Arc::new(PodRepositoryScenarioOwner::new_with_status_dispatcher().await),
+            query: owner.query_ports.clone(),
+            persistence: owner.persistence_ports.clone(),
+            watch: owner.watch_ports.clone(),
+            api_mutations: owner.api_mutations.clone(),
+            owner,
         }
-    }
-
-    pub fn query_ports(&self) -> &IntegrationPodQueryPorts {
-        self.owner.query_ports()
     }
 
     pub fn api_ports(&self) -> &IntegrationPodApiPorts {
@@ -3712,46 +3486,6 @@ impl IntegrationPodSchedulingFixture {
 
     pub fn scheduling_ports(&self) -> &dyn klights_pod_api::PodScheduling {
         self.owner.scheduling_ports()
-    }
-
-    pub async fn get_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.query_ports()
-            .get_pod(klights_pod_api::PodGetRequest::try_by_name(
-                namespace, name,
-            )?)
-            .await
-    }
-
-    pub async fn list_pods(
-        &self,
-        namespace: Option<&str>,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        limit: Option<i64>,
-        continue_token: Option<&str>,
-    ) -> anyhow::Result<klights_pod_api::PodListResult> {
-        self.query_ports()
-            .list_pods(klights_pod_api::PodListRequest::try_new(
-                namespace.map(str::to_string),
-                label_selector.map(str::to_string),
-                field_selector.map(str::to_string),
-                limit,
-                continue_token.map(str::to_string),
-            )?)
-            .await
-    }
-
-    pub async fn seed_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        pod: serde_json::Value,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.owner.seed_pod(namespace, name, pod).await
     }
 
     pub async fn seed_scheduling_resource(
@@ -3769,13 +3503,6 @@ impl IntegrationPodSchedulingFixture {
 
     pub async fn pending_reconcile_keys(&self) -> Vec<klights_reconcile_api::ReconcileKey> {
         self.owner.pending_reconcile_keys().await
-    }
-
-    pub async fn pod_watch_events_since(
-        &self,
-        resource_version: i64,
-    ) -> anyhow::Result<Vec<IntegrationPodWatchEvent>> {
-        self.owner.pod_watch_events_since(resource_version).await
     }
 
     pub async fn list_scheduling_resources(
@@ -3823,7 +3550,7 @@ impl IntegrationPodSchedulingFixture {
         _node_name: &str,
         pod: serde_json::Value,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.api_ports()
+        self.api_mutations
             .create(klights_pod_api::PodApiCreateRequest {
                 namespace: namespace.to_string(),
                 body: pod,
@@ -3844,54 +3571,34 @@ impl IntegrationPodSchedulingFixture {
 /// exercise node-outbox routing.
 pub struct IntegrationPodWorkerScenarioFixture {
     owner: Arc<PodRepositoryScenarioOwner>,
+    pub query: klights_pod_api::test_support::PodQueryPorts,
+    pub update: klights_pod_api::test_support::PodUpdatePorts,
+    pub persistence: klights_pod_api::test_support::PodFixturePersistencePorts,
 }
 
 impl IntegrationPodWorkerScenarioFixture {
-    pub async fn new_with_node_outbox() -> Self {
+    fn from_owner(owner: PodRepositoryScenarioOwner) -> Self {
+        let owner = Arc::new(owner);
         Self {
-            owner: Arc::new(PodRepositoryScenarioOwner::new_with_node_outbox().await),
+            query: owner.query_ports.clone(),
+            update: owner.update_ports.clone(),
+            persistence: owner.persistence_ports.clone(),
+            owner,
         }
+    }
+
+    pub async fn new_with_node_outbox() -> Self {
+        Self::from_owner(PodRepositoryScenarioOwner::new_with_node_outbox().await)
     }
 
     pub async fn new_cluster_backed(
         resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     ) -> Self {
-        Self {
-            owner: Arc::new(PodRepositoryScenarioOwner::new_cluster_backed(resource_query).await),
-        }
-    }
-
-    pub fn query_ports(&self) -> &IntegrationPodQueryPorts {
-        self.owner.query_ports()
-    }
-
-    pub fn update_ports(&self) -> &IntegrationPodUpdatePorts {
-        self.owner.update_ports()
+        Self::from_owner(PodRepositoryScenarioOwner::new_cluster_backed(resource_query).await)
     }
 
     pub fn status_ports(&self) -> &IntegrationPodStatusPorts {
         self.owner.status_ports()
-    }
-
-    pub async fn get_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.query_ports()
-            .get_pod(klights_pod_api::PodGetRequest::try_by_name(
-                namespace, name,
-            )?)
-            .await
-    }
-
-    pub async fn seed_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        pod: serde_json::Value,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.owner.seed_pod(namespace, name, pod).await
     }
 
     pub async fn set_pod_status_for_uid(
@@ -3927,7 +3634,7 @@ impl IntegrationPodWorkerScenarioFixture {
         uid: &str,
         sandbox_id: &str,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.update_ports()
+        self.update
             .update_pod(klights_pod_api::PodUpdateRequest::try_record_sandbox_id(
                 klights_pod_api::PodMutationTarget::try_by_identity(
                     klights_types::PodIdentity::new(namespace, name, uid),
@@ -3944,7 +3651,7 @@ impl IntegrationPodWorkerScenarioFixture {
         name: &str,
         refs: Vec<serde_json::Value>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.update_ports()
+        self.update
             .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
                 klights_pod_api::PodMutationTarget::try_by_name(namespace, name)?,
                 klights_pod_api::test_support::owner_references_from_values(refs)?,
@@ -3960,7 +3667,7 @@ impl IntegrationPodWorkerScenarioFixture {
         uid: &str,
         refs: Vec<serde_json::Value>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.update_ports()
+        self.update
             .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
                 klights_pod_api::PodMutationTarget::try_by_identity(
                     klights_types::PodIdentity::new(namespace, name, uid),
@@ -3978,7 +3685,7 @@ impl IntegrationPodWorkerScenarioFixture {
         uid: &str,
         labels: Vec<(String, String)>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.update_ports()
+        self.update
             .update_pod(klights_pod_api::PodUpdateRequest::merge_labels(
                 klights_pod_api::PodMutationTarget::try_by_identity(
                     klights_types::PodIdentity::new(namespace, name, uid),
@@ -4047,49 +3754,48 @@ impl IntegrationPodWorkerScenarioFixture {
 /// network fixtures.
 pub struct IntegrationPodDeletionFixture {
     owner: Arc<PodRepositoryScenarioOwner>,
+    pub query: klights_pod_api::test_support::PodQueryPorts,
+    pub update: klights_pod_api::test_support::PodUpdatePorts,
+    pub persistence: klights_pod_api::test_support::PodFixturePersistencePorts,
+    pub watch: klights_watch::test_support::WatchFixturePorts,
+    pub api_mutations: klights_pod_api::test_support::PodApiMutationPorts,
 }
 
 impl IntegrationPodDeletionFixture {
-    pub async fn new_inline() -> Self {
+    fn from_owner(owner: PodRepositoryScenarioOwner) -> Self {
+        let owner = Arc::new(owner);
         Self {
-            owner: Arc::new(PodRepositoryScenarioOwner::new_inline().await),
+            query: owner.query_ports.clone(),
+            update: owner.update_ports.clone(),
+            persistence: owner.persistence_ports.clone(),
+            watch: owner.watch_ports.clone(),
+            api_mutations: owner.api_mutations.clone(),
+            owner,
         }
+    }
+
+    pub async fn new_inline() -> Self {
+        Self::from_owner(PodRepositoryScenarioOwner::new_inline().await)
     }
 
     pub async fn new_with_status_dispatcher() -> Self {
-        Self {
-            owner: Arc::new(PodRepositoryScenarioOwner::new_with_status_dispatcher().await),
-        }
+        Self::from_owner(PodRepositoryScenarioOwner::new_with_status_dispatcher().await)
     }
 
     pub async fn new_with_delete_side_effect_observation() -> Self {
-        Self {
-            owner: Arc::new(
-                PodRepositoryScenarioOwner::new_with_delete_side_effect_observation().await,
-            ),
-        }
+        Self::from_owner(
+            PodRepositoryScenarioOwner::new_with_delete_side_effect_observation().await,
+        )
     }
 
     pub async fn new_with_gc_workqueue() -> Self {
-        Self {
-            owner: Arc::new(PodRepositoryScenarioOwner::new_with_gc_workqueue().await),
-        }
+        Self::from_owner(PodRepositoryScenarioOwner::new_with_gc_workqueue().await)
     }
 
     pub async fn new_cluster_backed(
         resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     ) -> Self {
-        Self {
-            owner: Arc::new(PodRepositoryScenarioOwner::new_cluster_backed(resource_query).await),
-        }
-    }
-
-    pub fn query_ports(&self) -> &IntegrationPodQueryPorts {
-        self.owner.query_ports()
-    }
-
-    pub fn update_ports(&self) -> &IntegrationPodUpdatePorts {
-        self.owner.update_ports()
+        Self::from_owner(PodRepositoryScenarioOwner::new_cluster_backed(resource_query).await)
     }
 
     pub fn status_ports(&self) -> &IntegrationPodStatusPorts {
@@ -4098,58 +3804,6 @@ impl IntegrationPodDeletionFixture {
 
     pub fn api_ports(&self) -> &IntegrationPodApiPorts {
         self.owner.api_ports()
-    }
-
-    pub async fn get_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.query_ports()
-            .get_pod(klights_pod_api::PodGetRequest::try_by_name(
-                namespace, name,
-            )?)
-            .await
-    }
-
-    pub async fn list_pods(
-        &self,
-        namespace: Option<&str>,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        limit: Option<i64>,
-        continue_token: Option<&str>,
-    ) -> anyhow::Result<klights_pod_api::PodListResult> {
-        self.query_ports()
-            .list_pods(klights_pod_api::PodListRequest::try_new(
-                namespace.map(str::to_string),
-                label_selector.map(str::to_string),
-                field_selector.map(str::to_string),
-                limit,
-                continue_token.map(str::to_string),
-            )?)
-            .await
-    }
-
-    pub async fn list_pods_by_owner_uid(
-        &self,
-        namespace: &str,
-        owner_uid: &str,
-    ) -> anyhow::Result<Vec<crate::datastore::Resource>> {
-        self.query_ports()
-            .list_pods_by_owner_uid(klights_pod_api::PodOwnerListRequest::try_new(
-                namespace, owner_uid,
-            )?)
-            .await
-    }
-
-    pub async fn seed_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        pod: serde_json::Value,
-    ) -> anyhow::Result<crate::datastore::Resource> {
-        self.owner.seed_pod(namespace, name, pod).await
     }
 
     pub async fn seed_scheduling_resource(
@@ -4272,13 +3926,6 @@ impl IntegrationPodDeletionFixture {
             .await
     }
 
-    pub async fn pod_watch_events_since(
-        &self,
-        resource_version: i64,
-    ) -> anyhow::Result<Vec<IntegrationPodWatchEvent>> {
-        self.owner.pod_watch_events_since(resource_version).await
-    }
-
     pub async fn read_namespace(
         &self,
         name: &str,
@@ -4292,7 +3939,7 @@ impl IntegrationPodDeletionFixture {
         name: &str,
         refs: Vec<serde_json::Value>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.update_ports()
+        self.update
             .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
                 klights_pod_api::PodMutationTarget::try_by_name(namespace, name)?,
                 klights_pod_api::test_support::owner_references_from_values(refs)?,
@@ -4307,7 +3954,7 @@ impl IntegrationPodDeletionFixture {
         name: &str,
         labels: Vec<(String, String)>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.update_ports()
+        self.update
             .update_pod(klights_pod_api::PodUpdateRequest::merge_labels(
                 klights_pod_api::PodMutationTarget::try_by_name(namespace, name)?,
                 labels
@@ -4326,7 +3973,7 @@ impl IntegrationPodDeletionFixture {
         uid: &str,
         labels: Vec<(String, String)>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.update_ports()
+        self.update
             .update_pod(klights_pod_api::PodUpdateRequest::merge_labels(
                 klights_pod_api::PodMutationTarget::try_by_identity(
                     klights_types::PodIdentity::new(namespace, name, uid),
@@ -4347,7 +3994,7 @@ impl IntegrationPodDeletionFixture {
         uid: &str,
         refs: Vec<serde_json::Value>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.update_ports()
+        self.update
             .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
                 klights_pod_api::PodMutationTarget::try_by_identity(
                     klights_types::PodIdentity::new(namespace, name, uid),
@@ -4365,7 +4012,7 @@ impl IntegrationPodDeletionFixture {
         _node_name: &str,
         pod: serde_json::Value,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.api_ports()
+        self.api_mutations
             .create(klights_pod_api::PodApiCreateRequest {
                 namespace: namespace.to_string(),
                 body: pod,
@@ -4516,6 +4163,7 @@ pub async fn run_local_bound_finalization_with_incidental_delivery_handles() -> 
         )
         .await?;
     repository
+        .persistence_ports
         .seed_pod(
             "default",
             "local-finalize-child",

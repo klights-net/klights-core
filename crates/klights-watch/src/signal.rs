@@ -487,3 +487,44 @@ mod tests {
         );
     }
 }
+#[cfg(feature = "integration-test-harness")]
+pub mod test_support {
+    use std::{future::Future, pin::Pin, sync::Arc};
+
+    use klights_cluster_core::Resource;
+
+    pub struct WatchFixtureEvent {
+        pub event_type: String,
+        pub resource: Resource,
+    }
+
+    pub type WatchFixtureFuture<'a> =
+        Pin<Box<dyn Future<Output = anyhow::Result<Vec<WatchFixtureEvent>>> + Send + 'a>>;
+
+    pub trait WatchFixtureSource: Send + Sync {
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::WatchEvent>;
+        fn pod_events_since(&self, resource_version: i64) -> WatchFixtureFuture<'_>;
+    }
+
+    #[derive(Clone)]
+    pub struct WatchFixturePorts {
+        source: Arc<dyn WatchFixtureSource>,
+    }
+
+    impl WatchFixturePorts {
+        pub fn new(source: Arc<dyn WatchFixtureSource>) -> Self {
+            Self { source }
+        }
+
+        pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::WatchEvent> {
+            self.source.subscribe()
+        }
+
+        pub async fn pod_events_since(
+            &self,
+            resource_version: i64,
+        ) -> anyhow::Result<Vec<WatchFixtureEvent>> {
+            self.source.pod_events_since(resource_version).await
+        }
+    }
+}

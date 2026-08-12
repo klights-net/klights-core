@@ -43,6 +43,8 @@ pub use session::{
     ProjectedWatchBaselineRequest, ProjectedWatchPlan, WatchResourceProjection, WatchResourceScope,
     WatchScopeResolver, WatchSelectorMembership,
 };
+#[cfg(feature = "integration-test-harness")]
+pub use signal::test_support;
 pub use signal::{
     DEFAULT_WATCH_ADVANCE_GROUP_LIMIT, PostCommitWatchWakeup, WatchAdvance, WatchSignal,
     WatchSignalEvent, WatchSignalFuture, WatchSignalHub, WatchSignalPublish,
