@@ -392,6 +392,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         db,
         leader_resource_query: leader_resource_query.clone(),
         leader_watch: leader_watch.clone(),
+        leader_watch_maintenance: leader_watch_maintenance.clone(),
         leader_cache_readiness: leader_cache_readiness.clone(),
         leader_projected_tokens: leader_projected_tokens.clone(),
         leader_pod_cleanup_intents: leader_pod_cleanup_intents.clone(),

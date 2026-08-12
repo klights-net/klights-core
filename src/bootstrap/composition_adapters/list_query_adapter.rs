@@ -6,19 +6,21 @@ use k8s_native_service::generic_read::{
 };
 
 pub(crate) struct DatastoreListResourceVersionPort {
-    db: crate::datastore::DatastoreHandle,
+    watch_maintenance: Arc<dyn klights_cluster_store::ClusterWatchMaintenance>,
 }
 
 impl DatastoreListResourceVersionPort {
-    pub(crate) fn new(db: crate::datastore::DatastoreHandle) -> Arc<Self> {
-        Arc::new(Self { db })
+    pub(crate) fn new(
+        watch_maintenance: Arc<dyn klights_cluster_store::ClusterWatchMaintenance>,
+    ) -> Arc<Self> {
+        Arc::new(Self { watch_maintenance })
     }
 }
 
 impl ListResourceVersionPort for DatastoreListResourceVersionPort {
     fn advance_after(&self, minimum_resource_version: i64) -> ListResourceVersionFuture<'_> {
         Box::pin(async move {
-            self.db
+            self.watch_maintenance
                 .advance_resource_version_after(minimum_resource_version)
                 .await
         })
@@ -89,5 +91,56 @@ impl NamespaceListPort for DatastoreNamespaceListPort {
                 })
                 .map_err(k8s_native_service::AppError::from)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingWatchMaintenance {
+        calls: AtomicUsize,
+        returned_rv: i64,
+    }
+
+    #[async_trait]
+    impl klights_cluster_store::ClusterWatchMaintenance for RecordingWatchMaintenance {
+        async fn advance_resource_version_after(&self, _min_rv: i64) -> anyhow::Result<i64> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.returned_rv)
+        }
+
+        async fn watch_events_gc_prunable_count(
+            &self,
+            _max_rows: i64,
+            _batch_cap: i64,
+        ) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn gc_watch_events(&self, _max_rows: i64, _batch_cap: i64) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn inconsistent_continue_rv_advance_uses_cluster_watch_maintenance() {
+        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+            .await
+            .unwrap();
+        let before = db.get_current_resource_version().await.unwrap();
+        let maintenance = Arc::new(RecordingWatchMaintenance {
+            calls: AtomicUsize::new(0),
+            returned_rv: before + 11,
+        });
+        let port = DatastoreListResourceVersionPort::new(maintenance.clone());
+
+        let advanced = port.advance_after(before + 10).await.unwrap();
+
+        assert_eq!(advanced, before + 11);
+        assert_eq!(maintenance.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(db.get_current_resource_version().await.unwrap(), before);
     }
 }

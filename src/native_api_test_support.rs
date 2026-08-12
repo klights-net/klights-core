@@ -1545,7 +1545,13 @@ impl NativeApiTestHarness {
             resource_command.clone(),
             finalizer_lifecycle,
             mutation_effects,
-            crate::bootstrap::composition_adapters::list_query_adapter::DatastoreListResourceVersionPort::new(datastore.clone()),
+            crate::bootstrap::composition_adapters::list_query_adapter::DatastoreListResourceVersionPort::new(Arc::new(
+                crate::bootstrap::composition_adapters::leader_maintenance_adapter::ClusterStoreLeaderMaintenance::new(
+                    datastore.clone(),
+                    Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(datastore.clone())),
+                    crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+                ),
+            )),
             crate::bootstrap::composition_adapters::list_query_adapter::DatastoreNamespaceListPort::new(datastore.clone()),
             crate::bootstrap::controller_adapters::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
                 datastore.clone(),

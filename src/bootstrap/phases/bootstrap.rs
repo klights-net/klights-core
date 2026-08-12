@@ -76,6 +76,7 @@ pub struct BootstrapRunArgs<'a> {
     pub db: &'a dyn crate::datastore::DatastoreBackend,
     pub leader_resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     pub leader_watch: Arc<dyn klights_leader_api::LeaderWatch>,
+    pub leader_watch_maintenance: Arc<dyn klights_cluster_store::ClusterWatchMaintenance>,
     pub leader_cache_readiness: Arc<dyn klights_leader_api::LeaderCacheReadiness>,
     pub leader_projected_tokens:
         Arc<dyn klights_leader_api::LeaderProjectedServiceAccountToken>,
@@ -318,6 +319,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         db,
         leader_resource_query,
         leader_watch,
+        leader_watch_maintenance,
         leader_cache_readiness,
         leader_projected_tokens,
         leader_pod_cleanup_intents,
@@ -1023,7 +1025,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         metrics.clone(),
     );
     let list_resource_versions =
-        crate::bootstrap::composition_adapters::list_query_adapter::DatastoreListResourceVersionPort::new(db_handle.clone());
+        crate::bootstrap::composition_adapters::list_query_adapter::DatastoreListResourceVersionPort::new(leader_watch_maintenance);
     let gc_owner_lifecycle =
         crate::bootstrap::controller_adapters::gc_delete_adapter::GcOwnerLifecycleAdapter::new_with_coordination(
             db_handle.clone(),
