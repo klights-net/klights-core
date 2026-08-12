@@ -151,6 +151,243 @@ impl klights_leader_api::LeaderResourceCommand for RecordingBootstrapCommands {
     }
 }
 
+struct RecordingCronJobCommands {
+    commands: Mutex<Vec<StorageCommand>>,
+    reject_as_follower: bool,
+}
+
+impl klights_leader_api::LeaderResourceCommand for RecordingCronJobCommands {
+    fn submit_resource_command(
+        &self,
+        request: klights_leader_api::ResourceCommandRequest,
+    ) -> klights_leader_api::ResourceCommandFuture<'_, klights_leader_api::ResourceCommandResult>
+    {
+        Box::pin(async move {
+            let command = request.into_command();
+            self.commands.lock().unwrap().push(command.clone());
+            if self.reject_as_follower {
+                return Err(klights_leader_api::ResourceCommandError::NotLeader);
+            }
+            match command {
+                StorageCommand::CreateResource { mut data, .. } => {
+                    data["metadata"]["uid"] = serde_json::json!("cronjob-job-uid");
+                    data["metadata"]["resourceVersion"] = serde_json::json!("72");
+                    Ok(klights_leader_api::ResourceCommandResult::Resource(
+                        klights_cluster_core::Resource::try_from_data(Arc::new(data)).unwrap(),
+                    ))
+                }
+                StorageCommand::UpdateStatus {
+                    api_version,
+                    kind,
+                    namespace,
+                    name,
+                    status,
+                    ..
+                } => Ok(klights_leader_api::ResourceCommandResult::Resource(
+                    klights_cluster_core::Resource::try_from_data(Arc::new(serde_json::json!({
+                        "apiVersion": api_version,
+                        "kind": kind,
+                        "metadata": {
+                            "name": name,
+                            "namespace": namespace,
+                            "uid": "cronjob-uid",
+                            "resourceVersion": "72"
+                        },
+                        "status": status
+                    })))
+                    .unwrap(),
+                )),
+                StorageCommand::DeleteResource { .. } => {
+                    Ok(klights_leader_api::ResourceCommandResult::Ack {
+                        resource_version: 72,
+                    })
+                }
+                other => panic!("unexpected CronJob command: {other:?}"),
+            }
+        })
+    }
+}
+
+fn cronjob_job() -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": "forbid-786492620",
+            "namespace": "cronjob-8930",
+            "ownerReferences": [{
+                "apiVersion": "batch/v1",
+                "kind": "CronJob",
+                "name": "forbid",
+                "uid": "cronjob-uid",
+                "controller": true,
+                "blockOwnerDeletion": true
+            }]
+        },
+        "spec": {"template": {"spec": {"restartPolicy": "Never", "containers": []}}}
+    })
+}
+
+#[tokio::test]
+async fn cronjob_job_create_routes_exact_raft_command_without_passive_mutation() {
+    use klights_controllers::cronjob::CronJobStore as _;
+
+    let passive = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
+    let before_rv = passive.get_current_resource_version().await.unwrap();
+    let commands = Arc::new(RecordingCronJobCommands {
+        commands: Mutex::new(Vec::new()),
+        reject_as_follower: false,
+    });
+    let port = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
+        Arc::new(passive.clone()),
+        commands.clone(),
+    );
+    let job = cronjob_job();
+
+    let created = port
+        .create_job("cronjob-8930", "forbid-786492620", job.clone())
+        .await
+        .expect("authoritative CronJob Job create is proposed");
+
+    assert_eq!(created.resource_version, 72);
+    assert_eq!(
+        commands.commands.lock().unwrap().as_slice(),
+        &[StorageCommand::CreateResource {
+            api_version: "batch/v1".into(),
+            kind: "Job".into(),
+            namespace: Some("cronjob-8930".into()),
+            name: "forbid-786492620".into(),
+            data: job,
+        }]
+    );
+    assert!(
+        passive
+            .get_resource("batch/v1", "Job", Some("cronjob-8930"), "forbid-786492620",)
+            .await
+            .unwrap()
+            .is_none(),
+        "CronJob controller must not materialize the Job in its passive local store"
+    );
+    assert_eq!(
+        passive.get_current_resource_version().await.unwrap(),
+        before_rv
+    );
+}
+
+#[tokio::test]
+async fn cronjob_job_create_follower_rejection_preserves_passive_store() {
+    use klights_controllers::cronjob::CronJobStore as _;
+
+    let passive = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
+    let before_rv = passive.get_current_resource_version().await.unwrap();
+    let commands = Arc::new(RecordingCronJobCommands {
+        commands: Mutex::new(Vec::new()),
+        reject_as_follower: true,
+    });
+    let port = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
+        Arc::new(passive.clone()),
+        commands,
+    );
+
+    let error = port
+        .create_job("cronjob-8930", "forbid-786492620", cronjob_job())
+        .await
+        .expect_err("follower CronJob effect must be rejected");
+
+    assert!(
+        matches!(
+            error,
+            klights_reconcile_api::ControllerStoreError::Unavailable(_)
+        ),
+        "follower rejection must remain retryable"
+    );
+    assert!(
+        passive
+            .get_resource("batch/v1", "Job", Some("cronjob-8930"), "forbid-786492620",)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        passive.get_current_resource_version().await.unwrap(),
+        before_rv
+    );
+}
+
+#[tokio::test]
+async fn cronjob_job_delete_and_status_preserve_strict_uid_rv_preconditions() {
+    use klights_controllers::common::ControllerStatusStore as _;
+    use klights_controllers::cronjob::CronJobStore as _;
+
+    let passive = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
+    let commands = Arc::new(RecordingCronJobCommands {
+        commands: Mutex::new(Vec::new()),
+        reject_as_follower: false,
+    });
+    let port = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
+        Arc::new(passive),
+        commands.clone(),
+    );
+
+    port.delete_job(
+        "cronjob-8930",
+        "forbid-786492620",
+        "cronjob-job-uid".into(),
+        71,
+    )
+    .await
+    .expect("CronJob history delete is proposed");
+    port.update_status(
+        "batch/v1",
+        "CronJob",
+        Some("cronjob-8930"),
+        "forbid",
+        serde_json::json!({"lastScheduleTime": "2026-08-11T23:57:00Z"}),
+        klights_cluster_core::ResourcePreconditions::uid_and_resource_version("cronjob-uid", 941),
+    )
+    .await
+    .expect("CronJob status CAS is proposed");
+
+    assert!(matches!(
+        commands.commands.lock().unwrap().as_slice(),
+        [
+            StorageCommand::DeleteResource {
+                api_version,
+                kind,
+                namespace: Some(namespace),
+                name,
+                preconditions,
+            },
+            StorageCommand::UpdateStatus {
+                api_version: status_api_version,
+                kind: status_kind,
+                namespace: Some(status_namespace),
+                name: status_name,
+                expected_rv: Some(941),
+                preconditions: status_preconditions,
+                ..
+            }
+        ] if api_version == "batch/v1"
+            && kind == "Job"
+            && namespace == "cronjob-8930"
+            && name == "forbid-786492620"
+            && preconditions.uid.as_deref() == Some("cronjob-job-uid")
+            && preconditions.resource_version == Some(71)
+            && status_api_version == "batch/v1"
+            && status_kind == "CronJob"
+            && status_namespace == "cronjob-8930"
+            && status_name == "forbid"
+            && status_preconditions.uid.as_deref() == Some("cronjob-uid")
+            && status_preconditions.resource_version == Some(941)
+    ));
+}
+
 #[tokio::test]
 async fn seed_bootstrap_mutation_uses_command_port_without_passive_write() {
     use klights_controllers::kube_service::KubernetesBootstrapStore as _;

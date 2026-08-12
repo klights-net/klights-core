@@ -443,6 +443,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     let node_lifecycle_handle = bp.node_lifecycle_handle;
     let scheduler_controller_handle = bp.scheduler_controller_handle;
     let dispatcher_for_worker = bp.dispatcher_for_worker;
+    let cronjob_store = bp.cronjob_store;
     let app = bp.app;
     let cri_for_shutdown = cri_for_api.clone();
     let dispatcher_for_cronjobs = dispatcher_for_worker.clone();
@@ -459,6 +460,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         task_supervisor: &task_supervisor,
         dispatcher_for_worker: &dispatcher_for_worker,
         dispatcher_for_cronjobs: &dispatcher_for_cronjobs,
+        cronjob_store: &cronjob_store,
         pod_query: &pod_query,
         pod_sandbox_gc_dirty_counter: &pod_sandbox_gc_dirty_counter,
         pod_scheduling: &pod_scheduling,

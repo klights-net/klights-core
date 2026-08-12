@@ -7,6 +7,7 @@ use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_c
 use crate::datastore::{DatastoreBackend, ResourceListQuery, ResourcePatchRequest};
 use klights_controllers::apiservice::ApiServiceStore;
 use klights_controllers::common::ControllerStatusStore;
+#[cfg(test)]
 use klights_controllers::cronjob::CronJobStore;
 use klights_controllers::csr_signer::CsrStatusStore;
 use klights_controllers::deployment::DeploymentFinalizeStore;
@@ -542,65 +543,6 @@ impl NamespaceBootstrapStore for crate::datastore::sqlite::Datastore {
     }
 }
 
-#[async_trait]
-impl CronJobStore for dyn DatastoreBackend + '_ {
-    async fn get_cronjob(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> ControllerStoreResult<Option<Resource>> {
-        self.get_resource("batch/v1", "CronJob", Some(namespace), name)
-            .await
-            .map_err(map_controller_store_error)
-    }
-
-    async fn get_job(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> ControllerStoreResult<Option<Resource>> {
-        self.get_resource("batch/v1", "Job", Some(namespace), name)
-            .await
-            .map_err(map_controller_store_error)
-    }
-
-    async fn create_job(
-        &self,
-        namespace: &str,
-        name: &str,
-        value: serde_json::Value,
-    ) -> ControllerStoreResult<Resource> {
-        self.create_resource("batch/v1", "Job", Some(namespace), name, value)
-            .await
-            .map_err(map_controller_store_error)
-    }
-
-    async fn list_jobs(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
-        self.list_resources("batch/v1", "Job", Some(namespace), ResourceListQuery::all())
-            .await
-            .map(|listing| listing.items)
-            .map_err(map_controller_store_error)
-    }
-
-    async fn delete_job(
-        &self,
-        namespace: &str,
-        name: &str,
-        uid: String,
-    ) -> ControllerStoreResult<()> {
-        self.delete_resource_with_preconditions(
-            "batch/v1",
-            "Job",
-            Some(namespace),
-            name,
-            ResourcePreconditions::uid(uid),
-        )
-        .await
-        .map(|_| ())
-        .map_err(map_controller_store_error)
-    }
-}
-
 #[cfg(test)]
 #[async_trait]
 impl CronJobStore for crate::datastore::sqlite::Datastore {
@@ -647,13 +589,14 @@ impl CronJobStore for crate::datastore::sqlite::Datastore {
         namespace: &str,
         name: &str,
         uid: String,
+        resource_version: i64,
     ) -> ControllerStoreResult<()> {
         self.delete_resource_with_preconditions(
             "batch/v1",
             "Job",
             Some(namespace),
             name,
-            ResourcePreconditions::uid(uid),
+            ResourcePreconditions::uid_and_resource_version(uid, resource_version),
         )
         .await
         .map(|_| ())

@@ -43,6 +43,7 @@ pub trait CronJobStore: ControllerStatusStore {
         namespace: &str,
         name: &str,
         uid: String,
+        resource_version: i64,
     ) -> ControllerStoreResult<()>;
 }
 
@@ -151,7 +152,7 @@ async fn reconcile_cronjob_inner_at<S: CronJobStore + ?Sized>(
             // Replace contract).
             for job in &active_jobs {
                 store
-                    .delete_job(namespace, &job.name, job.uid.clone())
+                    .delete_job(namespace, &job.name, job.uid.clone(), job.resource_version)
                     .await?;
             }
         }
@@ -420,7 +421,7 @@ async fn cleanup_old_jobs_by_history_limit<S: CronJobStore + ?Sized>(
         let to_delete = successful_jobs.len() - successful_limit;
         for job in successful_jobs.iter().take(to_delete) {
             store
-                .delete_job(namespace, &job.name, job.uid.clone())
+                .delete_job(namespace, &job.name, job.uid.clone(), job.resource_version)
                 .await?;
             tracing::info!(
                 "CronJob {}/{}: cleaned up old successful Job {} (limit={})",
@@ -439,7 +440,7 @@ async fn cleanup_old_jobs_by_history_limit<S: CronJobStore + ?Sized>(
         let to_delete = failed_jobs.len() - failed_limit;
         for job in failed_jobs.iter().take(to_delete) {
             store
-                .delete_job(namespace, &job.name, job.uid.clone())
+                .delete_job(namespace, &job.name, job.uid.clone(), job.resource_version)
                 .await?;
             tracing::info!(
                 "CronJob {}/{}: cleaned up old failed Job {} (limit={})",
@@ -717,9 +718,13 @@ mod tests {
             namespace: &str,
             name: &str,
             uid: String,
+            resource_version: i64,
         ) -> ControllerStoreResult<()> {
             self.jobs.lock().unwrap().retain(|job| {
-                !(job.namespace.as_deref() == Some(namespace) && job.name == name && job.uid == uid)
+                !(job.namespace.as_deref() == Some(namespace)
+                    && job.name == name
+                    && job.uid == uid
+                    && job.resource_version == resource_version)
             });
             Ok(())
         }

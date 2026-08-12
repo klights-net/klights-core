@@ -6,7 +6,8 @@ use klights_cluster_core::{
 };
 use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult as Result};
 
-use crate::datastore::DatastoreHandle;
+use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
+use crate::datastore::{DatastoreHandle, ResourceListQuery};
 use klights_controllers::{
     ControllerEffectPort, ControllerNetworkPort, ControllerReconcilePort, ControllerResourceQuery,
 };
@@ -705,6 +706,66 @@ impl klights_controllers::common::ControllerStatusStore for RootControllerLeader
             resource,
             reason,
         );
+    }
+}
+
+#[async_trait]
+impl klights_controllers::cronjob::CronJobStore for RootControllerLeaderPort {
+    async fn get_cronjob(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
+        self.store
+            .get_resource("batch/v1", "CronJob", Some(namespace), name)
+            .await
+            .map_err(map_controller_store_error)
+    }
+
+    async fn get_job(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
+        self.store
+            .get_resource("batch/v1", "Job", Some(namespace), name)
+            .await
+            .map_err(map_controller_store_error)
+    }
+
+    async fn create_job(
+        &self,
+        namespace: &str,
+        name: &str,
+        value: serde_json::Value,
+    ) -> Result<Resource> {
+        validate_controller_effect()?;
+        self.submit_resource(StorageCommand::CreateResource {
+            api_version: "batch/v1".into(),
+            kind: "Job".into(),
+            namespace: Some(namespace.into()),
+            name: name.into(),
+            data: value,
+        })
+        .await
+    }
+
+    async fn list_jobs(&self, namespace: &str) -> Result<Vec<Resource>> {
+        self.store
+            .list_resources("batch/v1", "Job", Some(namespace), ResourceListQuery::all())
+            .await
+            .map(|listing| listing.items)
+            .map_err(map_controller_store_error)
+    }
+
+    async fn delete_job(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: String,
+        resource_version: i64,
+    ) -> Result<()> {
+        validate_controller_effect()?;
+        self.submit_ack(StorageCommand::DeleteResource {
+            api_version: "batch/v1".into(),
+            kind: "Job".into(),
+            namespace: Some(namespace.into()),
+            name: name.into(),
+            preconditions: ResourcePreconditions::uid_and_resource_version(uid, resource_version),
+        })
+        .await
     }
 }
 

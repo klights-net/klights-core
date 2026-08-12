@@ -42,6 +42,7 @@ pub struct BootstrapPhase {
     pub node_lifecycle_handle: Option<SupervisedJoinHandle<()>>,
     pub scheduler_controller_handle: Option<SupervisedJoinHandle<()>>,
     pub dispatcher_for_worker: Arc<klights_controllers::ControllerDispatcher>,
+    pub cronjob_store: Arc<dyn klights_controllers::cronjob::CronJobStore>,
     pub app: axum::Router,
 }
 
@@ -1900,6 +1901,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         node_lifecycle_handle,
         scheduler_controller_handle,
         dispatcher_for_worker,
+        cronjob_store: controller_leader_ports,
         app,
     })
 }

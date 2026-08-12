@@ -12,6 +12,7 @@ use klights_supervisor::TaskSupervisor;
 
 struct LeaderCronJobSchedulerRuntime {
     db: DatastoreHandle,
+    store: Arc<dyn klights_controllers::cronjob::CronJobStore>,
     dispatcher: Arc<ControllerDispatcher>,
     positioned_watch: klights_watch::PositionedWatchService,
 }
@@ -45,7 +46,7 @@ impl CronJobSchedulerRuntime for LeaderCronJobSchedulerRuntime {
         klights_leader_api::validate_controller_lease_if_scoped()
             .map_err(|error| CronJobSchedulerRuntimeError::reconcile_failed(error.to_string()))?;
         klights_controllers::cronjob::reconcile_cronjob_one_at(
-            self.db.as_ref(),
+            self.store.as_ref(),
             Some(self.dispatcher.as_ref()),
             &resource.data,
             resource.resource_version,
@@ -85,6 +86,7 @@ impl CronJobSchedulerRuntime for LeaderCronJobSchedulerRuntime {
 
 pub(crate) fn new_leader_scheduler(
     db: DatastoreHandle,
+    store: Arc<dyn klights_controllers::cronjob::CronJobStore>,
     positioned_watch: klights_watch::PositionedWatchService,
     dispatcher: Arc<ControllerDispatcher>,
     supervisor: Arc<TaskSupervisor>,
@@ -93,6 +95,7 @@ pub(crate) fn new_leader_scheduler(
         Arc::new(LeaderCronJobSchedulerRuntime {
             positioned_watch,
             db,
+            store,
             dispatcher,
         }),
         supervisor,
@@ -138,6 +141,11 @@ mod tests {
                     db_handle.clone(),
                 ),
             db: db_handle,
+            store: Arc::new(
+                crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(
+                    Arc::new(db.clone()),
+                ),
+            ),
             dispatcher,
         };
 
