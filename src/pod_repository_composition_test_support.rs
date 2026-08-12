@@ -16,66 +16,6 @@ use klights_pod_api::test_support::{
     PodQueryPorts as IntegrationPodQueryPorts, PodUpdatePorts as IntegrationPodUpdatePorts,
 };
 
-#[derive(Default)]
-struct PodRepositoryRecordingReconcileSink {
-    keys: tokio::sync::Mutex<Vec<klights_reconcile_api::ReconcileKey>>,
-}
-
-impl PodRepositoryRecordingReconcileSink {
-    async fn record(&self, keys: impl IntoIterator<Item = klights_reconcile_api::ReconcileKey>) {
-        let mut recorded = self.keys.lock().await;
-        for key in keys {
-            if !recorded.contains(&key) {
-                recorded.push(key);
-            }
-        }
-    }
-
-    async fn enqueue_key(&self, key: klights_reconcile_api::ReconcileKey) {
-        self.record([key]).await;
-    }
-
-    async fn pending_keys(&self) -> Vec<klights_reconcile_api::ReconcileKey> {
-        self.keys.lock().await.clone()
-    }
-}
-
-impl klights_reconcile_api::ControllerReconcileSink for PodRepositoryRecordingReconcileSink {
-    fn enqueue_reconcile_batch(
-        &self,
-        keys: Vec<klights_reconcile_api::ReconcileKey>,
-    ) -> klights_reconcile_api::ReconcileSinkFuture<'_> {
-        Box::pin(async move {
-            if keys
-                .iter()
-                .any(|key| key.api_version() == "v1" && key.kind() == "Service")
-            {
-                return Err(klights_reconcile_api::ReconcileSinkError::unsupported_key(
-                    "Service reconcile keys must use ServiceReconcileSink",
-                ));
-            }
-            self.record(keys).await;
-            Ok(())
-        })
-    }
-}
-
-impl klights_reconcile_api::ServiceReconcileSink for PodRepositoryRecordingReconcileSink {
-    fn enqueue_service_reconcile_batch(
-        &self,
-        keys: Vec<klights_reconcile_api::ServiceReconcileKey>,
-    ) -> klights_reconcile_api::ReconcileSinkFuture<'_> {
-        Box::pin(async move {
-            self.record(
-                keys.into_iter()
-                    .map(klights_reconcile_api::ServiceReconcileKey::into_reconcile_key),
-            )
-            .await;
-            Ok(())
-        })
-    }
-}
-
 pub struct IntegrationSchedulerBindGate {
     gate: Arc<crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest>,
 }
@@ -286,13 +226,8 @@ impl IntegrationPodWorkerFixture {
         uid: &str,
         owner_references: Vec<serde_json::Value>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.pod_update
-            .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
-                klights_pod_api::PodMutationTarget::try_by_identity(
-                    klights_types::PodIdentity::new(namespace, name, uid),
-                )?,
-                klights_pod_api::test_support::owner_references_from_values(owner_references)?,
-            ))
+        self.update
+            .replace_owner_references_for_uid(namespace, name, uid, owner_references)
             .await
             .map_err(anyhow::Error::new)
     }
@@ -305,16 +240,8 @@ impl IntegrationPodWorkerFixture {
         uid: &str,
         labels: Vec<(String, String)>,
     ) -> anyhow::Result<crate::datastore::Resource> {
-        self.pod_update
-            .update_pod(klights_pod_api::PodUpdateRequest::merge_labels(
-                klights_pod_api::PodMutationTarget::try_by_identity(
-                    klights_types::PodIdentity::new(namespace, name, uid),
-                )?,
-                labels
-                    .into_iter()
-                    .map(|(key, value)| klights_pod_api::PodLabel::try_new(key, value))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
+        self.update
+            .merge_labels_for_uid(namespace, name, uid, labels)
             .await
             .map_err(anyhow::Error::new)
     }
@@ -725,7 +652,7 @@ struct PodRepositoryScenarioOwner {
     deferred_runtime: klights_kubelet::pod_repository::status::DeferredRuntimeReducerHandle,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
     background: klights_kubelet::pod_repository::background::PodRepositoryBackground,
-    controller_dispatcher: Option<Arc<PodRepositoryRecordingReconcileSink>>,
+    controller_dispatcher: Option<Arc<klights_controllers::test_support::RecordingReconcileSink>>,
     node_local: Option<Arc<crate::bootstrap::node_store::NodeLocalStores>>,
     outbox_delivery: Option<Arc<dyn klights_leader_api::LeaderOutboxDelivery>>,
     delete_observation: Option<Arc<tokio::sync::Mutex<Option<(bool, bool)>>>>,
@@ -910,37 +837,50 @@ pub async fn run_api_delete_status_race(
     })
 }
 
-struct IntegrationRecordingPodDeleteHook {
+/// Narrow `PodQuery` view backed directly by the root datastore handle, used
+/// only to let [`klights_controllers::test_support::RecordingPodDeleteHook`]
+/// observe whether a mutated Pod's row still exists. It intentionally does
+/// not support list operations: the delete-observation hook never calls
+/// them, and this adapter must not become a general-purpose Pod query port.
+struct IntegrationPodDeleteObservationQuery {
     db: crate::datastore::DatastoreHandle,
-    observed: Arc<tokio::sync::Mutex<Option<(bool, bool)>>>,
 }
 
-#[async_trait::async_trait]
-impl klights_controllers::side_effects::SideEffect for IntegrationRecordingPodDeleteHook {
-    fn name(&self) -> &'static str {
-        "integration_recording_pod_delete_hook"
+impl klights_pod_api::PodQuery for IntegrationPodDeleteObservationQuery {
+    fn get_pod(
+        &self,
+        request: klights_pod_api::PodGetRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Option<crate::datastore::Resource>> {
+        Box::pin(async move {
+            self.db
+                .get_resource("v1", "Pod", Some(request.namespace()), request.name())
+                .await
+                .map_err(|error| {
+                    klights_pod_api::PodRepositoryError::unavailable(error.to_string())
+                })
+        })
     }
 
-    async fn apply(&self, resource: &serde_json::Value) -> anyhow::Result<()> {
-        let namespace = resource
-            .pointer("/metadata/namespace")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("default");
-        let name = resource
-            .pointer("/metadata/name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let exists = self
-            .db
-            .get_resource("v1", "Pod", Some(namespace), name)
-            .await?
-            .is_some();
-        let original_owner = resource
-            .pointer("/metadata/ownerReferences/0/name")
-            .and_then(serde_json::Value::as_str)
-            == Some("rs-x");
-        *self.observed.lock().await = Some((exists, original_owner));
-        Ok(())
+    fn list_pods(
+        &self,
+        _request: klights_pod_api::PodListRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodListResult> {
+        Box::pin(async {
+            Err(klights_pod_api::PodRepositoryError::unavailable(
+                "delete-observation query does not support list_pods",
+            ))
+        })
+    }
+
+    fn list_pods_by_owner_uid(
+        &self,
+        _request: klights_pod_api::PodOwnerListRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Vec<crate::datastore::Resource>> {
+        Box::pin(async {
+            Err(klights_pod_api::PodRepositoryError::unavailable(
+                "delete-observation query does not support list_pods_by_owner_uid",
+            ))
+        })
     }
 }
 
@@ -1168,32 +1108,6 @@ impl klights_kubelet::test_support::pod_status::StatusWriteRaceHook for Integrat
     }
 }
 
-struct IntegrationNoopPodMutationReconcile;
-
-impl klights_reconcile_api::PodMutationReconcileSink for IntegrationNoopPodMutationReconcile {
-    fn reconcile_pod_mutation(
-        &self,
-        _request: klights_reconcile_api::PodMutationReconcileRequest,
-    ) -> klights_reconcile_api::ReconcileSinkFuture<'_> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
-struct IntegrationCountingPodMutationReconcile {
-    effects: std::sync::atomic::AtomicUsize,
-}
-
-impl klights_reconcile_api::PodMutationReconcileSink for IntegrationCountingPodMutationReconcile {
-    fn reconcile_pod_mutation(
-        &self,
-        _request: klights_reconcile_api::PodMutationReconcileRequest,
-    ) -> klights_reconcile_api::ReconcileSinkFuture<'_> {
-        self.effects
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Box::pin(async { Ok(()) })
-    }
-}
-
 pub async fn run_same_name_replacement_status_race(
     mut pod: serde_json::Value,
     update: klights_kubelet::pod_repository::PodStatusUpdate,
@@ -1217,9 +1131,8 @@ pub async fn run_same_name_replacement_status_race(
             release.clone(),
         ),
     );
-    let reconcile = Arc::new(IntegrationCountingPodMutationReconcile {
-        effects: std::sync::atomic::AtomicUsize::new(0),
-    });
+    let reconcile =
+        Arc::new(klights_controllers::test_support::CountingPodMutationReconcile::default());
     let service = klights_kubelet::pod_repository::status::PodStatusService::new(
         klights_kubelet::pod_repository::status::PodStatusServiceDependencies {
             pod_query: store.query.query_port(),
@@ -1277,7 +1190,7 @@ pub async fn run_same_name_replacement_status_race(
         replacement,
         persisted_after,
         persistence_attempts: writer.attempts(),
-        reconcile_effects: reconcile.effects.load(std::sync::atomic::Ordering::SeqCst),
+        reconcile_effects: reconcile.effects(),
         // This fixture deliberately supplies neither an outbox nor a remote
         // leader query, so the local CAS path has no outbox route to invoke.
         outbox_enqueues: 0,
@@ -1315,7 +1228,9 @@ async fn integration_status_race_service(
         klights_kubelet::pod_repository::status::PodStatusServiceDependencies {
             pod_query: store.query.query_port(),
             status_persistence: writer.clone(),
-            mutation_reconcile: Arc::new(IntegrationNoopPodMutationReconcile),
+            mutation_reconcile: Arc::new(
+                klights_controllers::test_support::NoopPodMutationReconcile,
+            ),
             outbox: None,
             remote_delivery_required: false,
             cluster_api: None,
@@ -2036,8 +1951,9 @@ impl PodRepositoryScenarioOwner {
             );
         let native_resource_query = repository_cluster_api.clone().unwrap_or(local_query);
         let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-        let controller_dispatcher =
-            with_dispatcher.then(|| Arc::new(PodRepositoryRecordingReconcileSink::default()));
+        let controller_dispatcher = with_dispatcher.then(|| {
+            Arc::new(klights_controllers::test_support::RecordingReconcileSink::default())
+        });
         let mut side_effect_registry = if with_dispatcher {
             crate::bootstrap::side_effects::default_registry(
                 metrics.clone(),
@@ -2053,10 +1969,12 @@ impl PodRepositoryScenarioOwner {
             side_effect_registry.register(
                 "v1",
                 "Pod",
-                Arc::new(IntegrationRecordingPodDeleteHook {
-                    db: db.clone(),
-                    observed: observed.clone(),
-                }),
+                Arc::new(
+                    klights_controllers::test_support::RecordingPodDeleteHook::new(
+                        Arc::new(IntegrationPodDeleteObservationQuery { db: db.clone() }),
+                        observed.clone(),
+                    ),
+                ),
                 klights_controllers::side_effects::ErrorPolicy::Fail,
             );
         }
@@ -2643,12 +2561,7 @@ impl IntegrationPodMetadataFixture {
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.owner
             .update_ports
-            .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
-                klights_pod_api::PodMutationTarget::try_by_identity(
-                    klights_types::PodIdentity::new(namespace, name, uid),
-                )?,
-                klights_pod_api::test_support::owner_references_from_values(owner_references)?,
-            ))
+            .replace_owner_references_for_uid(namespace, name, uid, owner_references)
             .await
             .map_err(anyhow::Error::new)
     }
@@ -2662,15 +2575,7 @@ impl IntegrationPodMetadataFixture {
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.owner
             .update_ports
-            .update_pod(klights_pod_api::PodUpdateRequest::merge_labels(
-                klights_pod_api::PodMutationTarget::try_by_identity(
-                    klights_types::PodIdentity::new(namespace, name, uid),
-                )?,
-                labels
-                    .into_iter()
-                    .map(|(key, value)| klights_pod_api::PodLabel::try_new(key, value))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
+            .merge_labels_for_uid(namespace, name, uid, labels)
             .await
             .map_err(anyhow::Error::new)
     }
@@ -3077,17 +2982,9 @@ impl IntegrationPodSchedulingFixture {
         pod: serde_json::Value,
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.api_mutations
-            .create(klights_pod_api::PodApiCreateRequest {
-                namespace: namespace.to_string(),
-                body: pod,
-                dry_run: false,
-            })
+            .create_or_require_resource(namespace, name, pod)
             .await
-            .map_err(anyhow::Error::new)?
-            .resource
-            .ok_or_else(|| {
-                anyhow::anyhow!("controller Pod {namespace}/{name} unexpectedly dry-ran")
-            })
+            .map_err(anyhow::Error::new)
     }
 }
 
@@ -3178,10 +3075,7 @@ impl IntegrationPodWorkerScenarioFixture {
         refs: Vec<serde_json::Value>,
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.update
-            .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
-                klights_pod_api::PodMutationTarget::try_by_name(namespace, name)?,
-                klights_pod_api::test_support::owner_references_from_values(refs)?,
-            ))
+            .replace_owner_references_by_name(namespace, name, refs)
             .await
             .map_err(anyhow::Error::new)
     }
@@ -3194,12 +3088,7 @@ impl IntegrationPodWorkerScenarioFixture {
         refs: Vec<serde_json::Value>,
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.update
-            .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
-                klights_pod_api::PodMutationTarget::try_by_identity(
-                    klights_types::PodIdentity::new(namespace, name, uid),
-                )?,
-                klights_pod_api::test_support::owner_references_from_values(refs)?,
-            ))
+            .replace_owner_references_for_uid(namespace, name, uid, refs)
             .await
             .map_err(anyhow::Error::new)
     }
@@ -3212,15 +3101,7 @@ impl IntegrationPodWorkerScenarioFixture {
         labels: Vec<(String, String)>,
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.update
-            .update_pod(klights_pod_api::PodUpdateRequest::merge_labels(
-                klights_pod_api::PodMutationTarget::try_by_identity(
-                    klights_types::PodIdentity::new(namespace, name, uid),
-                )?,
-                labels
-                    .into_iter()
-                    .map(|(key, value)| klights_pod_api::PodLabel::try_new(key, value))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
+            .merge_labels_for_uid(namespace, name, uid, labels)
             .await
             .map_err(anyhow::Error::new)
     }
@@ -3466,10 +3347,7 @@ impl IntegrationPodDeletionFixture {
         refs: Vec<serde_json::Value>,
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.update
-            .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
-                klights_pod_api::PodMutationTarget::try_by_name(namespace, name)?,
-                klights_pod_api::test_support::owner_references_from_values(refs)?,
-            ))
+            .replace_owner_references_by_name(namespace, name, refs)
             .await
             .map_err(anyhow::Error::new)
     }
@@ -3481,13 +3359,7 @@ impl IntegrationPodDeletionFixture {
         labels: Vec<(String, String)>,
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.update
-            .update_pod(klights_pod_api::PodUpdateRequest::merge_labels(
-                klights_pod_api::PodMutationTarget::try_by_name(namespace, name)?,
-                labels
-                    .into_iter()
-                    .map(|(key, value)| klights_pod_api::PodLabel::try_new(key, value))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
+            .merge_labels_by_name(namespace, name, labels)
             .await
             .map_err(anyhow::Error::new)
     }
@@ -3500,15 +3372,7 @@ impl IntegrationPodDeletionFixture {
         labels: Vec<(String, String)>,
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.update
-            .update_pod(klights_pod_api::PodUpdateRequest::merge_labels(
-                klights_pod_api::PodMutationTarget::try_by_identity(
-                    klights_types::PodIdentity::new(namespace, name, uid),
-                )?,
-                labels
-                    .into_iter()
-                    .map(|(key, value)| klights_pod_api::PodLabel::try_new(key, value))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
+            .merge_labels_for_uid(namespace, name, uid, labels)
             .await
             .map_err(anyhow::Error::new)
     }
@@ -3521,12 +3385,7 @@ impl IntegrationPodDeletionFixture {
         refs: Vec<serde_json::Value>,
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.update
-            .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
-                klights_pod_api::PodMutationTarget::try_by_identity(
-                    klights_types::PodIdentity::new(namespace, name, uid),
-                )?,
-                klights_pod_api::test_support::owner_references_from_values(refs)?,
-            ))
+            .replace_owner_references_for_uid(namespace, name, uid, refs)
             .await
             .map_err(anyhow::Error::new)
     }
@@ -3539,17 +3398,9 @@ impl IntegrationPodDeletionFixture {
         pod: serde_json::Value,
     ) -> anyhow::Result<crate::datastore::Resource> {
         self.api_mutations
-            .create(klights_pod_api::PodApiCreateRequest {
-                namespace: namespace.to_string(),
-                body: pod,
-                dry_run: false,
-            })
+            .create_or_require_resource(namespace, name, pod)
             .await
-            .map_err(anyhow::Error::new)?
-            .resource
-            .ok_or_else(|| {
-                anyhow::anyhow!("controller Pod {namespace}/{name} unexpectedly dry-ran")
-            })
+            .map_err(anyhow::Error::new)
     }
 
     pub async fn delete_pod(&self, namespace: &str, name: &str) -> anyhow::Result<()> {

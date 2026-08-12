@@ -8,7 +8,7 @@ fn active_pods(items: &[klights_cluster_core::Resource]) -> Vec<&klights_cluster
 }
 
 async fn current_statefulset(
-    db: &crate::test_support::TestStore,
+    db: &crate::internal_test_support::TestStore,
     namespace: &str,
     name: &str,
 ) -> serde_json::Value {
@@ -17,11 +17,11 @@ async fn current_statefulset(
         .await
         .unwrap()
         .unwrap();
-    crate::test_support::inject_resource_version(sts.data, sts.resource_version)
+    crate::internal_test_support::inject_resource_version(sts.data, sts.resource_version)
 }
 
 async fn reconcile_current_statefulset(
-    db: &crate::test_support::TestStore,
+    db: &crate::internal_test_support::TestStore,
     namespace: &str,
     name: &str,
 ) {
@@ -31,13 +31,16 @@ async fn reconcile_current_statefulset(
         .unwrap();
 }
 
-async fn mark_statefulset_pods_ready(db: &crate::test_support::TestStore, namespace: &str) {
+async fn mark_statefulset_pods_ready(
+    db: &crate::internal_test_support::TestStore,
+    namespace: &str,
+) {
     let pods = db
         .list_resources(
             "v1",
             "Pod",
             Some(namespace),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -73,7 +76,7 @@ async fn mark_statefulset_pods_ready(db: &crate::test_support::TestStore, namesp
 }
 
 async fn update_statefulset_spec(
-    db: &crate::test_support::TestStore,
+    db: &crate::internal_test_support::TestStore,
     namespace: &str,
     name: &str,
     update: impl FnOnce(&mut serde_json::Value),
@@ -97,7 +100,7 @@ async fn update_statefulset_spec(
     .unwrap();
 }
 
-async fn finalize_pod(db: &crate::test_support::TestStore, namespace: &str, name: &str) {
+async fn finalize_pod(db: &crate::internal_test_support::TestStore, namespace: &str, name: &str) {
     db.delete_resource("v1", "Pod", Some(namespace), name)
         .await
         .unwrap();
@@ -105,7 +108,7 @@ async fn finalize_pod(db: &crate::test_support::TestStore, namespace: &str, name
 
 #[tokio::test]
 async fn test_is_pod_ready_condition_false_returns_false() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -127,7 +130,7 @@ async fn test_is_pod_ready_condition_false_returns_false() {
     .unwrap();
 
     let ready = is_pod_ready(
-        crate::test_support::pod_repository_for_test(&db).as_ref(),
+        crate::internal_test_support::pod_repository_for_test(&db).as_ref(),
         "default",
         "not-ready-pod",
     )
@@ -139,7 +142,7 @@ async fn test_is_pod_ready_condition_false_returns_false() {
 #[tokio::test]
 async fn test_statefulset_ordered_creates_next_after_ready() {
     // OrderedReady: once pod-0 becomes Ready, pod-1 should be created on next reconcile
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -194,7 +197,7 @@ async fn test_statefulset_ordered_creates_next_after_ready() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -246,7 +249,7 @@ async fn test_statefulset_ordered_creates_next_after_ready() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -273,7 +276,7 @@ async fn test_statefulset_ordered_creates_next_after_ready() {
 
 #[tokio::test]
 async fn test_statefulset_labels_propagated_from_template() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -327,7 +330,7 @@ async fn test_statefulset_labels_propagated_from_template() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -341,7 +344,7 @@ async fn test_statefulset_labels_propagated_from_template() {
 
 #[tokio::test]
 async fn test_statefulset_skips_reconcile_when_deletion_timestamp_set() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -383,7 +386,7 @@ async fn test_statefulset_skips_reconcile_when_deletion_timestamp_set() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -397,7 +400,7 @@ async fn test_statefulset_skips_reconcile_when_deletion_timestamp_set() {
 #[tokio::test]
 async fn test_statefulset_canary_update_with_partition() {
     // partition=2 with 3 replicas: only pod-2 should be updated to new image
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -435,8 +438,10 @@ async fn test_statefulset_canary_update_with_partition() {
         .await
         .unwrap();
 
-    let sts_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let sts_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
 
     // Initial reconcile - creates 3 pods with nginx:1.0
     reconcile_statefulset_test(&db, &sts_with_rv, "test-node")
@@ -448,7 +453,7 @@ async fn test_statefulset_canary_update_with_partition() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -519,8 +524,10 @@ async fn test_statefulset_canary_update_with_partition() {
         .await
         .unwrap();
 
-    let sts_with_rv2 =
-        crate::test_support::inject_resource_version(updated.data, updated.resource_version);
+    let sts_with_rv2 = crate::internal_test_support::inject_resource_version(
+        updated.data,
+        updated.resource_version,
+    );
 
     // Reconcile with updated template - should only update pod-2.
     reconcile_statefulset_test(&db, &sts_with_rv2, "test-node")
@@ -532,7 +539,7 @@ async fn test_statefulset_canary_update_with_partition() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -585,7 +592,7 @@ async fn test_statefulset_canary_update_with_partition() {
 
 #[tokio::test]
 async fn test_statefulset_partitioned_recreate_preserves_current_revision_template() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
         .unwrap();
@@ -646,8 +653,10 @@ async fn test_statefulset_partitioned_recreate_preserves_current_revision_templa
         )
         .await
         .unwrap();
-    let sts_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let sts_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
 
     for _ in 0..3 {
         reconcile_statefulset_test(&db, &sts_with_rv, "test-node")
@@ -692,7 +701,7 @@ async fn test_statefulset_partitioned_recreate_preserves_current_revision_templa
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -732,7 +741,7 @@ async fn test_statefulset_partitioned_recreate_preserves_current_revision_templa
 
 #[tokio::test]
 async fn test_statefulset_partitioned_update_waits_for_terminating_higher_ordinal() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
         .unwrap();
@@ -749,7 +758,7 @@ async fn test_statefulset_partitioned_update_waits_for_terminating_higher_ordina
     let new_revision = compute_statefulset_update_revision("partition-wait", &new_template);
     let sts_uid = "sts-partition-wait-001";
 
-    let statefulset = crate::test_support::store_and_prepare(
+    let statefulset = crate::internal_test_support::store_and_prepare(
         &db,
         "apps/v1",
         "StatefulSet",
@@ -845,7 +854,7 @@ async fn test_statefulset_rolling_update_waits_for_actor_finalization() {
     // Without partition (partition=0), StatefulSet starts from the highest
     // ordinal but must not recreate the same Pod name until the actor finalizes
     // the old UID.
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -879,8 +888,10 @@ async fn test_statefulset_rolling_update_waits_for_actor_finalization() {
         .await
         .unwrap();
 
-    let sts_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let sts_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_statefulset_test(&db, &sts_with_rv, "test-node")
         .await
         .unwrap();
@@ -891,7 +902,7 @@ async fn test_statefulset_rolling_update_waits_for_actor_finalization() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -955,8 +966,10 @@ async fn test_statefulset_rolling_update_waits_for_actor_finalization() {
         .await
         .unwrap();
 
-    let sts_with_rv2 =
-        crate::test_support::inject_resource_version(updated.data, updated.resource_version);
+    let sts_with_rv2 = crate::internal_test_support::inject_resource_version(
+        updated.data,
+        updated.resource_version,
+    );
 
     // Rolling update advances one ordinal per reconcile.
     reconcile_statefulset_test(&db, &sts_with_rv2, "test-node")
@@ -968,7 +981,7 @@ async fn test_statefulset_rolling_update_waits_for_actor_finalization() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1000,7 +1013,7 @@ async fn test_statefulset_rolling_update_waits_for_actor_finalization() {
 #[tokio::test]
 async fn test_statefulset_on_delete_strategy_skips_rolling_update() {
     // OnDelete strategy: pods are not automatically updated
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -1035,8 +1048,10 @@ async fn test_statefulset_on_delete_strategy_skips_rolling_update() {
         .await
         .unwrap();
 
-    let sts_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let sts_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_statefulset_test(&db, &sts_with_rv, "test-node")
         .await
         .unwrap();
@@ -1075,8 +1090,10 @@ async fn test_statefulset_on_delete_strategy_skips_rolling_update() {
         .await
         .unwrap();
 
-    let sts_with_rv2 =
-        crate::test_support::inject_resource_version(updated.data, updated.resource_version);
+    let sts_with_rv2 = crate::internal_test_support::inject_resource_version(
+        updated.data,
+        updated.resource_version,
+    );
     reconcile_statefulset_test(&db, &sts_with_rv2, "test-node")
         .await
         .unwrap();
@@ -1087,7 +1104,7 @@ async fn test_statefulset_on_delete_strategy_skips_rolling_update() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1108,7 +1125,7 @@ async fn test_statefulset_on_delete_strategy_skips_rolling_update() {
 
 #[tokio::test]
 async fn test_statefulset_status_includes_revision_info() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -1142,8 +1159,10 @@ async fn test_statefulset_status_includes_revision_info() {
         .await
         .unwrap();
 
-    let sts_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let sts_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_statefulset_test(&db, &sts_with_rv, "test-node")
         .await
         .unwrap();
@@ -1171,7 +1190,7 @@ async fn test_statefulset_status_includes_revision_info() {
 
 #[tokio::test]
 async fn test_statefulset_rolling_update_keeps_current_revision_until_ready() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -1205,8 +1224,10 @@ async fn test_statefulset_rolling_update_keeps_current_revision_until_ready() {
         .await
         .unwrap();
 
-    let sts_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let sts_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_statefulset_test(&db, &sts_with_rv, "test-node")
         .await
         .unwrap();
@@ -1235,7 +1256,7 @@ async fn test_statefulset_rolling_update_keeps_current_revision_until_ready() {
         .await
         .unwrap()
         .unwrap();
-    let sts_with_rv2 = crate::test_support::inject_resource_version(
+    let sts_with_rv2 = crate::internal_test_support::inject_resource_version(
         after_spec_update.data,
         after_spec_update.resource_version,
     );

@@ -18,16 +18,16 @@ fn derive_job_status_from_owned_pods(job: &Value, owned_pods: &[Resource]) -> Va
 /// Test-only shim wrapping `reconcile_job` with the repository-backed
 /// argument list, mirroring the pre-Task-18 signature.
 async fn reconcile_job_test(
-    db: &crate::test_support::TestStore,
+    db: &crate::internal_test_support::TestStore,
     job: &Value,
     node_name: &str,
 ) -> Result<Value> {
-    let identity = crate::test_support::deterministic_controller_identity();
+    let identity = crate::internal_test_support::deterministic_controller_identity();
     reconcile_job_test_with_identity(db, job, node_name, identity.as_ref()).await
 }
 
 async fn reconcile_job_test_with_identity(
-    db: &crate::test_support::TestStore,
+    db: &crate::internal_test_support::TestStore,
     job: &Value,
     node_name: &str,
     identity: &dyn crate::ControllerIdentityGenerator,
@@ -40,7 +40,7 @@ async fn reconcile_job_test_with_identity(
         db,
         db,
         job,
-        crate::test_support::test_reconcile_context(coordination(), node_name),
+        crate::internal_test_support::test_reconcile_context(coordination(), node_name),
         chrono::Utc::now(),
     )
     .await
@@ -48,7 +48,7 @@ async fn reconcile_job_test_with_identity(
 
 #[tokio::test]
 async fn job_consumes_one_uid_per_pod_and_preserves_five_hex_name_derivation() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
     db.create_resource(
         "batch/v1",
         "Job",
@@ -68,7 +68,7 @@ async fn job_consumes_one_uid_per_pod_and_preserves_five_hex_name_derivation() {
     .await
     .unwrap();
     let job = get_job(&db, "default", "spy-job").await;
-    let identity = crate::test_support::ScriptedControllerIdentityGenerator::with_uids([
+    let identity = crate::internal_test_support::ScriptedControllerIdentityGenerator::with_uids([
         "abcde111-0000-4000-8000-000000000000",
         "f0123222-0000-4000-8000-000000000000",
     ]);
@@ -77,7 +77,7 @@ async fn job_consumes_one_uid_per_pod_and_preserves_five_hex_name_derivation() {
         .await
         .unwrap();
 
-    let mut names = crate::test_support::find_owned_pods(&db, "default", "spy-job-uid")
+    let mut names = crate::internal_test_support::find_owned_pods(&db, "default", "spy-job-uid")
         .await
         .unwrap()
         .into_iter()
@@ -89,7 +89,11 @@ async fn job_consumes_one_uid_per_pod_and_preserves_five_hex_name_derivation() {
 }
 
 /// Helper to fetch latest Job from DB with resourceVersion injected
-async fn get_job(db: &crate::test_support::TestStore, namespace: &str, name: &str) -> Value {
+async fn get_job(
+    db: &crate::internal_test_support::TestStore,
+    namespace: &str,
+    name: &str,
+) -> Value {
     let resource = db
         .get_resource("batch/v1", "Job", Some(namespace), name)
         .await
@@ -107,7 +111,7 @@ async fn get_job(db: &crate::test_support::TestStore, namespace: &str, name: &st
 }
 
 struct ScaleDownDuringJobCreateWriter {
-    db: crate::test_support::TestStore,
+    db: crate::internal_test_support::TestStore,
     creates: AtomicUsize,
 }
 
@@ -175,7 +179,7 @@ impl JobPodMutation for ScaleDownDuringJobCreateWriter {
 
 #[tokio::test]
 async fn test_job_stale_snapshot_after_delete_does_not_recreate_pods() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
     db.create_resource(
         "v1",
         "Namespace",
@@ -220,7 +224,7 @@ async fn test_job_stale_snapshot_after_delete_does_not_recreate_pods() {
             "v1",
             "Pod",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -232,8 +236,8 @@ async fn test_job_stale_snapshot_after_delete_does_not_recreate_pods() {
 
 #[tokio::test]
 async fn test_job_create_loop_observes_live_parallelism_scale_down() {
-    let db = crate::test_support::in_memory().await;
-    let pod_reader = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let pod_reader = crate::internal_test_support::pod_repository_for_test(&db);
     let pod_writer = Arc::new(ScaleDownDuringJobCreateWriter {
         db: db.clone(),
         creates: AtomicUsize::new(0),
@@ -269,24 +273,26 @@ async fn test_job_create_loop_observes_live_parallelism_scale_down() {
         .create_resource("batch/v1", "Job", Some("default"), "scale-down-job", job)
         .await
         .unwrap();
-    let job_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let job_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
 
     super::reconcile_job(
         &db,
         pod_reader.as_ref(),
         pod_writer.as_ref(),
-        crate::test_support::deterministic_controller_identity().as_ref(),
+        crate::internal_test_support::deterministic_controller_identity().as_ref(),
         pod_reader.as_ref(),
         &db,
         &job_with_rv,
-        crate::test_support::test_reconcile_context(coordination(), "test-node"),
+        crate::internal_test_support::test_reconcile_context(coordination(), "test-node"),
         chrono::Utc::now(),
     )
     .await
     .unwrap();
 
-    let pods = crate::test_support::find_owned_pods(&db, "default", "scale-down-job-uid")
+    let pods = crate::internal_test_support::find_owned_pods(&db, "default", "scale-down-job-uid")
         .await
         .unwrap();
     assert_eq!(

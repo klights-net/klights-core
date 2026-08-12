@@ -32,7 +32,7 @@ fn coordination() -> &'static crate::ControllerCoordination {
 }
 
 async fn reconcile_replicationcontroller(
-    db: &crate::test_support::TestStore,
+    db: &crate::internal_test_support::TestStore,
     pod_reader: &(impl klights_pod_api::PodQuery + ?Sized),
     pod_writer: &(impl ReplicationControllerPodMutation + ?Sized),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
@@ -44,27 +44,27 @@ async fn reconcile_replicationcontroller(
         db,
         pod_reader,
         pod_writer,
-        crate::test_support::deterministic_controller_identity().as_ref(),
+        crate::internal_test_support::deterministic_controller_identity().as_ref(),
         pod_delete_sink,
         non_pod_finalization,
         rc,
-        crate::test_support::test_reconcile_context(coordination(), node_name),
+        crate::internal_test_support::test_reconcile_context(coordination(), node_name),
     )
     .await
 }
 
 struct SlowFirstCreateWriter {
-    db: crate::test_support::TestStore,
+    db: crate::internal_test_support::TestStore,
     creates: AtomicUsize,
 }
 
 struct ScaleDownDuringRcCreateWriter {
-    db: crate::test_support::TestStore,
+    db: crate::internal_test_support::TestStore,
     creates: AtomicUsize,
 }
 
 struct BlockingSecondCreateWriter {
-    db: crate::test_support::TestStore,
+    db: crate::internal_test_support::TestStore,
     creates: AtomicUsize,
     first_create_persisted: Notify,
     second_create_started: Notify,
@@ -72,7 +72,7 @@ struct BlockingSecondCreateWriter {
 }
 
 struct BlockingFirstCreateWriter {
-    db: crate::test_support::TestStore,
+    db: crate::internal_test_support::TestStore,
     creates: AtomicUsize,
     first_create_started: Notify,
     second_create_started: Notify,
@@ -80,7 +80,7 @@ struct BlockingFirstCreateWriter {
 }
 
 impl BlockingSecondCreateWriter {
-    fn new(db: crate::test_support::TestStore) -> Self {
+    fn new(db: crate::internal_test_support::TestStore) -> Self {
         Self {
             db,
             creates: AtomicUsize::new(0),
@@ -92,7 +92,7 @@ impl BlockingSecondCreateWriter {
 }
 
 impl BlockingFirstCreateWriter {
-    fn new(db: crate::test_support::TestStore) -> Self {
+    fn new(db: crate::internal_test_support::TestStore) -> Self {
         Self {
             db,
             creates: AtomicUsize::new(0),
@@ -322,21 +322,21 @@ impl_replication_controller_mutation!(BlockingSecondCreateWriter);
 impl_replication_controller_mutation!(BlockingFirstCreateWriter);
 
 async fn reconcile_rc_test(
-    db: &crate::test_support::TestStore,
+    db: &crate::internal_test_support::TestStore,
     rc: &Value,
     node_name: &str,
 ) -> Result<()> {
-    let identity = crate::test_support::deterministic_controller_identity();
+    let identity = crate::internal_test_support::deterministic_controller_identity();
     reconcile_rc_test_with_identity(db, rc, node_name, identity.as_ref()).await
 }
 
 async fn reconcile_rc_test_with_identity(
-    db: &crate::test_support::TestStore,
+    db: &crate::internal_test_support::TestStore,
     rc: &Value,
     node_name: &str,
     identity: &dyn crate::ControllerIdentityGenerator,
 ) -> Result<()> {
-    let repo = crate::test_support::pod_repository_for_test(db);
+    let repo = crate::internal_test_support::pod_repository_for_test(db);
     super::reconcile_replicationcontroller(
         db,
         repo.as_ref(),
@@ -345,14 +345,14 @@ async fn reconcile_rc_test_with_identity(
         repo.as_ref(),
         db,
         rc,
-        crate::test_support::test_reconcile_context(coordination(), node_name),
+        crate::internal_test_support::test_reconcile_context(coordination(), node_name),
     )
     .await
 }
 
 #[tokio::test]
 async fn replicationcontroller_consumes_one_uid_per_pod_and_preserves_eight_hex_name_derivation() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
     let rc = json!({
         "apiVersion": "v1",
         "kind": "ReplicationController",
@@ -375,7 +375,7 @@ async fn replicationcontroller_consumes_one_uid_per_pod_and_preserves_eight_hex_
     )
     .await
     .unwrap();
-    let identity = crate::test_support::ScriptedControllerIdentityGenerator::with_uids([
+    let identity = crate::internal_test_support::ScriptedControllerIdentityGenerator::with_uids([
         "abcdef12-0000-4000-8000-000000000000",
         "1234abcd-0000-4000-8000-000000000000",
     ]);
@@ -389,7 +389,7 @@ async fn replicationcontroller_consumes_one_uid_per_pod_and_preserves_eight_hex_
             "v1",
             "Pod",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -405,7 +405,7 @@ async fn replicationcontroller_consumes_one_uid_per_pod_and_preserves_eight_hex_
 
 #[tokio::test]
 async fn test_replicationcontroller_status_counts_available_ready_pods() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
     let rc = json!({
         "apiVersion": "v1",
         "kind": "ReplicationController",
@@ -479,8 +479,8 @@ async fn test_replicationcontroller_status_counts_available_ready_pods() {
 
 #[tokio::test]
 async fn test_concurrent_replicationcontroller_reconcile_creates_only_desired_pods() {
-    let db = crate::test_support::in_memory().await;
-    let pod_reader = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let pod_reader = crate::internal_test_support::pod_repository_for_test(&db);
     let pod_writer = Arc::new(SlowFirstCreateWriter {
         db: db.clone(),
         creates: AtomicUsize::new(0),
@@ -540,7 +540,12 @@ async fn test_concurrent_replicationcontroller_reconcile_creates_only_desired_po
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::new(Some("app=race"), None, None, None),
+            crate::internal_test_support::ResourceListQuery::new(
+                Some("app=race"),
+                None,
+                None,
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -553,7 +558,7 @@ async fn test_concurrent_replicationcontroller_reconcile_creates_only_desired_po
 
 #[tokio::test]
 async fn test_replicationcontroller_skips_reconcile_when_deletion_timestamp_set() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
     let rc = json!({
         "apiVersion": "v1",
         "kind": "ReplicationController",
@@ -590,7 +595,7 @@ async fn test_replicationcontroller_skips_reconcile_when_deletion_timestamp_set(
             "v1",
             "Pod",
             Some("default"),
-            crate::test_support::ResourceListQuery::new(
+            crate::internal_test_support::ResourceListQuery::new(
                 Some("app=terminating-rc"),
                 None,
                 None,
@@ -607,8 +612,8 @@ async fn test_replicationcontroller_skips_reconcile_when_deletion_timestamp_set(
 
 #[tokio::test]
 async fn test_replicationcontroller_stale_snapshot_after_delete_does_not_recreate_pods() {
-    let db = crate::test_support::in_memory().await;
-    let pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -670,7 +675,7 @@ async fn test_replicationcontroller_stale_snapshot_after_delete_does_not_recreat
             "v1",
             "Pod",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -682,8 +687,8 @@ async fn test_replicationcontroller_stale_snapshot_after_delete_does_not_recreat
 
 #[tokio::test]
 async fn test_replicationcontroller_create_loop_observes_live_scale_down() {
-    let db = crate::test_support::in_memory().await;
-    let pod_reader = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let pod_reader = crate::internal_test_support::pod_repository_for_test(&db);
     let pod_writer = Arc::new(ScaleDownDuringRcCreateWriter {
         db: db.clone(),
         creates: AtomicUsize::new(0),
@@ -726,8 +731,10 @@ async fn test_replicationcontroller_create_loop_observes_live_scale_down() {
         )
         .await
         .unwrap();
-    let rc_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let rc_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
 
     reconcile_replicationcontroller(
         &db,
@@ -746,7 +753,7 @@ async fn test_replicationcontroller_create_loop_observes_live_scale_down() {
             "v1",
             "Pod",
             Some("default"),
-            crate::test_support::ResourceListQuery::new(
+            crate::internal_test_support::ResourceListQuery::new(
                 Some("app=scale-down-rc"),
                 None,
                 None,
@@ -792,7 +799,7 @@ async fn test_replicationcontroller_create_loop_observes_live_scale_down() {
 async fn test_rc_status_replicas_reflects_newly_created_pods() {
     // Regression test: RC controller was updating status with pre-creation owned_pods
     // (always empty on first reconcile), so status.replicas stayed 0 forever.
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -851,8 +858,8 @@ async fn test_rc_status_advances_while_large_scale_up_is_still_creating_pods() {
     // Conformance waits only two minutes for a 100-replica RC to report the
     // desired status. Status must advance as Pods are created instead of
     // staying at zero until the whole create loop finishes.
-    let db = crate::test_support::in_memory().await;
-    let pod_reader = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let pod_reader = crate::internal_test_support::pod_repository_for_test(&db);
     let pod_writer = Arc::new(BlockingSecondCreateWriter::new(db.clone()));
 
     db.create_resource(
@@ -953,8 +960,8 @@ async fn test_rc_status_advances_while_large_scale_up_is_still_creating_pods() {
 
 #[tokio::test]
 async fn test_rc_large_scale_up_starts_next_create_while_prior_create_is_in_flight() {
-    let db = crate::test_support::in_memory().await;
-    let pod_reader = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let pod_reader = crate::internal_test_support::pod_repository_for_test(&db);
     let pod_writer = Arc::new(BlockingFirstCreateWriter::new(db.clone()));
 
     db.create_resource(
@@ -1035,7 +1042,7 @@ async fn test_rc_large_scale_up_starts_next_create_while_prior_create_is_in_flig
 
 #[tokio::test]
 async fn test_rc_large_scale_up_does_not_write_status_after_every_child_create() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -1090,7 +1097,7 @@ async fn test_rc_large_scale_up_does_not_write_status_after_every_child_create()
 
 #[tokio::test]
 async fn test_rc_ignores_ownerref_pods_that_do_not_match_selector() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -1180,7 +1187,7 @@ async fn test_rc_ignores_ownerref_pods_that_do_not_match_selector() {
 
 #[tokio::test]
 async fn test_rc_create_pod_has_apiversion_kind_status_and_labels() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -1224,7 +1231,7 @@ async fn test_rc_create_pod_has_apiversion_kind_status_and_labels() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1276,8 +1283,8 @@ async fn test_rc_create_pod_has_apiversion_kind_status_and_labels() {
 
 #[tokio::test]
 async fn test_rc_releases_pod_when_selector_changes() {
-    let db = crate::test_support::in_memory().await;
-    let identity_graph = crate::test_support::ControllerIdentityTestGraph::default();
+    let db = crate::internal_test_support::in_memory().await;
+    let identity_graph = crate::internal_test_support::ControllerIdentityTestGraph::default();
     let identity = identity_graph.identity();
 
     db.create_resource(
@@ -1323,7 +1330,7 @@ async fn test_rc_releases_pod_when_selector_changes() {
             "v1",
             "Pod",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1383,7 +1390,7 @@ async fn test_rc_releases_pod_when_selector_changes() {
 
 #[tokio::test]
 async fn test_rc_does_not_adopt_pod_with_foreign_controller_owner() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",

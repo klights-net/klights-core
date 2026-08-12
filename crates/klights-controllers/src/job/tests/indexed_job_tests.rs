@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn test_job_single_completion() {
     // Job with completions=1 (default) should create 1 pod
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     let job = json!({
         "apiVersion": "batch/v1",
@@ -31,7 +31,7 @@ async fn test_job_single_completion() {
     let job = get_job(&db, "default", "test-job").await;
     let _job = reconcile_job_test(&db, &job, "test-node").await.unwrap();
 
-    let pods = crate::test_support::find_owned_pods(&db, "default", "job-1")
+    let pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-1")
         .await
         .unwrap();
     assert_eq!(pods.len(), 1, "Should create 1 pod for completions=1");
@@ -63,7 +63,7 @@ async fn test_job_single_completion() {
 
 #[tokio::test]
 async fn test_job_adopts_matching_orphan_pod() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     let job = json!({
         "apiVersion": "batch/v1",
@@ -129,7 +129,7 @@ async fn test_job_adopts_matching_orphan_pod() {
 
 #[tokio::test]
 async fn test_job_releases_owned_pod_that_no_longer_matches_selector() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     let job = json!({
         "apiVersion": "batch/v1",
@@ -210,8 +210,8 @@ async fn test_job_releases_owned_pod_that_no_longer_matches_selector() {
 #[tokio::test]
 async fn test_job_multiple_completions() {
     // Job with completions=3 should create 3 pods sequentially (parallelism=1)
-    let db = crate::test_support::in_memory().await;
-    let identity_graph = crate::test_support::ControllerIdentityTestGraph::default();
+    let db = crate::internal_test_support::in_memory().await;
+    let identity_graph = crate::internal_test_support::ControllerIdentityTestGraph::default();
     let identity = identity_graph.identity();
 
     let job = json!({
@@ -243,7 +243,7 @@ async fn test_job_multiple_completions() {
     let _job = reconcile_job_test_with_identity(&db, &job, "test-node", identity.as_ref())
         .await
         .unwrap();
-    let mut pods = crate::test_support::find_owned_pods(&db, "default", "job-2")
+    let mut pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-2")
         .await
         .unwrap();
     assert_eq!(pods.len(), 1, "Should create 1 pod (parallelism=1)");
@@ -267,7 +267,7 @@ async fn test_job_multiple_completions() {
     let _job = reconcile_job_test_with_identity(&db, &job, "test-node", identity.as_ref())
         .await
         .unwrap();
-    pods = crate::test_support::find_owned_pods(&db, "default", "job-2")
+    pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-2")
         .await
         .unwrap();
     assert_eq!(pods.len(), 2, "Should create second pod");
@@ -295,7 +295,7 @@ async fn test_job_multiple_completions() {
     let _job = reconcile_job_test_with_identity(&db, &job, "test-node", identity.as_ref())
         .await
         .unwrap();
-    pods = crate::test_support::find_owned_pods(&db, "default", "job-2")
+    pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-2")
         .await
         .unwrap();
     assert_eq!(pods.len(), 3, "Should create third pod");
@@ -330,7 +330,7 @@ async fn test_job_multiple_completions() {
 #[tokio::test]
 async fn test_job_parallelism() {
     // Job with parallelism=2 should create 2 pods concurrently
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     let job = json!({
         "apiVersion": "batch/v1",
@@ -360,7 +360,7 @@ async fn test_job_parallelism() {
     let job = get_job(&db, "default", "parallel-job").await;
     let job = reconcile_job_test(&db, &job, "test-node").await.unwrap();
 
-    let pods = crate::test_support::find_owned_pods(&db, "default", "job-3")
+    let pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-3")
         .await
         .unwrap();
     assert_eq!(pods.len(), 2, "Should create 2 pods for parallelism=2");
@@ -371,8 +371,8 @@ async fn test_job_parallelism() {
 #[tokio::test]
 async fn test_job_backoff_limit() {
     // Job with backoffLimit=1 should fail after 2 failures
-    let db = crate::test_support::in_memory().await;
-    let identity_graph = crate::test_support::ControllerIdentityTestGraph::default();
+    let db = crate::internal_test_support::in_memory().await;
+    let identity_graph = crate::internal_test_support::ControllerIdentityTestGraph::default();
     let identity = identity_graph.identity();
 
     let job = json!({
@@ -403,7 +403,7 @@ async fn test_job_backoff_limit() {
     let _job = reconcile_job_test_with_identity(&db, &job, "test-node", identity.as_ref())
         .await
         .unwrap();
-    let mut pods = crate::test_support::find_owned_pods(&db, "default", "job-4")
+    let mut pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-4")
         .await
         .unwrap();
     assert_eq!(pods.len(), 1);
@@ -428,7 +428,7 @@ async fn test_job_backoff_limit() {
     let _job = reconcile_job_test_with_identity(&db, &job, "test-node", identity.as_ref())
         .await
         .unwrap();
-    pods = crate::test_support::find_owned_pods(&db, "default", "job-4")
+    pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-4")
         .await
         .unwrap();
     assert_eq!(pods.len(), 2, "Should create second pod");
@@ -457,7 +457,7 @@ async fn test_job_backoff_limit() {
     let job = reconcile_job_test_with_identity(&db, &job, "test-node", identity.as_ref())
         .await
         .unwrap();
-    pods = crate::test_support::find_owned_pods(&db, "default", "job-4")
+    pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-4")
         .await
         .unwrap();
     assert_eq!(
@@ -476,7 +476,7 @@ async fn test_job_backoff_limit() {
 #[tokio::test]
 async fn test_job_status_complete() {
     // Verify Complete condition has correct fields
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     let job = json!({
         "apiVersion": "batch/v1",
@@ -503,7 +503,7 @@ async fn test_job_status_complete() {
     // Create and complete pod
     let job = get_job(&db, "default", "complete-job").await;
     let _job = reconcile_job_test(&db, &job, "test-node").await.unwrap();
-    let pods = crate::test_support::find_owned_pods(&db, "default", "job-5")
+    let pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-5")
         .await
         .unwrap();
 
@@ -545,7 +545,7 @@ async fn test_job_status_complete() {
 #[tokio::test]
 async fn test_job_status_failed() {
     // Verify Failed condition has correct fields
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     let job = json!({
         "apiVersion": "batch/v1",
@@ -573,7 +573,7 @@ async fn test_job_status_failed() {
     // Create and fail pod
     let job = get_job(&db, "default", "failed-job").await;
     let _job = reconcile_job_test(&db, &job, "test-node").await.unwrap();
-    let pods = crate::test_support::find_owned_pods(&db, "default", "job-6")
+    let pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-6")
         .await
         .unwrap();
 
@@ -617,7 +617,7 @@ async fn test_job_status_failed() {
 #[tokio::test]
 async fn test_job_pod_without_phase_counted_as_active() {
     // Pods with no status.phase should be counted as active (Pending)
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     let job = json!({
         "apiVersion": "batch/v1",
@@ -644,7 +644,7 @@ async fn test_job_pod_without_phase_counted_as_active() {
     let _job = reconcile_job_test(&db, &job, "test-node").await.unwrap();
 
     // Pods are created with phase "Pending" — remove phase from one to test the no-phase path
-    let pods = crate::test_support::find_owned_pods(&db, "default", "job-nophase")
+    let pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-nophase")
         .await
         .unwrap();
     assert_eq!(pods.len(), 2);
@@ -654,7 +654,7 @@ async fn test_job_pod_without_phase_counted_as_active() {
     let job = get_job(&db, "default", "nophase-job").await;
     let job = reconcile_job_test(&db, &job, "test-node").await.unwrap();
 
-    let pods = crate::test_support::find_owned_pods(&db, "default", "job-nophase")
+    let pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-nophase")
         .await
         .unwrap();
     assert_eq!(
@@ -671,7 +671,7 @@ async fn test_job_pod_without_phase_counted_as_active() {
 
 #[tokio::test]
 async fn test_reconcile_job_preserves_custom_status_conditions() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     let job = json!({
         "apiVersion": "batch/v1",
@@ -718,7 +718,7 @@ async fn test_reconcile_job_preserves_custom_status_conditions() {
 #[tokio::test]
 async fn test_job_does_not_exceed_parallelism() {
     // When active pods == parallelism, no new pods should be created
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     let job = json!({
         "apiVersion": "batch/v1",
@@ -744,7 +744,7 @@ async fn test_job_does_not_exceed_parallelism() {
     let job = get_job(&db, "default", "limit-job").await;
     reconcile_job_test(&db, &job, "test-node").await.unwrap();
 
-    let pods = crate::test_support::find_owned_pods(&db, "default", "job-limit")
+    let pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-limit")
         .await
         .unwrap();
     assert_eq!(pods.len(), 2, "Should create 2 pods for parallelism=2");
@@ -753,7 +753,7 @@ async fn test_job_does_not_exceed_parallelism() {
     let job = get_job(&db, "default", "limit-job").await;
     reconcile_job_test(&db, &job, "test-node").await.unwrap();
 
-    let pods = crate::test_support::find_owned_pods(&db, "default", "job-limit")
+    let pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-limit")
         .await
         .unwrap();
     assert_eq!(
@@ -765,7 +765,7 @@ async fn test_job_does_not_exceed_parallelism() {
 
 #[tokio::test]
 async fn test_job_pod_has_owner_references() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     let job = json!({
         "apiVersion": "batch/v1",
@@ -788,7 +788,7 @@ async fn test_job_pod_has_owner_references() {
     let job = get_job(&db, "default", "owner-job").await;
     reconcile_job_test(&db, &job, "test-node").await.unwrap();
 
-    let pods = crate::test_support::find_owned_pods(&db, "default", "job-owner-uid")
+    let pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-owner-uid")
         .await
         .unwrap();
     assert_eq!(pods.len(), 1);
@@ -810,7 +810,7 @@ async fn test_job_pod_has_owner_references() {
 #[tokio::test]
 async fn test_job_complete_does_not_create_more_pods() {
     // Once a Job is complete, no more pods should be created
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     let job = json!({
         "apiVersion": "batch/v1",
@@ -835,7 +835,7 @@ async fn test_job_complete_does_not_create_more_pods() {
     let job = get_job(&db, "default", "done-job").await;
     reconcile_job_test(&db, &job, "test-node").await.unwrap();
 
-    let pods = crate::test_support::find_owned_pods(&db, "default", "job-done")
+    let pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-done")
         .await
         .unwrap();
     let mut pod_data: serde_json::Value = (*pods[0].data).clone();
@@ -860,7 +860,7 @@ async fn test_job_complete_does_not_create_more_pods() {
     let job = get_job(&db, "default", "done-job").await;
     reconcile_job_test(&db, &job, "test-node").await.unwrap();
 
-    let pods = crate::test_support::find_owned_pods(&db, "default", "job-done")
+    let pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-done")
         .await
         .unwrap();
     assert_eq!(pods.len(), 1, "Complete Job must not create more pods");
@@ -870,7 +870,7 @@ async fn test_job_complete_does_not_create_more_pods() {
 async fn test_job_success_policy_succeeded_count_sets_success_criteria_met() {
     // Job with successPolicy.rules[{succeededCount: 1}] and completions=3
     // When 1 pod succeeds, SuccessCriteriaMet should be set even though completions not reached
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     let job = json!({
         "apiVersion": "batch/v1",
@@ -911,7 +911,7 @@ async fn test_job_success_policy_succeeded_count_sets_success_criteria_met() {
     let job = get_job(&db, "default", "success-policy-job").await;
     reconcile_job_test(&db, &job, "test-node").await.unwrap();
 
-    let pods = crate::test_support::find_owned_pods(&db, "default", "job-sp-1")
+    let pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-sp-1")
         .await
         .unwrap();
     assert_eq!(pods.len(), 3, "Should create 3 pods");
@@ -950,7 +950,7 @@ async fn test_job_success_policy_succeeded_count_sets_success_criteria_met() {
 async fn test_job_success_policy_succeeded_indexes_sets_success_criteria_met() {
     // Job with successPolicy.rules[{succeededIndexes: "0"}] — indexed job
     // When pod index 0 succeeds, SuccessCriteriaMet should be set
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     let job = json!({
         "apiVersion": "batch/v1",
@@ -986,7 +986,7 @@ async fn test_job_success_policy_succeeded_indexes_sets_success_criteria_met() {
     let job = get_job(&db, "default", "indexed-sp-job").await;
     reconcile_job_test(&db, &job, "test-node").await.unwrap();
 
-    let pods = crate::test_support::find_owned_pods(&db, "default", "job-sp-2")
+    let pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-sp-2")
         .await
         .unwrap();
 
@@ -1029,7 +1029,7 @@ async fn test_job_success_policy_succeeded_indexes_sets_success_criteria_met() {
 
 #[tokio::test]
 async fn test_indexed_job_preserves_completed_indexes_after_terminal_pods_are_deleted() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     let job = json!({
         "apiVersion": "batch/v1",
@@ -1090,9 +1090,10 @@ async fn test_indexed_job_preserves_completed_indexes_after_terminal_pods_are_de
     assert_eq!(reconciled["status"]["completedIndexes"], "0-1,3");
     assert_eq!(reconciled["status"]["succeeded"], 3);
 
-    let owned = crate::test_support::find_owned_pods(&db, "default", "job-indexed-history")
-        .await
-        .unwrap();
+    let owned =
+        crate::internal_test_support::find_owned_pods(&db, "default", "job-indexed-history")
+            .await
+            .unwrap();
     let new_indexes: Vec<_> = owned
         .iter()
         .filter_map(|pod| {
@@ -1116,7 +1117,7 @@ async fn test_indexed_job_does_not_complete_with_duplicate_succeeded_index() {
     // Kubernetes completes Indexed Jobs by unique completed indexes, not by the
     // raw number of succeeded Pods. A duplicate succeeded index must not let the
     // Job finish while another index is still missing.
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     let job = json!({
         "apiVersion": "batch/v1",
@@ -1182,7 +1183,7 @@ async fn test_indexed_job_does_not_complete_with_duplicate_succeeded_index() {
     );
     assert_eq!(reconciled["status"]["completedIndexes"], "0-1,3");
 
-    let pods = crate::test_support::find_owned_pods(&db, "default", "job-indexed-dup")
+    let pods = crate::internal_test_support::find_owned_pods(&db, "default", "job-indexed-dup")
         .await
         .unwrap();
     assert!(

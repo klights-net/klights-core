@@ -1,4 +1,4 @@
-use crate::test_support::TestStore;
+use crate::internal_test_support::TestStore;
 use serde_json::{Value, json};
 
 /// Test-only shim wrapping `reconcile_replicationcontroller` with the
@@ -9,11 +9,11 @@ async fn reconcile_rc_test(db: &TestStore, rc: &Value, node_name: &str) -> anyho
         db,
         db,
         db,
-        crate::test_support::deterministic_controller_identity().as_ref(),
+        crate::internal_test_support::deterministic_controller_identity().as_ref(),
         db,
         db,
         rc,
-        crate::test_support::test_reconcile_context(&coordination, node_name),
+        crate::internal_test_support::test_reconcile_context(&coordination, node_name),
     )
     .await
 }
@@ -42,7 +42,7 @@ async fn setup_db_with_rc(db: &TestStore, rc_name: &str) {
 
 #[tokio::test]
 async fn test_rc_publishes_replica_failure_condition_on_create_failure() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
     setup_db_with_rc(&db, "test-rc").await;
     db.create_resource(
         "v1",
@@ -88,7 +88,7 @@ async fn test_rc_publishes_replica_failure_condition_on_create_failure() {
 
 #[tokio::test]
 async fn test_rc_clears_replica_failure_condition_when_healthy() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
     setup_db_with_rc(&db, "test-rc-ok").await;
     let rc = db
         .get_resource("v1", "ReplicationController", Some("default"), "test-rc-ok")
@@ -116,7 +116,7 @@ async fn test_rc_clears_replica_failure_condition_when_healthy() {
 
 #[tokio::test]
 async fn test_rc_returns_error_when_quota_blocks_pod_create() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
     setup_db_with_rc(&db, "test-rc-quota").await;
 
     db.create_resource(
@@ -174,7 +174,7 @@ async fn test_rc_returns_error_when_quota_blocks_pod_create() {
             "v1",
             "Pod",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();

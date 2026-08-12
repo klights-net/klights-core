@@ -309,6 +309,7 @@ containerd = []
 pod-repository-test-support = [
     "klights-cluster-datastore/test-support",
     "klights-cluster-store/test-support",
+    "klights-controllers/test-support",
     "klights-kubelet/test-support",
     "klights-node-datastore/test-support",
     "klights-pod-api/test-support",

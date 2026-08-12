@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn test_statefulset_infers_current_revision_from_pods_when_status_missing() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -50,8 +50,10 @@ async fn test_statefulset_infers_current_revision_from_pods_when_status_missing(
         .await
         .unwrap();
 
-    let first =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let first = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_statefulset_test(&db, &first, "test-node")
         .await
         .unwrap();
@@ -77,8 +79,10 @@ async fn test_statefulset_infers_current_revision_from_pods_when_status_missing(
         .await
         .unwrap();
 
-    let second =
-        crate::test_support::inject_resource_version(updated.data, updated.resource_version);
+    let second = crate::internal_test_support::inject_resource_version(
+        updated.data,
+        updated.resource_version,
+    );
     reconcile_statefulset_test(&db, &second, "test-node")
         .await
         .unwrap();
@@ -108,7 +112,7 @@ async fn test_statefulset_infers_current_revision_from_pods_when_status_missing(
 
 #[tokio::test]
 async fn test_statefulset_respects_pod_resourcequota() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -155,7 +159,7 @@ async fn test_statefulset_respects_pod_resourcequota() {
         }
     });
 
-    let sts_with_rv = crate::test_support::store_and_prepare(
+    let sts_with_rv = crate::internal_test_support::store_and_prepare(
         &db,
         "apps/v1",
         "StatefulSet",
@@ -176,7 +180,7 @@ async fn test_statefulset_respects_pod_resourcequota() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();

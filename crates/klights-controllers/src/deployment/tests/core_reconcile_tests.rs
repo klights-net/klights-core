@@ -2,8 +2,8 @@ use super::*;
 
 #[tokio::test]
 async fn test_reconcile_deployment_creates_replicaset() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-1234";
 
     // Create the deployment in DB first
@@ -20,8 +20,10 @@ async fn test_reconcile_deployment_creates_replicaset() {
         .unwrap();
 
     // Inject resource version for reconcile
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
 
     reconcile_deployment(
         &db,
@@ -40,7 +42,7 @@ async fn test_reconcile_deployment_creates_replicaset() {
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -68,7 +70,7 @@ async fn test_reconcile_deployment_creates_replicaset() {
             "v1",
             "Pod",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -77,8 +79,8 @@ async fn test_reconcile_deployment_creates_replicaset() {
 
 #[tokio::test]
 async fn test_reconcile_deployment_rs_has_pod_template_hash() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
     let deploy = make_deployment("myapp", "default", "uid-hash-test", 1, "0");
     let created = db
         .create_resource(
@@ -90,8 +92,10 @@ async fn test_reconcile_deployment_rs_has_pod_template_hash() {
         )
         .await
         .unwrap();
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
 
     reconcile_deployment(
         &db,
@@ -109,7 +113,7 @@ async fn test_reconcile_deployment_rs_has_pod_template_hash() {
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -170,7 +174,7 @@ async fn test_reconcile_deployment_rs_has_pod_template_hash() {
             "v1",
             "Pod",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -190,8 +194,8 @@ async fn test_reconcile_deployment_rs_has_pod_template_hash() {
 
 #[tokio::test]
 async fn test_reconcile_deployment_scales_replicaset() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-scale";
 
     // Create deployment with 2 replicas
@@ -201,8 +205,10 @@ async fn test_reconcile_deployment_scales_replicaset() {
         .await
         .unwrap();
 
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -220,7 +226,7 @@ async fn test_reconcile_deployment_scales_replicaset() {
             "v1",
             "Pod",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -246,8 +252,10 @@ async fn test_reconcile_deployment_scales_replicaset() {
         .await
         .unwrap();
 
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(updated.data, updated.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        updated.data,
+        updated.resource_version,
+    );
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -265,7 +273,7 @@ async fn test_reconcile_deployment_scales_replicaset() {
             "v1",
             "Pod",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -278,8 +286,8 @@ async fn test_reconcile_deployment_scales_replicaset() {
 
 #[tokio::test]
 async fn test_reconcile_deployment_no_duplicate_replicasets() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-nodup";
 
     // Create and reconcile deployment
@@ -289,8 +297,10 @@ async fn test_reconcile_deployment_no_duplicate_replicasets() {
         .await
         .unwrap();
 
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -310,8 +320,10 @@ async fn test_reconcile_deployment_no_duplicate_replicasets() {
         .unwrap();
 
     // Reconcile again with same replicas
-    let deploy_with_rv2 =
-        crate::test_support::inject_resource_version(current.data, current.resource_version);
+    let deploy_with_rv2 = crate::internal_test_support::inject_resource_version(
+        current.data,
+        current.resource_version,
+    );
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -329,7 +341,7 @@ async fn test_reconcile_deployment_no_duplicate_replicasets() {
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -345,7 +357,7 @@ async fn test_reconcile_deployment_no_duplicate_replicasets() {
             "v1",
             "Pod",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -358,8 +370,8 @@ async fn test_reconcile_deployment_no_duplicate_replicasets() {
 
 #[tokio::test]
 async fn test_reconcile_deployment_zero_replicas_creates_no_pods() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-zero";
 
     let deploy = make_deployment("paused", "default", deploy_uid, 0, "0");
@@ -368,8 +380,10 @@ async fn test_reconcile_deployment_zero_replicas_creates_no_pods() {
         .await
         .unwrap();
 
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -387,7 +401,7 @@ async fn test_reconcile_deployment_zero_replicas_creates_no_pods() {
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -404,7 +418,7 @@ async fn test_reconcile_deployment_zero_replicas_creates_no_pods() {
             "v1",
             "Pod",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -413,8 +427,8 @@ async fn test_reconcile_deployment_zero_replicas_creates_no_pods() {
 
 #[tokio::test]
 async fn test_reconcile_deployment_status_has_progressing_condition() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-status";
 
     let deploy = make_deployment("web", "default", deploy_uid, 2, "0");
@@ -423,8 +437,10 @@ async fn test_reconcile_deployment_status_has_progressing_condition() {
         .await
         .unwrap();
 
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -474,8 +490,8 @@ async fn test_reconcile_deployment_status_has_progressing_condition() {
 
 #[tokio::test]
 async fn test_reconcile_deployment_status_noops_when_condition_state_unchanged() {
-    let db = crate::test_support::in_memory().await;
-    let pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-status-noop";
 
     let deploy = make_deployment("web-noop", "default", deploy_uid, 2, "0");
@@ -484,8 +500,10 @@ async fn test_reconcile_deployment_status_noops_when_condition_state_unchanged()
         .await
         .unwrap();
 
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_deployment(
         &db,
         pod_repo.as_ref(),
@@ -504,7 +522,7 @@ async fn test_reconcile_deployment_status_noops_when_condition_state_unchanged()
         .unwrap();
 
     let first_with_rv =
-        crate::test_support::inject_resource_version(first.data, first.resource_version);
+        crate::internal_test_support::inject_resource_version(first.data, first.resource_version);
     reconcile_deployment(
         &db,
         pod_repo.as_ref(),
@@ -532,7 +550,7 @@ async fn test_reconcile_deployment_status_noops_when_condition_state_unchanged()
     );
 
     let second_with_rv =
-        crate::test_support::inject_resource_version(second.data, second.resource_version);
+        crate::internal_test_support::inject_resource_version(second.data, second.resource_version);
     reconcile_deployment(
         &db,
         pod_repo.as_ref(),
@@ -560,8 +578,8 @@ async fn test_reconcile_deployment_status_noops_when_condition_state_unchanged()
 }
 
 struct ObservedGenerationBeforeCreateWriter {
-    db: crate::test_support::TestStore,
-    inner: std::sync::Arc<crate::test_support::TestStore>,
+    db: crate::internal_test_support::TestStore,
+    inner: std::sync::Arc<crate::internal_test_support::TestStore>,
     namespace: &'static str,
     deployment_name: &'static str,
     checked: std::sync::atomic::AtomicBool,
@@ -628,8 +646,8 @@ impl crate::deployment::DeploymentPodMutation for ObservedGenerationBeforeCreate
 
 #[tokio::test]
 async fn test_reconcile_deployment_observes_generation_before_pod_create() {
-    let db = crate::test_support::in_memory().await;
-    let pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     let deploy = make_deployment("web-observed", "default", "deploy-uid-observed", 3, "0");
     let created = db
@@ -643,8 +661,10 @@ async fn test_reconcile_deployment_observes_generation_before_pod_create() {
         .await
         .unwrap();
 
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     let writer = ObservedGenerationBeforeCreateWriter {
         db: db.clone(),
         inner: pod_repo.clone(),
@@ -671,8 +691,8 @@ async fn test_reconcile_deployment_observes_generation_before_pod_create() {
 }
 
 struct RollingUpdateObservedGenerationReader {
-    db: crate::test_support::TestStore,
-    inner: std::sync::Arc<crate::test_support::TestStore>,
+    db: crate::internal_test_support::TestStore,
+    inner: std::sync::Arc<crate::internal_test_support::TestStore>,
     namespace: &'static str,
     deployment_name: &'static str,
     new_image: &'static str,
@@ -724,7 +744,7 @@ impl klights_pod_api::PodQuery for RollingUpdateObservedGenerationReader {
                         "apps/v1",
                         "ReplicaSet",
                         Some(self.namespace),
-                        crate::test_support::ResourceListQuery::all(),
+                        crate::internal_test_support::ResourceListQuery::all(),
                     )
                     .await
                     .map_err(|error| {
@@ -751,8 +771,8 @@ impl klights_pod_api::PodQuery for RollingUpdateObservedGenerationReader {
 
 #[tokio::test]
 async fn test_reconcile_deployment_rollout_observed_generation_waits_for_new_replicaset() {
-    let db = crate::test_support::in_memory().await;
-    let pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-rollout-observed";
 
     let deploy = make_deployment_with_image(
@@ -773,8 +793,10 @@ async fn test_reconcile_deployment_rollout_observed_generation_waits_for_new_rep
         )
         .await
         .unwrap();
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_deployment(
         &db,
         pod_repo.as_ref(),
@@ -825,8 +847,10 @@ async fn test_reconcile_deployment_rollout_observed_generation_waits_for_new_rep
         new_image: "nginx:1.16",
         checked: std::sync::atomic::AtomicBool::new(false),
     };
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(updated.data, updated.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        updated.data,
+        updated.resource_version,
+    );
     reconcile_deployment(
         &db,
         &reader,
@@ -867,8 +891,8 @@ async fn test_reconcile_deployment_status_replicas_reflects_new_rs_pods() {
     // Regression test: after creating a new RS and reconciling it, status.replicas
     // must count the pods created by the new RS — not use the stale owned_rs_list
     // captured before RS creation (which had no entries).
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-rs-pods";
 
     let deploy = make_deployment("web2", "default", deploy_uid, 2, "0");
@@ -877,8 +901,10 @@ async fn test_reconcile_deployment_status_replicas_reflects_new_rs_pods() {
         .await
         .unwrap();
 
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -896,7 +922,7 @@ async fn test_reconcile_deployment_status_replicas_reflects_new_rs_pods() {
             "v1",
             "Pod",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -922,8 +948,8 @@ async fn test_reconcile_deployment_status_replicas_reflects_new_rs_pods() {
 
 #[tokio::test]
 async fn test_reconcile_deployment_status_ignores_terminal_node_lost_pods() {
-    let db = crate::test_support::in_memory().await;
-    let pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-node-lost";
     let rs_uid = "rs-uid-node-lost";
 
@@ -1012,8 +1038,10 @@ async fn test_reconcile_deployment_status_ignores_terminal_node_lost_pods() {
         .unwrap();
     }
 
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_deployment(
         &db,
         pod_repo.as_ref(),
@@ -1040,8 +1068,8 @@ async fn test_reconcile_deployment_status_ignores_terminal_node_lost_pods() {
 #[tokio::test]
 async fn test_reconcile_deployment_status_includes_newly_created_rs() {
     // Regression: first reconcile with no prior RS must show replicas >= 1 in status
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-new-rs-incl";
 
     let deploy = make_deployment("webx", "default", deploy_uid, 2, "0");
@@ -1050,8 +1078,10 @@ async fn test_reconcile_deployment_status_includes_newly_created_rs() {
         .await
         .unwrap();
 
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1080,8 +1110,8 @@ async fn test_reconcile_deployment_status_includes_newly_created_rs() {
 
 #[tokio::test]
 async fn test_reconcile_deployment_scale_down_to_zero() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-scaledown0";
 
     // Create deployment with 3 replicas
@@ -1091,8 +1121,10 @@ async fn test_reconcile_deployment_scale_down_to_zero() {
         .await
         .unwrap();
 
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1109,7 +1141,7 @@ async fn test_reconcile_deployment_scale_down_to_zero() {
             "v1",
             "Pod",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1135,8 +1167,10 @@ async fn test_reconcile_deployment_scale_down_to_zero() {
         .await
         .unwrap();
 
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(updated.data, updated.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        updated.data,
+        updated.resource_version,
+    );
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1153,7 +1187,7 @@ async fn test_reconcile_deployment_scale_down_to_zero() {
             "v1",
             "Pod",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1211,8 +1245,8 @@ fn make_deployment_with_image(
 
 #[tokio::test]
 async fn test_reconcile_deployment_rolling_update_creates_new_replicaset() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-rolling";
 
     // Create deployment with nginx:1.14 and 3 replicas
@@ -1222,8 +1256,10 @@ async fn test_reconcile_deployment_rolling_update_creates_new_replicaset() {
         .await
         .unwrap();
 
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1241,7 +1277,7 @@ async fn test_reconcile_deployment_rolling_update_creates_new_replicaset() {
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1269,8 +1305,10 @@ async fn test_reconcile_deployment_rolling_update_creates_new_replicaset() {
         .await
         .unwrap();
 
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(updated.data, updated.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        updated.data,
+        updated.resource_version,
+    );
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1288,7 +1326,7 @@ async fn test_reconcile_deployment_rolling_update_creates_new_replicaset() {
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1338,8 +1376,8 @@ async fn test_reconcile_deployment_rolling_update_creates_new_replicaset() {
 
 #[tokio::test]
 async fn test_recreate_strategy_does_not_scale_new_rs_until_old_rs_zero() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
     let deploy_uid = "deploy-uid-recreate";
 
     let mut deploy =
@@ -1356,8 +1394,10 @@ async fn test_recreate_strategy_does_not_scale_new_rs_until_old_rs_zero() {
         .await
         .unwrap();
 
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1390,8 +1430,10 @@ async fn test_recreate_strategy_does_not_scale_new_rs_until_old_rs_zero() {
         .await
         .unwrap();
 
-    let deploy_with_rv =
-        crate::test_support::inject_resource_version(updated.data, updated.resource_version);
+    let deploy_with_rv = crate::internal_test_support::inject_resource_version(
+        updated.data,
+        updated.resource_version,
+    );
     reconcile_deployment(
         &db,
         __pod_repo.as_ref(),
@@ -1408,7 +1450,7 @@ async fn test_recreate_strategy_does_not_scale_new_rs_until_old_rs_zero() {
             "apps/v1",
             "ReplicaSet",
             Some("default"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();

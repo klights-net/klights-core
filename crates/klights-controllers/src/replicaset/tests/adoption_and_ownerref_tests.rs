@@ -4,8 +4,8 @@ use super::*;
 /// not be hardcoded to 0. Sonobuoy: RS scaled to 3 but ReadyReplicas stays 0.
 #[tokio::test]
 async fn test_replicaset_status_ready_replicas_reflects_pod_conditions() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -72,7 +72,7 @@ async fn test_replicaset_status_ready_replicas_reflects_pod_conditions() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -147,8 +147,8 @@ async fn test_replicaset_status_ready_replicas_reflects_pod_conditions() {
 
 #[tokio::test]
 async fn test_replicaset_deletes_itself_when_controller_deployment_missing() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -189,8 +189,10 @@ async fn test_replicaset_deletes_itself_when_controller_deployment_missing() {
         .await
         .unwrap();
 
-    let rs_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let rs_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
     reconcile_replicaset(
         &db,
         __pod_repo.as_ref(),
@@ -214,8 +216,8 @@ async fn test_replicaset_deletes_itself_when_controller_deployment_missing() {
 
 #[tokio::test]
 async fn test_replicaset_skips_reconcile_when_deletion_timestamp_set() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -277,7 +279,7 @@ async fn test_replicaset_skips_reconcile_when_deletion_timestamp_set() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -290,8 +292,8 @@ async fn test_replicaset_skips_reconcile_when_deletion_timestamp_set() {
 
 #[tokio::test]
 async fn test_replicaset_stale_snapshot_after_delete_does_not_recreate_pods() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -347,7 +349,7 @@ async fn test_replicaset_stale_snapshot_after_delete_does_not_recreate_pods() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -376,7 +378,7 @@ async fn test_replicaset_stale_snapshot_after_delete_does_not_recreate_pods() {
 async fn test_replicaset_status_write_never_clobbers_user_scale_under_race() {
     use std::sync::Arc;
 
-    let db = Arc::new(crate::test_support::in_memory().await);
+    let db = Arc::new(crate::internal_test_support::in_memory().await);
 
     for iteration in 0..25 {
         let name = format!("rs-race-{iteration}");

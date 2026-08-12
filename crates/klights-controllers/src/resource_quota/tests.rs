@@ -165,7 +165,7 @@ fn test_resource_quota_scope_selector_matches_priority_class_and_cross_namespace
 
 #[tokio::test]
 async fn test_reconcile_resource_quotas_updates_secret_count() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     // Create a ResourceQuota tracking secrets
     db.create_resource(
@@ -226,7 +226,7 @@ async fn test_reconcile_resource_quotas_updates_secret_count() {
 
 #[tokio::test]
 async fn test_reconcile_resource_quotas_decrements_on_delete() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -286,7 +286,7 @@ async fn test_reconcile_resource_quotas_decrements_on_delete() {
 
 #[tokio::test]
 async fn test_reconcile_resource_quotas_no_quota_is_noop() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
     // Should not panic/error when no ResourceQuota exists
     let result = reconcile_resource_quotas_with_runtime(&db, "default").await;
     assert!(result.is_ok());
@@ -311,7 +311,7 @@ fn test_pod_is_terminating_uses_active_deadline_seconds() {
 
 #[tokio::test]
 async fn test_reconcile_resource_quota_notterminating_tracks_pod_compute_usage() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -415,7 +415,7 @@ async fn test_reconcile_resource_quota_notterminating_tracks_pod_compute_usage()
 /// capture the life of a pod".
 #[tokio::test]
 async fn test_reconcile_resource_quotas_pod_create_updates_used_pods_immediately() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -473,7 +473,7 @@ async fn test_reconcile_resource_quotas_pod_create_updates_used_pods_immediately
 /// resource requests (including ephemeral-storage and custom requests.* keys).
 #[tokio::test]
 async fn test_reconcile_resource_quota_unscoped_pod_compute_and_extended_requests() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -613,7 +613,7 @@ async fn test_reconcile_resource_quota_unscoped_pod_compute_and_extended_request
 /// requests in status.used, matching upstream resource_quota.go:280.
 #[tokio::test]
 async fn test_reconcile_resource_quota_unscoped_legacy_cpu_memory_keys() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -735,7 +735,7 @@ async fn test_reconcile_resource_quota_unscoped_legacy_cpu_memory_keys() {
 /// non-terminating pods for requests/limits accounting.
 #[tokio::test]
 async fn test_reconcile_resource_quota_terminating_scope_tracks_only_terminating_pods() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     for (name, scope) in [
         ("quota-terminating", "Terminating"),
@@ -914,7 +914,7 @@ async fn test_reconcile_resource_quota_terminating_scope_tracks_only_terminating
 /// causing resource_quota.go:280 to time out at 300s.
 #[tokio::test]
 async fn test_reconcile_resource_quotas_pod_delete_decrements_used_pods_immediately() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -986,7 +986,7 @@ async fn test_reconcile_resource_quotas_pod_delete_decrements_used_pods_immediat
 /// This models the K8s conformance test "should apply changes to a resourcequota status".
 #[tokio::test]
 async fn test_reconcile_resets_status_hard_to_spec_hard_after_status_patch() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     // Create RQ with Spec.Hard = {pods: "5"}
     db.create_resource(
@@ -1064,7 +1064,7 @@ async fn test_reconcile_resets_status_hard_to_spec_hard_after_status_patch() {
 /// terminating pods from status.used.
 #[tokio::test]
 async fn test_terminating_pod_excluded_from_pod_count() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1", "ResourceQuota", Some("default"), "test-rq",
@@ -1130,7 +1130,7 @@ async fn test_terminating_pod_excluded_from_pod_count() {
 /// a subsequent reconcile must release all its resources from quota.
 #[tokio::test]
 async fn test_pod_becomes_terminating_releases_quota() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1", "ResourceQuota", Some("default"), "test-rq",

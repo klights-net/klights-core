@@ -20,7 +20,7 @@ fn coordination() -> &'static crate::ControllerCoordination {
 }
 
 async fn reconcile_deployment(
-    db: &crate::test_support::TestStore,
+    db: &crate::internal_test_support::TestStore,
     pod_reader: &(impl klights_pod_api::PodQuery + ?Sized),
     pod_writer: &(
          impl crate::deployment::DeploymentPodMutation
@@ -35,11 +35,11 @@ async fn reconcile_deployment(
         db,
         pod_reader,
         pod_writer,
-        crate::test_support::deterministic_controller_identity().as_ref(),
+        crate::internal_test_support::deterministic_controller_identity().as_ref(),
         pod_delete_sink,
         db,
         deployment,
-        crate::test_support::test_reconcile_context(coordination(), node_name),
+        crate::internal_test_support::test_reconcile_context(coordination(), node_name),
     )
     .await
 }

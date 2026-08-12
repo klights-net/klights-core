@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct ScaleDownDuringCreateWriter {
-    db: crate::test_support::TestStore,
+    db: crate::internal_test_support::TestStore,
     creates: AtomicUsize,
 }
 
@@ -57,7 +57,7 @@ impl crate::replicaset::ReplicaSetPodMutation for ScaleDownDuringCreateWriter {
 }
 
 struct SlowFirstCreateWriter {
-    db: crate::test_support::TestStore,
+    db: crate::internal_test_support::TestStore,
     creates: AtomicUsize,
 }
 
@@ -90,8 +90,8 @@ impl crate::replicaset::ReplicaSetPodMutation for SlowFirstCreateWriter {
 
 #[tokio::test]
 async fn test_concurrent_replicaset_reconcile_creates_only_desired_pods() {
-    let db = crate::test_support::in_memory().await;
-    let pod_reader = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let pod_reader = crate::internal_test_support::pod_repository_for_test(&db);
     let pod_writer = Arc::new(SlowFirstCreateWriter {
         db: db.clone(),
         creates: AtomicUsize::new(0),
@@ -118,8 +118,10 @@ async fn test_concurrent_replicaset_reconcile_creates_only_desired_pods() {
         .create_resource("apps/v1", "ReplicaSet", Some("test-ns"), "race-rs", rs)
         .await
         .unwrap();
-    let rs_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let rs_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
 
     let first = reconcile_replicaset(
         &db,
@@ -146,7 +148,12 @@ async fn test_concurrent_replicaset_reconcile_creates_only_desired_pods() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::new(Some("app=race"), None, None, None),
+            crate::internal_test_support::ResourceListQuery::new(
+                Some("app=race"),
+                None,
+                None,
+                None,
+            ),
         )
         .await
         .unwrap();
@@ -159,8 +166,8 @@ async fn test_concurrent_replicaset_reconcile_creates_only_desired_pods() {
 
 #[tokio::test]
 async fn test_replicaset_replaces_terminating_owned_pod() {
-    let db = crate::test_support::in_memory().await;
-    let pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -245,7 +252,7 @@ async fn test_replicaset_replaces_terminating_owned_pod() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -264,8 +271,8 @@ async fn test_replicaset_replaces_terminating_owned_pod() {
 
 #[tokio::test]
 async fn test_replicaset_replaces_terminal_node_lost_owned_pod() {
-    let db = crate::test_support::in_memory().await;
-    let pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -352,7 +359,7 @@ async fn test_replicaset_replaces_terminal_node_lost_owned_pod() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -377,8 +384,8 @@ async fn test_replicaset_replaces_terminal_node_lost_owned_pod() {
 
 #[tokio::test]
 async fn test_replicaset_scale_up_creates_missing_pods() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     // Create namespace
     db.create_resource(
@@ -451,7 +458,7 @@ async fn test_replicaset_scale_up_creates_missing_pods() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -476,8 +483,8 @@ async fn test_replicaset_scale_up_creates_missing_pods() {
 
 #[tokio::test]
 async fn test_replicaset_create_loop_observes_live_scale_down() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
     let writer = Arc::new(ScaleDownDuringCreateWriter {
         db: db.clone(),
         creates: AtomicUsize::new(0),
@@ -522,8 +529,10 @@ async fn test_replicaset_create_loop_observes_live_scale_down() {
         )
         .await
         .unwrap();
-    let rs_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let rs_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
 
     reconcile_replicaset(
         &db,
@@ -541,7 +550,7 @@ async fn test_replicaset_create_loop_observes_live_scale_down() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -561,8 +570,8 @@ async fn test_replicaset_create_loop_observes_live_scale_down() {
 
 #[tokio::test]
 async fn test_replicaset_scale_down_deletes_excess_pods() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     // Create namespace
     db.create_resource(
@@ -635,7 +644,7 @@ async fn test_replicaset_scale_down_deletes_excess_pods() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -706,7 +715,7 @@ async fn test_replicaset_scale_down_deletes_excess_pods() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -749,8 +758,8 @@ async fn test_replicaset_scale_down_deletes_excess_pods() {
 
 #[tokio::test]
 async fn test_replicaset_zero_replicas_creates_no_pods() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -815,7 +824,7 @@ async fn test_replicaset_zero_replicas_creates_no_pods() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -824,8 +833,8 @@ async fn test_replicaset_zero_replicas_creates_no_pods() {
 
 #[tokio::test]
 async fn test_replicaset_pods_have_correct_labels_from_template() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -890,7 +899,7 @@ async fn test_replicaset_pods_have_correct_labels_from_template() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -918,8 +927,8 @@ async fn test_replicaset_pods_have_correct_labels_from_template() {
 
 #[tokio::test]
 async fn test_replicaset_idempotent_reconcile_no_extra_pods() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -985,7 +994,7 @@ async fn test_replicaset_idempotent_reconcile_no_extra_pods() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1026,7 +1035,7 @@ async fn test_replicaset_idempotent_reconcile_no_extra_pods() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1039,8 +1048,8 @@ async fn test_replicaset_idempotent_reconcile_no_extra_pods() {
 
 #[tokio::test]
 async fn test_replicaset_status_updated_after_reconcile() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -1117,8 +1126,8 @@ async fn test_replicaset_status_updated_after_reconcile() {
 
 #[tokio::test]
 async fn test_replicaset_status_update_preserves_stale_external_conditions() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -1217,8 +1226,8 @@ async fn test_replicaset_status_update_preserves_stale_external_conditions() {
 
 #[tokio::test]
 async fn test_replicaset_pods_have_owner_reference_with_controller_true() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -1283,7 +1292,7 @@ async fn test_replicaset_pods_have_owner_reference_with_controller_true() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1303,8 +1312,8 @@ async fn test_replicaset_pods_have_owner_reference_with_controller_true() {
 
 #[tokio::test]
 async fn test_replicaset_adopts_orphan_matching_pod() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -1382,7 +1391,7 @@ async fn test_replicaset_adopts_orphan_matching_pod() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1405,8 +1414,8 @@ async fn test_replicaset_adopts_orphan_matching_pod() {
 
 #[tokio::test]
 async fn test_replicaset_releases_pod_when_selector_changes() {
-    let db = crate::test_support::in_memory().await;
-    let __pod_repo = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let __pod_repo = crate::internal_test_support::pod_repository_for_test(&db);
 
     db.create_resource(
         "v1",
@@ -1463,7 +1472,7 @@ async fn test_replicaset_releases_pod_when_selector_changes() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();

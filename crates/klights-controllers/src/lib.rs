@@ -22,6 +22,9 @@ pub mod endpoints;
 pub mod gc;
 pub mod hpa;
 mod identity;
+#[cfg(test)]
+#[path = "tests/support.rs"]
+mod internal_test_support;
 pub mod job;
 mod job_controller;
 pub mod kube_service;
@@ -50,9 +53,8 @@ mod service_controller;
 pub mod side_effects;
 pub mod statefulset;
 mod statefulset_controller;
-#[cfg(test)]
-#[path = "tests/support.rs"]
-mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod workqueue;
 
 pub use coordination::{

@@ -11,7 +11,7 @@ fn active_pod_count(items: &[klights_cluster_core::Resource]) -> usize {
 }
 
 struct ScaleDownDuringStatefulSetCreateWriter {
-    db: crate::test_support::TestStore,
+    db: crate::internal_test_support::TestStore,
     creates: AtomicUsize,
 }
 
@@ -54,7 +54,7 @@ impl StatefulSetPodMutation for ScaleDownDuringStatefulSetCreateWriter {
 
 #[tokio::test]
 async fn test_statefulset_stale_snapshot_after_delete_does_not_recreate_pods() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -110,7 +110,7 @@ async fn test_statefulset_stale_snapshot_after_delete_does_not_recreate_pods() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -122,8 +122,8 @@ async fn test_statefulset_stale_snapshot_after_delete_does_not_recreate_pods() {
 
 #[tokio::test]
 async fn test_statefulset_create_loop_observes_live_scale_down() {
-    let db = crate::test_support::in_memory().await;
-    let pod_reader = crate::test_support::pod_repository_for_test(&db);
+    let db = crate::internal_test_support::in_memory().await;
+    let pod_reader = crate::internal_test_support::pod_repository_for_test(&db);
     let pod_writer = Arc::new(ScaleDownDuringStatefulSetCreateWriter {
         db: db.clone(),
         creates: AtomicUsize::new(0),
@@ -168,18 +168,20 @@ async fn test_statefulset_create_loop_observes_live_scale_down() {
         )
         .await
         .unwrap();
-    let sts_with_rv =
-        crate::test_support::inject_resource_version(created.data, created.resource_version);
+    let sts_with_rv = crate::internal_test_support::inject_resource_version(
+        created.data,
+        created.resource_version,
+    );
 
     crate::statefulset::reconcile_statefulset(
         &db,
         pod_reader.as_ref(),
         pod_writer.as_ref(),
-        crate::test_support::deterministic_controller_identity().as_ref(),
+        crate::internal_test_support::deterministic_controller_identity().as_ref(),
         pod_reader.as_ref(),
         &db,
         &sts_with_rv,
-        crate::test_support::test_reconcile_context(
+        crate::internal_test_support::test_reconcile_context(
             &crate::ControllerCoordination::new(),
             "test-node",
         ),
@@ -192,7 +194,7 @@ async fn test_statefulset_create_loop_observes_live_scale_down() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::new(
+            crate::internal_test_support::ResourceListQuery::new(
                 Some("app=scale-down-sts"),
                 None,
                 None,
@@ -210,7 +212,7 @@ async fn test_statefulset_create_loop_observes_live_scale_down() {
 
 #[tokio::test]
 async fn test_reconcile_statefulset_creates_pods() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     // Create namespace
     db.create_resource(
@@ -278,7 +280,7 @@ async fn test_reconcile_statefulset_creates_pods() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -307,7 +309,7 @@ async fn test_reconcile_statefulset_creates_pods() {
 
 #[tokio::test]
 async fn test_statefulset_deletes_failed_pod_for_recreation() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -339,7 +341,7 @@ async fn test_statefulset_deletes_failed_pod_for_recreation() {
         }
     });
 
-    let sts_with_rv = crate::test_support::store_and_prepare(
+    let sts_with_rv = crate::internal_test_support::store_and_prepare(
         &db,
         "apps/v1",
         "StatefulSet",
@@ -397,7 +399,7 @@ async fn test_statefulset_deletes_failed_pod_for_recreation() {
 
 #[tokio::test]
 async fn test_reconcile_statefulset_scale_down() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     // Create namespace
     db.create_resource(
@@ -465,7 +467,7 @@ async fn test_reconcile_statefulset_scale_down() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -531,7 +533,7 @@ async fn test_reconcile_statefulset_scale_down() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -568,7 +570,7 @@ async fn test_reconcile_statefulset_scale_down() {
 
 #[tokio::test]
 async fn test_statefulset_recreates_lowest_missing_ordinal_gap() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -600,7 +602,7 @@ async fn test_statefulset_recreates_lowest_missing_ordinal_gap() {
         }
     });
 
-    let sts_with_rv = crate::test_support::store_and_prepare(
+    let sts_with_rv = crate::internal_test_support::store_and_prepare(
         &db,
         "apps/v1",
         "StatefulSet",
@@ -664,7 +666,7 @@ async fn test_statefulset_recreates_lowest_missing_ordinal_gap() {
 
 #[tokio::test]
 async fn test_statefulset_recreates_partitioned_lower_ordinal_with_current_revision() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -704,7 +706,7 @@ async fn test_statefulset_recreates_partitioned_lower_ordinal_with_current_revis
         }
     });
 
-    let sts_with_rv = crate::test_support::store_and_prepare(
+    let sts_with_rv = crate::internal_test_support::store_and_prepare(
         &db,
         "apps/v1",
         "StatefulSet",
@@ -772,7 +774,7 @@ async fn test_statefulset_recreates_partitioned_lower_ordinal_with_current_revis
 
 #[tokio::test]
 async fn test_reconcile_statefulset_zero_replicas() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -831,7 +833,7 @@ async fn test_reconcile_statefulset_zero_replicas() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -840,7 +842,7 @@ async fn test_reconcile_statefulset_zero_replicas() {
 
 #[tokio::test]
 async fn test_reconcile_statefulset_ordinal_names() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -900,7 +902,7 @@ async fn test_reconcile_statefulset_ordinal_names() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -928,7 +930,7 @@ async fn test_reconcile_statefulset_ordinal_names() {
 
 #[tokio::test]
 async fn test_reconcile_statefulset_owner_references() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -987,7 +989,7 @@ async fn test_reconcile_statefulset_owner_references() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1007,7 +1009,7 @@ async fn test_reconcile_statefulset_owner_references() {
 
 #[tokio::test]
 async fn test_reconcile_statefulset_idempotent() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -1068,7 +1070,7 @@ async fn test_reconcile_statefulset_idempotent() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1102,7 +1104,7 @@ async fn test_reconcile_statefulset_idempotent() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1115,7 +1117,7 @@ async fn test_reconcile_statefulset_idempotent() {
 
 #[tokio::test]
 async fn test_reconcile_statefulset_status_updated() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -1188,7 +1190,7 @@ async fn test_statefulset_ordered_creation() {
     // OrderedReady policy: create pods one at a time in order (0, 1, 2)
     // This test verifies that only the first pod is created on initial reconcile
     // when podManagementPolicy is OrderedReady (default)
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -1243,7 +1245,7 @@ async fn test_statefulset_ordered_creation() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1266,7 +1268,7 @@ async fn test_statefulset_ordered_creation() {
 #[tokio::test]
 async fn test_statefulset_reverse_deletion() {
     // Verify pods are deleted in reverse ordinal order (highest first)
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -1324,7 +1326,7 @@ async fn test_statefulset_reverse_deletion() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1385,7 +1387,7 @@ async fn test_statefulset_reverse_deletion() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();

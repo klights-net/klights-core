@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn test_statefulset_ordered_scale_down_halts_when_unhealthy() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -58,7 +58,7 @@ async fn test_statefulset_ordered_scale_down_halts_when_unhealthy() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -164,7 +164,7 @@ async fn test_statefulset_ordered_scale_down_halts_when_unhealthy() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -227,7 +227,7 @@ async fn test_statefulset_ordered_scale_down_halts_when_unhealthy() {
                 "v1",
                 "Pod",
                 Some("test-ns"),
-                crate::test_support::ResourceListQuery::all(),
+                crate::internal_test_support::ResourceListQuery::all(),
             )
             .await
             .unwrap();
@@ -258,7 +258,7 @@ async fn test_statefulset_ordered_scale_down_halts_when_unhealthy() {
 
 #[tokio::test]
 async fn statefulset_zero_ordinal_scale_down_with_parity() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -391,7 +391,7 @@ async fn statefulset_zero_ordinal_scale_down_with_parity() {
 
 #[tokio::test]
 async fn test_statefulset_ordered_scale_down_deletes_one_pod_per_reconcile() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -444,7 +444,7 @@ async fn test_statefulset_ordered_scale_down_deletes_one_pod_per_reconcile() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -530,7 +530,7 @@ async fn test_statefulset_ordered_scale_down_deletes_one_pod_per_reconcile() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -577,7 +577,7 @@ async fn test_statefulset_ordered_scale_down_deletes_one_pod_per_reconcile() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -603,7 +603,7 @@ async fn test_statefulset_ordered_scale_down_deletes_one_pod_per_reconcile() {
 #[tokio::test]
 async fn test_statefulset_scale_up_waits_for_ready() {
     // OrderedReady: when pod-0 is not Ready, reconcile should not create pod-1
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -658,7 +658,7 @@ async fn test_statefulset_scale_up_waits_for_ready() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -719,7 +719,7 @@ async fn test_statefulset_scale_up_waits_for_ready() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -733,7 +733,7 @@ async fn test_statefulset_scale_up_waits_for_ready() {
 #[tokio::test]
 async fn test_statefulset_parallel_policy() {
     // Parallel policy creates all pods at once, regardless of Ready status
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -788,7 +788,7 @@ async fn test_statefulset_parallel_policy() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -820,7 +820,7 @@ async fn test_statefulset_parallel_policy() {
 #[tokio::test]
 async fn test_statefulset_pod_naming() {
     // Verify deterministic pod names: {statefulset-name}-{ordinal}
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -874,7 +874,7 @@ async fn test_statefulset_pod_naming() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -907,7 +907,7 @@ async fn test_statefulset_pod_naming() {
 #[tokio::test]
 async fn test_statefulset_pod_hostname() {
     // Verify each StatefulSet pod gets hostname = pod name
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -961,7 +961,7 @@ async fn test_statefulset_pod_hostname() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -991,7 +991,7 @@ async fn test_statefulset_pod_hostname() {
 #[tokio::test]
 async fn test_statefulset_pod_subdomain() {
     // Verify each StatefulSet pod gets subdomain = serviceName
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -1039,7 +1039,7 @@ async fn test_statefulset_pod_subdomain() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1064,7 +1064,7 @@ async fn test_statefulset_pod_subdomain() {
 #[tokio::test]
 async fn test_statefulset_headless_service_endpoints() {
     // Verify headless service gets individual pod IPs in Endpoints
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_namespace("test-ns", json!({"metadata": {"name": "test-ns"}}))
         .await
@@ -1142,7 +1142,7 @@ async fn test_statefulset_headless_service_endpoints() {
             "v1",
             "Pod",
             Some("test-ns"),
-            crate::test_support::ResourceListQuery::all(),
+            crate::internal_test_support::ResourceListQuery::all(),
         )
         .await
         .unwrap();
@@ -1250,9 +1250,9 @@ async fn test_statefulset_headless_service_endpoints() {
 
 #[tokio::test]
 async fn test_is_pod_ready_nonexistent_pod_returns_false() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
     let ready = is_pod_ready(
-        crate::test_support::pod_repository_for_test(&db).as_ref(),
+        crate::internal_test_support::pod_repository_for_test(&db).as_ref(),
         "default",
         "nonexistent-pod",
     )
@@ -1263,7 +1263,7 @@ async fn test_is_pod_ready_nonexistent_pod_returns_false() {
 
 #[tokio::test]
 async fn test_is_pod_ready_no_status_returns_false() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -1281,7 +1281,7 @@ async fn test_is_pod_ready_no_status_returns_false() {
     .unwrap();
 
     let ready = is_pod_ready(
-        crate::test_support::pod_repository_for_test(&db).as_ref(),
+        crate::internal_test_support::pod_repository_for_test(&db).as_ref(),
         "default",
         "no-status-pod",
     )
@@ -1292,7 +1292,7 @@ async fn test_is_pod_ready_no_status_returns_false() {
 
 #[tokio::test]
 async fn test_is_pod_ready_no_ready_condition_returns_false() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -1314,7 +1314,7 @@ async fn test_is_pod_ready_no_ready_condition_returns_false() {
     .unwrap();
 
     let ready = is_pod_ready(
-        crate::test_support::pod_repository_for_test(&db).as_ref(),
+        crate::internal_test_support::pod_repository_for_test(&db).as_ref(),
         "default",
         "no-condition-pod",
     )
@@ -1325,7 +1325,7 @@ async fn test_is_pod_ready_no_ready_condition_returns_false() {
 
 #[tokio::test]
 async fn test_is_pod_ready_condition_true_returns_true() {
-    let db = crate::test_support::in_memory().await;
+    let db = crate::internal_test_support::in_memory().await;
 
     db.create_resource(
         "v1",
@@ -1347,7 +1347,7 @@ async fn test_is_pod_ready_condition_true_returns_true() {
     .unwrap();
 
     let ready = is_pod_ready(
-        crate::test_support::pod_repository_for_test(&db).as_ref(),
+        crate::internal_test_support::pod_repository_for_test(&db).as_ref(),
         "default",
         "ready-pod",
     )

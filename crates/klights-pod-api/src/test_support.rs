@@ -7,12 +7,15 @@ use serde_json::Value;
 
 use klights_cluster_core::Resource;
 
+use klights_types::PodIdentity;
+
 use crate::{
     PodApiCreateRequest, PodApiCreateResult, PodApiMutation, PodApiPatchRequest,
-    PodApiUpdateRequest, PodApiWriteOutcome, PodGetRequest, PodListRequest, PodListResult,
-    PodMetadataPatchRequest, PodOwnerListRequest, PodOwnerReference, PodPersistence,
-    PodPersistenceCreateRequest, PodPersistenceReplaceRequest, PodQuery, PodRepositoryError,
-    PodSnapshotListOutcome, PodSnapshotListRequest, PodSnapshotQuery, PodUpdate, PodUpdateRequest,
+    PodApiUpdateRequest, PodApiWriteOutcome, PodGetRequest, PodLabel, PodListRequest,
+    PodListResult, PodMetadataPatchRequest, PodMutationTarget, PodOwnerListRequest,
+    PodOwnerReference, PodPersistence, PodPersistenceCreateRequest, PodPersistenceReplaceRequest,
+    PodQuery, PodRepositoryError, PodSnapshotListOutcome, PodSnapshotListRequest, PodSnapshotQuery,
+    PodUpdate, PodUpdateRequest,
 };
 
 #[derive(Clone)]
@@ -218,6 +221,71 @@ impl PodUpdatePorts {
     ) -> Result<Resource, PodRepositoryError> {
         self.update.update_pod(request).await
     }
+
+    /// Replaces owner references for the named Pod without a UID check.
+    pub async fn replace_owner_references_by_name(
+        &self,
+        namespace: &str,
+        name: &str,
+        owner_references: Vec<Value>,
+    ) -> Result<Resource, PodRepositoryError> {
+        self.update_pod(PodUpdateRequest::replace_owner_references(
+            PodMutationTarget::try_by_name(namespace, name)?,
+            owner_references_from_values(owner_references)?,
+        ))
+        .await
+    }
+
+    /// Replaces owner references for a UID-qualified Pod.
+    pub async fn replace_owner_references_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        owner_references: Vec<Value>,
+    ) -> Result<Resource, PodRepositoryError> {
+        self.update_pod(PodUpdateRequest::replace_owner_references(
+            PodMutationTarget::try_by_identity(PodIdentity::new(namespace, name, uid))?,
+            owner_references_from_values(owner_references)?,
+        ))
+        .await
+    }
+
+    /// Merges labels for the named Pod without a UID check.
+    pub async fn merge_labels_by_name(
+        &self,
+        namespace: &str,
+        name: &str,
+        labels: Vec<(String, String)>,
+    ) -> Result<Resource, PodRepositoryError> {
+        self.update_pod(PodUpdateRequest::merge_labels(
+            PodMutationTarget::try_by_name(namespace, name)?,
+            labels_from_pairs(labels)?,
+        ))
+        .await
+    }
+
+    /// Merges labels for a UID-qualified Pod.
+    pub async fn merge_labels_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        labels: Vec<(String, String)>,
+    ) -> Result<Resource, PodRepositoryError> {
+        self.update_pod(PodUpdateRequest::merge_labels(
+            PodMutationTarget::try_by_identity(PodIdentity::new(namespace, name, uid))?,
+            labels_from_pairs(labels)?,
+        ))
+        .await
+    }
+}
+
+fn labels_from_pairs(labels: Vec<(String, String)>) -> Result<Vec<PodLabel>, PodRepositoryError> {
+    labels
+        .into_iter()
+        .map(|(key, value)| PodLabel::try_new(key, value))
+        .collect()
 }
 
 /// Focused Pod persistence capability for tests. The concrete datastore and
@@ -278,6 +346,30 @@ impl PodApiMutationPorts {
         request: PodApiCreateRequest,
     ) -> Result<PodApiCreateResult, PodRepositoryError> {
         self.mutations.create_pod(request).await
+    }
+
+    /// Creates a Pod and requires the API to have actually persisted it
+    /// (rather than dry-run) — the shape every controller-owned Pod fixture
+    /// needs, with an error message that names the target Pod.
+    pub async fn create_or_require_resource(
+        &self,
+        namespace: &str,
+        name: &str,
+        body: Value,
+    ) -> Result<Resource, PodRepositoryError> {
+        self.create(PodApiCreateRequest {
+            namespace: namespace.to_string(),
+            body,
+            dry_run: false,
+        })
+        .await?
+        .resource
+        .ok_or_else(|| {
+            PodRepositoryError::invalid_request(
+                "pod",
+                format!("controller Pod {namespace}/{name} unexpectedly dry-ran"),
+            )
+        })
     }
 
     pub async fn update(

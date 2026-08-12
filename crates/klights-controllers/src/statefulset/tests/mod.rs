@@ -16,7 +16,7 @@ async fn is_pod_ready(
 
 /// Private focused-port harness for controller-owned policy regressions.
 async fn reconcile_statefulset_test(
-    db: &crate::test_support::TestStore,
+    db: &crate::internal_test_support::TestStore,
     statefulset: &serde_json::Value,
     node_name: &str,
 ) -> anyhow::Result<()> {
@@ -24,11 +24,11 @@ async fn reconcile_statefulset_test(
         db,
         db,
         db,
-        crate::test_support::deterministic_controller_identity().as_ref(),
+        crate::internal_test_support::deterministic_controller_identity().as_ref(),
         db,
         db,
         statefulset,
-        crate::test_support::test_reconcile_context(
+        crate::internal_test_support::test_reconcile_context(
             &crate::ControllerCoordination::new(),
             node_name,
         ),
