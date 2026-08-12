@@ -2,6 +2,14 @@
 
 use std::sync::Arc;
 
+use klights_kubelet::test_support::pod_deletion::{
+    BoundPodDeleteCasRaceOutcome, BoundPodDeleteOutcome, ClaimedPodOutbox,
+    DeferredRuntimeFinalizerOutcome, PodDeleteCasRaceKind, PodFinalizationOutcome,
+    PodOutboxCommand, UnscheduledPodDeleteCasRaceOutcome, WorkerFinalizationDeliveryOutcome,
+    WorkerFinalizationRaceOutcome,
+};
+use klights_node_store::test_support::ClaimedPodWork;
+
 use klights_cluster_datastore::sqlite::embedded::ResourceMutationPauseOperation as IntegrationResourceMutationPauseOperation;
 use klights_pod_api::PodSubresourceMutation as _;
 use klights_pod_api::test_support::{
@@ -93,13 +101,6 @@ pub struct IntegrationPodWorkerFixture {
     pub update: klights_pod_api::test_support::PodUpdatePorts,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IntegrationPodFinalizationOutcome {
-    DeletedOrAlreadyGone,
-    Queued,
-    FinalizersPending,
-}
-
 /// Finalizes bound-pod cleanup through the focused deletion-finalizer port
 /// only — callers pass the port obtained from their own concrete backing
 /// repository rather than the repository itself.
@@ -108,17 +109,17 @@ async fn integration_finalize_pod_after_actor_cleanup(
     namespace: &str,
     name: &str,
     uid: &str,
-) -> anyhow::Result<IntegrationPodFinalizationOutcome> {
+) -> anyhow::Result<PodFinalizationOutcome> {
     let key = klights_kubelet::runtime_types::PodRuntimeKey::new(namespace, name, uid);
     Ok(match finalizer.finalize_after_actor_cleanup(&key).await? {
         klights_kubelet::runtime_types::PodDeletionFinalizeResult::DeletedOrAlreadyGone => {
-            IntegrationPodFinalizationOutcome::DeletedOrAlreadyGone
+            PodFinalizationOutcome::DeletedOrAlreadyGone
         }
         klights_kubelet::runtime_types::PodDeletionFinalizeResult::Queued => {
-            IntegrationPodFinalizationOutcome::Queued
+            PodFinalizationOutcome::Queued
         }
         klights_kubelet::runtime_types::PodDeletionFinalizeResult::FinalizersPending => {
-            IntegrationPodFinalizationOutcome::FinalizersPending
+            PodFinalizationOutcome::FinalizersPending
         }
     })
 }
@@ -202,7 +203,7 @@ impl IntegrationPodWorkerFixture {
         now_ms: i64,
         lease_ms: i64,
         lease_token: &str,
-    ) -> anyhow::Result<Option<IntegrationClaimedPodOutbox>> {
+    ) -> anyhow::Result<Option<ClaimedPodOutbox>> {
         claim_pod_outbox(&self.node_local, now_ms, lease_ms, lease_token).await
     }
 
@@ -211,7 +212,7 @@ impl IntegrationPodWorkerFixture {
         namespace: &str,
         name: &str,
         uid: &str,
-    ) -> anyhow::Result<IntegrationPodFinalizationOutcome> {
+    ) -> anyhow::Result<PodFinalizationOutcome> {
         integration_finalize_pod_after_actor_cleanup(
             self.deletion_finalizer.as_ref(),
             namespace,
@@ -374,24 +375,8 @@ impl IntegrationPodWorkerFixture {
     }
 }
 
-pub struct IntegrationWorkerFinalizationRaceOutcome {
-    pub initially_pending: bool,
-    pub resource_version_advanced: bool,
-    pub dispatched: bool,
-    pub removed_after_dispatch: bool,
-    pub completed_after_committed_absence: bool,
-    pub node_mismatch_rejected: bool,
-}
-
-pub struct IntegrationWorkerFinalizationDeliveryOutcome {
-    pub queued: bool,
-    pub exact_uid_bound_command: bool,
-    pub committed_resource_receipt: bool,
-    pub authoritative_pod_removed: bool,
-}
-
 pub async fn run_worker_actor_finalization_delivery_scenario()
--> anyhow::Result<IntegrationWorkerFinalizationDeliveryOutcome> {
+-> anyhow::Result<WorkerFinalizationDeliveryOutcome> {
     let sqlite = crate::datastore::sqlite::Datastore::new_in_memory().await?;
     let db: crate::datastore::DatastoreHandle = Arc::new(sqlite.clone());
     db.create_resource(
@@ -430,7 +415,7 @@ pub async fn run_worker_actor_finalization_delivery_scenario()
             "uid-leader-finalize",
         )
         .await?
-        == IntegrationPodFinalizationOutcome::Queued;
+        == PodFinalizationOutcome::Queued;
     let request = klights_node_store::OutboxClaimRequest::try_new(
         i64::MAX / 4,
         1_000,
@@ -477,7 +462,7 @@ pub async fn run_worker_actor_finalization_delivery_scenario()
         .get_resource("v1", "Pod", Some("default"), "leader-finalize")
         .await?
         .is_none();
-    Ok(IntegrationWorkerFinalizationDeliveryOutcome {
+    Ok(WorkerFinalizationDeliveryOutcome {
         queued,
         exact_uid_bound_command,
         committed_resource_receipt: committed_resource.is_some(),
@@ -485,8 +470,7 @@ pub async fn run_worker_actor_finalization_delivery_scenario()
     })
 }
 
-pub async fn run_worker_actor_finalization_race()
--> anyhow::Result<IntegrationWorkerFinalizationRaceOutcome> {
+pub async fn run_worker_actor_finalization_race() -> anyhow::Result<WorkerFinalizationRaceOutcome> {
     let sqlite = crate::datastore::sqlite::Datastore::new_in_memory().await?;
     let db: crate::datastore::DatastoreHandle = Arc::new(sqlite.clone());
     let created = db
@@ -541,7 +525,7 @@ pub async fn run_worker_actor_finalization_race()
             "uid-rv-retry-finalize",
         )
         .await?
-        == IntegrationPodFinalizationOutcome::Queued;
+        == PodFinalizationOutcome::Queued;
     let raced = db
         .update_status_only(
             "v1",
@@ -565,7 +549,7 @@ pub async fn run_worker_actor_finalization_race()
             "uid-rv-retry-finalize",
         )
         .await?
-        == IntegrationPodFinalizationOutcome::DeletedOrAlreadyGone;
+        == PodFinalizationOutcome::DeletedOrAlreadyGone;
     db.create_resource(
         "v1",
         "Pod",
@@ -600,7 +584,7 @@ pub async fn run_worker_actor_finalization_race()
         .get_resource("v1", "Pod", Some("default"), "wrong-node-finalize")
         .await?
         .is_some();
-    Ok(IntegrationWorkerFinalizationRaceOutcome {
+    Ok(WorkerFinalizationRaceOutcome {
         initially_pending,
         resource_version_advanced: raced.resource_version > created.resource_version,
         dispatched,
@@ -764,82 +748,10 @@ impl IntegrationPodNetworkPorts {
 /// Focused API and subresource capabilities.  These keep API-facing tests
 /// from depending on any repository-wide trait implementation.
 pub struct IntegrationPodApiPorts {
-    api: Arc<k8s_native_service::PodApiService>,
     subresource: Arc<k8s_native_service::PodSubresourceService>,
 }
 
 impl IntegrationPodApiPorts {
-    pub async fn delete(
-        &self,
-        request: klights_pod_api::PodApiDeleteRequest,
-    ) -> Result<klights_pod_api::PodApiDeleteOutcome, klights_pod_api::PodRepositoryError> {
-        use klights_pod_api::PodApiMutation as _;
-        self.api.delete_pod(request).await
-    }
-
-    pub async fn delete_pod<O>(
-        &self,
-        namespace: &str,
-        name: &str,
-        options: O,
-        dry_run: bool,
-    ) -> Result<klights_pod_api::PodApiDeleteOutcome, klights_pod_api::PodRepositoryError>
-    where
-        O: Into<klights_pod_api::PodDeleteOptions> + Send,
-    {
-        self.delete(klights_pod_api::PodApiDeleteRequest {
-            namespace: namespace.to_string(),
-            name: name.to_string(),
-            options: options.into(),
-            dry_run,
-        })
-        .await
-    }
-
-    pub async fn ordinary_mark_pod_terminating(
-        &self,
-        request: klights_pod_api::PodMarkTerminatingRequest,
-    ) -> Result<crate::datastore::Resource, klights_pod_api::PodRepositoryError> {
-        let target = request.into_target();
-        let options = target
-            .uid()
-            .map(k8s_native_service::DeleteOptions::with_uid_precondition)
-            .unwrap_or_default();
-        match self
-            .delete_pod(target.namespace(), target.name(), options, false)
-            .await?
-        {
-            klights_pod_api::PodApiDeleteOutcome::GracefulSet(resource) => Ok(resource),
-            klights_pod_api::PodApiDeleteOutcome::DryRun(_) => {
-                unreachable!("ordinary mark is never dry-run")
-            }
-        }
-    }
-
-    pub async fn delete_collection(
-        &self,
-        request: klights_pod_api::PodApiDeleteCollectionRequest,
-    ) -> Result<(), klights_pod_api::PodRepositoryError> {
-        use klights_pod_api::PodApiMutation as _;
-        self.api.delete_collection_pods(request).await
-    }
-
-    pub async fn delete_collection_pods(
-        &self,
-        namespace: &str,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        dry_run: bool,
-    ) -> Result<(), klights_pod_api::PodRepositoryError> {
-        self.delete_collection(klights_pod_api::PodApiDeleteCollectionRequest {
-            namespace: namespace.to_string(),
-            label_selector: label_selector.map(str::to_string),
-            field_selector: field_selector.map(str::to_string),
-            dry_run,
-        })
-        .await
-    }
-
     pub async fn replace_status(
         &self,
         request: klights_pod_api::PodStatusReplaceRequest,
@@ -955,6 +867,7 @@ struct PodRepositoryScenarioOwner {
     status_ports: IntegrationPodStatusPorts,
     network_ports: IntegrationPodNetworkPorts,
     api_ports: IntegrationPodApiPorts,
+    deletion_api: klights_kubelet::test_support::pod_deletion::PodDeletionApiTestPorts,
     api_mutations: klights_pod_api::test_support::PodApiMutationPorts,
     scheduling: Arc<dyn klights_pod_api::PodScheduling>,
     gc_delete: Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
@@ -1111,14 +1024,6 @@ impl klights_node_store::PodNetworkCache for IntegrationEmptyPodNetworkCache {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IntegrationBoundPodDeleteOutcome {
-    Removed,
-    IdentityChanged,
-    FinalizersPending,
-    Retry,
-}
-
 pub struct IntegrationStatusRaceOutcome {
     pub attempts: usize,
     pub resource: Option<crate::datastore::Resource>,
@@ -1178,7 +1083,7 @@ pub async fn run_api_delete_status_race(
         Some("default"),
         pod_name,
     );
-    let delete = repo.api_ports().delete_pod(
+    let delete = repo.deletion_api.delete_pod(
         "default",
         pod_name,
         k8s_native_service::DeleteOptions {
@@ -1232,19 +1137,6 @@ pub async fn run_api_delete_status_race(
     })
 }
 
-pub struct IntegrationClaimedPodOutbox {
-    pub operation: String,
-    pub pod_uid: String,
-    pub command: IntegrationPodOutboxCommand,
-}
-
-pub struct IntegrationPodWorkqueueEntry {
-    pub namespace: String,
-    pub name: String,
-    pub uid: String,
-    pub target_node: Option<String>,
-}
-
 struct IntegrationRecordingPodDeleteHook {
     db: crate::datastore::DatastoreHandle,
     observed: Arc<tokio::sync::Mutex<Option<(bool, bool)>>>,
@@ -1279,47 +1171,12 @@ impl klights_controllers::side_effects::SideEffect for IntegrationRecordingPodDe
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub enum IntegrationPodOutboxCommand {
-    SandboxAnnotationPatch {
-        api_version: String,
-        kind: String,
-        namespace: Option<String>,
-        name: String,
-        patch_kind: klights_cluster_core::PatchKind,
-        pod_uid: String,
-        resource_version: i64,
-        strict_resource_version: bool,
-        sandbox_id: String,
-    },
-    DeleteMarkPatch {
-        api_version: String,
-        kind: String,
-        namespace: Option<String>,
-        name: String,
-        patch_kind: klights_cluster_core::PatchKind,
-        pod_uid: String,
-        resource_version: Option<i64>,
-        strict_resource_version: bool,
-        grace_period_seconds: i64,
-        has_deletion_timestamp: bool,
-    },
-    FinalizeBoundPod {
-        namespace: String,
-        name: String,
-        pod_uid: String,
-        node_name: String,
-        observed_resource_version: i64,
-    },
-    Other,
-}
-
 async fn claim_pod_outbox(
     stores: &crate::bootstrap::node_store::NodeLocalStores,
     now_ms: i64,
     lease_ms: i64,
     lease_token: &str,
-) -> anyhow::Result<Option<IntegrationClaimedPodOutbox>> {
+) -> anyhow::Result<Option<ClaimedPodOutbox>> {
     let request = klights_node_store::OutboxClaimRequest::try_new(now_ms, lease_ms, lease_token)?;
     stores
         .outbox_dispatcher()
@@ -1342,7 +1199,7 @@ async fn claim_pod_outbox(
                         preconditions,
                         strict_resource_version,
                     } if patch.pointer("/metadata/annotations/klights.dev~1sandbox-id").is_some() => {
-                        IntegrationPodOutboxCommand::SandboxAnnotationPatch {
+                        PodOutboxCommand::SandboxAnnotationPatch {
                             api_version,
                             kind,
                             namespace,
@@ -1369,7 +1226,7 @@ async fn claim_pod_outbox(
                         strict_resource_version,
                         ..
                     } if patch.pointer("/metadata/deletionTimestamp").is_some() => {
-                        IntegrationPodOutboxCommand::DeleteMarkPatch {
+                        PodOutboxCommand::DeleteMarkPatch {
                             api_version,
                             kind,
                             namespace,
@@ -1394,16 +1251,16 @@ async fn claim_pod_outbox(
                         pod_uid,
                         node_name,
                         observed_resource_version,
-                    } => IntegrationPodOutboxCommand::FinalizeBoundPod {
+                    } => PodOutboxCommand::FinalizeBoundPod {
                         namespace,
                         name,
                         pod_uid,
                         node_name,
                         observed_resource_version,
                     },
-                    _ => IntegrationPodOutboxCommand::Other,
+                    _ => PodOutboxCommand::Other,
                 };
-                IntegrationClaimedPodOutbox {
+                ClaimedPodOutbox {
                 operation: row.operation().to_string(),
                 pod_uid: row.subject().pod_uid().to_string(),
                 command,
@@ -1411,50 +1268,17 @@ async fn claim_pod_outbox(
         })
 }
 
-#[derive(Clone, Copy)]
-pub enum IntegrationDeferredRuntimeFinalizerOutcome {
-    Deleted,
-    Pending,
-    Error,
-}
-
-struct IntegrationFixedDeletionFinalizer {
-    outcome: IntegrationDeferredRuntimeFinalizerOutcome,
-}
-
-#[async_trait::async_trait]
-impl klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer
-    for IntegrationFixedDeletionFinalizer
-{
-    async fn finalize_after_actor_cleanup(
-        &self,
-        _key: &klights_kubelet::runtime_types::PodRuntimeKey,
-    ) -> anyhow::Result<klights_kubelet::runtime_types::PodDeletionFinalizeResult> {
-        use klights_kubelet::runtime_types::PodDeletionFinalizeResult;
-        match self.outcome {
-            IntegrationDeferredRuntimeFinalizerOutcome::Deleted => {
-                Ok(PodDeletionFinalizeResult::DeletedOrAlreadyGone)
-            }
-            IntegrationDeferredRuntimeFinalizerOutcome::Pending => {
-                Ok(PodDeletionFinalizeResult::FinalizersPending)
-            }
-            IntegrationDeferredRuntimeFinalizerOutcome::Error => {
-                anyhow::bail!("injected finalizer error")
-            }
-        }
-    }
-}
-
 pub async fn run_deferred_runtime_cleanup_case(
     uid: &str,
-    outcome: IntegrationDeferredRuntimeFinalizerOutcome,
+    outcome: DeferredRuntimeFinalizerOutcome,
 ) -> (bool, bool) {
     use klights_kubelet::pod_deletion_finalizer::PodDeletionFinalizer as _;
     let deferred = klights_kubelet::pod_repository::status::DeferredRuntimeReducerHandle::default();
     deferred.insert_marker(uid);
+    let fixed = klights_kubelet::test_support::pod_deletion::PodDeletionTestPorts::fixed(outcome);
     let finalizer =
         crate::bootstrap::pod_repository_composition::DeferredRuntimeCleanupFinalizer::new(
-            Arc::new(IntegrationFixedDeletionFinalizer { outcome }),
+            fixed.finalizer(),
             deferred.clone(),
         );
     let result = finalizer
@@ -1986,7 +1810,7 @@ impl IntegrationPodStoreFixture {
         namespace: &str,
         name: &str,
         uid: &str,
-    ) -> anyhow::Result<IntegrationBoundPodDeleteOutcome> {
+    ) -> anyhow::Result<BoundPodDeleteOutcome> {
         let outcome = self
             .bound_finalization
             .finalize_bound_pod(klights_pod_api::BoundPodFinalizationRequest::try_new(
@@ -2016,48 +1840,14 @@ impl IntegrationPodStoreFixture {
 
 fn map_bound_delete_outcome(
     outcome: klights_pod_api::BoundPodFinalizationOutcome,
-) -> IntegrationBoundPodDeleteOutcome {
-    match outcome {
-        klights_pod_api::BoundPodFinalizationOutcome::Removed
-        | klights_pod_api::BoundPodFinalizationOutcome::Accepted => {
-            IntegrationBoundPodDeleteOutcome::Removed
-        }
-        klights_pod_api::BoundPodFinalizationOutcome::IdentityChanged => {
-            IntegrationBoundPodDeleteOutcome::IdentityChanged
-        }
-        klights_pod_api::BoundPodFinalizationOutcome::FinalizersPending => {
-            IntegrationBoundPodDeleteOutcome::FinalizersPending
-        }
-        klights_pod_api::BoundPodFinalizationOutcome::Retry => {
-            IntegrationBoundPodDeleteOutcome::Retry
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IntegrationPodDeleteCasRaceKind {
-    SchedulerBind,
-    StatusUpdate,
-}
-
-pub struct IntegrationUnscheduledPodDeleteCasRaceOutcome {
-    pub disposition: klights_pod_api::UnscheduledPodDeletionOutcome,
-    pub raced: bool,
-    pub created_resource_version: i64,
-    pub live: crate::datastore::Resource,
-}
-
-pub struct IntegrationBoundPodDeleteCasRaceOutcome {
-    pub disposition: IntegrationBoundPodDeleteOutcome,
-    pub raced: bool,
-    pub created_resource_version: i64,
-    pub live: crate::datastore::Resource,
+) -> BoundPodDeleteOutcome {
+    outcome.into()
 }
 
 struct IntegrationPodDeleteCasRaceHook {
     inner: crate::datastore::DatastoreHandle,
     pod_name: String,
-    race: IntegrationPodDeleteCasRaceKind,
+    race: PodDeleteCasRaceKind,
     raced: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -2069,7 +1859,7 @@ impl IntegrationPodDeleteCasRaceHook {
             .await?
             .expect("CAS race target Pod exists");
         match self.race {
-            IntegrationPodDeleteCasRaceKind::SchedulerBind => {
+            PodDeleteCasRaceKind::SchedulerBind => {
                 let mut body = (*current.data).clone();
                 body["spec"]["nodeName"] = serde_json::json!("node-bound-by-scheduler");
                 self.inner
@@ -2086,7 +1876,7 @@ impl IntegrationPodDeleteCasRaceHook {
                     )
                     .await?;
             }
-            IntegrationPodDeleteCasRaceKind::StatusUpdate => {
+            PodDeleteCasRaceKind::StatusUpdate => {
                 self.inner
                     .update_status_only_with_preconditions(
                         "v1",
@@ -2131,7 +1921,7 @@ impl
 
 async fn integration_pod_delete_cas_race_store(
     pod_name: &str,
-    race: IntegrationPodDeleteCasRaceKind,
+    race: PodDeleteCasRaceKind,
 ) -> (
     crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::RootPodRepositoryPersistenceParts,
     crate::datastore::DatastoreHandle,
@@ -2160,8 +1950,8 @@ async fn integration_pod_delete_cas_race_store(
 pub async fn run_unscheduled_pod_delete_cas_race(
     pod_name: &str,
     pod_uid: &str,
-    race: IntegrationPodDeleteCasRaceKind,
-) -> anyhow::Result<IntegrationUnscheduledPodDeleteCasRaceOutcome> {
+    race: PodDeleteCasRaceKind,
+) -> anyhow::Result<UnscheduledPodDeleteCasRaceOutcome> {
     let (persistence, datastore, raced) =
         integration_pod_delete_cas_race_store(pod_name, race).await;
     let store = persistence.store.clone();
@@ -2196,7 +1986,7 @@ pub async fn run_unscheduled_pod_delete_cas_race(
         .get_resource("v1", "Pod", Some("default"), pod_name)
         .await?
         .expect("Pod survives lost unscheduled delete CAS");
-    Ok(IntegrationUnscheduledPodDeleteCasRaceOutcome {
+    Ok(UnscheduledPodDeleteCasRaceOutcome {
         disposition,
         raced: raced.load(std::sync::atomic::Ordering::SeqCst),
         created_resource_version: created.resource_version,
@@ -2207,12 +1997,9 @@ pub async fn run_unscheduled_pod_delete_cas_race(
 pub async fn run_bound_pod_delete_cas_race(
     pod_name: &str,
     pod_uid: &str,
-) -> anyhow::Result<IntegrationBoundPodDeleteCasRaceOutcome> {
-    let (persistence, datastore, raced) = integration_pod_delete_cas_race_store(
-        pod_name,
-        IntegrationPodDeleteCasRaceKind::StatusUpdate,
-    )
-    .await;
+) -> anyhow::Result<BoundPodDeleteCasRaceOutcome> {
+    let (persistence, datastore, raced) =
+        integration_pod_delete_cas_race_store(pod_name, PodDeleteCasRaceKind::StatusUpdate).await;
     let store = persistence.store.clone();
     let created = store
         .create(
@@ -2254,7 +2041,7 @@ pub async fn run_bound_pod_delete_cas_race(
         .get_resource("v1", "Pod", Some("default"), pod_name)
         .await?
         .expect("Pod survives lost actor finalization CAS");
-    Ok(IntegrationBoundPodDeleteCasRaceOutcome {
+    Ok(BoundPodDeleteCasRaceOutcome {
         disposition,
         raced: raced.load(std::sync::atomic::Ordering::SeqCst),
         created_resource_version: created.resource_version,
@@ -2568,7 +2355,7 @@ impl PodRepositoryScenarioOwner {
             _eviction_admission,
             _namespace_bootstrap,
             _namespace_termination_queue,
-            api,
+            _api,
             subresource,
             scheduling,
             watch_source,
@@ -2628,9 +2415,14 @@ impl PodRepositoryScenarioOwner {
                 assignment: pod_network_assignment,
             },
             api_ports: IntegrationPodApiPorts {
-                api: api.expect("integration root Pod API"),
                 subresource: subresource.expect("integration root Pod subresource"),
             },
+            deletion_api: klights_kubelet::test_support::pod_deletion::PodDeletionApiTestPorts::new(
+                test_api
+                    .as_ref()
+                    .expect("integration root Pod API deletion port")
+                    .clone(),
+            ),
             api_mutations: klights_pod_api::test_support::PodApiMutationPorts::new(
                 test_api.expect("integration root Pod API mutation port"),
             ),
@@ -2682,7 +2474,7 @@ impl PodRepositoryScenarioOwner {
         now_ms: i64,
         lease_ms: i64,
         lease_token: &str,
-    ) -> anyhow::Result<Option<IntegrationClaimedPodOutbox>> {
+    ) -> anyhow::Result<Option<ClaimedPodOutbox>> {
         claim_pod_outbox(
             self.node_local.as_ref().expect("node outbox fixture"),
             now_ms,
@@ -2769,7 +2561,7 @@ impl PodRepositoryScenarioOwner {
         )
         .await?;
         match self
-            .api_ports()
+            .deletion_api
             .delete_pod(
                 "default",
                 "side-effect-pod",
@@ -2788,45 +2580,23 @@ impl PodRepositoryScenarioOwner {
         Ok(value)
     }
 
-    pub async fn claim_uid_bound_pod_work(
-        &self,
-    ) -> anyhow::Result<Option<IntegrationPodWorkqueueEntry>> {
+    pub async fn claim_uid_bound_pod_work(&self) -> anyhow::Result<Option<ClaimedPodWork>> {
         let stores = self.node_local.as_ref().expect("GC workqueue fixture");
-        let lease = stores
-            .pod_workqueue()
-            .claim_due_work_with_lease(klights_node_store::PodWorkqueueClaimRequest::try_new(
-                i64::MAX - 1,
-                1,
-            )?)
+        let ports =
+            klights_node_store::test_support::PodWorkqueueTestPorts::new(stores.pod_workqueue());
+        let claim = ports
+            .claim_uid_bound_pod_work(i64::MAX - 1, 1)
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let Some(lease) = lease else {
-            return Ok(None);
-        };
-        let result = {
-            let row = lease.entry();
-            match row.identity() {
-                klights_node_store::PodWorkIdentity::Pod(identity) => {
-                    let payload: serde_json::Value = serde_json::from_slice(row.payload())?;
-                    Some(IntegrationPodWorkqueueEntry {
-                        namespace: identity.namespace.clone(),
-                        name: identity.name.clone(),
-                        uid: identity.uid.clone(),
-                        target_node: payload
-                            .get("target_node")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string),
-                    })
-                }
-                klights_node_store::PodWorkIdentity::Namespace { .. } => None,
-            }
-        };
-        stores
-            .pod_workqueue()
-            .acknowledge_work(lease.token().clone())
-            .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        Ok(result)
+        if let Some(claim) = claim {
+            ports
+                .acknowledge_claim(claim.clone())
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            Ok(Some(claim))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn run_gc_cascade(
@@ -2914,7 +2684,7 @@ impl PodRepositoryScenarioOwner {
         namespace: &str,
         name: &str,
         uid: &str,
-    ) -> anyhow::Result<IntegrationBoundPodDeleteOutcome> {
+    ) -> anyhow::Result<BoundPodDeleteOutcome> {
         let request = klights_pod_api::BoundPodFinalizationRequest::try_new(
             klights_types::PodIdentity::new(namespace, name, uid),
         )?;
@@ -2931,7 +2701,7 @@ impl PodRepositoryScenarioOwner {
         namespace: &str,
         name: &str,
         uid: &str,
-    ) -> anyhow::Result<IntegrationPodFinalizationOutcome> {
+    ) -> anyhow::Result<PodFinalizationOutcome> {
         integration_finalize_pod_after_actor_cleanup(
             self.deletion_finalizer.as_ref(),
             namespace,
@@ -3312,7 +3082,7 @@ impl IntegrationPodStatusFixture {
         namespace: &str,
         name: &str,
         uid: &str,
-    ) -> anyhow::Result<IntegrationPodFinalizationOutcome> {
+    ) -> anyhow::Result<PodFinalizationOutcome> {
         self.owner
             .finalize_pod_deletion_after_actor_cleanup(namespace, name, uid)
             .await
@@ -3388,10 +3158,11 @@ impl IntegrationPodStoreWatchFixture {
 /// API/deadline scenarios expose API and query ports plus persistence needed
 /// to seed a Pod and inspect its canonical watch history.
 pub struct IntegrationPodApiFixture {
-    owner: Arc<PodRepositoryScenarioOwner>,
+    _owner: Arc<PodRepositoryScenarioOwner>,
     pub query: klights_pod_api::test_support::PodQueryPorts,
     pub persistence: klights_pod_api::test_support::PodFixturePersistencePorts,
     pub watch: klights_watch::test_support::WatchFixturePorts,
+    pub deletion: klights_kubelet::test_support::pod_deletion::PodDeletionApiTestPorts,
 }
 
 impl IntegrationPodApiFixture {
@@ -3401,12 +3172,9 @@ impl IntegrationPodApiFixture {
             query: owner.query_ports.clone(),
             persistence: owner.persistence_ports.clone(),
             watch: owner.watch_ports.clone(),
-            owner,
+            deletion: owner.deletion_api.clone(),
+            _owner: owner,
         }
-    }
-
-    pub fn api_ports(&self) -> &IntegrationPodApiPorts {
-        self.owner.api_ports()
     }
 }
 
@@ -3704,7 +3472,7 @@ impl IntegrationPodWorkerScenarioFixture {
         now_ms: i64,
         lease_ms: i64,
         lease_token: &str,
-    ) -> anyhow::Result<Option<IntegrationClaimedPodOutbox>> {
+    ) -> anyhow::Result<Option<ClaimedPodOutbox>> {
         self.owner
             .claim_next_due_outbox(now_ms, lease_ms, lease_token)
             .await
@@ -3759,6 +3527,7 @@ pub struct IntegrationPodDeletionFixture {
     pub persistence: klights_pod_api::test_support::PodFixturePersistencePorts,
     pub watch: klights_watch::test_support::WatchFixturePorts,
     pub api_mutations: klights_pod_api::test_support::PodApiMutationPorts,
+    pub deletion: klights_kubelet::test_support::pod_deletion::PodDeletionApiTestPorts,
 }
 
 impl IntegrationPodDeletionFixture {
@@ -3770,6 +3539,7 @@ impl IntegrationPodDeletionFixture {
             persistence: owner.persistence_ports.clone(),
             watch: owner.watch_ports.clone(),
             api_mutations: owner.api_mutations.clone(),
+            deletion: owner.deletion_api.clone(),
             owner,
         }
     }
@@ -3884,9 +3654,7 @@ impl IntegrationPodDeletionFixture {
             .await
     }
 
-    pub async fn claim_uid_bound_pod_work(
-        &self,
-    ) -> anyhow::Result<Option<IntegrationPodWorkqueueEntry>> {
+    pub async fn claim_uid_bound_pod_work(&self) -> anyhow::Result<Option<ClaimedPodWork>> {
         self.owner.claim_uid_bound_pod_work().await
     }
 
@@ -3899,7 +3667,7 @@ impl IntegrationPodDeletionFixture {
         namespace: &str,
         name: &str,
         uid: &str,
-    ) -> anyhow::Result<IntegrationPodFinalizationOutcome> {
+    ) -> anyhow::Result<PodFinalizationOutcome> {
         self.owner
             .finalize_pod_deletion_after_actor_cleanup(namespace, name, uid)
             .await
@@ -3910,7 +3678,7 @@ impl IntegrationPodDeletionFixture {
         namespace: &str,
         name: &str,
         uid: &str,
-    ) -> anyhow::Result<IntegrationBoundPodDeleteOutcome> {
+    ) -> anyhow::Result<BoundPodDeleteOutcome> {
         self.owner
             .finalize_bound_pod_after_actor_cleanup(namespace, name, uid)
             .await
@@ -4028,7 +3796,7 @@ impl IntegrationPodDeletionFixture {
 
     pub async fn delete_pod(&self, namespace: &str, name: &str) -> anyhow::Result<()> {
         match self
-            .api_ports()
+            .deletion
             .delete(klights_pod_api::PodApiDeleteRequest {
                 namespace: namespace.to_string(),
                 name: name.to_string(),
@@ -4223,7 +3991,7 @@ pub async fn run_local_bound_finalization_with_incidental_delivery_handles() -> 
         .await?;
 
     anyhow::ensure!(
-        outcome == IntegrationPodFinalizationOutcome::DeletedOrAlreadyGone,
+        outcome == PodFinalizationOutcome::DeletedOrAlreadyGone,
         "explicit local role did not complete finalization synchronously"
     );
     anyhow::ensure!(

@@ -1,9 +1,11 @@
 //! Focused SQLite fixtures for cross-crate node-delivery tests.
 
 mod legacy_delivery;
+mod runtime_work;
 mod types;
 
 pub use legacy_delivery::LegacyDeliveryTestStore;
+pub use runtime_work::RuntimeWorkTestStore;
 pub use types::{
     DeadLetterRow, DeadLetterTestInsert, OutboxInsert, OutboxRow, OutboxStats, PodStatusCheckpoint,
 };

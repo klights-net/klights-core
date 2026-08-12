@@ -78,3 +78,5 @@ mod phase15b2_red_tests;
 
 #[cfg(any(test, feature = "test-support"))]
 mod phase15d_test_support;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;

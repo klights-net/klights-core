@@ -7,6 +7,9 @@ mod open;
 mod raft_durability;
 mod runtime_work;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 pub use cache_network::{
     CacheNetworkError, CacheNetworkFuture, EndpointDeleteOutcome, EndpointUpsertOutcome, NodeKey,
     PodEndpointMode, PodEndpointRecord, PodEndpointStore, PodEndpointStoreEvent,
