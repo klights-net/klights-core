@@ -51,6 +51,9 @@ pub trait PodStartRetryDiagnostics: Send + Sync {
 }
 use klights_types::PodIdentity;
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 pub type PodRepositoryFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, PodRepositoryError>> + Send + 'a>>;
 pub type PodLifecycleFuture<'a> =

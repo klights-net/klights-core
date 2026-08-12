@@ -311,6 +311,7 @@ pod-repository-test-support = [
     "klights-cluster-store/test-support",
     "klights-kubelet/test-support",
     "klights-node-datastore/test-support",
+    "klights-pod-api/test-support",
     "klights-watch/integration-test-harness",
 ]
 native-api-test-support = [

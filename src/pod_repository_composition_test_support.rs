@@ -5,37 +5,6 @@ use std::sync::Arc;
 use klights_cluster_datastore::sqlite::embedded::ResourceMutationPauseOperation as IntegrationResourceMutationPauseOperation;
 use klights_pod_api::PodSubresourceMutation as _;
 
-fn integration_owner_references(
-    values: Vec<serde_json::Value>,
-) -> Result<Vec<klights_pod_api::PodOwnerReference>, klights_pod_api::PodRepositoryError> {
-    values
-        .into_iter()
-        .map(|value| {
-            let required = |field: &'static str| {
-                value
-                    .get(field)
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        klights_pod_api::PodRepositoryError::invalid_request(
-                            "owner_reference",
-                            format!("missing {field}"),
-                        )
-                    })
-            };
-            klights_pod_api::PodOwnerReference::try_new(
-                required("apiVersion")?,
-                required("kind")?,
-                required("name")?,
-                required("uid")?,
-                value.get("controller").and_then(serde_json::Value::as_bool),
-                value
-                    .get("blockOwnerDeletion")
-                    .and_then(serde_json::Value::as_bool),
-            )
-        })
-        .collect()
-}
-
 #[derive(Default)]
 struct PodRepositoryRecordingReconcileSink {
     keys: tokio::sync::Mutex<Vec<klights_reconcile_api::ReconcileKey>>,
@@ -343,7 +312,7 @@ impl IntegrationPodWorkerFixture {
                 klights_pod_api::PodMutationTarget::try_by_identity(
                     klights_types::PodIdentity::new(namespace, name, uid),
                 )?,
-                integration_owner_references(owner_references)?,
+                klights_pod_api::test_support::owner_references_from_values(owner_references)?,
             ))
             .await
             .map_err(anyhow::Error::new)
@@ -3313,7 +3282,7 @@ impl IntegrationPodMetadataFixture {
                 klights_pod_api::PodMutationTarget::try_by_identity(
                     klights_types::PodIdentity::new(namespace, name, uid),
                 )?,
-                integration_owner_references(owner_references)?,
+                klights_pod_api::test_support::owner_references_from_values(owner_references)?,
             ))
             .await
             .map_err(anyhow::Error::new)
@@ -3978,7 +3947,7 @@ impl IntegrationPodWorkerScenarioFixture {
         self.update_ports()
             .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
                 klights_pod_api::PodMutationTarget::try_by_name(namespace, name)?,
-                integration_owner_references(refs)?,
+                klights_pod_api::test_support::owner_references_from_values(refs)?,
             ))
             .await
             .map_err(anyhow::Error::new)
@@ -3996,7 +3965,7 @@ impl IntegrationPodWorkerScenarioFixture {
                 klights_pod_api::PodMutationTarget::try_by_identity(
                     klights_types::PodIdentity::new(namespace, name, uid),
                 )?,
-                integration_owner_references(refs)?,
+                klights_pod_api::test_support::owner_references_from_values(refs)?,
             ))
             .await
             .map_err(anyhow::Error::new)
@@ -4326,7 +4295,7 @@ impl IntegrationPodDeletionFixture {
         self.update_ports()
             .update_pod(klights_pod_api::PodUpdateRequest::replace_owner_references(
                 klights_pod_api::PodMutationTarget::try_by_name(namespace, name)?,
-                integration_owner_references(refs)?,
+                klights_pod_api::test_support::owner_references_from_values(refs)?,
             ))
             .await
             .map_err(anyhow::Error::new)
@@ -4383,7 +4352,7 @@ impl IntegrationPodDeletionFixture {
                 klights_pod_api::PodMutationTarget::try_by_identity(
                     klights_types::PodIdentity::new(namespace, name, uid),
                 )?,
-                integration_owner_references(refs)?,
+                klights_pod_api::test_support::owner_references_from_values(refs)?,
             ))
             .await
             .map_err(anyhow::Error::new)
