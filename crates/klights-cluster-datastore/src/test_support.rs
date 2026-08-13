@@ -572,6 +572,29 @@ impl ResourceTestStore {
             .await
     }
 
+    pub async fn list_namespace_pods(&self, namespace: &str) -> anyhow::Result<Vec<Resource>> {
+        self.datastore
+            .list_namespace_resources_of_kind(namespace, "Pod")
+            .await
+    }
+
+    pub async fn list_namespace_non_pod_resources(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<Vec<Resource>> {
+        self.datastore
+            .list_namespace_resources_excluding_kind(namespace, "Pod")
+            .await
+    }
+
+    pub async fn count_namespace_resources(&self, namespace: &str) -> anyhow::Result<i64> {
+        self.datastore.count_namespace_resources(namespace).await
+    }
+
+    pub async fn delete_namespace(&self, namespace: &str) -> anyhow::Result<()> {
+        self.datastore.delete_namespace(namespace).await
+    }
+
     pub async fn list_resources_by_owner_uid(
         &self,
         api_version: &str,
@@ -669,316 +692,6 @@ impl ResourceTestStore {
         self.datastore
             .find_owned_resources(owner_uid, namespace)
             .await
-    }
-}
-
-fn query_error(error: anyhow::Error) -> klights_leader_api::ResourceQueryError {
-    klights_leader_api::ResourceQueryError::query_failed(error.to_string())
-}
-
-impl klights_leader_api::LeaderResourceQuery for ResourceTestStore {
-    fn get_resource(
-        &self,
-        request: klights_leader_api::ResourceGetRequest,
-    ) -> klights_leader_api::ResourceQueryFuture<'_, Option<Resource>> {
-        Box::pin(async move {
-            let key = request.into_key();
-            self.get_resource(
-                &key.api_version,
-                &key.kind,
-                key.namespace.as_deref(),
-                &key.name,
-            )
-            .await
-            .map_err(query_error)
-        })
-    }
-
-    fn list_resources(
-        &self,
-        request: klights_leader_api::ResourceListRequest,
-    ) -> klights_leader_api::ResourceQueryFuture<'_, klights_leader_api::ResourceListResult> {
-        Box::pin(async move {
-            let list = self
-                .list_resources(
-                    request.api_version(),
-                    request.kind(),
-                    request.namespace(),
-                    ResourceListOptions::new(
-                        request.label_selector(),
-                        request.field_selector(),
-                        request.limit(),
-                        request.continue_token(),
-                    ),
-                )
-                .await
-                .map_err(query_error)?;
-            klights_leader_api::ResourceListResult::try_new(
-                list.items,
-                list.resource_version,
-                list.watch_replay_position,
-                list.continue_token,
-                list.remaining_item_count,
-            )
-        })
-    }
-}
-
-fn namespace_lifecycle_error(
-    error: anyhow::Error,
-) -> klights_reconcile_api::NamespaceLifecycleError {
-    if crate::errors::is_conflict_error(&error) {
-        klights_reconcile_api::NamespaceLifecycleError::Conflict {
-            message: error.to_string(),
-        }
-    } else {
-        klights_reconcile_api::NamespaceLifecycleError::Internal {
-            message: error.to_string(),
-        }
-    }
-}
-
-/// The named resource fixture also provides the exact namespace-finalization
-/// persistence port. It can mark Pods terminating but deliberately has no
-/// generic Pod-delete operation.
-impl klights_reconcile_api::NamespaceLifecycleStore for ResourceTestStore {
-    fn get_terminating_namespace(
-        &self,
-        namespace: String,
-    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Option<Resource>> {
-        Box::pin(async move {
-            self.datastore
-                .get_namespace(&namespace)
-                .await
-                .map_err(namespace_lifecycle_error)
-        })
-    }
-
-    fn list_namespace_pods(
-        &self,
-        namespace: String,
-    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Vec<Resource>> {
-        Box::pin(async move {
-            self.datastore
-                .list_namespace_resources_of_kind(&namespace, "Pod")
-                .await
-                .map_err(namespace_lifecycle_error)
-        })
-    }
-
-    fn mark_namespace_pod_terminating(
-        &self,
-        pod: Resource,
-        namespace: String,
-        body: serde_json::Value,
-    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, ()> {
-        Box::pin(async move {
-            self.update_main_strict(
-                &pod.api_version,
-                &pod.kind,
-                Some(&namespace),
-                &pod.name,
-                body,
-                ResourcePreconditions::from_resource(&pod),
-            )
-            .await
-            .map(|_| ())
-            .map_err(namespace_lifecycle_error)
-        })
-    }
-
-    fn update_terminating_namespace(
-        &self,
-        namespace: String,
-        body: serde_json::Value,
-        expected_resource_version: i64,
-    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Resource> {
-        Box::pin(async move {
-            self.datastore
-                .update_namespace(&namespace, body, expected_resource_version)
-                .await
-                .map_err(namespace_lifecycle_error)
-        })
-    }
-
-    fn list_namespace_non_pod_resources(
-        &self,
-        namespace: String,
-    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Vec<Resource>> {
-        Box::pin(async move {
-            self.datastore
-                .list_namespace_resources_excluding_kind(&namespace, "Pod")
-                .await
-                .map_err(namespace_lifecycle_error)
-        })
-    }
-
-    fn delete_namespace_non_pod_resource(
-        &self,
-        resource: Resource,
-        namespace: String,
-    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, ()> {
-        Box::pin(async move {
-            self.delete_non_pod_strict(
-                &resource.api_version,
-                &resource.kind,
-                Some(&namespace),
-                &resource.name,
-                ResourcePreconditions::from_resource(&resource),
-            )
-            .await
-            .map_err(namespace_lifecycle_error)
-        })
-    }
-
-    fn count_namespace_resources(
-        &self,
-        namespace: String,
-    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, i64> {
-        Box::pin(async move {
-            self.datastore
-                .count_namespace_resources(&namespace)
-                .await
-                .map_err(namespace_lifecycle_error)
-        })
-    }
-
-    fn delete_terminating_namespace(
-        &self,
-        namespace: String,
-    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, ()> {
-        Box::pin(async move {
-            self.datastore
-                .delete_namespace(&namespace)
-                .await
-                .map_err(namespace_lifecycle_error)
-        })
-    }
-}
-
-fn finalizer_lifecycle_error(
-    error: anyhow::Error,
-) -> klights_reconcile_api::FinalizerLifecycleError {
-    if crate::errors::is_conflict_error(&error) {
-        klights_reconcile_api::FinalizerLifecycleError::Conflict(error.to_string())
-    } else {
-        klights_reconcile_api::FinalizerLifecycleError::Internal(error.to_string())
-    }
-}
-
-impl klights_reconcile_api::FinalizerLifecyclePort for ResourceTestStore {
-    fn get_resource(
-        &self,
-        target: klights_reconcile_api::FinalizerResourceTarget,
-    ) -> klights_reconcile_api::FinalizerLifecycleFuture<'_, Option<Resource>> {
-        Box::pin(async move {
-            self.get_resource(
-                target.api_version(),
-                target.kind(),
-                target.namespace(),
-                target.name(),
-            )
-            .await
-            .map_err(finalizer_lifecycle_error)
-        })
-    }
-
-    fn update_resource(
-        &self,
-        request: klights_reconcile_api::FinalizerUpdateRequest,
-    ) -> klights_reconcile_api::FinalizerLifecycleFuture<'_, Resource> {
-        Box::pin(async move {
-            self.update_main_strict(
-                request.target.api_version(),
-                request.target.kind(),
-                request.target.namespace(),
-                request.target.name(),
-                request.data,
-                request.preconditions,
-            )
-            .await
-            .map_err(finalizer_lifecycle_error)
-        })
-    }
-
-    fn delete_with_tombstone(
-        &self,
-        request: klights_reconcile_api::FinalizerTombstoneDeleteRequest,
-    ) -> klights_reconcile_api::FinalizerLifecycleFuture<'_, Resource> {
-        Box::pin(async move {
-            let target = request.target;
-            let resource = self
-                .get_resource(
-                    target.api_version(),
-                    target.kind(),
-                    target.namespace(),
-                    target.name(),
-                )
-                .await
-                .map_err(finalizer_lifecycle_error)?
-                .ok_or_else(|| {
-                    klights_reconcile_api::FinalizerLifecycleError::NotFound(format!(
-                        "{}/{} not found",
-                        target.kind(),
-                        target.name()
-                    ))
-                })?;
-            self.delete_non_pod_strict(
-                target.api_version(),
-                target.kind(),
-                target.namespace(),
-                target.name(),
-                request.preconditions,
-            )
-            .await
-            .map_err(finalizer_lifecycle_error)?;
-            Ok(resource)
-        })
-    }
-
-    fn orphan_children(
-        &self,
-        request: klights_reconcile_api::FinalizerOrphanRequest,
-    ) -> klights_reconcile_api::FinalizerLifecycleFuture<'_, ()> {
-        Box::pin(async move {
-            for child in self
-                .owned_resources(&request.owner_uid, request.target.namespace())
-                .await
-                .map_err(finalizer_lifecycle_error)?
-            {
-                let mut data = (*child.data).clone();
-                if let Some(references) = data
-                    .pointer_mut("/metadata/ownerReferences")
-                    .and_then(serde_json::Value::as_array_mut)
-                {
-                    references.retain(|reference| {
-                        reference.get("uid").and_then(serde_json::Value::as_str)
-                            != Some(request.owner_uid.as_str())
-                    });
-                }
-                // Orphaning updates ownership metadata; it never deletes a Pod.
-                self.update_main_strict(
-                    &child.api_version,
-                    &child.kind,
-                    child.namespace.as_deref(),
-                    &child.name,
-                    data,
-                    ResourcePreconditions::from_resource(&child),
-                )
-                .await
-                .map_err(finalizer_lifecycle_error)?;
-            }
-            Ok(())
-        })
-    }
-
-    fn run_finalized_effects(
-        &self,
-        _request: klights_reconcile_api::FinalizerEffectsRequest,
-    ) -> klights_reconcile_api::FinalizerLifecycleFuture<'_, ()> {
-        // This resource fixture intentionally owns persistence only. Controller
-        // cascade and side-effect algorithms remain with their later owners.
-        Box::pin(async { Ok(()) })
     }
 }
 

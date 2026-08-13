@@ -2201,8 +2201,6 @@ dependencies = [
  "chrono",
  "klights-cluster-core",
  "klights-cluster-store",
- "klights-leader-api",
- "klights-reconcile-api",
  "klights-supervisor",
  "klights-types",
  "rand_core 0.6.4",
