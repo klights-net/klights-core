@@ -6,8 +6,6 @@ pub mod datastore;
 pub mod native_api_test_support;
 pub mod paths;
 pub mod pidfile;
-#[cfg(feature = "pod-repository-test-support")]
-pub mod pod_repository_composition_test_support;
 pub mod shutdown;
 pub mod version;
 
