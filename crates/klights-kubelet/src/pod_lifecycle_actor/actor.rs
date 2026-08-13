@@ -160,6 +160,17 @@ fn pod_pending_with_published_runtime_state(pod: &serde_json::Value) -> bool {
         })
 }
 
+fn pod_start_configuration_fingerprint(pod: &serde_json::Value) -> String {
+    serde_json::json!({
+        "annotations": pod.pointer("/metadata/annotations").cloned().unwrap_or_default(),
+        "labels": pod.pointer("/metadata/labels").cloned().unwrap_or_default(),
+        "containers": pod.pointer("/spec/containers").cloned().unwrap_or_default(),
+        "initContainers": pod.pointer("/spec/initContainers").cloned().unwrap_or_default(),
+        "volumes": pod.pointer("/spec/volumes").cloned().unwrap_or_default(),
+    })
+    .to_string()
+}
+
 fn pod_create_container_config_error_fingerprint(pod: &serde_json::Value) -> Option<String> {
     let is_pending = pod.pointer("/status/phase").and_then(|v| v.as_str()) == Some("Pending");
     if !is_pending {
@@ -181,16 +192,7 @@ fn pod_create_container_config_error_fingerprint(pod: &serde_json::Value) -> Opt
         return None;
     }
 
-    Some(
-        serde_json::json!({
-            "annotations": pod.pointer("/metadata/annotations").cloned().unwrap_or_default(),
-            "labels": pod.pointer("/metadata/labels").cloned().unwrap_or_default(),
-            "containers": pod.pointer("/spec/containers").cloned().unwrap_or_default(),
-            "initContainers": pod.pointer("/spec/initContainers").cloned().unwrap_or_default(),
-            "volumes": pod.pointer("/spec/volumes").cloned().unwrap_or_default(),
-        })
-        .to_string(),
-    )
+    Some(pod_start_configuration_fingerprint(pod))
 }
 
 pub struct PodLifecycleActor {
@@ -199,6 +201,7 @@ pub struct PodLifecycleActor {
     restart_reconciled: bool,
     pending_restart_admission: Option<LifecycleMessage>,
     last_config_error_retry_fingerprint: Option<String>,
+    last_start_pod_configuration_fingerprint: Option<String>,
     trace: std::sync::Arc<Mutex<LifecycleTraceRing>>,
     actor_state: Option<PodLifecycleActorStateMap>,
     supervisor: Arc<TaskSupervisor>,
@@ -239,6 +242,7 @@ impl PodLifecycleActor {
             restart_reconciled: true,
             pending_restart_admission: None,
             last_config_error_retry_fingerprint: None,
+            last_start_pod_configuration_fingerprint: None,
             trace: std::sync::Arc::new(Mutex::new(LifecycleTraceRing::new(trace_capacity))),
             actor_state: None,
             supervisor: Arc::new(TaskSupervisor::new(TaskCategoryConfig::default())),
@@ -275,6 +279,7 @@ impl PodLifecycleActor {
             restart_reconciled: false,
             pending_restart_admission: None,
             last_config_error_retry_fingerprint: None,
+            last_start_pod_configuration_fingerprint: None,
             trace: runtime.trace,
             actor_state: Some(runtime.actor_state),
             supervisor: runtime.supervisor,
@@ -853,6 +858,7 @@ impl PodLifecycleActor {
         self.state.cancel_in_flight();
         self.state.admit_uid(&key.uid);
         self.last_config_error_retry_fingerprint = None;
+        self.last_start_pod_configuration_fingerprint = None;
     }
 
     fn next_work_operation(&mut self, key: &PodLifecycleKey, kind: PodLifecycleWorkKind) -> u64 {
@@ -867,6 +873,8 @@ impl PodLifecycleActor {
         key: PodLifecycleKey,
         pod: Option<serde_json::Value>,
     ) -> PodAction {
+        self.last_start_pod_configuration_fingerprint =
+            pod.as_ref().map(pod_start_configuration_fingerprint);
         let operation_id = self.next_work_operation(&key, PodLifecycleWorkKind::StartPod);
         PodAction::StartPod {
             key,
@@ -1113,6 +1121,56 @@ impl PodLifecycleActor {
         } else {
             PodAction::Noop
         }
+    }
+
+    fn retry_repaired_pending_start_after_config_error(
+        &mut self,
+        key: PodLifecycleKey,
+    ) -> PodAction {
+        let Some(attempted_fingerprint) = self.last_start_pod_configuration_fingerprint.take()
+        else {
+            return PodAction::Noop;
+        };
+        self.last_config_error_retry_fingerprint = Some(attempted_fingerprint.clone());
+
+        let Some((pending_key, pending_pod, pending_resource_version, start_after_admit)) = self
+            .state
+            .pending_start_pod
+            .as_ref()
+            .filter(|pending| pending.key.uid == key.uid)
+            .map(|pending| {
+                (
+                    pending.key.clone(),
+                    pending.pod.clone(),
+                    pending.resource_version,
+                    pending.start_after_admit,
+                )
+            })
+        else {
+            return PodAction::Noop;
+        };
+
+        if pod_start_configuration_fingerprint(&pending_pod) == attempted_fingerprint {
+            return PodAction::Noop;
+        }
+
+        // A deferred CRI observation reflects newer runtime state and must
+        // retain priority over retrying a repaired spec snapshot. Its normal
+        // completion path returns through RetryDue, which consumes the same
+        // pending snapshot below.
+        let deferred = self.reconcile_deferred_runtime_after_start_failure(key.clone());
+        if !deferred.is_noop() {
+            return deferred;
+        }
+
+        self.state.pending_start_pod = None;
+        self.state.phase = PodPhase::PendingStart;
+        self.start_or_check_slot_admission(
+            pending_key,
+            pending_pod,
+            pending_resource_version,
+            start_after_admit,
+        )
     }
 
     fn start_or_check_slot_admission(
@@ -1952,6 +2010,22 @@ impl PodLifecycleActor {
                     );
                     return self.resume_pending_restart_admission();
                 }
+                if kind == PodLifecycleWorkKind::StartPod
+                    && matches!(
+                        &failure,
+                        PodLifecycleWorkFailure::Startup(message)
+                            if message.contains("CreateContainerConfigError")
+                    )
+                {
+                    // The repair watch can arrive before the terminal worker
+                    // failure. Compare that buffered same-UID snapshot with
+                    // the exact configuration StartPod attempted, so a
+                    // repaired subPathExpr fieldRef restarts immediately but
+                    // an unchanged status echo cannot hot-loop.
+                    return self.retry_repaired_pending_start_after_config_error(key);
+                } else if kind == PodLifecycleWorkKind::StartPod {
+                    self.last_start_pod_configuration_fingerprint = None;
+                }
                 match (kind, retryable) {
                     (PodLifecycleWorkKind::ReconcileRuntime, true)
                         if matches!(failure, PodLifecycleWorkFailure::ContainerNotFound) =>
@@ -2161,6 +2235,8 @@ impl PodLifecycleActor {
                 if !self.completion_matches(&key, operation_id, PodLifecycleWorkKind::StartPod) {
                     return PodAction::Noop;
                 }
+                self.last_start_pod_configuration_fingerprint = None;
+                self.last_config_error_retry_fingerprint = None;
                 tracing::info!(
                     namespace = %key.namespace, pod = %key.name, uid = %key.uid,
                     ?sandbox_id,
@@ -2241,6 +2317,7 @@ impl PodLifecycleActor {
                     self.state.update_resource_version(pending.resource_version);
                     self.state.phase = PodPhase::PendingStart;
                     self.last_config_error_retry_fingerprint = None;
+                    self.last_start_pod_configuration_fingerprint = None;
                     self.start_or_check_slot_admission(
                         pending.key,
                         pending.pod,

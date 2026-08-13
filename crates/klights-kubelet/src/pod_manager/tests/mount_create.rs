@@ -1,4 +1,4 @@
-use crate::pod_env::collect_literal_env_vars;
+use crate::pod_env::{collect_literal_env_vars, collect_value_from_env_vars_for_subpath};
 use std::collections::HashMap;
 
 fn build_mounts(
@@ -268,6 +268,47 @@ fn test_build_mounts_subpath_expr_uses_resolved_env_overriding_literal() {
     assert!(
         mounts[0].host_path.ends_with("/my-pod-from-fieldref"),
         "subPathExpr must expand fieldRef env var via resolved_envs, got: {}",
+        mounts[0].host_path
+    );
+}
+
+#[test]
+fn test_build_mounts_subpath_expr_field_ref_annotation_repair_makes_path_relative() {
+    let tmp = tempfile::tempdir().unwrap();
+    let container = serde_json::json!({
+        "env": [
+            {"name": "POD_NAME", "value": "foo"},
+            {"name": "ANNOTATION", "valueFrom": {"fieldRef": {"fieldPath": "metadata.annotations['mysubpath']"}}}
+        ],
+        "volumeMounts": [
+            {"name": "data", "mountPath": "/data", "subPathExpr": "$(ANNOTATION)"}
+        ]
+    });
+    let mut volume_paths = HashMap::new();
+    volume_paths.insert("data".to_string(), tmp.path().to_str().unwrap().to_string());
+    let mut pod = serde_json::json!({
+        "metadata": {
+            "annotations": {
+                "notmysubpath": "mypath",
+                "mysubpath": "/foo"
+            }
+        }
+    });
+
+    let failed_envs = collect_value_from_env_vars_for_subpath(&container, &pod);
+    let error = build_mounts(&container, &volume_paths, &failed_envs).unwrap_err();
+    assert!(
+        error.to_string().contains("invalid subPath \"/foo\""),
+        "the initial fieldRef annotation must reproduce the absolute subPath failure: {error}"
+    );
+
+    pod["metadata"]["annotations"]["mysubpath"] = serde_json::json!("mypath");
+    let repaired_envs = collect_value_from_env_vars_for_subpath(&container, &pod);
+    let (mounts, _) = build_mounts(&container, &volume_paths, &repaired_envs).unwrap();
+    assert_eq!(mounts.len(), 1);
+    assert!(
+        mounts[0].host_path.ends_with("/mypath"),
+        "the repaired fieldRef annotation must produce a relative subPath, got: {}",
         mounts[0].host_path
     );
 }

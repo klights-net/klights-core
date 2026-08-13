@@ -1262,6 +1262,171 @@ fn forced_stop_retry_remains_forced_and_finalizers_still_gate_hard_delete() {
     ));
 }
 
+#[test]
+fn pending_start_config_error_restarts_repaired_snapshot_after_in_flight_update() {
+    use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
+    use crate::pod_lifecycle_core::action::PodAction;
+
+    let mut actor = direct_test_actor();
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+    let invalid_pod = serde_json::json!({
+        "metadata": {
+            "namespace": "default",
+            "name": "pod-a",
+            "uid": "uid-a",
+            "annotations": {
+                "notmysubpath": "mypath",
+                "mysubpath": "/foo"
+            }
+        },
+        "spec": {
+            "nodeName": "dallas",
+            "containers": [{
+                "name": "c",
+                "env": [
+                    {"name": "POD_NAME", "value": "foo"},
+                    {"name": "ANNOTATION", "valueFrom": {"fieldRef": {"fieldPath": "metadata.annotations['mysubpath']"}}}
+                ],
+                "volumeMounts": [{
+                    "name": "workdir",
+                    "mountPath": "/subpath_mount",
+                    "subPathExpr": "$(ANNOTATION)"
+                }]
+            }],
+            "volumes": [{"name": "workdir", "emptyDir": {}}]
+        }
+    });
+
+    assert!(matches!(
+        actor.handle_for_test(LifecycleMessage::WatchAdded {
+            key: key.clone(),
+            resource_version: Some(1),
+            pod: invalid_pod.clone(),
+        }),
+        PodAction::StartPod {
+            operation_id: 1,
+            ..
+        }
+    ));
+
+    let mut repaired_pod = invalid_pod;
+    repaired_pod["metadata"]["annotations"]["mysubpath"] = serde_json::json!("mypath");
+    repaired_pod["status"] = serde_json::json!({
+        "phase": "Pending",
+        "containerStatuses": [{
+            "name": "c",
+            "state": {"waiting": {"reason": "CreateContainerConfigError"}}
+        }]
+    });
+    assert!(matches!(
+        actor.handle_for_test(LifecycleMessage::WatchModified {
+            key: key.clone(),
+            resource_version: Some(2),
+            pod: repaired_pod,
+        }),
+        PodAction::Noop
+    ));
+
+    let retry = actor.handle_for_test(LifecycleMessage::PodWorkFailed {
+        key: key.clone(),
+        operation_id: 1,
+        kind: PodLifecycleWorkKind::StartPod,
+        retryable: false,
+        failure: PodLifecycleWorkFailure::Startup(
+            "All 1 app container(s) failed with CreateContainerConfigError".to_string(),
+        ),
+    });
+    assert!(matches!(
+        retry,
+        PodAction::StartPod {
+            key: action_key,
+            operation_id: 2,
+            pod: Some(pod),
+            ..
+        } if action_key == key
+            && pod.pointer("/metadata/annotations/mysubpath").and_then(|value| value.as_str())
+                == Some("mypath")
+    ));
+}
+
+#[test]
+fn pending_start_config_error_does_not_restart_unchanged_buffered_echo() {
+    use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
+    use crate::pod_lifecycle_core::action::PodAction;
+
+    let mut actor = direct_test_actor();
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+    let invalid_pod = serde_json::json!({
+        "metadata": {
+            "namespace": "default",
+            "name": "pod-a",
+            "uid": "uid-a",
+            "annotations": {
+                "notmysubpath": "mypath",
+                "mysubpath": "/foo"
+            }
+        },
+        "spec": {
+            "nodeName": "dallas",
+            "containers": [{
+                "name": "c",
+                "env": [
+                    {"name": "POD_NAME", "value": "foo"},
+                    {"name": "ANNOTATION", "valueFrom": {"fieldRef": {"fieldPath": "metadata.annotations['mysubpath']"}}}
+                ],
+                "volumeMounts": [{
+                    "name": "workdir",
+                    "mountPath": "/subpath_mount",
+                    "subPathExpr": "$(ANNOTATION)"
+                }]
+            }],
+            "volumes": [{"name": "workdir", "emptyDir": {}}]
+        }
+    });
+
+    assert!(matches!(
+        actor.handle_for_test(LifecycleMessage::WatchAdded {
+            key: key.clone(),
+            resource_version: Some(1),
+            pod: invalid_pod.clone(),
+        }),
+        PodAction::StartPod {
+            operation_id: 1,
+            ..
+        }
+    ));
+
+    let mut unchanged_echo = invalid_pod;
+    unchanged_echo["status"] = serde_json::json!({
+        "phase": "Pending",
+        "containerStatuses": [{
+            "name": "c",
+            "state": {"waiting": {"reason": "CreateContainerConfigError"}}
+        }]
+    });
+    assert!(matches!(
+        actor.handle_for_test(LifecycleMessage::WatchModified {
+            key: key.clone(),
+            resource_version: Some(2),
+            pod: unchanged_echo,
+        }),
+        PodAction::Noop
+    ));
+
+    assert!(matches!(
+        actor.handle_for_test(LifecycleMessage::PodWorkFailed {
+            key,
+            operation_id: 1,
+            kind: PodLifecycleWorkKind::StartPod,
+            retryable: false,
+            failure: PodLifecycleWorkFailure::Startup(
+                "All 1 app container(s) failed with CreateContainerConfigError".to_string(),
+            ),
+        }),
+        PodAction::Noop
+    ));
+}
+
 #[tokio::test]
 async fn supervised_deadline_shortening_cancels_graceful_and_dispatches_forced_stop() {
     let executor = DeadlineStopExecutor::new();
@@ -4433,6 +4598,7 @@ fn pending_start_config_error_retries_when_pod_fingerprint_changes() {
             "name": "pod-a",
             "uid": "uid-a",
             "annotations": {
+                "notmysubpath": "mypath",
                 "mysubpath": "/foo"
             }
         },
@@ -4440,10 +4606,14 @@ fn pending_start_config_error_retries_when_pod_fingerprint_changes() {
             "nodeName": "dallas",
             "containers": [{
                 "name": "c",
+                "env": [
+                    {"name": "POD_NAME", "value": "foo"},
+                    {"name": "ANNOTATION", "valueFrom": {"fieldRef": {"fieldPath": "metadata.annotations['mysubpath']"}}}
+                ],
                 "volumeMounts": [{
                     "name": "workdir",
                     "mountPath": "/subpath_mount",
-                    "subPathExpr": "$(ANNOTATION)/$(POD_NAME)"
+                    "subPathExpr": "$(ANNOTATION)"
                 }]
             }],
             "volumes": [{"name": "workdir", "emptyDir": {}}]
@@ -4505,6 +4675,7 @@ fn pending_start_config_error_retries_when_pod_fingerprint_changes() {
                 "name": "pod-a",
                 "uid": "uid-a",
                 "annotations": {
+                    "notmysubpath": "mypath",
                     "mysubpath": "mypath"
                 }
             },
@@ -4512,10 +4683,14 @@ fn pending_start_config_error_retries_when_pod_fingerprint_changes() {
                 "nodeName": "dallas",
                 "containers": [{
                     "name": "c",
+                    "env": [
+                        {"name": "POD_NAME", "value": "foo"},
+                        {"name": "ANNOTATION", "valueFrom": {"fieldRef": {"fieldPath": "metadata.annotations['mysubpath']"}}}
+                    ],
                     "volumeMounts": [{
                         "name": "workdir",
                         "mountPath": "/subpath_mount",
-                        "subPathExpr": "$(ANNOTATION)/$(POD_NAME)"
+                        "subPathExpr": "$(ANNOTATION)"
                     }]
                 }],
                 "volumes": [{"name": "workdir", "emptyDir": {}}]
@@ -4545,6 +4720,120 @@ fn pending_start_config_error_retries_when_pod_fingerprint_changes() {
         } if action_key == key
             && pod.pointer("/metadata/annotations/mysubpath").and_then(|value| value.as_str())
                 == Some("mypath")
+    ));
+}
+
+#[test]
+fn pending_start_config_error_retries_when_metadata_update_arrives_before_status_echo() {
+    use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
+    use crate::pod_lifecycle_core::action::PodAction;
+
+    // Kubernetes permits a failed subPathExpr to become valid after a metadata
+    // update.  A worker-local status write need not loop back through the pod
+    // watch before that update arrives, so the actor must remember the
+    // configuration it attempted rather than treating the update as its first
+    // CreateContainerConfigError echo.
+    let mut actor = direct_test_actor();
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+    let invalid_pod = serde_json::json!({
+        "metadata": {
+            "namespace": "default",
+            "name": "pod-a",
+            "uid": "uid-a",
+            "annotations": {
+                "notmysubpath": "mypath",
+                "mysubpath": "/foo"
+            }
+        },
+        "spec": {
+            "nodeName": "dallas",
+            "containers": [{
+                "name": "c",
+                "env": [
+                    {"name": "POD_NAME", "value": "foo"},
+                    {"name": "ANNOTATION", "valueFrom": {"fieldRef": {"fieldPath": "metadata.annotations['mysubpath']"}}}
+                ],
+                "volumeMounts": [{
+                    "name": "workdir",
+                    "mountPath": "/subpath_mount",
+                    "subPathExpr": "$(ANNOTATION)"
+                }]
+            }],
+            "volumes": [{"name": "workdir", "emptyDir": {}}]
+        }
+    });
+
+    let first_action = actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key: key.clone(),
+        resource_version: Some(1),
+        pod: invalid_pod,
+    });
+    assert!(matches!(
+        first_action,
+        PodAction::StartPod {
+            operation_id: 1,
+            ..
+        }
+    ));
+
+    let failed_action = actor.handle_for_test(LifecycleMessage::PodWorkFailed {
+        key: key.clone(),
+        operation_id: 1,
+        kind: PodLifecycleWorkKind::StartPod,
+        retryable: false,
+        failure: PodLifecycleWorkFailure::Startup(
+            "All 1 app container(s) failed with CreateContainerConfigError".to_string(),
+        ),
+    });
+    assert!(matches!(failed_action, PodAction::Noop));
+
+    let updated_pod = serde_json::json!({
+        "metadata": {
+            "namespace": "default",
+            "name": "pod-a",
+            "uid": "uid-a",
+            "annotations": {
+                "notmysubpath": "mypath",
+                "mysubpath": "mypath"
+            }
+        },
+        "spec": {
+            "nodeName": "dallas",
+            "containers": [{
+                "name": "c",
+                "env": [
+                    {"name": "POD_NAME", "value": "foo"},
+                    {"name": "ANNOTATION", "valueFrom": {"fieldRef": {"fieldPath": "metadata.annotations['mysubpath']"}}}
+                ],
+                "volumeMounts": [{
+                    "name": "workdir",
+                    "mountPath": "/subpath_mount",
+                    "subPathExpr": "$(ANNOTATION)"
+                }]
+            }],
+            "volumes": [{"name": "workdir", "emptyDir": {}}]
+        },
+        "status": {
+            "phase": "Pending",
+            "containerStatuses": [{
+                "name": "c",
+                "state": {"waiting": {"reason": "CreateContainerConfigError"}}
+            }]
+        }
+    });
+
+    let retry_action = actor.handle_for_test(LifecycleMessage::WatchModified {
+        key: key.clone(),
+        resource_version: Some(2),
+        pod: updated_pod,
+    });
+    assert!(matches!(
+        retry_action,
+        PodAction::StartPod {
+            key: action_key,
+            operation_id: 2,
+            ..
+        } if action_key == key
     ));
 }
 
