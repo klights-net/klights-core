@@ -3,6 +3,27 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+#[cfg(test)]
+mod p12_2d_tests {
+    #[tokio::test]
+    async fn observed_network_records_queued_and_immediate_service_sync_without_provider_calls() {
+        let (network, observation) = super::mock_network_with_service_routing_observation();
+
+        network
+            .services()
+            .request_services_sync()
+            .expect("test router accepts queued sync");
+        network
+            .services()
+            .sync_services_now()
+            .await
+            .expect("test router accepts immediate sync");
+
+        assert_eq!(observation.sync_count(), 1);
+        assert_eq!(observation.sync_now_count(), 1);
+    }
+}
+
 pub use crate::pod_link::allocate_ip_with_reclaim;
 
 /// Empty focused node-network cache for tests that exercise waiter fallback.
@@ -391,11 +412,39 @@ impl Default for MockNetworkProvider {
 /// Test-only `ServiceRouter` impl. Records each call so tests can
 /// assert side-effect dispatch behaviour; never touches netlink.
 pub struct MockServiceRouter {
-    sync_count: std::sync::atomic::AtomicUsize,
-    sync_now_count: std::sync::atomic::AtomicUsize,
+    service_routing: ServiceRoutingCounters,
     add_hostport_count: std::sync::atomic::AtomicUsize,
     remove_hostport_count: std::sync::atomic::AtomicUsize,
     cleanup_count: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone, Default)]
+struct ServiceRoutingCounters {
+    sync_count: Arc<std::sync::atomic::AtomicUsize>,
+    sync_now_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Read-only observation of service-routing requests sent to the mock router.
+///
+/// The observation shares only request counters with `MockServiceRouter`; it
+/// cannot retrieve the router, provider, or a concrete networking component.
+#[derive(Clone)]
+pub struct ServiceRoutingObservation {
+    counters: ServiceRoutingCounters,
+}
+
+impl ServiceRoutingObservation {
+    pub fn sync_count(&self) -> usize {
+        self.counters
+            .sync_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn sync_now_count(&self) -> usize {
+        self.counters
+            .sync_now_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 pub struct MockPodEndpointResolver;
@@ -450,10 +499,13 @@ impl MockServiceRouter {
     }
 
     pub fn sync_count(&self) -> usize {
-        self.sync_count.load(std::sync::atomic::Ordering::Relaxed)
+        self.service_routing
+            .sync_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn sync_now_count(&self) -> usize {
-        self.sync_now_count
+        self.service_routing
+            .sync_now_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn add_hostport_count(&self) -> usize {
@@ -473,8 +525,7 @@ impl MockServiceRouter {
 impl Default for MockServiceRouter {
     fn default() -> Self {
         Self {
-            sync_count: std::sync::atomic::AtomicUsize::new(0),
-            sync_now_count: std::sync::atomic::AtomicUsize::new(0),
+            service_routing: ServiceRoutingCounters::default(),
             add_hostport_count: std::sync::atomic::AtomicUsize::new(0),
             remove_hostport_count: std::sync::atomic::AtomicUsize::new(0),
             cleanup_count: std::sync::atomic::AtomicUsize::new(0),
@@ -487,24 +538,41 @@ impl Default for MockServiceRouter {
 /// `services: Arc<dyn ...>` separately, so the post-Task-7 ApiState
 /// fixture stays one line.
 pub fn mock_network() -> std::sync::Arc<crate::Network> {
+    mock_network_builder().0
+}
+
+/// Build the test network with a read-only observation of its service router.
+pub fn mock_network_with_service_routing_observation()
+-> (std::sync::Arc<crate::Network>, ServiceRoutingObservation) {
+    mock_network_builder()
+}
+
+fn mock_network_builder() -> (std::sync::Arc<crate::Network>, ServiceRoutingObservation) {
     let provider = Arc::new(MockNetworkProvider::new());
-    std::sync::Arc::new(crate::Network::new(
+    let service_router = Arc::new(MockServiceRouter::new());
+    let observation = ServiceRoutingObservation {
+        counters: service_router.service_routing.clone(),
+    };
+    let network = std::sync::Arc::new(crate::Network::new(
         provider.clone(),
         provider,
-        Arc::new(MockServiceRouter::new()),
+        service_router,
         Arc::new(MockPodEndpointResolver),
-    ))
+    ));
+    (network, observation)
 }
 
 impl klights_network_api::ServiceRouter for MockServiceRouter {
     fn request_services_sync(&self) -> Result<(), klights_network_api::ServiceRouterError> {
-        self.sync_count
+        self.service_routing
+            .sync_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
     fn sync_services_now(&self) -> klights_network_api::ServiceRouterFuture<'_> {
         Box::pin(async move {
-            self.sync_now_count
+            self.service_routing
+                .sync_now_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         })

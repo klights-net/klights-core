@@ -43,7 +43,7 @@ fn generate(prefix: &str) -> String {
     format!("{prefix}{suffix}")
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 fn deterministic_generated_name(prefix: &str, value: u64) -> String {
     const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     const SUFFIX_SPACE: u64 = 36_u64.pow(5);
@@ -61,7 +61,7 @@ fn deterministic_generated_name(prefix: &str, value: u64) -> String {
     )
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 fn deterministic_uuid_v4(value: u64) -> String {
     let first = ((value & 0x000f_ffff) << 12) | ((value >> 20) & 0x0fff);
     let second = (value >> 32) & 0xffff;
@@ -70,13 +70,13 @@ fn deterministic_uuid_v4(value: u64) -> String {
     format!("{first:08x}-{second:04x}-{third:04x}-{fourth:04x}-000000000000")
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 #[derive(Debug)]
 struct DeterministicControllerIdentityGenerator {
     sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 impl klights_controllers::ControllerIdentityGenerator for DeterministicControllerIdentityGenerator {
     fn generate_name(&self, prefix: &str) -> String {
         let value = self
@@ -93,13 +93,13 @@ impl klights_controllers::ControllerIdentityGenerator for DeterministicControlle
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ControllerIdentityTestGraph {
     sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 impl ControllerIdentityTestGraph {
     pub(crate) fn identity(
         &self,
@@ -110,7 +110,7 @@ impl ControllerIdentityTestGraph {
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub(crate) fn deterministic_controller_identity()
 -> std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator> {
     ControllerIdentityTestGraph::default().identity()

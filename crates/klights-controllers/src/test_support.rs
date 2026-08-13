@@ -203,6 +203,170 @@ impl ControllerRuntimeFixture {
     }
 }
 
+/// Exact endpoint/controller operations assembled over focused controller ports.
+///
+/// This fixture never exposes a datastore, router, Pod repository, or GC
+/// implementation. The root may compose the ports, while endpoint behavior
+/// remains owned here with the controller algorithms.
+#[derive(Clone)]
+pub struct EndpointReconcileFixture {
+    endpoint_store: Arc<dyn crate::endpoints::EndpointReconcileStore>,
+    pod_query: Arc<dyn PodQuery>,
+    gc_store: Arc<dyn crate::gc::GcResourceStore>,
+    non_pod_finalization: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
+    coordination: Arc<crate::ControllerCoordination>,
+    identity: Arc<dyn crate::ControllerIdentityGenerator>,
+}
+
+/// Test-only, exact NodePort-range exhaustion control for Service API cases.
+///
+/// It exposes no allocator access and cannot reserve an arbitrary port.
+#[derive(Clone)]
+pub struct NodePortExhaustionFixture {
+    allocator: Arc<crate::service::NodePortAllocator>,
+}
+
+impl NodePortExhaustionFixture {
+    pub fn new(allocator: Arc<crate::service::NodePortAllocator>) -> Self {
+        Self { allocator }
+    }
+
+    pub fn exhaust(&self) -> anyhow::Result<()> {
+        for expected in 30000..=32767 {
+            let allocated = self.allocator.allocate().map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                allocated == expected,
+                "unexpected NodePort allocation {allocated}"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl EndpointReconcileFixture {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        endpoint_store: Arc<dyn crate::endpoints::EndpointReconcileStore>,
+        pod_query: Arc<dyn PodQuery>,
+        gc_store: Arc<dyn crate::gc::GcResourceStore>,
+        non_pod_finalization: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
+        coordination: Arc<crate::ControllerCoordination>,
+        identity: Arc<dyn crate::ControllerIdentityGenerator>,
+    ) -> Self {
+        Self {
+            endpoint_store,
+            pod_query,
+            gc_store,
+            non_pod_finalization,
+            coordination,
+            identity,
+        }
+    }
+
+    pub async fn reconcile_endpointslice(
+        &self,
+        service_name: &str,
+        service_uid: &str,
+        namespace: &str,
+        selector: Option<&serde_json::Value>,
+        ports: Option<&serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        crate::endpoints::reconcile_endpointslice(
+            self.endpoint_store.as_ref(),
+            self.pod_query.as_ref(),
+            service_name,
+            service_uid,
+            namespace,
+            selector,
+            ports,
+        )
+        .await
+    }
+
+    pub async fn reconcile_endpoints(
+        &self,
+        service_name: &str,
+        namespace: &str,
+        selector: Option<&serde_json::Value>,
+        ports: Option<&serde_json::Value>,
+        publish_not_ready: bool,
+    ) -> anyhow::Result<()> {
+        crate::endpoints::reconcile_endpoints(
+            self.endpoint_store.as_ref(),
+            self.pod_query.as_ref(),
+            service_name,
+            namespace,
+            selector,
+            ports,
+            publish_not_ready,
+        )
+        .await
+    }
+
+    pub async fn reconcile_service_endpoint_batch(
+        &self,
+        service_name: &str,
+        service_uid: &str,
+        namespace: &str,
+        selector: Option<&serde_json::Value>,
+        ports: Option<&serde_json::Value>,
+        publish_not_ready: bool,
+    ) -> anyhow::Result<()> {
+        crate::endpoints::reconcile_service_endpoints_batch(
+            self.endpoint_store.as_ref(),
+            self.pod_query.as_ref(),
+            crate::endpoints::ServiceEndpointBatchReconcileRequest {
+                service_name,
+                service_uid,
+                namespace,
+                selector,
+                service_ports: ports,
+                publish_not_ready,
+            },
+        )
+        .await
+    }
+
+    /// Mirrors an Endpoints snapshot at the caller-supplied controller time.
+    ///
+    /// Tests must provide this value explicitly so the fixture has no ambient
+    /// clock or service-locator dependency.
+    pub async fn mirror_endpoints_at(
+        &self,
+        endpoints: &serde_json::Value,
+        mirrored_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        crate::endpoints::mirror_endpoints_to_endpointslice_at(
+            self.endpoint_store.as_ref(),
+            endpoints,
+            mirrored_at,
+            self.identity.as_ref(),
+        )
+        .await
+    }
+
+    pub async fn cascade_delete_service(
+        &self,
+        owner_uid: &str,
+        owner_name: &str,
+        owner_namespace: &str,
+    ) -> anyhow::Result<()> {
+        let pod_delete = FailClosedGcPodDeleteSink;
+        crate::gc::cascade_delete_with_uid(
+            self.gc_store.as_ref(),
+            owner_uid,
+            "v1",
+            owner_name,
+            "Service",
+            Some(owner_namespace.to_owned()),
+            &pod_delete,
+            self.non_pod_finalization.as_ref(),
+            self.coordination.as_ref(),
+        )
+        .await
+    }
+}
+
 /// Recording reconcile sink used by controller/reconcile scenarios.
 ///
 /// It enforces the same one-way separation the production dispatcher
@@ -434,14 +598,31 @@ impl klights_reconcile_api::GcPodDeleteSink for FailClosedGcPodDeleteSink {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControllerRuntimeFixture, DeterministicControllerIdentity, DrainBudget, ExecutionLease,
-        FailClosedGcPodDeleteSink, MAX_DRAINED_KEYS, RecordingGcPodDeleteSink,
+        ControllerRuntimeFixture, DeterministicControllerIdentity, DrainBudget,
+        EndpointReconcileFixture, ExecutionLease, FailClosedGcPodDeleteSink, MAX_DRAINED_KEYS,
+        NodePortExhaustionFixture, RecordingGcPodDeleteSink,
     };
     use crate::ControllerIdentityGenerator;
     use klights_reconcile_api::{GcPodDeleteRequest, GcPodDeleteSink};
     use klights_types::PodIdentity;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn endpoint_fixture_is_a_named_controller_owner_without_an_inner_escape() {
+        fn accepts_fixture(_: Option<EndpointReconcileFixture>) {}
+        accepts_fixture(None);
+    }
+
+    #[test]
+    fn nodeport_exhaustion_fixture_consumes_only_the_exact_service_range() {
+        let allocator = Arc::new(crate::service::NodePortAllocator::new());
+        allocator.set_ready();
+        let fixture = NodePortExhaustionFixture::new(allocator.clone());
+
+        fixture.exhaust().expect("exhaust the NodePort range");
+        assert!(allocator.allocate().is_err());
+    }
 
     #[tokio::test]
     async fn gc_pod_sink_preserves_foreground_cascade_uid_for_same_name_replacement() {

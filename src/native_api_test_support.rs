@@ -21,78 +21,6 @@ impl IntegrationHeldSupervisorTask {
     }
 }
 
-struct UnavailableNodeMetrics;
-
-struct IntegrationNodeMetrics {
-    inner: std::sync::RwLock<Arc<dyn klights_node_api::NodeMetrics>>,
-}
-
-impl IntegrationNodeMetrics {
-    fn new() -> Self {
-        Self {
-            inner: std::sync::RwLock::new(Arc::new(UnavailableNodeMetrics)),
-        }
-    }
-
-    fn set(&self, metrics: Arc<dyn klights_node_api::NodeMetrics>) {
-        *self.inner.write().expect("integration node metrics lock") = metrics;
-    }
-}
-
-impl klights_node_api::NodeMetrics for IntegrationNodeMetrics {
-    fn collect_metrics(
-        &self,
-        request: klights_node_api::NodeMetricsRequest,
-    ) -> klights_node_api::NodeMetricsFuture<'_, klights_node_api::NodeMetricsResult> {
-        let metrics = self
-            .inner
-            .read()
-            .expect("integration node metrics lock")
-            .clone();
-        Box::pin(async move { metrics.collect_metrics(request).await })
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct IntegrationServiceRoutingObservation {
-    sync_count: Arc<std::sync::atomic::AtomicUsize>,
-    sync_now_count: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl IntegrationServiceRoutingObservation {
-    pub fn sync_count(&self) -> usize {
-        self.sync_count.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub fn sync_now_count(&self) -> usize {
-        self.sync_now_count
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
-
-impl klights_reconcile_api::ServiceRoutingSync for IntegrationServiceRoutingObservation {
-    fn request_service_routing_sync(
-        &self,
-    ) -> Result<(), klights_reconcile_api::ReconcileSinkError> {
-        self.sync_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-}
-
-impl klights_node_api::NodeMetrics for UnavailableNodeMetrics {
-    fn collect_metrics(
-        &self,
-        _request: klights_node_api::NodeMetricsRequest,
-    ) -> klights_node_api::NodeMetricsFuture<'_, klights_node_api::NodeMetricsResult> {
-        Box::pin(async {
-            Err(klights_node_api::NodeMetricsError::unavailable(
-                "node metrics are not configured for the integration harness",
-            ))
-        })
-    }
-}
-
 /// Narrow integration handle around one real registered replication follower.
 pub struct IntegrationFollowerSession {
     replication: Arc<klights_replication::ReplicationService>,
@@ -244,49 +172,23 @@ struct IntegrationHarnessOptions {
         Option<Arc<dyn klights_leader_api::LeaderBootstrapTokenAuthentication>>,
 }
 
-#[derive(Clone, Copy)]
-enum EndpointFixtureKind {
-    Pod,
-    Service,
-    Endpoints,
-    EndpointSlice,
-}
-
-impl EndpointFixtureKind {
-    const fn api_version(self) -> &'static str {
-        match self {
-            Self::Pod | Self::Service | Self::Endpoints => "v1",
-            Self::EndpointSlice => "discovery.k8s.io/v1",
-        }
-    }
-
-    const fn kind(self) -> &'static str {
-        match self {
-            Self::Pod => "Pod",
-            Self::Service => "Service",
-            Self::Endpoints => "Endpoints",
-            Self::EndpointSlice => "EndpointSlice",
-        }
-    }
-}
-
 /// Opaque full-stack API fixture owned by the base integration-test package.
 #[derive(Clone)]
 pub struct NativeApiTestHarness {
     router: axum::Router,
     datastore: DatastoreHandle,
     resource_store: klights_cluster_datastore::test_support::ResourceTestStore,
+    endpoint_resource_fixture: klights_cluster_datastore::test_support::EndpointResourceFixture,
     commit_watch_fixture: Arc<klights_watch::test_support::CommitWatchFixture>,
-    nodeport_alloc: Arc<klights_controllers::service::NodePortAllocator>,
-    pod_query: Arc<dyn klights_pod_api::PodQuery>,
+    nodeport_exhaustion_fixture: klights_controllers::test_support::NodePortExhaustionFixture,
     bound_pod_finalization_fixture: klights_pod_api::test_support::BoundPodFinalizationFixture,
     _node_local: Arc<crate::bootstrap::node_store::NodeLocalStores>,
     #[allow(dead_code)]
     outbox_dispatcher: Arc<klights_kubelet::node_outbox::OutboxDispatcher>,
     controller_runtime_fixture: klights_controllers::test_support::ControllerRuntimeFixture,
+    endpoint_reconcile_fixture: klights_controllers::test_support::EndpointReconcileFixture,
     crd_registry: klights_controllers::crd::CrdRegistry,
-    service_routing: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
-    node_metrics: Arc<IntegrationNodeMetrics>,
+    node_metrics_fixture: Arc<k8s_native_service::test_support::resource::NodeMetricsFixture>,
     operational_replication: Option<Arc<klights_replication::ReplicationService>>,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     node_lease_tracker: Arc<klights_controllers::node_lease::NodeLeaseTracker>,
@@ -537,9 +439,12 @@ impl NativeApiTestHarness {
         .await
     }
 
-    pub async fn with_service_routing_observation()
-    -> anyhow::Result<(Self, IntegrationServiceRoutingObservation)> {
-        let observation = IntegrationServiceRoutingObservation::default();
+    pub async fn with_service_routing_observation() -> anyhow::Result<(
+        Self,
+        klights_networking::test_support::ServiceRoutingObservation,
+    )> {
+        let (network, observation) =
+            klights_networking::test_support::mock_network_with_service_routing_observation();
         let harness = Self::assemble(
             Arc::new(AllowAllAuthorizer),
             None,
@@ -548,7 +453,7 @@ impl NativeApiTestHarness {
             None,
             None,
             None,
-            Some(observation.clone()),
+            Some(network),
             None,
             None,
             false,
@@ -656,7 +561,7 @@ impl NativeApiTestHarness {
                     + Send,
             >,
         >,
-        service_routing_observation: Option<IntegrationServiceRoutingObservation>,
+        service_routing_network: Option<Arc<klights_networking::Network>>,
         audit_sink: Option<Arc<dyn k8s_native_service::audit::AuditSink>>,
         priority_fairness: Option<Arc<k8s_native_service::priority_fairness::ApiPriorityFairness>>,
         mount_operational_endpoints: bool,
@@ -669,7 +574,7 @@ impl NativeApiTestHarness {
             webhook,
             watch_history_failure,
             mutation_side_effects_factory,
-            service_routing_observation,
+            service_routing_network,
             audit_sink,
             priority_fairness,
             mount_operational_endpoints,
@@ -696,7 +601,7 @@ impl NativeApiTestHarness {
                     + Send,
             >,
         >,
-        service_routing_observation: Option<IntegrationServiceRoutingObservation>,
+        service_routing_network: Option<Arc<klights_networking::Network>>,
         audit_sink: Option<Arc<dyn k8s_native_service::audit::AuditSink>>,
         priority_fairness: Option<Arc<k8s_native_service::priority_fairness::ApiPriorityFairness>>,
         mount_operational_endpoints: bool,
@@ -754,6 +659,10 @@ impl NativeApiTestHarness {
         ));
         let nodeport_alloc = Arc::new(klights_controllers::service::NodePortAllocator::new());
         nodeport_alloc.set_ready();
+        let nodeport_exhaustion_fixture =
+            klights_controllers::test_support::NodePortExhaustionFixture::new(
+                nodeport_alloc.clone(),
+            );
         let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
         let leader_rx =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
@@ -938,13 +847,23 @@ impl NativeApiTestHarness {
             config.data_root.join("etc/ca.crt"),
             controller_identity.clone(),
         );
-        let network = klights_networking::test_support::mock_network();
+        let network =
+            service_routing_network.unwrap_or_else(klights_networking::test_support::mock_network);
         let controller_leader_ports = Arc::new(
             crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(datastore.clone()),
         );
         let non_pod_finalization = Arc::new(
             crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(datastore.clone()),
         );
+        let endpoint_reconcile_fixture =
+            klights_controllers::test_support::EndpointReconcileFixture::new(
+                controller_leader_ports.clone(),
+                api_pod_repository.clone(),
+                controller_leader_ports.clone(),
+                non_pod_finalization.clone(),
+                gc_coordination.clone(),
+                controller_identity.clone(),
+            );
         let controller_dependencies = klights_controllers::ControllerRuntimeDependencies {
             wall_time: chrono::Utc::now,
             resource_query: controller_leader_ports.clone(),
@@ -986,7 +905,8 @@ impl NativeApiTestHarness {
             coordination: gc_coordination.clone(),
             node_name: Arc::from(config.node_name.as_str()),
         };
-        let node_metrics = Arc::new(IntegrationNodeMetrics::new());
+        let node_metrics_fixture =
+            Arc::new(k8s_native_service::test_support::resource::NodeMetricsFixture::new());
         let csr_issuer = csr_signer.map(|signer| {
             Arc::new(crate::bootstrap::auth_adapters::AuthCsrIssuer::new(
                 signer,
@@ -1003,7 +923,7 @@ impl NativeApiTestHarness {
                 non_pod_finalization,
                 gc_coordination.clone(),
                 Arc::from(config.node_name.as_str()),
-                node_metrics.clone(),
+                node_metrics_fixture.clone(),
                 controller_identity.clone(),
             );
         let controller_dispatcher =
@@ -1017,15 +937,11 @@ impl NativeApiTestHarness {
                 controller_identity.clone(),
             ));
         side_effects.set_controller_dispatcher(controller_dispatcher.clone());
-        let service_routing: Arc<dyn klights_reconcile_api::ServiceRoutingSync> =
-            match service_routing_observation {
-                Some(services) => Arc::new(services),
-                None => Arc::new(
-                    crate::bootstrap::network_adapters::ApiServiceRoutingSyncAdapter::new(
-                        network.services().clone(),
-                    ),
-                ),
-            };
+        let service_routing: Arc<dyn klights_reconcile_api::ServiceRoutingSync> = Arc::new(
+            crate::bootstrap::network_adapters::ApiServiceRoutingSyncAdapter::new(
+                network.services().clone(),
+            ),
+        );
         let pod_logs_root = config.data_root.join("logs/pods");
         let wall_clock: Arc<dyn klights_supervisor::WallClock> =
             Arc::new(klights_supervisor::SystemWallClock);
@@ -1175,7 +1091,7 @@ impl NativeApiTestHarness {
             service_routing.clone(),
             pod_logs,
             None,
-            node_metrics.clone(),
+            node_metrics_fixture.clone(),
             klights_kubelet::node_api::port_forward::local_node_port_forward(supervisor.clone()),
             pod_lifecycle_diagnostics,
             None,
@@ -1220,20 +1136,24 @@ impl NativeApiTestHarness {
             klights_pod_api::test_support::BoundPodFinalizationFixture::new(
                 bound_pod_finalization.clone(),
             );
+        let endpoint_resource_fixture =
+            klights_cluster_datastore::test_support::EndpointResourceFixture::new(
+                resource_store.clone(),
+            );
         Ok(Self {
             router: outer_layers.finish(router),
             datastore,
             resource_store,
+            endpoint_resource_fixture,
             commit_watch_fixture,
-            nodeport_alloc,
-            pod_query: api_pod_repository,
+            nodeport_exhaustion_fixture,
             bound_pod_finalization_fixture,
             _node_local: node_local,
             outbox_dispatcher,
             controller_runtime_fixture,
+            endpoint_reconcile_fixture,
             crd_registry,
-            service_routing,
-            node_metrics,
+            node_metrics_fixture,
             operational_replication,
             task_supervisor: supervisor,
             node_lease_tracker,
@@ -1275,12 +1195,6 @@ impl NativeApiTestHarness {
             .map(|_| ())
     }
 
-    pub fn request_service_routing_sync(
-        &self,
-    ) -> Result<(), klights_reconcile_api::ReconcileSinkError> {
-        self.service_routing.request_service_routing_sync()
-    }
-
     /// Root assembly transport retained for P12.2f deletion. The returned
     /// fixture owns only named actor-finalization behavior.
     pub fn bound_pod_finalization_fixture(
@@ -1295,6 +1209,28 @@ impl NativeApiTestHarness {
         &self,
     ) -> klights_controllers::test_support::ControllerRuntimeFixture {
         self.controller_runtime_fixture.clone()
+    }
+
+    /// Root assembly transport retained for P12.2f deletion. Endpoint
+    /// reconciliation behavior belongs to the canonical controller fixture.
+    pub fn endpoint_reconcile_fixture(
+        &self,
+    ) -> klights_controllers::test_support::EndpointReconcileFixture {
+        self.endpoint_reconcile_fixture.clone()
+    }
+
+    /// Root assembly transport retained for P12.2f deletion. Resource
+    /// operations remain owned by the canonical datastore fixture.
+    pub fn endpoint_resource_fixture(
+        &self,
+    ) -> klights_cluster_datastore::test_support::EndpointResourceFixture {
+        self.endpoint_resource_fixture.clone()
+    }
+
+    pub fn nodeport_exhaustion_fixture(
+        &self,
+    ) -> klights_controllers::test_support::NodePortExhaustionFixture {
+        self.nodeport_exhaustion_fixture.clone()
     }
 
     #[allow(dead_code)]
@@ -1312,282 +1248,19 @@ impl NativeApiTestHarness {
         anyhow::bail!("node outbox drain exceeded 1024 deliveries")
     }
 
-    pub async fn reconcile_endpointslice(
-        &self,
-        service_name: &str,
-        service_uid: &str,
-        namespace: &str,
-        selector: Option<&serde_json::Value>,
-        ports: Option<&serde_json::Value>,
-    ) -> anyhow::Result<()> {
-        klights_controllers::endpoints::reconcile_endpointslice(
-            self.datastore.as_ref(),
-            self.pod_query.as_ref(),
-            service_name,
-            service_uid,
-            namespace,
-            selector,
-            ports,
-        )
-        .await
-    }
-
-    async fn seed_endpoint_fixture(
-        &self,
-        kind: EndpointFixtureKind,
-        namespace: Option<&str>,
-        name: &str,
-        value: serde_json::Value,
-    ) -> anyhow::Result<klights_cluster_core::Resource> {
-        self.resource_store
-            .create_resource(kind.api_version(), kind.kind(), namespace, name, value)
-            .await
-    }
-
-    pub async fn seed_endpoint_namespace(
-        &self,
-        name: &str,
-        value: serde_json::Value,
-    ) -> anyhow::Result<klights_cluster_core::Resource> {
-        self.resource_store.create_namespace(name, value).await
-    }
-
-    pub async fn seed_endpoint_pod(
-        &self,
-        namespace: &str,
-        name: &str,
-        value: serde_json::Value,
-    ) -> anyhow::Result<klights_cluster_core::Resource> {
-        self.seed_endpoint_fixture(EndpointFixtureKind::Pod, Some(namespace), name, value)
-            .await
-    }
-
-    pub async fn seed_endpoint_service(
-        &self,
-        namespace: &str,
-        name: &str,
-        value: serde_json::Value,
-    ) -> anyhow::Result<klights_cluster_core::Resource> {
-        self.seed_endpoint_fixture(EndpointFixtureKind::Service, Some(namespace), name, value)
-            .await
-    }
-
-    pub async fn seed_endpoints(
-        &self,
-        namespace: &str,
-        name: &str,
-        value: serde_json::Value,
-    ) -> anyhow::Result<klights_cluster_core::Resource> {
-        self.seed_endpoint_fixture(EndpointFixtureKind::Endpoints, Some(namespace), name, value)
-            .await
-    }
-
-    pub async fn seed_endpoint_slice(
-        &self,
-        namespace: &str,
-        name: &str,
-        value: serde_json::Value,
-    ) -> anyhow::Result<klights_cluster_core::Resource> {
-        self.seed_endpoint_fixture(
-            EndpointFixtureKind::EndpointSlice,
-            Some(namespace),
-            name,
-            value,
-        )
-        .await
-    }
-
-    async fn observe_endpoint_fixture(
-        &self,
-        kind: EndpointFixtureKind,
-        namespace: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
-        self.resource_store
-            .get_resource(kind.api_version(), kind.kind(), Some(namespace), name)
-            .await
-    }
-
-    pub async fn observe_endpoints(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
-        self.observe_endpoint_fixture(EndpointFixtureKind::Endpoints, namespace, name)
-            .await
-    }
-
-    pub async fn observe_endpoint_slice(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
-        self.observe_endpoint_fixture(EndpointFixtureKind::EndpointSlice, namespace, name)
-            .await
-    }
-
-    pub async fn observe_endpoint_slices(
-        &self,
-        namespace: &str,
-        label_selector: Option<&str>,
-    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>> {
-        Ok(self
-            .resource_store
-            .list_resources(
-                EndpointFixtureKind::EndpointSlice.api_version(),
-                EndpointFixtureKind::EndpointSlice.kind(),
-                Some(namespace),
-                klights_cluster_store::ResourceListOptions::new(label_selector, None, None, None),
-            )
-            .await?
-            .items)
-    }
-
-    pub async fn replace_endpoints(
-        &self,
-        namespace: &str,
-        name: &str,
-        value: serde_json::Value,
-        expected_rv: i64,
-    ) -> anyhow::Result<klights_cluster_core::Resource> {
-        self.resource_store
-            .update_resource("v1", "Endpoints", Some(namespace), name, value, expected_rv)
-            .await
-    }
-
-    pub async fn remove_endpoints(&self, namespace: &str, name: &str) -> anyhow::Result<()> {
-        self.resource_store
-            .delete_resource("v1", "Endpoints", Some(namespace), name)
-            .await
-    }
-
-    pub async fn remove_endpoint_slice(&self, namespace: &str, name: &str) -> anyhow::Result<()> {
-        self.resource_store
-            .delete_resource(
-                "discovery.k8s.io/v1",
-                "EndpointSlice",
-                Some(namespace),
-                name,
-            )
-            .await
-    }
-
-    pub async fn endpoint_fixture_resource_version(&self) -> anyhow::Result<i64> {
-        self.resource_store.get_current_resource_version().await
-    }
-
-    pub fn endpoint_fixture_value_with_resource_version(
-        value: impl Into<Arc<serde_json::Value>>,
-        resource_version: i64,
-    ) -> serde_json::Value {
-        crate::bootstrap::controller_adapters::controller_runtime_adapter::inject_resource_version(
-            value,
-            resource_version,
-        )
-    }
-
-    pub async fn reconcile_endpoints(
-        &self,
-        service_name: &str,
-        namespace: &str,
-        selector: Option<&serde_json::Value>,
-        ports: Option<&serde_json::Value>,
-        publish_not_ready: bool,
-    ) -> anyhow::Result<()> {
-        klights_controllers::endpoints::reconcile_endpoints(
-            self.datastore.as_ref(),
-            self.pod_query.as_ref(),
-            service_name,
-            namespace,
-            selector,
-            ports,
-            publish_not_ready,
-        )
-        .await
-    }
-
-    pub async fn reconcile_service_endpoint_batch(
-        &self,
-        service_name: &str,
-        service_uid: &str,
-        namespace: &str,
-        selector: Option<&serde_json::Value>,
-        ports: Option<&serde_json::Value>,
-        publish_not_ready: bool,
-    ) -> anyhow::Result<()> {
-        klights_controllers::endpoints::reconcile_service_endpoints_batch(
-            self.datastore.as_ref(),
-            self.pod_query.as_ref(),
-            klights_controllers::endpoints::ServiceEndpointBatchReconcileRequest {
-                service_name,
-                service_uid,
-                namespace,
-                selector,
-                service_ports: ports,
-                publish_not_ready,
-            },
-        )
-        .await
-    }
-
-    pub async fn mirror_endpoint_fixture(
-        &self,
-        endpoints: &serde_json::Value,
-    ) -> anyhow::Result<()> {
-        klights_controllers::endpoints::mirror_endpoints_to_endpointslice_at(
-            self.datastore.as_ref(),
-            endpoints,
-            chrono::Utc::now(),
-            crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity().as_ref(),
-        )
-        .await
-    }
-
-    pub async fn cascade_delete_endpoint_service(
-        &self,
-        owner_uid: &str,
-        owner_name: &str,
-        owner_namespace: &str,
-    ) -> anyhow::Result<()> {
-        struct FailClosedGcPodDeleteSink;
-
-        impl klights_reconcile_api::GcPodDeleteSink for FailClosedGcPodDeleteSink {
-            fn request_gc_pod_delete(
-                &self,
-                _request: klights_reconcile_api::GcPodDeleteRequest,
-            ) -> klights_reconcile_api::GcPodDeleteFuture<'_> {
-                Box::pin(async {
-                    Err(klights_reconcile_api::GcPodDeleteError::unavailable(
-                        "endpoint owner-cascade fixture must not request Pod deletion",
-                    ))
-                })
-            }
-        }
-
-        klights_controllers::gc::cascade_delete_with_uid(
-            self.datastore.as_ref(),
-            owner_uid,
-            "v1",
-            owner_name,
-            "Service",
-            Some(owner_namespace.to_owned()),
-            &FailClosedGcPodDeleteSink,
-            &crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
-                self.datastore.clone(),
-            ),
-            &klights_controllers::ControllerCoordination::new(),
-        )
-        .await
-    }
-
     /// Returns the neutral native-service registry already wired into this
     /// router. CRD fixture behavior remains owned by native-service support.
     pub fn crd_registry(&self) -> klights_leader_api::CrdRegistry {
         self.crd_registry.clone()
     }
 
-    pub fn set_node_metrics(&self, metrics: Arc<dyn klights_node_api::NodeMetrics>) {
-        self.node_metrics.set(metrics);
+    /// Returns the canonical native-service fixture composed into this router.
+    /// Root assembly transport is retained for P12.2f; metric behavior belongs
+    /// to native-service test support.
+    pub fn node_metrics_fixture(
+        &self,
+    ) -> Arc<k8s_native_service::test_support::resource::NodeMetricsFixture> {
+        self.node_metrics_fixture.clone()
     }
 
     pub async fn ensure_operational_cluster_metadata(&self) -> anyhow::Result<()> {
@@ -1652,17 +1325,6 @@ impl NativeApiTestHarness {
 
     pub fn commit_watch_fixture(&self) -> Arc<klights_watch::test_support::CommitWatchFixture> {
         self.commit_watch_fixture.clone()
-    }
-
-    pub fn exhaust_nodeports(&self) -> anyhow::Result<()> {
-        for expected in 30000..=32767 {
-            let allocated = self.nodeport_alloc.allocate().map_err(anyhow::Error::msg)?;
-            anyhow::ensure!(
-                allocated == expected,
-                "unexpected NodePort allocation {allocated}"
-            );
-        }
-        Ok(())
     }
 
     pub fn node_name(&self) -> &str {

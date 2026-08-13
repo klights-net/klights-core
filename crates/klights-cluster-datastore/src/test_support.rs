@@ -133,6 +133,158 @@ pub struct ResourceTestStore {
     datastore: crate::sqlite::embedded::Datastore,
 }
 
+/// Endpoint/EndpointSlice-only persistence setup and observation for controller
+/// tests. The inner resource fixture is intentionally private.
+#[derive(Clone)]
+pub struct EndpointResourceFixture {
+    resources: ResourceTestStore,
+}
+
+impl EndpointResourceFixture {
+    pub fn new(resources: ResourceTestStore) -> Self {
+        Self { resources }
+    }
+
+    pub async fn seed_namespace(
+        &self,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<Resource> {
+        self.resources.create_namespace(name, value).await
+    }
+
+    pub async fn seed_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<Resource> {
+        self.resources
+            .create_resource("v1", "Pod", Some(namespace), name, value)
+            .await
+    }
+
+    pub async fn seed_service(
+        &self,
+        namespace: &str,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<Resource> {
+        self.resources
+            .create_resource("v1", "Service", Some(namespace), name, value)
+            .await
+    }
+
+    pub async fn seed_endpoints(
+        &self,
+        namespace: &str,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<Resource> {
+        self.resources
+            .create_resource("v1", "Endpoints", Some(namespace), name, value)
+            .await
+    }
+
+    pub async fn seed_endpoint_slice(
+        &self,
+        namespace: &str,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<Resource> {
+        self.resources
+            .create_resource(
+                "discovery.k8s.io/v1",
+                "EndpointSlice",
+                Some(namespace),
+                name,
+                value,
+            )
+            .await
+    }
+
+    pub async fn endpoints(&self, namespace: &str, name: &str) -> anyhow::Result<Option<Resource>> {
+        self.resources
+            .get_resource("v1", "Endpoints", Some(namespace), name)
+            .await
+    }
+
+    pub async fn endpoint_slice(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<Resource>> {
+        self.resources
+            .get_resource(
+                "discovery.k8s.io/v1",
+                "EndpointSlice",
+                Some(namespace),
+                name,
+            )
+            .await
+    }
+
+    pub async fn endpoint_slices(
+        &self,
+        namespace: &str,
+        label_selector: Option<&str>,
+    ) -> anyhow::Result<Vec<Resource>> {
+        Ok(self
+            .resources
+            .list_resources(
+                "discovery.k8s.io/v1",
+                "EndpointSlice",
+                Some(namespace),
+                ResourceListOptions::new(label_selector, None, None, None),
+            )
+            .await?
+            .items)
+    }
+
+    pub async fn replace_endpoints(
+        &self,
+        namespace: &str,
+        name: &str,
+        value: serde_json::Value,
+        expected_rv: i64,
+    ) -> anyhow::Result<Resource> {
+        self.resources
+            .update_resource("v1", "Endpoints", Some(namespace), name, value, expected_rv)
+            .await
+    }
+
+    pub async fn remove_endpoints(&self, namespace: &str, name: &str) -> anyhow::Result<()> {
+        self.resources
+            .delete_resource("v1", "Endpoints", Some(namespace), name)
+            .await
+    }
+
+    pub async fn remove_endpoint_slice(&self, namespace: &str, name: &str) -> anyhow::Result<()> {
+        self.resources
+            .delete_resource(
+                "discovery.k8s.io/v1",
+                "EndpointSlice",
+                Some(namespace),
+                name,
+            )
+            .await
+    }
+
+    pub async fn current_resource_version(&self) -> anyhow::Result<i64> {
+        self.resources.current_resource_version().await
+    }
+
+    pub fn value_with_resource_version(
+        value: impl Into<std::sync::Arc<serde_json::Value>>,
+        resource_version: i64,
+    ) -> serde_json::Value {
+        let mut value = (*value.into()).clone();
+        value["metadata"]["resourceVersion"] =
+            serde_json::Value::String(resource_version.to_string());
+        value
+    }
+}
+
 impl ResourceTestStore {
     /// Consumes the canonical embedded store at the composition boundary while
     /// retaining no public path back to its concrete type.
@@ -1470,7 +1622,7 @@ mod tests {
     };
 
     use super::{
-        ResourceMutationPauseOperation, ResourcePreconditions,
+        EndpointResourceFixture, ResourceMutationPauseOperation, ResourcePreconditions,
         toggle_failing_watch_history_for_test_support,
     };
 
@@ -1483,6 +1635,12 @@ mod tests {
         ];
 
         assert_eq!(operations.len(), 3);
+    }
+
+    #[test]
+    fn p12_2d_endpoint_fixture_is_a_narrow_named_resource_owner() {
+        fn accepts_endpoint_fixture(_: Option<EndpointResourceFixture>) {}
+        accepts_endpoint_fixture(None);
     }
 
     #[derive(Default)]
