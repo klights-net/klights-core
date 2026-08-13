@@ -6,6 +6,8 @@
 
 pub mod diagnostics;
 pub mod errors;
+#[doc(hidden)]
+pub use errors::cluster_store_adapter_error as map_cluster_store_adapter_error;
 mod position_membership;
 pub mod redb;
 pub mod signing_key_state;

@@ -1631,14 +1631,22 @@ impl crate::datastore::DurableRecoveryStore for RedbDatastore {
 impl klights_cluster_store::BackendLifecycleStore for RedbDatastore {
     async fn acquire_snapshot_exclusive_fence(
         &self,
-    ) -> Result<Option<crate::datastore::backend::SnapshotExclusiveFence>> {
-        crate::datastore::DatastoreBackend::acquire_snapshot_exclusive_fence(self).await
+    ) -> klights_cluster_store::ClusterStoreResult<
+        Option<crate::datastore::backend::SnapshotExclusiveFence>,
+    > {
+        crate::datastore::DatastoreBackend::acquire_snapshot_exclusive_fence(self)
+            .await
+            .map_err(crate::datastore::backend::root_cluster_store_error)
     }
 
     async fn acquire_snapshot_mutation_fence(
         &self,
-    ) -> Result<Option<crate::datastore::backend::SnapshotMutationFence>> {
-        crate::datastore::DatastoreBackend::acquire_snapshot_mutation_fence(self).await
+    ) -> klights_cluster_store::ClusterStoreResult<
+        Option<crate::datastore::backend::SnapshotMutationFence>,
+    > {
+        crate::datastore::DatastoreBackend::acquire_snapshot_mutation_fence(self)
+            .await
+            .map_err(crate::datastore::backend::root_cluster_store_error)
     }
 
     fn close(&self) {

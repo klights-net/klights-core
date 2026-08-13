@@ -11,7 +11,8 @@ use async_trait::async_trait;
 
 use klights_cluster_core::command::COMMAND_CODEC_VERSION;
 use klights_cluster_store::{
-    DatastoreSnapshotter, SnapshotEntry, SnapshotEnvelope, SnapshotExclusiveFence, SnapshotTable,
+    ClusterStoreError, ClusterStoreErrorKind, ClusterStoreResult, DatastoreSnapshotter,
+    PersistenceBackend, SnapshotEntry, SnapshotEnvelope, SnapshotExclusiveFence, SnapshotTable,
     compute_schema_fingerprint,
 };
 
@@ -32,6 +33,15 @@ const SNAPSHOT_TABLES: &[&str] = &[
     "meta",
 ];
 
+fn redb_snapshot_error(error: anyhow::Error) -> ClusterStoreError {
+    ClusterStoreError::adapter_failure_boxed(
+        ClusterStoreErrorKind::Persistence,
+        PersistenceBackend::Redb,
+        "snapshot persistence",
+        error.into_boxed_dyn_error(),
+    )
+}
+
 #[async_trait]
 impl DatastoreSnapshotter for RedbRecoveryStore {
     fn backend_kind(&self) -> &'static str {
@@ -42,294 +52,309 @@ impl DatastoreSnapshotter for RedbRecoveryStore {
         compute_schema_fingerprint(SNAPSHOT_TABLES)
     }
 
-    async fn snapshot(&self, _fence: SnapshotExclusiveFence) -> Result<SnapshotEnvelope> {
-        let r = self.accessor.db().unwrap().begin_read()?;
+    async fn snapshot(
+        &self,
+        _fence: SnapshotExclusiveFence,
+    ) -> ClusterStoreResult<SnapshotEnvelope> {
+        let snapshot = (|| -> Result<SnapshotEnvelope> {
+            let r = self.accessor.db().unwrap().begin_read()?;
 
-        let last_applied_rv: i64 = {
-            let tbl = r.open_table(tables::META)?;
-            tbl.get("rv")?
-                .map(|g| {
-                    std::str::from_utf8(g.value())
-                        .unwrap_or("0")
-                        .parse()
-                        .unwrap_or(0)
-                })
-                .unwrap_or(0)
-        };
-
-        let last_applied_command_id: Option<String> = {
-            let tbl = r.open_table(tables::META)?;
-            tbl.get("last_applied_command_id")?
-                .map(|g| std::str::from_utf8(g.value()).unwrap_or("").to_string())
-        };
-
-        let mut tables = Vec::new();
-
-        // --- RES_CLUSTER ---
-        {
-            let tbl = r.open_table(tables::RES_CLUSTER)?;
-            let mut entries = Vec::new();
-            for e in tbl.iter()? {
-                let (k, v) = e?;
-                let key = k.value().to_vec();
-                let value = serde_json::to_vec(&(v.value().0, v.value().1.to_vec()))?;
-                entries.push(SnapshotEntry { key, value });
-            }
-            tables.push(SnapshotTable {
-                name: "res_cluster".into(),
-                entries,
-            });
-        }
-
-        // --- RES_NS ---
-        {
-            let tbl = r.open_table(tables::RES_NS)?;
-            let mut entries = Vec::new();
-            for e in tbl.iter()? {
-                let (k, v) = e?;
-                let key = k.value().to_vec();
-                let value = serde_json::to_vec(&(v.value().0, v.value().1.to_vec()))?;
-                entries.push(SnapshotEntry { key, value });
-            }
-            tables.push(SnapshotTable {
-                name: "res_ns".into(),
-                entries,
-            });
-        }
-
-        // --- NAMESPACES ---
-        {
-            let tbl = r.open_table(tables::NAMESPACES)?;
-            let mut entries = Vec::new();
-            for e in tbl.iter()? {
-                let (k, v) = e?;
-                let key = k.value().as_bytes().to_vec();
-                let value = v.value().to_vec();
-                entries.push(SnapshotEntry { key, value });
-            }
-            tables.push(SnapshotTable {
-                name: "namespaces".into(),
-                entries,
-            });
-        }
-
-        // --- WATCH_EVENTS ---
-        {
-            let tbl = r.open_table(tables::WATCH_EVENTS)?;
-            let mut entries = Vec::new();
-            for e in tbl.iter()? {
-                let (k, v) = e?;
-                let key = k.value().to_le_bytes().to_vec();
-                let value = v.value().to_vec();
-                entries.push(SnapshotEntry { key, value });
-            }
-            tables.push(SnapshotTable {
-                name: "watch_events".into(),
-                entries,
-            });
-        }
-
-        // --- WATCH_REPLAY_POSITION_FLOORS ---
-        {
-            let tbl = r.open_table(tables::WATCH_REPLAY_POSITION_FLOORS)?;
-            let mut entries = Vec::new();
-            for e in tbl.iter()? {
-                let (k, v) = e?;
-                entries.push(SnapshotEntry {
-                    key: k.value().to_vec(),
-                    value: v.value().to_vec(),
-                });
-            }
-            tables.push(SnapshotTable {
-                name: "watch_replay_position_floors".into(),
-                entries,
-            });
-        }
-
-        // --- RESOURCES_BY_OWNER ---
-        {
-            let tbl = r.open_table(tables::RESOURCES_BY_OWNER)?;
-            let mut entries = Vec::new();
-            for e in tbl.iter()? {
-                let (k, v) = e?;
-                let key = k.value().to_vec();
-                let value = serde_json::to_vec(&(v.value().0, v.value().1.to_vec()))?;
-                entries.push(SnapshotEntry { key, value });
-            }
-            tables.push(SnapshotTable {
-                name: "resources_by_owner".into(),
-                entries,
-            });
-        }
-
-        // --- RV_TO_KEY ---
-        {
-            let tbl = r.open_table(tables::RV_TO_KEY)?;
-            let mut entries = Vec::new();
-            for e in tbl.iter()? {
-                let (k, v) = e?;
-                let key = k.value().to_le_bytes().to_vec();
-                let value = v.value().to_vec();
-                entries.push(SnapshotEntry { key, value });
-            }
-            tables.push(SnapshotTable {
-                name: "rv_to_key".into(),
-                entries,
-            });
-        }
-
-        // --- NODE_SUBNETS ---
-        {
-            let tbl = r.open_table(tables::NODE_SUBNETS)?;
-            let mut entries = Vec::new();
-            for e in tbl.iter()? {
-                let (k, v) = e?;
-                let key = k.value().as_bytes().to_vec();
-                let value = v.value().to_vec();
-                entries.push(SnapshotEntry { key, value });
-            }
-            tables.push(SnapshotTable {
-                name: "node_subnets".into(),
-                entries,
-            });
-        }
-
-        // --- META (only RV and command id) ---
-        {
-            let mut entries = Vec::new();
-            {
+            let last_applied_rv: i64 = {
                 let tbl = r.open_table(tables::META)?;
-                if let Some(g) = tbl.get("rv")? {
-                    entries.push(SnapshotEntry {
-                        key: b"rv".to_vec(),
-                        value: g.value().to_vec(),
-                    });
+                tbl.get("rv")?
+                    .map(|g| {
+                        std::str::from_utf8(g.value())
+                            .unwrap_or("0")
+                            .parse()
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0)
+            };
+
+            let last_applied_command_id: Option<String> = {
+                let tbl = r.open_table(tables::META)?;
+                tbl.get("last_applied_command_id")?
+                    .map(|g| std::str::from_utf8(g.value()).unwrap_or("").to_string())
+            };
+
+            let mut tables = Vec::new();
+
+            // --- RES_CLUSTER ---
+            {
+                let tbl = r.open_table(tables::RES_CLUSTER)?;
+                let mut entries = Vec::new();
+                for e in tbl.iter()? {
+                    let (k, v) = e?;
+                    let key = k.value().to_vec();
+                    let value = serde_json::to_vec(&(v.value().0, v.value().1.to_vec()))?;
+                    entries.push(SnapshotEntry { key, value });
                 }
-                if let Some(g) = tbl.get("last_applied_command_id")? {
-                    entries.push(SnapshotEntry {
-                        key: b"last_applied_command_id".to_vec(),
-                        value: g.value().to_vec(),
-                    });
-                }
-                if let Some(g) = tbl.get("watch_event_id")? {
-                    entries.push(SnapshotEntry {
-                        key: b"watch_event_id".to_vec(),
-                        value: g.value().to_vec(),
-                    });
-                }
-            }
-            if !entries.is_empty() {
                 tables.push(SnapshotTable {
-                    name: "meta".into(),
+                    name: "res_cluster".into(),
                     entries,
                 });
             }
-        }
 
-        Ok(SnapshotEnvelope {
-            backend_kind: "redb".to_string(),
-            schema_fingerprint: self.schema_fingerprint(),
-            codec_version: COMMAND_CODEC_VERSION,
-            last_applied_rv,
-            last_applied_command_id,
-            tables,
-        })
+            // --- RES_NS ---
+            {
+                let tbl = r.open_table(tables::RES_NS)?;
+                let mut entries = Vec::new();
+                for e in tbl.iter()? {
+                    let (k, v) = e?;
+                    let key = k.value().to_vec();
+                    let value = serde_json::to_vec(&(v.value().0, v.value().1.to_vec()))?;
+                    entries.push(SnapshotEntry { key, value });
+                }
+                tables.push(SnapshotTable {
+                    name: "res_ns".into(),
+                    entries,
+                });
+            }
+
+            // --- NAMESPACES ---
+            {
+                let tbl = r.open_table(tables::NAMESPACES)?;
+                let mut entries = Vec::new();
+                for e in tbl.iter()? {
+                    let (k, v) = e?;
+                    let key = k.value().as_bytes().to_vec();
+                    let value = v.value().to_vec();
+                    entries.push(SnapshotEntry { key, value });
+                }
+                tables.push(SnapshotTable {
+                    name: "namespaces".into(),
+                    entries,
+                });
+            }
+
+            // --- WATCH_EVENTS ---
+            {
+                let tbl = r.open_table(tables::WATCH_EVENTS)?;
+                let mut entries = Vec::new();
+                for e in tbl.iter()? {
+                    let (k, v) = e?;
+                    let key = k.value().to_le_bytes().to_vec();
+                    let value = v.value().to_vec();
+                    entries.push(SnapshotEntry { key, value });
+                }
+                tables.push(SnapshotTable {
+                    name: "watch_events".into(),
+                    entries,
+                });
+            }
+
+            // --- WATCH_REPLAY_POSITION_FLOORS ---
+            {
+                let tbl = r.open_table(tables::WATCH_REPLAY_POSITION_FLOORS)?;
+                let mut entries = Vec::new();
+                for e in tbl.iter()? {
+                    let (k, v) = e?;
+                    entries.push(SnapshotEntry {
+                        key: k.value().to_vec(),
+                        value: v.value().to_vec(),
+                    });
+                }
+                tables.push(SnapshotTable {
+                    name: "watch_replay_position_floors".into(),
+                    entries,
+                });
+            }
+
+            // --- RESOURCES_BY_OWNER ---
+            {
+                let tbl = r.open_table(tables::RESOURCES_BY_OWNER)?;
+                let mut entries = Vec::new();
+                for e in tbl.iter()? {
+                    let (k, v) = e?;
+                    let key = k.value().to_vec();
+                    let value = serde_json::to_vec(&(v.value().0, v.value().1.to_vec()))?;
+                    entries.push(SnapshotEntry { key, value });
+                }
+                tables.push(SnapshotTable {
+                    name: "resources_by_owner".into(),
+                    entries,
+                });
+            }
+
+            // --- RV_TO_KEY ---
+            {
+                let tbl = r.open_table(tables::RV_TO_KEY)?;
+                let mut entries = Vec::new();
+                for e in tbl.iter()? {
+                    let (k, v) = e?;
+                    let key = k.value().to_le_bytes().to_vec();
+                    let value = v.value().to_vec();
+                    entries.push(SnapshotEntry { key, value });
+                }
+                tables.push(SnapshotTable {
+                    name: "rv_to_key".into(),
+                    entries,
+                });
+            }
+
+            // --- NODE_SUBNETS ---
+            {
+                let tbl = r.open_table(tables::NODE_SUBNETS)?;
+                let mut entries = Vec::new();
+                for e in tbl.iter()? {
+                    let (k, v) = e?;
+                    let key = k.value().as_bytes().to_vec();
+                    let value = v.value().to_vec();
+                    entries.push(SnapshotEntry { key, value });
+                }
+                tables.push(SnapshotTable {
+                    name: "node_subnets".into(),
+                    entries,
+                });
+            }
+
+            // --- META (only RV and command id) ---
+            {
+                let mut entries = Vec::new();
+                {
+                    let tbl = r.open_table(tables::META)?;
+                    if let Some(g) = tbl.get("rv")? {
+                        entries.push(SnapshotEntry {
+                            key: b"rv".to_vec(),
+                            value: g.value().to_vec(),
+                        });
+                    }
+                    if let Some(g) = tbl.get("last_applied_command_id")? {
+                        entries.push(SnapshotEntry {
+                            key: b"last_applied_command_id".to_vec(),
+                            value: g.value().to_vec(),
+                        });
+                    }
+                    if let Some(g) = tbl.get("watch_event_id")? {
+                        entries.push(SnapshotEntry {
+                            key: b"watch_event_id".to_vec(),
+                            value: g.value().to_vec(),
+                        });
+                    }
+                }
+                if !entries.is_empty() {
+                    tables.push(SnapshotTable {
+                        name: "meta".into(),
+                        entries,
+                    });
+                }
+            }
+
+            Ok(SnapshotEnvelope {
+                backend_kind: "redb".to_string(),
+                schema_fingerprint: self.schema_fingerprint(),
+                codec_version: COMMAND_CODEC_VERSION,
+                last_applied_rv,
+                last_applied_command_id,
+                tables,
+            })
+        })();
+        snapshot.map_err(redb_snapshot_error)
     }
 
     async fn restore(
         &self,
         envelope: &SnapshotEnvelope,
         _fence: SnapshotExclusiveFence,
-    ) -> Result<()> {
-        self.validate_envelope(envelope)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    ) -> ClusterStoreResult<()> {
+        self.validate_envelope(envelope).map_err(|error| {
+            ClusterStoreError::adapter_failure_boxed(
+                ClusterStoreErrorKind::CorruptData,
+                PersistenceBackend::Redb,
+                "snapshot envelope validation",
+                Box::new(error),
+            )
+        })?;
 
-        let w = self.accessor.db().unwrap().begin_write()?;
+        let restore = (|| -> Result<()> {
+            let w = self.accessor.db().unwrap().begin_write()?;
 
-        for table in &envelope.tables {
-            match table.name.as_str() {
-                "res_cluster" => {
-                    let mut tbl = w.open_table(tables::RES_CLUSTER)?;
-                    for entry in &table.entries {
-                        let (rv, body): (u64, Vec<u8>) = serde_json::from_slice(&entry.value)?;
-                        tbl.insert(entry.key.as_slice(), (rv, body.as_slice()))?;
+            for table in &envelope.tables {
+                match table.name.as_str() {
+                    "res_cluster" => {
+                        let mut tbl = w.open_table(tables::RES_CLUSTER)?;
+                        for entry in &table.entries {
+                            let (rv, body): (u64, Vec<u8>) = serde_json::from_slice(&entry.value)?;
+                            tbl.insert(entry.key.as_slice(), (rv, body.as_slice()))?;
+                        }
                     }
-                }
-                "res_ns" => {
-                    let mut tbl = w.open_table(tables::RES_NS)?;
-                    for entry in &table.entries {
-                        let (rv, body): (u64, Vec<u8>) = serde_json::from_slice(&entry.value)?;
-                        tbl.insert(entry.key.as_slice(), (rv, body.as_slice()))?;
+                    "res_ns" => {
+                        let mut tbl = w.open_table(tables::RES_NS)?;
+                        for entry in &table.entries {
+                            let (rv, body): (u64, Vec<u8>) = serde_json::from_slice(&entry.value)?;
+                            tbl.insert(entry.key.as_slice(), (rv, body.as_slice()))?;
+                        }
                     }
-                }
-                "namespaces" => {
-                    let mut tbl = w.open_table(tables::NAMESPACES)?;
-                    for entry in &table.entries {
-                        let name = std::str::from_utf8(&entry.key)
-                            .map_err(|e| anyhow::anyhow!("bad namespace key: {e}"))?;
-                        tbl.insert(name, entry.value.as_slice())?;
+                    "namespaces" => {
+                        let mut tbl = w.open_table(tables::NAMESPACES)?;
+                        for entry in &table.entries {
+                            let name = std::str::from_utf8(&entry.key)
+                                .map_err(|e| anyhow::anyhow!("bad namespace key: {e}"))?;
+                            tbl.insert(name, entry.value.as_slice())?;
+                        }
                     }
-                }
-                "watch_events" => {
-                    let mut tbl = w.open_table(tables::WATCH_EVENTS)?;
-                    for entry in &table.entries {
-                        let rv = u64::from_le_bytes(
-                            entry.key[..8]
-                                .try_into()
-                                .map_err(|_| anyhow::anyhow!("bad watch event key len"))?,
-                        );
-                        tbl.insert(rv, entry.value.as_slice())?;
+                    "watch_events" => {
+                        let mut tbl = w.open_table(tables::WATCH_EVENTS)?;
+                        for entry in &table.entries {
+                            let rv = u64::from_le_bytes(
+                                entry.key[..8]
+                                    .try_into()
+                                    .map_err(|_| anyhow::anyhow!("bad watch event key len"))?,
+                            );
+                            tbl.insert(rv, entry.value.as_slice())?;
+                        }
                     }
-                }
-                "watch_replay_position_floors" => {
-                    let mut tbl = w.open_table(tables::WATCH_REPLAY_POSITION_FLOORS)?;
-                    for entry in &table.entries {
-                        tbl.insert(entry.key.as_slice(), entry.value.as_slice())?;
+                    "watch_replay_position_floors" => {
+                        let mut tbl = w.open_table(tables::WATCH_REPLAY_POSITION_FLOORS)?;
+                        for entry in &table.entries {
+                            tbl.insert(entry.key.as_slice(), entry.value.as_slice())?;
+                        }
                     }
-                }
-                "resources_by_owner" => {
-                    let mut tbl = w.open_table(tables::RESOURCES_BY_OWNER)?;
-                    for entry in &table.entries {
-                        let (rv, body): (u64, Vec<u8>) = serde_json::from_slice(&entry.value)?;
-                        tbl.insert(entry.key.as_slice(), (rv, body.as_slice()))?;
+                    "resources_by_owner" => {
+                        let mut tbl = w.open_table(tables::RESOURCES_BY_OWNER)?;
+                        for entry in &table.entries {
+                            let (rv, body): (u64, Vec<u8>) = serde_json::from_slice(&entry.value)?;
+                            tbl.insert(entry.key.as_slice(), (rv, body.as_slice()))?;
+                        }
                     }
-                }
-                "rv_to_key" => {
-                    let mut tbl = w.open_table(tables::RV_TO_KEY)?;
-                    for entry in &table.entries {
-                        let rv = u64::from_le_bytes(
-                            entry.key[..8]
-                                .try_into()
-                                .map_err(|_| anyhow::anyhow!("bad rv_to_key key len"))?,
-                        );
-                        tbl.insert(rv, entry.value.as_slice())?;
+                    "rv_to_key" => {
+                        let mut tbl = w.open_table(tables::RV_TO_KEY)?;
+                        for entry in &table.entries {
+                            let rv = u64::from_le_bytes(
+                                entry.key[..8]
+                                    .try_into()
+                                    .map_err(|_| anyhow::anyhow!("bad rv_to_key key len"))?,
+                            );
+                            tbl.insert(rv, entry.value.as_slice())?;
+                        }
                     }
-                }
-                "node_subnets" => {
-                    let mut tbl = w.open_table(tables::NODE_SUBNETS)?;
-                    for entry in &table.entries {
-                        let name = std::str::from_utf8(&entry.key)
-                            .map_err(|e| anyhow::anyhow!("bad node_subnet key: {e}"))?;
-                        tbl.insert(name, entry.value.as_slice())?;
+                    "node_subnets" => {
+                        let mut tbl = w.open_table(tables::NODE_SUBNETS)?;
+                        for entry in &table.entries {
+                            let name = std::str::from_utf8(&entry.key)
+                                .map_err(|e| anyhow::anyhow!("bad node_subnet key: {e}"))?;
+                            tbl.insert(name, entry.value.as_slice())?;
+                        }
                     }
-                }
-                "meta" => {
-                    let mut tbl = w.open_table(tables::META)?;
-                    for entry in &table.entries {
-                        let key = std::str::from_utf8(&entry.key)
-                            .map_err(|e| anyhow::anyhow!("bad meta key: {e}"))?;
-                        tbl.insert(key, entry.value.as_slice())?;
+                    "meta" => {
+                        let mut tbl = w.open_table(tables::META)?;
+                        for entry in &table.entries {
+                            let key = std::str::from_utf8(&entry.key)
+                                .map_err(|e| anyhow::anyhow!("bad meta key: {e}"))?;
+                            tbl.insert(key, entry.value.as_slice())?;
+                        }
                     }
-                }
-                other => {
-                    return Err(anyhow::anyhow!("unknown table in snapshot: {other}"));
+                    other => {
+                        return Err(anyhow::anyhow!("unknown table in snapshot: {other}"));
+                    }
                 }
             }
-        }
 
-        w.commit()
-            .map_err(|e| anyhow::anyhow!("restore commit failed: {e}"))?;
-        Ok(())
+            w.commit()
+                .map_err(|e| anyhow::anyhow!("restore commit failed: {e}"))?;
+            Ok(())
+        })();
+        restore.map_err(redb_snapshot_error)
     }
 }
 
@@ -368,7 +393,10 @@ mod tests {
 
     async fn restore(db: &TestStore, envelope: &SnapshotEnvelope) -> Result<()> {
         let fence = SnapshotExclusiveFence::new(db.accessor.acquire_snapshot_exclusive().await);
-        db.recovery.restore(envelope, fence).await
+        db.recovery
+            .restore(envelope, fence)
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn seed_cluster_state(db: &TestStore) {
@@ -531,9 +559,18 @@ mod tests {
         let mut bad = envelope.clone();
         bad.backend_kind = "sqlite".to_string();
 
-        let err = restore(&db2, &bad).await;
-        assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("backend"));
+        let fence = SnapshotExclusiveFence::new(db2.accessor.acquire_snapshot_exclusive().await);
+        let err = db2.recovery.restore(&bad, fence).await.unwrap_err();
+        assert_eq!(err.kind(), ClusterStoreErrorKind::CorruptData);
+        assert_eq!(err.backend(), Some(PersistenceBackend::Redb));
+        assert_eq!(err.operation(), "snapshot envelope validation");
+        assert!(std::error::Error::source(&err).is_some_and(|source| {
+            source
+                .downcast_ref::<klights_cluster_store::SnapshotRestoreError>()
+                .is_some()
+        }));
+        assert!(!err.is_retryable());
+        assert!(err.to_string().contains("backend"));
     }
 
     #[tokio::test]

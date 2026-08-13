@@ -1426,11 +1426,15 @@ impl DatastoreBackend for Datastore {
     }
 
     async fn get_klights_meta(&self, key: &str) -> anyhow::Result<Option<String>> {
-        klights_cluster_store::ClusterMetadataMutation::get_klights_meta(&self.0, key).await
+        klights_cluster_store::ClusterMetadataMutation::get_klights_meta(&self.0, key)
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn set_klights_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        klights_cluster_store::ClusterMetadataMutation::set_klights_meta(&self.0, key, value).await
+        klights_cluster_store::ClusterMetadataMutation::set_klights_meta(&self.0, key, value)
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn list_outbox_stream_watermarks(

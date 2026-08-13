@@ -46,13 +46,13 @@ struct NoopLifecycle;
 impl BackendLifecycleStore for NoopLifecycle {
     async fn acquire_snapshot_exclusive_fence(
         &self,
-    ) -> anyhow::Result<Option<SnapshotExclusiveFence>> {
+    ) -> klights_cluster_store::ClusterStoreResult<Option<SnapshotExclusiveFence>> {
         Ok(None)
     }
 
     async fn acquire_snapshot_mutation_fence(
         &self,
-    ) -> anyhow::Result<Option<SnapshotMutationFence>> {
+    ) -> klights_cluster_store::ClusterStoreResult<Option<SnapshotMutationFence>> {
         Ok(None)
     }
 

@@ -619,9 +619,12 @@ pub fn snapshot_id_for(last_applied: Option<LogId<NodeId>>) -> String {
     }
 }
 
-fn snapshot_write_err<E: std::fmt::Display>(e: E) -> StorageError<NodeId> {
+fn snapshot_write_err(error: anyhow::Error) -> StorageError<NodeId> {
     StorageError::IO {
-        source: StorageIOError::write_snapshot(None, AnyError::error(e.to_string())),
+        source: StorageIOError::write_snapshot(
+            None,
+            AnyError::from_dyn(error.as_ref(), Some("replication snapshot".to_string())),
+        ),
     }
 }
 
@@ -737,7 +740,33 @@ impl crate::state_machine::RaftSnapshotRestore for RaftSnapshotRestoreAdapter {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::error::Error;
     use std::sync::Mutex;
+
+    #[test]
+    fn snapshot_replication_boundary_preserves_cluster_store_source_chain() {
+        let error = klights_cluster_store::ClusterStoreError::adapter_failure_boxed(
+            klights_cluster_store::ClusterStoreErrorKind::Conflict,
+            klights_cluster_store::PersistenceBackend::Sqlite,
+            "snapshot capture",
+            Box::new(std::io::Error::other("unique identity collision")),
+        );
+
+        let mapped = snapshot_write_err(anyhow::Error::new(error));
+        assert!(mapped.to_string().contains("sqlite"));
+        assert!(mapped.to_string().contains("conflict"));
+        let mut source = Error::source(&mapped);
+        let mut depth = 0;
+        while let Some(error) = source {
+            depth += 1;
+            source = error.source();
+        }
+
+        assert!(
+            depth >= 2,
+            "replication must retain the cluster-store source beneath its OpenRaft wrapper"
+        );
+    }
 
     use klights_cluster_store::{
         AllocatorStateFuture, DurableAllocatorState, SnapshotCaptureRequest,
@@ -847,13 +876,17 @@ mod tests {
     impl BackendLifecycleStore for FakeLifecycle {
         async fn acquire_snapshot_exclusive_fence(
             &self,
-        ) -> Result<Option<klights_cluster_store::SnapshotExclusiveFence>> {
+        ) -> klights_cluster_store::ClusterStoreResult<
+            Option<klights_cluster_store::SnapshotExclusiveFence>,
+        > {
             Ok(Some(klights_cluster_store::SnapshotExclusiveFence::new(())))
         }
 
         async fn acquire_snapshot_mutation_fence(
             &self,
-        ) -> Result<Option<klights_cluster_store::SnapshotMutationFence>> {
+        ) -> klights_cluster_store::ClusterStoreResult<
+            Option<klights_cluster_store::SnapshotMutationFence>,
+        > {
             Ok(Some(klights_cluster_store::SnapshotMutationFence::new(())))
         }
 

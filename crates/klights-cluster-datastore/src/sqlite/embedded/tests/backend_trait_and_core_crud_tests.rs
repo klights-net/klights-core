@@ -30,6 +30,60 @@ async fn apply_exact_storage_command(
 }
 
 #[tokio::test]
+async fn focused_sqlite_mutation_maps_identity_collisions_to_cluster_store_conflict() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let data = || json!({"metadata": {"name": "typed-error"}});
+
+    ClusterResourceMutation::create_resource(
+        &db,
+        "v1",
+        "ConfigMap",
+        Some("default"),
+        "typed-error",
+        data(),
+    )
+    .await
+    .unwrap();
+
+    let error = ClusterResourceMutation::create_resource(
+        &db,
+        "v1",
+        "ConfigMap",
+        Some("default"),
+        "typed-error",
+        data(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        error.kind(),
+        klights_cluster_store::ClusterStoreErrorKind::Conflict
+    );
+    assert_eq!(
+        error.backend(),
+        Some(klights_cluster_store::PersistenceBackend::Sqlite)
+    );
+    assert!(std::error::Error::source(&error).is_some());
+}
+
+#[test]
+fn sqlite_tombstone_invariant_is_a_sqlite_persistence_error() {
+    let error = super::super::focused_ports::sqlite_tombstone_not_marked_error();
+
+    assert_eq!(
+        error.kind(),
+        klights_cluster_store::ClusterStoreErrorKind::Persistence
+    );
+    assert_eq!(
+        error.backend(),
+        Some(klights_cluster_store::PersistenceBackend::Sqlite)
+    );
+    assert_eq!(error.operation(), "SQLite tombstone delete");
+    assert!(std::error::Error::source(&error).is_some());
+}
+
+#[tokio::test]
 async fn ensure_cluster_metadata_command_applies_cluster_id_once() {
     let db = Datastore::new_in_memory().await.unwrap();
     apply_exact_storage_command(

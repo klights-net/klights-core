@@ -16,6 +16,7 @@ mod durable_recovery;
 mod namespace_content;
 mod ownership;
 mod persistence_contract;
+mod persistence_error;
 mod persistence_ports;
 mod pod_uid_precondition;
 mod post_commit;
@@ -63,6 +64,9 @@ pub use persistence_contract::{
     POD_CLEANUP_REASON_NODE_LOST, PositionedWatchReplay, PositionedWatchReplayRead,
     ReplicatedMembershipState, ReplicatedSnapshotMetadata, ResourceList, ResourceListOptions,
     SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget, WatchTargetScope,
+};
+pub use persistence_error::{
+    ClusterStoreError, ClusterStoreErrorKind, ClusterStoreResult, PersistenceBackend,
 };
 pub use persistence_ports::{
     AppliedOutboxLedger, ClusterMetadataMutation, ClusterNamespaceMutation, ClusterPodCleanupStore,

@@ -1,6 +1,6 @@
 //! Backend-neutral snapshot contracts and capture fencing.
 
-use anyhow::Result;
+use crate::ClusterStoreResult;
 use async_trait::async_trait;
 use klights_cluster_core::command::{COMMAND_CODEC_VERSION, supports_command_codec_version};
 use serde::{Deserialize, Serialize};
@@ -42,8 +42,12 @@ impl SnapshotMutationFence {
 /// Focused backend lifecycle and snapshot-fence port.
 #[async_trait]
 pub trait BackendLifecycleStore: Send + Sync {
-    async fn acquire_snapshot_exclusive_fence(&self) -> Result<Option<SnapshotExclusiveFence>>;
-    async fn acquire_snapshot_mutation_fence(&self) -> Result<Option<SnapshotMutationFence>>;
+    async fn acquire_snapshot_exclusive_fence(
+        &self,
+    ) -> ClusterStoreResult<Option<SnapshotExclusiveFence>>;
+    async fn acquire_snapshot_mutation_fence(
+        &self,
+    ) -> ClusterStoreResult<Option<SnapshotMutationFence>>;
     fn close(&self);
 }
 
@@ -103,14 +107,18 @@ pub enum SnapshotRestoreError {
 pub trait DatastoreSnapshotter: Send + Sync {
     fn backend_kind(&self) -> &'static str;
     fn schema_fingerprint(&self) -> String;
-    async fn snapshot(&self, fence: SnapshotExclusiveFence) -> Result<SnapshotEnvelope>;
+    async fn snapshot(&self, fence: SnapshotExclusiveFence)
+    -> ClusterStoreResult<SnapshotEnvelope>;
     async fn restore(
         &self,
         envelope: &SnapshotEnvelope,
         fence: SnapshotExclusiveFence,
-    ) -> Result<()>;
+    ) -> ClusterStoreResult<()>;
 
-    fn validate_envelope(&self, envelope: &SnapshotEnvelope) -> Result<(), SnapshotRestoreError> {
+    fn validate_envelope(
+        &self,
+        envelope: &SnapshotEnvelope,
+    ) -> std::result::Result<(), SnapshotRestoreError> {
         if envelope.backend_kind != self.backend_kind() {
             return Err(SnapshotRestoreError::BackendMismatch {
                 snapshot_backend: envelope.backend_kind.clone(),
@@ -147,6 +155,23 @@ pub fn compute_schema_fingerprint(table_names: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::compute_schema_fingerprint;
+    use crate::{ClusterStoreError, ClusterStoreErrorKind, PersistenceBackend};
+
+    #[test]
+    fn adapter_failures_keep_owned_kind_backend_operation_and_source() {
+        let error = ClusterStoreError::adapter_failure_boxed(
+            ClusterStoreErrorKind::Conflict,
+            PersistenceBackend::Sqlite,
+            "focused persistence port",
+            Box::new(std::io::Error::other("unique identity collision")),
+        );
+
+        assert_eq!(error.kind(), ClusterStoreErrorKind::Conflict);
+        assert_eq!(error.backend(), Some(PersistenceBackend::Sqlite));
+        assert_eq!(error.operation(), "focused persistence port");
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(!error.is_retryable());
+    }
 
     #[test]
     fn schema_fingerprint_is_order_independent_and_inventory_sensitive() {

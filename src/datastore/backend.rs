@@ -1642,17 +1642,35 @@ impl DatastoreBackendLifecyclePort {
 
 #[async_trait]
 impl klights_cluster_store::BackendLifecycleStore for DatastoreBackendLifecyclePort {
-    async fn acquire_snapshot_exclusive_fence(&self) -> Result<Option<SnapshotExclusiveFence>> {
-        DatastoreBackend::acquire_snapshot_exclusive_fence(self.db.as_ref()).await
+    async fn acquire_snapshot_exclusive_fence(
+        &self,
+    ) -> klights_cluster_store::ClusterStoreResult<Option<SnapshotExclusiveFence>> {
+        DatastoreBackend::acquire_snapshot_exclusive_fence(self.db.as_ref())
+            .await
+            .map_err(root_cluster_store_error)
     }
 
-    async fn acquire_snapshot_mutation_fence(&self) -> Result<Option<SnapshotMutationFence>> {
-        DatastoreBackend::acquire_snapshot_mutation_fence(self.db.as_ref()).await
+    async fn acquire_snapshot_mutation_fence(
+        &self,
+    ) -> klights_cluster_store::ClusterStoreResult<Option<SnapshotMutationFence>> {
+        DatastoreBackend::acquire_snapshot_mutation_fence(self.db.as_ref())
+            .await
+            .map_err(root_cluster_store_error)
     }
 
     fn close(&self) {
         DatastoreBackend::close(self.db.as_ref());
     }
+}
+
+pub(crate) fn root_cluster_store_error(
+    error: anyhow::Error,
+) -> klights_cluster_store::ClusterStoreError {
+    klights_cluster_datastore::map_cluster_store_adapter_error(
+        error,
+        klights_cluster_store::PersistenceBackend::Root,
+        "root datastore compatibility adapter",
+    )
 }
 
 /// Test-only watch bus controls.
@@ -1932,5 +1950,28 @@ mod endpoint_effect_default_tests {
             !backend.mutation_called.load(Ordering::SeqCst),
             "fallback must reject before a backend mutation can commit"
         );
+    }
+}
+
+#[cfg(test)]
+mod cluster_store_error_tests {
+    use std::error::Error as _;
+
+    use super::root_cluster_store_error;
+
+    #[test]
+    fn root_cluster_store_mapper_keeps_boundary_and_source() {
+        let error = root_cluster_store_error(anyhow::Error::msg("storage paused"));
+
+        assert_eq!(
+            error.kind(),
+            klights_cluster_store::ClusterStoreErrorKind::Persistence
+        );
+        assert_eq!(
+            error.backend(),
+            Some(klights_cluster_store::PersistenceBackend::Root)
+        );
+        assert_eq!(error.operation(), "root datastore compatibility adapter");
+        assert!(error.source().is_some());
     }
 }

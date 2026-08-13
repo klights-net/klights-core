@@ -32,11 +32,15 @@ impl ClusterStoreLeaderMaintenance {
         }
     }
 
-    fn require_leader(&self) -> anyhow::Result<()> {
-        self.authority
-            .local_permit()
-            .map(|_| ())
-            .map_err(|error| anyhow::anyhow!("operation requires current raft leader: {error}"))
+    fn require_leader(&self) -> klights_cluster_store::ClusterStoreResult<()> {
+        self.authority.local_permit().map(|_| ()).map_err(|error| {
+            klights_cluster_store::ClusterStoreError::adapter_failure_boxed(
+                klights_cluster_store::ClusterStoreErrorKind::Retryable,
+                klights_cluster_store::PersistenceBackend::Root,
+                "leader-gated cluster maintenance",
+                Box::new(error),
+            )
+        })
     }
 
     #[cfg(test)]
@@ -56,32 +60,57 @@ impl ClusterStoreLeaderMaintenance {
 
 #[async_trait]
 impl klights_cluster_store::ClusterWatchMaintenance for ClusterStoreLeaderMaintenance {
-    async fn advance_resource_version_after(&self, min_rv: i64) -> anyhow::Result<i64> {
+    async fn advance_resource_version_after(
+        &self,
+        min_rv: i64,
+    ) -> klights_cluster_store::ClusterStoreResult<i64> {
         self.require_leader()?;
-        let before = self.db.get_current_resource_version().await?;
+        let before = self
+            .db
+            .get_current_resource_version()
+            .await
+            .map_err(crate::datastore::backend::root_cluster_store_error)?;
         let new_rv = before.saturating_add(1).max(min_rv.saturating_add(1));
         self.proposal
             .propose_command(StorageCommand::AdvanceResourceVersion { min_rv, new_rv })
-            .await?;
-        self.db.get_current_resource_version().await.or(Ok(new_rv))
+            .await
+            .map_err(|error| {
+                klights_cluster_store::ClusterStoreError::adapter_failure_boxed(
+                    klights_cluster_store::ClusterStoreErrorKind::Retryable,
+                    klights_cluster_store::PersistenceBackend::Root,
+                    "raft maintenance proposal",
+                    error.into_boxed_dyn_error(),
+                )
+            })?;
+        self.db
+            .get_current_resource_version()
+            .await
+            .map_err(crate::datastore::backend::root_cluster_store_error)
+            .or(Ok(new_rv))
     }
 
     async fn watch_events_gc_prunable_count(
         &self,
         max_rows: i64,
         batch_cap: i64,
-    ) -> anyhow::Result<usize> {
+    ) -> klights_cluster_store::ClusterStoreResult<usize> {
         self.db
             .watch_events_gc_prunable_count(max_rows, batch_cap)
             .await
+            .map_err(crate::datastore::backend::root_cluster_store_error)
     }
 
-    async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> anyhow::Result<usize> {
+    async fn gc_watch_events(
+        &self,
+        max_rows: i64,
+        batch_cap: i64,
+    ) -> klights_cluster_store::ClusterStoreResult<usize> {
         self.require_leader()?;
         let prunable = self
             .db
             .watch_events_gc_prunable_count(max_rows, batch_cap)
-            .await?;
+            .await
+            .map_err(crate::datastore::backend::root_cluster_store_error)?;
         if prunable == 0 {
             return Ok(0);
         }
@@ -90,25 +119,51 @@ impl klights_cluster_store::ClusterWatchMaintenance for ClusterStoreLeaderMainte
                 max_rows,
                 batch_cap,
             })
-            .await?;
+            .await
+            .map_err(|error| {
+                klights_cluster_store::ClusterStoreError::adapter_failure_boxed(
+                    klights_cluster_store::ClusterStoreErrorKind::Retryable,
+                    klights_cluster_store::PersistenceBackend::Root,
+                    "raft maintenance proposal",
+                    error.into_boxed_dyn_error(),
+                )
+            })?;
         Ok(prunable)
     }
 }
 
 #[async_trait]
 impl klights_cluster_store::ClusterMetadataMutation for ClusterStoreLeaderMaintenance {
-    async fn get_klights_meta(&self, key: &str) -> anyhow::Result<Option<String>> {
-        self.db.get_klights_meta(key).await
+    async fn get_klights_meta(
+        &self,
+        key: &str,
+    ) -> klights_cluster_store::ClusterStoreResult<Option<String>> {
+        self.db
+            .get_klights_meta(key)
+            .await
+            .map_err(crate::datastore::backend::root_cluster_store_error)
     }
 
-    async fn set_klights_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
+    async fn set_klights_meta(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> klights_cluster_store::ClusterStoreResult<()> {
         self.require_leader()?;
         self.proposal
             .propose_command(StorageCommand::SetKlightsMeta {
                 key: key.to_string(),
                 value: value.to_string(),
             })
-            .await?;
+            .await
+            .map_err(|error| {
+                klights_cluster_store::ClusterStoreError::adapter_failure_boxed(
+                    klights_cluster_store::ClusterStoreErrorKind::Retryable,
+                    klights_cluster_store::PersistenceBackend::Root,
+                    "raft metadata proposal",
+                    error.into_boxed_dyn_error(),
+                )
+            })?;
         Ok(())
     }
 }
@@ -284,7 +339,21 @@ mod tests {
             .await
             .expect_err("follower metadata write must be rejected");
 
-        assert!(error.to_string().contains("current raft leader"));
+        assert_eq!(
+            error.kind(),
+            klights_cluster_store::ClusterStoreErrorKind::Retryable
+        );
+        assert_eq!(
+            error.backend(),
+            Some(klights_cluster_store::PersistenceBackend::Root)
+        );
+        assert_eq!(error.operation(), "leader-gated cluster maintenance");
+        let source = std::error::Error::source(&error)
+            .expect("leader rejection must retain its authority source");
+        assert_eq!(
+            source.downcast_ref::<klights_leader_api::AuthorityError>(),
+            Some(&klights_leader_api::AuthorityError::NotAuthoritative)
+        );
         assert!(proposal.commands.lock().unwrap().is_empty());
         assert!(db.get_klights_meta("cluster-id").await.unwrap().is_none());
     }

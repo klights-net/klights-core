@@ -163,7 +163,10 @@ mod tests {
 
     #[async_trait]
     impl ClusterWatchMaintenance for RecordingWatchMaintenance {
-        async fn advance_resource_version_after(&self, min_rv: i64) -> Result<i64> {
+        async fn advance_resource_version_after(
+            &self,
+            min_rv: i64,
+        ) -> klights_cluster_store::ClusterStoreResult<i64> {
             Ok(min_rv)
         }
 
@@ -171,11 +174,15 @@ mod tests {
             &self,
             _max_rows: i64,
             _batch_cap: i64,
-        ) -> Result<usize> {
+        ) -> klights_cluster_store::ClusterStoreResult<usize> {
             Ok(0)
         }
 
-        async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
+        async fn gc_watch_events(
+            &self,
+            max_rows: i64,
+            batch_cap: i64,
+        ) -> klights_cluster_store::ClusterStoreResult<usize> {
             self.sweeps.fetch_add(1, Ordering::SeqCst);
             self.last_max_rows.store(max_rows, Ordering::SeqCst);
             self.last_batch_cap.store(batch_cap, Ordering::SeqCst);

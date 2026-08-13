@@ -9,6 +9,8 @@
 
 use std::path::PathBuf;
 
+use klights_cluster_store::{ClusterStoreError, ClusterStoreErrorKind, PersistenceBackend};
+
 /// Errors that can occur when opening a datastore connection.
 ///
 /// These are fatal startup errors — the operator must take explicit action
@@ -124,6 +126,37 @@ impl DatastoreError {
     }
 }
 
+/// Map a concrete datastore failure at a public persistence-port boundary.
+///
+/// This belongs beside [`DatastoreError`] so root composition can preserve
+/// semantic classifications without importing concrete datastore error types.
+pub fn cluster_store_adapter_error(
+    error: anyhow::Error,
+    backend: PersistenceBackend,
+    operation: &'static str,
+) -> ClusterStoreError {
+    let error = match error.downcast::<ClusterStoreError>() {
+        Ok(error) => {
+            let kind = error.kind();
+            return ClusterStoreError::adapter_failure_boxed(
+                kind,
+                backend,
+                operation,
+                Box::new(error),
+            );
+        }
+        Err(error) => error,
+    };
+    let kind = match error.downcast_ref::<DatastoreError>() {
+        Some(DatastoreError::AlreadyExists { .. } | DatastoreError::Conflict { .. }) => {
+            ClusterStoreErrorKind::Conflict
+        }
+        Some(DatastoreError::NotFound { .. }) => ClusterStoreErrorKind::NotFound,
+        None => ClusterStoreErrorKind::Persistence,
+    };
+    ClusterStoreError::adapter_failure_boxed(kind, backend, operation, error.into_boxed_dyn_error())
+}
+
 /// Return true when an anyhow error represents a datastore conflict.
 pub fn is_conflict_error(err: &anyhow::Error) -> bool {
     if err
@@ -137,4 +170,36 @@ pub fn is_conflict_error(err: &anyhow::Error) -> bool {
     lower.contains("409 conflict")
         || lower.contains("version conflict")
         || lower.contains("rv conflict")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+
+    use super::*;
+
+    #[test]
+    fn compatibility_adapter_preserves_an_inner_typed_cluster_store_error() {
+        let inner = ClusterStoreError::adapter_failure_boxed(
+            ClusterStoreErrorKind::Conflict,
+            PersistenceBackend::Sqlite,
+            "focused persistence port",
+            Box::new(std::io::Error::other("unique identity collision")),
+        );
+        let error = cluster_store_adapter_error(
+            anyhow::Error::new(inner),
+            PersistenceBackend::Root,
+            "root datastore compatibility adapter",
+        );
+
+        assert_eq!(error.kind(), ClusterStoreErrorKind::Conflict);
+        assert_eq!(error.backend(), Some(PersistenceBackend::Root));
+        assert_eq!(error.operation(), "root datastore compatibility adapter");
+        let source = error.source().expect("typed error must remain the source");
+        let inner = source
+            .downcast_ref::<ClusterStoreError>()
+            .expect("source must remain the typed cluster-store error");
+        assert_eq!(inner.kind(), ClusterStoreErrorKind::Conflict);
+        assert_eq!(inner.backend(), Some(PersistenceBackend::Sqlite));
+    }
 }

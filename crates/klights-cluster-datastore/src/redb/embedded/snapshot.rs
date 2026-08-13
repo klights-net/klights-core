@@ -1,8 +1,9 @@
 //! Root composition wrapper for the focused Redb backend snapshot port.
 
-use anyhow::Result;
 use async_trait::async_trait;
-use klights_cluster_store::{DatastoreSnapshotter, SnapshotEnvelope, SnapshotExclusiveFence};
+use klights_cluster_store::{
+    ClusterStoreResult, DatastoreSnapshotter, SnapshotEnvelope, SnapshotExclusiveFence,
+};
 
 use super::RedbDatastore;
 
@@ -16,7 +17,10 @@ impl DatastoreSnapshotter for RedbDatastore {
         self.recovery.schema_fingerprint()
     }
 
-    async fn snapshot(&self, fence: SnapshotExclusiveFence) -> Result<SnapshotEnvelope> {
+    async fn snapshot(
+        &self,
+        fence: SnapshotExclusiveFence,
+    ) -> ClusterStoreResult<SnapshotEnvelope> {
         self.recovery.snapshot(fence).await
     }
 
@@ -24,7 +28,7 @@ impl DatastoreSnapshotter for RedbDatastore {
         &self,
         envelope: &SnapshotEnvelope,
         fence: SnapshotExclusiveFence,
-    ) -> Result<()> {
+    ) -> ClusterStoreResult<()> {
         self.recovery.restore(envelope, fence).await
     }
 }

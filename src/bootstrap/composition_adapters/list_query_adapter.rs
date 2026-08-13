@@ -23,6 +23,7 @@ impl ListResourceVersionPort for DatastoreListResourceVersionPort {
             self.watch_maintenance
                 .advance_resource_version_after(minimum_resource_version)
                 .await
+                .map_err(anyhow::Error::new)
         })
     }
 }
@@ -107,7 +108,10 @@ mod tests {
 
     #[async_trait]
     impl klights_cluster_store::ClusterWatchMaintenance for RecordingWatchMaintenance {
-        async fn advance_resource_version_after(&self, _min_rv: i64) -> anyhow::Result<i64> {
+        async fn advance_resource_version_after(
+            &self,
+            _min_rv: i64,
+        ) -> klights_cluster_store::ClusterStoreResult<i64> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.returned_rv)
         }
@@ -116,11 +120,15 @@ mod tests {
             &self,
             _max_rows: i64,
             _batch_cap: i64,
-        ) -> anyhow::Result<usize> {
+        ) -> klights_cluster_store::ClusterStoreResult<usize> {
             Ok(0)
         }
 
-        async fn gc_watch_events(&self, _max_rows: i64, _batch_cap: i64) -> anyhow::Result<usize> {
+        async fn gc_watch_events(
+            &self,
+            _max_rows: i64,
+            _batch_cap: i64,
+        ) -> klights_cluster_store::ClusterStoreResult<usize> {
             Ok(0)
         }
     }

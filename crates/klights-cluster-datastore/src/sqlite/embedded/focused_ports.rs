@@ -4,9 +4,33 @@ use super::*;
 use async_trait::async_trait;
 use klights_cluster_store::{
     AppliedOutboxLedger, BackendLifecycleStore, ClusterMetadataMutation, ClusterNamespaceMutation,
-    ClusterPodCleanupStore, ClusterResourceMutation, ClusterTopologyMutation,
-    ClusterWatchMaintenance,
+    ClusterPodCleanupStore, ClusterResourceMutation, ClusterStoreError, ClusterTopologyMutation,
+    ClusterWatchMaintenance, PersistenceBackend,
 };
+type Result<T> = klights_cluster_store::ClusterStoreResult<T>;
+
+fn sqlite_port_error(error: anyhow::Error) -> ClusterStoreError {
+    crate::errors::cluster_store_adapter_error(
+        error,
+        PersistenceBackend::Sqlite,
+        "focused persistence port",
+    )
+}
+
+fn sqlite_db_port_error(error: tokio_rusqlite::Error) -> ClusterStoreError {
+    sqlite_port_error(anyhow::Error::from(error))
+}
+
+pub(crate) fn sqlite_tombstone_not_marked_error() -> ClusterStoreError {
+    ClusterStoreError::adapter_failure_boxed(
+        klights_cluster_store::ClusterStoreErrorKind::Persistence,
+        PersistenceBackend::Sqlite,
+        "SQLite tombstone delete",
+        Box::new(std::io::Error::other(
+            "SQLite tombstone delete did not mark its target",
+        )),
+    )
+}
 
 #[async_trait]
 impl ClusterResourceMutation for Datastore {
@@ -18,7 +42,9 @@ impl ClusterResourceMutation for Datastore {
         name: &str,
         data: Value,
     ) -> Result<Resource> {
-        Datastore::create_resource(self, api_version, kind, namespace, name, data).await
+        Datastore::create_resource(self, api_version, kind, namespace, name, data)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn update_resource(
@@ -32,6 +58,7 @@ impl ClusterResourceMutation for Datastore {
     ) -> Result<Resource> {
         Datastore::update_resource(self, api_version, kind, namespace, name, data, expected_rv)
             .await
+            .map_err(sqlite_port_error)
     }
 
     async fn update_resource_with_preconditions(
@@ -53,6 +80,7 @@ impl ClusterResourceMutation for Datastore {
             preconditions,
         )
         .await
+        .map_err(sqlite_port_error)
     }
 
     async fn update_main_resource_with_preconditions(
@@ -74,10 +102,13 @@ impl ClusterResourceMutation for Datastore {
             preconditions,
         )
         .await
+        .map_err(sqlite_port_error)
     }
 
     async fn apply_resource_batch(&self, operations: Vec<ResourceBatchOperation>) -> Result<()> {
-        Datastore::apply_resource_batch(self, operations).await
+        Datastore::apply_resource_batch(self, operations)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn delete_resource(
@@ -87,7 +118,9 @@ impl ClusterResourceMutation for Datastore {
         namespace: Option<&str>,
         name: &str,
     ) -> Result<()> {
-        Datastore::delete_resource(self, api_version, kind, namespace, name).await
+        Datastore::delete_resource(self, api_version, kind, namespace, name)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn delete_resource_with_preconditions(
@@ -107,6 +140,7 @@ impl ClusterResourceMutation for Datastore {
             preconditions,
         )
         .await
+        .map_err(sqlite_port_error)
     }
 
     async fn delete_resource_with_preconditions_observed_rv(
@@ -126,6 +160,7 @@ impl ClusterResourceMutation for Datastore {
             preconditions,
         )
         .await
+        .map_err(sqlite_port_error)
     }
 
     async fn mark_for_delete_without_watch(
@@ -147,6 +182,7 @@ impl ClusterResourceMutation for Datastore {
             grace_seconds,
         )
         .await
+        .map_err(sqlite_port_error)
     }
 
     async fn delete_resource_without_watch_with_tombstone(
@@ -167,8 +203,9 @@ impl ClusterResourceMutation for Datastore {
             preconditions,
             grace_seconds,
         )
-        .await?
-        .ok_or_else(|| anyhow!("SQLite tombstone delete did not mark its target"))?;
+        .await
+        .map_err(sqlite_port_error)?
+        .ok_or_else(sqlite_tombstone_not_marked_error)?;
         Datastore::delete_resource_with_preconditions(
             self,
             api_version,
@@ -180,7 +217,8 @@ impl ClusterResourceMutation for Datastore {
                 marked.resource_version,
             ),
         )
-        .await?;
+        .await
+        .map_err(sqlite_port_error)?;
         Ok(marked)
     }
 
@@ -203,6 +241,7 @@ impl ClusterResourceMutation for Datastore {
             patch,
         )
         .await
+        .map_err(sqlite_port_error)
     }
 
     async fn patch_resource_latest_with_preconditions(
@@ -222,13 +261,16 @@ impl ClusterResourceMutation for Datastore {
             request,
         )
         .await
+        .map_err(sqlite_port_error)
     }
 }
 
 #[async_trait]
 impl ClusterNamespaceMutation for Datastore {
     async fn create_namespace(&self, name: &str, data: Value) -> Result<Resource> {
-        Datastore::create_namespace(self, name, data).await
+        Datastore::create_namespace(self, name, data)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn update_namespace(
@@ -237,34 +279,48 @@ impl ClusterNamespaceMutation for Datastore {
         data: Value,
         expected_rv: i64,
     ) -> Result<Resource> {
-        Datastore::update_namespace(self, name, data, expected_rv).await
+        Datastore::update_namespace(self, name, data, expected_rv)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn delete_namespace(&self, name: &str) -> Result<()> {
-        Datastore::delete_namespace(self, name).await
+        Datastore::delete_namespace(self, name)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn delete_namespace_observed_rv(&self, name: &str) -> Result<i64> {
-        Datastore::delete_namespace_observed_rv(self, name).await
+        Datastore::delete_namespace_observed_rv(self, name)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn delete_namespace_contents(&self, name: &str) -> Result<()> {
-        Datastore::delete_namespace_contents(self, name).await
+        Datastore::delete_namespace_contents(self, name)
+            .await
+            .map_err(sqlite_port_error)
     }
 }
 
 #[async_trait]
 impl ClusterWatchMaintenance for Datastore {
     async fn advance_resource_version_after(&self, min_rv: i64) -> Result<i64> {
-        Datastore::advance_resource_version_after(self, min_rv).await
+        Datastore::advance_resource_version_after(self, min_rv)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn watch_events_gc_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
-        Datastore::watch_events_gc_prunable_count(self, max_rows, batch_cap).await
+        Datastore::watch_events_gc_prunable_count(self, max_rows, batch_cap)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
-        Datastore::gc_watch_events(self, max_rows, batch_cap).await
+        Datastore::gc_watch_events(self, max_rows, batch_cap)
+            .await
+            .map_err(sqlite_port_error)
     }
 }
 
@@ -276,7 +332,9 @@ impl ClusterTopologyMutation for Datastore {
         cluster_cidr: &str,
         node_ip: &str,
     ) -> Result<klights_cluster_store::StoredNodeSubnet> {
-        Datastore::allocate_node_subnet(self, node_name, cluster_cidr, node_ip).await
+        Datastore::allocate_node_subnet(self, node_name, cluster_cidr, node_ip)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn update_node_peer_attributes(
@@ -285,18 +343,24 @@ impl ClusterTopologyMutation for Datastore {
         mode: klights_types::NodePeerMode,
         hostport_range: Option<klights_types::HostPortRange>,
     ) -> Result<()> {
-        Datastore::update_node_peer_attributes(self, node_name, mode, hostport_range).await
+        Datastore::update_node_peer_attributes(self, node_name, mode, hostport_range)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn update_node_dataplane(
         &self,
         metadata: klights_cluster_store::DataplanePeerMetadata,
     ) -> Result<()> {
-        Datastore::update_node_dataplane(self, metadata).await
+        Datastore::update_node_dataplane(self, metadata)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn delete_node_subnet(&self, node_name: &str) -> Result<()> {
-        Datastore::delete_node_subnet(self, node_name).await
+        Datastore::delete_node_subnet(self, node_name)
+            .await
+            .map_err(sqlite_port_error)
     }
 }
 
@@ -312,13 +376,16 @@ impl ClusterPodCleanupStore for Datastore {
     ) -> Result<()> {
         Datastore::move_pod_to_cleanup_intent(self, node_name, namespace, pod_name, pod_uid, reason)
             .await
+            .map_err(sqlite_port_error)
     }
 
     async fn list_pod_cleanup_intents_for_node(
         &self,
         node_name: &str,
     ) -> Result<Vec<LogApplyPodCleanupIntentRow>> {
-        Datastore::list_pod_cleanup_intents_for_node(self, node_name).await
+        Datastore::list_pod_cleanup_intents_for_node(self, node_name)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn delete_pod_cleanup_intent(
@@ -331,23 +398,30 @@ impl ClusterPodCleanupStore for Datastore {
     ) -> Result<()> {
         Datastore::delete_pod_cleanup_intent(self, node_name, namespace, pod_name, pod_uid, reason)
             .await
+            .map_err(sqlite_port_error)
     }
 
     async fn delete_pod_cleanup_intents_for_node(&self, node_name: &str) -> Result<()> {
-        Datastore::delete_pod_cleanup_intents_for_node(self, node_name).await
+        Datastore::delete_pod_cleanup_intents_for_node(self, node_name)
+            .await
+            .map_err(sqlite_port_error)
     }
 }
 
 #[async_trait]
 impl AppliedOutboxLedger for Datastore {
     async fn applied_outbox_gc_prunable_count(&self, cutoff_ms: i64) -> Result<usize> {
-        Datastore::applied_outbox_gc_prunable_count(self, cutoff_ms).await
+        Datastore::applied_outbox_gc_prunable_count(self, cutoff_ms)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn list_outbox_stream_watermarks(
         &self,
     ) -> Result<Vec<klights_cluster_core::OutboxStreamWatermark>> {
-        Datastore::list_outbox_stream_watermarks(self).await
+        Datastore::list_outbox_stream_watermarks(self)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn list_outbox_stream_watermarks_paged(
@@ -355,22 +429,30 @@ impl AppliedOutboxLedger for Datastore {
         after: Option<&klights_cluster_store::SnapshotOutboxWatermarkCursor>,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<klights_cluster_core::OutboxStreamWatermark>> {
-        Datastore::list_outbox_stream_watermarks_paged(self, after, limit).await
+        Datastore::list_outbox_stream_watermarks_paged(self, after, limit)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
     ) -> Result<Option<LogApplyAppliedOutboxRow>> {
-        Datastore::get_applied_outbox(self, idempotency_key).await
+        Datastore::get_applied_outbox(self, idempotency_key)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn insert_applied_outbox(&self, record: LogApplyAppliedOutboxRow) -> Result<bool> {
-        Datastore::insert_applied_outbox(self, record).await
+        Datastore::insert_applied_outbox(self, record)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn list_applied_outbox(&self) -> Result<Vec<LogApplyAppliedOutboxRow>> {
-        Datastore::list_applied_outbox(self).await
+        Datastore::list_applied_outbox(self)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn list_applied_outbox_paged(
@@ -378,7 +460,9 @@ impl AppliedOutboxLedger for Datastore {
         after_key: Option<&str>,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<LogApplyAppliedOutboxRow>> {
-        Datastore::list_applied_outbox_paged(self, after_key, limit).await
+        Datastore::list_applied_outbox_paged(self, after_key, limit)
+            .await
+            .map_err(sqlite_port_error)
     }
 
     async fn build_log_apply_commit_for_command(
@@ -389,6 +473,7 @@ impl AppliedOutboxLedger for Datastore {
     ) -> Result<klights_cluster_core::LogApplyCommit> {
         Datastore::build_log_apply_commit_for_command(self, command, operation, authoring_node)
             .await
+            .map_err(sqlite_port_error)
     }
 
     async fn build_log_apply_commit_for_outbox(
@@ -434,7 +519,9 @@ impl AppliedOutboxLedger for Datastore {
     }
 
     async fn gc_applied_outbox(&self, now_ms: i64, ttl_ms: i64) -> Result<usize> {
-        Datastore::gc_applied_outbox(self, now_ms, ttl_ms).await
+        Datastore::gc_applied_outbox(self, now_ms, ttl_ms)
+            .await
+            .map_err(sqlite_port_error)
     }
 }
 
@@ -450,7 +537,7 @@ impl ClusterMetadataMutation for Datastore {
                 .optional()?)
         })
         .await
-        .map_err(|error| anyhow!("get_klights_meta failed: {error}"))
+        .map_err(sqlite_db_port_error)
     }
 
     async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()> {
@@ -464,7 +551,7 @@ impl ClusterMetadataMutation for Datastore {
             Ok(())
         })
         .await
-        .map_err(|error| anyhow!("set_klights_meta failed: {error}"))
+        .map_err(sqlite_db_port_error)
     }
 }
 
