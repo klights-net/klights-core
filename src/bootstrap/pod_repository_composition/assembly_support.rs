@@ -92,7 +92,6 @@ pub(crate) mod support {
                     crate::datastore::backend_kind::BackendKind::Sqlite,
                     None,
                     supervisor.clone(),
-                    None,
                     "sqlite:pod-worker-composition-integration",
                 )
                 .await
@@ -1360,7 +1359,6 @@ pub(crate) mod support {
                     crate::datastore::backend_kind::BackendKind::Sqlite,
                     None,
                     supervisor.clone(),
-                    None,
                     "sqlite:pod-network-integration",
                 )
                 .await
@@ -2018,7 +2016,6 @@ pub(crate) mod support {
                         crate::datastore::backend_kind::BackendKind::Sqlite,
                         None,
                         supervisor.clone(),
-                        None,
                         "sqlite:pod-repository-outbox-integration",
                     )
                     .await

@@ -272,7 +272,7 @@ async fn canonical_snapshot_restore_preserves_exact_v3_activation() {
                     [],
                     |row| row.get::<_, String>(0),
                 )
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
         })
         .await
         .unwrap();
@@ -343,7 +343,7 @@ async fn canonical_snapshot_restore_preserves_legacy_metadata_omission_and_curre
                     [],
                     |row| row.get::<_, String>(0),
                 )
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
         })
         .await
         .unwrap();
@@ -1327,7 +1327,7 @@ async fn sqlite_recovery_preserves_metadata_codec_and_restore_rollback() {
                     [],
                     |row| row.get(0),
                 )
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
         })
         .await
         .unwrap();
@@ -1515,7 +1515,7 @@ async fn sqlite_metadata_rejects_malformed_rows_and_absent_membership_clears_sta
                     [],
                     |row| row.get(0),
                 )
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
         })
         .await
         .unwrap();

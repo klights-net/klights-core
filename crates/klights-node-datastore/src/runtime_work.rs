@@ -109,10 +109,16 @@ impl SqliteRuntimeWorkStore {
             .min(i64::MAX as u128) as i64
     }
 
-    async fn db_call<T, F>(&self, query_name: &'static str, call: F) -> tokio_rusqlite::Result<T>
+    async fn db_call<T, F>(
+        &self,
+        query_name: &'static str,
+        call: F,
+    ) -> klights_supervisor::DbCallResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> klights_supervisor::DbClosureResult<T>
+            + Send
+            + 'static,
     {
         self.executor.call_raw(query_name, call).await
     }
@@ -231,7 +237,7 @@ impl PodRuntimeStore for SqliteRuntimeWorkStore {
                 .db_call("node_local:pod_runtime_get", move |conn| {
                     conn.query_row(POD_RUNTIME_GET_UID, [pod_uid], runtime_row)
                         .optional()
-                        .map_err(tokio_rusqlite::Error::from)
+                        .map_err(klights_supervisor::DbError::from)
                 })
                 .await
                 .map_err(|error| persistence_error("pod_runtime get", error))?;
@@ -246,7 +252,7 @@ impl PodRuntimeStore for SqliteRuntimeWorkStore {
                     conn.prepare(POD_RUNTIME_LIST)?
                         .query_map([], runtime_row)?
                         .collect::<rusqlite::Result<Vec<_>>>()
-                        .map_err(tokio_rusqlite::Error::from)
+                        .map_err(klights_supervisor::DbError::from)
                 })
                 .await
                 .map_err(|error| persistence_error("pod_runtime list", error))?;
@@ -265,7 +271,7 @@ impl PodRuntimeStore for SqliteRuntimeWorkStore {
                     conn.prepare(POD_RUNTIME_LIST_NS)?
                         .query_map([namespace], runtime_row)?
                         .collect::<rusqlite::Result<Vec<_>>>()
-                        .map_err(tokio_rusqlite::Error::from)
+                        .map_err(klights_supervisor::DbError::from)
                 })
                 .await
                 .map_err(|error| persistence_error("pod_runtime list namespace", error))?;
@@ -313,7 +319,7 @@ impl ProbeStateStore for SqliteRuntimeWorkStore {
                         },
                     )
                     .optional()
-                    .map_err(tokio_rusqlite::Error::from)
+                    .map_err(klights_supervisor::DbError::from)
                 })
                 .await
                 .map_err(|error| persistence_error("probe_state get", error))?;
@@ -450,7 +456,7 @@ impl PodWorkqueueStore for SqliteRuntimeWorkStore {
                 })
                 .optional()
                 .map(|value| value.flatten())
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
             })
             .await
             .map_err(|error| persistence_error("pod_workqueue peek", error))
@@ -526,7 +532,7 @@ impl PodWorkqueueStore for SqliteRuntimeWorkStore {
                         "DELETE FROM pod_workqueue WHERE id = ?1 AND kind = ?2 AND namespace = ?3 AND pod_name = ?4 AND pod_uid = ?5 AND next_due_ms = ?6",
                         rusqlite::params![id.get(), kind, pod.namespace, pod.name, pod.uid, leased_next_due_ms.get()],
                     )
-                    .map_err(tokio_rusqlite::Error::from)
+                    .map_err(klights_supervisor::DbError::from)
                 })
                 .await
                 .map_err(|error| persistence_error("pod_workqueue acknowledge", error))?;
@@ -981,7 +987,7 @@ fn read_pod_slot(
     transaction: &rusqlite::Transaction<'_>,
     namespace: &str,
     pod_name: &str,
-) -> tokio_rusqlite::Result<Option<PodSlotRow>> {
+) -> klights_supervisor::DbClosureResult<Option<PodSlotRow>> {
     let row = transaction
         .query_row(
             POD_SLOT_ADMISSION_SELECT,
@@ -1015,7 +1021,7 @@ fn slot_state(state: PodSlotAdmissionState) -> &'static str {
     }
 }
 
-fn parse_slot_state(value: &str) -> tokio_rusqlite::Result<PodSlotAdmissionState> {
+fn parse_slot_state(value: &str) -> klights_supervisor::DbClosureResult<PodSlotAdmissionState> {
     match value {
         "Admitted" => Ok(PodSlotAdmissionState::Admitted),
         "Terminating" => Ok(PodSlotAdmissionState::Terminating),
@@ -1027,7 +1033,7 @@ fn parse_slot_state(value: &str) -> tokio_rusqlite::Result<PodSlotAdmissionState
 
 fn next_pod_slot_version(
     transaction: &rusqlite::Transaction<'_>,
-) -> tokio_rusqlite::Result<ObservedPodVersion> {
+) -> klights_supervisor::DbClosureResult<ObservedPodVersion> {
     let current = transaction
         .query_row(POD_SLOT_RV_SELECT, [], |row| row.get::<_, String>(0))
         .optional()?
@@ -1038,8 +1044,8 @@ fn next_pod_slot_version(
     ObservedPodVersion::try_new(next).map_err(|error| corrupt_db_error(error.to_string()))
 }
 
-fn corrupt_db_error(message: String) -> tokio_rusqlite::Error {
-    tokio_rusqlite::Error::Other(Box::new(std::io::Error::new(
+fn corrupt_db_error(message: String) -> klights_supervisor::DbError {
+    klights_supervisor::DbError::Application(Box::new(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         message,
     )))

@@ -48,21 +48,15 @@ async fn open_leader_node_local(
     kind: BackendKind,
     path: Option<&std::path::Path>,
     supervisor: Arc<TaskSupervisor>,
-    key_file: Option<&std::path::Path>,
     connection_key: &'static str,
 ) -> Result<LeaderNodeLocalStores> {
     anyhow::ensure!(
         kind == BackendKind::Sqlite,
         "the redb node-local backend does not implement Raft durability"
     );
-    let node = crate::bootstrap::node_store::open_node_local(
-        kind,
-        path,
-        supervisor,
-        key_file,
-        connection_key,
-    )
-    .await?;
+    let node =
+        crate::bootstrap::node_store::open_node_local(kind, path, supervisor, connection_key)
+            .await?;
     let raft = Arc::new(
         klights_replication::node_durability::OpenRaftNodeDurabilityAdapter::new(
             node.raft_log_persistence(),
@@ -169,7 +163,6 @@ fn passive_store_open_request(config: &KlightsConfig) -> PassiveStoreOpenRequest
         (BackendKind::Sqlite, true) => PassiveStoreOpenRequest::SqliteInMemory,
         (BackendKind::Sqlite, false) => PassiveStoreOpenRequest::SqlitePersistent {
             cluster_db_path: &config.cluster_db_path,
-            db_key_file: config.db_key_file.as_deref(),
         },
         (BackendKind::Redb, true) => PassiveStoreOpenRequest::RedbInMemory,
         (BackendKind::Redb, false) => PassiveStoreOpenRequest::RedbPersistent {
@@ -269,7 +262,6 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 config.node_local_backend,
                 node_local_db_path,
                 supervisor.clone(),
-                config.db_key_file.as_deref(),
                 "sqlite:node-local",
             )
             .await
@@ -285,7 +277,6 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             config.node_local_backend,
             node_local_db_path,
             supervisor.clone(),
-            config.db_key_file.as_deref(),
             "sqlite:node-local",
         )
         .await
@@ -1467,7 +1458,6 @@ mod tests {
             let mut config = crate::KlightsConfig::test_default();
             config.datastore_backend = backend;
             config.in_memory = in_memory;
-            config.db_key_file = Some("/keys/cluster.key".into());
 
             match (
                 backend,
@@ -1479,13 +1469,9 @@ mod tests {
                 (
                     BackendKind::Sqlite,
                     false,
-                    PassiveStoreOpenRequest::SqlitePersistent {
-                        cluster_db_path,
-                        db_key_file,
-                    },
+                    PassiveStoreOpenRequest::SqlitePersistent { cluster_db_path },
                 ) => {
                     assert_eq!(cluster_db_path, config.cluster_db_path);
-                    assert_eq!(db_key_file, config.db_key_file.as_deref());
                 }
                 (
                     BackendKind::Redb,

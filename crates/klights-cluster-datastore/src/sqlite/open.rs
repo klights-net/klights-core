@@ -24,8 +24,10 @@ pub async fn open_with_opts(
     let executor = DbExecutor::open_with_opts(opts, supervisor, connection_key).await?;
     executor
         .call_raw("cluster-schema:init-and-check", move |conn| {
-            init_schema(conn)?;
-            check_db_health(conn, Path::new(&display))?;
+            init_schema(conn)
+                .map_err(|error| klights_supervisor::DbError::Application(Box::new(error)))?;
+            check_db_health(conn, Path::new(&display))
+                .map_err(|error| klights_supervisor::DbError::Application(Box::new(error)))?;
             Ok(())
         })
         .await?;
@@ -41,8 +43,10 @@ pub async fn open_read_only_with_opts(
     let executor = DbExecutor::open_read_only_with_opts(opts, supervisor, connection_key).await?;
     executor
         .call_raw("cluster-schema:check-read-only", move |conn| {
-            sqlite_open::check_integrity(conn, Path::new(&display))?;
-            super::fingerprint::check_or_init(conn, Path::new(&display))?;
+            sqlite_open::check_integrity(conn, Path::new(&display))
+                .map_err(klights_supervisor::DbError::from)?;
+            super::fingerprint::check_or_init(conn, Path::new(&display))
+                .map_err(|error| klights_supervisor::DbError::Application(Box::new(error)))?;
             Ok(())
         })
         .await?;

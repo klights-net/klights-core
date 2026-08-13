@@ -159,7 +159,7 @@ impl Datastore {
                 }
             }
 
-            Err(tokio_rusqlite::Error::Rusqlite(
+            Err(klights_supervisor::DbError::Sqlite(
                 rusqlite::Error::QueryReturnedNoRows,
             ))
         })

@@ -17,17 +17,9 @@ fn supervisor() -> Arc<TaskSupervisor> {
 async fn open_sqlite(
     path: Option<&Path>,
     supervisor: Arc<TaskSupervisor>,
-    key_file: Option<&Path>,
     connection_key: &'static str,
 ) -> anyhow::Result<super::NodeLocalStores> {
-    super::open_node_local(
-        BackendKind::Sqlite,
-        path,
-        supervisor,
-        key_file,
-        connection_key,
-    )
-    .await
+    super::open_node_local(BackendKind::Sqlite, path, supervisor, connection_key).await
 }
 
 #[tokio::test]
@@ -45,7 +37,6 @@ async fn disk_open_reopen_preserves_node_metadata_and_schema() {
         let stores = open_sqlite(
             Some(&path),
             supervisor.clone(),
-            None,
             "sqlite:phase18-selector-disk-first",
         )
         .await
@@ -62,7 +53,6 @@ async fn disk_open_reopen_preserves_node_metadata_and_schema() {
     let reopened = open_sqlite(
         Some(&path),
         supervisor,
-        None,
         "sqlite:phase18-selector-disk-reopen",
     )
     .await
@@ -84,7 +74,6 @@ async fn memory_open_isolated_and_does_not_create_disk_state() {
     let first = open_sqlite(
         None,
         supervisor.clone(),
-        None,
         "sqlite:phase18-selector-memory-first",
     )
     .await
@@ -97,14 +86,9 @@ async fn memory_open_isolated_and_does_not_create_disk_state() {
         .expect("write in-memory metadata");
     drop(first);
 
-    let reopened = open_sqlite(
-        None,
-        supervisor,
-        None,
-        "sqlite:phase18-selector-memory-reopen",
-    )
-    .await
-    .expect("open fresh in-memory node store");
+    let reopened = open_sqlite(None, supervisor, "sqlite:phase18-selector-memory-reopen")
+        .await
+        .expect("open fresh in-memory node store");
     assert_eq!(
         reopened
             .identity()
@@ -130,13 +114,11 @@ async fn concurrent_disk_opens_are_safe_and_reopenable() {
         open_sqlite(
             Some(&path),
             supervisor_handle.clone(),
-            None,
             "sqlite:phase18-selector-concurrent-left",
         ),
         open_sqlite(
             Some(&path),
             supervisor_handle,
-            None,
             "sqlite:phase18-selector-concurrent-right",
         ),
     );
@@ -157,7 +139,6 @@ async fn concurrent_disk_opens_are_safe_and_reopenable() {
     let reopened = open_sqlite(
         Some(&path),
         supervisor(),
-        None,
         "sqlite:phase18-selector-concurrent-reopen",
     )
     .await
@@ -182,67 +163,12 @@ async fn concurrent_disk_opens_are_safe_and_reopenable() {
     );
 }
 
-#[cfg(not(feature = "sqlcipher"))]
-#[tokio::test]
-async fn key_file_is_rejected_without_sqlcipher_instead_of_falling_back() {
-    let directory = tempfile::tempdir().expect("key selector fixture");
-    let key_path = directory.path().join("node.key");
-    std::fs::write(&key_path, b"k").expect("write selector key");
-
-    let result = open_sqlite(
-        None,
-        supervisor(),
-        Some(&key_path),
-        "sqlite:phase18-selector-key-rejected",
-    )
-    .await;
-    let error = match result {
-        Ok(_) => panic!("key file must not silently select plaintext SQLite"),
-        Err(error) => error,
-    };
-    assert_eq!(
-        error.to_string(),
-        "SQLCipher encryption requested but the 'sqlcipher' cargo feature is not enabled. \
-Rebuild with --features sqlcipher"
-    );
-}
-
-#[cfg(feature = "sqlcipher")]
-#[tokio::test]
-async fn key_file_preserves_existing_sqlcipher_open_refusal() {
-    let directory = tempfile::tempdir().expect("SQLCipher selector fixture");
-    std::fs::set_permissions(
-        directory.path(),
-        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
-    )
-    .expect("secure SQLCipher selector fixture directory");
-    let key_path = directory.path().join("node.key");
-    let db_path = directory.path().join("node.db");
-    std::fs::write(&key_path, b"k").expect("write selector key");
-    let result = open_sqlite(
-        Some(&db_path),
-        supervisor(),
-        Some(&key_path),
-        "sqlite:phase18-selector-key-refusal",
-    )
-    .await;
-    let error = match result {
-        Ok(_) => panic!("the existing SQLCipher opener unexpectedly accepted a byte key"),
-        Err(error) => error,
-    };
-    assert_eq!(
-        error.to_string(),
-        r#"Rusqlite("Unsupported value "Blob([107])"")"#
-    );
-}
-
 #[tokio::test]
 async fn redb_selection_is_a_typed_fail_closed_refusal() {
     let result = super::open_node_local(
         BackendKind::Redb,
         None,
         supervisor(),
-        None,
         "redb:phase18-selector-refusal",
     )
     .await;

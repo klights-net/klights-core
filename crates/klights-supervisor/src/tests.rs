@@ -1,5 +1,7 @@
 use crate::supervisor::{ProcessError, ProcessShutdownPolicy};
-use crate::{TaskAdmissionError, TaskCategory, TaskCategoryConfig, TaskOutcome, TaskSupervisor};
+use crate::{
+    DbError, TaskAdmissionError, TaskCategory, TaskCategoryConfig, TaskOutcome, TaskSupervisor,
+};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -1302,7 +1304,7 @@ async fn db_query_logging_default_off_and_toggle() {
     assert!(!(supervisor.db_query_logging_status().enabled));
     supervisor
         .call_db("no-log", "conn-a", conn.clone(), move |_conn| {
-            Ok::<_, tokio_rusqlite::Error>(())
+            Ok::<_, DbError>(())
         })
         .await
         .unwrap();
@@ -1311,7 +1313,7 @@ async fn db_query_logging_default_off_and_toggle() {
     assert!(supervisor.set_db_query_logging(true).enabled);
     supervisor
         .call_db("metadata-only", "conn-a", conn, move |_conn| {
-            Ok::<_, tokio_rusqlite::Error>(())
+            Ok::<_, DbError>(())
         })
         .await
         .unwrap();
@@ -1339,7 +1341,7 @@ async fn db_query_logging_entries_never_include_payload_values() {
     supervisor
         .call_db("payload-check", "conn-a", conn, move |_conn| {
             let _ignored = secret_payload;
-            Ok::<_, tokio_rusqlite::Error>(())
+            Ok::<_, DbError>(())
         })
         .await
         .unwrap();
@@ -2384,7 +2386,7 @@ fn sqlite_open_error_converts_inside_the_supervisor_boundary() {
         path: "state.db".to_string(),
         details: "orphaned WAL".to_string(),
     };
-    let converted: tokio_rusqlite::Error = error.into();
+    let converted: crate::DbError = error.into();
     assert!(
         converted.to_string().contains("orphaned WAL"),
         "the schema-neutral opener error must stay observable after crossing the DB executor"

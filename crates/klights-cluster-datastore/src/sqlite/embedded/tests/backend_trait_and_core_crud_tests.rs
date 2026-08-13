@@ -833,7 +833,7 @@ async fn strict_v3_rejects_stale_statefulset_status_after_metadata_rv_advance() 
 fn apply_commit_in_tx_for_raft(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
-) -> tokio_rusqlite::Result<RaftLogApplyOutcome> {
+) -> klights_supervisor::DbClosureResult<RaftLogApplyOutcome> {
     let codec = crate::test_fixtures::outbox::new_codec();
     let context = crate::sqlite::live_apply::TransactionContext::new(codec.as_ref());
     crate::sqlite::live_apply::apply_commit_in_tx_for_raft_with_context(tx, commit, &context)
@@ -8937,9 +8937,7 @@ async fn new_persistent_creates_only_cluster_db_file() {
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let ds = Datastore::new_persistent(db_dir, supervisor, None)
-        .await
-        .unwrap();
+    let ds = Datastore::new_persistent(db_dir, supervisor).await.unwrap();
 
     // Cluster persistence owns only cluster.db. The node-local selector owns
     // node.db and its schema.
@@ -8985,7 +8983,7 @@ async fn new_persistent_rejects_when_parent_perms_too_open() {
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let result = Datastore::new_persistent(&parent, supervisor, None).await;
+    let result = Datastore::new_persistent(&parent, supervisor).await;
 
     assert!(result.is_err(), "must reject parent with 0755");
     let err_msg = result.unwrap_err().to_string();
@@ -9003,7 +9001,7 @@ async fn new_persistent_failure_propagates_no_fallback() {
         klights_supervisor::TaskCategoryConfig::default(),
     ));
     let bad_dir = std::path::Path::new("/proc/klights-test-noexist");
-    let result = Datastore::new_persistent(bad_dir, supervisor, None).await;
+    let result = Datastore::new_persistent(bad_dir, supervisor).await;
 
     assert!(result.is_err(), "must fail on non-creatable dir");
     // Verify it didn't silently fall back to in-memory
@@ -9658,7 +9656,7 @@ async fn restart_preserves_pods_with_uids_and_rv() {
 
     // First session: create a pod
     {
-        let ds = Datastore::new_persistent(db_dir, supervisor.clone(), None)
+        let ds = Datastore::new_persistent(db_dir, supervisor.clone())
             .await
             .unwrap();
 
@@ -9690,9 +9688,7 @@ async fn restart_preserves_pods_with_uids_and_rv() {
 
     // Second session: reopen and verify persistence
     {
-        let ds = Datastore::new_persistent(db_dir, supervisor, None)
-            .await
-            .unwrap();
+        let ds = Datastore::new_persistent(db_dir, supervisor).await.unwrap();
         let loaded = ds
             .get_resource("v1", "Pod", Some("default"), "restart-test-pod")
             .await
@@ -9736,7 +9732,7 @@ async fn restart_preserves_configmaps_secrets_crds_services() {
 
     // Session 1: create resources
     {
-        let ds = Datastore::new_persistent(db_dir, supervisor.clone(), None)
+        let ds = Datastore::new_persistent(db_dir, supervisor.clone())
             .await
             .unwrap();
         for (name, kind) in names.iter().zip(kinds.iter()) {
@@ -9758,9 +9754,7 @@ async fn restart_preserves_configmaps_secrets_crds_services() {
 
     // Session 2: verify all survive
     {
-        let ds = Datastore::new_persistent(db_dir, supervisor, None)
-            .await
-            .unwrap();
+        let ds = Datastore::new_persistent(db_dir, supervisor).await.unwrap();
         for (name, kind) in names.iter().zip(kinds.iter()) {
             let res = ds
                 .get_resource("v1", kind, Some("default"), name)
@@ -9789,7 +9783,7 @@ async fn restart_resumes_watch_within_retention_window() {
     // Session 1: create resources to generate watch events
     let mut last_rv = 0i64;
     {
-        let ds = Datastore::new_persistent(db_dir, supervisor.clone(), None)
+        let ds = Datastore::new_persistent(db_dir, supervisor.clone())
             .await
             .unwrap();
         for i in 0..20 {
@@ -9802,9 +9796,7 @@ async fn restart_resumes_watch_within_retention_window() {
 
     // Session 2: reopen and verify replay works from a since_rv within the window
     {
-        let ds = Datastore::new_persistent(db_dir, supervisor, None)
-            .await
-            .unwrap();
+        let ds = Datastore::new_persistent(db_dir, supervisor).await.unwrap();
 
         // Replay from half the window
         let since_rv = last_rv - 10;
@@ -9852,7 +9844,7 @@ async fn restart_returns_410_gone_when_rv_pre_dates_retention() {
 
     // Session 1: create many events, then GC aggressively
     {
-        let ds = Datastore::new_persistent(db_dir, supervisor.clone(), None)
+        let ds = Datastore::new_persistent(db_dir, supervisor.clone())
             .await
             .unwrap();
         for i in 0..30 {
@@ -9867,9 +9859,7 @@ async fn restart_returns_410_gone_when_rv_pre_dates_retention() {
 
     // Session 2: verify old events are gone (replay from very old RV returns empty)
     {
-        let ds = Datastore::new_persistent(db_dir, supervisor, None)
-            .await
-            .unwrap();
+        let ds = Datastore::new_persistent(db_dir, supervisor).await.unwrap();
         use klights_cluster_store::{WatchTarget, WatchTargetScope};
         let targets = vec![WatchTarget {
             api_version: "v1".into(),
@@ -9908,9 +9898,7 @@ async fn retention_bounds_db_file_size_after_churn() {
     ));
 
     {
-        let ds = Datastore::new_persistent(db_dir, supervisor, None)
-            .await
-            .unwrap();
+        let ds = Datastore::new_persistent(db_dir, supervisor).await.unwrap();
 
         // Create and delete 50 resources to generate churn
         for i in 0..50 {

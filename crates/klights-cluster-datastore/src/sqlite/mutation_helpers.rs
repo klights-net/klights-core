@@ -205,8 +205,8 @@ pub fn is_watch_events_unique_violation(err: &rusqlite::Error) -> bool {
     false
 }
 
-pub fn serde_to_sqlite_error(error: serde_json::Error) -> tokio_rusqlite::Error {
-    tokio_rusqlite::Error::Rusqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+pub fn serde_to_sqlite_error(error: serde_json::Error) -> klights_supervisor::DbError {
+    klights_supervisor::DbError::from(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
 // TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.

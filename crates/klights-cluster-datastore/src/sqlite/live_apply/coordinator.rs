@@ -20,7 +20,7 @@ impl RaftLogApplyOutcome {
         committed_outcome: klights_cluster_core::CommittedApplyOutcome,
         pending: Vec<StagedPostCommit>,
         pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
-    ) -> tokio_rusqlite::Result<Self> {
+    ) -> klights_supervisor::DbClosureResult<Self> {
         let returned_resource = match &committed_outcome {
             klights_cluster_core::CommittedApplyOutcome::Visible { resource, .. } => {
                 resource.clone()
@@ -63,7 +63,7 @@ struct ApplyCommit {
 }
 
 impl ApplyCommit {
-    fn from_live(commit: LogApplyCommit) -> tokio_rusqlite::Result<Self> {
+    fn from_live(commit: LogApplyCommit) -> klights_supervisor::DbClosureResult<Self> {
         commit
             .validate_live_template()
             .map_err(|error| other_error(error.to_string()))?;
@@ -92,7 +92,7 @@ impl From<SnapshotRestoreOperation> for ApplyCommit {
 fn pod_state_in_tx(
     tx: &rusqlite::Transaction<'_>,
     target: Option<&(Option<String>, String)>,
-) -> tokio_rusqlite::Result<Option<serde_json::Value>> {
+) -> klights_supervisor::DbClosureResult<Option<serde_json::Value>> {
     let Some((namespace, name)) = target else {
         return Ok(None);
     };
@@ -141,7 +141,7 @@ pub fn apply_commit_in_tx_for_raft_with_context(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
     context: &super::TransactionContext<'_>,
-) -> tokio_rusqlite::Result<RaftLogApplyOutcome> {
+) -> klights_supervisor::DbClosureResult<RaftLogApplyOutcome> {
     let pod_target = pod_status_target(&commit);
     let pod_before = pod_state_in_tx(tx, pod_target.as_ref())?;
     commit
@@ -378,10 +378,10 @@ pub fn apply_commit_in_tx_for_raft_with_context(
 }
 
 fn committed_rejection_from_conflict(
-    error: &tokio_rusqlite::Error,
+    error: &klights_supervisor::DbError,
     message: String,
-) -> tokio_rusqlite::Result<klights_cluster_core::CommittedApplyRejection> {
-    let tokio_rusqlite::Error::Other(inner) = error else {
+) -> klights_supervisor::DbClosureResult<klights_cluster_core::CommittedApplyRejection> {
+    let klights_supervisor::DbError::Application(inner) = error else {
         return Err(other_error(
             "terminal committed-apply rejection had no typed conflict",
         ));
@@ -425,7 +425,7 @@ pub fn apply_commit_in_tx_with_context(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
     context: &super::TransactionContext<'_>,
-) -> tokio_rusqlite::Result<Vec<StagedPostCommit>> {
+) -> klights_supervisor::DbClosureResult<Vec<StagedPostCommit>> {
     let (_applied_rv, pending) = apply_commit_in_tx_returning_rv_with_context(tx, commit, context)?;
     Ok(pending)
 }
@@ -434,7 +434,7 @@ pub(crate) fn apply_commit_in_tx_returning_rv_with_context(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
     context: &super::TransactionContext<'_>,
-) -> tokio_rusqlite::Result<(i64, Vec<StagedPostCommit>)> {
+) -> klights_supervisor::DbClosureResult<(i64, Vec<StagedPostCommit>)> {
     let (applied_rv, pending, _applied_mutation) =
         apply_commit_in_tx_returning_rv_and_mutation_with_context(tx, commit, context)?;
     Ok((applied_rv, pending))
@@ -444,7 +444,7 @@ pub fn apply_commit_in_tx_returning_rv_and_mutation_with_context(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
     context: &super::TransactionContext<'_>,
-) -> tokio_rusqlite::Result<(i64, Vec<StagedPostCommit>, Option<Resource>)> {
+) -> klights_supervisor::DbClosureResult<(i64, Vec<StagedPostCommit>, Option<Resource>)> {
     let has_explicit_watch_history = commit
         .mutations()
         .iter()
@@ -462,7 +462,7 @@ pub fn apply_snapshot_restore_operation_in_tx(
     operation: SnapshotRestoreOperation,
     emit_watch_events: bool,
     context: &super::TransactionContext<'_>,
-) -> tokio_rusqlite::Result<(i64, Vec<StagedPostCommit>, Option<Resource>)> {
+) -> klights_supervisor::DbClosureResult<(i64, Vec<StagedPostCommit>, Option<Resource>)> {
     apply_commit_in_tx_with_watch_events(
         tx,
         ApplyCommit::from(operation),
@@ -476,7 +476,7 @@ fn apply_commit_in_tx_with_watch_events(
     commit: ApplyCommit,
     emit_watch_events: bool,
     context: &super::TransactionContext<'_>,
-) -> tokio_rusqlite::Result<(i64, Vec<StagedPostCommit>, Option<Resource>)> {
+) -> klights_supervisor::DbClosureResult<(i64, Vec<StagedPostCommit>, Option<Resource>)> {
     if commit.resource_version < 0 {
         return Err(other_error(
             "log_apply commit resourceVersion must be non-negative",
@@ -562,7 +562,7 @@ fn apply_commit_in_tx_with_watch_events(
 fn resolve_noop_put_resources_in_tx(
     tx: &rusqlite::Transaction<'_>,
     mut commit: ApplyCommit,
-) -> tokio_rusqlite::Result<ApplyCommit> {
+) -> klights_supervisor::DbClosureResult<ApplyCommit> {
     if commit.preserve_historical_bytes {
         return Ok(commit);
     }
@@ -597,7 +597,7 @@ fn resolve_noop_put_resources_in_tx(
 fn resolve_bound_pod_finalizations_in_tx(
     tx: &rusqlite::Transaction<'_>,
     mut commit: ApplyCommit,
-) -> tokio_rusqlite::Result<ApplyCommit> {
+) -> klights_supervisor::DbClosureResult<ApplyCommit> {
     let mutations = std::mem::take(&mut commit.mutations);
     let mut resolved = Vec::with_capacity(mutations.len().saturating_add(1));
     for mutation in mutations {
@@ -721,7 +721,7 @@ fn returned_resource_target(commit: &ApplyCommit) -> Option<ReturnedResourceTarg
 fn read_returned_resource_in_tx(
     tx: &rusqlite::Transaction<'_>,
     target: &ReturnedResourceTarget,
-) -> tokio_rusqlite::Result<Option<Resource>> {
+) -> klights_supervisor::DbClosureResult<Option<Resource>> {
     match target {
         ReturnedResourceTarget::Resource {
             api_version,
@@ -755,7 +755,7 @@ fn read_returned_resource_in_tx(
                 },
             )
             .optional()
-            .map_err(tokio_rusqlite::Error::from),
+            .map_err(klights_supervisor::DbError::from),
         ReturnedResourceTarget::Resource {
             api_version,
             kind,
@@ -788,7 +788,7 @@ fn read_returned_resource_in_tx(
                 },
             )
             .optional()
-            .map_err(tokio_rusqlite::Error::from),
+            .map_err(klights_supervisor::DbError::from),
         ReturnedResourceTarget::Namespace { name } => tx
             .query_row(mutation_queries::NAMESPACE_GET, [name], |row| {
                 let data: Vec<u8> = row.get(3)?;
@@ -810,13 +810,13 @@ fn read_returned_resource_in_tx(
                 })
             })
             .optional()
-            .map_err(tokio_rusqlite::Error::from),
+            .map_err(klights_supervisor::DbError::from),
     }
 }
 
 fn deleted_resource_from_stamped_commit(
     commit: &ApplyCommit,
-) -> tokio_rusqlite::Result<Option<Resource>> {
+) -> klights_supervisor::DbClosureResult<Option<Resource>> {
     let Some(deleted_key) = commit.mutations.iter().find_map(|mutation| match mutation {
         LogApplyMutation::DeleteResource(key) => Some(key),
         _ => None,
@@ -863,7 +863,7 @@ fn deleted_resource_from_stamped_commit(
 fn outbox_watermark_decision_in_tx(
     tx: &rusqlite::Transaction<'_>,
     watermark: Option<&OutboxStreamWatermark>,
-) -> tokio_rusqlite::Result<klights_cluster_core::OutboxWatermarkDecision> {
+) -> klights_supervisor::DbClosureResult<klights_cluster_core::OutboxWatermarkDecision> {
     let Some(watermark) = watermark else {
         return klights_cluster_core::decide_outbox_watermark(None, None)
             .map_err(|err| other_error(err.to_string()));
@@ -884,7 +884,7 @@ fn outbox_watermark_decision_in_tx(
 fn upsert_outbox_watermark_in_tx(
     tx: &rusqlite::Transaction<'_>,
     watermark: &OutboxStreamWatermark,
-) -> tokio_rusqlite::Result<()> {
+) -> klights_supervisor::DbClosureResult<()> {
     tx.execute(
         "INSERT INTO outbox_stream_watermarks (client_id, stream_id, last_seq) VALUES (?1, ?2, ?3) \
          ON CONFLICT(client_id, stream_id) DO UPDATE SET last_seq = excluded.last_seq",
@@ -901,7 +901,7 @@ fn stamp_provisional_resource_version_in_tx(
     tx: &rusqlite::Transaction<'_>,
     mut commit: ApplyCommit,
     context: &super::TransactionContext<'_>,
-) -> tokio_rusqlite::Result<ApplyCommit> {
+) -> klights_supervisor::DbClosureResult<ApplyCommit> {
     let does_not_advance_public_rv = commit.mutations.is_empty()
         || commit
             .mutations
@@ -1008,7 +1008,7 @@ fn stamp_provisional_resource_version_in_tx(
 fn applied_outbox_record_in_tx(
     tx: &rusqlite::Transaction<'_>,
     idempotency_key: &str,
-) -> tokio_rusqlite::Result<Option<klights_cluster_core::LogApplyAppliedOutboxRow>> {
+) -> klights_supervisor::DbClosureResult<Option<klights_cluster_core::LogApplyAppliedOutboxRow>> {
     tx.query_row(
         mutation_queries::APPLIED_OUTBOX_GET,
         [idempotency_key],
@@ -1025,13 +1025,13 @@ fn applied_outbox_record_in_tx(
         },
     )
     .optional()
-    .map_err(tokio_rusqlite::Error::from)
+    .map_err(klights_supervisor::DbError::from)
 }
 
 fn receipt_from_applied_outbox(
     row: &klights_cluster_core::LogApplyAppliedOutboxRow,
     context: &super::TransactionContext<'_>,
-) -> tokio_rusqlite::Result<(Option<i64>, Option<String>, Option<Resource>)> {
+) -> klights_supervisor::DbClosureResult<(Option<i64>, Option<String>, Option<Resource>)> {
     match context.decode(&row.result_proto) {
         Ok(klights_cluster_core::command::StorageResponse::Error { message }) => {
             Ok((row.applied_rv, Some(message), None))
@@ -1077,17 +1077,19 @@ impl std::error::Error for ApplyConflictError {}
 pub fn apply_conflict_error(
     code: ApplyConflictCode,
     message: impl Into<String>,
-) -> tokio_rusqlite::Error {
-    tokio_rusqlite::Error::Other(Box::new(ApplyConflictError {
+) -> klights_supervisor::DbError {
+    klights_supervisor::DbError::Application(Box::new(ApplyConflictError {
         code,
         message: message.into(),
     }))
 }
 
 #[doc(hidden)]
-pub fn is_terminal_apply_conflict(err: &tokio_rusqlite::Error) -> bool {
+pub fn is_terminal_apply_conflict(err: &klights_supervisor::DbError) -> bool {
     match err {
-        tokio_rusqlite::Error::Other(inner) => inner.downcast_ref::<ApplyConflictError>().is_some(),
+        klights_supervisor::DbError::Application(inner) => {
+            inner.downcast_ref::<ApplyConflictError>().is_some()
+        }
         _ => false,
     }
 }
@@ -1095,7 +1097,7 @@ pub fn is_terminal_apply_conflict(err: &tokio_rusqlite::Error) -> bool {
 fn advance_metadata_rv_to_at_least_tx(
     tx: &rusqlite::Transaction<'_>,
     resource_version: i64,
-) -> tokio_rusqlite::Result<()> {
+) -> klights_supervisor::DbClosureResult<()> {
     let current_rv: i64 = tx.query_row(mutation_queries::METADATA_SELECT_RV_INT, [], |row| {
         row.get(0)
     })?;
@@ -1108,8 +1110,8 @@ fn advance_metadata_rv_to_at_least_tx(
     Ok(())
 }
 
-pub fn other_error(message: impl Into<String>) -> tokio_rusqlite::Error {
-    tokio_rusqlite::Error::Other(Box::new(std::io::Error::new(
+pub fn other_error(message: impl Into<String>) -> klights_supervisor::DbError {
+    klights_supervisor::DbError::Application(Box::new(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         message.into(),
     )))

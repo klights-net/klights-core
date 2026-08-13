@@ -49,10 +49,16 @@ impl SqliteNodeNetworkStateStore {
             .min(i64::MAX as u128) as i64
     }
 
-    async fn db_call<T, F>(&self, query_name: &'static str, call: F) -> tokio_rusqlite::Result<T>
+    async fn db_call<T, F>(
+        &self,
+        query_name: &'static str,
+        call: F,
+    ) -> klights_supervisor::DbCallResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> klights_supervisor::DbClosureResult<T>
+            + Send
+            + 'static,
     {
         self.executor.call_raw(query_name, call).await
     }
@@ -82,7 +88,7 @@ impl SqliteNodeNetworkStateStore {
                 )?
                 .query_map([], endpoint_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
             })
             .await
             .map_err(|error| persistence_error("pod endpoint list all", error))?;
@@ -106,7 +112,7 @@ impl PodNetworkCache for SqliteNodeNetworkStateStore {
                         network_endpoint_row,
                     )
                     .optional()
-                    .map_err(tokio_rusqlite::Error::from)
+                    .map_err(klights_supervisor::DbError::from)
                 })
                 .await
                 .map_err(|error| persistence_error("pod network get uid", error))?;
@@ -131,7 +137,7 @@ impl PodNetworkCache for SqliteNodeNetworkStateStore {
                         network_assignment_row,
                     )
                     .optional()
-                    .map_err(tokio_rusqlite::Error::from)
+                    .map_err(klights_supervisor::DbError::from)
                 })
                 .await
                 .map_err(|error| persistence_error("pod network assignment get pod", error))?;
@@ -155,7 +161,7 @@ impl PodNetworkCache for SqliteNodeNetworkStateStore {
                         network_endpoint_row,
                     )
                     .optional()
-                    .map_err(tokio_rusqlite::Error::from)
+                    .map_err(klights_supervisor::DbError::from)
                 })
                 .await
                 .map_err(|error| persistence_error("pod network get sandbox", error))?;
@@ -180,7 +186,7 @@ impl PodNetworkCache for SqliteNodeNetworkStateStore {
                         network_assignment_row,
                     )
                     .optional()
-                    .map_err(tokio_rusqlite::Error::from)
+                    .map_err(klights_supervisor::DbError::from)
                 })
                 .await
                 .map_err(|error| persistence_error("pod network assignment get sandbox", error))?;
@@ -257,7 +263,7 @@ impl PodNetworkCache for SqliteNodeNetworkStateStore {
                     )?
                     .query_map([], network_assignment_row)?
                     .collect::<rusqlite::Result<Vec<_>>>()
-                    .map_err(tokio_rusqlite::Error::from)
+                    .map_err(klights_supervisor::DbError::from)
                 })
                 .await
                 .map_err(|error| persistence_error("pod network list", error))?;
@@ -416,7 +422,7 @@ impl PodEndpointStore for SqliteNodeNetworkStateStore {
                     endpoint_row,
                 )
                 .optional()
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
             })
             .await
             .map_err(|error| persistence_error("pod endpoint get by pod_ip", error))?
@@ -444,7 +450,7 @@ impl PodEndpointStore for SqliteNodeNetworkStateStore {
                     )?
                     .query_map([node_name], endpoint_row)?
                     .collect::<rusqlite::Result<Vec<_>>>()
-                    .map_err(tokio_rusqlite::Error::from)
+                    .map_err(klights_supervisor::DbError::from)
                 })
                 .await
                 .map_err(|error| persistence_error("pod endpoint list by node", error))?;
@@ -514,7 +520,7 @@ fn reserve_ip_and_insert_network_in_conn(
     conn: &rusqlite::Connection,
     request: &PodNetworkAllocationRequest,
     now_ms: i64,
-) -> tokio_rusqlite::Result<PodNetworkReservationOutcome> {
+) -> klights_supervisor::DbClosureResult<PodNetworkReservationOutcome> {
     if let Some(existing) = conn
         .query_row(
             "SELECT namespace, pod_name, pod_uid, subnet_base_int, subnet_size, \
@@ -823,12 +829,15 @@ fn persisted_endpoint_port(value: Option<i64>) -> Result<Option<i64>, CacheNetwo
     }
 }
 
-fn persistence_error(operation: &str, error: tokio_rusqlite::Error) -> CacheNetworkError {
+fn persistence_error(
+    operation: &str,
+    error: tokio_rusqlite::Error<klights_supervisor::DbError>,
+) -> CacheNetworkError {
     CacheNetworkError::persistence_failed(format!("{operation} failed: {error}"))
 }
 
-fn cache_network_db_error(error: CacheNetworkError) -> tokio_rusqlite::Error {
-    tokio_rusqlite::Error::Other(Box::new(error))
+fn cache_network_db_error(error: CacheNetworkError) -> klights_supervisor::DbError {
+    klights_supervisor::DbError::Application(Box::new(error))
 }
 
 #[cfg(test)]
@@ -904,7 +913,7 @@ mod tests {
                     [],
                     |row| Ok((row.get::<_, i64>(0)? as u32, row.get::<_, i64>(1)? as u32)),
                 )
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
             })
             .await
             .unwrap()
@@ -1229,7 +1238,7 @@ mod tests {
                     [],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
                 )
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
             })
             .await
             .unwrap();

@@ -80,7 +80,7 @@ impl DurableApplyLedgerRead for SqliteApplyLedgerRead {
                             },
                         )
                         .optional()
-                        .map_err(tokio_rusqlite::Error::from)
+                        .map_err(klights_supervisor::DbError::from)
                 })
                 .await
                 .map_err(anyhow::Error::new)
@@ -105,7 +105,7 @@ impl DurableApplyLedgerRead for SqliteApplyLedgerRead {
                         })
                     })?;
                     rows.collect::<rusqlite::Result<Vec<_>>>()
-                        .map_err(tokio_rusqlite::Error::from)
+                        .map_err(klights_supervisor::DbError::from)
                 })
                 .await
                 .map_err(anyhow::Error::new)

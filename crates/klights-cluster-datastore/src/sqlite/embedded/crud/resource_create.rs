@@ -130,9 +130,9 @@ impl Datastore {
                     data: std::sync::Arc::new(data),
                 })
             }
-            Err(tokio_rusqlite::Error::Rusqlite(rusqlite::Error::SqliteFailure(err, _)))
-                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
+            Err(tokio_rusqlite::Error::Error(klights_supervisor::DbError::Sqlite(
+                rusqlite::Error::SqliteFailure(err, _),
+            ))) if err.code == rusqlite::ErrorCode::ConstraintViolation => {
                 if let Ok(Some(live)) = self.get_resource(api_version, kind, namespace, name).await
                     && live.uid != uid
                 {

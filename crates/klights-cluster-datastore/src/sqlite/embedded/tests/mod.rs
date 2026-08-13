@@ -29,7 +29,6 @@ async fn create_and_fetch_via_focused_ports(db: &Datastore) -> Result<Option<Res
 
 mod applied_outbox_gc_tests;
 mod backend_trait_and_core_crud_tests;
-mod encryption_tests;
 mod event_compat_tests;
 mod fingerprint_tests;
 mod ipam_and_network_tests;

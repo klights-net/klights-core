@@ -19,7 +19,7 @@ pub struct MarkResourceForDeletionInput {
 pub fn mark_resource_for_deletion_in_conn(
     conn: &mut rusqlite::Connection,
     input: MarkResourceForDeletionInput,
-) -> tokio_rusqlite::Result<Option<(i64, Vec<u8>)>> {
+) -> klights_supervisor::DbClosureResult<Option<(i64, Vec<u8>)>> {
     let MarkResourceForDeletionInput {
         api_version,
         kind,
@@ -51,12 +51,12 @@ pub fn mark_resource_for_deletion_in_conn(
         .as_deref()
         .is_some_and(|uid| uid != current_uid)
     {
-        return Err(tokio_rusqlite::Error::Rusqlite(
+        return Err(klights_supervisor::DbError::Sqlite(
             rusqlite::Error::QueryReturnedNoRows,
         ));
     }
     if expected_resource_version.is_some_and(|rv| rv != current_rv) {
-        return Err(tokio_rusqlite::Error::Rusqlite(
+        return Err(klights_supervisor::DbError::Sqlite(
             rusqlite::Error::QueryReturnedNoRows,
         ));
     }
@@ -101,7 +101,7 @@ pub fn mark_resource_for_deletion_in_conn(
         )?
     };
     if rows == 0 {
-        return Err(tokio_rusqlite::Error::Rusqlite(
+        return Err(klights_supervisor::DbError::Sqlite(
             rusqlite::Error::QueryReturnedNoRows,
         ));
     }
@@ -154,7 +154,7 @@ pub struct UpdateResourceInput {
 pub fn update_resource_in_conn(
     conn: &mut rusqlite::Connection,
     input: UpdateResourceInput,
-) -> tokio_rusqlite::Result<(i64, i64, Value)> {
+) -> klights_supervisor::DbClosureResult<(i64, i64, Value)> {
     let UpdateResourceInput {
         api_version,
         kind,
@@ -212,7 +212,7 @@ pub fn update_resource_in_conn(
         )?
     };
     if rows == 0 {
-        return Err(tokio_rusqlite::Error::Rusqlite(
+        return Err(klights_supervisor::DbError::Sqlite(
             rusqlite::Error::QueryReturnedNoRows,
         ));
     }
@@ -269,7 +269,7 @@ fn preserve_latest_status_subresource(
     namespace: Option<&str>,
     name: &str,
     proposed: &mut Value,
-) -> tokio_rusqlite::Result<()> {
+) -> klights_supervisor::DbClosureResult<()> {
     if !klights_types::has_builtin_status_subresource(api_version, kind) {
         return Ok(());
     }

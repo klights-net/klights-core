@@ -435,7 +435,7 @@ impl DurableWatchHistoryRead for SqliteReadStore {
                     result.map_err(|_| rusqlite::Error::InvalidQuery)
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
-                    .map_err(tokio_rusqlite::Error::from)
+                    .map_err(klights_supervisor::DbError::from)
             })
             .await
             .map_err(map_watch_error)
@@ -462,7 +462,7 @@ impl DurableWatchRangeRead for SqliteReadStore {
                         watch_row_to_durable_event,
                     )?;
                     rows.collect::<rusqlite::Result<Vec<_>>>()
-                        .map_err(tokio_rusqlite::Error::from)
+                        .map_err(klights_supervisor::DbError::from)
                 },
             )
             .await
@@ -500,7 +500,7 @@ impl DurableWatchRangeRead for SqliteReadStore {
                     let mut statement = connection.prepare(&query)?;
                     let rows = statement.query_map(&references[..], watch_row_to_durable_event)?;
                     rows.collect::<rusqlite::Result<Vec<_>>>()
-                        .map_err(tokio_rusqlite::Error::from)
+                        .map_err(klights_supervisor::DbError::from)
                 },
             )
             .await
@@ -526,7 +526,7 @@ impl DurableWatchRangeRead for SqliteReadStore {
                     None,
                     watch_row_to_durable_event,
                 )
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
             })
             .await
             .map_err(map_watch_error)
@@ -539,7 +539,7 @@ impl DurableWatchRangeRead for SqliteReadStore {
                 connection
                     .query_row(queries::WATCH_EVENTS_MIN_RV, [], |row| row.get(0))
                     .optional()
-                    .map_err(tokio_rusqlite::Error::from)
+                    .map_err(klights_supervisor::DbError::from)
             })
             .await
             .map_err(map_watch_error)
@@ -561,7 +561,7 @@ impl DurableWatchRangeRead for SqliteReadStore {
                         watch_row_to_durable_event,
                     )?;
                     rows.collect::<rusqlite::Result<Vec<_>>>()
-                        .map_err(tokio_rusqlite::Error::from)
+                        .map_err(klights_supervisor::DbError::from)
                 },
             )
             .await
@@ -585,7 +585,7 @@ impl DurableWatchRangeRead for SqliteReadStore {
                         watch_row_to_durable_event,
                     )?;
                     rows.collect::<rusqlite::Result<Vec<_>>>()
-                        .map_err(tokio_rusqlite::Error::from)
+                        .map_err(klights_supervisor::DbError::from)
                 },
             )
             .await
@@ -1118,10 +1118,12 @@ impl SqliteReadStore {
         &self,
         label: &'static str,
         operation: F,
-    ) -> tokio_rusqlite::Result<T>
+    ) -> klights_supervisor::DbCallResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> klights_supervisor::DbClosureResult<T>
+            + Send
+            + 'static,
     {
         self.executor.call_raw(label, operation).await
     }
@@ -1180,9 +1182,7 @@ impl SqliteReadStore {
         match result {
             Ok(Ok(resource)) => Ok(Some(resource)),
             Ok(Err(rusqlite::Error::QueryReturnedNoRows)) => Ok(None),
-            Ok(Err(error)) | Err(tokio_rusqlite::Error::Rusqlite(error)) => {
-                Err(anyhow!("Failed to get namespace: {error}"))
-            }
+            Ok(Err(error)) => Err(anyhow!("Failed to get namespace: {error}")),
             Err(error) => Err(anyhow!("Failed to get namespace: {error}")),
         }
     }
@@ -1399,7 +1399,7 @@ impl SqliteReadStore {
                     row_to_node_subnet,
                 )
                 .optional()
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
         })
         .await
         .map_err(|error| anyhow!("Failed to get node subnet: {error}"))
@@ -1417,7 +1417,7 @@ impl SqliteReadStore {
             statement
                 .query_map(rusqlite::params![excluded_node_name], row_to_node_subnet)?
                 .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
         })
         .await
         .map_err(|error| anyhow!("Failed to list peer subnets: {error}"))
@@ -1436,7 +1436,7 @@ impl SqliteReadStore {
                     row_to_node_dataplane,
                 )
                 .optional()
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
         })
         .await
         .map_err(|error| anyhow!("Failed to get node dataplane metadata: {error}"))
@@ -1462,7 +1462,7 @@ impl SqliteReadStore {
                     |row| row.get(0),
                 )?;
                 let resource_version = raw_resource_version.parse::<i64>().map_err(|_| {
-                    tokio_rusqlite::Error::Other(Box::new(std::io::Error::new(
+                    klights_supervisor::DbError::Application(Box::new(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("invalid resource_version metadata {raw_resource_version:?}"),
                     )))
@@ -1473,7 +1473,7 @@ impl SqliteReadStore {
                     |row| row.get(0),
                 )?;
                 if resource_version < 0 || event_id < 0 {
-                    return Err(tokio_rusqlite::Error::Other(Box::new(std::io::Error::new(
+                    return Err(klights_supervisor::DbError::Application(Box::new(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "allocator values must be non-negative",
                     ))));
@@ -1521,7 +1521,7 @@ impl SqliteReadStore {
                     watch_row_to_durable_event,
                 )
                 .map(SqliteCheckedWatchRead::Events)
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
             },
         )
         .await
@@ -1531,7 +1531,9 @@ impl SqliteReadStore {
     async fn db_call<T, F>(&self, label: &'static str, operation: F) -> Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> klights_supervisor::DbClosureResult<T>
+            + Send
+            + 'static,
     {
         self.executor
             .call_raw(label, operation)

@@ -72,7 +72,7 @@ async fn node_local_schema_has_only_slim_uid_bound_tables() {
             )?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(tokio_rusqlite::Error::from)
+            .map_err(klights_supervisor::DbError::from)
         })
         .await
         .unwrap();
@@ -182,7 +182,7 @@ async fn node_local_schema_and_index_digest_is_stable() {
                 hasher.update([b'\n']);
             }
             let digest = hasher.finalize();
-            Ok::<_, tokio_rusqlite::Error>(
+            Ok::<_, klights_supervisor::DbError>(
                 digest
                     .iter()
                     .map(|byte| format!("{byte:02x}"))

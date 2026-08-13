@@ -23,14 +23,9 @@ use klights_supervisor::TaskSupervisor;
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PassiveStoreOpenRequest<'a> {
     SqliteInMemory,
-    SqlitePersistent {
-        cluster_db_path: &'a Path,
-        db_key_file: Option<&'a Path>,
-    },
+    SqlitePersistent { cluster_db_path: &'a Path },
     RedbInMemory,
-    RedbPersistent {
-        cluster_db_path: &'a Path,
-    },
+    RedbPersistent { cluster_db_path: &'a Path },
 }
 
 /// Immutable focused read capabilities selected with the passive backend.
@@ -142,15 +137,11 @@ pub(crate) async fn open_with_sink(
                 ),
             })
         }
-        PassiveStoreOpenRequest::SqlitePersistent {
-            cluster_db_path,
-            db_key_file,
-        } => {
+        PassiveStoreOpenRequest::SqlitePersistent { cluster_db_path } => {
             tracing::info!(backend = "sqlite", mode = "persistent", "opening datastore");
             let ds = sqlite::Datastore::new_persistent_paths_with_sink(
                 cluster_db_path,
                 supervisor,
-                db_key_file,
                 #[cfg(any(test, feature = "pod-repository-test-support"))]
                 commit_sink,
                 outbox_codec,
@@ -302,7 +293,6 @@ mod tests {
         let sqlite = open(
             PassiveStoreOpenRequest::SqlitePersistent {
                 cluster_db_path: &sqlite_cluster,
-                db_key_file: None,
             },
             supervisor(),
         )

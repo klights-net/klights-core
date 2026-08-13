@@ -21,7 +21,6 @@ explicit target and static native dependency discovery:
 ```bash
 PKG_CONFIG_ALL_STATIC=1 \
 OPENSSL_STATIC=1 \
-LIBSQLITE3_SYS_STATIC=1 \
 LIBZ_SYS_STATIC=1 \
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+crt-static" \
 cargo build --release --target x86_64-unknown-linux-gnu
@@ -34,7 +33,8 @@ target/x86_64-unknown-linux-gnu/release/klights
 ```
 
 Static builds require static archives for the native dependencies used by
-`libnftnl`, `libmnl`, zlib, OpenSSL, and SQLite.
+`libnftnl`, `libmnl`, zlib, and OpenSSL. SQLite is bundled from the pinned
+upstream source.
 
 Useful local checks:
 
@@ -279,8 +279,6 @@ first public stable release.
 | `KLIGHTS_NODE_LOCAL_BACKEND` | `sqlite` | Node-local datastore backend |
 | `KLIGHTS_DB_DIR` | `{KLIGHTS_DATA_ROOT}/db` | Datastore parent directory |
 | `KLIGHTS_IN_MEMORY` | `false` | Use in-memory datastore instead of disk |
-| `KLIGHTS_DB_ENCRYPTION` | `disabled` | `sqlcipher`, requires `--features sqlcipher` |
-| `KLIGHTS_DB_KEY_FILE` | `{KLIGHTS_DB_DIR}/...` | SQLCipher key file path |
 | `KLIGHTS_WAL_CHECKPOINT_INTERVAL` | `0` | SQLite WAL checkpoint interval in seconds; `0` uses SQLite defaults |
 
 ### Node Runtime

@@ -88,7 +88,7 @@ impl Datastore {
                 ) {
                     Ok(current) => Some(current),
                     Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                    Err(e) => return Err(tokio_rusqlite::Error::Rusqlite(e)),
+                    Err(e) => return Err(klights_supervisor::DbError::from(e)),
                 };
 
                 match current {
@@ -239,7 +239,7 @@ impl Datastore {
                 ) {
                     Ok(current) => Some(current),
                     Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                    Err(e) => return Err(tokio_rusqlite::Error::Rusqlite(e)),
+                    Err(e) => return Err(klights_supervisor::DbError::from(e)),
                 };
 
                 match current {

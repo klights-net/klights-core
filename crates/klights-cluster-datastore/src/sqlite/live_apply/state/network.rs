@@ -16,7 +16,10 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
         Self { tx }
     }
 
-    pub(super) fn put_node_subnet(&self, row: LogApplyNodeSubnetRow) -> tokio_rusqlite::Result<()> {
+    pub(super) fn put_node_subnet(
+        &self,
+        row: LogApplyNodeSubnetRow,
+    ) -> klights_supervisor::DbClosureResult<()> {
         self.tx.execute(
             mutation_queries::NODE_SUBNET_UPSERT_EXACT,
             rusqlite::params![
@@ -35,12 +38,15 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
     pub(super) fn allocate_node_subnet(
         &self,
         allocation: LogApplyNodeSubnetAllocation,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         let row = self.allocate_node_subnet_row(allocation)?;
         self.put_node_subnet(row)
     }
 
-    pub(super) fn delete_node_subnet(&self, node_name: String) -> tokio_rusqlite::Result<()> {
+    pub(super) fn delete_node_subnet(
+        &self,
+        node_name: String,
+    ) -> klights_supervisor::DbClosureResult<()> {
         self.tx.execute(
             mutation_queries::NODE_SUBNET_DELETE,
             rusqlite::params![node_name],
@@ -51,7 +57,7 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
     pub(super) fn put_node_dataplane(
         &self,
         row: LogApplyNodeDataplaneRow,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         self.tx.execute(
             mutation_queries::NODE_DATAPLANE_UPSERT,
             rusqlite::params![
@@ -67,7 +73,10 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
         Ok(())
     }
 
-    pub(super) fn delete_node_dataplane(&self, node_name: String) -> tokio_rusqlite::Result<()> {
+    pub(super) fn delete_node_dataplane(
+        &self,
+        node_name: String,
+    ) -> klights_supervisor::DbClosureResult<()> {
         self.tx.execute(
             mutation_queries::NODE_DATAPLANE_DELETE,
             rusqlite::params![node_name],
@@ -78,7 +87,7 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
     fn allocate_node_subnet_row(
         &self,
         allocation: LogApplyNodeSubnetAllocation,
-    ) -> tokio_rusqlite::Result<LogApplyNodeSubnetRow> {
+    ) -> klights_supervisor::DbClosureResult<LogApplyNodeSubnetRow> {
         let node_name_typed = NodeName::parse(&allocation.node_name).map_err(|err| {
             super::super::other_error(format!("Invalid node name {}: {err}", allocation.node_name))
         })?;
@@ -153,7 +162,7 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
             });
         }
 
-        Err(tokio_rusqlite::Error::Rusqlite(
+        Err(klights_supervisor::DbError::Sqlite(
             rusqlite::Error::QueryReturnedNoRows,
         ))
     }

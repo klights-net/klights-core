@@ -19,7 +19,7 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
         &self,
         row: LogApplyNamespaceRow,
         emit_watch_events: bool,
-    ) -> tokio_rusqlite::Result<Option<StagedPostCommit>> {
+    ) -> klights_supervisor::DbClosureResult<Option<StagedPostCommit>> {
         let data_bytes = serde_json::to_vec(&row.data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
         let existing = self
@@ -75,7 +75,7 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
         resource_version: i64,
         name: &str,
         emit_watch_events: bool,
-    ) -> tokio_rusqlite::Result<Option<StagedPostCommit>> {
+    ) -> klights_supervisor::DbClosureResult<Option<StagedPostCommit>> {
         let existing = self
             .tx
             .query_row(
@@ -117,7 +117,10 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
         )))
     }
 
-    pub(super) fn delete_namespace_contents(&self, name: &str) -> tokio_rusqlite::Result<()> {
+    pub(super) fn delete_namespace_contents(
+        &self,
+        name: &str,
+    ) -> klights_supervisor::DbClosureResult<()> {
         let mut stmt = self
             .tx
             .prepare(mutation_queries::NAMESPACE_RESOURCES_LIST_EXCLUDING_KIND)?;

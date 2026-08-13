@@ -13,7 +13,7 @@ impl<'tx, 'conn> OutboxLedgerStateApplier<'tx, 'conn> {
     pub(super) fn put_applied_outbox(
         &self,
         row: LogApplyAppliedOutboxRow,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         self.tx.execute(
             mutation_queries::APPLIED_OUTBOX_UPSERT_EXACT,
             rusqlite::params![
@@ -32,7 +32,7 @@ impl<'tx, 'conn> OutboxLedgerStateApplier<'tx, 'conn> {
     pub(super) fn delete_applied_outbox(
         &self,
         idempotency_key: String,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         self.tx.execute(
             mutation_queries::APPLIED_OUTBOX_DELETE_BY_KEY,
             rusqlite::params![idempotency_key],
@@ -40,7 +40,10 @@ impl<'tx, 'conn> OutboxLedgerStateApplier<'tx, 'conn> {
         Ok(())
     }
 
-    pub(super) fn gc_applied_outbox(&self, cutoff_ms: i64) -> tokio_rusqlite::Result<()> {
+    pub(super) fn gc_applied_outbox(
+        &self,
+        cutoff_ms: i64,
+    ) -> klights_supervisor::DbClosureResult<()> {
         self.tx.execute(
             mutation_queries::APPLIED_OUTBOX_DELETE_EXPIRED,
             rusqlite::params![cutoff_ms],

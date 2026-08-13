@@ -1430,7 +1430,7 @@ impl SqliteReadStore {
             watch_replay_position.resource_version = response_rv;
             klights_cluster_store::ResourceScopeSnapshot::try_new(items, watch_replay_position)
                 .map_err(|error| {
-                    tokio_rusqlite::Error::Other(Box::new(std::io::Error::new(
+                    klights_supervisor::DbError::Application(Box::new(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         error.to_string(),
                     )))

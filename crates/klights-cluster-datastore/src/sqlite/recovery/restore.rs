@@ -38,7 +38,7 @@ pub fn replace_resource_state_in_conn(
     watch_replay_floors: Option<Vec<SnapshotReplayFloor>>,
     metadata: Option<SnapshotMetadata>,
     context: &live_apply::TransactionContext<'_>,
-) -> tokio_rusqlite::Result<Vec<StagedPostCommit>> {
+) -> klights_supervisor::DbClosureResult<Vec<StagedPostCommit>> {
     if current_rv < 0 {
         return Err(live_apply::other_error(
             "snapshot current_rv must be non-negative",
@@ -252,7 +252,7 @@ pub fn replace_resource_state_in_conn(
 
 fn restore_created_rv_from_watch_history(
     tx: &rusqlite::Transaction<'_>,
-) -> tokio_rusqlite::Result<()> {
+) -> klights_supervisor::DbClosureResult<()> {
     tx.execute(
         "UPDATE namespaced_resources AS r
          SET created_rv = (

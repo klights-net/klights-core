@@ -11,10 +11,6 @@ publish.workspace = true
 [features]
 default = []
 test-support = ["klights-node-store/test-support"]
-sqlcipher = [
-    "rusqlite/bundled-sqlcipher-vendored-openssl",
-    "klights-supervisor/sqlcipher",
-]
 
 [dependencies]
 anyhow = { workspace = true }

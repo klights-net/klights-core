@@ -29,12 +29,18 @@ struct DbExecutorInner {
 
 #[derive(Debug)]
 pub enum DbError {
+    Sqlite(rusqlite::Error),
+    Application(Box<dyn std::error::Error + Send + Sync>),
+    ConnectionClosed,
     ReentrantCall { query_name: String },
 }
 
 impl fmt::Display for DbError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Sqlite(error) => error.fmt(formatter),
+            Self::Application(error) => error.fmt(formatter),
+            Self::ConnectionClosed => formatter.write_str("SQLite connection closed"),
             Self::ReentrantCall { query_name } => write!(
                 formatter,
                 "reentrant db call rejected before enqueue: query_name={query_name}"
@@ -43,7 +49,41 @@ impl fmt::Display for DbError {
     }
 }
 
-impl std::error::Error for DbError {}
+impl std::error::Error for DbError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Sqlite(error) => Some(error),
+            Self::Application(error) => Some(error.as_ref()),
+            Self::ConnectionClosed | Self::ReentrantCall { .. } => None,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for DbError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(error)
+    }
+}
+
+impl From<tokio_rusqlite::Error> for DbError {
+    fn from(error: tokio_rusqlite::Error) -> Self {
+        match error {
+            tokio_rusqlite::Error::ConnectionClosed => Self::ConnectionClosed,
+            tokio_rusqlite::Error::Close((_, error)) | tokio_rusqlite::Error::Error(error) => {
+                Self::Sqlite(error)
+            }
+            _ => Self::Application(Box::new(std::io::Error::other(
+                "unknown tokio-rusqlite error variant",
+            ))),
+        }
+    }
+}
+
+/// Project-owned DB closure result. It keeps application failures distinct from
+/// SQLite failures while adapting tokio-rusqlite's generic `Error<E>` API.
+pub type DbCallResult<T> = std::result::Result<T, tokio_rusqlite::Error<DbError>>;
+/// Synchronous closure result accepted by the supervised SQLite executor.
+pub type DbClosureResult<T> = std::result::Result<T, DbError>;
 
 pub struct DbCallGuard;
 
@@ -168,25 +208,10 @@ impl DbExecutor {
         );
         let profile = opts.profile;
 
-        // Read SQLCipher key if present (DSB-06).
-        #[cfg(feature = "sqlcipher")]
-        let sqlcipher_key: Option<Vec<u8>> = match &opts.key_source {
-            Some(opener::KeySource::File(path)) => {
-                Some(opener::read_key_file(&task_supervisor, path).await?)
-            }
-            _ => None,
-        };
-        #[cfg(not(feature = "sqlcipher"))]
-        let _sqlcipher_key: () = ();
-
         executor
             .call_raw("opener:apply_pragmas", move |conn| {
-                // Apply SQLCipher key first, before any PRAGMA reads
-                #[cfg(feature = "sqlcipher")]
-                if let Some(ref key) = sqlcipher_key {
-                    conn.pragma_update(None, "key", &key[..])?;
-                }
-                apply_pragmas(conn, profile)?;
+                opener::verify_runtime_sqlite(conn).map_err(DbError::from)?;
+                apply_pragmas(conn, profile).map_err(DbError::from)?;
                 Ok(())
             })
             .await?;
@@ -231,23 +256,10 @@ impl DbExecutor {
         );
         let profile = opts.profile;
 
-        #[cfg(feature = "sqlcipher")]
-        let sqlcipher_key: Option<Vec<u8>> = match &opts.key_source {
-            Some(opener::KeySource::File(path)) => {
-                Some(opener::read_key_file(&task_supervisor, path).await?)
-            }
-            _ => None,
-        };
-        #[cfg(not(feature = "sqlcipher"))]
-        let _sqlcipher_key: () = ();
-
         executor
             .call_raw("opener:apply_read_pragmas", move |conn| {
-                #[cfg(feature = "sqlcipher")]
-                if let Some(ref key) = sqlcipher_key {
-                    conn.pragma_update(None, "key", &key[..])?;
-                }
-                apply_read_pragmas(conn, profile)?;
+                opener::verify_runtime_sqlite(conn).map_err(DbError::from)?;
+                apply_read_pragmas(conn, profile).map_err(DbError::from)?;
                 Ok(())
             })
             .await?;
@@ -266,11 +278,13 @@ impl DbExecutor {
     pub async fn open_in_memory(
         task_supervisor: Arc<TaskSupervisor>,
         connection_key: impl Into<String>,
-    ) -> Result<Self, tokio_rusqlite::Error> {
+    ) -> DbCallResult<Self> {
         Self::open_with_opts(OpenOpts::in_memory(), task_supervisor, connection_key)
             .await
             .map_err(|e| {
-                tokio_rusqlite::Error::Other(Box::new(std::io::Error::other(e.to_string())))
+                tokio_rusqlite::Error::Error(DbError::Application(Box::new(std::io::Error::other(
+                    e.to_string(),
+                ))))
             })
     }
 
@@ -280,22 +294,20 @@ impl DbExecutor {
     #[cfg(test)]
     pub async fn open_in_memory_with_default_supervisor(
         connection_key: impl Into<String>,
-    ) -> Result<Self, tokio_rusqlite::Error> {
+    ) -> DbCallResult<Self> {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         Self::open_in_memory(supervisor, connection_key).await
     }
 
-    pub async fn call_raw<T, F>(&self, query_name: &'static str, f: F) -> tokio_rusqlite::Result<T>
+    pub async fn call_raw<T, F>(&self, query_name: &'static str, f: F) -> DbCallResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> DbClosureResult<T> + Send + 'static,
     {
         if DB_CALL_DEPTH.with(|depth| depth.get() > 0) {
-            return Err(tokio_rusqlite::Error::Other(Box::new(
-                DbError::ReentrantCall {
-                    query_name: query_name.to_string(),
-                },
-            )));
+            return Err(tokio_rusqlite::Error::Error(DbError::ReentrantCall {
+                query_name: query_name.to_string(),
+            }));
         }
 
         let connection_key = self.inner.connection_key.clone();
@@ -329,11 +341,11 @@ impl DbExecutor {
         query_name: &'static str,
         f: F,
         post_commit: C,
-    ) -> tokio_rusqlite::Result<T>
+    ) -> DbCallResult<T>
     where
         T: Send + 'static,
         P: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<(T, P)> + Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> DbClosureResult<(T, P)> + Send + 'static,
         C: FnOnce(P) + Send + 'static,
     {
         let executor = self.clone();
@@ -346,10 +358,14 @@ impl DbExecutor {
             })
             .await
             .map_err(|error| {
-                tokio_rusqlite::Error::Other(Box::new(std::io::Error::other(error.to_string())))
+                tokio_rusqlite::Error::Error(DbError::Application(Box::new(std::io::Error::other(
+                    error.to_string(),
+                ))))
             })?;
         handle.join().await.map_err(|error| {
-            tokio_rusqlite::Error::Other(Box::new(std::io::Error::other(error.to_string())))
+            tokio_rusqlite::Error::Error(DbError::Application(Box::new(std::io::Error::other(
+                error.to_string(),
+            ))))
         })?
     }
 }
@@ -387,12 +403,9 @@ mod tests {
             .unwrap_or_default()
     }
 
-    fn assert_reentrant_db_error(err: &tokio_rusqlite::Error, expected_query_name: &str) {
-        let tokio_rusqlite::Error::Other(inner) = err else {
-            panic!("expected tokio_rusqlite::Error::Other(DbError), got {err}");
-        };
-        let Some(DbError::ReentrantCall { query_name }) = inner.downcast_ref::<DbError>() else {
-            panic!("expected DbError::ReentrantCall in inner error, got {inner}");
+    fn assert_reentrant_db_error(err: &tokio_rusqlite::Error<DbError>, expected_query_name: &str) {
+        let tokio_rusqlite::Error::Error(DbError::ReentrantCall { query_name }) = err else {
+            panic!("expected DbError::ReentrantCall, got {err}");
         };
         assert_eq!(query_name, expected_query_name);
     }
@@ -410,7 +423,7 @@ mod tests {
             executor
                 .call_raw("outer", move |_conn| {
                     let nested = handle.block_on(nested_executor.call_raw("inner", |_conn| Ok(())));
-                    Ok::<_, tokio_rusqlite::Error>(nested)
+                    Ok::<_, DbError>(nested)
                 })
                 .await
         })
@@ -434,7 +447,7 @@ mod tests {
         let nested = executor
             .call_raw("outer", move |_conn| {
                 let nested = handle.block_on(nested_executor.call_raw("inner", |_conn| Ok(())));
-                Ok::<_, tokio_rusqlite::Error>(nested)
+                Ok::<_, DbError>(nested)
             })
             .await
             .unwrap();
@@ -443,9 +456,7 @@ mod tests {
 
         let value: i64 = executor
             .call_raw("post_error_query", move |conn| {
-                Ok::<_, tokio_rusqlite::Error>(
-                    conn.query_row("SELECT 41 + 1", [], |row| row.get(0))?,
-                )
+                Ok::<_, DbError>(conn.query_row("SELECT 41 + 1", [], |row| row.get(0))?)
             })
             .await
             .unwrap();
@@ -472,7 +483,7 @@ mod tests {
                     .call_raw("first", move |_conn| {
                         started.fetch_add(1, Ordering::SeqCst);
                         wait_on_gate(&gate);
-                        Ok::<_, tokio_rusqlite::Error>(())
+                        Ok::<_, DbError>(())
                     })
                     .await
                     .unwrap();
@@ -487,7 +498,7 @@ mod tests {
             let executor = executor.clone();
             tokio::spawn(async move {
                 executor
-                    .call_raw("second", move |_conn| Ok::<_, tokio_rusqlite::Error>(()))
+                    .call_raw("second", move |_conn| Ok::<_, DbError>(()))
                     .await
                     .unwrap();
             })
@@ -528,7 +539,7 @@ mod tests {
                     .call_raw("write_hold", move |_conn| {
                         write_started.fetch_add(1, Ordering::SeqCst);
                         wait_on_gate(&gate);
-                        Ok::<_, tokio_rusqlite::Error>(())
+                        Ok::<_, DbError>(())
                     })
                     .await
                     .unwrap();
@@ -546,7 +557,7 @@ mod tests {
                 executor
                     .call_raw("read_while_write_held", move |_conn| {
                         read_started.fetch_add(1, Ordering::SeqCst);
-                        Ok::<_, tokio_rusqlite::Error>(())
+                        Ok::<_, DbError>(())
                     })
                     .await
                     .unwrap();
@@ -606,7 +617,7 @@ mod tests {
                     "INSERT OR REPLACE INTO metadata(key, value) VALUES('read_lane_probe', 'old')",
                     [],
                 )?;
-                Ok::<_, tokio_rusqlite::Error>(())
+                Ok::<_, DbError>(())
             })
             .await
             .unwrap();
@@ -631,7 +642,7 @@ mod tests {
                         write_started.fetch_add(1, Ordering::SeqCst);
                         wait_on_gate(&gate);
                         tx.commit()?;
-                        Ok::<_, tokio_rusqlite::Error>(())
+                        Ok::<_, DbError>(())
                     })
                     .await
                     .unwrap();
@@ -655,7 +666,7 @@ mod tests {
                         )?;
                         assert_eq!(value, "old");
                         read_started.fetch_add(1, Ordering::SeqCst);
-                        Ok::<_, tokio_rusqlite::Error>(())
+                        Ok::<_, DbError>(())
                     })
                     .await
                     .unwrap();
@@ -694,7 +705,7 @@ mod tests {
                     [],
                     |row| row.get::<_, i64>(0),
                 )?;
-                Ok::<_, tokio_rusqlite::Error>(count)
+                Ok::<_, DbError>(count)
             })
             .await
             .unwrap();

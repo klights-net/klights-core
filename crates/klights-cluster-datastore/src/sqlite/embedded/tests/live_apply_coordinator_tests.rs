@@ -1185,7 +1185,7 @@ async fn committed_apply_v1_stale_pod_status_stamp_replay_updates_only_outbox() 
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let db = Datastore::new_persistent(&db_root, supervisor.clone(), None)
+    let db = Datastore::new_persistent(&db_root, supervisor.clone())
         .await
         .unwrap();
     enable_committed_apply_v1(&db).await;
@@ -1392,7 +1392,7 @@ async fn committed_apply_v1_stale_pod_status_stamp_replay_updates_only_outbox() 
     );
 
     drop(db);
-    let reopened = Datastore::new_persistent(&db_root, supervisor, None)
+    let reopened = Datastore::new_persistent(&db_root, supervisor)
         .await
         .unwrap();
     let after_reopen = pod_status_apply_snapshot(&reopened, "stamped-status", &keys).await;
@@ -1770,7 +1770,7 @@ async fn replace_replicated_resource_state_clears_stale_owner_ref_index_rows() {
             conn.query_row("SELECT COUNT(*) FROM resource_owner_refs", [], |row| {
                 row.get(0)
             })
-            .map_err(tokio_rusqlite::Error::from)
+            .map_err(klights_supervisor::DbError::from)
         })
         .await
         .unwrap();
@@ -1785,7 +1785,7 @@ async fn replace_replicated_resource_state_clears_stale_owner_ref_index_rows() {
             conn.query_row("SELECT COUNT(*) FROM resource_owner_refs", [], |row| {
                 row.get(0)
             })
-            .map_err(tokio_rusqlite::Error::from)
+            .map_err(klights_supervisor::DbError::from)
         })
         .await
         .unwrap();
@@ -1887,7 +1887,7 @@ async fn replace_replicated_resource_state_restores_created_rv_from_watch_histor
                 [],
                 |row| row.get(0),
             )
-            .map_err(tokio_rusqlite::Error::from)
+            .map_err(klights_supervisor::DbError::from)
         })
         .await
         .unwrap();
@@ -2439,7 +2439,7 @@ async fn apply_log_apply_commit_replays_explicit_watch_event_without_synthesizin
                 [applied_rv],
                 |row| row.get(0),
             )
-            .map_err(tokio_rusqlite::Error::from)
+            .map_err(klights_supervisor::DbError::from)
         })
         .await
         .unwrap();

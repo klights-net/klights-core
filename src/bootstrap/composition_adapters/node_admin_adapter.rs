@@ -192,15 +192,9 @@ mod tests {
     }
 
     async fn node_db(connection_key: &'static str) -> NodeLocalStores {
-        open_node_local(
-            BackendKind::Sqlite,
-            None,
-            supervisor(),
-            None,
-            connection_key,
-        )
-        .await
-        .expect("open node-local test db")
+        open_node_local(BackendKind::Sqlite, None, supervisor(), connection_key)
+            .await
+            .expect("open node-local test db")
     }
 
     async fn node_db_with_dead_letter(

@@ -69,7 +69,9 @@ impl Datastore {
         let (resource_version, data) = match mark_outcome {
             Ok(Some(resource_data)) => resource_data,
             Ok(None) => return Ok(None),
-            Err(tokio_rusqlite::Error::Rusqlite(rusqlite::Error::QueryReturnedNoRows)) => {
+            Err(tokio_rusqlite::Error::Error(klights_supervisor::DbError::Sqlite(
+                rusqlite::Error::QueryReturnedNoRows,
+            ))) => {
                 return Err(crate::errors::DatastoreError::conflict(
                     "Resource not found or version conflict",
                 )
@@ -367,7 +369,9 @@ impl Datastore {
                     data: std::sync::Arc::new(data),
                 })
             }
-            Err(tokio_rusqlite::Error::Rusqlite(rusqlite::Error::QueryReturnedNoRows)) => {
+            Err(tokio_rusqlite::Error::Error(klights_supervisor::DbError::Sqlite(
+                rusqlite::Error::QueryReturnedNoRows,
+            ))) => {
                 if let Some(expected_uid) = expected_uid_for_log.as_deref() {
                     self.warn_uid_precondition_mismatch_if_live(
                         "update_resource",

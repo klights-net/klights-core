@@ -356,7 +356,6 @@ impl IntegrationLeaderRpcComposition {
                 crate::datastore::backend_kind::BackendKind::Sqlite,
                 None,
                 supervisor,
-                None,
                 connection_key,
             )
             .await?,

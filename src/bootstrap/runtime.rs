@@ -889,7 +889,6 @@ mod tests {
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
-            None,
             "sqlite:worker-dataplane-outbox-test",
         )
         .await

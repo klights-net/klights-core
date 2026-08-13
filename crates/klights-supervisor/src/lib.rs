@@ -11,8 +11,8 @@ mod task;
 
 pub use category::{TaskCategory, TaskCategoryConfig};
 pub use clock::{SystemWallClock, WallClock};
-pub use sqlite::{DbError, DbExecutor};
-pub use sqlite_open::{KeySource, OpenOpts, OpenPath, PragmaProfile, SqliteOpenError};
+pub use sqlite::{DbCallResult, DbClosureResult, DbError, DbExecutor};
+pub use sqlite_open::{OpenOpts, OpenPath, PragmaProfile, SqliteOpenError};
 pub use supervisor::{
     CryptoExecutor, FileProcessExecutor, ProcessError, ProcessShutdownPolicy, SupervisedChild,
     SupervisedJoinHandle, TaskSupervisor,

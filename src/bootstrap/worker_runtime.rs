@@ -215,7 +215,6 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         config.node_local_backend,
         nldb,
         task_supervisor.clone(),
-        config.db_key_file.as_deref(),
         "sqlite:node-local",
     )
     .await
@@ -866,7 +865,6 @@ mod tests {
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
-            None,
             "sqlite:worker-runtime-repository-graph",
         )
         .await

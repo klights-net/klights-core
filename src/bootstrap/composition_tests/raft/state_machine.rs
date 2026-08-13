@@ -517,7 +517,6 @@ mod tests {
             klights::datastore::sqlite::Datastore::new_persistent_paths(
                 &directory.path().join("cluster.db"),
                 supervisor.clone(),
-                None,
             )
             .await
             .expect("open persistent snapshot fixture"),

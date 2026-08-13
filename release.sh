@@ -18,7 +18,7 @@ Build modes:
               `cargo build --release`.
 
 Static builds require static archives for native dependencies, including
-libnftnl, libmnl, zlib, OpenSSL, and SQLite.
+libnftnl, libmnl, zlib, and OpenSSL. SQLite is bundled from the pinned source.
 EOF_USAGE
 }
 
@@ -83,7 +83,6 @@ case "$LINK_MODE" in
 
     export PKG_CONFIG_ALL_STATIC=1
     export OPENSSL_STATIC=1
-    export LIBSQLITE3_SYS_STATIC=1
     export LIBZ_SYS_STATIC=1
     OPENSSL_EXTRA_LINK_ARGS="$(openssl_static_link_args)"
     export "$RUSTFLAGS_ENV=${EXISTING_RUSTFLAGS:+$EXISTING_RUSTFLAGS }-C target-feature=+crt-static${OPENSSL_EXTRA_LINK_ARGS}"

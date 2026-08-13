@@ -88,7 +88,7 @@ impl NodeDeliveryTestStore {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
             })
             .await
             .map_err(anyhow::Error::from)
@@ -110,7 +110,7 @@ impl NodeDeliveryTestStore {
                 )?;
                 conn.execute_batch("PRAGMA ignore_check_constraints = OFF")?;
                 if changed != 1 {
-                    return Err(tokio_rusqlite::Error::Other(Box::new(
+                    return Err(klights_supervisor::DbError::Application(Box::new(
                         std::io::Error::other(format!(
                             "test operation mutation changed {changed} rows"
                         )),
@@ -136,7 +136,7 @@ impl NodeDeliveryTestStore {
                     |row| row.get(0),
                 )
                 .optional()
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
             })
             .await
             .map_err(anyhow::Error::from)

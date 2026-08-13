@@ -478,7 +478,7 @@ async fn node_local_outbox_commits_stream_sequence_before_enqueue_returns() {
                     [key],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                 )
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
             })
             .await
             .unwrap();

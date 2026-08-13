@@ -79,9 +79,9 @@ impl From<klights_supervisor::SqliteOpenError> for OpenError {
 }
 
 /// Bridge private datastore adapter errors into the supervised DB call result.
-impl From<OpenError> for tokio_rusqlite::Error {
+impl From<OpenError> for klights_supervisor::DbError {
     fn from(error: OpenError) -> Self {
-        Self::Other(Box::new(error))
+        Self::Application(Box::new(error))
     }
 }
 
@@ -147,13 +147,21 @@ pub fn cluster_store_adapter_error(
         }
         Err(error) => error,
     };
-    let kind = match error.downcast_ref::<DatastoreError>() {
-        Some(DatastoreError::AlreadyExists { .. } | DatastoreError::Conflict { .. }) => {
-            ClusterStoreErrorKind::Conflict
-        }
-        Some(DatastoreError::NotFound { .. }) => ClusterStoreErrorKind::NotFound,
-        None => ClusterStoreErrorKind::Persistence,
-    };
+    let kind = error
+        .chain()
+        .find_map(|source| {
+            source
+                .downcast_ref::<ClusterStoreError>()
+                .map(ClusterStoreError::kind)
+                .or_else(|| match source.downcast_ref::<DatastoreError>() {
+                    Some(
+                        DatastoreError::AlreadyExists { .. } | DatastoreError::Conflict { .. },
+                    ) => Some(ClusterStoreErrorKind::Conflict),
+                    Some(DatastoreError::NotFound { .. }) => Some(ClusterStoreErrorKind::NotFound),
+                    None => None,
+                })
+        })
+        .unwrap_or(ClusterStoreErrorKind::Persistence);
     ClusterStoreError::adapter_failure_boxed(kind, backend, operation, error.into_boxed_dyn_error())
 }
 
@@ -199,6 +207,34 @@ mod tests {
         let inner = source
             .downcast_ref::<ClusterStoreError>()
             .expect("source must remain the typed cluster-store error");
+        assert_eq!(inner.kind(), ClusterStoreErrorKind::Conflict);
+        assert_eq!(inner.backend(), Some(PersistenceBackend::Sqlite));
+    }
+
+    #[test]
+    fn compatibility_adapter_preserves_typed_error_wrapped_by_db_executor() {
+        let inner = ClusterStoreError::adapter_failure_boxed(
+            ClusterStoreErrorKind::Conflict,
+            PersistenceBackend::Sqlite,
+            "focused persistence port",
+            Box::new(std::io::Error::other("unique identity collision")),
+        );
+        let db_error = klights_supervisor::DbError::Application(Box::new(inner));
+        let error = anyhow::Error::new(tokio_rusqlite::Error::Error(db_error));
+        let error = cluster_store_adapter_error(
+            error,
+            PersistenceBackend::Root,
+            "root datastore compatibility adapter",
+        );
+
+        assert_eq!(error.kind(), ClusterStoreErrorKind::Conflict);
+        assert_eq!(error.backend(), Some(PersistenceBackend::Root));
+        let inner = error
+            .source()
+            .and_then(|source| source.source())
+            .and_then(|source| source.source())
+            .and_then(|source| source.downcast_ref::<ClusterStoreError>())
+            .expect("the typed cluster-store source must survive the DB wrapper");
         assert_eq!(inner.kind(), ClusterStoreErrorKind::Conflict);
         assert_eq!(inner.backend(), Some(PersistenceBackend::Sqlite));
     }

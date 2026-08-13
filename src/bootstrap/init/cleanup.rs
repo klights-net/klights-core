@@ -320,7 +320,6 @@ async fn open_cleanup_node_local(
         config.node_local_backend,
         node_db_path,
         task_supervisor,
-        config.db_key_file.as_deref(),
         "sqlite:node-local-cleanup",
     )
     .await

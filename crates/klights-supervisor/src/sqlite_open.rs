@@ -1,7 +1,7 @@
 //! Centralized open-time configuration for SQLite-backed datastores.
 //!
 //! This module owns only schema-neutral connection policy: paths, permissions,
-//! SQLCipher key application, PRAGMAs, integrity checks, and file metrics.
+//! PRAGMAs, integrity checks, and file metrics.
 //! Cluster and node-local owners compose it with their own schema and
 //! fingerprint adapters.
 //!
@@ -39,9 +39,9 @@ impl std::fmt::Display for SqliteOpenError {
 
 impl std::error::Error for SqliteOpenError {}
 
-impl From<SqliteOpenError> for tokio_rusqlite::Error {
+impl From<SqliteOpenError> for crate::DbError {
     fn from(error: SqliteOpenError) -> Self {
-        Self::Other(Box::new(error))
+        Self::Application(Box::new(error))
     }
 }
 
@@ -54,6 +54,33 @@ const PRAGMA_MMAP_SIZE: &str = "mmap_size";
 const PRAGMA_FOREIGN_KEYS: &str = "foreign_keys";
 const PRAGMA_BUSY_TIMEOUT: &str = "busy_timeout";
 const PRAGMA_VALUE_JOURNAL_MODE_WAL: &str = "WAL";
+/// SQLite 3.53.4 includes the upstream WAL-reset database-corruption fix.
+pub const MIN_SQLITE_VERSION_NUMBER: i32 = 3_053_004;
+/// Immutable SQLite 3.53.4 source identity, used to catch a split or stale
+/// bundled provider before it can open a datastore.
+pub const REQUIRED_SQLITE_SOURCE_ID: &str =
+    "2026-07-24 19:02:57 bf7c7f30031888f4e796e429ab3978879485813aaca6f641c7b33e4e09459bcc";
+
+/// Fail closed if the process is not linked against the fixed bundled SQLite.
+pub fn verify_runtime_sqlite(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let linked_version = rusqlite::version_number();
+    let linked_version_text = rusqlite::version();
+    let sql_version: String = conn.query_row("SELECT sqlite_version()", [], |row| row.get(0))?;
+    let sql_source_id: String =
+        conn.query_row("SELECT sqlite_source_id()", [], |row| row.get(0))?;
+    if linked_version < MIN_SQLITE_VERSION_NUMBER
+        || sql_version != linked_version_text
+        || sql_source_id != REQUIRED_SQLITE_SOURCE_ID
+    {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+            Some(format!(
+                "klights requires bundled SQLite >= 3.53.4 (source {REQUIRED_SQLITE_SOURCE_ID}); linked {linked_version_text} ({linked_version}), SQL reports {sql_version} ({sql_source_id})"
+            )),
+        ));
+    }
+    Ok(())
+}
 const PRAGMA_VALUE_SYNCHRONOUS_NORMAL: &str = "NORMAL";
 const PRAGMA_VALUE_AUTO_VACUUM_INCREMENTAL: &str = "INCREMENTAL";
 const PRAGMA_VALUE_CACHE_SIZE: &str = "-40000";
@@ -65,20 +92,8 @@ const PRAGMA_VALUE_BUSY_TIMEOUT_MS: &str = "5000";
 /// PRAGMA + key application profile selected at open time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PragmaProfile {
-    /// Standard SQLite, no encryption. Today's only callable profile.
+    /// The single supported plain SQLite profile.
     Plaintext,
-    /// SQLCipher whole-file encryption — DSB-06 implements; DSB-01 does
-    /// not call it. Defined here so the opener has one type to grow.
-    Encrypted,
-}
-
-/// Source of the SQLCipher key. Stub today; DSB-06 fills in `File`.
-/// Only `None` is callable from DSB-01.
-#[derive(Debug, Clone)]
-pub enum KeySource {
-    /// Read the key bytes from a root-only file (mode 0600, parent 0700).
-    /// Implementation lives in DSB-06.
-    File(PathBuf),
 }
 
 /// Where the connection lives.
@@ -93,9 +108,6 @@ pub enum OpenPath {
 pub struct OpenOpts {
     pub path: OpenPath,
     pub profile: PragmaProfile,
-    /// `None` in DSB-01 (plaintext + in-memory only). DSB-06 plumbs the
-    /// real `KeySource::File` value through the encrypted profile.
-    pub key_source: Option<KeySource>,
     /// Default `false` — the opener refuses to open a disk DB whose
     /// parent directory exists with permissions wider than `0700`. Tests
     /// running on shared `/tmp` (mode `1777`) flip this to `true` to
@@ -108,7 +120,6 @@ impl OpenOpts {
         Self {
             path: OpenPath::SharedMemory(shared_memory_uri("raw")),
             profile: PragmaProfile::Plaintext,
-            key_source: None,
             allow_existing_perms: false,
         }
     }
@@ -117,7 +128,6 @@ impl OpenOpts {
         Self {
             path: OpenPath::Disk(path.into()),
             profile: PragmaProfile::Plaintext,
-            key_source: None,
             allow_existing_perms: false,
         }
     }
@@ -126,31 +136,7 @@ impl OpenOpts {
         Self {
             path: OpenPath::SharedMemory(shared_memory_uri(scope)),
             profile: PragmaProfile::Plaintext,
-            key_source: None,
             allow_existing_perms: false,
-        }
-    }
-
-    pub fn with_key_file(self, key_file: Option<&Path>) -> Result<Self> {
-        #[cfg(not(feature = "sqlcipher"))]
-        {
-            if key_file.is_some() {
-                return Err(anyhow!(
-                    "SQLCipher encryption requested but the 'sqlcipher' cargo feature is not enabled. \
-                     Rebuild with --features sqlcipher"
-                ));
-            }
-            Ok(self)
-        }
-
-        #[cfg(feature = "sqlcipher")]
-        {
-            let mut opts = self;
-            if let Some(kf) = key_file {
-                opts.profile = PragmaProfile::Encrypted;
-                opts.key_source = Some(KeySource::File(kf.to_path_buf()));
-            }
-            Ok(opts)
         }
     }
 }
@@ -172,31 +158,13 @@ fn shared_memory_uri(scope: &str) -> PathBuf {
 /// `pragma_update` with a `&str` quotes the value, which `auto_vacuum`
 /// silently rejects.
 pub fn apply_pragmas(conn: &rusqlite::Connection, profile: PragmaProfile) -> rusqlite::Result<()> {
-    // Sanity: DSB-01 only ships `Plaintext`; `Encrypted` is a forward
-    // declaration. If a caller smuggles `Encrypted` through without the
-    // sqlcipher feature or a key, fail loudly.
-    if matches!(profile, PragmaProfile::Encrypted) {
-        #[cfg(not(feature = "sqlcipher"))]
-        {
-            return Err(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
-                Some("Encrypted profile requires sqlcipher cargo feature".into()),
-            ));
-        }
-        // Under sqlcipher: key was already applied before this call.
-        // Fall through to apply remaining PRAGMAs with mmap_size=0.
-    }
-
+    let _ = profile;
     // auto_vacuum is a persistent file-header flag and can only be
     // toggled when the file has zero pages. Issue it first, then VACUUM
     // to materialise the header before journal_mode=WAL writes any
     // pages of its own. After this batch a fresh disk DB has the flag
     // baked in; an existing DB no-ops because the flag is already set.
-    let mmap_val: String = if matches!(profile, PragmaProfile::Encrypted) {
-        "0".to_string()
-    } else {
-        PRAGMA_VALUE_MMAP_SIZE.to_string()
-    };
+    let mmap_val = PRAGMA_VALUE_MMAP_SIZE;
 
     let batch = format!(
         "PRAGMA {av} = {av_v}; \
@@ -237,21 +205,8 @@ pub fn apply_read_pragmas(
     conn: &rusqlite::Connection,
     profile: PragmaProfile,
 ) -> rusqlite::Result<()> {
-    if matches!(profile, PragmaProfile::Encrypted) {
-        #[cfg(not(feature = "sqlcipher"))]
-        {
-            return Err(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
-                Some("Encrypted profile requires sqlcipher cargo feature".into()),
-            ));
-        }
-    }
-
-    let mmap_val: String = if matches!(profile, PragmaProfile::Encrypted) {
-        "0".to_string()
-    } else {
-        PRAGMA_VALUE_MMAP_SIZE.to_string()
-    };
+    let _ = profile;
+    let mmap_val = PRAGMA_VALUE_MMAP_SIZE;
 
     let batch = format!(
         "PRAGMA query_only = ON; \
@@ -371,44 +326,6 @@ fn chmod(path: &Path, mode: u32) -> Result<()> {
         .map_err(|e| anyhow!("chmod {} to {:o} failed: {}", path.display(), mode, e))
 }
 
-/// Apply the SQLCipher key to a freshly-opened connection.
-///
-/// Must be called **before** `apply_pragmas` so the encrypted pages are
-/// readable.  The key is applied via `pragma_update` (bound parameter)
-/// which never places the key in the SQL text.
-#[cfg(feature = "sqlcipher")]
-pub fn apply_key(conn: &rusqlite::Connection, key: &[u8]) -> rusqlite::Result<()> {
-    conn.pragma_update(None, "key", key)
-}
-
-/// Read the SQLCipher key from a file via the supervisor's file-category
-/// blocking pool.
-#[cfg(feature = "sqlcipher")]
-pub async fn read_key_file(
-    supervisor: &std::sync::Arc<TaskSupervisor>,
-    path: &std::path::Path,
-) -> Result<Vec<u8>> {
-    let path = path.to_path_buf();
-    let path_for_err = path.clone();
-    let supervisor = supervisor.clone();
-    let key = supervisor
-        .run_blocking_file("opener:read_key_file", move || {
-            std::fs::read(&path)
-                .map_err(|e| anyhow!("failed to read key file {}: {}", path.display(), e))
-        })
-        .await
-        .map_err(|e| anyhow!("read_key_file supervisor error: {e}"))??;
-
-    if key.is_empty() {
-        return Err(anyhow!(
-            "SQLCipher key file {} is empty",
-            path_for_err.display()
-        ));
-    }
-
-    Ok(key)
-}
-
 /// Check for orphaned WAL file (WAL exists but main DB does not).
 ///
 /// This is a safety check that detects an inconsistent state where
@@ -498,7 +415,6 @@ mod tests {
         Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))
     }
 
-    #[cfg(not(feature = "sqlcipher"))]
     fn open_temp_conn() -> rusqlite::Connection {
         rusqlite::Connection::open_in_memory().expect("open in-memory")
     }
@@ -520,6 +436,81 @@ mod tests {
     fn pragma_int(conn: &rusqlite::Connection, name: &str) -> i64 {
         conn.pragma_query_value(None, name, |row| row.get::<_, i64>(0))
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn linked_sqlite_is_the_exact_wal_reset_fixed_provider() {
+        let conn = open_temp_conn();
+        verify_runtime_sqlite(&conn).expect("fixed bundled SQLite provider");
+        assert!(rusqlite::version_number() >= MIN_SQLITE_VERSION_NUMBER);
+        assert_eq!(rusqlite::version(), "3.53.4");
+        assert_eq!(
+            conn.query_row("SELECT sqlite_version()", [], |row| row.get::<_, String>(0))
+                .expect("SQL SQLite version"),
+            rusqlite::version()
+        );
+        assert_eq!(
+            conn.query_row("SELECT sqlite_source_id()", [], |row| row
+                .get::<_, String>(0))
+                .expect("SQL SQLite source identity"),
+            REQUIRED_SQLITE_SOURCE_ID
+        );
+    }
+
+    #[test]
+    fn concurrent_wal_write_and_checkpoint_preserve_integrity() {
+        // SQLite documents the WAL-reset race as requiring concurrent writers
+        // and checkpoints on distinct connections. The upstream developers
+        // need special fault-injection to reproduce the historic corruption,
+        // so this is a project-relevant contention regression, not a claim to
+        // recreate the upstream fault organically.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("checkpoint-race.db");
+        let setup = rusqlite::Connection::open(&path).expect("setup open");
+        apply_pragmas(&setup, PragmaProfile::Plaintext).expect("setup pragmas");
+        setup
+            .execute("CREATE TABLE writes (value INTEGER NOT NULL)", [])
+            .expect("create table");
+        drop(setup);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writer_path = path.clone();
+        let writer_barrier = barrier.clone();
+        let writer = std::thread::spawn(move || -> rusqlite::Result<()> {
+            let conn = rusqlite::Connection::open(writer_path)?;
+            writer_barrier.wait();
+            for value in 0..64 {
+                conn.execute("INSERT INTO writes (value) VALUES (?1)", [value])?;
+            }
+            Ok(())
+        });
+        let checkpointer_path = path.clone();
+        let checkpointer = std::thread::spawn(move || -> rusqlite::Result<()> {
+            let conn = rusqlite::Connection::open(checkpointer_path)?;
+            barrier.wait();
+            for _ in 0..64 {
+                let _: (i64, i64, i64) =
+                    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })?;
+            }
+            Ok(())
+        });
+        writer
+            .join()
+            .expect("writer thread")
+            .expect("writer result");
+        checkpointer
+            .join()
+            .expect("checkpointer thread")
+            .expect("checkpointer result");
+
+        let conn = rusqlite::Connection::open(&path).expect("verify open");
+        check_integrity(&conn, &path).expect("database integrity");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM writes", [], |row| row.get(0))
+            .expect("count writes");
+        assert_eq!(count, 64);
     }
 
     #[test]
@@ -556,15 +547,6 @@ mod tests {
         apply_pragmas(&conn, PragmaProfile::Plaintext).expect("second apply");
         assert_eq!(pragma_text(&conn, "journal_mode"), mode_before);
         assert_eq!(pragma_int(&conn, "cache_size"), cache_before);
-    }
-
-    #[cfg(not(feature = "sqlcipher"))]
-    #[test]
-    fn apply_pragmas_rejects_encrypted_profile_without_sqlcipher_feature() {
-        let conn = open_temp_conn();
-        let err =
-            apply_pragmas(&conn, PragmaProfile::Encrypted).expect_err("Encrypted must not apply");
-        assert!(format!("{err}").contains("sqlcipher"));
     }
 
     #[tokio::test]

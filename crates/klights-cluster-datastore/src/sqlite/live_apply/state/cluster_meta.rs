@@ -13,7 +13,7 @@ impl<'tx, 'conn> ClusterMetaStateApplier<'tx, 'conn> {
         &self,
         key: String,
         value: String,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         self.tx.execute(
             mutation_queries::UPSERT_KLIGHTS_META,
             rusqlite::params![&key, &value],

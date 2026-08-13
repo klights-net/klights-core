@@ -40,8 +40,8 @@ pub fn disk_opts(path: impl Into<std::path::PathBuf>) -> OpenOpts {
     OpenOpts::disk(path)
 }
 
-fn db_call_error(error: NodeStoreOpenError) -> tokio_rusqlite::Error {
-    tokio_rusqlite::Error::Other(Box::new(error))
+fn db_call_error(error: NodeStoreOpenError) -> klights_supervisor::DbError {
+    klights_supervisor::DbError::Application(Box::new(error))
 }
 
 fn init_schema(conn: &mut rusqlite::Connection) -> Result<(), NodeStoreOpenError> {

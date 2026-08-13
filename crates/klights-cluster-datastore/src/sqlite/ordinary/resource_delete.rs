@@ -25,7 +25,7 @@ pub enum DeleteResourceAttempt {
 pub fn delete_resource_in_conn(
     conn: &mut rusqlite::Connection,
     input: DeleteResourceInput,
-) -> tokio_rusqlite::Result<DeleteResourceAttempt> {
+) -> klights_supervisor::DbClosureResult<DeleteResourceAttempt> {
     let DeleteResourceInput {
         api_version,
         kind,
@@ -66,7 +66,7 @@ pub fn delete_resource_in_conn(
         Err(rusqlite::Error::QueryReturnedNoRows) => {
             return Ok(DeleteResourceAttempt::NotFound);
         }
-        Err(error) => return Err(tokio_rusqlite::Error::Rusqlite(error)),
+        Err(error) => return Err(klights_supervisor::DbError::from(error)),
     };
     if let Err(error) = resource_shape::validate_resource_preconditions(
         &preconditions,

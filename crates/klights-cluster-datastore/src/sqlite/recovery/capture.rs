@@ -413,7 +413,9 @@ mod tests {
         async fn db_call<T, F>(&self, query_name: &'static str, call: F) -> T
         where
             T: Send + 'static,
-            F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+            F: FnOnce(&mut rusqlite::Connection) -> klights_supervisor::DbClosureResult<T>
+                + Send
+                + 'static,
         {
             self.executor.call_raw(query_name, call).await.unwrap()
         }

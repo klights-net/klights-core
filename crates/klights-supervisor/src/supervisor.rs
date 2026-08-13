@@ -3,6 +3,7 @@ use super::task::{
     ActiveTask, ActiveTaskStatus, DbQueryLoggingStatus, ShutdownReport, TaskAdmissionError,
     TaskCategoryStatus, TaskJoinError, TaskOutcome, TaskOutcomeStatus,
 };
+use crate::{DbCallResult, DbClosureResult, DbError};
 use anyhow::{Context, Result, anyhow};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -723,10 +724,10 @@ impl TaskSupervisor {
         connection_key: impl Into<String>,
         connection: tokio_rusqlite::Connection,
         f: F,
-    ) -> tokio_rusqlite::Result<T>
+    ) -> DbCallResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> DbClosureResult<T> + Send + 'static,
     {
         self.call_db_with_category(TaskCategory::Db, query_name, connection_key, connection, f)
             .await
@@ -738,10 +739,10 @@ impl TaskSupervisor {
         connection_key: impl Into<String>,
         connection: tokio_rusqlite::Connection,
         f: F,
-    ) -> tokio_rusqlite::Result<T>
+    ) -> DbCallResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> DbClosureResult<T> + Send + 'static,
     {
         self.call_db_with_category(
             TaskCategory::DbRead,
@@ -760,19 +761,21 @@ impl TaskSupervisor {
         connection_key: impl Into<String>,
         connection: tokio_rusqlite::Connection,
         f: F,
-    ) -> tokio_rusqlite::Result<T>
+    ) -> DbCallResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> DbClosureResult<T> + Send + 'static,
     {
         let query_name: String = query_name.into();
         let connection_key: String = connection_key.into();
         let permit = self.acquire_permit(category).await.map_err(|e| {
-            tokio_rusqlite::Error::Other(Box::new(std::io::Error::other(e.to_string())))
+            tokio_rusqlite::Error::Error(DbError::Application(Box::new(std::io::Error::other(
+                e.to_string(),
+            ))))
         })?;
         let task_id = self
             .start_task(category, query_name.clone())
-            .map_err(|error| tokio_rusqlite::Error::Other(Box::new(error)))?;
+            .map_err(|error| tokio_rusqlite::Error::Error(DbError::Application(Box::new(error))))?;
 
         // Detach into a task that holds the DB permit for the true duration
         // of the DB call. If the caller future is cancelled, the permit
@@ -802,11 +805,12 @@ impl TaskSupervisor {
             let _ = tx.send(result);
         });
 
-        rx.await.map_err(|_| {
-            tokio_rusqlite::Error::Other(Box::new(std::io::Error::other(
-                "supervised db task was dropped",
-            )))
-        })?
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(tokio_rusqlite::Error::Error(DbError::Application(
+                Box::new(std::io::Error::other("supervised db task was dropped")),
+            ))),
+        }
     }
 
     pub async fn spawn_delay<F>(

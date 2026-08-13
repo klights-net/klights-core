@@ -16,10 +16,16 @@ impl SqliteNodeIdentity {
         Self { executor }
     }
 
-    async fn call<T, F>(&self, query_name: &'static str, call: F) -> tokio_rusqlite::Result<T>
+    async fn call<T, F>(
+        &self,
+        query_name: &'static str,
+        call: F,
+    ) -> klights_supervisor::DbCallResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> klights_supervisor::DbClosureResult<T>
+            + Send
+            + 'static,
     {
         self.executor.call_raw(query_name, call).await
     }
@@ -59,7 +65,7 @@ impl NodeIdentity for SqliteNodeIdentity {
             self.call("node_local:get_meta", move |conn| {
                 conn.query_row(NODE_META_GET, [key], |row| row.get(0))
                     .optional()
-                    .map_err(tokio_rusqlite::Error::from)
+                    .map_err(klights_supervisor::DbError::from)
             })
             .await
             .map_err(|error| {

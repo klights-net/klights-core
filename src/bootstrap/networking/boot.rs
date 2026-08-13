@@ -186,8 +186,6 @@ mod tests {
                 crate::bootstrap::config::DEFAULT_GC_INTERVAL_SECONDS,
             ),
             in_memory: true,
-            db_encryption: crate::DbEncryption::Disabled,
-            db_key_file: None,
             datastore_backend: crate::datastore::backend_kind::BackendKind::Sqlite,
             node_local_backend: crate::datastore::backend_kind::BackendKind::Sqlite,
             oidc_issuer_url: None,
@@ -213,7 +211,6 @@ mod tests {
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
-            None,
             "sqlite:network-boot-test",
         )
         .await

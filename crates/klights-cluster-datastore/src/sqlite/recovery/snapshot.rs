@@ -526,7 +526,9 @@ fn text_error(error: impl std::fmt::Display + Send + Sync + 'static) -> rusqlite
     }))
 }
 
-pub(crate) fn map_sqlite_snapshot_error(error: tokio_rusqlite::Error) -> SnapshotPersistenceError {
+pub(crate) fn map_sqlite_snapshot_error(
+    error: tokio_rusqlite::Error<klights_supervisor::DbError>,
+) -> SnapshotPersistenceError {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
     while let Some(current) = source {
         if let Some(snapshot) = current.downcast_ref::<SnapshotPersistenceError>() {

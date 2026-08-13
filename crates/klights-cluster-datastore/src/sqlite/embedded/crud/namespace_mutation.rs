@@ -40,9 +40,9 @@ impl Datastore {
                     data: std::sync::Arc::new(data),
                 })
             }
-            Err(tokio_rusqlite::Error::Rusqlite(rusqlite::Error::SqliteFailure(err, _)))
-                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
+            Err(tokio_rusqlite::Error::Error(klights_supervisor::DbError::Sqlite(
+                rusqlite::Error::SqliteFailure(err, _),
+            ))) if err.code == rusqlite::ErrorCode::ConstraintViolation => {
                 Err(anyhow!("Namespace already exists"))
             }
             Err(e) => Err(anyhow!("Failed to create namespace: {}", e)),
@@ -123,10 +123,12 @@ impl Datastore {
                     data: std::sync::Arc::new(data),
                 })
             }
-            Err(tokio_rusqlite::Error::Rusqlite(rusqlite::Error::QueryReturnedNoRows)) => Err(
-                crate::errors::DatastoreError::conflict("Namespace not found or version conflict")
-                    .into(),
-            ),
+            Err(tokio_rusqlite::Error::Error(klights_supervisor::DbError::Sqlite(
+                rusqlite::Error::QueryReturnedNoRows,
+            ))) => Err(crate::errors::DatastoreError::conflict(
+                "Namespace not found or version conflict",
+            )
+            .into()),
             Err(e) => Err(anyhow!("Failed to update namespace: {}", e)),
         }
     }
@@ -158,9 +160,9 @@ impl Datastore {
             Ok(ordinary::NamespaceDeleteResult::HasRemainingContent) => Err(
                 crate::errors::DatastoreError::conflict("Namespace has remaining content").into(),
             ),
-            Err(tokio_rusqlite::Error::Rusqlite(rusqlite::Error::QueryReturnedNoRows)) => {
-                Err(anyhow!("Namespace not found"))
-            }
+            Err(tokio_rusqlite::Error::Error(klights_supervisor::DbError::Sqlite(
+                rusqlite::Error::QueryReturnedNoRows,
+            ))) => Err(anyhow!("Namespace not found")),
             Err(e) => Err(anyhow!("Failed to delete namespace: {}", e)),
         }
     }
@@ -175,9 +177,9 @@ impl Datastore {
 
         match result {
             Ok(()) => Ok(()),
-            Err(tokio_rusqlite::Error::Rusqlite(rusqlite::Error::QueryReturnedNoRows)) => {
-                Err(anyhow!("Namespace not found"))
-            }
+            Err(tokio_rusqlite::Error::Error(klights_supervisor::DbError::Sqlite(
+                rusqlite::Error::QueryReturnedNoRows,
+            ))) => Err(anyhow!("Namespace not found")),
             Err(e) => Err(anyhow!("Failed to delete namespace contents: {}", e)),
         }
     }

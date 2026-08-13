@@ -688,7 +688,6 @@ impl NativeApiTestHarness {
                 crate::datastore::backend_kind::BackendKind::Sqlite,
                 None,
                 supervisor.clone(),
-                None,
                 "sqlite:native-api-integration-node-local",
             )
             .await?,

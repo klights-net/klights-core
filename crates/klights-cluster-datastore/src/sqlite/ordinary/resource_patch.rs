@@ -62,7 +62,7 @@ impl PatchResourceInput {
 pub fn patch_resource_in_conn(
     conn: &mut rusqlite::Connection,
     input: PatchResourceInput,
-) -> tokio_rusqlite::Result<Option<Resource>> {
+) -> klights_supervisor::DbClosureResult<Option<Resource>> {
     let PatchResourceInput {
         key,
         patch_kind,

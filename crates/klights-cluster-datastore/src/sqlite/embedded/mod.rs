@@ -383,7 +383,7 @@ impl Datastore {
     fn completed_outbox_record_in_tx(
         tx: &rusqlite::Transaction<'_>,
         idempotency_key: &str,
-    ) -> tokio_rusqlite::Result<Option<LogApplyAppliedOutboxRow>> {
+    ) -> klights_supervisor::DbClosureResult<Option<LogApplyAppliedOutboxRow>> {
         let existing = tx
             .query_row(queries::APPLIED_OUTBOX_GET, [idempotency_key], |row| {
                 Ok(LogApplyAppliedOutboxRow {
@@ -402,7 +402,7 @@ impl Datastore {
 
     fn outbox_materialization_resource_version_hint_in_tx(
         tx: &rusqlite::Transaction<'_>,
-    ) -> tokio_rusqlite::Result<Option<i64>> {
+    ) -> klights_supervisor::DbClosureResult<Option<i64>> {
         Ok(Some(
             Self::current_resource_version_in_tx(tx)?.saturating_add(1),
         ))
@@ -412,7 +412,7 @@ impl Datastore {
         tx: &rusqlite::Transaction<'_>,
         commit: &klights_cluster_core::LogApplyCommit,
         rv: &mut i64,
-    ) -> tokio_rusqlite::Result<bool> {
+    ) -> klights_supervisor::DbClosureResult<bool> {
         let ledger_only = commit.mutations().is_empty();
         if ledger_only {
             *rv = Self::current_resource_version_in_tx(tx)?;
@@ -465,7 +465,7 @@ impl Datastore {
     fn author_live_commit(
         candidate_resource_version: i64,
         mut mutations: Vec<klights_cluster_core::LogApplyMutation>,
-    ) -> tokio_rusqlite::Result<klights_cluster_core::LogApplyCommit> {
+    ) -> klights_supervisor::DbClosureResult<klights_cluster_core::LogApplyCommit> {
         fn clear_metadata_resource_version(data: &mut serde_json::Value) {
             if let Some(metadata) = data
                 .pointer_mut("/metadata")
@@ -531,7 +531,7 @@ impl Datastore {
     fn author_live_commit_from_cluster_mutations(
         candidate_resource_version: i64,
         mutations: Vec<klights_cluster_core::ClusterMutation>,
-    ) -> tokio_rusqlite::Result<klights_cluster_core::LogApplyCommit> {
+    ) -> klights_supervisor::DbClosureResult<klights_cluster_core::LogApplyCommit> {
         Self::author_live_commit(
             candidate_resource_version,
             mutations
@@ -574,7 +574,7 @@ impl Datastore {
         authoring_node: &str,
         resource_version_hint: Option<i64>,
         operation_now: chrono::DateTime<chrono::Utc>,
-    ) -> tokio_rusqlite::Result<(klights_cluster_core::LogApplyCommit, i64)> {
+    ) -> klights_supervisor::DbClosureResult<(klights_cluster_core::LogApplyCommit, i64)> {
         use crate::sqlite::mutation_helpers::serde_to_sqlite_error;
         use crate::sqlite::resource_shape::{
             ensure_metadata_create_defaults, ensure_metadata_identity, ensure_metadata_uid,
@@ -707,7 +707,7 @@ impl Datastore {
                             rusqlite::Error::QueryReturnedNoRows => {
                                 Self::sqlite_conversion_error(anyhow!("Namespace {name} not found"))
                             }
-                            other => tokio_rusqlite::Error::Rusqlite(other),
+                            other => klights_supervisor::DbError::from(other),
                         })?;
                     let live: Value =
                         serde_json::from_slice(&live_data).map_err(serde_to_sqlite_error)?;
@@ -1166,7 +1166,7 @@ impl Datastore {
                             rusqlite::Error::QueryReturnedNoRows => {
                                 Self::sqlite_conversion_error(anyhow!("Namespace {name} not found"))
                             }
-                            other => tokio_rusqlite::Error::Rusqlite(other),
+                            other => klights_supervisor::DbError::from(other),
                         })?;
                     validate_resource_preconditions(&preconditions, Some(&current_uid), current_rv)
                         .map_err(Self::sqlite_conversion_error)?;
@@ -1476,7 +1476,7 @@ impl Datastore {
                         rusqlite::Error::QueryReturnedNoRows => {
                             Self::sqlite_conversion_error(anyhow!("Namespace {name} not found"))
                         }
-                        other => tokio_rusqlite::Error::Rusqlite(other),
+                        other => klights_supervisor::DbError::from(other),
                     })?;
                 validate_resource_preconditions(
                     &ResourcePreconditions::resource_version(expected_rv),
@@ -1743,7 +1743,7 @@ impl Datastore {
                     &pod_name,
                 )?;
                 if live_uid != pod_uid {
-                    return Err(tokio_rusqlite::Error::Rusqlite(
+                    return Err(klights_supervisor::DbError::Sqlite(
                         rusqlite::Error::QueryReturnedNoRows,
                     ));
                 }
@@ -1754,7 +1754,7 @@ impl Datastore {
                     .and_then(|value| value.as_str())
                     != Some(node_name.as_str())
                 {
-                    return Err(tokio_rusqlite::Error::Rusqlite(
+                    return Err(klights_supervisor::DbError::Sqlite(
                         rusqlite::Error::QueryReturnedNoRows,
                     ));
                 }
@@ -1943,7 +1943,7 @@ impl Datastore {
                 )
             }
             _ => {
-                return Err(tokio_rusqlite::Error::Rusqlite(
+                return Err(klights_supervisor::DbError::Sqlite(
                     rusqlite::Error::InvalidQuery,
                 ));
             }
@@ -1952,10 +1952,16 @@ impl Datastore {
         Ok((commit, rv))
     }
 
-    pub async fn db_call<T, F>(&self, query_name: &'static str, f: F) -> tokio_rusqlite::Result<T>
+    pub async fn db_call<T, F>(
+        &self,
+        query_name: &'static str,
+        f: F,
+    ) -> klights_supervisor::DbCallResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> klights_supervisor::DbClosureResult<T>
+            + Send
+            + 'static,
     {
         self.executor.call_raw(query_name, f).await
     }
@@ -1965,11 +1971,13 @@ impl Datastore {
         query_name: &'static str,
         f: F,
         post_commit: C,
-    ) -> tokio_rusqlite::Result<T>
+    ) -> klights_supervisor::DbCallResult<T>
     where
         T: Send + 'static,
         P: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<(T, P)> + Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> klights_supervisor::DbClosureResult<(T, P)>
+            + Send
+            + 'static,
         C: FnOnce(P) + Send + 'static,
     {
         self.executor
@@ -1981,10 +1989,12 @@ impl Datastore {
         &self,
         query_name: &'static str,
         f: F,
-    ) -> tokio_rusqlite::Result<T>
+    ) -> klights_supervisor::DbCallResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> klights_supervisor::DbClosureResult<T>
+            + Send
+            + 'static,
     {
         self.read_executor.call_raw(query_name, f).await
     }
@@ -2007,7 +2017,7 @@ impl Datastore {
                 })
             })
             .optional()
-            .map_err(tokio_rusqlite::Error::from)
+            .map_err(klights_supervisor::DbError::from)
         })
         .await
         .map_err(|e| anyhow!("applied outbox get failed: {e}"))
@@ -2973,7 +2983,7 @@ impl Datastore {
         authoring_node: &str,
         context: &live_apply::TransactionContext<'_>,
         operation_now: chrono::DateTime<chrono::Utc>,
-    ) -> tokio_rusqlite::Result<AtomicOutboxMutation> {
+    ) -> klights_supervisor::DbClosureResult<AtomicOutboxMutation> {
         use klights_cluster_core::StorageResponse;
 
         let durable_actor_cascade = Self::is_bound_pod_finalization_delivery(&command, operation);
@@ -3024,7 +3034,7 @@ impl Datastore {
         command: klights_cluster_core::command::StorageCommand,
         operation: &str,
         authoring_node: &str,
-    ) -> tokio_rusqlite::Result<AtomicOutboxMutation> {
+    ) -> klights_supervisor::DbClosureResult<AtomicOutboxMutation> {
         let codec = crate::test_fixtures::outbox::new_codec();
         let context = live_apply::TransactionContext::new(codec.as_ref());
         Self::apply_outbox_command_in_tx_with_context(
@@ -3045,7 +3055,7 @@ impl Datastore {
         namespace: Option<&str>,
         name: &str,
         resource_version: i64,
-    ) -> tokio_rusqlite::Result<Option<Value>> {
+    ) -> klights_supervisor::DbClosureResult<Option<Value>> {
         transaction_primitives::resource_snapshot_for_key_at_rv(
             tx,
             api_version,
@@ -3217,7 +3227,7 @@ impl Datastore {
         live: &mut Value,
         patch_kind: klights_cluster_core::PatchKind,
         patch: Value,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         let _ = (api_version, kind);
         let existing = live.clone();
         match patch_kind {
@@ -3240,7 +3250,8 @@ impl Datastore {
         node_name: &str,
         metadata: &klights_cluster_store::DataplanePeerMetadata,
         resource_version: i64,
-    ) -> tokio_rusqlite::Result<Option<klights_cluster_core::LogApplyResourceRow>> {
+    ) -> klights_supervisor::DbClosureResult<Option<klights_cluster_core::LogApplyResourceRow>>
+    {
         let Some((_current_rv, current_uid, current_bytes)) = tx
             .query_row(
                 queries::CLUSTER_GET_DATA_FOR_DELETE,
@@ -3418,7 +3429,7 @@ impl Datastore {
         tx: &rusqlite::Transaction<'_>,
         operation: &str,
         command: &klights_cluster_core::command::StorageCommand,
-    ) -> tokio_rusqlite::Result<bool> {
+    ) -> klights_supervisor::DbClosureResult<bool> {
         let idempotent_create = operation
             == klights_cluster_core::OutboxOperation::EventCreate.as_str()
             || operation == klights_cluster_core::OutboxOperation::NodeRegistration.as_str();
@@ -3448,7 +3459,7 @@ impl Datastore {
     fn terminal_error_for_stale_uid_bound_pod_in_tx(
         tx: &rusqlite::Transaction<'_>,
         command: &klights_cluster_core::command::StorageCommand,
-    ) -> tokio_rusqlite::Result<Option<klights_cluster_core::OutboxApplyError>> {
+    ) -> klights_supervisor::DbClosureResult<Option<klights_cluster_core::OutboxApplyError>> {
         let Some((namespace, name, expected_uid)) = Self::uid_bound_pod_target(command) else {
             return Ok(None);
         };
@@ -3521,14 +3532,14 @@ impl Datastore {
         Some((namespace, name.as_str(), expected_uid))
     }
 
-    fn sqlite_conversion_error(err: impl std::fmt::Display) -> tokio_rusqlite::Error {
-        tokio_rusqlite::Error::Rusqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(
+    fn sqlite_conversion_error(err: impl std::fmt::Display) -> klights_supervisor::DbError {
+        klights_supervisor::DbError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(
             std::io::Error::other(err.to_string()),
         )))
     }
 
     fn outbox_apply_error_from_db_error(
-        err: tokio_rusqlite::Error,
+        err: tokio_rusqlite::Error<klights_supervisor::DbError>,
     ) -> klights_cluster_core::OutboxApplyError {
         let msg = err.to_string();
         if msg.contains("409 Conflict") {
@@ -3675,7 +3686,7 @@ impl Datastore {
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-    ) -> tokio_rusqlite::Result<(i64, String, Vec<u8>)> {
+    ) -> klights_supervisor::DbClosureResult<(i64, String, Vec<u8>)> {
         if use_namespaced_table(api_version, kind, &namespace) {
             tx.query_row(
                 queries::NAMESPACED_GET_DATA_FOR_DELETE,
@@ -3688,7 +3699,7 @@ impl Datastore {
                     namespace.unwrap_or("default"),
                     name
                 )),
-                other => tokio_rusqlite::Error::Rusqlite(other),
+                other => Self::sqlite_conversion_error(other),
             })
         } else {
             tx.query_row(
@@ -3700,7 +3711,7 @@ impl Datastore {
                 rusqlite::Error::QueryReturnedNoRows => Self::sqlite_conversion_error(anyhow!(
                     "Resource not found: {api_version}/{kind} {name}"
                 )),
-                other => tokio_rusqlite::Error::Rusqlite(other),
+                other => Self::sqlite_conversion_error(other),
             })
         }
     }
@@ -3711,7 +3722,7 @@ impl Datastore {
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-    ) -> tokio_rusqlite::Result<Option<(i64, String, Vec<u8>)>> {
+    ) -> klights_supervisor::DbClosureResult<Option<(i64, String, Vec<u8>)>> {
         if use_namespaced_table(api_version, kind, &namespace) {
             tx.query_row(
                 queries::NAMESPACED_GET_DATA_FOR_DELETE,
@@ -3719,7 +3730,7 @@ impl Datastore {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
-            .map_err(tokio_rusqlite::Error::Rusqlite)
+            .map_err(klights_supervisor::DbError::Sqlite)
         } else {
             tx.query_row(
                 queries::CLUSTER_GET_DATA_FOR_DELETE,
@@ -3727,7 +3738,7 @@ impl Datastore {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
-            .map_err(tokio_rusqlite::Error::Rusqlite)
+            .map_err(klights_supervisor::DbError::Sqlite)
         }
     }
 
@@ -3768,7 +3779,7 @@ impl Datastore {
                 queries::APPLIED_OUTBOX_DELETE_EXPIRED,
                 rusqlite::params![cutoff],
             )
-            .map_err(tokio_rusqlite::Error::from)
+            .map_err(klights_supervisor::DbError::from)
         })
         .await
         .map_err(|e| anyhow!("applied outbox gc failed: {e}"))
@@ -3903,12 +3914,9 @@ impl Datastore {
     ///
     /// Opens explicit cluster and node-local SQLite database files.
     ///
-    /// If `key_file` is `Some`, the DB is opened with SQLCipher encryption
-    /// (requires the `sqlcipher` cargo feature).
     async fn new_persistent_paths_inner(
         cluster_db_path: &std::path::Path,
         supervisor: std::sync::Arc<TaskSupervisor>,
-        key_file: Option<&std::path::Path>,
         #[cfg(any(test, feature = "test-support"))] commit_sink: Option<
             std::sync::Arc<dyn CommitObservationSink>,
         >,
@@ -3916,13 +3924,7 @@ impl Datastore {
         wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
         let db_path = cluster_db_path.to_path_buf();
-        let opts = opener::OpenOpts::disk(db_path.clone()).with_key_file(key_file)?;
-        if let Some(kf) = key_file {
-            tracing::info!(
-                key_file = %kf.display(),
-                "opening encrypted datastore"
-            );
-        }
+        let opts = opener::OpenOpts::disk(db_path.clone());
 
         let executor = crate::sqlite::open_with_opts(opts, supervisor.clone(), "sqlite:cluster")
             .await
@@ -3933,7 +3935,7 @@ impl Datastore {
                     e
                 )
             })?;
-        let read_opts = opener::OpenOpts::disk(db_path.clone()).with_key_file(key_file)?;
+        let read_opts = opener::OpenOpts::disk(db_path.clone());
         let read_executor = crate::sqlite::open_read_only_with_opts(
             read_opts.clone(),
             supervisor.clone(),
@@ -3980,14 +3982,12 @@ impl Datastore {
     pub async fn new_persistent_paths(
         cluster_db_path: &std::path::Path,
         supervisor: std::sync::Arc<TaskSupervisor>,
-        key_file: Option<&std::path::Path>,
         outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
         wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
         Self::new_persistent_paths_inner(
             cluster_db_path,
             supervisor,
-            key_file,
             #[cfg(any(test, feature = "test-support"))]
             None,
             outbox_codec,
@@ -4001,7 +4001,6 @@ impl Datastore {
     pub async fn new_persistent_paths_with_sink(
         cluster_db_path: &std::path::Path,
         supervisor: std::sync::Arc<TaskSupervisor>,
-        key_file: Option<&std::path::Path>,
         commit_sink: std::sync::Arc<dyn CommitObservationSink>,
         outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
         wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
@@ -4009,7 +4008,6 @@ impl Datastore {
         Self::new_persistent_paths_inner(
             cluster_db_path,
             supervisor,
-            key_file,
             Some(commit_sink),
             outbox_codec,
             wall_clock,
@@ -4023,12 +4021,10 @@ impl Datastore {
     pub async fn new_persistent(
         db_root: &std::path::Path,
         supervisor: std::sync::Arc<TaskSupervisor>,
-        key_file: Option<&std::path::Path>,
     ) -> Result<Self> {
         Self::new_persistent_paths_with_sink(
             &db_root.join("sqlite").join("cluster.db"),
             supervisor,
-            key_file,
             crate::test_fixtures::commit_observation::new_sink(),
             crate::test_fixtures::outbox::new_codec(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),

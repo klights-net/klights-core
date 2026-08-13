@@ -20,7 +20,7 @@ pub fn update_status_in_conn(
     name: &str,
     status: Value,
     preconditions: ResourcePreconditions,
-) -> tokio_rusqlite::Result<StatusUpdate> {
+) -> klights_supervisor::DbClosureResult<StatusUpdate> {
     let expected_rv = preconditions.resource_version;
     let expected_uid = preconditions.uid;
     let (id, current_rv, live_uid, current_bytes): (i64, i64, String, Vec<u8>) =
@@ -42,7 +42,7 @@ pub fn update_status_in_conn(
             .as_deref()
             .is_some_and(|expected| expected != live_uid)
     {
-        return Err(tokio_rusqlite::Error::Rusqlite(
+        return Err(klights_supervisor::DbError::Sqlite(
             rusqlite::Error::QueryReturnedNoRows,
         ));
     }
@@ -88,7 +88,7 @@ pub fn update_status_in_conn(
         )?
     };
     if rows == 0 {
-        return Err(tokio_rusqlite::Error::Rusqlite(
+        return Err(klights_supervisor::DbError::Sqlite(
             rusqlite::Error::QueryReturnedNoRows,
         ));
     }

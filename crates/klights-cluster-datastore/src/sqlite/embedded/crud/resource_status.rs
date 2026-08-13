@@ -87,7 +87,9 @@ impl Datastore {
                     data: std::sync::Arc::new(data),
                 })
             }
-            Err(tokio_rusqlite::Error::Rusqlite(rusqlite::Error::QueryReturnedNoRows)) => {
+            Err(tokio_rusqlite::Error::Error(klights_supervisor::DbError::Sqlite(
+                rusqlite::Error::QueryReturnedNoRows,
+            ))) => {
                 if let Some(expected_uid) = expected_uid_for_log.as_deref() {
                     self.warn_uid_precondition_mismatch_if_live(
                         "update_status_only",

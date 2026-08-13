@@ -69,13 +69,6 @@ pub struct KlightsConfig {
     /// When true, use an in-memory datastore instead of persistent disk.
     pub in_memory: bool,
 
-    /// Database encryption mode.
-    pub db_encryption: DbEncryption,
-
-    /// Path to the SQLCipher key file (only used when db_encryption=Sqlcipher).
-    /// Defaults to the configured DB root key path when not set.
-    pub db_key_file: Option<std::path::PathBuf>,
-
     /// Cluster datastore backend selection.
     pub datastore_backend: BackendKind,
 
@@ -112,22 +105,15 @@ pub struct KlightsConfig {
     pub webhook_auth_cache_unauthorized_ttl_secs: u64,
 }
 
-/// Database encryption mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DbEncryption {
-    /// Plaintext (default).
-    Disabled,
-    /// SQLCipher whole-file encryption (requires `sqlcipher` cargo feature).
-    Sqlcipher,
-}
-
-impl DbEncryption {
-    fn from_env() -> Self {
-        match std::env::var("KLIGHTS_DB_ENCRYPTION").as_deref() {
-            Ok("sqlcipher") => DbEncryption::Sqlcipher,
-            _ => DbEncryption::Disabled,
+fn reject_retired_db_encryption_env() -> anyhow::Result<()> {
+    for variable in ["KLIGHTS_DB_ENCRYPTION", "KLIGHTS_DB_KEY_FILE"] {
+        if std::env::var_os(variable).is_some() {
+            anyhow::bail!(
+                "{variable} is unsupported: klights has no maintained encryption-at-rest provider with SQLite >= 3.53.4"
+            );
         }
     }
+    Ok(())
 }
 
 fn parse_pod_subnet(raw: &str) -> anyhow::Result<String> {
@@ -209,10 +195,7 @@ impl KlightsConfig {
         let node_db_path =
             crate::paths::node_db_path(&containerd_namespace, node_local_backend.as_str());
         let in_memory = parse_bool_env("KLIGHTS_IN_MEMORY", false)?;
-        let db_encryption = DbEncryption::from_env();
-        let db_key_file = std::env::var("KLIGHTS_DB_KEY_FILE")
-            .ok()
-            .map(std::path::PathBuf::from);
+        reject_retired_db_encryption_env()?;
         let containerd_socket = std::env::var("KLIGHTS_CONTAINERD_SOCKET").ok();
         let registry_proxy_endpoint = std::env::var("KLIGHTS_REGISTRY_PROXY_ENDPOINT").ok();
         let registry_proxy = klights_kubelet::registry_proxy::RegistryProxyConfig::from_inputs(
@@ -272,8 +255,6 @@ impl KlightsConfig {
                 DEFAULT_GC_INTERVAL_SECONDS,
             )),
             in_memory,
-            db_encryption,
-            db_key_file,
             datastore_backend,
             node_local_backend,
 
@@ -376,8 +357,6 @@ impl KlightsConfig {
             max_watch_events: DEFAULT_MAX_WATCH_EVENTS,
             gc_interval: std::time::Duration::from_secs(DEFAULT_GC_INTERVAL_SECONDS),
             in_memory: true,
-            db_encryption: DbEncryption::Disabled,
-            db_key_file: None,
             datastore_backend: BackendKind::Sqlite,
             node_local_backend: BackendKind::Sqlite,
 
@@ -523,7 +502,7 @@ pub fn resolve_local_pod_subnet(node_subnet: Option<String>, fallback_pod_subnet
 mod tests {
     use super::*;
     use crate::datastore::backend_kind::BackendKind;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
 
     // Global lock to serialize env var tests (env vars are process-global)
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -568,16 +547,39 @@ mod tests {
         unsafe { std::env::remove_var("KLIGHTS_DATASTORE_BACKEND") };
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var("KLIGHTS_NODE_LOCAL_BACKEND") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("KLIGHTS_DB_ENCRYPTION") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("KLIGHTS_DB_KEY_FILE") };
         unsafe { std::env::remove_var("KLIGHTS_API_SLOW_LOG_MS") };
         unsafe { std::env::remove_var("KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS") };
         unsafe { std::env::remove_var("KLIGHTS_MAX_WATCH_EVENTS") };
         unsafe { std::env::remove_var("KLIGHTS_GC_INTERVAL_SECS") };
     }
 
+    struct ConfigEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl ConfigEnvGuard {
+        fn new() -> Self {
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            clear_klights_env();
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for ConfigEnvGuard {
+        fn drop(&mut self) {
+            clear_klights_env();
+        }
+    }
+
     #[test]
     fn test_config_default_values() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
 
         let config = KlightsConfig::from_env().expect("env config valid in test");
 
@@ -638,9 +640,37 @@ mod tests {
     }
 
     #[test]
-    fn ambient_runtime_inputs_preserve_defaults_invalid_fallbacks_and_valid_overrides() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn retired_database_encryption_environment_is_rejected() {
+        let _guard = ConfigEnvGuard::new();
+        // SAFETY: ConfigEnvGuard serializes environment mutation in this module.
+        unsafe { std::env::set_var("KLIGHTS_DB_ENCRYPTION", "sqlcipher") };
+
+        let error = KlightsConfig::from_env().expect_err("retired provider must fail closed");
+        assert!(error.to_string().contains("SQLite >= 3.53.4"));
+
         clear_klights_env();
+    }
+
+    #[test]
+    fn config_environment_guard_clears_retired_inputs_after_panic() {
+        let result = std::panic::catch_unwind(|| {
+            let _guard = ConfigEnvGuard::new();
+            // SAFETY: ConfigEnvGuard serializes environment mutation in this module.
+            unsafe { std::env::set_var("KLIGHTS_DB_ENCRYPTION", "sqlcipher") };
+            // SAFETY: ConfigEnvGuard serializes environment mutation in this module.
+            unsafe { std::env::set_var("KLIGHTS_DB_KEY_FILE", "/tmp/retired-key") };
+            panic!("exercise ConfigEnvGuard cleanup during unwinding");
+        });
+        assert!(result.is_err());
+
+        let _guard = ConfigEnvGuard::new();
+        assert!(std::env::var_os("KLIGHTS_DB_ENCRYPTION").is_none());
+        assert!(std::env::var_os("KLIGHTS_DB_KEY_FILE").is_none());
+    }
+
+    #[test]
+    fn ambient_runtime_inputs_preserve_defaults_invalid_fallbacks_and_valid_overrides() {
+        let _guard = ConfigEnvGuard::new();
         unsafe { std::env::set_var("KLIGHTS_API_SLOW_LOG_MS", "0") };
         unsafe { std::env::set_var("KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS", "-1") };
         unsafe { std::env::set_var("KLIGHTS_MAX_WATCH_EVENTS", "invalid") };
@@ -679,8 +709,7 @@ mod tests {
 
     #[test]
     fn datastore_backend_env_defaults_to_sqlite() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
 
         let config = KlightsConfig::from_env().expect("env config valid in test");
 
@@ -690,8 +719,7 @@ mod tests {
 
     #[test]
     fn node_local_backend_env_defaults_to_sqlite() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
 
         let config = KlightsConfig::from_env().expect("env config valid in test");
 
@@ -701,8 +729,7 @@ mod tests {
 
     #[test]
     fn datastore_and_node_local_backend_env_can_differ() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("KLIGHTS_DATASTORE_BACKEND", "redb") };
         // TODO: Audit that the environment access only happens in single-threaded code.
@@ -718,8 +745,7 @@ mod tests {
 
     #[test]
     fn legacy_backend_env_does_not_select_node_local_backend() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("KLIGHTS_BACKEND", "redb") };
 
@@ -737,8 +763,7 @@ mod tests {
 
     #[test]
     fn test_config_custom_values() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("KLIGHTS_BRIDGE_NAME", "klights-dev") };
         // TODO: Audit that the environment access only happens in single-threaded code.
@@ -768,8 +793,7 @@ mod tests {
 
     #[test]
     fn log_file_true_uses_data_root_klights_log_case_insensitive() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("KLIGHTS_CONTAINERD_NAMESPACE", "klights-dev") };
         // TODO: Audit that the environment access only happens in single-threaded code.
@@ -786,8 +810,7 @@ mod tests {
 
     #[test]
     fn test_external_endpoint_and_worker_no_ingress_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("KLIGHTS_EXTERNAL_ENDPOINT", " 192.0.2.55 ") };
         // TODO: Audit that the environment access only happens in single-threaded code.
@@ -801,8 +824,7 @@ mod tests {
 
     #[test]
     fn test_config_cluster_cidr_explicit_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("KLIGHTS_POD_SUBNET", "10.44.0.0/17") };
         // TODO: Audit that the environment access only happens in single-threaded code.
@@ -816,8 +838,7 @@ mod tests {
 
     #[test]
     fn test_config_bridge_name_defaults_to_namespace() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("KLIGHTS_CONTAINERD_NAMESPACE", "my-namespace") };
 
@@ -834,8 +855,7 @@ mod tests {
 
     #[test]
     fn test_config_containerd_socket_default() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
 
         let config = KlightsConfig::from_env().expect("env config valid in test");
 
@@ -845,8 +865,7 @@ mod tests {
 
     #[test]
     fn anonymous_auth_env_can_disable_anonymous_requests() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("KLIGHTS_ANONYMOUS_AUTH", "false") };
 
@@ -857,8 +876,7 @@ mod tests {
 
     #[test]
     fn test_config_containerd_socket_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
         let sock_path = format!(
             "{}/containerd.sock",
             crate::paths::test_data_root_path("klights-test").display()
@@ -876,8 +894,7 @@ mod tests {
 
     #[test]
     fn test_config_node_name_override_from_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("KLIGHTS_NODE_NAME", "192.168.8.22") };
 
@@ -888,8 +905,7 @@ mod tests {
 
     #[test]
     fn test_config_node_ip_override_from_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("KLIGHTS_NODE_IP", " 192.168.8.23 ") };
 
@@ -912,8 +928,7 @@ mod tests {
 
     #[test]
     fn test_bridge_name_truncated_to_15_chars() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("KLIGHTS_BRIDGE_NAME", "klights-developer-1") }; // 19 chars
 
@@ -925,8 +940,7 @@ mod tests {
 
     #[test]
     fn test_bridge_name_under_15_unchanged() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("KLIGHTS_BRIDGE_NAME", "klights") }; // 7 chars
 
@@ -938,8 +952,7 @@ mod tests {
 
     #[test]
     fn test_bridge_name_exactly_15_unchanged() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var("KLIGHTS_BRIDGE_NAME", "tes-developer-1") }; // Exactly 15 chars
 
@@ -951,8 +964,7 @@ mod tests {
 
     #[test]
     fn test_bridge_name_truncation_preserves_uniqueness() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
+        let _guard = ConfigEnvGuard::new();
 
         // Test developer-1
         // TODO: Audit that the environment access only happens in single-threaded code.

@@ -87,8 +87,10 @@ tokio-util = "0.7"
 axum = { version = "0.8", features = ["ws"] }
 rustls = { version = "0.23", features = ["ring"] }
 rcgen = { version = "0.13", features = ["x509-parser"] }
-rusqlite = { version = "0.32", features = ["hooks", "backup"] }
-tokio-rusqlite = "0.6"
+# Immutable upstream revisions: rusqlite carries official SQLite 3.53.4 and
+# tokio-rusqlite PR #54 raises its compatibility requirement to rusqlite 0.40.
+rusqlite = { git = "https://github.com/rusqlite/rusqlite.git", rev = "5f375768baec5637f502dbcba3ff474a8e4daf6c", default-features = false, features = ["bundled", "hooks", "backup"] }
+tokio-rusqlite = { git = "https://github.com/programatik29/tokio-rusqlite.git", rev = "d8316eda22d666e740c4a40a147bd77524b40f1e" }
 redb = "4"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -187,10 +189,11 @@ package = "klights"
 default-features = false
 features = ["full"]
 
-[workspace.metadata.klights.feature-matrix.root-sqlcipher]
-package = "klights"
-default-features = false
-features = ["full", "sqlcipher"]
+[patch.crates-io]
+# tokio-rusqlite PR #54 names this released-source dependency by version. Patch
+# it to the same immutable upstream tree used by every direct workspace edge.
+rusqlite = { git = "https://github.com/rusqlite/rusqlite.git", rev = "5f375768baec5637f502dbcba3ff474a8e4daf6c" }
+libsqlite3-sys = { git = "https://github.com/rusqlite/rusqlite.git", rev = "5f375768baec5637f502dbcba3ff474a8e4daf6c" }
 
 [workspace.metadata.klights.feature-matrix.workspace-unit]
 package = "*"
@@ -326,11 +329,4 @@ native-api-test-support = [
     "klights-kubelet/test-support",
     "klights-networking/test-support",
     "klights-watch/integration-test-harness",
-]
-sqlcipher = [
-    "sqlite",
-    "rusqlite/bundled-sqlcipher-vendored-openssl",
-    "klights-cluster-datastore/sqlcipher",
-    "klights-node-datastore/sqlcipher",
-    "klights-supervisor/sqlcipher",
 ]

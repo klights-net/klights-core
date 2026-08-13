@@ -17,7 +17,11 @@ fn sqlite_port_error(error: anyhow::Error) -> ClusterStoreError {
     )
 }
 
-fn sqlite_db_port_error(error: tokio_rusqlite::Error) -> ClusterStoreError {
+/// Preserve the project-owned closure error through the generic
+/// tokio-rusqlite wrapper before presenting it at the persistence port.
+fn sqlite_db_port_error(
+    error: tokio_rusqlite::Error<klights_supervisor::DbError>,
+) -> ClusterStoreError {
     sqlite_port_error(anyhow::Error::from(error))
 }
 

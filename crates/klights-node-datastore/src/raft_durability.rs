@@ -44,10 +44,16 @@ impl SqliteRaftDurability {
         Self { executor }
     }
 
-    async fn call<T, F>(&self, query_name: &'static str, call: F) -> tokio_rusqlite::Result<T>
+    async fn call<T, F>(
+        &self,
+        query_name: &'static str,
+        call: F,
+    ) -> klights_supervisor::DbCallResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> klights_supervisor::DbClosureResult<T>
+            + Send
+            + 'static,
     {
         self.executor.call_raw(query_name, call).await
     }
@@ -107,7 +113,10 @@ fn index_i64(field: &'static str, value: u64) -> Result<i64, RaftDurabilityError
     })
 }
 
-fn map_db_error(operation: &'static str, error: tokio_rusqlite::Error) -> RaftDurabilityError {
+fn map_db_error(
+    operation: &'static str,
+    error: tokio_rusqlite::Error<klights_supervisor::DbError>,
+) -> RaftDurabilityError {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
     while let Some(current) = source {
         if let Some(error) = current.downcast_ref::<RaftDurabilityError>() {

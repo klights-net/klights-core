@@ -20,7 +20,6 @@ extern crate self as klights;
 #[cfg(test)]
 mod shutdown_test;
 
-pub use bootstrap::config::DbEncryption;
 pub use bootstrap::config::KlightsConfig;
 
 #[cfg(test)]

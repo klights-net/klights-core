@@ -16,7 +16,7 @@ pub struct CreateResourceInput {
 pub fn create_resource_in_conn(
     conn: &mut rusqlite::Connection,
     input: CreateResourceInput,
-) -> tokio_rusqlite::Result<(i64, i64)> {
+) -> klights_supervisor::DbClosureResult<(i64, i64)> {
     let CreateResourceInput {
         api_version,
         kind,

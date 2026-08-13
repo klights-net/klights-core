@@ -297,7 +297,7 @@ async fn list_resources_response_rv_does_not_advance_past_concurrent_delete_snap
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let db = Datastore::new_persistent(&db_root, supervisor.clone(), None)
+    let db = Datastore::new_persistent(&db_root, supervisor.clone())
         .await
         .unwrap();
 
@@ -397,7 +397,7 @@ async fn list_resources_watch_position_is_atomic_with_row_snapshot() {
         klights_supervisor::TaskCategoryConfig::default(),
     ));
     let db_root = dir.path().join("state");
-    let db = Datastore::new_persistent(&db_root, supervisor, None)
+    let db = Datastore::new_persistent(&db_root, supervisor)
         .await
         .unwrap();
 
@@ -512,7 +512,7 @@ async fn multi_target_watch_list_uses_one_snapshot_across_target_scans() {
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let db = Datastore::new_persistent(&dir.path().join("state"), supervisor, None)
+    let db = Datastore::new_persistent(&dir.path().join("state"), supervisor)
         .await
         .unwrap();
     db.create_resource(
@@ -623,7 +623,7 @@ async fn list_resources_response_rv_stays_at_snapshot_despite_retained_delete_hi
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let db = Datastore::new_persistent(&db_root, supervisor.clone(), None)
+    let db = Datastore::new_persistent(&db_root, supervisor.clone())
         .await
         .unwrap();
 

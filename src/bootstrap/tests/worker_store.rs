@@ -152,7 +152,6 @@ async fn network_metadata_surfaces_forward_through_focused_leader_ports() {
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
-        None,
         "sqlite:worker-store-focused-network-forwarding-test",
     )
     .await
@@ -296,7 +295,6 @@ async fn failed_local_pod_route_is_not_published_by_worker_mirror() {
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
-        None,
         "sqlite:worker-store-route-apply-gate-test",
     )
     .await
@@ -372,7 +370,6 @@ async fn failed_snapshot_pod_route_retries_without_committing_reflector_or_membe
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
-        None,
         "sqlite:worker-store-snapshot-apply-gate-test",
     )
     .await
@@ -579,7 +576,6 @@ async fn failed_pod_route_reconnects_and_replays_from_prior_exact_position() {
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor.clone(),
-        None,
         "sqlite:worker-store-route-replay-position-test",
     )
     .await
@@ -793,7 +789,6 @@ async fn worker_pod_get_uses_worker_cache_not_fresh_leader_state() {
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
-        None,
         "sqlite:worker-store-pod-get-fresh-test",
     )
     .await
@@ -819,7 +814,6 @@ async fn worker_store_pod_events_use_fresh_namespace_state_before_outbox_enqueue
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
-        None,
         "sqlite:worker-store-event-namespace-fresh-test",
     )
     .await
@@ -884,7 +878,6 @@ async fn worker_pod_lists_are_constrained_to_local_node() {
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
-        None,
         "sqlite:worker-store-pod-list-local-node-test",
     )
     .await
@@ -940,7 +933,6 @@ async fn worker_list_page_preserves_continuation_metadata() {
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
-        None,
         "sqlite:worker-store-pagination-test",
     )
     .await
@@ -1032,7 +1024,6 @@ async fn worker_watch_replay_respects_resume_resource_version() {
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
-        None,
         "sqlite:worker-store-watch-resume-rv-test",
     )
     .await
@@ -1111,7 +1102,6 @@ async fn worker_scalar_watch_replay_never_synthesizes_events_from_live_list_stat
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
-        None,
         "sqlite:worker-store-no-scalar-snapshot-replay-test",
     )
     .await
@@ -1146,7 +1136,6 @@ async fn worker_watch_replay_preserves_mirrored_delete_events() {
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
-        None,
         "sqlite:worker-store-watch-delete-replay-test",
     )
     .await
@@ -1235,7 +1224,6 @@ async fn worker_watch_replay_marks_resumed_bound_pod_snapshot_changes_modified()
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
-        None,
         "sqlite:worker-store-watch-resume-pod-modified-test",
     )
     .await
@@ -1346,7 +1334,6 @@ async fn reads_cluster_objects_through_worker_cache_and_runtime_rows_from_node_l
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
-        None,
         "sqlite:worker-store-test",
     )
     .await
@@ -1419,7 +1406,6 @@ async fn watch_mirror_publishes_existing_node_pods_on_startup() {
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor.clone(),
-        None,
         "sqlite:worker-store-watch-bootstrap-test",
     )
     .await
@@ -1493,7 +1479,6 @@ async fn watch_mirror_publishes_namespace_events_on_startup() {
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor.clone(),
-        None,
         "sqlite:worker-store-namespace-watch-bootstrap-test",
     )
     .await
@@ -1554,7 +1539,6 @@ async fn watch_mirror_relists_after_open_time_replay_window_expiration() {
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor.clone(),
-        None,
         "sqlite:worker-store-watch-open-expired-test",
     )
     .await
@@ -1624,7 +1608,6 @@ async fn watch_mirror_unmarked_out_of_range_reconnects_without_relist() {
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor.clone(),
-        None,
         "sqlite:worker-store-watch-unmarked-out-of-range-test",
     )
     .await
@@ -1679,7 +1662,6 @@ async fn watch_mirror_repeated_expiry_backs_off_before_next_relist() {
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor.clone(),
-        None,
         "sqlite:worker-store-watch-repeated-expiry-test",
     )
     .await
@@ -1740,7 +1722,6 @@ async fn worker_store_requeues_node_local_pod_workqueue_failures() {
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
-        None,
         "sqlite:worker-store-workqueue-retry-test",
     )
     .await
@@ -1963,7 +1944,6 @@ async fn worker_store_routes_local_pod_watch_to_lifecycle_actor() {
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor.clone(),
-        None,
         "sqlite:worker-store-terminating-pod-watch-test",
     )
     .await
@@ -2073,7 +2053,6 @@ async fn watch_mirror_replays_pods_bound_between_initial_list_and_watch() {
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
         supervisor.clone(),
-        None,
         "sqlite:worker-store-watch-handoff-test",
     )
     .await

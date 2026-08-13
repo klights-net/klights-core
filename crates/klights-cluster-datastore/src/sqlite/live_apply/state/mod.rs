@@ -74,7 +74,7 @@ impl<'tx, 'conn> RaftClusterStateApplier<'tx, 'conn> {
     pub(super) fn put_applied_outbox(
         &mut self,
         row: klights_cluster_core::LogApplyAppliedOutboxRow,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         self.outbox_mut().put_applied_outbox(row)
     }
 
@@ -96,7 +96,7 @@ impl<'tx, 'conn> RaftClusterStateApplier<'tx, 'conn> {
         mutation: ClusterMutation,
         emit_watch_events: bool,
         effects: &mut ApplyEffects,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         match mutation {
             ClusterMutation::Resource(mutation) => match mutation {
                 klights_cluster_core::ResourceMutation::PutResource(row) => {

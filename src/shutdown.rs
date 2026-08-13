@@ -1056,7 +1056,6 @@ tmpfs on /data/klights/pods/pod-a/volumes/empty-dir/cache type tmpfs (rw,relatim
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
-            None,
             "shutdown-test-node-local",
         )
         .await

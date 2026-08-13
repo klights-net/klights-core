@@ -59,12 +59,10 @@ impl Datastore {
     pub async fn new_persistent_paths(
         cluster_db_path: &std::path::Path,
         supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
-        key_file: Option<&std::path::Path>,
     ) -> Result<Self> {
         Self::new_persistent_paths_with_sink(
             cluster_db_path,
             supervisor,
-            key_file,
             #[cfg(any(test, feature = "pod-repository-test-support"))]
             crate::bootstrap::watch_commit_wiring::new_sink(),
             crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
@@ -76,7 +74,6 @@ impl Datastore {
     pub async fn new_persistent_paths_with_sink(
         cluster_db_path: &std::path::Path,
         supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
-        key_file: Option<&std::path::Path>,
         #[cfg(any(test, feature = "pod-repository-test-support"))] commit_sink: std::sync::Arc<
             dyn CommitObservationSink,
         >,
@@ -87,7 +84,6 @@ impl Datastore {
         let passive = PassiveDatastore::new_persistent_paths_with_sink(
             cluster_db_path,
             supervisor,
-            key_file,
             commit_sink,
             outbox_codec,
             wall_clock,
@@ -97,7 +93,6 @@ impl Datastore {
         let passive = PassiveDatastore::new_persistent_paths(
             cluster_db_path,
             supervisor,
-            key_file,
             outbox_codec,
             wall_clock,
         )
@@ -163,12 +158,10 @@ impl Datastore {
     pub async fn new_persistent(
         db_root: &std::path::Path,
         supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
-        key_file: Option<&std::path::Path>,
     ) -> Result<Self> {
         Self::new_persistent_paths_with_sink(
             &db_root.join("sqlite").join("cluster.db"),
             supervisor,
-            key_file,
             crate::bootstrap::watch_commit_wiring::new_sink(),
             crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),

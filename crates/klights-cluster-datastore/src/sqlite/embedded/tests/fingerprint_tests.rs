@@ -288,7 +288,10 @@ fn hash_optional_i64(hasher: &mut Sha256, value: Option<i64>) {
 async fn fingerprint_db_family_state(db: &Datastore) -> String {
     let mut hasher = Sha256::new();
 
-    async fn append_namespaces(hasher: &mut Sha256, db: &Datastore) -> tokio_rusqlite::Result<()> {
+    async fn append_namespaces(
+        hasher: &mut Sha256,
+        db: &Datastore,
+    ) -> klights_supervisor::DbClosureResult<()> {
         let rows = db
             .db_call("family-fingerprint-namespaces", |conn| {
                 let mut stmt = conn.prepare(
@@ -323,7 +326,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
     async fn append_namespaced_resources(
         hasher: &mut Sha256,
         db: &Datastore,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         let rows = db
             .db_call("family-fingerprint-namespaced-resources", |conn| {
                 let mut stmt = conn.prepare(
@@ -369,7 +372,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
     async fn append_cluster_resources(
         hasher: &mut Sha256,
         db: &Datastore,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         let rows = db
             .db_call("family-fingerprint-cluster-resources", |conn| {
                 let mut stmt = conn.prepare(
@@ -413,7 +416,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
     async fn append_watch_events(
         hasher: &mut Sha256,
         db: &Datastore,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         let rows = db
             .db_call("family-fingerprint-watch-events", |conn| {
                 let mut stmt = conn.prepare(
@@ -457,7 +460,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
     async fn append_watch_replay_floors(
         hasher: &mut Sha256,
         db: &Datastore,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         let rows = db
             .db_call("family-fingerprint-watch-replay-floors", |conn| {
                 let mut stmt = conn.prepare(
@@ -497,7 +500,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
     async fn append_node_subnets(
         hasher: &mut Sha256,
         db: &Datastore,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         let rows = db
             .db_call("family-fingerprint-node-subnets", |conn| {
                 let mut stmt = conn.prepare(
@@ -541,7 +544,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
     async fn append_node_dataplane(
         hasher: &mut Sha256,
         db: &Datastore,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         let rows = db
             .db_call("family-fingerprint-node-dataplane", |conn| {
                 let mut stmt = conn.prepare(
@@ -583,7 +586,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
     async fn append_applied_outbox(
         hasher: &mut Sha256,
         db: &Datastore,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         let rows = db
             .db_call("family-fingerprint-applied-outbox", |conn| {
                 let mut stmt = conn.prepare(
@@ -626,7 +629,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
     async fn append_pod_cleanup_intents(
         hasher: &mut Sha256,
         db: &Datastore,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         let rows = db
             .db_call("family-fingerprint-pod-cleanup-intents", |conn| {
                 let mut stmt = conn.prepare(
@@ -670,7 +673,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
     async fn append_klights_meta(
         hasher: &mut Sha256,
         db: &Datastore,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         let rows = db
             .db_call("family-fingerprint-klights-meta", |conn| {
                 let mut stmt = conn.prepare("SELECT key, value FROM _klights_meta ORDER BY key")?;

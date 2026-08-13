@@ -11,11 +11,10 @@ pub(crate) async fn open_node_local(
     kind: BackendKind,
     path: Option<&Path>,
     supervisor: Arc<TaskSupervisor>,
-    key_file: Option<&Path>,
     connection_key: &'static str,
 ) -> Result<NodeLocalStores> {
     match kind {
-        BackendKind::Sqlite => open_sqlite(path, supervisor, key_file, connection_key).await,
+        BackendKind::Sqlite => open_sqlite(path, supervisor, connection_key).await,
         BackendKind::Redb => match open_redb().await? {},
     }
 }
@@ -27,14 +26,12 @@ async fn open_redb() -> Result<std::convert::Infallible> {
 async fn open_sqlite(
     path: Option<&Path>,
     supervisor: Arc<TaskSupervisor>,
-    key_file: Option<&Path>,
     connection_key: &'static str,
 ) -> Result<NodeLocalStores> {
     let opts = match path {
         Some(path) => klights_node_datastore::open::disk_opts(path.to_path_buf()),
         None => klights_node_datastore::open::in_memory_opts(),
-    }
-    .with_key_file(key_file)?;
+    };
     let executor =
         klights_node_datastore::open::open_with_opts(opts, supervisor, connection_key).await?;
     NodeLocalStores::from_executor_with_clock(

@@ -111,7 +111,7 @@ impl<'tx, 'conn> WatchHistoryStateApplier<'tx, 'conn> {
     pub(super) fn apply_put_watch_event(
         &self,
         row: LogApplyWatchEventRow,
-    ) -> tokio_rusqlite::Result<klights_cluster_store::StagedPostCommit> {
+    ) -> klights_supervisor::DbClosureResult<klights_cluster_store::StagedPostCommit> {
         let data_bytes = serde_json::to_vec(&row.data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
         insert_watch_event_in_conn(
@@ -144,7 +144,7 @@ impl<'tx, 'conn> WatchHistoryStateApplier<'tx, 'conn> {
         &self,
         max_rows: i64,
         batch_cap: i64,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         let removed = gc_watch_events_in_tx(self.tx, max_rows, batch_cap)?;
         if removed > 0 {
             let _ = self.tx.execute("PRAGMA incremental_vacuum(1000)", []);

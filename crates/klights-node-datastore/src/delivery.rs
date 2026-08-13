@@ -38,10 +38,16 @@ impl SqliteDeliveryStore {
         }
     }
 
-    async fn call<T, F>(&self, query_name: &'static str, call: F) -> tokio_rusqlite::Result<T>
+    async fn call<T, F>(
+        &self,
+        query_name: &'static str,
+        call: F,
+    ) -> klights_supervisor::DbCallResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> klights_supervisor::DbClosureResult<T>
+            + Send
+            + 'static,
     {
         self.executor.call_raw(query_name, call).await
     }
@@ -146,7 +152,7 @@ impl SqliteDeliveryStore {
         self.call("node_local:get_meta", move |conn| {
             conn.query_row(queries::META_GET, [key], |row| row.get(0))
                 .optional()
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
         })
         .await
         .map_err(|error| anyhow::anyhow!("node meta get failed: {error}"))
@@ -206,7 +212,7 @@ impl SqliteDeliveryStore {
                 row_to_pod_status_checkpoint,
             )
             .optional()
-            .map_err(tokio_rusqlite::Error::from)
+            .map_err(klights_supervisor::DbError::from)
         })
         .await
         .map_err(|error| anyhow::anyhow!("pod_status_checkpoint get failed: {error}"))
@@ -254,6 +260,9 @@ impl SqliteDeliveryStore {
             updated_ms,
         } = checkpoint;
         let container_ids_json = serde_json::to_string(&container_ids)?;
+        let generation = i64::try_from(generation).map_err(|_| {
+            anyhow::anyhow!("runtime observation generation exceeds SQLite INTEGER")
+        })?;
         self.call(
             "node_local:runtime_observation_checkpoint_upsert",
             move |conn| {
@@ -282,7 +291,7 @@ impl SqliteDeliveryStore {
                     row_to_runtime_observation_checkpoint,
                 )
                 .optional()
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
             },
         )
         .await
@@ -473,7 +482,7 @@ impl SqliteDeliveryStore {
                     rusqlite::params![id, lease_token],
                 )?;
                 if changed != 1 {
-                    return Err(tokio_rusqlite::Error::Other(Box::new(
+                    return Err(klights_supervisor::DbError::Application(Box::new(
                         std::io::Error::other("outbox lease changed during dead-letter move"),
                     )));
                 }
@@ -568,7 +577,7 @@ impl SqliteDeliveryStore {
                     queries::OUTBOX_COMPLETE_SUPERSEDED_TERMINAL_POD_DELETE_STATUS,
                     rusqlite::params![subject_key, terminal_delete_id],
                 )
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
             },
         )
         .await
@@ -578,7 +587,7 @@ impl SqliteDeliveryStore {
     async fn requeue_expired_outbox_leases(&self, now_ms: i64) -> anyhow::Result<usize> {
         self.call("node_local:outbox_requeue_expired", move |conn| {
             conn.execute(queries::OUTBOX_REQUEUE_EXPIRED, [now_ms])
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
         })
         .await
         .map_err(|error| anyhow::anyhow!("outbox requeue expired failed: {error}"))
@@ -589,7 +598,7 @@ impl SqliteDeliveryStore {
             conn.query_row(queries::OUTBOX_NEXT_WAKE, [now_ms], |row| {
                 row.get::<_, Option<i64>>(0)
             })
-            .map_err(tokio_rusqlite::Error::from)
+            .map_err(klights_supervisor::DbError::from)
         })
         .await
         .map_err(|error| anyhow::anyhow!("outbox next wake failed: {error}"))
@@ -673,7 +682,7 @@ impl SqliteDeliveryStore {
         self.call("node_local:outbox_dead_letter_get", move |conn| {
             conn.query_row(queries::DEAD_LETTER_GET, [id], row_to_dead_letter)
                 .optional()
-                .map_err(tokio_rusqlite::Error::from)
+                .map_err(klights_supervisor::DbError::from)
         })
         .await
         .map_err(|error| anyhow::anyhow!("dead letter get failed: {error}"))
@@ -795,7 +804,7 @@ impl SqliteDeliveryStore {
                 dispatch_total,
                 dispatch_errors_total,
             )
-            .map_err(|error| tokio_rusqlite::Error::Other(Box::new(error)))
+            .map_err(|error| klights_supervisor::DbError::Application(Box::new(error)))
         })
         .await
         .map_err(|error| anyhow::anyhow!("outbox stats failed: {error}"))

@@ -250,7 +250,6 @@ mod stale_route_tests {
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
-            None,
             "sqlite:root-cni-del-test",
         )
         .await

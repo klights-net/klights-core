@@ -13,7 +13,7 @@ impl<'tx, 'conn> PodCleanupStateApplier<'tx, 'conn> {
     pub(super) fn put_pod_cleanup_intent(
         &self,
         row: LogApplyPodCleanupIntentRow,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         let pod_data = serde_json::to_vec(&row.pod_data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
         self.tx.execute(
@@ -35,7 +35,7 @@ impl<'tx, 'conn> PodCleanupStateApplier<'tx, 'conn> {
     pub(super) fn delete_pod_cleanup_intent(
         &self,
         key: LogApplyPodCleanupIntentKey,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         self.tx.execute(
             mutation_queries::POD_CLEANUP_INTENT_DELETE,
             rusqlite::params![
@@ -52,7 +52,7 @@ impl<'tx, 'conn> PodCleanupStateApplier<'tx, 'conn> {
     pub(super) fn delete_pod_cleanup_intents_for_node(
         &self,
         node_name: String,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         self.tx.execute(
             mutation_queries::POD_CLEANUP_INTENTS_DELETE_BY_NODE,
             rusqlite::params![node_name],

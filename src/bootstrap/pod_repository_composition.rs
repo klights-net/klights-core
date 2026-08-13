@@ -2358,7 +2358,6 @@ pub(crate) async fn test_node_local_store(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
-            None,
             "sqlite:pod-repository-network-test",
         )
         .await

@@ -54,7 +54,7 @@ pub fn resource_snapshot_for_key_at_rv(
     namespace: Option<&str>,
     name: &str,
     resource_version: i64,
-) -> tokio_rusqlite::Result<Option<serde_json::Value>> {
+) -> klights_supervisor::DbClosureResult<Option<serde_json::Value>> {
     let earliest: Option<i64> = tx
         .query_row(queries::WATCH_EVENTS_MIN_RV, [], |row| row.get(0))
         .optional()?;
@@ -85,6 +85,6 @@ pub fn resource_snapshot_for_key_at_rv(
         return Ok(None);
     }
     serde_json::from_slice(&bytes).map(Some).map_err(|error| {
-        tokio_rusqlite::Error::Rusqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        klights_supervisor::DbError::from(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
     })
 }

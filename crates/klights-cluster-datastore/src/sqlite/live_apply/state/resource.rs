@@ -19,7 +19,7 @@ use rusqlite::OptionalExtension;
 pub(in crate::sqlite::live_apply) fn resolve_noop_put_resource_in_tx(
     tx: &rusqlite::Transaction<'_>,
     row: LogApplyResourceRow,
-) -> tokio_rusqlite::Result<Option<LogApplyResourceRow>> {
+) -> klights_supervisor::DbClosureResult<Option<LogApplyResourceRow>> {
     let mut namespace_owned = String::new();
     let applier = ClusterStateApplier::new(tx);
     let identity = resource_identity(
@@ -81,7 +81,7 @@ impl<'tx, 'conn> ResourceWriteSink<'tx, 'conn> {
         uid: &str,
         resource_version: i64,
         data_bytes: &[u8],
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         match identity.scope {
             ResourceScope::Namespaced(namespace) => {
                 self.tx.execute(
@@ -118,7 +118,7 @@ impl<'tx, 'conn> ResourceWriteSink<'tx, 'conn> {
         &self,
         identity: ResourceIdentity<'_>,
         data_bytes: &[u8],
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         selector_index::upsert_index_entries(
             self.tx,
             identity.api_version,
@@ -141,7 +141,7 @@ impl<'tx, 'conn> ResourceWriteSink<'tx, 'conn> {
     fn delete_resource_from_identity(
         &self,
         identity: ResourceIdentity<'_>,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         match identity.scope {
             ResourceScope::Namespaced(namespace) => {
                 self.tx.execute(
@@ -167,7 +167,7 @@ impl<'tx, 'conn> ResourceWriteSink<'tx, 'conn> {
     fn delete_indexes_from_identity(
         &self,
         identity: ResourceIdentity<'_>,
-    ) -> tokio_rusqlite::Result<()> {
+    ) -> klights_supervisor::DbClosureResult<()> {
         selector_index::delete_index_entries(
             self.tx,
             identity.api_version,
@@ -193,7 +193,7 @@ impl<'tx, 'conn> ResourceWriteSink<'tx, 'conn> {
         event_type: &str,
         data_bytes: &[u8],
         data: serde_json::Value,
-    ) -> tokio_rusqlite::Result<Option<StagedPostCommit>> {
+    ) -> klights_supervisor::DbClosureResult<Option<StagedPostCommit>> {
         if !emit_watch_events {
             return Ok(None);
         }
@@ -230,7 +230,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         &self,
         mut row: LogApplyResourceRow,
         emit_watch_events: bool,
-    ) -> tokio_rusqlite::Result<Option<StagedPostCommit>> {
+    ) -> klights_supervisor::DbClosureResult<Option<StagedPostCommit>> {
         let mut namespace_owned = String::new();
         let sink = ResourceWriteSink::new(self.tx);
         let existing = {
@@ -284,7 +284,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         &self,
         patch: LogApplyResourcePatch,
         emit_watch_events: bool,
-    ) -> tokio_rusqlite::Result<Option<StagedPostCommit>> {
+    ) -> klights_supervisor::DbClosureResult<Option<StagedPostCommit>> {
         let mut namespace_owned = String::new();
         let sink = ResourceWriteSink::new(self.tx);
         let identity = resource_identity(
@@ -335,7 +335,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         resource_version: i64,
         key: LogApplyResourceKey,
         emit_watch_events: bool,
-    ) -> tokio_rusqlite::Result<Option<StagedPostCommit>> {
+    ) -> klights_supervisor::DbClosureResult<Option<StagedPostCommit>> {
         let mut namespace_owned = String::new();
         let sink = ResourceWriteSink::new(self.tx);
         let identity = resource_identity(
@@ -379,7 +379,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
     fn get_existing_resource(
         &self,
         identity: ResourceIdentity<'_>,
-    ) -> tokio_rusqlite::Result<Option<ExistingResourceRow>> {
+    ) -> klights_supervisor::DbClosureResult<Option<ExistingResourceRow>> {
         match identity.scope {
             ResourceScope::Namespaced(namespace) => self
                 .tx
@@ -400,7 +400,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
                     },
                 )
                 .optional()
-                .map_err(tokio_rusqlite::Error::from),
+                .map_err(klights_supervisor::DbError::from),
             ResourceScope::Cluster => self
                 .tx
                 .query_row(
@@ -415,7 +415,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
                     },
                 )
                 .optional()
-                .map_err(tokio_rusqlite::Error::from),
+                .map_err(klights_supervisor::DbError::from),
         }
     }
 }
@@ -490,7 +490,7 @@ fn resource_identity<'a>(
 fn normalize_committed_resource_for_apply(
     row: &mut LogApplyResourceRow,
     existing: Option<&ExistingResourceRow>,
-) -> tokio_rusqlite::Result<()> {
+) -> klights_supervisor::DbClosureResult<()> {
     merge_status_only_row_with_existing(row, existing)?;
     preserve_newer_same_uid_row_on_stale_committed_put(row, existing)?;
     preserve_same_uid_server_metadata_from_existing(row, existing)?;
@@ -503,7 +503,7 @@ fn apply_latest_patch_to_current_resource(
     current_uid: &str,
     current_bytes: &[u8],
     namespace: Option<&str>,
-) -> tokio_rusqlite::Result<serde_json::Value> {
+) -> klights_supervisor::DbClosureResult<serde_json::Value> {
     klights_cluster_core::validate_apply_preconditions(
         klights_cluster_core::ApplyPreconditions {
             uid: patch.precondition_uid.as_deref(),
@@ -588,7 +588,7 @@ fn apply_latest_patch_to_current_resource(
 fn merge_status_only_row_with_existing(
     row: &mut LogApplyResourceRow,
     existing: Option<&ExistingResourceRow>,
-) -> tokio_rusqlite::Result<()> {
+) -> klights_supervisor::DbClosureResult<()> {
     if !row.status_only {
         return Ok(());
     }
@@ -651,7 +651,7 @@ fn merge_status_only_row_with_existing(
 fn preserve_newer_same_uid_row_on_stale_committed_put(
     row: &mut LogApplyResourceRow,
     existing: Option<&ExistingResourceRow>,
-) -> tokio_rusqlite::Result<()> {
+) -> klights_supervisor::DbClosureResult<()> {
     if row.status_only {
         return Ok(());
     }
@@ -724,7 +724,7 @@ fn metadata_generation(data: &serde_json::Value) -> Option<i64> {
 fn preserve_same_uid_server_metadata_from_existing(
     row: &mut LogApplyResourceRow,
     existing: Option<&ExistingResourceRow>,
-) -> tokio_rusqlite::Result<()> {
+) -> klights_supervisor::DbClosureResult<()> {
     let Some((current_rv, current_uid, existing_bytes)) = existing else {
         return Ok(());
     };
@@ -819,7 +819,7 @@ fn pod_terminating_condition_time(data: &serde_json::Value) -> Option<&str> {
 fn validate_put_resource_apply_preconditions(
     row: &LogApplyResourceRow,
     existing: Option<&ExistingResourceRow>,
-) -> tokio_rusqlite::Result<()> {
+) -> klights_supervisor::DbClosureResult<()> {
     klights_cluster_core::validate_apply_preconditions(
         klights_cluster_core::ApplyPreconditions {
             require_absent: row.require_absent,
@@ -839,7 +839,7 @@ fn validate_put_resource_apply_preconditions(
 
 fn apply_precondition_error(
     violation: klights_cluster_core::ApplyPreconditionViolation,
-) -> tokio_rusqlite::Error {
+) -> klights_supervisor::DbError {
     match violation {
         klights_cluster_core::ApplyPreconditionViolation::AlreadyExists => apply_conflict_error(
             ApplyConflictCode::AlreadyExists,
