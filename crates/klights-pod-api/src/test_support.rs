@@ -18,6 +18,85 @@ use crate::{
     PodUpdate, PodUpdateRequest,
 };
 
+/// Canonical test fixture for the exact actor-owned bound-Pod finalization
+/// port already assembled by root. It retains no datastore or generic delete
+/// capability and exposes the exact domain outcome rather than a bool.
+#[derive(Clone)]
+pub struct BoundPodFinalizationFixture {
+    finalization: Arc<dyn crate::BoundPodFinalization>,
+}
+
+impl BoundPodFinalizationFixture {
+    pub fn new(finalization: Arc<dyn crate::BoundPodFinalization>) -> Self {
+        Self { finalization }
+    }
+
+    pub async fn finalize(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: &str,
+    ) -> Result<crate::BoundPodFinalizationOutcome, crate::BoundPodFinalizationError> {
+        let request =
+            crate::BoundPodFinalizationRequest::try_new(PodIdentity::new(namespace, name, uid))?;
+        self.finalization.finalize_bound_pod(request).await
+    }
+}
+
+#[cfg(test)]
+mod bound_finalization_fixture_tests {
+    use std::sync::Arc;
+
+    use klights_types::PodIdentity;
+
+    use crate::{
+        BoundPodFinalization, BoundPodFinalizationError, BoundPodFinalizationFuture,
+        BoundPodFinalizationOutcome, BoundPodFinalizationRequest,
+    };
+
+    use super::BoundPodFinalizationFixture;
+
+    struct RecordingFinalization;
+
+    impl BoundPodFinalization for RecordingFinalization {
+        fn finalize_bound_pod(
+            &self,
+            request: BoundPodFinalizationRequest,
+        ) -> BoundPodFinalizationFuture<'_> {
+            Box::pin(async move {
+                assert_eq!(
+                    request.identity(),
+                    &PodIdentity::new("default", "web", "old-uid")
+                );
+                Ok(BoundPodFinalizationOutcome::IdentityChanged)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_finalization_fixture_preserves_uid_qualified_request_and_outcome() {
+        let fixture = BoundPodFinalizationFixture::new(Arc::new(RecordingFinalization));
+        let outcome = fixture
+            .finalize("default", "web", "old-uid")
+            .await
+            .expect("same actor-owned finalization port");
+        assert_eq!(outcome, BoundPodFinalizationOutcome::IdentityChanged);
+    }
+
+    #[tokio::test]
+    async fn bound_finalization_fixture_rejects_missing_identity_before_calling_port() {
+        let fixture = BoundPodFinalizationFixture::new(Arc::new(RecordingFinalization));
+        let error = fixture
+            .finalize("default", "web", "")
+            .await
+            .expect_err("UID is required for actor-owned finalization");
+        assert!(matches!(
+            error,
+            BoundPodFinalizationError::InvalidRequest { .. }
+        ));
+    }
+}
+
 #[derive(Clone)]
 pub struct PodQueryPorts {
     query: Arc<dyn PodQuery>,

@@ -160,6 +160,32 @@ impl ControllerDispatcher {
             .await;
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn worker_running(&self) -> bool {
+        self.runtime.worker_running()
+    }
+
+    /// Dispatches one already-ready key for the canonical test-only runtime
+    /// fixture. It never waits for work, so a bounded fixture drain can only
+    /// iterate when it actually owns a key.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn dispatch_one_ready_for_test_support(
+        &self,
+    ) -> anyhow::Result<Option<ReconcileKey>> {
+        if self.runtime.worker_running() {
+            anyhow::bail!("controller runtime fixture refuses a concurrent worker");
+        }
+        let Some(key) = self.runtime.try_take_ready().await else {
+            return Ok(None);
+        };
+        if !self.runtime.begin_key_dispatch(&key).await {
+            anyhow::bail!("controller runtime fixture refused an in-flight key");
+        }
+        self.dispatch_key(&key).await;
+        self.runtime.finish_key_dispatch(key.clone()).await;
+        Ok(Some(key))
+    }
+
     async fn dispatch_key(&self, key: &Key) {
         let resource = match self
             .dependencies()

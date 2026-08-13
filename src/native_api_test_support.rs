@@ -6,13 +6,10 @@
 use std::sync::Arc;
 
 use crate::datastore::DatastoreHandle;
-use k8s_native_service::test_support::admission::{
-    DeterministicApiIdentity, deterministic_uuid_v4,
-};
+use k8s_native_service::test_support::admission::DeterministicApiIdentity;
 use klights_auth::test_support::{
     AllowAllAuthorizer, IntegrationCsrSignerObservation, recording_csr_signer,
 };
-use klights_reconcile_api::ControllerDispatcherPort as _;
 
 pub struct IntegrationHeldSupervisorTask {
     handle: klights_supervisor::SupervisedJoinHandle<()>,
@@ -21,56 +18,6 @@ pub struct IntegrationHeldSupervisorTask {
 impl IntegrationHeldSupervisorTask {
     pub fn abort(&self) {
         self.handle.abort();
-    }
-}
-
-/// P12.2c-owned finalizer fixture bridge. Its persistence input is the
-/// canonical narrow resource fixture; it exposes no datastore capability.
-pub async fn mark_foreground_deletion_for_integration(
-    store: klights_cluster_datastore::test_support::ResourceTestStore,
-    target: k8s_native_service::generic_command::ResourceDeleteTarget<'_>,
-    initial_resource: klights_cluster_core::Resource,
-    delete_preconditions: klights_cluster_core::ResourcePreconditions,
-) -> Result<klights_cluster_core::Resource, k8s_native_service::AppError> {
-    k8s_native_service::generic_command::mark_foreground_deletion_with_retry(
-        &store,
-        target.api_version,
-        target.kind,
-        target.namespace,
-        target.name,
-        initial_resource,
-        delete_preconditions,
-        chrono::Utc::now(),
-    )
-    .await
-}
-
-/// P12.2c-owned finalizer fixture bridge. See
-/// [`mark_foreground_deletion_for_integration`] for its narrow boundary.
-pub async fn complete_non_foreground_delete_for_integration(
-    store: klights_cluster_datastore::test_support::ResourceTestStore,
-    request: k8s_native_service::generic_command::NonForegroundDeleteRequest<'_>,
-) -> Result<k8s_native_service::generic_command::DeleteCompletion, k8s_native_service::AppError> {
-    k8s_native_service::generic_command::complete_non_foreground_delete_with_live_recheck(
-        &store, request,
-    )
-    .await
-}
-
-#[derive(Default)]
-pub(super) struct DeterministicControllerIdentity {
-    next: std::sync::atomic::AtomicU64,
-}
-
-impl klights_controllers::ControllerIdentityGenerator for DeterministicControllerIdentity {
-    fn generate_name(&self, prefix: &str) -> String {
-        let value = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("{prefix}{value:05}")
-    }
-
-    fn new_uid(&self) -> String {
-        let value = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        deterministic_uuid_v4(value)
     }
 }
 
@@ -332,11 +279,11 @@ pub struct NativeApiTestHarness {
     commit_watch_fixture: Arc<klights_watch::test_support::CommitWatchFixture>,
     nodeport_alloc: Arc<klights_controllers::service::NodePortAllocator>,
     pod_query: Arc<dyn klights_pod_api::PodQuery>,
-    pod_finalization: Arc<dyn klights_pod_api::BoundPodFinalization>,
+    bound_pod_finalization_fixture: klights_pod_api::test_support::BoundPodFinalizationFixture,
     _node_local: Arc<crate::bootstrap::node_store::NodeLocalStores>,
     #[allow(dead_code)]
     outbox_dispatcher: Arc<klights_kubelet::node_outbox::OutboxDispatcher>,
-    controller_dispatcher: Arc<klights_controllers::ControllerDispatcher>,
+    controller_runtime_fixture: klights_controllers::test_support::ControllerRuntimeFixture,
     crd_registry: klights_controllers::crd::CrdRegistry,
     service_routing: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
     node_metrics: Arc<IntegrationNodeMetrics>,
@@ -801,7 +748,7 @@ impl NativeApiTestHarness {
         let identity: Arc<dyn k8s_native_service::ApiIdentityGenerator> =
             Arc::new(DeterministicApiIdentity::default());
         let controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator> =
-            Arc::new(DeterministicControllerIdentity::default());
+            Arc::new(klights_controllers::test_support::DeterministicControllerIdentity::default());
         let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
             &config.service_cidr,
         ));
@@ -1264,6 +1211,15 @@ impl NativeApiTestHarness {
         } else {
             router.into_router()
         };
+        let controller_runtime_fixture =
+            klights_controllers::test_support::ControllerRuntimeFixture::new(
+                controller_dispatcher.clone(),
+                supervisor.clone(),
+            );
+        let bound_pod_finalization_fixture =
+            klights_pod_api::test_support::BoundPodFinalizationFixture::new(
+                bound_pod_finalization.clone(),
+            );
         Ok(Self {
             router: outer_layers.finish(router),
             datastore,
@@ -1271,10 +1227,10 @@ impl NativeApiTestHarness {
             commit_watch_fixture,
             nodeport_alloc,
             pod_query: api_pod_repository,
-            pod_finalization: bound_pod_finalization,
+            bound_pod_finalization_fixture,
             _node_local: node_local,
             outbox_dispatcher,
-            controller_dispatcher,
+            controller_runtime_fixture,
             crd_registry,
             service_routing,
             node_metrics,
@@ -1325,26 +1281,20 @@ impl NativeApiTestHarness {
         self.service_routing.request_service_routing_sync()
     }
 
-    pub async fn finalize_pod_deletion_after_actor_cleanup(
+    /// Root assembly transport retained for P12.2f deletion. The returned
+    /// fixture owns only named actor-finalization behavior.
+    pub fn bound_pod_finalization_fixture(
         &self,
-        namespace: &str,
-        name: &str,
-        uid: &str,
-    ) -> anyhow::Result<bool> {
-        let request = klights_pod_api::BoundPodFinalizationRequest::try_new(
-            klights_types::PodIdentity::new(namespace, name, uid),
-        )?;
-        let outcome = self
-            .pod_finalization
-            .finalize_bound_pod(request)
-            .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        Ok(matches!(
-            outcome,
-            klights_pod_api::BoundPodFinalizationOutcome::Removed
-                | klights_pod_api::BoundPodFinalizationOutcome::Accepted
-                | klights_pod_api::BoundPodFinalizationOutcome::IdentityChanged
-        ))
+    ) -> klights_pod_api::test_support::BoundPodFinalizationFixture {
+        self.bound_pod_finalization_fixture.clone()
+    }
+
+    /// Root assembly transport retained for P12.2f deletion. The returned
+    /// fixture owns only named controller runtime behavior.
+    pub fn controller_runtime_fixture(
+        &self,
+    ) -> klights_controllers::test_support::ControllerRuntimeFixture {
+        self.controller_runtime_fixture.clone()
     }
 
     #[allow(dead_code)]
@@ -1360,53 +1310,6 @@ impl NativeApiTestHarness {
             }
         }
         anyhow::bail!("node outbox drain exceeded 1024 deliveries")
-    }
-
-    pub async fn queued_reconcile_keys(&self) -> Vec<klights_reconcile_api::ReconcileKey> {
-        self.controller_dispatcher.pending_reconcile_keys().await
-    }
-
-    pub async fn drain_controller_reconciles(
-        &self,
-    ) -> anyhow::Result<Vec<klights_reconcile_api::ReconcileKey>> {
-        let mut drained = Vec::new();
-        for _ in 0..1024 {
-            let queued = self.controller_dispatcher.pending_reconcile_keys().await;
-            if queued.is_empty() {
-                return Ok(drained);
-            }
-            for key in queued {
-                if !drained.contains(&key) {
-                    drained.push(key);
-                }
-            }
-
-            let cancel = tokio_util::sync::CancellationToken::new();
-            let worker = self.spawn_controller_worker(cancel.clone()).await?;
-            let ready_queue_drained =
-                tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                    loop {
-                        if self
-                            .controller_dispatcher
-                            .pending_reconcile_keys()
-                            .await
-                            .is_empty()
-                        {
-                            break;
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await;
-            cancel.cancel();
-            let worker_result = worker.join().await;
-            if ready_queue_drained.is_err() {
-                worker_result?;
-                anyhow::bail!("controller reconcile ready-queue drain timed out");
-            }
-            worker_result?;
-        }
-        anyhow::bail!("controller reconcile drain exceeded 1024 worker rounds")
     }
 
     pub async fn reconcile_endpointslice(
@@ -1675,21 +1578,6 @@ impl NativeApiTestHarness {
             &klights_controllers::ControllerCoordination::new(),
         )
         .await
-    }
-
-    pub async fn spawn_controller_worker(
-        &self,
-        cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<klights_supervisor::SupervisedJoinHandle<()>, klights_supervisor::TaskAdmissionError>
-    {
-        let dispatcher = self.controller_dispatcher.clone();
-        self.task_supervisor
-            .spawn_async(
-                klights_supervisor::TaskCategory::Background,
-                "native_api_controller_worker",
-                async move { dispatcher.run_worker_pool(1, cancel).await },
-            )
-            .await
     }
 
     /// Returns the neutral native-service registry already wired into this

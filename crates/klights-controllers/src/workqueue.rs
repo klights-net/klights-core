@@ -202,6 +202,20 @@ impl WorkQueue {
         }
     }
 
+    /// Removes one currently-ready key without waiting for a future enqueue.
+    ///
+    /// This is used only by the canonical controller test-support fixture:
+    /// each successful call owns and dispatches exactly one already-ready key.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn try_take_ready(&self) -> Option<Key> {
+        let mut ready = self.ready.lock().await;
+        let key = ready.iter().next().cloned();
+        if let Some(key) = &key {
+            ready.remove(key);
+        }
+        key
+    }
+
     #[cfg(test)]
     pub async fn ready_len(&self) -> usize {
         self.ready.lock().await.len()

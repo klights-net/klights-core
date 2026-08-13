@@ -67,6 +67,11 @@ impl DispatcherRuntime {
         self.queue.take().await
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn try_take_ready(&self) -> Option<Key> {
+        self.queue.try_take_ready().await
+    }
+
     pub async fn record_success(&self, key: &Key) {
         self.retry_count.lock().await.remove(key);
     }
