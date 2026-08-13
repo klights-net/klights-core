@@ -24,6 +24,8 @@ mod state;
 pub mod status;
 pub mod streaming;
 pub mod subresources;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod watch;
 
 pub use current::{

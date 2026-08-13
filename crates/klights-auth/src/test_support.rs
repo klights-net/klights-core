@@ -4,7 +4,86 @@
 
 use anyhow::Result;
 use rcgen::{Certificate, KeyPair};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use time::OffsetDateTime;
+use tokio::sync::Notify;
+
+/// Deterministic authorization fake for full-stack integration fixtures.
+pub struct AllowAllAuthorizer;
+
+#[async_trait::async_trait]
+impl crate::authorizer::Authorizer for AllowAllAuthorizer {
+    async fn authorize(
+        &self,
+        _identity: &crate::AuthenticatedIdentity,
+        _request: &crate::request_attributes::AuthorizationRequest,
+    ) -> crate::authorizer::AuthorizationDecision {
+        crate::authorizer::AuthorizationDecision::allow("integration harness allow-all")
+    }
+}
+
+/// Observation handle paired with [`recording_csr_signer`].
+#[derive(Clone)]
+pub struct IntegrationCsrSignerObservation {
+    request_count: Arc<AtomicUsize>,
+    changed: Arc<Notify>,
+}
+
+impl IntegrationCsrSignerObservation {
+    pub fn request_count(&self) -> usize {
+        self.request_count.load(Ordering::Acquire)
+    }
+
+    pub async fn wait_for_request(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if self.request_count() > 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+struct IntegrationRecordingCsrSigner {
+    request_count: Arc<AtomicUsize>,
+    changed: Arc<Notify>,
+}
+
+impl crate::csr_signer::CsrSigner for IntegrationRecordingCsrSigner {
+    fn sign(
+        &self,
+        _request: crate::csr_signer::SignRequest,
+    ) -> Result<crate::csr_signer::SignResult, crate::CredentialOperationError> {
+        self.request_count.fetch_add(1, Ordering::AcqRel);
+        self.changed.notify_waiters();
+        Ok(crate::csr_signer::SignResult {
+            certificate_pem: "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n"
+                .to_string(),
+        })
+    }
+}
+
+/// Builds the canonical CSR signer fake and its event-driven observation handle.
+pub fn recording_csr_signer() -> (
+    Arc<dyn crate::csr_signer::CsrSigner>,
+    IntegrationCsrSignerObservation,
+) {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let changed = Arc::new(Notify::new());
+    let observation = IntegrationCsrSignerObservation {
+        request_count: Arc::clone(&request_count),
+        changed: Arc::clone(&changed),
+    };
+    let signer = Arc::new(IntegrationRecordingCsrSigner {
+        request_count,
+        changed,
+    });
+    (signer, observation)
+}
 
 pub fn generate_ca_full_at(
     valid_at: OffsetDateTime,
@@ -49,4 +128,48 @@ pub fn generate_admin_cert_at(
     valid_at: OffsetDateTime,
 ) -> Result<(String, String)> {
     crate::cert::generate_admin_cert_at(ca_cert, ca_key, valid_at)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        AuthenticatedIdentity,
+        authorizer::{AuthorizationDecision, Authorizer},
+        csr_signer::SignRequest,
+        request_attributes::AuthorizationRequest,
+    };
+
+    use super::{AllowAllAuthorizer, recording_csr_signer};
+
+    #[tokio::test]
+    async fn allow_all_authorizer_preserves_the_harness_allow_decision() {
+        let decision = AllowAllAuthorizer
+            .authorize(
+                &AuthenticatedIdentity::anonymous(),
+                &AuthorizationRequest::resource("get", "", "v1", "pods", None, None, None),
+            )
+            .await;
+
+        assert_eq!(
+            decision,
+            AuthorizationDecision::allow("integration harness allow-all")
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_csr_signer_observes_requests_without_polling() {
+        let (signer, observation) = recording_csr_signer();
+        signer
+            .sign(SignRequest {
+                csr_pem: vec![],
+                common_name: "system:node:fixture".to_string(),
+                organizations: vec!["system:nodes".to_string()],
+                usages: vec!["client auth".to_string()],
+                ttl_seconds: 300,
+            })
+            .expect("fixture signer must accept the request");
+
+        observation.wait_for_request().await;
+        assert_eq!(observation.request_count(), 1);
+    }
 }

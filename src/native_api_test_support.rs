@@ -6,6 +6,12 @@
 use std::sync::Arc;
 
 use crate::datastore::DatastoreHandle;
+use k8s_native_service::test_support::admission::{
+    DeterministicApiIdentity, deterministic_uuid_v4,
+};
+use klights_auth::test_support::{
+    AllowAllAuthorizer, IntegrationCsrSignerObservation, recording_csr_signer,
+};
 use klights_reconcile_api::ControllerDispatcherPort as _;
 
 /// Opaque root datastore capability for base-repository integration fixtures.
@@ -360,33 +366,6 @@ pub async fn delete_collection_listed_resource_for_integration(
     ))
 }
 
-fn deterministic_uuid_v4(value: u64) -> String {
-    let first = ((value & 0x000f_ffff) << 12) | ((value >> 20) & 0x0fff);
-    let second = (value >> 32) & 0xffff;
-    let third = 0x4000 | ((value >> 48) & 0x0fff);
-    let fourth = 0x8000 | ((value >> 60) & 0x000f);
-    format!("{first:08x}-{second:04x}-{third:04x}-{fourth:04x}-000000000000")
-}
-
-#[derive(Default)]
-struct DeterministicApiIdentity {
-    next: std::sync::atomic::AtomicU64,
-}
-
-impl k8s_native_service::ApiIdentityGenerator for DeterministicApiIdentity {
-    fn generate_name(&self, prefix: &str) -> String {
-        let value = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("{prefix}{value:05}")
-    }
-
-    fn new_uid(&self) -> String {
-        let value = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        deterministic_uuid_v4(value)
-    }
-}
-
-struct AllowAllAuthorizer;
-
 #[derive(Default)]
 pub(super) struct DeterministicControllerIdentity {
     next: std::sync::atomic::AtomicU64,
@@ -476,17 +455,6 @@ impl klights_node_api::NodeMetrics for UnavailableNodeMetrics {
     }
 }
 
-#[async_trait::async_trait]
-impl klights_auth::authorizer::Authorizer for AllowAllAuthorizer {
-    async fn authorize(
-        &self,
-        _identity: &klights_auth::AuthenticatedIdentity,
-        _request: &klights_auth::request_attributes::AuthorizationRequest,
-    ) -> klights_auth::authorizer::AuthorizationDecision {
-        klights_auth::authorizer::AuthorizationDecision::allow("integration harness allow-all")
-    }
-}
-
 /// Narrow integration handle around one real registered replication follower.
 pub struct IntegrationFollowerSession {
     replication: Arc<klights_replication::ReplicationService>,
@@ -571,34 +539,6 @@ impl IntegrationRemoteExecSync {
     }
 }
 
-#[derive(Clone)]
-pub struct IntegrationCsrSignerObservation {
-    request_count: Arc<std::sync::atomic::AtomicUsize>,
-    changed: Arc<tokio::sync::Notify>,
-}
-
-impl IntegrationCsrSignerObservation {
-    pub fn request_count(&self) -> usize {
-        self.request_count
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    pub async fn wait_for_request(&self) {
-        loop {
-            let changed = self.changed.notified();
-            if self.request_count() > 0 {
-                return;
-            }
-            changed.await;
-        }
-    }
-}
-
-struct IntegrationRecordingCsrSigner {
-    request_count: Arc<std::sync::atomic::AtomicUsize>,
-    changed: Arc<tokio::sync::Notify>,
-}
-
 /// In-process leader delivery for the native API fixture. This keeps the real
 /// node outbox codec, authorization, watermark, proposal, and committed-apply
 /// path while keeping the authenticated worker identity fixed by fixture
@@ -652,21 +592,6 @@ impl klights_leader_api::LeaderOutboxDelivery for IntegrationOutboxDelivery {
                 .await?;
             let (result, _, _, _) = effect.into_parts();
             Ok(result.into())
-        })
-    }
-}
-
-impl klights_auth::csr_signer::CsrSigner for IntegrationRecordingCsrSigner {
-    fn sign(
-        &self,
-        _request: klights_auth::csr_signer::SignRequest,
-    ) -> Result<klights_auth::csr_signer::SignResult, klights_auth::CredentialOperationError> {
-        self.request_count
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        self.changed.notify_waiters();
-        Ok(klights_auth::csr_signer::SignResult {
-            certificate_pem: "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n"
-                .to_string(),
         })
     }
 }
@@ -1016,12 +941,7 @@ impl NativeApiTestHarness {
 
     pub async fn with_csr_signer_observation()
     -> anyhow::Result<(Self, IntegrationCsrSignerObservation)> {
-        let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let changed = Arc::new(tokio::sync::Notify::new());
-        let observation = IntegrationCsrSignerObservation {
-            request_count: request_count.clone(),
-            changed: changed.clone(),
-        };
+        let (csr_signer, observation) = recording_csr_signer();
         let harness = Self::assemble_with_options(
             Arc::new(AllowAllAuthorizer),
             None,
@@ -1035,10 +955,7 @@ impl NativeApiTestHarness {
             None,
             false,
             IntegrationHarnessOptions {
-                csr_signer: Some(Arc::new(IntegrationRecordingCsrSigner {
-                    request_count,
-                    changed,
-                })),
+                csr_signer: Some(csr_signer),
                 ..Default::default()
             },
         )
