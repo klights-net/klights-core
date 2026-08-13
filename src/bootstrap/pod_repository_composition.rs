@@ -56,6 +56,36 @@ use klights_types::{PodIdentity, ResourceKey};
 #[cfg(test)]
 mod workqueue_tests;
 
+// P12.1f: private root Pod-repository composition/assembly tests. These
+// prove "true root Pod assembly" behavior (leader/worker construction,
+// fail-closed missing capability, background start/shutdown, durable-state
+// reconstruction, and every Pod-composition behavior formerly proven through
+// the deleted public `pod_repository_composition_test_support` feature) from
+// inside the crate, the same way `workqueue_tests` already does for the
+// workqueue. `assembly_support` holds the shared fixtures; each `*_tests`
+// module holds the test bodies formerly owned by the corresponding
+// `base:tests/pod_repository_composition/*.rs` file.
+#[cfg(test)]
+mod assembly_support;
+#[cfg(test)]
+mod bound_finalization_delivery_role_tests;
+#[cfg(test)]
+mod construction_tests;
+#[cfg(test)]
+mod delete_deadline_semantics_tests;
+#[cfg(test)]
+mod deletion_tests;
+#[cfg(test)]
+mod network_tests;
+#[cfg(test)]
+mod scheduling_tests;
+#[cfg(test)]
+mod status_tests;
+#[cfg(test)]
+mod store_watch_tests;
+#[cfg(test)]
+mod worker_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PodSchedulingMode {
     InlineSingleNode,
@@ -71,7 +101,7 @@ pub(crate) struct PostWriteMaintenanceTracker {
 
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 impl PostWriteMaintenanceTracker {
-    #[cfg(feature = "pod-repository-test-support")]
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self {
             launched: std::sync::atomic::AtomicU64::new(0),
@@ -92,7 +122,7 @@ impl PostWriteMaintenanceTracker {
         self.notify.notify_waiters();
     }
 
-    #[cfg(feature = "pod-repository-test-support")]
+    #[cfg(test)]
     pub(crate) async fn wait_for_latest(&self) {
         let target = self.launched.load(std::sync::atomic::Ordering::SeqCst);
         loop {
@@ -1834,7 +1864,7 @@ pub(crate) fn build_pod_repository_parts(
     build_pod_repository_parts_inner(config, leader_coordination, None)
 }
 
-#[cfg(feature = "pod-repository-test-support")]
+#[cfg(test)]
 pub(crate) fn build_integration_pod_repository_parts(
     config: PodRepositoryBuildConfig,
     resource_query: Arc<dyn LeaderResourceQuery>,

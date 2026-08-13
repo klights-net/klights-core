@@ -12,7 +12,7 @@ use klights_kubelet::unscheduled_deletion::{
 use klights_leader_api::{
     LeaderResourceCommand, ResourceCommandError, ResourceCommandRequest, ResourceCommandResult,
 };
-#[cfg(feature = "pod-repository-test-support")]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 use klights_pod_api::BoundPodFinalization;
 use klights_pod_api::{
     BoundPodFinalizationError, BoundPodFinalizationFuture, BoundPodFinalizationOutcome,
@@ -521,7 +521,7 @@ impl LocalBoundPodFinalizationPersistence for RootPodRepositoryPersistenceAdapte
     }
 }
 
-#[cfg(feature = "pod-repository-test-support")]
+#[cfg(any(test, feature = "pod-repository-test-support"))]
 impl BoundPodFinalization for RootPodRepositoryPersistenceAdapter {
     fn finalize_bound_pod(
         &self,
@@ -759,7 +759,7 @@ pub(crate) fn new_raft_root_parts(
     }
 }
 
-#[cfg(feature = "pod-repository-test-support")]
+#[cfg(test)]
 pub(crate) fn new_root_parts_with_delete_cas_hook(
     db: DatastoreHandle,
     delete_cas_hook: Arc<dyn PodDeleteCasTestHook>,

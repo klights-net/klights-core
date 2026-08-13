@@ -238,7 +238,7 @@ pub(crate) fn test_resource_command(
     )
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub(crate) fn test_outbox_delivery(
     db: DatastoreHandle,
     authority: &crate::bootstrap::authority::AuthorityHandle,
