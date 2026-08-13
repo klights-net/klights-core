@@ -51,6 +51,11 @@ impl std::fmt::Debug for Datastore {
 }
 
 impl Datastore {
+    #[cfg(feature = "native-api-test-support")]
+    pub(crate) fn canonical_embedded_for_test_support(&self) -> PassiveDatastore {
+        self.0.clone()
+    }
+
     pub async fn new_persistent_paths(
         cluster_db_path: &std::path::Path,
         supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,

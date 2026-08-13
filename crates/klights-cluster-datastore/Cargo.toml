@@ -10,7 +10,11 @@ publish.workspace = true
 
 [features]
 default = []
-test-support = ["klights-cluster-store/test-support"]
+test-support = [
+    "klights-cluster-store/test-support",
+    "dep:klights-leader-api",
+    "dep:klights-reconcile-api",
+]
 sqlcipher = [
     "rusqlite/bundled-sqlcipher-vendored-openssl",
     "klights-supervisor/sqlcipher",
@@ -22,7 +26,9 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 klights-cluster-core = { workspace = true }
+klights-leader-api = { workspace = true, optional = true }
 klights-cluster-store = { workspace = true }
+klights-reconcile-api = { workspace = true, optional = true }
 klights-supervisor = { workspace = true }
 klights-types = { workspace = true }
 rand_core = { workspace = true }
@@ -43,6 +49,8 @@ workspace = true
 [dev-dependencies]
 base64 = { workspace = true }
 klights-cluster-store = { workspace = true, features = ["test-support"] }
+klights-leader-api = { workspace = true }
+klights-reconcile-api = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }

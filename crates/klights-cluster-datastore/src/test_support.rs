@@ -3,6 +3,85 @@
 use klights_cluster_core::{LogApplyCommit, LogApplyMutation, Resource, ResourcePreconditions};
 use klights_cluster_store::ResourceListOptions;
 
+/// Exact mutation-pause coordinates used by resource-update race fixtures.
+///
+/// The pause remains an opt-in datastore test capability; consumers cannot
+/// obtain the concrete datastore through this re-export.
+pub use crate::sqlite::embedded::{ResourceMutationPause, ResourceMutationPauseOperation};
+
+/// Deterministic control for a durable-history replay failure fixture.
+///
+/// It intentionally affects only subsequent replay reads. Retention-floor
+/// reads continue to delegate, matching a live replay persistence failure
+/// without changing positioned list handoff behavior.
+#[derive(Clone)]
+pub struct WatchHistoryFailureControl {
+    fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl WatchHistoryFailureControl {
+    pub fn new() -> Self {
+        Self {
+            fail: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    pub fn fail_subsequent_reads(&self) {
+        self.fail.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Default for WatchHistoryFailureControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Wrap a durable-history reader with a deterministic replay-failure switch.
+///
+/// This focused fixture preserves the delegate's positioned replay and floor
+/// semantics until the control is activated.
+pub fn toggle_failing_watch_history_for_test_support(
+    delegate: std::sync::Arc<dyn klights_cluster_store::DurableWatchHistoryRead>,
+    control: WatchHistoryFailureControl,
+) -> std::sync::Arc<dyn klights_cluster_store::DurableWatchHistoryRead> {
+    std::sync::Arc::new(ToggleFailingWatchHistory {
+        delegate,
+        fail: control.fail,
+    })
+}
+
+struct ToggleFailingWatchHistory {
+    delegate: std::sync::Arc<dyn klights_cluster_store::DurableWatchHistoryRead>,
+    fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl klights_cluster_store::DurableWatchHistoryRead for ToggleFailingWatchHistory {
+    fn replay_watch_history(
+        &self,
+        request: klights_cluster_store::WatchHistoryRequest,
+    ) -> klights_cluster_store::WatchHistoryFuture<'_, klights_cluster_store::WatchHistoryRead>
+    {
+        if self.fail.load(std::sync::atomic::Ordering::Acquire) {
+            return Box::pin(async {
+                Err(
+                    klights_cluster_store::WatchHistoryError::PersistenceFailed {
+                        message: "injected live replay read failure".to_string(),
+                    },
+                )
+            });
+        }
+        self.delegate.replay_watch_history(request)
+    }
+
+    fn list_replay_floors(
+        &self,
+    ) -> klights_cluster_store::WatchHistoryFuture<'_, Vec<klights_cluster_store::DurableReplayFloor>>
+    {
+        self.delegate.list_replay_floors()
+    }
+}
+
 #[derive(Default)]
 struct GcCommitSink;
 
@@ -44,6 +123,713 @@ pub struct GcTestStore {
     datastore: crate::sqlite::embedded::Datastore,
 }
 
+/// Focused CRUD/list/watch fixture for canonical service-owner tests.
+///
+/// Root composition may bind this to its already-open canonical store. Its
+/// public surface is deliberately named K8s operations only: it never returns
+/// a backend, raw SQLite connection, or broad datastore handle.
+#[derive(Clone)]
+pub struct ResourceTestStore {
+    datastore: crate::sqlite::embedded::Datastore,
+}
+
+impl ResourceTestStore {
+    /// Consumes the canonical embedded store at the composition boundary while
+    /// retaining no public path back to its concrete type.
+    pub fn from_embedded_for_test_support(datastore: crate::sqlite::embedded::Datastore) -> Self {
+        Self { datastore }
+    }
+
+    pub async fn create(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<Resource> {
+        self.datastore
+            .create_resource(api_version, kind, namespace, name, value)
+            .await
+    }
+
+    pub async fn create_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<Resource> {
+        self.create(api_version, kind, namespace, name, value).await
+    }
+
+    pub async fn create_namespace(
+        &self,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<Resource> {
+        self.datastore.create_namespace(name, value).await
+    }
+
+    pub async fn get(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> anyhow::Result<Option<Resource>> {
+        self.datastore
+            .get_resource(api_version, kind, namespace, name)
+            .await
+    }
+
+    pub async fn get_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> anyhow::Result<Option<Resource>> {
+        self.get(api_version, kind, namespace, name).await
+    }
+
+    pub async fn list(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        options: ResourceListOptions<'_>,
+    ) -> anyhow::Result<klights_cluster_store::ResourceList> {
+        self.datastore
+            .list_resources(api_version, kind, namespace, options)
+            .await
+    }
+
+    pub async fn list_resources(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        options: ResourceListOptions<'_>,
+    ) -> anyhow::Result<klights_cluster_store::ResourceList> {
+        self.list(api_version, kind, namespace, options).await
+    }
+
+    pub async fn update_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: serde_json::Value,
+        resource_version: i64,
+    ) -> anyhow::Result<Resource> {
+        self.datastore
+            .update_resource(api_version, kind, namespace, name, data, resource_version)
+            .await
+    }
+
+    pub async fn update_resource_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: serde_json::Value,
+        preconditions: ResourcePreconditions,
+    ) -> anyhow::Result<Resource> {
+        self.datastore
+            .update_resource_with_preconditions(
+                api_version,
+                kind,
+                namespace,
+                name,
+                data,
+                preconditions,
+            )
+            .await
+    }
+
+    pub async fn update_main_strict(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: serde_json::Value,
+        preconditions: ResourcePreconditions,
+    ) -> anyhow::Result<Resource> {
+        self.datastore
+            .update_main_resource_with_preconditions(
+                api_version,
+                kind,
+                namespace,
+                name,
+                data,
+                preconditions,
+            )
+            .await
+    }
+
+    pub async fn update_status_strict(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        status: serde_json::Value,
+        resource_version: i64,
+    ) -> anyhow::Result<Resource> {
+        self.datastore
+            .update_status_only(
+                api_version,
+                kind,
+                namespace,
+                name,
+                status,
+                Some(resource_version),
+            )
+            .await
+    }
+
+    pub async fn update_status_only(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        status: serde_json::Value,
+        resource_version: Option<i64>,
+    ) -> anyhow::Result<Resource> {
+        self.datastore
+            .update_status_only(api_version, kind, namespace, name, status, resource_version)
+            .await
+    }
+
+    pub async fn update_status_only_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        status: serde_json::Value,
+        preconditions: ResourcePreconditions,
+    ) -> anyhow::Result<Resource> {
+        self.datastore
+            .update_status_only_with_preconditions(
+                api_version,
+                kind,
+                namespace,
+                name,
+                status,
+                preconditions,
+            )
+            .await
+    }
+
+    pub async fn patch_resource_latest_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        request: klights_cluster_core::ResourcePatchRequest,
+    ) -> anyhow::Result<Option<Resource>> {
+        self.datastore
+            .patch_resource_latest_with_preconditions(api_version, kind, namespace, name, request)
+            .await
+    }
+
+    pub async fn delete_non_pod_strict(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        preconditions: ResourcePreconditions,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (api_version, kind) != ("v1", "Pod"),
+            "generic Pod deletion is forbidden"
+        );
+        self.datastore
+            .delete_resource_with_preconditions(api_version, kind, namespace, name, preconditions)
+            .await
+    }
+
+    pub async fn delete_resource_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        preconditions: ResourcePreconditions,
+    ) -> anyhow::Result<()> {
+        self.delete_non_pod_strict(api_version, kind, namespace, name, preconditions)
+            .await
+    }
+
+    pub async fn delete_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> anyhow::Result<()> {
+        let resource = self
+            .get_resource(api_version, kind, namespace, name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("resource not found"))?;
+        self.delete_non_pod_strict(
+            api_version,
+            kind,
+            namespace,
+            name,
+            ResourcePreconditions::from_resource(&resource),
+        )
+        .await
+    }
+
+    pub async fn current_resource_version(&self) -> anyhow::Result<i64> {
+        self.datastore.get_current_resource_version().await
+    }
+
+    pub async fn get_current_resource_version(&self) -> anyhow::Result<i64> {
+        self.current_resource_version().await
+    }
+
+    pub async fn watch_replay_position(
+        &self,
+    ) -> anyhow::Result<klights_cluster_core::WatchReplayPosition> {
+        self.datastore.current_watch_replay_position().await
+    }
+
+    pub async fn get_namespace(&self, name: &str) -> anyhow::Result<Option<Resource>> {
+        self.datastore.get_namespace(name).await
+    }
+
+    pub async fn update_namespace(
+        &self,
+        name: &str,
+        data: serde_json::Value,
+        expected_rv: i64,
+    ) -> anyhow::Result<Resource> {
+        self.datastore
+            .update_namespace(name, data, expected_rv)
+            .await
+    }
+
+    pub async fn list_resources_by_owner_uid(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        owner_uid: &str,
+    ) -> anyhow::Result<Vec<Resource>> {
+        self.datastore
+            .list_resources_by_owner_uid(api_version, kind, namespace, owner_uid)
+            .await
+    }
+
+    pub async fn advance_resource_version_after(&self, min_rv: i64) -> anyhow::Result<i64> {
+        self.datastore.advance_resource_version_after(min_rv).await
+    }
+
+    pub async fn list_watch_events_since(
+        &self,
+        targets: &[klights_cluster_store::WatchTarget],
+        resource_version: i64,
+    ) -> anyhow::Result<Vec<klights_cluster_store::CatchUpResource>> {
+        self.datastore
+            .list_watch_events_since(targets, resource_version)
+            .await
+    }
+
+    pub async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> anyhow::Result<usize> {
+        self.datastore.gc_watch_events(max_rows, batch_cap).await
+    }
+
+    pub async fn apply_resource_batch(
+        &self,
+        operations: Vec<klights_cluster_core::ResourceBatchOperation>,
+    ) -> anyhow::Result<()> {
+        self.datastore.apply_resource_batch(operations).await
+    }
+
+    pub async fn apply_committed_resource_batch(
+        &self,
+        commit: klights_cluster_core::LogApplyCommit,
+    ) -> anyhow::Result<()> {
+        self.datastore.apply_log_apply_commit(commit).await
+    }
+
+    pub async fn apply_log_apply_commit(&self, commit: LogApplyCommit) -> anyhow::Result<()> {
+        self.datastore.apply_log_apply_commit(commit).await
+    }
+
+    pub async fn apply_raft_log_apply_commit(
+        &self,
+        commit: LogApplyCommit,
+    ) -> anyhow::Result<klights_cluster_store::CommittedRaftApplyReceipt> {
+        self.datastore
+            .apply_raft_log_apply_commit_receipt(commit)
+            .await
+    }
+
+    pub async fn build_log_apply_commit_for_outbox(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        command: klights_cluster_core::StorageCommand,
+        authoring_node: &str,
+    ) -> Result<klights_cluster_core::BuildOutboxOutcome, klights_cluster_core::OutboxApplyError>
+    {
+        self.datastore
+            .build_log_apply_commit_for_outbox(idempotency_key, operation, command, authoring_node)
+            .await
+    }
+
+    pub fn install_resource_mutation_pause(
+        &self,
+        operation: ResourceMutationPauseOperation,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> std::sync::Arc<ResourceMutationPause> {
+        self.datastore.install_resource_mutation_pause(
+            operation,
+            api_version,
+            kind,
+            namespace,
+            name,
+        )
+    }
+
+    /// Finds the exact resources owned by a fixture parent without exposing a
+    /// generic query backend.
+    pub async fn owned_resources(
+        &self,
+        owner_uid: &str,
+        namespace: Option<&str>,
+    ) -> anyhow::Result<Vec<Resource>> {
+        self.datastore
+            .find_owned_resources(owner_uid, namespace)
+            .await
+    }
+}
+
+fn query_error(error: anyhow::Error) -> klights_leader_api::ResourceQueryError {
+    klights_leader_api::ResourceQueryError::query_failed(error.to_string())
+}
+
+impl klights_leader_api::LeaderResourceQuery for ResourceTestStore {
+    fn get_resource(
+        &self,
+        request: klights_leader_api::ResourceGetRequest,
+    ) -> klights_leader_api::ResourceQueryFuture<'_, Option<Resource>> {
+        Box::pin(async move {
+            let key = request.into_key();
+            self.get_resource(
+                &key.api_version,
+                &key.kind,
+                key.namespace.as_deref(),
+                &key.name,
+            )
+            .await
+            .map_err(query_error)
+        })
+    }
+
+    fn list_resources(
+        &self,
+        request: klights_leader_api::ResourceListRequest,
+    ) -> klights_leader_api::ResourceQueryFuture<'_, klights_leader_api::ResourceListResult> {
+        Box::pin(async move {
+            let list = self
+                .list_resources(
+                    request.api_version(),
+                    request.kind(),
+                    request.namespace(),
+                    ResourceListOptions::new(
+                        request.label_selector(),
+                        request.field_selector(),
+                        request.limit(),
+                        request.continue_token(),
+                    ),
+                )
+                .await
+                .map_err(query_error)?;
+            klights_leader_api::ResourceListResult::try_new(
+                list.items,
+                list.resource_version,
+                list.watch_replay_position,
+                list.continue_token,
+                list.remaining_item_count,
+            )
+        })
+    }
+}
+
+fn namespace_lifecycle_error(
+    error: anyhow::Error,
+) -> klights_reconcile_api::NamespaceLifecycleError {
+    if crate::errors::is_conflict_error(&error) {
+        klights_reconcile_api::NamespaceLifecycleError::Conflict {
+            message: error.to_string(),
+        }
+    } else {
+        klights_reconcile_api::NamespaceLifecycleError::Internal {
+            message: error.to_string(),
+        }
+    }
+}
+
+/// The named resource fixture also provides the exact namespace-finalization
+/// persistence port. It can mark Pods terminating but deliberately has no
+/// generic Pod-delete operation.
+impl klights_reconcile_api::NamespaceLifecycleStore for ResourceTestStore {
+    fn get_terminating_namespace(
+        &self,
+        namespace: String,
+    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Option<Resource>> {
+        Box::pin(async move {
+            self.datastore
+                .get_namespace(&namespace)
+                .await
+                .map_err(namespace_lifecycle_error)
+        })
+    }
+
+    fn list_namespace_pods(
+        &self,
+        namespace: String,
+    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Vec<Resource>> {
+        Box::pin(async move {
+            self.datastore
+                .list_namespace_resources_of_kind(&namespace, "Pod")
+                .await
+                .map_err(namespace_lifecycle_error)
+        })
+    }
+
+    fn mark_namespace_pod_terminating(
+        &self,
+        pod: Resource,
+        namespace: String,
+        body: serde_json::Value,
+    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, ()> {
+        Box::pin(async move {
+            self.update_main_strict(
+                &pod.api_version,
+                &pod.kind,
+                Some(&namespace),
+                &pod.name,
+                body,
+                ResourcePreconditions::from_resource(&pod),
+            )
+            .await
+            .map(|_| ())
+            .map_err(namespace_lifecycle_error)
+        })
+    }
+
+    fn update_terminating_namespace(
+        &self,
+        namespace: String,
+        body: serde_json::Value,
+        expected_resource_version: i64,
+    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Resource> {
+        Box::pin(async move {
+            self.datastore
+                .update_namespace(&namespace, body, expected_resource_version)
+                .await
+                .map_err(namespace_lifecycle_error)
+        })
+    }
+
+    fn list_namespace_non_pod_resources(
+        &self,
+        namespace: String,
+    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Vec<Resource>> {
+        Box::pin(async move {
+            self.datastore
+                .list_namespace_resources_excluding_kind(&namespace, "Pod")
+                .await
+                .map_err(namespace_lifecycle_error)
+        })
+    }
+
+    fn delete_namespace_non_pod_resource(
+        &self,
+        resource: Resource,
+        namespace: String,
+    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, ()> {
+        Box::pin(async move {
+            self.delete_non_pod_strict(
+                &resource.api_version,
+                &resource.kind,
+                Some(&namespace),
+                &resource.name,
+                ResourcePreconditions::from_resource(&resource),
+            )
+            .await
+            .map_err(namespace_lifecycle_error)
+        })
+    }
+
+    fn count_namespace_resources(
+        &self,
+        namespace: String,
+    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, i64> {
+        Box::pin(async move {
+            self.datastore
+                .count_namespace_resources(&namespace)
+                .await
+                .map_err(namespace_lifecycle_error)
+        })
+    }
+
+    fn delete_terminating_namespace(
+        &self,
+        namespace: String,
+    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, ()> {
+        Box::pin(async move {
+            self.datastore
+                .delete_namespace(&namespace)
+                .await
+                .map_err(namespace_lifecycle_error)
+        })
+    }
+}
+
+fn finalizer_lifecycle_error(
+    error: anyhow::Error,
+) -> klights_reconcile_api::FinalizerLifecycleError {
+    if crate::errors::is_conflict_error(&error) {
+        klights_reconcile_api::FinalizerLifecycleError::Conflict(error.to_string())
+    } else {
+        klights_reconcile_api::FinalizerLifecycleError::Internal(error.to_string())
+    }
+}
+
+impl klights_reconcile_api::FinalizerLifecyclePort for ResourceTestStore {
+    fn get_resource(
+        &self,
+        target: klights_reconcile_api::FinalizerResourceTarget,
+    ) -> klights_reconcile_api::FinalizerLifecycleFuture<'_, Option<Resource>> {
+        Box::pin(async move {
+            self.get_resource(
+                target.api_version(),
+                target.kind(),
+                target.namespace(),
+                target.name(),
+            )
+            .await
+            .map_err(finalizer_lifecycle_error)
+        })
+    }
+
+    fn update_resource(
+        &self,
+        request: klights_reconcile_api::FinalizerUpdateRequest,
+    ) -> klights_reconcile_api::FinalizerLifecycleFuture<'_, Resource> {
+        Box::pin(async move {
+            self.update_main_strict(
+                request.target.api_version(),
+                request.target.kind(),
+                request.target.namespace(),
+                request.target.name(),
+                request.data,
+                request.preconditions,
+            )
+            .await
+            .map_err(finalizer_lifecycle_error)
+        })
+    }
+
+    fn delete_with_tombstone(
+        &self,
+        request: klights_reconcile_api::FinalizerTombstoneDeleteRequest,
+    ) -> klights_reconcile_api::FinalizerLifecycleFuture<'_, Resource> {
+        Box::pin(async move {
+            let target = request.target;
+            let resource = self
+                .get_resource(
+                    target.api_version(),
+                    target.kind(),
+                    target.namespace(),
+                    target.name(),
+                )
+                .await
+                .map_err(finalizer_lifecycle_error)?
+                .ok_or_else(|| {
+                    klights_reconcile_api::FinalizerLifecycleError::NotFound(format!(
+                        "{}/{} not found",
+                        target.kind(),
+                        target.name()
+                    ))
+                })?;
+            self.delete_non_pod_strict(
+                target.api_version(),
+                target.kind(),
+                target.namespace(),
+                target.name(),
+                request.preconditions,
+            )
+            .await
+            .map_err(finalizer_lifecycle_error)?;
+            Ok(resource)
+        })
+    }
+
+    fn orphan_children(
+        &self,
+        request: klights_reconcile_api::FinalizerOrphanRequest,
+    ) -> klights_reconcile_api::FinalizerLifecycleFuture<'_, ()> {
+        Box::pin(async move {
+            for child in self
+                .owned_resources(&request.owner_uid, request.target.namespace())
+                .await
+                .map_err(finalizer_lifecycle_error)?
+            {
+                let mut data = (*child.data).clone();
+                if let Some(references) = data
+                    .pointer_mut("/metadata/ownerReferences")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    references.retain(|reference| {
+                        reference.get("uid").and_then(serde_json::Value::as_str)
+                            != Some(request.owner_uid.as_str())
+                    });
+                }
+                // Orphaning updates ownership metadata; it never deletes a Pod.
+                self.update_main_strict(
+                    &child.api_version,
+                    &child.kind,
+                    child.namespace.as_deref(),
+                    &child.name,
+                    data,
+                    ResourcePreconditions::from_resource(&child),
+                )
+                .await
+                .map_err(finalizer_lifecycle_error)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn run_finalized_effects(
+        &self,
+        _request: klights_reconcile_api::FinalizerEffectsRequest,
+    ) -> klights_reconcile_api::FinalizerLifecycleFuture<'_, ()> {
+        // This resource fixture intentionally owns persistence only. Controller
+        // cascade and side-effect algorithms remain with their later owners.
+        Box::pin(async { Ok(()) })
+    }
+}
+
 impl GcTestStore {
     pub async fn open(
         supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
@@ -73,6 +859,55 @@ impl GcTestStore {
         self.datastore
             .create_resource(api_version, kind, namespace, name, value)
             .await
+    }
+
+    pub async fn create(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: serde_json::Value,
+    ) -> anyhow::Result<Resource> {
+        self.seed_fixture(api_version, kind, namespace, name, value)
+            .await
+    }
+
+    pub async fn get(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> anyhow::Result<Option<Resource>> {
+        self.observe_fixture(api_version, kind, namespace, name)
+            .await
+    }
+
+    pub async fn list(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+    ) -> anyhow::Result<Vec<Resource>> {
+        self.list_fixtures(api_version, kind, namespace).await
+    }
+
+    pub fn install_resource_mutation_pause(
+        &self,
+        operation: ResourceMutationPauseOperation,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> std::sync::Arc<ResourceMutationPause> {
+        self.datastore.install_resource_mutation_pause(
+            operation,
+            api_version,
+            kind,
+            namespace,
+            name,
+        )
     }
 
     pub async fn observe_fixture(
@@ -622,4 +1457,150 @@ pub fn test_live_commit(
     }
     let _ = candidate_resource_version;
     LogApplyCommit::try_new(mutations).expect("test live commit must be an RV-zero template")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use klights_cluster_core::WatchReplayPosition;
+    use klights_cluster_store::{
+        DurableWatchTarget, WatchHistoryError, WatchHistoryFuture, WatchHistoryRead,
+        WatchHistoryRequest,
+    };
+
+    use super::{
+        ResourceMutationPauseOperation, ResourcePreconditions,
+        toggle_failing_watch_history_for_test_support,
+    };
+
+    #[test]
+    fn p12_2b_resource_pause_support_preserves_every_mutation_coordinate() {
+        let operations = [
+            ResourceMutationPauseOperation::MainUpdate,
+            ResourceMutationPauseOperation::PatchLatest,
+            ResourceMutationPauseOperation::BuildPatchCommand,
+        ];
+
+        assert_eq!(operations.len(), 3);
+    }
+
+    #[derive(Default)]
+    struct RecordingHistory;
+
+    impl klights_cluster_store::DurableWatchHistoryRead for RecordingHistory {
+        fn replay_watch_history(
+            &self,
+            _request: WatchHistoryRequest,
+        ) -> WatchHistoryFuture<'_, WatchHistoryRead> {
+            Box::pin(async { Ok(WatchHistoryRead::Expired) })
+        }
+
+        fn list_replay_floors(
+            &self,
+        ) -> WatchHistoryFuture<'_, Vec<klights_cluster_store::DurableReplayFloor>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn p12_2b_watch_history_control_fails_only_replay_after_activation() {
+        let control = super::WatchHistoryFailureControl::new();
+        let history = toggle_failing_watch_history_for_test_support(
+            Arc::new(RecordingHistory),
+            control.clone(),
+        );
+        let request = WatchHistoryRequest::new(
+            vec![DurableWatchTarget::cluster("v1", "ConfigMap")],
+            WatchReplayPosition::default(),
+            1,
+        )
+        .expect("valid positioned ConfigMap replay request");
+
+        assert!(matches!(
+            history.replay_watch_history(request.clone()).await,
+            Ok(WatchHistoryRead::Expired)
+        ));
+        assert_eq!(
+            history.list_replay_floors().await.expect("delegate floors"),
+            Vec::new()
+        );
+
+        control.fail_subsequent_reads();
+        assert!(matches!(
+            history.replay_watch_history(request).await,
+            Err(WatchHistoryError::PersistenceFailed { message })
+                if message == "injected live replay read failure"
+        ));
+        assert_eq!(
+            history.list_replay_floors().await.expect("delegate floors"),
+            Vec::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn p12_2b_resource_pause_targets_main_update_and_blocks_until_resumed() {
+        let store = super::GcTestStore::open(Arc::new(klights_supervisor::TaskSupervisor::new(
+            Default::default(),
+        )))
+        .await
+        .expect("open focused resource test store");
+        let resource = store
+            .create(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "paused",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "paused", "namespace": "default"},
+                    "data": {"before": "pause"}
+                }),
+            )
+            .await
+            .expect("seed ConfigMap");
+        let pause = store.install_resource_mutation_pause(
+            ResourceMutationPauseOperation::MainUpdate,
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "paused",
+        );
+        let update_store = store.clone();
+        let update = tokio::spawn(async move {
+            update_store
+                .update_main_fixture(
+                    "v1",
+                    "ConfigMap",
+                    Some("default"),
+                    "paused",
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {"name": "paused", "namespace": "default"},
+                        "data": {"after": "resume"}
+                    }),
+                    ResourcePreconditions::from_resource(&resource),
+                )
+                .await
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pause.wait_until_reached(),
+        )
+        .await
+        .expect("targeted main update reaches the pause");
+        assert!(
+            !update.is_finished(),
+            "the exact mutation must remain blocked before resume"
+        );
+        pause.resume();
+        let updated = update
+            .await
+            .expect("update task joins")
+            .expect("resumed strict main update succeeds");
+        assert_eq!(updated.data["data"]["after"], "resume");
+    }
 }

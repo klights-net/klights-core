@@ -492,6 +492,7 @@ pub mod test_support {
     use std::{future::Future, pin::Pin, sync::Arc};
 
     use klights_cluster_core::Resource;
+    use klights_cluster_store::{CommitObservationSink, StagedPostCommit};
 
     pub struct WatchFixtureEvent {
         pub event_type: String,
@@ -525,6 +526,179 @@ pub mod test_support {
             resource_version: i64,
         ) -> anyhow::Result<Vec<WatchFixtureEvent>> {
             self.source.pod_events_since(resource_version).await
+        }
+    }
+
+    /// Passive post-commit fixture sharing the exact per-topic watch hub used
+    /// by API routing. It retains encoded JSON payload bytes when persistence
+    /// supplied them and never receives a datastore capability.
+    #[derive(Clone)]
+    pub struct CommitWatchFixture {
+        bus: Arc<crate::WatchBus>,
+    }
+
+    impl CommitWatchFixture {
+        pub fn new(capacity: usize) -> Self {
+            Self {
+                bus: Arc::new(crate::WatchBus::new(capacity)),
+            }
+        }
+
+        pub fn watch_bus(&self) -> Arc<crate::WatchBus> {
+            self.bus.clone()
+        }
+
+        pub fn subscribe(
+            &self,
+            topic: crate::WatchTopic,
+        ) -> tokio::sync::broadcast::Receiver<crate::WatchEvent> {
+            self.bus.subscribe(topic)
+        }
+
+        pub fn subscribe_many(
+            &self,
+            topics: impl IntoIterator<Item = crate::WatchTopic>,
+        ) -> crate::WatchReceiver {
+            self.bus.subscribe_many(topics)
+        }
+
+        pub fn publish(&self, event: crate::WatchEvent) {
+            self.bus.publish(event);
+        }
+
+        pub fn subscribe_signals(&self, topic: crate::WatchTopic) -> crate::WatchSignalReceiver {
+            self.bus.subscribe_signals(topic)
+        }
+
+        /// Give routing the signal subscription for this exact fixture bus.
+        /// The wrapper is watch-owned and intentionally exposes no persistence
+        /// capability.
+        pub fn signal_source(&self) -> Arc<dyn crate::WatchSignalSubscribe> {
+            Arc::new(CommitWatchSignalSource(self.bus.clone()))
+        }
+    }
+
+    struct CommitWatchSignalSource(Arc<crate::WatchBus>);
+
+    impl crate::WatchSignalSubscribe for CommitWatchSignalSource {
+        fn subscribe(&self, topic: crate::WatchTopic) -> crate::WatchSignalReceiver {
+            self.0.subscribe_signals(topic)
+        }
+    }
+
+    impl CommitObservationSink for CommitWatchFixture {
+        fn observe(&self, observations: &[StagedPostCommit]) {
+            for observation in observations {
+                let Some(staged) = observation.test_event() else {
+                    continue;
+                };
+                let mut event = crate::WatchEvent::from_type(
+                    staged.event_type(),
+                    staged.resource().data.as_ref().clone(),
+                );
+                event.encoded_payload =
+                    staged
+                        .encoded_json()
+                        .map(|bytes| crate::EncodedWatchPayload {
+                            content_type: crate::WatchContentType::Json,
+                            bytes: bytes.clone(),
+                        });
+                self.bus.publish(event);
+                self.bus.publish_signal(crate::WatchSignal {
+                    topic: crate::WatchTopic::new(observation.api_version(), observation.kind()),
+                    advances: vec![crate::WatchAdvance {
+                        namespace: observation.namespace().map(str::to_owned),
+                        low_rv: observation.resource_version(),
+                        high_rv: observation.resource_version(),
+                    }],
+                });
+            }
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::Arc;
+
+        use bytes::Bytes;
+        use klights_cluster_core::Resource;
+        use klights_cluster_store::{CommitObservationSink as _, StagedPostCommit};
+
+        use super::CommitWatchFixture;
+        use crate::WatchSignalSubscribe as _;
+
+        #[test]
+        fn committed_fixture_preserves_topic_payload_bytes_and_signal_cursor() {
+            let fixture = CommitWatchFixture::new(4);
+            let mut event_rx = fixture.subscribe(crate::WatchTopic::new("v1", "ConfigMap"));
+            let mut signal_rx =
+                fixture.subscribe_signals(crate::WatchTopic::new("v1", "ConfigMap"));
+            let resource = Resource::try_from_data(Arc::new(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "fixture",
+                    "namespace": "default",
+                    "uid": "fixture-uid",
+                    "resourceVersion": "17"
+                }
+            })))
+            .expect("valid committed ConfigMap");
+            let bytes = Bytes::from_static(br#"{\"type\":\"ADDED\",\"object\":\"exact\"}"#);
+
+            fixture.observe(&[
+                StagedPostCommit::new("v1", "ConfigMap", Some("default"), 17).with_test_event(
+                    "ADDED",
+                    resource,
+                    Some(bytes.clone()),
+                ),
+            ]);
+
+            let event = event_rx
+                .try_recv()
+                .expect("same hub receives committed event");
+            assert_eq!(
+                event.encoded_payload.expect("preserved encoded JSON").bytes,
+                bytes
+            );
+            let signal = signal_rx
+                .try_recv()
+                .expect("same hub receives cursor signal");
+            assert_eq!(signal.advances[0].low_rv, 17);
+            assert_eq!(signal.advances[0].high_rv, 17);
+        }
+
+        #[test]
+        fn committed_fixture_signal_source_uses_the_same_watch_bus() {
+            let fixture = CommitWatchFixture::new(4);
+            let source = fixture.signal_source();
+            let mut signal_rx = source.subscribe(crate::WatchTopic::new("v1", "ConfigMap"));
+            let resource = Resource::try_from_data(Arc::new(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "fixture",
+                    "uid": "fixture-uid",
+                    "resourceVersion": "19"
+                }
+            })))
+            .expect("valid committed ConfigMap");
+
+            fixture.observe(&[StagedPostCommit::new("v1", "ConfigMap", None, 19)
+                .with_test_event("ADDED", resource, None)]);
+
+            assert_eq!(
+                signal_rx
+                    .try_recv()
+                    .expect("fixture signal source receives committed advance")
+                    .advances[0]
+                    .high_rv,
+                19
+            );
         }
     }
 }

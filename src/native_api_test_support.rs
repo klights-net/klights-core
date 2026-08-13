@@ -14,17 +14,6 @@ use klights_auth::test_support::{
 };
 use klights_reconcile_api::ControllerDispatcherPort as _;
 
-/// Opaque root datastore capability for base-repository integration fixtures.
-///
-/// This alias is compiled only by the root-private base-owned suite; production and
-/// native-service APIs do not expose a datastore surface.
-pub type IntegrationDatastoreHandle = DatastoreHandle;
-pub type IntegrationWatchEvent = klights_watch::WatchEvent;
-pub use klights_cluster_datastore::sqlite::embedded::{
-    ResourceMutationPause as IntegrationResourceMutationPause,
-    ResourceMutationPauseOperation as IntegrationResourceMutationPauseOperation,
-};
-
 pub struct IntegrationHeldSupervisorTask {
     handle: klights_supervisor::SupervisedJoinHandle<()>,
 }
@@ -35,270 +24,16 @@ impl IntegrationHeldSupervisorTask {
     }
 }
 
-/// Resolves one admission webhook target through the root's concrete
-/// datastore-to-native-service composition. This exists only for base-owned
-/// full-adapter integration tests and does not expose the private adapter.
-pub async fn resolve_admission_webhook_target_for_integration(
-    db: IntegrationDatastoreHandle,
-    client_config: &serde_json::Value,
-) -> Result<
-    k8s_native_service::admission::WebhookTarget,
-    k8s_native_service::admission::AdmissionDependencyError,
-> {
-    use k8s_native_service::admission::WebhookTargetResolver as _;
-
-    let query: Arc<dyn k8s_native_service::admission::AdmissionQuery> =
-        crate::bootstrap::composition_adapters::resource_admission_adapter::DatastoreAdmissionQuery::new(db);
-    k8s_native_service::admission::ServiceWebhookTargetResolver::new(query)
-        .resolve(client_config)
-        .await
-}
-
-/// Reads Namespace labels through the root admission query composition.
-pub async fn admission_namespace_labels_for_integration(
-    db: IntegrationDatastoreHandle,
-    namespace: &str,
-) -> std::collections::BTreeMap<String, String> {
-    let query: Arc<dyn k8s_native_service::admission::AdmissionQuery> =
-        crate::bootstrap::composition_adapters::resource_admission_adapter::DatastoreAdmissionQuery::new(db);
-    k8s_native_service::admission::selectors::get_namespace_labels(query.as_ref(), namespace).await
-}
-
-/// Runs one mutating or validating pass through the exact concrete admission
-/// dependencies assembled by root. Kept narrow and feature-only for the
-/// base-owned cross-adapter integration suite.
-pub async fn run_admission_for_integration(
-    db: IntegrationDatastoreHandle,
-    context: &k8s_native_service::admission::AdmissionRequestContext,
-    is_mutating: bool,
-) -> anyhow::Result<serde_json::Value> {
-    let identity = DeterministicApiIdentity::default();
-    let query: Arc<dyn k8s_native_service::admission::AdmissionQuery> =
-        crate::bootstrap::composition_adapters::resource_admission_adapter::DatastoreAdmissionQuery::new(db);
-    let target_resolver: Arc<dyn k8s_native_service::admission::WebhookTargetResolver> =
-        k8s_native_service::admission::ServiceWebhookTargetResolver::new(Arc::clone(&query));
-    let webhook_client: Arc<dyn k8s_native_service::admission::AdmissionWebhookClient> =
-        k8s_native_service::admission::ReqwestAdmissionWebhookClient::new();
-    k8s_native_service::admission::AdmissionEngine::new(
-        &identity,
-        query.as_ref(),
-        target_resolver.as_ref(),
-        webhook_client.as_ref(),
-    )
-    .run_with_context(context, is_mutating)
-    .await
-}
-
-#[derive(Clone)]
-pub struct IntegrationWatchHistoryFailureControl {
-    fail: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl IntegrationWatchHistoryFailureControl {
-    pub fn fail_subsequent_reads(&self) {
-        self.fail.store(true, std::sync::atomic::Ordering::Release);
-    }
-}
-
-struct ToggleFailingWatchHistory {
-    delegate: Arc<dyn klights_cluster_store::DurableWatchHistoryRead>,
-    fail: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl klights_cluster_store::DurableWatchHistoryRead for ToggleFailingWatchHistory {
-    fn replay_watch_history(
-        &self,
-        request: klights_cluster_store::WatchHistoryRequest,
-    ) -> klights_cluster_store::WatchHistoryFuture<'_, klights_cluster_store::WatchHistoryRead>
-    {
-        if self.fail.load(std::sync::atomic::Ordering::Acquire) {
-            return Box::pin(async {
-                Err(
-                    klights_cluster_store::WatchHistoryError::PersistenceFailed {
-                        message: "injected live replay read failure".to_string(),
-                    },
-                )
-            });
-        }
-        self.delegate.replay_watch_history(request)
-    }
-
-    fn list_replay_floors(
-        &self,
-    ) -> klights_cluster_store::WatchHistoryFuture<'_, Vec<klights_cluster_store::DurableReplayFloor>>
-    {
-        self.delegate.list_replay_floors()
-    }
-}
-
-struct IntegrationBoundTokenSubjects {
-    db: IntegrationDatastoreHandle,
-}
-
-impl IntegrationBoundTokenSubjects {
-    async fn uid(
-        &self,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-    ) -> Result<Option<String>, klights_leader_api::ClusterIdentityError> {
-        self.db
-            .get_resource("v1", kind, namespace, name)
-            .await
-            .map(|resource| resource.map(|resource| resource.uid))
-            .map_err(|error| {
-                klights_leader_api::ClusterIdentityError::dependency_failure(format!(
-                    "credential subject lookup failed: {error}"
-                ))
-            })
-    }
-}
-
-impl klights_leader_api::LeaderBoundTokenSubjectLookup for IntegrationBoundTokenSubjects {
-    fn service_account_uid<'a>(
-        &'a self,
-        namespace: &'a str,
-        name: &'a str,
-    ) -> klights_leader_api::ClusterIdentityFuture<'a, Option<String>> {
-        Box::pin(async move { self.uid("ServiceAccount", Some(namespace), name).await })
-    }
-
-    fn pod_uid<'a>(
-        &'a self,
-        namespace: &'a str,
-        name: &'a str,
-    ) -> klights_leader_api::ClusterIdentityFuture<'a, Option<String>> {
-        Box::pin(async move { self.uid("Pod", Some(namespace), name).await })
-    }
-
-    fn node_uid<'a>(
-        &'a self,
-        name: &'a str,
-    ) -> klights_leader_api::ClusterIdentityFuture<'a, Option<String>> {
-        Box::pin(async move { self.uid("Node", None, name).await })
-    }
-
-    fn secret_uid<'a>(
-        &'a self,
-        namespace: &'a str,
-        name: &'a str,
-    ) -> klights_leader_api::ClusterIdentityFuture<'a, Option<String>> {
-        Box::pin(async move { self.uid("Secret", Some(namespace), name).await })
-    }
-}
-
-pub async fn validate_sa_token_bindings_for_integration(
-    db: IntegrationDatastoreHandle,
-    claims: &klights_auth::SaTokenClaims,
-) -> Result<(), k8s_native_service::AppError> {
-    klights_auth::authentication::validate_sa_token_bindings(
-        &IntegrationBoundTokenSubjects { db },
-        claims,
-    )
-    .await
-    .map_err(k8s_native_service::AppError::from)
-}
-
-/// Seeds the production bootstrap-token Secret shape used by full-stack API
-/// authentication cases and returns its bearer token.
-pub async fn create_worker_bootstrap_token_for_integration(
-    db: &IntegrationDatastoreHandle,
-) -> anyhow::Result<String> {
-    let token = crate::bootstrap::bootstrap_token::generate_random_bootstrap_token();
-    crate::bootstrap::bootstrap_token::create_scoped_bootstrap_token_secret_for_test(
-        db.as_ref(),
-        klights_auth::bootstrap_token::BootstrapTokenScope::Worker,
-        &token,
-    )
-    .await?;
-    Ok(token)
-}
-
-/// Seeds a fixed worker bootstrap Secret with a caller-selected lifetime so
-/// full-stack GET tests can exercise the production rotation boundary.
-pub async fn create_worker_bootstrap_token_with_ttl_for_integration(
-    db: &IntegrationDatastoreHandle,
-    token: &str,
-    ttl: std::time::Duration,
-) -> anyhow::Result<()> {
-    crate::bootstrap::bootstrap_token::create_scoped_bootstrap_token_secret_with_ttl_for_test(
-        db.as_ref(),
-        klights_auth::bootstrap_token::BootstrapTokenScope::Worker,
-        token,
-        ttl,
-    )
-    .await
-}
-
-/// Seeds a fixed control-plane bootstrap Secret with a caller-selected
-/// lifetime for cross-Secret rotation isolation tests.
-pub async fn create_controlplane_bootstrap_token_with_ttl_for_integration(
-    db: &IntegrationDatastoreHandle,
-    token: &str,
-    ttl: std::time::Duration,
-) -> anyhow::Result<()> {
-    crate::bootstrap::bootstrap_token::create_scoped_bootstrap_token_secret_with_ttl_for_test(
-        db.as_ref(),
-        klights_auth::bootstrap_token::BootstrapTokenScope::Controlplane,
-        token,
-        ttl,
-    )
-    .await
-}
-
-pub fn broadcast_watch_event_for_integration(
-    db: &IntegrationDatastoreHandle,
-    object: serde_json::Value,
-) {
-    let event = klights_watch::WatchEvent::added(object);
-    let pending = crate::datastore::staged_post_commit_from_event(event);
-    db.commit_observation_sink().observe(&[pending]);
-}
-
-pub async fn reconcile_namespace_termination_for_integration(
-    db: IntegrationDatastoreHandle,
-    namespace: &str,
-) -> Result<(), k8s_native_service::AppError> {
-    let store = crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(db);
-    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-    k8s_native_service::reconcile_namespace_termination_at(
-        store.as_ref(),
-        namespace,
-        metrics.as_ref(),
-        chrono::Utc::now(),
-    )
-    .await
-}
-
-pub async fn reconcile_namespace_termination_for_uid_for_integration(
-    db: IntegrationDatastoreHandle,
-    namespace: &str,
-    expected_uid: &str,
-) -> Result<k8s_native_service::NamespaceTerminationOutcome, k8s_native_service::AppError> {
-    let store = crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(db);
-    let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-    k8s_native_service::reconcile_namespace_termination_for_uid_with_outcome_at(
-        store.as_ref(),
-        namespace,
-        expected_uid,
-        metrics.as_ref(),
-        chrono::Utc::now(),
-    )
-    .await
-}
-
+/// P12.2c-owned finalizer fixture bridge. Its persistence input is the
+/// canonical narrow resource fixture; it exposes no datastore capability.
 pub async fn mark_foreground_deletion_for_integration(
-    db: IntegrationDatastoreHandle,
+    store: klights_cluster_datastore::test_support::ResourceTestStore,
     target: k8s_native_service::generic_command::ResourceDeleteTarget<'_>,
     initial_resource: klights_cluster_core::Resource,
     delete_preconditions: klights_cluster_core::ResourcePreconditions,
 ) -> Result<klights_cluster_core::Resource, k8s_native_service::AppError> {
-    let lifecycle = crate::bootstrap::finalizer_lifecycle_adapter::CommandFinalizerLifecycleStore::new(
-        db.clone(),
-        crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(db),
-    );
     k8s_native_service::generic_command::mark_foreground_deletion_with_retry(
-        &lifecycle,
+        &store,
         target.api_version,
         target.kind,
         target.namespace,
@@ -310,60 +45,16 @@ pub async fn mark_foreground_deletion_for_integration(
     .await
 }
 
+/// P12.2c-owned finalizer fixture bridge. See
+/// [`mark_foreground_deletion_for_integration`] for its narrow boundary.
 pub async fn complete_non_foreground_delete_for_integration(
-    db: IntegrationDatastoreHandle,
+    store: klights_cluster_datastore::test_support::ResourceTestStore,
     request: k8s_native_service::generic_command::NonForegroundDeleteRequest<'_>,
 ) -> Result<k8s_native_service::generic_command::DeleteCompletion, k8s_native_service::AppError> {
-    let lifecycle = crate::bootstrap::finalizer_lifecycle_adapter::CommandFinalizerLifecycleStore::new(
-        db.clone(),
-        crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(db),
-    );
     k8s_native_service::generic_command::complete_non_foreground_delete_with_live_recheck(
-        &lifecycle, request,
+        &store, request,
     )
     .await
-}
-
-pub async fn delete_collection_listed_resource_for_integration(
-    db: IntegrationDatastoreHandle,
-    api_version: &'static str,
-    kind: &'static str,
-    namespace: Option<&str>,
-    resource: klights_cluster_core::Resource,
-) -> Result<bool, k8s_native_service::AppError> {
-    let leader_rx =
-        crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
-    let resource_query = crate::bootstrap::outbox_apply_adapter::BackendResourceQueryFixture::new(
-        db.clone(),
-        leader_rx,
-    );
-    let lifecycle = crate::bootstrap::finalizer_lifecycle_adapter::CommandFinalizerLifecycleStore::new(
-        db.clone(),
-        crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(db),
-    );
-    let strategy = k8s_native_service::generic_command::FinalizerAwareDeleteStrategy {
-        resource_query: &resource_query,
-        lifecycle: &lifecycle,
-        operation_now: chrono::DateTime::from_timestamp(1_700_000_000, 0)
-            .expect("fixed collection-delete integration timestamp"),
-    };
-    let target = klights_types::ResourceKey::new(
-        api_version,
-        kind,
-        namespace.map(str::to_string),
-        resource.name.clone(),
-    );
-    let intent = k8s_native_service::generic_command::DeleteIntent::collection_item(
-        k8s_native_service::generic_command::DryRunMode::Live,
-        klights_cluster_core::ResourcePreconditions::uid(resource.uid.clone()),
-    );
-    Ok(matches!(
-        k8s_native_service::generic_command::delete_loaded_with_strategy(
-            &strategy, target, resource, &intent,
-        )
-        .await?,
-        k8s_native_service::generic_command::DeleteResult::HardDeleted(_)
-    ))
 }
 
 #[derive(Default)]
@@ -636,8 +327,9 @@ impl EndpointFixtureKind {
 #[derive(Clone)]
 pub struct NativeApiTestHarness {
     router: axum::Router,
-    datastore: IntegrationDatastoreHandle,
-    sqlite: crate::datastore::sqlite::Datastore,
+    datastore: DatastoreHandle,
+    resource_store: klights_cluster_datastore::test_support::ResourceTestStore,
+    commit_watch_fixture: Arc<klights_watch::test_support::CommitWatchFixture>,
     nodeport_alloc: Arc<klights_controllers::service::NodePortAllocator>,
     pod_query: Arc<dyn klights_pod_api::PodQuery>,
     pod_finalization: Arc<dyn klights_pod_api::BoundPodFinalization>,
@@ -852,16 +544,18 @@ impl NativeApiTestHarness {
         .await
     }
 
-    pub async fn with_toggle_failing_watch_history()
-    -> anyhow::Result<(Self, IntegrationWatchHistoryFailureControl)> {
-        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    pub async fn with_toggle_failing_watch_history() -> anyhow::Result<(
+        Self,
+        klights_cluster_datastore::test_support::WatchHistoryFailureControl,
+    )> {
+        let control = klights_cluster_datastore::test_support::WatchHistoryFailureControl::new();
         let harness = Self::assemble(
             Arc::new(AllowAllAuthorizer),
             None,
             crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             None,
             None,
-            Some(fail.clone()),
+            Some(control.clone()),
             None,
             None,
             None,
@@ -869,13 +563,13 @@ impl NativeApiTestHarness {
             false,
         )
         .await?;
-        Ok((harness, IntegrationWatchHistoryFailureControl { fail }))
+        Ok((harness, control))
     }
 
     pub async fn with_mutation_side_effect_factory<F>(factory: F) -> anyhow::Result<Self>
     where
         F: FnOnce(
-                IntegrationDatastoreHandle,
+                klights_cluster_datastore::test_support::ResourceTestStore,
             ) -> Arc<klights_controllers::side_effects::SideEffectRegistry>
             + Send
             + 'static,
@@ -1003,11 +697,13 @@ impl NativeApiTestHarness {
         signing_keys: Arc<dyn klights_leader_api::LeaderServiceAccountSigningKeyState>,
         oidc: Option<Arc<dyn klights_auth::oidc::OidcValidator>>,
         webhook: Option<Arc<dyn klights_auth::webhook_auth::WebhookAuthenticator>>,
-        watch_history_failure: Option<Arc<std::sync::atomic::AtomicBool>>,
+        watch_history_failure: Option<
+            klights_cluster_datastore::test_support::WatchHistoryFailureControl,
+        >,
         mutation_side_effects_factory: Option<
             Box<
                 dyn FnOnce(
-                        IntegrationDatastoreHandle,
+                        klights_cluster_datastore::test_support::ResourceTestStore,
                     )
                         -> Arc<klights_controllers::side_effects::SideEffectRegistry>
                     + Send,
@@ -1041,11 +737,13 @@ impl NativeApiTestHarness {
         signing_keys: Arc<dyn klights_leader_api::LeaderServiceAccountSigningKeyState>,
         oidc: Option<Arc<dyn klights_auth::oidc::OidcValidator>>,
         webhook: Option<Arc<dyn klights_auth::webhook_auth::WebhookAuthenticator>>,
-        watch_history_failure: Option<Arc<std::sync::atomic::AtomicBool>>,
+        watch_history_failure: Option<
+            klights_cluster_datastore::test_support::WatchHistoryFailureControl,
+        >,
         mutation_side_effects_factory: Option<
             Box<
                 dyn FnOnce(
-                        IntegrationDatastoreHandle,
+                        klights_cluster_datastore::test_support::ResourceTestStore,
                     )
                         -> Arc<klights_controllers::side_effects::SideEffectRegistry>
                     + Send,
@@ -1065,25 +763,41 @@ impl NativeApiTestHarness {
             bootstrap_token_authenticator,
         } = options;
         let auth_clock = auth_clock.unwrap_or_else(|| Arc::new(klights_auth::clock::SystemClock));
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
-            .await
-            .unwrap();
-        let passive_reads = if let Some(fail) = watch_history_failure {
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(task_categories));
+        let commit_watch_fixture =
+            Arc::new(klights_watch::test_support::CommitWatchFixture::new(64));
+        let executor = klights_cluster_datastore::sqlite::open_in_memory(
+            supervisor.clone(),
+            "sqlite:native-api-integration",
+        )
+        .await?;
+        let db =
+            crate::datastore::sqlite::Datastore::new_in_memory_with_watch_and_executor_with_sink(
+                executor,
+                commit_watch_fixture.clone(),
+                crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
+                Arc::new(klights_supervisor::SystemWallClock),
+            )
+            .await?;
+        let passive_reads = if let Some(control) = watch_history_failure {
             let focused_reads = db.focused_read_store();
             crate::datastore::selector::PassiveReadPorts::new(
                 focused_reads.clone(),
-                Arc::new(ToggleFailingWatchHistory {
-                    delegate: focused_reads.clone(),
-                    fail,
-                }),
+                klights_cluster_datastore::test_support::toggle_failing_watch_history_for_test_support(
+                    focused_reads.clone(),
+                    control,
+                ),
                 focused_reads,
             )
         } else {
             crate::datastore::selector::sqlite_passive_read_ports(&db)
         };
-        let datastore: IntegrationDatastoreHandle = Arc::new(db.clone());
+        let resource_store =
+            klights_cluster_datastore::test_support::ResourceTestStore::from_embedded_for_test_support(
+                db.canonical_embedded_for_test_support(),
+            );
+        let datastore: DatastoreHandle = Arc::new(db.clone());
         let config = crate::KlightsConfig::test_default();
-        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(task_categories));
         let identity: Arc<dyn k8s_native_service::ApiIdentityGenerator> =
             Arc::new(DeterministicApiIdentity::default());
         let controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator> =
@@ -1253,18 +967,18 @@ impl NativeApiTestHarness {
                 gc_coordination.clone(),
             );
         let mutation_side_effects = mutation_side_effects_factory
-            .map(|factory| factory(datastore.clone()))
+            .map(|factory| factory(resource_store.clone()))
             .unwrap_or_else(|| side_effects.clone());
         let mutation_effects = klights_controllers::side_effects::ResourceMutationEffects::new(
             mutation_side_effects,
             metrics.clone(),
         );
-        let positioned_watch =
-            crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
-                &passive_reads,
-                datastore.clone(),
-            );
-        let watch_signals = crate::bootstrap::watch_commit_wiring::test_signal_source(&datastore);
+        let positioned_watch = crate::bootstrap::composition_adapters::positioned_watch_adapter::datastore_positioned_watch_service(
+            &passive_reads,
+            datastore.clone(),
+            commit_watch_fixture.signal_source(),
+        );
+        let watch_signals = commit_watch_fixture.signal_source();
         let generated = crate::bootstrap::composition_adapters::generated_handler_adapter::GeneratedHandlerAdapter::new(
             crate::bootstrap::composition_adapters::generated_handler_adapter::GeneratedHandlerStorage::new(
                 datastore.clone(),
@@ -1480,7 +1194,7 @@ impl NativeApiTestHarness {
             ),
             crate::bootstrap::composition_adapters::custom_resource_read_adapter::CustomResourceReadAdapter::new(
                 datastore.clone(),
-                crate::bootstrap::watch_commit_wiring::test_signal_source(&datastore),
+                commit_watch_fixture.signal_source(),
                 positioned_watch,
                 supervisor.clone(),
             ),
@@ -1553,7 +1267,8 @@ impl NativeApiTestHarness {
         Ok(Self {
             router: outer_layers.finish(router),
             datastore,
-            sqlite: db,
+            resource_store,
+            commit_watch_fixture,
             nodeport_alloc,
             pod_query: api_pod_repository,
             pod_finalization: bound_pod_finalization,
@@ -1721,7 +1436,7 @@ impl NativeApiTestHarness {
         name: &str,
         value: serde_json::Value,
     ) -> anyhow::Result<klights_cluster_core::Resource> {
-        self.datastore
+        self.resource_store
             .create_resource(kind.api_version(), kind.kind(), namespace, name, value)
             .await
     }
@@ -1731,7 +1446,7 @@ impl NativeApiTestHarness {
         name: &str,
         value: serde_json::Value,
     ) -> anyhow::Result<klights_cluster_core::Resource> {
-        self.sqlite.create_namespace(name, value).await
+        self.resource_store.create_namespace(name, value).await
     }
 
     pub async fn seed_endpoint_pod(
@@ -1785,7 +1500,7 @@ impl NativeApiTestHarness {
         namespace: &str,
         name: &str,
     ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
-        self.datastore
+        self.resource_store
             .get_resource(kind.api_version(), kind.kind(), Some(namespace), name)
             .await
     }
@@ -1814,12 +1529,12 @@ impl NativeApiTestHarness {
         label_selector: Option<&str>,
     ) -> anyhow::Result<Vec<klights_cluster_core::Resource>> {
         Ok(self
-            .datastore
+            .resource_store
             .list_resources(
                 EndpointFixtureKind::EndpointSlice.api_version(),
                 EndpointFixtureKind::EndpointSlice.kind(),
                 Some(namespace),
-                crate::datastore::ResourceListQuery::new(label_selector, None, None, None),
+                klights_cluster_store::ResourceListOptions::new(label_selector, None, None, None),
             )
             .await?
             .items)
@@ -1832,19 +1547,19 @@ impl NativeApiTestHarness {
         value: serde_json::Value,
         expected_rv: i64,
     ) -> anyhow::Result<klights_cluster_core::Resource> {
-        self.datastore
+        self.resource_store
             .update_resource("v1", "Endpoints", Some(namespace), name, value, expected_rv)
             .await
     }
 
     pub async fn remove_endpoints(&self, namespace: &str, name: &str) -> anyhow::Result<()> {
-        self.datastore
+        self.resource_store
             .delete_resource("v1", "Endpoints", Some(namespace), name)
             .await
     }
 
     pub async fn remove_endpoint_slice(&self, namespace: &str, name: &str) -> anyhow::Result<()> {
-        self.datastore
+        self.resource_store
             .delete_resource(
                 "discovery.k8s.io/v1",
                 "EndpointSlice",
@@ -1855,7 +1570,7 @@ impl NativeApiTestHarness {
     }
 
     pub async fn endpoint_fixture_resource_version(&self) -> anyhow::Result<i64> {
-        self.datastore.get_current_resource_version().await
+        self.resource_store.get_current_resource_version().await
     }
 
     pub fn endpoint_fixture_value_with_resource_version(
@@ -1977,32 +1692,10 @@ impl NativeApiTestHarness {
             .await
     }
 
-    pub async fn register_crd_value(&self, crd: &serde_json::Value) -> anyhow::Result<()> {
-        klights_controllers::crd::register_crd_from_value(&self.crd_registry, crd).await
-    }
-
-    pub async fn register_crd_info(&self, info: klights_controllers::crd::CrdResourceInfo) {
-        self.crd_registry.register(info).await;
-    }
-
-    pub async fn sync_crd_registry_from_datastore(&self) -> anyhow::Result<()> {
-        klights_controllers::crd::sync_registry_from_datastore(
-            self.datastore.as_ref(),
-            &self.crd_registry,
-        )
-        .await
-    }
-
-    pub async fn crd_selectable_fields(
-        &self,
-        group: &str,
-        version: &str,
-        plural: &str,
-    ) -> Option<Vec<String>> {
-        self.crd_registry
-            .get(group, version, plural)
-            .await
-            .map(|info| info.selectable_fields)
+    /// Returns the neutral native-service registry already wired into this
+    /// router. CRD fixture behavior remains owned by native-service support.
+    pub fn crd_registry(&self) -> klights_leader_api::CrdRegistry {
+        self.crd_registry.clone()
     }
 
     pub fn set_node_metrics(&self, metrics: Arc<dyn klights_node_api::NodeMetrics>) {
@@ -2064,33 +1757,13 @@ impl NativeApiTestHarness {
         })
     }
 
-    /// Existing adapter cases require direct CRUD setup and observation.
-    /// This capability is absent unless the integration-only feature is set.
-    pub fn datastore(&self) -> IntegrationDatastoreHandle {
-        self.datastore.clone()
+    /// Canonical narrow persistence fixture bound to this router's exact store.
+    pub fn resource_store(&self) -> klights_cluster_datastore::test_support::ResourceTestStore {
+        self.resource_store.clone()
     }
 
-    pub fn subscribe_watch(
-        &self,
-        api_version: &str,
-        kind: &str,
-    ) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
-        crate::bootstrap::watch_commit_wiring::subscribe_test_events(
-            self.datastore.commit_observation_sink().as_ref(),
-            klights_watch::WatchTopic::new(api_version, kind),
-        )
-    }
-
-    pub fn install_resource_mutation_pause(
-        &self,
-        operation: IntegrationResourceMutationPauseOperation,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-    ) -> Arc<IntegrationResourceMutationPause> {
-        self.sqlite
-            .install_resource_mutation_pause(operation, api_version, kind, namespace, name)
+    pub fn commit_watch_fixture(&self) -> Arc<klights_watch::test_support::CommitWatchFixture> {
+        self.commit_watch_fixture.clone()
     }
 
     pub fn exhaust_nodeports(&self) -> anyhow::Result<()> {

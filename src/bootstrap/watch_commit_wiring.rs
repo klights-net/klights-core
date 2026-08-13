@@ -26,17 +26,23 @@ pub(crate) fn new_wiring() -> WatchCommitWiring {
     });
     WatchCommitWiring {
         #[cfg(any(test, feature = "pod-repository-test-support"))]
-        sink: Arc::new(WatchCommitObservationSink::new(
-            wakeups.clone(),
-            hub.clone(),
-        )),
+        sink: Arc::new({
+            #[cfg(test)]
+            {
+                WatchCommitObservationSink::new(wakeups.clone(), hub.clone())
+            }
+            #[cfg(not(test))]
+            {
+                WatchCommitObservationSink::new(wakeups.clone())
+            }
+        }),
         signals: hub,
         wakeups,
         follower_progress,
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub(crate) fn new_sink() -> Arc<WatchCommitObservationSink> {
     let hub = Arc::new(klights_watch::WatchSignalHub::new(1024));
     Arc::new(WatchCommitObservationSink::new(
@@ -45,7 +51,15 @@ pub(crate) fn new_sink() -> Arc<WatchCommitObservationSink> {
     ))
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(all(not(test), feature = "pod-repository-test-support"))]
+pub(crate) fn new_sink() -> Arc<WatchCommitObservationSink> {
+    let hub = Arc::new(klights_watch::WatchSignalHub::new(1024));
+    Arc::new(WatchCommitObservationSink::new(Arc::new(
+        klights_watch::PostCommitWatchWakeup::new(hub),
+    )))
+}
+
+#[cfg(test)]
 pub(crate) fn test_signal_source(
     db: &crate::datastore::DatastoreHandle,
 ) -> Arc<dyn klights_watch::WatchSignalSubscribe> {
@@ -66,7 +80,7 @@ pub(crate) fn subscribe(
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 pub(crate) struct WatchCommitObservationSink {
     wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     #[cfg(any(test, feature = "pod-repository-test-support"))]
     bus: WatchBus,
@@ -74,6 +88,7 @@ pub(crate) struct WatchCommitObservationSink {
 
 #[cfg(any(test, feature = "pod-repository-test-support"))]
 impl WatchCommitObservationSink {
+    #[cfg(test)]
     fn new(
         wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>,
         signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
@@ -87,7 +102,16 @@ impl WatchCommitObservationSink {
         }
     }
 
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(not(test))]
+    fn new(wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>) -> Self {
+        Self {
+            wakeups,
+            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            bus: WatchBus::new(1024),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn signal_source(&self) -> Arc<dyn klights_watch::WatchSignalSubscribe> {
         self.signals.clone()
     }
