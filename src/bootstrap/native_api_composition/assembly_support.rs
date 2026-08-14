@@ -549,7 +549,7 @@ pub(crate) mod support {
             .await?;
             let passive_reads = if let Some(control) = watch_history_failure {
                 let focused_reads = db.focused_read_store();
-                crate::datastore::selector::PassiveReadPorts::new(
+                crate::bootstrap::cluster_store::selector::PassiveReadPorts::new(
                 focused_reads.clone(),
                 klights_cluster_datastore::test_support::toggle_failing_watch_history_for_test_support(
                     focused_reads.clone(),
@@ -558,7 +558,7 @@ pub(crate) mod support {
                 focused_reads,
             )
             } else {
-                crate::datastore::selector::sqlite_passive_read_ports(&db)
+                crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&db)
             };
             let resource_store =
             klights_cluster_datastore::test_support::ResourceTestStore::from_embedded_for_test_support(

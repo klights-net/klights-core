@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use klights_leader_api::LeaderWatchError;
 
-use crate::datastore::selector::PassiveReadPorts;
+use crate::bootstrap::cluster_store::selector::PassiveReadPorts;
 use crate::datastore::{DatastoreBackend, DatastoreHandle};
 
 pub(crate) fn datastore_positioned_watch_service(

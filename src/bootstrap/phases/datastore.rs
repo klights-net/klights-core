@@ -11,9 +11,9 @@ use tokio_util::sync::CancellationToken;
 use crate::KlightsConfig;
 use crate::bootstrap::NodeRole;
 use crate::bootstrap::cluster_store::backend_kind::BackendKind;
+use crate::bootstrap::cluster_store::selector::PassiveStoreOpenRequest;
 use crate::bootstrap::credential_store::BootstrapCredentialStore;
 use crate::datastore::DatastoreHandle;
-use crate::datastore::selector::PassiveStoreOpenRequest;
 use klights_supervisor::TaskSupervisor;
 
 #[derive(Debug, thiserror::Error)]
@@ -196,7 +196,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     validate_raft_backend_capability(config.datastore_backend)?;
 
     let watch_commit_wiring = crate::bootstrap::watch_commit_wiring::new_wiring();
-    let opened_passive = crate::datastore::selector::open_with_sink(
+    let opened_passive = crate::bootstrap::cluster_store::selector::open_with_sink(
         passive_store_open_request(config),
         supervisor.clone(),
         #[cfg(test)]
@@ -1422,8 +1422,8 @@ async fn controlplane_join_client_identity_for_token_from_store(
 #[cfg(test)]
 mod tests {
     use crate::bootstrap::cluster_store::backend_kind::BackendKind;
+    use crate::bootstrap::cluster_store::selector::PassiveStoreOpenRequest;
     use crate::bootstrap::node_role::{LeaderBootstrap, LeaderPeer, NodeRole};
-    use crate::datastore::selector::PassiveStoreOpenRequest;
 
     #[test]
     fn redb_is_rejected_before_raft_composition() {

@@ -1225,7 +1225,8 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
     let concrete_db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
-    let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&concrete_db);
+    let passive_reads =
+        crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&concrete_db);
     let db: crate::datastore::DatastoreHandle = Arc::new(concrete_db);
     let (tx, rx) = watch::channel(true); // simulate seed cp1
     let authority = crate::bootstrap::authority::AuthorityHandle::from(rx.clone());

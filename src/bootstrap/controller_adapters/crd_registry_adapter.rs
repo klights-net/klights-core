@@ -164,7 +164,8 @@ mod tests {
             .await
             .unwrap();
         let handle: DatastoreHandle = Arc::new(db.clone());
-        let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&db);
+        let passive_reads =
+            crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&db);
         let registry = CrdRegistry::new();
         let cancel = CancellationToken::new();
         let watcher = tokio::spawn(run_crd_registry_watch_with_components(

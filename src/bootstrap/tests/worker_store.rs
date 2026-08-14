@@ -40,7 +40,7 @@ fn worker_pod_watch_request() -> WatchRequest {
 
 fn worker_store_from_local(
     db: crate::datastore::DatastoreHandle,
-    passive_reads: &crate::datastore::selector::PassiveReadPorts,
+    passive_reads: &crate::bootstrap::cluster_store::selector::PassiveReadPorts,
     node_name: &str,
 ) -> WorkerStoreAdapter {
     let authority =
@@ -145,7 +145,8 @@ async fn network_metadata_surfaces_forward_through_focused_leader_ports() {
         .update_node_dataplane(stored_dataplane.clone())
         .await
         .expect("seed leader dataplane metadata");
-    let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&cluster_db);
+    let passive_reads =
+        crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
@@ -363,7 +364,8 @@ async fn failed_snapshot_pod_route_retries_without_committing_reflector_or_membe
         )
         .await
         .expect("create snapshot Pod");
-    let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&cluster_db);
+    let passive_reads =
+        crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
@@ -937,7 +939,8 @@ async fn worker_list_page_preserves_continuation_metadata() {
             .await
             .expect("create configmap");
     }
-    let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&cluster_db);
+    let passive_reads =
+        crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
@@ -1028,7 +1031,8 @@ async fn worker_watch_replay_respects_resume_resource_version() {
             .await
             .expect("create configmap");
     }
-    let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&cluster_db);
+    let passive_reads =
+        crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
@@ -1106,7 +1110,8 @@ async fn worker_scalar_watch_replay_never_synthesizes_events_from_live_list_stat
         )
         .await
         .expect("create configmap");
-    let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&cluster_db);
+    let passive_reads =
+        crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
@@ -1140,7 +1145,8 @@ async fn worker_watch_replay_preserves_mirrored_delete_events() {
     let cluster_db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
-    let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&cluster_db);
+    let passive_reads =
+        crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
@@ -1220,7 +1226,8 @@ async fn worker_watch_replay_marks_resumed_bound_pod_snapshot_changes_modified()
         )
         .await
         .expect("create pod");
-    let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&cluster_db);
+    let passive_reads =
+        crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
@@ -1330,7 +1337,8 @@ async fn reads_cluster_objects_through_worker_cache_and_runtime_rows_from_node_l
         )
         .await
         .expect("create cluster pod");
-    let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&cluster_db);
+    let passive_reads =
+        crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let node_local = crate::bootstrap::node_store::open_node_local(
@@ -1402,7 +1410,8 @@ async fn watch_mirror_publishes_existing_node_pods_on_startup() {
         )
         .await
         .expect("create cluster pod");
-    let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&cluster_db);
+    let passive_reads =
+        crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
@@ -1475,7 +1484,8 @@ async fn watch_mirror_publishes_namespace_events_on_startup() {
         )
         .await
         .expect("create terminating namespace");
-    let passive_reads = crate::datastore::selector::sqlite_passive_read_ports(&cluster_db);
+    let passive_reads =
+        crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&cluster_db);
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(

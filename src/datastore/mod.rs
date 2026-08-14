@@ -7,7 +7,6 @@
 
 pub mod backend;
 pub mod redb;
-pub(crate) mod selector;
 pub mod sqlite;
 
 #[cfg(test)]

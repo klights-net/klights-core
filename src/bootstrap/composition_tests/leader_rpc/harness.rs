@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::datastore::DatastoreHandle as IntegrationDatastoreHandle;
 
 pub struct IntegrationPassiveReadPorts {
-    ports: crate::datastore::selector::PassiveReadPorts,
+    ports: crate::bootstrap::cluster_store::selector::PassiveReadPorts,
 }
 
 struct UnavailableLeaderWatchForTest;
@@ -162,7 +162,7 @@ impl IntegrationLeaderRpcComposition {
         db: &crate::datastore::sqlite::Datastore,
     ) -> IntegrationPassiveReadPorts {
         IntegrationPassiveReadPorts {
-            ports: crate::datastore::selector::sqlite_passive_read_ports(db),
+            ports: crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(db),
         }
     }
 
