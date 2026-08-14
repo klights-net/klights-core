@@ -11,7 +11,6 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::datastore::backend::DatastoreBackend;
-use crate::datastore::types::*;
 use klights_cluster_core::{
     LogApplyAppliedOutboxRow, LogApplyPodCleanupIntentRow, PatchKind, Resource,
     ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
@@ -25,6 +24,12 @@ use klights_cluster_datastore::redb::read_core::RedbSnapshotRead;
 use klights_cluster_datastore::redb::tables;
 #[cfg(test)]
 use klights_cluster_store::StagedPostCommit;
+use klights_cluster_store::{
+    CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation, ListPageRequest,
+    PositionedWatchReplay, PositionedWatchReplayRead, ReplicatedMembershipState,
+    ReplicatedSnapshotMetadata, ResourceList, ResourceListOptions, SnapshotAtRv, WatchReplayFloor,
+    WatchReplayRead, WatchTarget, WatchTargetScope,
+};
 use klights_types::HostPortRange;
 use klights_types::NodePeerMode;
 #[cfg(test)]
@@ -302,7 +307,7 @@ impl DatastoreBackend for RedbDatastore {
         a: &str,
         k: &str,
         n: Option<&str>,
-        query: ResourceListQuery<'_>,
+        query: ResourceListOptions<'_>,
     ) -> Result<ResourceList> {
         let cursor = query.continue_token.map(|name| {
             klights_cluster_store::ResourceCollectionKey::new(
@@ -1607,13 +1612,13 @@ impl crate::datastore::ReplicationStore for RedbDatastore {
 impl crate::datastore::DurableRecoveryStore for RedbDatastore {
     async fn read_durable_allocator_observation(
         &self,
-    ) -> Result<crate::datastore::DurableAllocatorObservation> {
+    ) -> Result<klights_cluster_store::DurableAllocatorObservation> {
         crate::datastore::DatastoreBackend::read_durable_allocator_observation(self).await
     }
 
     async fn read_cluster_metadata_observation(
         &self,
-    ) -> Result<crate::datastore::ClusterMetadataObservation> {
+    ) -> Result<klights_cluster_store::ClusterMetadataObservation> {
         crate::datastore::DatastoreBackend::read_cluster_metadata_observation(self).await
     }
 
@@ -1672,7 +1677,7 @@ impl crate::datastore::ClusterResourceQueryStore for RedbDatastore {
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
-        query: ResourceListQuery<'_>,
+        query: ResourceListOptions<'_>,
     ) -> Result<ResourceList> {
         crate::datastore::DatastoreBackend::list_resources(
             self,
@@ -1838,7 +1843,7 @@ impl crate::datastore::WatchMaintenanceStore for RedbDatastore {
         targets: &[WatchTarget],
         since_rv: i64,
         limit: std::num::NonZeroUsize,
-    ) -> Result<crate::datastore::WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>>
+    ) -> Result<klights_cluster_store::WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>>
     {
         crate::datastore::DatastoreBackend::list_raw_watch_events_since_checked_bounded(
             self, targets, since_rv, limit,
@@ -1851,7 +1856,7 @@ impl crate::datastore::WatchMaintenanceStore for RedbDatastore {
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
-        query: ResourceListQuery<'_>,
+        query: ResourceListOptions<'_>,
         snapshot_rv: i64,
     ) -> Result<SnapshotAtRv> {
         crate::datastore::DatastoreBackend::snapshot_resources_at_rv(

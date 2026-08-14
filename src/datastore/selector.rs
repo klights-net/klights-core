@@ -226,12 +226,9 @@ pub(crate) async fn open(
 #[cfg(test)]
 mod tests {
     use super::{OpenedPassiveStore, PassiveStoreOpenRequest, open, open_with_sink};
-    use crate::datastore::{
-        PositionedWatchReplayRead, ResourceListQuery as LegacyResourceListQuery, WatchTarget,
-    };
     use klights_cluster_store::{
-        DurableWatchTarget, ResourceCollectionScope, ResourceListQuery, ResourceListRead,
-        ResourceListRequest, WatchHistoryRead, WatchHistoryRequest,
+        DurableWatchTarget, PositionedWatchReplayRead, ResourceCollectionScope, ResourceListQuery,
+        ResourceListRead, ResourceListRequest, WatchHistoryRead, WatchHistoryRequest, WatchTarget,
     };
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use serde_json::json;
@@ -360,7 +357,7 @@ mod tests {
                     "v1",
                     "ConfigMap",
                     Some("phase9-repair"),
-                    LegacyResourceListQuery::all(),
+                    klights_cluster_store::ResourceListOptions::all(),
                 )
                 .await
                 .expect("legacy list");
@@ -487,7 +484,7 @@ mod tests {
                     "v1",
                     "ConfigMap",
                     Some("phase9-repair"),
-                    LegacyResourceListQuery::new(None, None, Some(-1), None),
+                    klights_cluster_store::ResourceListOptions::new(None, None, Some(-1), None),
                 )
                 .await
                 .expect("legacy negative list limit remains unbounded");

@@ -100,7 +100,7 @@ impl FreshServiceInventoryClient {
     async fn fresh_list_for_test(
         &self,
         req: klights_leader_api::ResourceListRequest,
-    ) -> anyhow::Result<crate::datastore::ResourceList> {
+    ) -> anyhow::Result<klights_cluster_store::ResourceList> {
         if req.api_version() == "discovery.k8s.io/v1" && req.kind() == "EndpointSlice" {
             self.endpointslice_list_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -110,7 +110,7 @@ impl FreshServiceInventoryClient {
             }
             let ports = self.endpointslice_ports();
             let endpoints = self.endpointslice_endpoints();
-            return Ok(crate::datastore::ResourceList {
+            return Ok(klights_cluster_store::ResourceList {
                 items: if self.legacy_endpoints_empty || self.legacy_endpoints_partial {
                     vec![inventory_resource(
                         "discovery.k8s.io/v1",
@@ -147,7 +147,7 @@ impl FreshServiceInventoryClient {
             self.endpoints_list_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let legacy_addresses = self.legacy_endpoint_addresses();
-            return Ok(crate::datastore::ResourceList {
+            return Ok(klights_cluster_store::ResourceList {
                 items: vec![inventory_resource(
                     "v1",
                     "Endpoints",
@@ -184,7 +184,7 @@ impl FreshServiceInventoryClient {
         self.service_list_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let service_ports = self.service_ports();
-        Ok(crate::datastore::ResourceList {
+        Ok(klights_cluster_store::ResourceList {
             items: vec![inventory_resource(
                 "v1",
                 "Service",

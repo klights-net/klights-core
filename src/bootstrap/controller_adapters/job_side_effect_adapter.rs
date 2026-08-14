@@ -1,10 +1,11 @@
+use klights_cluster_store::ResourceListOptions;
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
 
-use crate::datastore::{DatastoreBackend, DatastoreHandle, ResourceListQuery};
+use crate::datastore::{DatastoreBackend, DatastoreHandle};
 use klights_controllers::side_effects::job::JobSideEffectStore;
 
 struct BorrowedJobSideEffectStore<'a> {
@@ -23,7 +24,12 @@ pub(crate) fn borrowed_store(db: &dyn DatastoreBackend) -> impl JobSideEffectSto
 impl JobSideEffectStore for BorrowedJobSideEffectStore<'_> {
     async fn list_jobs(&self, namespace: &str) -> Result<Vec<Resource>> {
         self.db
-            .list_resources("batch/v1", "Job", Some(namespace), ResourceListQuery::all())
+            .list_resources(
+                "batch/v1",
+                "Job",
+                Some(namespace),
+                ResourceListOptions::all(),
+            )
             .await
             .map(|listing| listing.items)
     }

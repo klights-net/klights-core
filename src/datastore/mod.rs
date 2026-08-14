@@ -1,6 +1,7 @@
 //! Datastore — runtime contract (`DatastoreBackend`) plus backend
-//! implementations. The trait surface is in `backend.rs`, shared types in
-//! `types.rs`, and each backend lives in its own sibling folder. Today
+//! implementations. The trait surface is in `backend.rs`, while canonical
+//! persistence and snapshot values live in `klights-cluster-store`; each backend lives in
+//! its own sibling folder. Today
 //! there is one backend: `sqlite/`. Future backends slot in alongside
 //! with the same internal shape.
 
@@ -8,10 +9,8 @@ pub mod backend;
 pub mod backend_kind;
 pub mod redb;
 pub(crate) mod selector;
-pub mod snapshot;
 pub(crate) mod snapshot_export;
 pub mod sqlite;
-pub mod types;
 
 #[cfg(test)]
 pub use backend::CommitObservationSink;
@@ -33,14 +32,5 @@ pub use klights_cluster_core::{
 #[cfg(test)]
 pub use klights_cluster_datastore::sqlite::embedded::ReplicatedCreateOptions;
 pub use klights_cluster_store::StagedPostCommit;
-pub use types::{
-    CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation, ListPageRequest,
-    POD_CLEANUP_REASON_NODE_LOST, PositionedWatchReplay, PositionedWatchReplayRead,
-    ReplicatedMembershipState, ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery,
-    SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget, WatchTargetScope,
-};
-
-#[cfg(test)]
-pub use sqlite::create_staged_post_commit;
 #[cfg(test)]
 pub use sqlite::{staged_post_commit_from_event, staged_test_event};

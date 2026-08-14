@@ -87,7 +87,7 @@ async fn worker_replay_since_checked_bounded(
     targets: &[WatchTarget],
     resource_version: i64,
     limit: NonZeroUsize,
-) -> anyhow::Result<crate::datastore::WatchReplayRead> {
+) -> anyhow::Result<klights_cluster_store::WatchReplayRead> {
     let read = adapter.list_watch_events_after_position_checked_bounded(
         targets,
         WatchReplayPosition::from_resource_version(resource_version),
@@ -95,14 +95,14 @@ async fn worker_replay_since_checked_bounded(
     );
     Ok(match read {
         klights_watch::PositionedWatchReplayRead::Expired => {
-            crate::datastore::WatchReplayRead::Expired
+            klights_cluster_store::WatchReplayRead::Expired
         }
         klights_watch::PositionedWatchReplayRead::Events(replay) => {
-            crate::datastore::WatchReplayRead::Events(
+            klights_cluster_store::WatchReplayRead::Events(
                 replay
                     .events
                     .into_iter()
-                    .map(|positioned| crate::datastore::CatchUpResource {
+                    .map(|positioned| klights_cluster_store::CatchUpResource {
                         resource: positioned.event.resource,
                         event_type: std::borrow::Cow::Owned(positioned.event.event_type),
                     })
@@ -116,11 +116,11 @@ fn worker_replay_since(
     adapter: &WorkerStoreAdapter,
     targets: &[WatchTarget],
     resource_version: i64,
-) -> Vec<crate::datastore::CatchUpResource> {
+) -> Vec<klights_cluster_store::CatchUpResource> {
     adapter
         .list_watch_events_since(targets, resource_version)
         .into_iter()
-        .map(|event| crate::datastore::CatchUpResource {
+        .map(|event| klights_cluster_store::CatchUpResource {
             resource: event.resource,
             event_type: std::borrow::Cow::Owned(event.event_type),
         })
@@ -1051,7 +1051,7 @@ async fn worker_watch_replay_respects_resume_resource_version() {
     let first = worker_replay_since_checked_bounded(&adapter, &targets, 0, limit)
         .await
         .expect("initial watch replay");
-    let crate::datastore::WatchReplayRead::Events(first_events) = first else {
+    let klights_cluster_store::WatchReplayRead::Events(first_events) = first else {
         panic!("worker adapter replay should not expire");
     };
     assert_eq!(first_events.len(), 3);
@@ -1064,7 +1064,7 @@ async fn worker_watch_replay_respects_resume_resource_version() {
     let second = worker_replay_since_checked_bounded(&adapter, &targets, max_rv, limit)
         .await
         .expect("resumed watch replay");
-    let crate::datastore::WatchReplayRead::Events(second_events) = second else {
+    let klights_cluster_store::WatchReplayRead::Events(second_events) = second else {
         panic!("worker adapter replay should not expire");
     };
     assert!(
@@ -1142,27 +1142,18 @@ async fn worker_watch_replay_preserves_mirrored_delete_events() {
     .expect("open node-local");
     let adapter = worker_store_from_local(cluster_db_handle, &passive_reads, "worker-a");
 
-    let pending = crate::datastore::create_staged_post_commit(
-        "v1",
-        "ConfigMap",
-        Some("default"),
-        "deleted-config",
-        42,
-        "DELETED",
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": {
-                "namespace": "default",
-                "name": "deleted-config",
-                "resourceVersion": "41"
-            },
-            "data": {"data-1": "value-1"}
-        }),
-    );
-    adapter.publish_watch_for_test(
-        crate::datastore::staged_test_event(&pending).expect("staged test watch event"),
-    );
+    let deleted = klights_cluster_core::Resource::try_from_data(Arc::new(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "namespace": "default",
+            "name": "deleted-config",
+            "resourceVersion": "42"
+        },
+        "data": {"data-1": "value-1"}
+    })))
+    .expect("deleted watch fixture has canonical identity");
+    adapter.publish_watch_for_test(WatchEvent::deleted((*deleted.data).clone()));
 
     let replay = worker_replay_since_checked_bounded(
         &adapter,
@@ -1173,7 +1164,7 @@ async fn worker_watch_replay_preserves_mirrored_delete_events() {
     .await
     .expect("watch replay should succeed");
 
-    let crate::datastore::WatchReplayRead::Events(events) = replay else {
+    let klights_cluster_store::WatchReplayRead::Events(events) = replay else {
         panic!("worker adapter replay should not expire");
     };
     assert!(
@@ -1182,6 +1173,7 @@ async fn worker_watch_replay_preserves_mirrored_delete_events() {
                 && event.resource.kind == "ConfigMap"
                 && event.resource.name == "deleted-config"
                 && event.resource.resource_version == 42
+                && event.resource.data["data"]["data-1"] == "value-1"
         }),
         "worker watch replay must preserve mirrored DELETED events because deleted resources are absent from snapshot replay"
     );
@@ -1239,7 +1231,7 @@ async fn worker_watch_replay_marks_resumed_bound_pod_snapshot_changes_modified()
     let first = worker_replay_since_checked_bounded(&adapter, &targets, 0, limit)
         .await
         .expect("initial watch replay");
-    let crate::datastore::WatchReplayRead::Events(first_events) = first else {
+    let klights_cluster_store::WatchReplayRead::Events(first_events) = first else {
         panic!("worker adapter replay should not expire");
     };
     assert_eq!(first_events.len(), 1);
@@ -1281,7 +1273,7 @@ async fn worker_watch_replay_marks_resumed_bound_pod_snapshot_changes_modified()
         worker_replay_since_checked_bounded(&adapter, &targets, created.resource_version, limit)
             .await
             .expect("resumed watch replay");
-    let crate::datastore::WatchReplayRead::Events(resumed_events) = resumed else {
+    let klights_cluster_store::WatchReplayRead::Events(resumed_events) = resumed else {
         panic!("worker adapter replay should not expire");
     };
     assert_eq!(resumed_events.len(), 1);

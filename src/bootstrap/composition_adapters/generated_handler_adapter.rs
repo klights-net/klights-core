@@ -1,9 +1,10 @@
+use klights_cluster_store::ResourceListOptions;
 use std::sync::Arc;
 
 use klights_cluster_core::Resource;
 use serde_json::Value;
 
-use crate::datastore::{DatastoreHandle, ResourceListQuery};
+use crate::datastore::DatastoreHandle;
 use k8s_native_service::AppError;
 use k8s_native_service::generic_command::{
     BuiltinAdmissionDefaultsPort, GeneratedLifecyclePort, GeneratedResourceMutationPort,
@@ -168,7 +169,7 @@ impl k8s_native_service::ports::AdmissionResourceStore for GeneratedHandlerAdapt
         namespace: Option<&str>,
     ) -> Result<Vec<Resource>, klights_leader_api::ResourceQueryError> {
         self.db
-            .list_resources(api_version, kind, namespace, ResourceListQuery::all())
+            .list_resources(api_version, kind, namespace, ResourceListOptions::all())
             .await
             .map(|listing| listing.items)
             .map_err(|error| {

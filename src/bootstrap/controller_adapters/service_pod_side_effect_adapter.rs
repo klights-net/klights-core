@@ -1,7 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_cluster_store::ResourceListOptions;
 
-use crate::datastore::{DatastoreBackend, ResourceListQuery};
+use crate::datastore::DatastoreBackend;
 use klights_controllers::side_effects::service_pod::{ServiceEndpointState, ServicePodStore};
 
 struct BorrowedServicePodStore<'a> {
@@ -23,17 +24,22 @@ impl ServicePodStore for BorrowedServicePodStore<'_> {
 impl ServicePodStore for dyn DatastoreBackend + '_ {
     async fn load_service_endpoint_state(&self, namespace: &str) -> Result<ServiceEndpointState> {
         let services = self
-            .list_resources("v1", "Service", Some(namespace), ResourceListQuery::all())
+            .list_resources("v1", "Service", Some(namespace), ResourceListOptions::all())
             .await?;
         let endpoints = self
-            .list_resources("v1", "Endpoints", Some(namespace), ResourceListQuery::all())
+            .list_resources(
+                "v1",
+                "Endpoints",
+                Some(namespace),
+                ResourceListOptions::all(),
+            )
             .await?;
         let endpoint_slices = self
             .list_resources(
                 "discovery.k8s.io/v1",
                 "EndpointSlice",
                 Some(namespace),
-                ResourceListQuery::all(),
+                ResourceListOptions::all(),
             )
             .await?;
         Ok(ServiceEndpointState {

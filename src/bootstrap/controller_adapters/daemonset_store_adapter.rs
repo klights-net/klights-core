@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
+use klights_cluster_store::ResourceListOptions;
 use klights_reconcile_api::ControllerStoreResult as Result;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::{DatastoreBackend, ResourceListQuery};
+use crate::datastore::DatastoreBackend;
 use klights_controllers::daemonset::{DaemonSetPodMutation, DaemonSetStore};
 
 #[async_trait]
@@ -31,7 +32,7 @@ impl DaemonSetStore for dyn DatastoreBackend + '_ {
                 "apps/v1",
                 "ControllerRevision",
                 Some(namespace),
-                ResourceListQuery::all(),
+                ResourceListOptions::all(),
             )
             .await
             .map_err(map_controller_store_error)?
@@ -57,7 +58,7 @@ impl DaemonSetStore for dyn DatastoreBackend + '_ {
 
     async fn list_nodes(&self) -> Result<Vec<Resource>> {
         Ok(self
-            .list_resources("v1", "Node", None, ResourceListQuery::all())
+            .list_resources("v1", "Node", None, ResourceListOptions::all())
             .await
             .map_err(map_controller_store_error)?
             .items)

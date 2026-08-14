@@ -9,12 +9,6 @@ use tokio::sync::broadcast;
 #[cfg(test)]
 use super::backend::CommitObservationSink;
 use super::backend::DatastoreBackend;
-use super::types::{
-    CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation, ListPageRequest,
-    PositionedWatchReplay, PositionedWatchReplayRead, ReplicatedMembershipState,
-    ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery, SnapshotAtRv, WatchReplayRead,
-    WatchTarget, WatchTargetScope,
-};
 use klights_cluster_core::{
     BuildOutboxOutcome, LogApplyAppliedOutboxRow, LogApplyPodCleanupIntentRow, PatchKind, Resource,
     ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
@@ -25,6 +19,12 @@ pub use klights_cluster_datastore::sqlite::embedded::ResourceMutationPauseOperat
 use klights_cluster_store::ClusterMetadataRead;
 #[cfg(test)]
 use klights_cluster_store::StagedPostCommit;
+use klights_cluster_store::{
+    CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation, ListPageRequest,
+    PositionedWatchReplay, PositionedWatchReplayRead, ReplicatedMembershipState,
+    ReplicatedSnapshotMetadata, ResourceList, ResourceListOptions, SnapshotAtRv, WatchReplayRead,
+    WatchTarget, WatchTargetScope,
+};
 #[cfg(test)]
 use klights_watch::WatchTopic;
 
@@ -314,24 +314,6 @@ fn focused_events_to_catchup(
 }
 
 #[cfg(test)]
-pub fn create_staged_post_commit(
-    api_version: &str,
-    kind: &str,
-    namespace: Option<&str>,
-    name: &str,
-    resource_version: i64,
-    event_type: &str,
-    data: impl Into<std::sync::Arc<Value>>,
-) -> StagedPostCommit {
-    crate::datastore::types::with_staged_test_resource_event(
-        StagedPostCommit::new(api_version, kind, namespace, resource_version),
-        event_type,
-        name,
-        data.into(),
-    )
-}
-
-#[cfg(test)]
 pub fn staged_test_event(pending: &StagedPostCommit) -> Option<klights_watch::WatchEvent> {
     let staged = pending.test_event()?;
     let mut event = klights_watch::WatchEvent::from_type(
@@ -493,7 +475,7 @@ impl DatastoreBackend for Datastore {
         entries: Vec<klights_cluster_core::SnapshotRestoreOperation>,
         current_rv: i64,
         watch_event_high_water: Option<i64>,
-        watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
+        watch_replay_floors: Option<Vec<klights_cluster_store::WatchReplayFloor>>,
         metadata: Option<ReplicatedSnapshotMetadata>,
     ) -> Result<()> {
         PassiveDatastore::replace_replicated_resource_state(
@@ -559,7 +541,7 @@ impl DatastoreBackend for Datastore {
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
-        query: ResourceListQuery<'_>,
+        query: ResourceListOptions<'_>,
     ) -> Result<ResourceList> {
         PassiveDatastore::list_resources(self, api_version, kind, namespace, query).await
     }
@@ -598,9 +580,9 @@ impl DatastoreBackend for Datastore {
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
-        query: ResourceListQuery<'_>,
+        query: ResourceListOptions<'_>,
         snapshot_rv: i64,
-    ) -> Result<crate::datastore::types::SnapshotAtRv> {
+    ) -> Result<SnapshotAtRv> {
         PassiveDatastore::snapshot_resources_at_rv(
             self,
             api_version,
@@ -1213,7 +1195,9 @@ impl DatastoreBackend for Datastore {
             .await
     }
 
-    async fn list_watch_replay_floors(&self) -> Result<Vec<crate::datastore::WatchReplayFloor>> {
+    async fn list_watch_replay_floors(
+        &self,
+    ) -> Result<Vec<klights_cluster_store::WatchReplayFloor>> {
         use klights_cluster_store::DurableWatchHistoryRead as _;
 
         self.focused_read_store()
@@ -1239,7 +1223,7 @@ impl DatastoreBackend for Datastore {
                                 namespace,
                             } => (api_version, kind, namespace),
                         };
-                        crate::datastore::WatchReplayFloor {
+                        klights_cluster_store::WatchReplayFloor {
                             api_version,
                             kind,
                             namespace_key,
@@ -1257,7 +1241,7 @@ impl DatastoreBackend for Datastore {
         &self,
         after: Option<&klights_cluster_store::SnapshotReplayFloorCursor>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<crate::datastore::WatchReplayFloor>> {
+    ) -> Result<Vec<klights_cluster_store::WatchReplayFloor>> {
         PassiveDatastore::list_watch_replay_floors_paged(self, after, limit).await
     }
 

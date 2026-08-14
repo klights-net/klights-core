@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
 use klights_cluster_datastore::diagnostics::{NoopResourceWrite, log_noop_resource_write};
+use klights_cluster_store::ResourceListOptions;
 use serde_json::json;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::{DatastoreBackend, ResourceListQuery, ResourcePatchRequest};
+use crate::datastore::{DatastoreBackend, ResourcePatchRequest};
 use klights_controllers::apiservice::ApiServiceStore;
 use klights_controllers::common::ControllerStatusStore;
 #[cfg(test)]
@@ -43,7 +44,7 @@ impl ApiServiceStore for dyn DatastoreBackend + '_ {
             "discovery.k8s.io/v1",
             "EndpointSlice",
             Some(namespace),
-            ResourceListQuery::new(Some(&selector), None, None, None),
+            ResourceListOptions::new(Some(&selector), None, None, None),
         )
         .await
         .map(|listing| listing.items)
@@ -378,7 +379,7 @@ impl RbacPolicyStore for dyn DatastoreBackend + '_ {
             None,
             None,
             None,
-            crate::datastore::types::ListPageRequest::unbounded(),
+            klights_cluster_store::ListPageRequest::unbounded(),
         )
         .await
         .map(|listing| listing.items)
@@ -578,10 +579,15 @@ impl CronJobStore for crate::datastore::sqlite::Datastore {
     }
 
     async fn list_jobs(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
-        self.list_resources("batch/v1", "Job", Some(namespace), ResourceListQuery::all())
-            .await
-            .map(|listing| listing.items)
-            .map_err(map_controller_store_error)
+        self.list_resources(
+            "batch/v1",
+            "Job",
+            Some(namespace),
+            ResourceListOptions::all(),
+        )
+        .await
+        .map(|listing| listing.items)
+        .map_err(map_controller_store_error)
     }
 
     async fn delete_job(
@@ -617,7 +623,7 @@ impl PvcStore for dyn DatastoreBackend + '_ {
     }
 
     async fn list_persistent_volumes(&self) -> ControllerStoreResult<Vec<Resource>> {
-        self.list_resources("v1", "PersistentVolume", None, ResourceListQuery::all())
+        self.list_resources("v1", "PersistentVolume", None, ResourceListOptions::all())
             .await
             .map(|listing| listing.items)
             .map_err(map_controller_store_error)
@@ -672,7 +678,7 @@ impl PvcStore for crate::datastore::sqlite::Datastore {
     }
 
     async fn list_persistent_volumes(&self) -> ControllerStoreResult<Vec<Resource>> {
-        self.list_resources("v1", "PersistentVolume", None, ResourceListQuery::all())
+        self.list_resources("v1", "PersistentVolume", None, ResourceListOptions::all())
             .await
             .map(|listing| listing.items)
             .map_err(map_controller_store_error)
@@ -720,7 +726,7 @@ impl PdbStore for dyn DatastoreBackend + '_ {
             "policy/v1",
             "PodDisruptionBudget",
             Some(namespace),
-            ResourceListQuery::all(),
+            ResourceListOptions::all(),
         )
         .await
         .map(|listing| listing.items)
@@ -736,7 +742,7 @@ impl PdbStore for crate::datastore::sqlite::Datastore {
             "policy/v1",
             "PodDisruptionBudget",
             Some(namespace),
-            ResourceListQuery::all(),
+            ResourceListOptions::all(),
         )
         .await
         .map(|listing| listing.items)

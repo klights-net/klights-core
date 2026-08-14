@@ -32,7 +32,7 @@ impl CronJobSchedulerRuntime for LeaderCronJobSchedulerRuntime {
                 "batch/v1",
                 "CronJob",
                 None,
-                crate::datastore::ResourceListQuery::all(),
+                klights_cluster_store::ResourceListOptions::all(),
             )
             .await
             .map(|listing| listing.items)
@@ -63,7 +63,7 @@ impl CronJobSchedulerRuntime for LeaderCronJobSchedulerRuntime {
                 "batch/v1",
                 "CronJob",
                 None,
-                crate::datastore::ResourceListQuery::all(),
+                klights_cluster_store::ResourceListOptions::all(),
             )
             .await
             .map_err(|error| LeaderWatchError::unavailable(error.to_string()))?;

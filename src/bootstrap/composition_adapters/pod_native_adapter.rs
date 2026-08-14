@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
+use klights_cluster_store::ResourceListOptions;
 use klights_pod_api::{
     PodControlPlaneEventRequest, PodControlPlaneEventSink, PodGetRequest, PodListRequest,
     PodListResult, PodMetadataPatchRequest, PodPersistence, PodPersistenceCreateRequest,
@@ -11,7 +12,7 @@ use klights_pod_api::{
     PodSpecValidation, PodStatusPersistence, PodStatusWriteRequest,
 };
 
-use crate::datastore::{DatastoreHandle, ResourceListQuery};
+use crate::datastore::DatastoreHandle;
 use k8s_native_service::AdmissionResourceStore;
 use klights_kubelet::pod_repository::store::PodStore;
 
@@ -268,7 +269,7 @@ impl AdmissionResourceStore for RootPodNativeAdapter {
         namespace: Option<&str>,
     ) -> Result<Vec<Resource>, klights_leader_api::ResourceQueryError> {
         self.db
-            .list_resources(api_version, kind, namespace, ResourceListQuery::all())
+            .list_resources(api_version, kind, namespace, ResourceListOptions::all())
             .await
             .map(|list| list.items)
             .map_err(|error| {

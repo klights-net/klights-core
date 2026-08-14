@@ -11,9 +11,10 @@ use async_trait::async_trait;
 use klights_cluster_core::{
     OutboxApplyError, OutboxApplyOutcome, OutboxStreamWatermark, StorageCommand,
 };
+use klights_cluster_store::ResourceListOptions;
 use klights_replication::proposal::{RaftProposal, RaftProposalEffect};
 
-use crate::datastore::{DatastoreBackend, ResourceListQuery};
+use crate::datastore::DatastoreBackend;
 
 pub(crate) struct BackendProposalFixture {
     backend: Arc<dyn DatastoreBackend>,
@@ -82,7 +83,7 @@ impl klights_leader_api::LeaderResourceQuery for BackendResourceQueryFixture {
                     request.api_version(),
                     request.kind(),
                     request.namespace(),
-                    ResourceListQuery::new(
+                    ResourceListOptions::new(
                         request.label_selector(),
                         request.field_selector(),
                         request.limit(),

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use klights_auth::bootstrap_token::BootstrapTokenScopePolicy;
 use klights_cluster_core::{Resource, ResourcePreconditions, StorageCommand};
+use klights_cluster_store::ResourceListOptions;
 use klights_controllers::kube_service::KubernetesBootstrapStore;
 use klights_controllers::namespace::NamespaceBootstrapStore;
 use klights_controllers::rbac_reconcile::RbacPolicyStore;
@@ -13,7 +14,7 @@ use klights_leader_api::{
 };
 use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 
-use crate::datastore::{DatastoreHandle, ResourceListQuery};
+use crate::datastore::DatastoreHandle;
 
 /// Bootstrap-only read/command composition. Reads use the committed local
 /// state machine; every mutation crosses the leader command boundary and is
@@ -152,7 +153,7 @@ impl klights_kubelet::node_registration::NodeRegistrationStore for LeaderBootstr
 impl klights_kubelet::node_leader_labels::NodeLeaderLabelStore for LeaderBootstrapStore {
     async fn list_nodes(&self) -> anyhow::Result<Vec<Resource>> {
         self.reads
-            .list_resources("v1", "Node", None, ResourceListQuery::all())
+            .list_resources("v1", "Node", None, ResourceListOptions::all())
             .await
             .map(|list| list.items)
     }
@@ -363,7 +364,7 @@ impl RbacPolicyStore for LeaderBootstrapStore {
                 "rbac.authorization.k8s.io/v1",
                 "ClusterRole",
                 None,
-                ResourceListQuery::all(),
+                ResourceListOptions::all(),
             )
             .await
             .map(|listing| listing.items)

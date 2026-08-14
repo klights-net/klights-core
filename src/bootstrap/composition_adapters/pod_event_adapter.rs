@@ -35,7 +35,7 @@ impl klights_kubelet::pod_events::PodEventQuery for DatastorePodEventAdapter<'_>
                 "v1",
                 "Event",
                 Some(namespace),
-                crate::datastore::ResourceListQuery::all(),
+                klights_cluster_store::ResourceListOptions::all(),
             )
             .await?
             .items)

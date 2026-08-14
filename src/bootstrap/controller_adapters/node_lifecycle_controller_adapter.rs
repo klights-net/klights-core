@@ -1,10 +1,11 @@
+use klights_cluster_store::ResourceListOptions;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::{DatastoreBackend, DatastoreHandle, ResourceListQuery};
+use crate::datastore::{DatastoreBackend, DatastoreHandle};
 use klights_cluster_core::Resource;
 use klights_controllers::node_lifecycle::{
     NodeLifecyclePodStore, NodeLifecycleStore, NodeLostPodLifecycleSink,
@@ -49,7 +50,7 @@ where
         Ok(self
             .inner
             .datastore()
-            .list_resources("v1", "Node", None, ResourceListQuery::all())
+            .list_resources("v1", "Node", None, ResourceListOptions::all())
             .await
             .map_err(map_controller_store_error)?
             .items)
@@ -65,7 +66,7 @@ where
                 "coordination.k8s.io/v1",
                 "Lease",
                 Some("kube-node-lease"),
-                ResourceListQuery::all(),
+                ResourceListOptions::all(),
             )
             .await
             .map_err(map_controller_store_error)?

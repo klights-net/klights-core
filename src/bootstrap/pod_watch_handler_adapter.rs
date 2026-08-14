@@ -84,7 +84,7 @@ impl PersistentVolumeEventHandler for LeaderPersistentVolumeEventHandler {
                 "v1",
                 "PersistentVolumeClaim",
                 None,
-                crate::datastore::ResourceListQuery::all(),
+                klights_cluster_store::ResourceListOptions::all(),
             )
             .await
         else {

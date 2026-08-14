@@ -933,7 +933,7 @@ async fn cleanup_intent_ack_is_idempotent_and_never_touches_same_name_pod_row() 
         "default",
         "web",
         "old-uid",
-        crate::datastore::POD_CLEANUP_REASON_NODE_LOST,
+        klights_cluster_store::POD_CLEANUP_REASON_NODE_LOST,
     )
     .unwrap();
 

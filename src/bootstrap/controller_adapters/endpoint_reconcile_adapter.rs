@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use klights_cluster_core::{Resource, ResourceBatchOperation, ResourcePreconditions};
+use klights_cluster_store::ResourceListOptions;
 use klights_reconcile_api::ControllerStoreResult as Result;
 use serde_json::Value;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::{DatastoreBackend, ResourceListQuery};
+use crate::datastore::DatastoreBackend;
 use klights_controllers::endpoints::EndpointReconcileStore;
 
 #[async_trait]
@@ -46,7 +47,7 @@ impl EndpointReconcileStore for dyn DatastoreBackend + '_ {
                 "discovery.k8s.io/v1",
                 "EndpointSlice",
                 Some(namespace),
-                ResourceListQuery::new(
+                ResourceListOptions::new(
                     Some(&format!("kubernetes.io/service-name={service_name}")),
                     None,
                     None,

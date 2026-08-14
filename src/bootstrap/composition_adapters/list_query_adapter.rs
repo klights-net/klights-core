@@ -37,7 +37,7 @@ impl DatastoreNamespaceListPort {
         Arc::new(Self { db })
     }
 
-    fn page(list: crate::datastore::ResourceList) -> NamespaceListPage {
+    fn page(list: klights_cluster_store::ResourceList) -> NamespaceListPage {
         NamespaceListPage {
             items: list.items,
             resource_version: list.resource_version,
@@ -53,9 +53,11 @@ impl NamespaceListPort for DatastoreNamespaceListPort {
         request: NamespaceListRequest,
     ) -> NamespaceListFuture<'_, NamespaceListPage> {
         Box::pin(async move {
-            let page =
-                crate::datastore::ListPageRequest::try_new(request.limit, request.continue_token)
-                    .map_err(k8s_native_service::AppError::from)?;
+            let page = klights_cluster_store::ListPageRequest::try_new(
+                request.limit,
+                request.continue_token,
+            )
+            .map_err(k8s_native_service::AppError::from)?;
             self.db
                 .list_namespaces_page(
                     request.label_selector.as_deref(),
@@ -74,7 +76,7 @@ impl NamespaceListPort for DatastoreNamespaceListPort {
         snapshot_resource_version: i64,
     ) -> NamespaceListFuture<'_, NamespaceListSnapshot> {
         Box::pin(async move {
-            let query = crate::datastore::ResourceListQuery::new(
+            let query = klights_cluster_store::ResourceListOptions::new(
                 request.label_selector.as_deref(),
                 request.field_selector.as_deref(),
                 request.limit,
@@ -84,11 +86,11 @@ impl NamespaceListPort for DatastoreNamespaceListPort {
                 .snapshot_resources_at_rv("v1", "Namespace", None, query, snapshot_resource_version)
                 .await
                 .map(|snapshot| match snapshot {
-                    crate::datastore::SnapshotAtRv::List(list) => {
+                    klights_cluster_store::SnapshotAtRv::List(list) => {
                         NamespaceListSnapshot::List(Self::page(list))
                     }
-                    crate::datastore::SnapshotAtRv::Current => NamespaceListSnapshot::Current,
-                    crate::datastore::SnapshotAtRv::Expired => NamespaceListSnapshot::Expired,
+                    klights_cluster_store::SnapshotAtRv::Current => NamespaceListSnapshot::Current,
+                    klights_cluster_store::SnapshotAtRv::Expired => NamespaceListSnapshot::Expired,
                 })
                 .map_err(k8s_native_service::AppError::from)
         })

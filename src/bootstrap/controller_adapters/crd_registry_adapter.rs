@@ -21,7 +21,7 @@ impl CrdRegistryReader for dyn DatastoreBackend + '_ {
             "apiextensions.k8s.io/v1",
             "CustomResourceDefinition",
             None,
-            crate::datastore::ResourceListQuery::all(),
+            klights_cluster_store::ResourceListOptions::all(),
         )
         .await
         .map(|listing| {
@@ -55,7 +55,7 @@ impl CrdRegistryRuntime for LeaderCrdRegistryRuntime {
                 "apiextensions.k8s.io/v1",
                 "CustomResourceDefinition",
                 None,
-                crate::datastore::ResourceListQuery::all(),
+                klights_cluster_store::ResourceListOptions::all(),
             )
             .await
             .map_err(|error| LeaderWatchError::unavailable(error.to_string()))?;

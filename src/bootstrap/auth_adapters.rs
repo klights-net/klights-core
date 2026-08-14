@@ -6,9 +6,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::datastore::backend::DatastoreHandle;
-use crate::datastore::types::ListPageRequest;
 use klights_auth::node_policy_store::NodePolicyStore;
 use klights_auth::rbac_policy_store::RbacResourceReader;
+use klights_cluster_store::ListPageRequest;
 use klights_controllers::csr_signer::{
     CsrIssuanceError, CsrIssuanceOutcome, CsrIssuanceRequest, CsrIssuer, IssuedCsr,
 };

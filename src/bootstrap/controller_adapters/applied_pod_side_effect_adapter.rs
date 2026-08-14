@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use klights_cluster_core::{Resource, command::StorageCommand};
+use klights_cluster_store::ResourceListOptions;
 use klights_controllers::side_effects::applied_pod::{
     AppliedPodPdbStore, AppliedPodSideEffectError, AppliedPodSideEffectSinks,
     AppliedPodSideEffectStores,
@@ -7,7 +8,7 @@ use klights_controllers::side_effects::applied_pod::{
 use klights_reconcile_api::ControllerStoreResult;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::{DatastoreBackend, ResourceListQuery};
+use crate::datastore::DatastoreBackend;
 
 struct BorrowedAppliedPodPdbStore<'a> {
     db: &'a dyn DatastoreBackend,
@@ -25,7 +26,7 @@ impl AppliedPodPdbStore for BorrowedAppliedPodPdbStore<'_> {
                 "policy/v1",
                 "PodDisruptionBudget",
                 Some(namespace),
-                ResourceListQuery::all(),
+                ResourceListOptions::all(),
             )
             .await
             .map_err(map_controller_store_error)?

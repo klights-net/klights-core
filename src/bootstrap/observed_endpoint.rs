@@ -3,10 +3,11 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use klights_cluster_store::ResourceListOptions;
 use tokio_util::sync::CancellationToken;
 
 use crate::bootstrap::NodeMode;
-use crate::datastore::{DatastoreHandle, ResourceListQuery};
+use crate::datastore::DatastoreHandle;
 use klights_leader_api::{JoinRole, PeerEndpoint, node_external_ip, peer_endpoint_from_node};
 use klights_leader_rpc::client::{GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient};
 use klights_network_api::GRPC_PORT_ANNOTATION;
@@ -165,7 +166,7 @@ async fn observe_from_existing_nodes(
     grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
 ) -> Result<()> {
     let nodes = db
-        .list_resources("v1", "Node", None, ResourceListQuery::all())
+        .list_resources("v1", "Node", None, ResourceListOptions::all())
         .await?;
     for node in nodes.items {
         let Some(peer) = peer_endpoint_from_node(

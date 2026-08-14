@@ -1,11 +1,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
+use klights_cluster_store::ResourceListOptions;
 use klights_pod_api::{PodListRequest, PodQuery};
 use serde_json::Value;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::{DatastoreBackend, ResourceListQuery};
+use crate::datastore::DatastoreBackend;
 use klights_controllers::resource_quota::{
     ResourceQuotaRuntime, reconcile_resource_quotas_with_runtime,
 };
@@ -25,7 +26,12 @@ impl ResourceQuotaRuntime for ResourceQuotaControllerAdapter<'_> {
         namespace: &str,
     ) -> klights_reconcile_api::ControllerStoreResult<Vec<Resource>> {
         self.db
-            .list_resources(api_version, kind, Some(namespace), ResourceListQuery::all())
+            .list_resources(
+                api_version,
+                kind,
+                Some(namespace),
+                ResourceListOptions::all(),
+            )
             .await
             .map(|listing| listing.items)
             .map_err(map_controller_store_error)

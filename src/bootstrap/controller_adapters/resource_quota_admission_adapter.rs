@@ -25,7 +25,7 @@ impl ResourceQuotaAdmissionRuntime for ResourceQuotaAdmissionAdapter {
                     api_version,
                     kind,
                     Some(namespace),
-                    crate::datastore::ResourceListQuery::all(),
+                    klights_cluster_store::ResourceListOptions::all(),
                 )
                 .await
                 .map(|list| list.items)

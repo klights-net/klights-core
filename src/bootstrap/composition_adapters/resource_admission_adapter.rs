@@ -1,9 +1,10 @@
+use klights_cluster_store::ResourceListOptions;
 use std::sync::Arc;
 
 use klights_cluster_core::Resource;
 use serde_json::Value;
 
-use crate::datastore::{DatastoreHandle, ResourceListQuery};
+use crate::datastore::DatastoreHandle;
 use k8s_native_service::admission::{
     AdmissionDependencyError, AdmissionEngine, AdmissionQuery, AdmissionResource,
     AdmissionWebhookClient, ReqwestAdmissionWebhookClient, ServiceWebhookTargetResolver,
@@ -64,7 +65,7 @@ impl AdmissionQuery for DatastoreAdmissionQuery {
             api_version,
             kind,
             namespace,
-            ResourceListQuery::new(label_selector, None, None, None),
+            ResourceListOptions::new(label_selector, None, None, None),
         )
         .await
         .map(|page| page.items.into_iter().map(admission_resource).collect())

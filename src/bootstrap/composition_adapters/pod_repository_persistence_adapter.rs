@@ -163,7 +163,7 @@ impl PodRepositoryReadPersistence for RootPodRepositoryPersistenceAdapter {
                     "v1",
                     "Pod",
                     request.namespace.as_deref(),
-                    crate::datastore::ResourceListQuery::new(
+                    klights_cluster_store::ResourceListOptions::new(
                         request.label_selector.as_deref(),
                         request.field_selector.as_deref(),
                         request.limit,
@@ -199,7 +199,7 @@ impl PodRepositoryReadPersistence for RootPodRepositoryPersistenceAdapter {
                     "v1",
                     "Pod",
                     list.namespace(),
-                    crate::datastore::ResourceListQuery::new(
+                    klights_cluster_store::ResourceListOptions::new(
                         list.label_selector(),
                         list.field_selector(),
                         list.limit(),
@@ -210,7 +210,7 @@ impl PodRepositoryReadPersistence for RootPodRepositoryPersistenceAdapter {
                 .await
                 .map_err(|error| PodRepositoryError::unavailable(error.to_string()))?;
             Ok(match snapshot {
-                crate::datastore::SnapshotAtRv::List(list) => {
+                klights_cluster_store::SnapshotAtRv::List(list) => {
                     PodSnapshotListOutcome::List(PodListResult::try_new(
                         list.items,
                         list.resource_version,
@@ -218,8 +218,8 @@ impl PodRepositoryReadPersistence for RootPodRepositoryPersistenceAdapter {
                         list.remaining_item_count,
                     )?)
                 }
-                crate::datastore::SnapshotAtRv::Current => PodSnapshotListOutcome::Current,
-                crate::datastore::SnapshotAtRv::Expired => PodSnapshotListOutcome::Expired,
+                klights_cluster_store::SnapshotAtRv::Current => PodSnapshotListOutcome::Current,
+                klights_cluster_store::SnapshotAtRv::Expired => PodSnapshotListOutcome::Expired,
             })
         })
     }

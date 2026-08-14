@@ -1,3 +1,4 @@
+use klights_cluster_store::ResourceListOptions;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -7,7 +8,7 @@ use klights_cluster_core::{
 use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult as Result};
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::{DatastoreHandle, ResourceListQuery};
+use crate::datastore::DatastoreHandle;
 use klights_controllers::{
     ControllerEffectPort, ControllerNetworkPort, ControllerReconcilePort, ControllerResourceQuery,
 };
@@ -744,7 +745,12 @@ impl klights_controllers::cronjob::CronJobStore for RootControllerLeaderPort {
 
     async fn list_jobs(&self, namespace: &str) -> Result<Vec<Resource>> {
         self.store
-            .list_resources("batch/v1", "Job", Some(namespace), ResourceListQuery::all())
+            .list_resources(
+                "batch/v1",
+                "Job",
+                Some(namespace),
+                ResourceListOptions::all(),
+            )
             .await
             .map(|listing| listing.items)
             .map_err(map_controller_store_error)

@@ -746,7 +746,7 @@ pub(crate) mod support {
             Box::pin(async move {
                 self.db
                     .list_watch_events_since(
-                        &[crate::datastore::WatchTarget::namespaced("v1", "Pod")],
+                        &[klights_cluster_store::WatchTarget::namespaced("v1", "Pod")],
                         resource_version,
                     )
                     .await
@@ -2457,14 +2457,14 @@ pub(crate) mod support {
             api_version: &str,
             kind: &str,
             namespace: Option<&str>,
-        ) -> anyhow::Result<crate::datastore::ResourceList> {
+        ) -> anyhow::Result<klights_cluster_store::ResourceList> {
             anyhow::ensure!(kind != "Pod", "Pod fixtures must use list_pods");
             self.db
                 .list_resources(
                     api_version,
                     kind,
                     namespace,
-                    crate::datastore::ResourceListQuery::all(),
+                    klights_cluster_store::ResourceListOptions::all(),
                 )
                 .await
         }
@@ -2980,7 +2980,7 @@ pub(crate) mod support {
             api_version: &str,
             kind: &str,
             namespace: Option<&str>,
-        ) -> anyhow::Result<crate::datastore::ResourceList> {
+        ) -> anyhow::Result<klights_cluster_store::ResourceList> {
             self.owner
                 .list_scheduling_resources(api_version, kind, namespace)
                 .await

@@ -74,11 +74,6 @@ use klights_watch::WatchTopic;
 #[cfg(test)]
 use klights_watch::{WatchEvent, WatchReceiver};
 
-use super::types::{
-    CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation, ListPageRequest,
-    PositionedWatchReplayRead, ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery,
-    SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
-};
 #[cfg(test)]
 use crate::datastore::ReplicatedCreateOptions;
 use klights_cluster_core::{
@@ -87,6 +82,11 @@ use klights_cluster_core::{
 };
 #[cfg(test)]
 use klights_cluster_store::StagedPostCommit;
+use klights_cluster_store::{
+    CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation, ListPageRequest,
+    PositionedWatchReplayRead, ReplicatedSnapshotMetadata, ResourceList, ResourceListOptions,
+    SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
+};
 
 pub use klights_cluster_store::{SnapshotExclusiveFence, SnapshotMutationFence};
 
@@ -306,7 +306,7 @@ pub trait DatastoreBackend: Send + Sync {
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
-        query: ResourceListQuery<'_>,
+        query: ResourceListOptions<'_>,
     ) -> Result<ResourceList> {
         self.list_resources_page(
             api_version,
@@ -753,7 +753,7 @@ pub trait DatastoreBackend: Send + Sync {
         _api_version: &str,
         _kind: &str,
         _namespace: Option<&str>,
-        _query: ResourceListQuery<'_>,
+        _query: ResourceListOptions<'_>,
         snapshot_rv: i64,
     ) -> Result<SnapshotAtRv> {
         let current = self.get_current_resource_version().await?;
@@ -1688,7 +1688,7 @@ pub trait ClusterResourceQueryStore: Send + Sync {
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
-        query: ResourceListQuery<'_>,
+        query: ResourceListOptions<'_>,
     ) -> Result<ResourceList>;
     async fn list_resources_for_watch_targets(
         &self,
@@ -1771,7 +1771,7 @@ pub trait WatchMaintenanceStore: Send + Sync {
         _api_version: &str,
         _kind: &str,
         _namespace: Option<&str>,
-        _query: ResourceListQuery<'_>,
+        _query: ResourceListOptions<'_>,
         snapshot_rv: i64,
     ) -> Result<SnapshotAtRv>;
     async fn list_all_watch_events_after_id_bounded(

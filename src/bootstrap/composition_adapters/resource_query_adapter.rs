@@ -88,7 +88,7 @@ impl LeaderResourceQuery for DatastoreResourceQueryAdapter {
                     request.api_version(),
                     request.kind(),
                     request.namespace(),
-                    crate::datastore::ResourceListQuery::new(
+                    klights_cluster_store::ResourceListOptions::new(
                         request.label_selector(),
                         request.field_selector(),
                         request.limit(),

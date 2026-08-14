@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
+use klights_cluster_store::ResourceListOptions;
 use klights_reconcile_api::ControllerStoreResult as Result;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::{DatastoreBackend, ResourceListQuery, ResourcePatchRequest};
+use crate::datastore::{DatastoreBackend, ResourcePatchRequest};
 use klights_controllers::deployment::{DeploymentPodMutation, DeploymentStore};
 
 #[async_trait]
@@ -30,7 +31,7 @@ impl DeploymentStore for dyn DatastoreBackend + '_ {
                 "apps/v1",
                 "ReplicaSet",
                 Some(namespace),
-                ResourceListQuery::all(),
+                ResourceListOptions::all(),
             )
             .await
             .map_err(map_controller_store_error)?

@@ -1,10 +1,11 @@
+use klights_cluster_store::ResourceListOptions;
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
 
-use crate::datastore::{DatastoreHandle, ResourceListQuery};
+use crate::datastore::DatastoreHandle;
 use klights_controllers::side_effects::apiservice::ApiServiceSideEffectStore;
 
 struct RootApiServiceSideEffectStore {
@@ -19,7 +20,7 @@ impl ApiServiceSideEffectStore for RootApiServiceSideEffectStore {
                 "apiregistration.k8s.io/v1",
                 "APIService",
                 None,
-                ResourceListQuery::all(),
+                ResourceListOptions::all(),
             )
             .await
             .map(|listing| listing.items)

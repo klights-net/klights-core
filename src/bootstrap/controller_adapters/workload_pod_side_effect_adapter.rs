@@ -1,10 +1,11 @@
+use klights_cluster_store::ResourceListOptions;
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
 
-use crate::datastore::{DatastoreBackend, DatastoreHandle, ResourceListQuery};
+use crate::datastore::{DatastoreBackend, DatastoreHandle};
 use klights_controllers::side_effects::workload_pod::WorkloadPodStore;
 
 struct BorrowedWorkloadPodStore<'a> {
@@ -33,7 +34,7 @@ impl WorkloadPodStore for BorrowedWorkloadPodStore<'_> {
                 "apps/v1",
                 "ReplicaSet",
                 Some(namespace),
-                ResourceListQuery::all(),
+                ResourceListOptions::all(),
             )
             .await
             .map(|listing| listing.items)
@@ -45,7 +46,7 @@ impl WorkloadPodStore for BorrowedWorkloadPodStore<'_> {
                 "v1",
                 "ReplicationController",
                 Some(namespace),
-                ResourceListQuery::all(),
+                ResourceListOptions::all(),
             )
             .await
             .map(|listing| listing.items)

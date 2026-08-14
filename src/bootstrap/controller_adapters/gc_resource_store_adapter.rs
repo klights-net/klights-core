@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_cluster_store::ResourceListOptions;
 use klights_reconcile_api::ControllerStoreResult as Result;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::{DatastoreBackend, ResourceListQuery};
+use crate::datastore::DatastoreBackend;
 use klights_controllers::gc::GcResourceStore;
 
 struct BorrowedGcResourceStore<'a> {
@@ -106,7 +107,7 @@ impl GcResourceStore for dyn DatastoreBackend + '_ {
                 "apiextensions.k8s.io/v1",
                 "CustomResourceDefinition",
                 None,
-                ResourceListQuery::all(),
+                ResourceListOptions::all(),
             )
             .await
             .map_err(map_controller_store_error)?

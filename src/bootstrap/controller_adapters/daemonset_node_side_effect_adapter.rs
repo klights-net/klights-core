@@ -1,10 +1,11 @@
+use klights_cluster_store::ResourceListOptions;
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
 
-use crate::datastore::{DatastoreHandle, ResourceListQuery};
+use crate::datastore::DatastoreHandle;
 use klights_controllers::side_effects::daemonset_node::DaemonSetNodeSideEffectStore;
 
 struct RootDaemonSetNodeSideEffectStore {
@@ -15,7 +16,7 @@ struct RootDaemonSetNodeSideEffectStore {
 impl DaemonSetNodeSideEffectStore for RootDaemonSetNodeSideEffectStore {
     async fn list_daemonsets(&self) -> Result<Vec<Resource>> {
         self.db
-            .list_resources("apps/v1", "DaemonSet", None, ResourceListQuery::all())
+            .list_resources("apps/v1", "DaemonSet", None, ResourceListOptions::all())
             .await
             .map(|listing| listing.items)
     }
@@ -112,7 +113,7 @@ mod tests {
                 "v1",
                 "Pod",
                 Some("default"),
-                crate::datastore::ResourceListQuery::all(),
+                klights_cluster_store::ResourceListOptions::all(),
             )
             .await
             .unwrap();

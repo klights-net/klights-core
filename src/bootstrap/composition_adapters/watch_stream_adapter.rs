@@ -1,5 +1,6 @@
-use crate::datastore::{DatastoreHandle, ResourceListQuery};
+use crate::datastore::DatastoreHandle;
 use k8s_native_service::watch::{WatchSourceListFuture, WatchSourceWaitFuture, WatchStreamSource};
+use klights_cluster_store::ResourceListOptions;
 
 pub(crate) struct DatastoreWatchStreamAdapter {
     db: DatastoreHandle,
@@ -54,7 +55,7 @@ impl WatchStreamSource for DatastoreWatchStreamAdapter {
                     api_version,
                     kind,
                     namespace,
-                    ResourceListQuery::new(label_selector, field_selector, limit, None),
+                    ResourceListOptions::new(label_selector, field_selector, limit, None),
                 )
                 .await
                 .map_err(|error| {

@@ -61,7 +61,7 @@ pub(crate) async fn datastore_watch_resource_scope(
             "apiextensions.k8s.io/v1",
             "CustomResourceDefinition",
             None,
-            crate::datastore::ResourceListQuery::all(),
+            klights_cluster_store::ResourceListOptions::all(),
         )
         .await
         .map_err(|error| {

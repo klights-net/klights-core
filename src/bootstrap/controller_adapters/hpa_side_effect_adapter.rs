@@ -1,10 +1,11 @@
+use klights_cluster_store::ResourceListOptions;
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
 
-use crate::datastore::{DatastoreHandle, ResourceListQuery};
+use crate::datastore::DatastoreHandle;
 use klights_controllers::side_effects::hpa::HpaSideEffectStore;
 
 struct RootHpaSideEffectStore {
@@ -19,7 +20,7 @@ impl HpaSideEffectStore for RootHpaSideEffectStore {
                 api_version,
                 "HorizontalPodAutoscaler",
                 Some(namespace),
-                ResourceListQuery::all(),
+                ResourceListOptions::all(),
             )
             .await
             .map(|listing| listing.items)

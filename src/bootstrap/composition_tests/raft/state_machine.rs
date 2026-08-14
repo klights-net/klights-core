@@ -161,10 +161,10 @@ mod tests {
                 0,
                 Some(0),
                 Some(Vec::new()),
-                Some(klights::datastore::ReplicatedSnapshotMetadata {
+                Some(klights_cluster_store::ReplicatedSnapshotMetadata {
                     cluster_id: "leader-snapshot-cluster".into(),
                     leader_epoch: 7,
-                    membership: klights::datastore::ReplicatedMembershipState::Present(
+                    membership: klights_cluster_store::ReplicatedMembershipState::Present(
                         leader_membership.clone(),
                     ),
                     command_codec_activation_version: Some(3),
@@ -222,10 +222,10 @@ mod tests {
                 0,
                 Some(0),
                 Some(Vec::new()),
-                Some(klights::datastore::ReplicatedSnapshotMetadata {
+                Some(klights_cluster_store::ReplicatedSnapshotMetadata {
                     cluster_id: "divergent-snapshot-cluster".into(),
                     leader_epoch: 99,
-                    membership: klights::datastore::ReplicatedMembershipState::Present(
+                    membership: klights_cluster_store::ReplicatedMembershipState::Present(
                         klights_cluster_core::ClusterMembership {
                             cluster_id: "divergent-snapshot-cluster".into(),
                             voters: vec!["stale-cp".into()],
@@ -279,7 +279,7 @@ mod tests {
         assert_eq!(restored_metadata.metadata.leader_epoch, 7);
         assert_eq!(
             restored_metadata.membership,
-            klights::datastore::ReplicatedMembershipState::Present(leader_membership),
+            klights_cluster_store::ReplicatedMembershipState::Present(leader_membership),
             "streaming Raft envelope must preserve authoritative membership presence and value"
         );
 
@@ -690,7 +690,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(backend_src.gc_watch_events(1, 100).await.unwrap(), 4);
-        let target = [klights::datastore::WatchTarget::namespaced_in_namespace(
+        let target = [klights_cluster_store::WatchTarget::namespaced_in_namespace(
             "v1",
             "ConfigMap",
             "floor-ns",
@@ -709,7 +709,7 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-            klights::datastore::PositionedWatchReplayRead::Events(_)
+            klights_cluster_store::PositionedWatchReplayRead::Events(_)
         ));
 
         let mut sm_src = build_sm_with_backend(backend_src).await;
@@ -755,7 +755,7 @@ mod tests {
                     )
                     .await
                     .unwrap(),
-                klights::datastore::PositionedWatchReplayRead::Events(_)
+                klights_cluster_store::PositionedWatchReplayRead::Events(_)
             ),
             "a cursor valid against the leader floor must remain valid after snapshot install"
         );
@@ -1428,7 +1428,12 @@ mod tests {
                 "v1",
                 "Pod",
                 Some("guestbook"),
-                klights::datastore::ResourceListQuery::new(Some("app=guestbook"), None, None, None),
+                klights_cluster_store::ResourceListOptions::new(
+                    Some("app=guestbook"),
+                    None,
+                    None,
+                    None,
+                ),
             )
             .await
             .unwrap();

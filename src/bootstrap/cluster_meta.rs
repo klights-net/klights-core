@@ -189,7 +189,7 @@ mod tests {
                 "v1",
                 "Secret",
                 Some("kube-system"),
-                crate::datastore::ResourceListQuery::all(),
+                klights_cluster_store::ResourceListOptions::all(),
             )
             .await
             .unwrap();

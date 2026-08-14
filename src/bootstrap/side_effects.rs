@@ -203,7 +203,7 @@ mod tests {
                 "v1",
                 "Pod",
                 Some("default"),
-                crate::datastore::ResourceListQuery::all(),
+                klights_cluster_store::ResourceListOptions::all(),
             )
             .await
             .unwrap()

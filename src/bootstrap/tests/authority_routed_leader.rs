@@ -701,7 +701,7 @@ async fn authority_routed_leader_reads_cleanup_intents_locally_when_authoritativ
             "kube-system",
             "coredns-old",
             "uid-old",
-            crate::datastore::POD_CLEANUP_REASON_NODE_LOST,
+            klights_cluster_store::POD_CLEANUP_REASON_NODE_LOST,
             205,
             1_700_000_000_000,
             Resource::try_from_data(Arc::new(serde_json::json!({
@@ -745,7 +745,7 @@ async fn authority_routed_leader_acknowledges_cleanup_intent_locally_when_author
                 "kube-system",
                 "coredns-old",
                 "uid-old",
-                crate::datastore::POD_CLEANUP_REASON_NODE_LOST,
+                klights_cluster_store::POD_CLEANUP_REASON_NODE_LOST,
             )
             .unwrap(),
         )
