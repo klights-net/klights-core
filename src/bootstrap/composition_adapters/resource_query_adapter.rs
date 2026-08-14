@@ -5,6 +5,7 @@
 //! but the local client does not own the store adapter or its read surface.
 
 use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
 
 use base64::Engine as _;
 use klights_cluster_core::WatchReplayPosition;
@@ -26,6 +27,10 @@ use crate::bootstrap::authority::AuthorityHandle;
 use crate::datastore::{DatastoreHandle, Resource};
 
 const PRIVATE_CONTINUATION_CODEC_VERSION: u8 = 2;
+/// Kubernetes clients must be able to restart a chunked LIST after bounded
+/// server-side retention. Keep the private pinned snapshot lifetime aligned
+/// with the upstream compaction cadence rather than an unbounded row count.
+pub(crate) const PRIVATE_PINNED_CONTINUATION_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Root-owned, versioned LIST cursor payload. It is intentionally private:
 /// native HTTP and leader RPC only transport its ASCII representation, while
@@ -43,6 +48,11 @@ struct PrivateListContinuation {
     after_namespace: Option<String>,
     after_name: String,
     position: Option<PrivateReplayPosition>,
+    /// Root-owned issuance instant for the pinned snapshot. Older private
+    /// cursors without this field are safely recovered instead of remaining
+    /// valid forever after an upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    issued_at_unix_ms: Option<i64>,
     #[serde(default)]
     crd_plan: Option<PrivateCrdPlanRef>,
 }
@@ -94,6 +104,27 @@ enum DecodedListContinuation {
     Recovery(ResourceListRecoveryContinuation),
 }
 
+struct PrivateContinuationOptions<'a> {
+    issued_at_unix_ms: Option<i64>,
+    crd_plan: Option<&'a PrivateCrdPlanRef>,
+}
+
+fn private_pinned_cursor_expired_at(
+    issued_at_unix_ms: Option<i64>,
+    now_unix_ms: i64,
+) -> Result<bool, ResourceQueryError> {
+    let Some(issued_at_unix_ms) = issued_at_unix_ms else {
+        return Ok(true);
+    };
+    if now_unix_ms < issued_at_unix_ms {
+        return Err(ResourceQueryError::InvalidRequest {
+            field: "list.continue_token",
+            message: "pinned continuation issuance timestamp is in the future".to_string(),
+        });
+    }
+    Ok(now_unix_ms - issued_at_unix_ms >= PRIVATE_PINNED_CONTINUATION_TTL.as_millis() as i64)
+}
+
 fn encode_private_continuation(
     api_version: &str,
     kind: &str,
@@ -101,7 +132,7 @@ fn encode_private_continuation(
     label_selector: Option<&str>,
     field_selector: Option<&str>,
     continuation: DecodedListContinuation,
-    crd_plan: Option<&PrivateCrdPlanRef>,
+    options: PrivateContinuationOptions<'_>,
 ) -> Result<String, ResourceQueryError> {
     let (mode, after, position) = match continuation {
         DecodedListContinuation::Pinned(cursor) => (
@@ -151,7 +182,8 @@ fn encode_private_continuation(
             resource_version_filter_through_event_id: position
                 .resource_version_filter_through_event_id,
         }),
-        crd_plan: crd_plan.cloned(),
+        issued_at_unix_ms: options.issued_at_unix_ms,
+        crd_plan: options.crd_plan.cloned(),
     })
     .map_err(|error| ResourceQueryError::corrupt_response(error.to_string()))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(encoded))
@@ -283,6 +315,7 @@ pub(crate) struct DatastoreResourceQueryAdapter {
     db: Option<DatastoreHandle>,
     resource_reads: Option<Arc<dyn ClusterResourceRead>>,
     authority: AuthorityHandle,
+    wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
 impl DatastoreResourceQueryAdapter {
@@ -292,21 +325,24 @@ impl DatastoreResourceQueryAdapter {
             db: Some(db),
             resource_reads: None,
             authority: authority.into(),
+            wall_clock: Arc::new(klights_supervisor::SystemWallClock),
         })
     }
 
     /// The root-selected public LIST path. The focused read port receives
-    /// decoded typed cursors; the legacy datastore handle remains available
-    /// only for older composition fixtures during the staged migration.
-    pub(crate) fn new_with_resource_reads<A: Into<AuthorityHandle>>(
+    /// decoded typed cursors and the root injects the clock that defines a
+    /// pinned pagination session's bounded lifetime.
+    pub(crate) fn new_with_resource_reads_and_clock<A: Into<AuthorityHandle>>(
         db: DatastoreHandle,
         resource_reads: Arc<dyn ClusterResourceRead>,
         authority: A,
+        wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Arc<Self> {
         Arc::new(Self {
             db: Some(db),
             resource_reads: Some(resource_reads),
             authority: authority.into(),
+            wall_clock,
         })
     }
 
@@ -319,6 +355,98 @@ impl DatastoreResourceQueryAdapter {
             db: None,
             resource_reads: Some(resource_reads),
             authority: authority.into(),
+            wall_clock: Arc::new(klights_supervisor::SystemWallClock),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_focused_for_test_with_clock<A: Into<AuthorityHandle>>(
+        resource_reads: Arc<dyn ClusterResourceRead>,
+        authority: A,
+        wall_clock: Arc<dyn klights_supervisor::WallClock>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            db: None,
+            resource_reads: Some(resource_reads),
+            authority: authority.into(),
+            wall_clock,
+        })
+    }
+
+    fn private_cursor_now_unix_ms(&self) -> Result<i64, ResourceQueryError> {
+        i64::try_from(
+            self.wall_clock
+                .now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| ResourceQueryError::InvalidRequest {
+                    field: "list.continue_token",
+                    message: "pinned continuation clock precedes the Unix epoch".to_string(),
+                })?
+                .as_millis(),
+        )
+        .map_err(|_| ResourceQueryError::InvalidRequest {
+            field: "list.continue_token",
+            message: "pinned continuation clock is out of range".to_string(),
+        })
+    }
+
+    fn private_pinned_continuation_issued_at(
+        &self,
+        raw: &str,
+    ) -> Result<Option<i64>, ResourceQueryError> {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(raw)
+            .map_err(|_| ResourceQueryError::InvalidRequest {
+                field: "list.continue_token",
+                message: "malformed private continuation".to_string(),
+            })?;
+        let cursor: PrivateListContinuation =
+            serde_json::from_slice(&bytes).map_err(|_| ResourceQueryError::InvalidRequest {
+                field: "list.continue_token",
+                message: "malformed private continuation".to_string(),
+            })?;
+        if !matches!(cursor.mode, PrivateContinuationMode::Pinned) {
+            return Ok(None);
+        }
+        Ok(cursor.issued_at_unix_ms)
+    }
+
+    fn private_pinned_continuation_expired(&self, raw: &str) -> Result<bool, ResourceQueryError> {
+        private_pinned_cursor_expired_at(
+            self.private_pinned_continuation_issued_at(raw)?,
+            self.private_cursor_now_unix_ms()?,
+        )
+    }
+
+    fn expired_pinned_continuation(
+        &self,
+        request: &ResourceListRequest,
+        scope: &ResourceCollectionScope,
+        cursor: &ResourceContinuation,
+        crd_plan: Option<&PrivateCrdPlanRef>,
+    ) -> Result<ResourceQueryError, ResourceQueryError> {
+        let replacement_continue_token = encode_private_continuation(
+            request.api_version(),
+            request.kind(),
+            scope,
+            request.label_selector(),
+            request.field_selector(),
+            DecodedListContinuation::Recovery(ResourceListRecoveryContinuation::new(
+                cursor.after().clone(),
+            )),
+            PrivateContinuationOptions {
+                issued_at_unix_ms: None,
+                crd_plan,
+            },
+        )?;
+        Ok(ResourceQueryError::Expired {
+            requested: cursor.snapshot().resource_version(),
+            // This is a continuation-session retention boundary, not a global
+            // datastore compaction boundary. The timed-out pinned snapshot is
+            // unavailable; reporting its successor makes that strict boundary
+            // truthful without doing an unrelated live-store read.
+            oldest_available: cursor.snapshot().resource_version().saturating_add(1),
+            replacement_continue_token: Some(replacement_continue_token),
         })
     }
 
@@ -387,11 +515,14 @@ impl DatastoreResourceQueryAdapter {
     }
 
     fn focused_list_request(
+        &self,
         request: &ResourceListRequest,
-    ) -> Result<StoreResourceListRequest, ResourceQueryError> {
+    ) -> Result<(StoreResourceListRequest, Option<i64>), ResourceQueryError> {
         let scope = Self::store_scope(request.scope());
-        let (continuation, recovery_continuation) = match request.continuation_mode() {
-            ResourceListContinuationMode::Initial => (None, None),
+        let (continuation, recovery_continuation, pinned_issued_at_unix_ms) = match request
+            .continuation_mode()
+        {
+            ResourceListContinuationMode::Initial => (None, None, None),
             ResourceListContinuationMode::Pinned | ResourceListContinuationMode::Recovery => {
                 let raw =
                     request
@@ -400,7 +531,7 @@ impl DatastoreResourceQueryAdapter {
                             field: "list.continue_token",
                             message: "continuation is required".to_string(),
                         })?;
-                match decode_private_continuation(
+                let decoded = decode_private_continuation(
                     raw,
                     request.api_version(),
                     request.kind(),
@@ -408,9 +539,19 @@ impl DatastoreResourceQueryAdapter {
                     request.label_selector(),
                     request.field_selector(),
                     request.continuation_mode(),
-                )? {
-                    DecodedListContinuation::Pinned(cursor) => (Some(cursor), None),
-                    DecodedListContinuation::Recovery(cursor) => (None, Some(cursor)),
+                )?;
+                if let DecodedListContinuation::Pinned(cursor) = &decoded
+                    && self.private_pinned_continuation_expired(raw)?
+                {
+                    return Err(self.expired_pinned_continuation(request, &scope, cursor, None)?);
+                }
+                match decoded {
+                    DecodedListContinuation::Pinned(cursor) => (
+                        Some(cursor),
+                        None,
+                        self.private_pinned_continuation_issued_at(raw)?,
+                    ),
+                    DecodedListContinuation::Recovery(cursor) => (None, Some(cursor), None),
                 }
             }
         };
@@ -433,23 +574,27 @@ impl DatastoreResourceQueryAdapter {
             },
         )
         .map_err(Self::focused_read_error)?;
-        Ok(StoreResourceListRequest::new(
-            request.api_version(),
-            request.kind(),
-            scope,
-            query,
+        Ok((
+            StoreResourceListRequest::new(request.api_version(), request.kind(), scope, query),
+            pinned_issued_at_unix_ms,
         ))
     }
 
     fn focused_result(
+        &self,
         request: &ResourceListRequest,
         read: ResourceListRead,
+        pinned_issued_at_unix_ms: Option<i64>,
     ) -> Result<ResourceListResult, ResourceQueryError> {
         let scope = Self::store_scope(request.scope());
         match read {
             ResourceListRead::Current(page) | ResourceListRead::Historical(page) => {
                 let snapshot = page.snapshot();
                 let remaining_item_count = page.remaining_item_count();
+                let issued_at_unix_ms = match pinned_issued_at_unix_ms {
+                    Some(issued_at_unix_ms) => issued_at_unix_ms,
+                    None => self.private_cursor_now_unix_ms()?,
+                };
                 let continuation = page
                     .continuation()
                     .cloned()
@@ -462,7 +607,10 @@ impl DatastoreResourceQueryAdapter {
                             request.label_selector(),
                             request.field_selector(),
                             cursor,
-                            None,
+                            PrivateContinuationOptions {
+                                issued_at_unix_ms: Some(issued_at_unix_ms),
+                                crd_plan: None,
+                            },
                         )
                     })
                     .transpose()?;
@@ -489,7 +637,10 @@ impl DatastoreResourceQueryAdapter {
                             request.label_selector(),
                             request.field_selector(),
                             cursor,
-                            None,
+                            PrivateContinuationOptions {
+                                issued_at_unix_ms: None,
+                                crd_plan: None,
+                            },
                         )
                     })
                     .transpose()?;
@@ -569,7 +720,10 @@ impl DatastoreResourceQueryAdapter {
                             request.label_selector(),
                             request.field_selector(),
                             cursor,
-                            None,
+                            PrivateContinuationOptions {
+                                issued_at_unix_ms: None,
+                                crd_plan: None,
+                            },
                         )
                     })
                     .transpose()?;
@@ -668,11 +822,17 @@ impl DatastoreResourceQueryAdapter {
     /// replay position, so an old served-version row cannot force native code
     /// back to raw-name continuation or a synthetic session.
     async fn focused_composed_crd_list(
+        &self,
         resource_reads: &Arc<dyn ClusterResourceRead>,
         request: &ResourceListRequest,
         plan: &ResolvedCrdReadPlan,
+        pinned_issued_at_unix_ms: Option<i64>,
     ) -> Result<ResourceListResult, ResourceQueryError> {
         let scope = Self::store_scope(request.scope());
+        let issued_at_unix_ms = match pinned_issued_at_unix_ms {
+            Some(issued_at_unix_ms) => issued_at_unix_ms,
+            None => self.private_cursor_now_unix_ms()?,
+        };
         let decoded = match request.continuation_mode() {
             ResourceListContinuationMode::Initial => None,
             ResourceListContinuationMode::Pinned | ResourceListContinuationMode::Recovery => {
@@ -790,7 +950,10 @@ impl DatastoreResourceQueryAdapter {
                                 request.label_selector(),
                                 request.field_selector(),
                                 cursor,
-                                Some(&private_crd_plan_ref(&plan.definition)?),
+                                PrivateContinuationOptions {
+                                    issued_at_unix_ms: None,
+                                    crd_plan: Some(&private_crd_plan_ref(&plan.definition)?),
+                                },
                             )
                         })
                         .transpose()?;
@@ -853,7 +1016,10 @@ impl DatastoreResourceQueryAdapter {
                             ResourceCollectionKey::new(item.namespace.clone(), item.name.clone()),
                             snapshot,
                         )),
-                        Some(&private_crd_plan_ref(&plan.definition)?),
+                        PrivateContinuationOptions {
+                            issued_at_unix_ms: Some(issued_at_unix_ms),
+                            crd_plan: Some(&private_crd_plan_ref(&plan.definition)?),
+                        },
                     )
                     .map(Some)
                 })
@@ -871,7 +1037,10 @@ impl DatastoreResourceQueryAdapter {
                     request.label_selector(),
                     request.field_selector(),
                     cursor,
-                    Some(&private_crd_plan_ref(&plan.definition)?),
+                    PrivateContinuationOptions {
+                        issued_at_unix_ms: Some(issued_at_unix_ms),
+                        crd_plan: Some(&private_crd_plan_ref(&plan.definition)?),
+                    },
                 )
             })
             .transpose()?;
@@ -936,151 +1105,171 @@ impl LeaderResourceQuery for DatastoreResourceQueryAdapter {
     ) -> ResourceQueryFuture<'_, ResourceListResult> {
         Box::pin(async move {
             let leadership = self.sample_leader_fresh(request.consistency())?;
-            let result = if let Some(resource_reads) = &self.resource_reads {
-                let plan = if request.custom_resource_identity().is_none() {
-                    // Ordinary typed LIST continuations carry no CRD plan.
-                    // They must stay on the focused store path instead of
-                    // being rejected as an incomplete CRD cursor.
-                    None
-                } else {
-                    match request.continuation_mode() {
-                        ResourceListContinuationMode::Pinned => {
-                            let raw = request.continue_token().ok_or_else(|| {
-                                ResourceQueryError::InvalidRequest {
-                                    field: "list.continue_token",
-                                    message: "pinned continuation is missing".to_string(),
-                                }
-                            })?;
-                            let cursor_ref = private_crd_plan(raw)?.ok_or_else(|| {
-                                ResourceQueryError::InvalidRequest {
+            let result =
+                if let Some(resource_reads) = &self.resource_reads {
+                    let (plan, pinned_issued_at_unix_ms) =
+                        if request.custom_resource_identity().is_none() {
+                            // Ordinary typed LIST continuations carry no CRD plan.
+                            // They must stay on the focused store path instead of
+                            // being rejected as an incomplete CRD cursor.
+                            (None, None)
+                        } else {
+                            match request.continuation_mode() {
+                                ResourceListContinuationMode::Pinned => {
+                                    let raw = request.continue_token().ok_or_else(|| {
+                                        ResourceQueryError::InvalidRequest {
+                                            field: "list.continue_token",
+                                            message: "pinned continuation is missing".to_string(),
+                                        }
+                                    })?;
+                                    let cursor_ref = private_crd_plan(raw)?.ok_or_else(|| {
+                                        ResourceQueryError::InvalidRequest {
                                     field: "list.continue_token",
                                     message: "CRD continuation is missing its definition reference"
                                         .to_string(),
                                 }
-                            })?;
-                            let scope = Self::store_scope(request.scope());
-                            let decoded = decode_private_continuation(
-                                raw,
-                                request.api_version(),
-                                request.kind(),
-                                &scope,
-                                request.label_selector(),
-                                request.field_selector(),
-                                ResourceListContinuationMode::Pinned,
-                            )?;
-                            let DecodedListContinuation::Pinned(cursor) = decoded else {
-                                return Err(ResourceQueryError::InvalidRequest {
-                                    field: "list.continue_token",
-                                    message: "CRD cursor mode is not pinned".to_string(),
-                                });
-                            };
-                            let plan = Self::focused_crd_plan(
-                                resource_reads,
-                                &request,
-                                Some(cursor.snapshot().position()),
-                                Some(cursor.after().clone()),
-                            )
-                            .await?
-                            .ok_or_else(|| {
-                                ResourceQueryError::InvalidRequest {
-                                    field: "list.continue_token",
-                                    message: "pinned CRD definition is unavailable".to_string(),
-                                }
-                            })?;
-                            if private_crd_plan_ref(&plan.definition)? != cursor_ref {
-                                return Err(ResourceQueryError::InvalidRequest {
+                                    })?;
+                                    let scope = Self::store_scope(request.scope());
+                                    let decoded = decode_private_continuation(
+                                        raw,
+                                        request.api_version(),
+                                        request.kind(),
+                                        &scope,
+                                        request.label_selector(),
+                                        request.field_selector(),
+                                        ResourceListContinuationMode::Pinned,
+                                    )?;
+                                    let DecodedListContinuation::Pinned(cursor) = decoded else {
+                                        return Err(ResourceQueryError::InvalidRequest {
+                                            field: "list.continue_token",
+                                            message: "CRD cursor mode is not pinned".to_string(),
+                                        });
+                                    };
+                                    if self.private_pinned_continuation_expired(raw)? {
+                                        return Err(self.expired_pinned_continuation(
+                                            &request,
+                                            &scope,
+                                            &cursor,
+                                            Some(&cursor_ref),
+                                        )?);
+                                    }
+                                    let plan = Self::focused_crd_plan(
+                                        resource_reads,
+                                        &request,
+                                        Some(cursor.snapshot().position()),
+                                        Some(cursor.after().clone()),
+                                    )
+                                    .await?
+                                    .ok_or_else(|| ResourceQueryError::InvalidRequest {
+                                        field: "list.continue_token",
+                                        message: "pinned CRD definition is unavailable".to_string(),
+                                    })?;
+                                    if private_crd_plan_ref(&plan.definition)? != cursor_ref {
+                                        return Err(ResourceQueryError::InvalidRequest {
                                     field: "list.continue_token",
                                     message:
                                         "CRD definition reference does not match pinned history"
                                             .to_string(),
                                 });
-                            }
-                            Some(plan)
-                        }
-                        ResourceListContinuationMode::Initial => {
-                            Self::focused_crd_plan(resource_reads, &request, None, None).await?
-                        }
-                        ResourceListContinuationMode::Recovery => {
-                            let raw = request.continue_token().ok_or_else(|| {
-                                ResourceQueryError::InvalidRequest {
-                                    field: "list.continue_token",
-                                    message: "recovery continuation is missing".to_string(),
+                                    }
+                                    (Some(plan), self.private_pinned_continuation_issued_at(raw)?)
                                 }
-                            })?;
-                            let scope = Self::store_scope(request.scope());
-                            let decoded = decode_private_continuation(
-                                raw,
-                                request.api_version(),
-                                request.kind(),
-                                &scope,
-                                request.label_selector(),
-                                request.field_selector(),
-                                ResourceListContinuationMode::Recovery,
-                            )?;
-                            let DecodedListContinuation::Recovery(cursor) = decoded else {
-                                return Err(ResourceQueryError::InvalidRequest {
-                                    field: "list.continue_token",
-                                    message: "CRD cursor mode is not recovery".to_string(),
-                                });
-                            };
-                            Self::focused_crd_plan(
-                                resource_reads,
-                                &request,
-                                None,
-                                Some(cursor.after().clone()),
-                            )
-                            .await?
-                        }
-                    }
-                };
-                if let Some(plan) = plan {
-                    Self::focused_composed_crd_list(resource_reads, &request, &plan).await?
-                } else if request.custom_resource_identity().is_some() {
-                    // A custom LIST is meaningful only with its frozen CRD
-                    // definition/served-version plan. Falling through to an
-                    // ordinary collection read would return no definition and
-                    // let native or a remote worker fail later with a bogus
-                    // 500/corrupt response.
-                    return Err(ResourceQueryError::InvalidRequest {
+                                ResourceListContinuationMode::Initial => (
+                                    Self::focused_crd_plan(resource_reads, &request, None, None)
+                                        .await?,
+                                    None,
+                                ),
+                                ResourceListContinuationMode::Recovery => {
+                                    let raw = request.continue_token().ok_or_else(|| {
+                                        ResourceQueryError::InvalidRequest {
+                                            field: "list.continue_token",
+                                            message: "recovery continuation is missing".to_string(),
+                                        }
+                                    })?;
+                                    let scope = Self::store_scope(request.scope());
+                                    let decoded = decode_private_continuation(
+                                        raw,
+                                        request.api_version(),
+                                        request.kind(),
+                                        &scope,
+                                        request.label_selector(),
+                                        request.field_selector(),
+                                        ResourceListContinuationMode::Recovery,
+                                    )?;
+                                    let DecodedListContinuation::Recovery(cursor) = decoded else {
+                                        return Err(ResourceQueryError::InvalidRequest {
+                                            field: "list.continue_token",
+                                            message: "CRD cursor mode is not recovery".to_string(),
+                                        });
+                                    };
+                                    (
+                                        Self::focused_crd_plan(
+                                            resource_reads,
+                                            &request,
+                                            None,
+                                            Some(cursor.after().clone()),
+                                        )
+                                        .await?,
+                                        None,
+                                    )
+                                }
+                            }
+                        };
+                    if let Some(plan) = plan {
+                        self.focused_composed_crd_list(
+                            resource_reads,
+                            &request,
+                            &plan,
+                            pinned_issued_at_unix_ms,
+                        )
+                        .await?
+                    } else if request.custom_resource_identity().is_some() {
+                        // A custom LIST is meaningful only with its frozen CRD
+                        // definition/served-version plan. Falling through to an
+                        // ordinary collection read would return no definition and
+                        // let native or a remote worker fail later with a bogus
+                        // 500/corrupt response.
+                        return Err(ResourceQueryError::InvalidRequest {
                         field: "list.custom_resource",
                         message:
                             "custom resource definition is unavailable at the requested snapshot"
                                 .to_string(),
                     });
+                    } else {
+                        let (store_request, pinned_issued_at_unix_ms) =
+                            self.focused_list_request(&request)?;
+                        let read = resource_reads
+                            .list_resources(store_request)
+                            .await
+                            .map_err(Self::focused_read_error)?;
+                        self.focused_result(&request, read, pinned_issued_at_unix_ms)?
+                    }
                 } else {
-                    let store_request = Self::focused_list_request(&request)?;
-                    let read = resource_reads
-                        .list_resources(store_request)
+                    let list = self
+                        .db
+                        .as_ref()
+                        .expect("legacy adapter construction supplies datastore")
+                        .list_resources(
+                            request.api_version(),
+                            request.kind(),
+                            request.namespace(),
+                            klights_cluster_store::ResourceListOptions::new(
+                                request.label_selector(),
+                                request.field_selector(),
+                                request.limit(),
+                                request.continue_token(),
+                            ),
+                        )
                         .await
-                        .map_err(Self::focused_read_error)?;
-                    Self::focused_result(&request, read)?
-                }
-            } else {
-                let list = self
-                    .db
-                    .as_ref()
-                    .expect("legacy adapter construction supplies datastore")
-                    .list_resources(
-                        request.api_version(),
-                        request.kind(),
-                        request.namespace(),
-                        klights_cluster_store::ResourceListOptions::new(
-                            request.label_selector(),
-                            request.field_selector(),
-                            request.limit(),
-                            request.continue_token(),
-                        ),
-                    )
-                    .await
-                    .map_err(Self::query_error)?;
-                ResourceListResult::try_new(
-                    list.items,
-                    list.resource_version,
-                    list.watch_replay_position,
-                    list.continue_token,
-                    list.remaining_item_count,
-                )?
-            };
+                        .map_err(Self::query_error)?;
+                    ResourceListResult::try_new(
+                        list.items,
+                        list.resource_version,
+                        list.watch_replay_position,
+                        list.continue_token,
+                        list.remaining_item_count,
+                    )?
+                };
             if leadership
                 .as_ref()
                 .is_some_and(|permit| self.authority.validate(permit).is_err())
@@ -1225,14 +1414,15 @@ mod tests {
         };
         let spy = CrdMergeSpy::new(position);
         let reads: Arc<dyn ClusterResourceRead> = Arc::new(spy.clone());
+        let adapter = DatastoreResourceQueryAdapter::new_focused_for_test(
+            reads.clone(),
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority(),
+        );
         let plan = crd_merge_plan(position);
-        let first = DatastoreResourceQueryAdapter::focused_composed_crd_list(
-            &reads,
-            &crd_merge_request(None),
-            &plan,
-        )
-        .await
-        .unwrap();
+        let first = adapter
+            .focused_composed_crd_list(&reads, &crd_merge_request(None), &plan, None)
+            .await
+            .unwrap();
         assert_eq!(
             first
                 .items()
@@ -1243,13 +1433,15 @@ mod tests {
         );
         assert_eq!(first.items()[0].data["winner"], "storage");
         let page_two_token = first.continue_token().unwrap().to_string();
-        let second = DatastoreResourceQueryAdapter::focused_composed_crd_list(
-            &reads,
-            &crd_merge_request(Some(page_two_token)),
-            &plan,
-        )
-        .await
-        .unwrap();
+        let second = adapter
+            .focused_composed_crd_list(
+                &reads,
+                &crd_merge_request(Some(page_two_token)),
+                &plan,
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(
             second
                 .items()
@@ -1308,7 +1500,10 @@ mod tests {
             Some("emoji=\u{1f680},tier in (prod,canary)"),
             Some("metadata.name!=old/name"),
             DecodedListContinuation::Pinned(cursor),
-            None,
+            PrivateContinuationOptions {
+                issued_at_unix_ms: Some(1_000_000),
+                crd_plan: None,
+            },
         )
         .unwrap();
         assert!(encoded.is_ascii());
@@ -1337,6 +1532,145 @@ mod tests {
     }
 
     #[test]
+    fn private_pinned_cursor_expiry_is_time_bounded_and_inclusive_at_the_ttl() {
+        let issued_at_unix_ms = 1_000_000;
+        assert!(
+            !private_pinned_cursor_expired_at(
+                Some(issued_at_unix_ms),
+                issued_at_unix_ms + PRIVATE_PINNED_CONTINUATION_TTL.as_millis() as i64 - 1,
+            )
+            .unwrap(),
+            "the pinned cursor must remain valid strictly before its TTL"
+        );
+        assert!(
+            private_pinned_cursor_expired_at(
+                Some(issued_at_unix_ms),
+                issued_at_unix_ms + PRIVATE_PINNED_CONTINUATION_TTL.as_millis() as i64,
+            )
+            .unwrap(),
+            "the TTL boundary must expire the pinned cursor"
+        );
+        assert!(
+            private_pinned_cursor_expired_at(None, issued_at_unix_ms).unwrap(),
+            "pre-TTL private pinned cursors must safely recover rather than remain indefinitely valid"
+        );
+        assert!(matches!(
+            private_pinned_cursor_expired_at(Some(issued_at_unix_ms), issued_at_unix_ms - 1),
+            Err(ResourceQueryError::InvalidRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_pinned_cursor_recovers_at_the_same_key_while_fresh_cursor_keeps_its_issuance() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        struct FixedClock(std::time::SystemTime);
+
+        impl klights_supervisor::WallClock for FixedClock {
+            fn now(&self) -> std::time::SystemTime {
+                self.0
+            }
+        }
+
+        const NOW_UNIX_MS: i64 = 1_700_000_000_000;
+        let scope = all_namespaces();
+        let position = WatchReplayPosition {
+            resource_version: 41,
+            event_id: 68,
+            resource_version_filter_through_event_id: 69,
+        };
+        let cursor = ResourceContinuation::new(
+            ResourceCollectionKey::new(Some("team-a"), "after-this"),
+            ResourceListSnapshot::try_new(position).unwrap(),
+        );
+        let request = |token, mode| {
+            ResourceListRequest::try_new_with_continuation_mode(
+                "v1",
+                "ConfigMap",
+                ResourceListScope::AllNamespaces,
+                Some("team=blue".to_string()),
+                None,
+                Some(10),
+                Some(token),
+                mode,
+                ResourceQueryConsistency::Cached,
+            )
+            .unwrap()
+        };
+        let adapter = DatastoreResourceQueryAdapter::new_focused_for_test_with_clock(
+            Arc::new(CrdMergeSpy::new(position)),
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority(),
+            Arc::new(FixedClock(
+                UNIX_EPOCH + Duration::from_millis(NOW_UNIX_MS as u64),
+            )),
+        );
+
+        let legacy = encode_private_continuation(
+            "v1",
+            "ConfigMap",
+            &scope,
+            Some("team=blue"),
+            None,
+            DecodedListContinuation::Pinned(cursor.clone()),
+            PrivateContinuationOptions {
+                issued_at_unix_ms: None,
+                crd_plan: None,
+            },
+        )
+        .unwrap();
+        let error = adapter
+            .focused_list_request(&request(legacy, ResourceListContinuationMode::Pinned))
+            .unwrap_err();
+        let ResourceQueryError::Expired {
+            requested,
+            oldest_available,
+            replacement_continue_token: Some(replacement),
+            ..
+        } = error
+        else {
+            panic!("legacy pinned cursor must return typed recovery")
+        };
+        assert_eq!(requested, position.resource_version);
+        assert_eq!(
+            oldest_available,
+            position.resource_version.saturating_add(1),
+            "TTL expiry must mark the pinned snapshot unavailable rather than claim its RV remains available"
+        );
+        let DecodedListContinuation::Recovery(recovery) = decode_private_continuation(
+            &replacement,
+            "v1",
+            "ConfigMap",
+            &scope,
+            Some("team=blue"),
+            None,
+            ResourceListContinuationMode::Recovery,
+        )
+        .unwrap() else {
+            panic!("legacy pinned cursor replacement must be recovery")
+        };
+        assert_eq!(recovery.after(), cursor.after());
+
+        let issued_at_unix_ms = NOW_UNIX_MS - 1;
+        let fresh = encode_private_continuation(
+            "v1",
+            "ConfigMap",
+            &scope,
+            Some("team=blue"),
+            None,
+            DecodedListContinuation::Pinned(cursor),
+            PrivateContinuationOptions {
+                issued_at_unix_ms: Some(issued_at_unix_ms),
+                crd_plan: None,
+            },
+        )
+        .unwrap();
+        let (_, observed_issued_at_unix_ms) = adapter
+            .focused_list_request(&request(fresh, ResourceListContinuationMode::Pinned))
+            .expect("fresh pinned cursor must retain its original snapshot session");
+        assert_eq!(observed_issued_at_unix_ms, Some(issued_at_unix_ms));
+    }
+
+    #[test]
     fn private_cursor_rejects_cross_context_and_recovery_omits_position() {
         let scope = all_namespaces();
         let encoded = encode_private_continuation(
@@ -1348,7 +1682,10 @@ mod tests {
             DecodedListContinuation::Recovery(ResourceListRecoveryContinuation::new(
                 ResourceCollectionKey::new(Some("team-a"), "same"),
             )),
-            None,
+            PrivateContinuationOptions {
+                issued_at_unix_ms: None,
+                crd_plan: None,
+            },
         )
         .unwrap();
         let DecodedListContinuation::Recovery(decoded) = decode_private_continuation(
@@ -1400,7 +1737,18 @@ mod tests {
             ),
         ] {
             assert!(matches!(
-                encode_private_continuation("v1", "ConfigMap", &scope, None, None, cursor, None),
+                encode_private_continuation(
+                    "v1",
+                    "ConfigMap",
+                    &scope,
+                    None,
+                    None,
+                    cursor,
+                    PrivateContinuationOptions {
+                        issued_at_unix_ms: None,
+                        crd_plan: None,
+                    },
+                ),
                 Err(ResourceQueryError::InvalidRequest { .. })
             ));
         }
@@ -1424,6 +1772,7 @@ mod tests {
                 event_id: -1,
                 resource_version_filter_through_event_id: 0,
             }),
+            issued_at_unix_ms: None,
             crd_plan: None,
         };
         let malformed_position = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -1443,7 +1792,10 @@ mod tests {
                 })
                 .unwrap(),
             )),
-            None,
+            PrivateContinuationOptions {
+                issued_at_unix_ms: Some(1_000_000),
+                crd_plan: None,
+            },
         )
         .unwrap();
         for (case, raw, selector, mode) in [

@@ -1107,6 +1107,18 @@ pub async fn build_test_router_with_db() -> (
     (harness.router(), harness.resource_store())
 }
 
+pub async fn build_test_router_with_db_and_list_cursor_clock(
+    clock: Arc<dyn klights_supervisor::WallClock>,
+) -> (
+    axum::Router,
+    klights_cluster_datastore::test_support::ResourceTestStore,
+) {
+    let harness = NativeApiTestHarness::with_list_cursor_clock(clock)
+        .await
+        .expect("assemble native API integration harness with fixed LIST cursor clock");
+    (harness.router(), harness.resource_store())
+}
+
 pub async fn in_memory() -> klights_cluster_datastore::test_support::ResourceTestStore {
     NativeApiTestHarness::new()
         .await

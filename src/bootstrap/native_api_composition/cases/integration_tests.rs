@@ -1,7 +1,7 @@
 use crate::bootstrap::native_api_composition::support::{
     build_test_app_state, build_test_app_state_with_authorizer,
     build_test_app_state_with_service_routing_observation, build_test_router,
-    build_test_router_with_db,
+    build_test_router_with_db, build_test_router_with_db_and_list_cursor_clock,
 };
 use k8s_native_service::test_protobuf as k8s_pb;
 use serde_json::json;

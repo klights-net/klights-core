@@ -74,6 +74,7 @@ pub(crate) mod support {
         csr_signer: Option<Arc<dyn klights_auth::csr_signer::CsrSigner>>,
         task_categories: klights_supervisor::TaskCategoryConfig,
         auth_clock: Option<Arc<dyn klights_auth::clock::Clock>>,
+        list_cursor_clock: Option<Arc<dyn klights_supervisor::WallClock>>,
         authority: Option<Arc<dyn klights_leader_api::LeaderAuthority>>,
         bootstrap_token_authenticator:
             Option<Arc<dyn klights_leader_api::LeaderBootstrapTokenAuthentication>>,
@@ -269,6 +270,29 @@ pub(crate) mod support {
             false,
             IntegrationHarnessOptions {
                 auth_clock: Some(clock),
+                ..Default::default()
+            },
+        )
+        .await
+        }
+
+        pub(crate) async fn with_list_cursor_clock(
+            clock: Arc<dyn klights_supervisor::WallClock>,
+        ) -> anyhow::Result<Self> {
+            Self::assemble_with_options(
+            Arc::new(AllowAllAuthorizer),
+            None,
+            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            IntegrationHarnessOptions {
+                list_cursor_clock: Some(clock),
                 ..Default::default()
             },
         )
@@ -526,11 +550,14 @@ pub(crate) mod support {
                 csr_signer,
                 task_categories,
                 auth_clock,
+                list_cursor_clock,
                 authority,
                 bootstrap_token_authenticator,
             } = options;
             let auth_clock =
                 auth_clock.unwrap_or_else(|| Arc::new(klights_auth::clock::SystemClock));
+            let list_cursor_clock =
+                list_cursor_clock.unwrap_or_else(|| Arc::new(klights_supervisor::SystemWallClock));
             let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(task_categories));
             let commit_watch_fixture =
                 Arc::new(klights_watch::test_support::CommitWatchFixture::new(64));
@@ -585,10 +612,11 @@ pub(crate) mod support {
             let leader_rx =
                 crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
             let resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery> =
-                crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_with_resource_reads(
+                crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_with_resource_reads_and_clock(
                     datastore.clone(),
                     passive_reads.resource_reads(),
                     leader_rx.clone(),
+                    list_cursor_clock,
                 );
             let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
                 crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(

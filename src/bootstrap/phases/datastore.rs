@@ -444,10 +444,11 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     watch_commit_wiring.signals.clone(),
                 );
             let local_resource_query = crate::bootstrap::composition_adapters::
-                resource_query_adapter::DatastoreResourceQueryAdapter::new_with_resource_reads(
+                resource_query_adapter::DatastoreResourceQueryAdapter::new_with_resource_reads_and_clock(
                     db_handle.clone(),
                     passive_read_ports.resource_reads(),
                     leader_authority.clone(),
+                    Arc::new(klights_supervisor::SystemWallClock),
                 );
             let local_network = Arc::new(
                 crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(

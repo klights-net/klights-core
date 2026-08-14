@@ -8678,7 +8678,9 @@ async fn test_list_exact_serves_snapshot_protobuf_and_410_when_too_old() {
     assert_eq!(&body[..4], b"k8s\x00", "protobuf frame magic prefix");
 
     // Once the rv ages out of the retained window, Exact ⇒ 410 Expired.
-    db.gc_watch_events(1, 1000).await.unwrap();
+    // Retain no history: this deterministically expires the first pinned
+    // snapshot regardless of the fixture's number of watch scopes.
+    db.gc_watch_events(0, 1000).await.unwrap();
     let resp = app
         .clone()
         .oneshot(
@@ -8730,7 +8732,24 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use base64::Engine as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tower::ServiceExt;
+
+    struct ListCursorClock(AtomicI64);
+
+    impl ListCursorClock {
+        fn advance_to(&self, unix_ms: i64) {
+            self.0.store(unix_ms, Ordering::Release);
+        }
+    }
+
+    impl klights_supervisor::WallClock for ListCursorClock {
+        fn now(&self) -> SystemTime {
+            UNIX_EPOCH + Duration::from_millis(self.0.load(Ordering::Acquire) as u64)
+        }
+    }
 
     fn decode_continue_token(token: &str) -> k8s_native_service::generic_read::ContinueTokenData {
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -8739,10 +8758,14 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
         serde_json::from_slice(&bytes).expect("continue token must be JSON")
     }
 
-    let (app, db) = build_test_router_with_db().await;
+    const START_UNIX_MS: i64 = 1_700_000_000_000;
+    let clock = Arc::new(ListCursorClock(AtomicI64::new(START_UNIX_MS)));
+    let (app, db) = build_test_router_with_db_and_list_cursor_clock(clock.clone()).await;
 
     let mut template_rvs = std::collections::HashMap::new();
-    for i in 0..45 {
+    const TOTAL: usize = 400;
+    const PAGE_SIZE: usize = 40;
+    for i in 0..TOTAL {
         let name = format!("template-{i:04}");
         let created = db
             .create_resource(
@@ -8770,7 +8793,7 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/api/v1/podtemplates?limit=20")
+                .uri(format!("/api/v1/podtemplates?limit={PAGE_SIZE}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -8789,14 +8812,15 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
         .to_string();
     assert_eq!(
         first_list["metadata"]["remainingItemCount"].as_i64(),
-        Some(25),
+        Some(i64::try_from(TOTAL - PAGE_SIZE).unwrap()),
         "an unfiltered cluster-wide first page with continue must report its exact remaining item count"
     );
     let first_token_data = decode_continue_token(&first_token);
     assert!(first_token_data.ts.is_some());
 
-    // Same-scope PodTemplate churn can compact the pinned snapshot. The
-    // leader returns a typed 410 replacement cursor, never a silent restart.
+    // A page served just before the TTL remains pinned to the original
+    // session. Its successor must inherit, rather than refresh, that
+    // issuance instant so a client cannot keep a snapshot alive forever.
     let changed_name = "template-0020";
     db.update_resource(
         "v1",
@@ -8820,15 +8844,44 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
     )
     .await
     .unwrap();
-    db.gc_watch_events(1, 1000).await.unwrap();
+    let fresh_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/podtemplates?limit={PAGE_SIZE}&continue={first_token}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fresh_resp.status(), StatusCode::OK);
+    let fresh_body = to_bytes(fresh_resp.into_body(), usize::MAX).await.unwrap();
+    let fresh_list: serde_json::Value = serde_json::from_slice(&fresh_body).unwrap();
+    assert_eq!(list_item_names(&fresh_list).len(), PAGE_SIZE);
+    let fresh_token = fresh_list["metadata"]["continue"]
+        .as_str()
+        .expect("fresh page must continue the original pinned session")
+        .to_string();
+
+    clock.advance_to(
+        START_UNIX_MS
+            + i64::try_from(
+                crate::bootstrap::composition_adapters::resource_query_adapter::PRIVATE_PINNED_CONTINUATION_TTL
+                    .as_millis(),
+            )
+            .unwrap(),
+    );
 
     let compacted_resp = app
         .clone()
         .oneshot(
             Request::builder()
                 .uri(format!(
-                    "/api/v1/podtemplates?limit=20&continue={first_token}"
+                    "/api/v1/podtemplates?limit={PAGE_SIZE}&continue={fresh_token}"
                 ))
+                .header("accept", "application/vnd.kubernetes.protobuf")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -8838,7 +8891,10 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
     let compacted_body = to_bytes(compacted_resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    let compacted_status: serde_json::Value = serde_json::from_slice(&compacted_body).unwrap();
+    let compacted_status = k8s_native_service::test_protobuf::decode_protobuf(&compacted_body)
+        .expect("expired protobuf LIST must return Kubernetes Status");
+    assert_eq!(compacted_status["reason"], "Expired");
+    assert_eq!(compacted_status["code"], 410);
     let recovery_token = compacted_status["metadata"]["continue"]
         .as_str()
         .expect("410 Expired must include a typed recovery cursor");
@@ -8865,7 +8921,7 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
         .oneshot(
             Request::builder()
                 .uri(format!(
-                    "/api/v1/podtemplates?limit=20&continue={recovery_query}"
+                    "/api/v1/podtemplates?limit={PAGE_SIZE}&continue={recovery_query}"
                 ))
                 .body(Body::empty())
                 .unwrap(),
@@ -8896,12 +8952,220 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
         .expect("recovery page should still have another page");
     assert_eq!(
         recovery_list["metadata"]["remainingItemCount"].as_i64(),
-        Some(5),
+        Some(i64::try_from(TOTAL - (PAGE_SIZE * 3)).unwrap()),
         "an unfiltered recovery page with continue must report its exact remaining item count"
+    );
+    assert_eq!(
+        list_item_names(&recovery_list),
+        (PAGE_SIZE * 2..PAGE_SIZE * 3)
+            .map(|index| format!("template-{index:04}"))
+            .collect::<Vec<_>>(),
+        "the typed recovery cursor must resume immediately after the last pinned key"
     );
     let recovery_next_data = decode_continue_token(recovery_next);
     assert!(recovery_next_data.ts.is_some());
     assert_eq!(recovery_next_data.rv.to_string(), recovery_rv);
+
+    // The replacement cursor has to advance through every later recovery
+    // page.  Sonobuoy checks this equation after an expired snapshot, where a
+    // stale boundary would report the original remainder again (400 + 40).
+    let mut found = PAGE_SIZE * 3;
+    let mut continue_token = recovery_next.to_string();
+    for page_number in 3..=9 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/podtemplates?limit={PAGE_SIZE}&continue={}",
+                        urlencoding::encode(&continue_token),
+                    ))
+                    .header(
+                        "accept",
+                        if page_number == 3 {
+                            "application/vnd.kubernetes.protobuf"
+                        } else {
+                            "application/json"
+                        },
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let list = if page_number == 3 {
+            k8s_native_service::test_protobuf::decode_protobuf(&body)
+                .expect("recovery page three must honor protobuf Accept")
+        } else {
+            serde_json::from_slice(&body).unwrap()
+        };
+        let continue_value = list["metadata"]["continue"].as_str();
+        if let Some(next) = continue_value {
+            let remaining = list["metadata"]["remainingItemCount"]
+                .as_i64()
+                .expect("every nonterminal recovery page must report remainingItemCount");
+            assert_eq!(
+                usize::try_from(remaining).unwrap() + list_item_names(&list).len() + found,
+                TOTAL,
+                "recovery page {page_number} must carry an advanced exact remainder"
+            );
+            continue_token = next.to_string();
+        } else {
+            assert!(
+                list["metadata"].get("remainingItemCount").is_none(),
+                "terminal recovery page must omit remainingItemCount"
+            );
+        }
+        assert_eq!(
+            list_item_names(&list),
+            (found..found + PAGE_SIZE)
+                .map(|index| format!("template-{index:04}"))
+                .collect::<Vec<_>>(),
+            "recovery page {page_number} must advance its keyset boundary"
+        );
+        found += PAGE_SIZE;
+    }
+    assert_eq!(found, TOTAL);
+}
+
+/// Sonobuoy's chunking recovery path expires the original first-page token
+/// before a second pinned page is consumed. The replacement must resume at
+/// item 40 and retain the exact 400-item accounting equation.
+#[tokio::test]
+async fn test_paginated_original_token_ttl_recovery_preserves_chunking_accounting() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tower::ServiceExt;
+
+    struct ListCursorClock(AtomicI64);
+
+    impl ListCursorClock {
+        fn advance_to(&self, unix_ms: i64) {
+            self.0.store(unix_ms, Ordering::Release);
+        }
+    }
+
+    impl klights_supervisor::WallClock for ListCursorClock {
+        fn now(&self) -> SystemTime {
+            UNIX_EPOCH + Duration::from_millis(self.0.load(Ordering::Acquire) as u64)
+        }
+    }
+
+    const START_UNIX_MS: i64 = 1_700_000_000_000;
+    const TOTAL: usize = 400;
+    const PAGE_SIZE: usize = 40;
+    let clock = Arc::new(ListCursorClock(AtomicI64::new(START_UNIX_MS)));
+    let (app, db) = build_test_router_with_db_and_list_cursor_clock(clock.clone()).await;
+    for index in 0..TOTAL {
+        let name = format!("template-{index:04}");
+        db.create_resource(
+            "v1",
+            "PodTemplate",
+            Some("default"),
+            &name,
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PodTemplate",
+                "metadata": {"name": name, "namespace": "default"},
+                "template": {
+                    "spec": {
+                        "containers": [{"name": "main", "image": "registry.k8s.io/pause:3.10"}]
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/podtemplates?limit={PAGE_SIZE}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first: serde_json::Value =
+        serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let first_token = first["metadata"]["continue"]
+        .as_str()
+        .expect("first page must return a pinned continuation");
+
+    clock.advance_to(
+        START_UNIX_MS
+            + i64::try_from(
+                crate::bootstrap::composition_adapters::resource_query_adapter::PRIVATE_PINNED_CONTINUATION_TTL
+                    .as_millis(),
+            )
+            .unwrap(),
+    );
+    let expired = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/podtemplates?limit={PAGE_SIZE}&continue={first_token}"
+                ))
+                .header("accept", "application/vnd.kubernetes.protobuf")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(expired.status(), StatusCode::GONE);
+    let expired = k8s_native_service::test_protobuf::decode_protobuf(
+        &to_bytes(expired.into_body(), usize::MAX).await.unwrap(),
+    )
+    .expect("protobuf expired LIST must carry Kubernetes Status");
+    assert_eq!(expired["reason"], "Expired");
+    let recovery_token = expired["metadata"]["continue"]
+        .as_str()
+        .expect("expired pinned LIST must provide typed recovery");
+    assert!(matches!(
+        k8s_native_service::generic_read::process_generic_list_continue_token(Some(
+            recovery_token.to_string(),
+        )),
+        Ok((
+            _,
+            klights_leader_api::ResourceListContinuationMode::Recovery
+        ))
+    ));
+
+    let recovery = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/podtemplates?limit={PAGE_SIZE}&continue={}",
+                    urlencoding::encode(recovery_token),
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovery.status(), StatusCode::OK);
+    let recovery: serde_json::Value =
+        serde_json::from_slice(&to_bytes(recovery.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        recovery["metadata"]["remainingItemCount"].as_i64(),
+        Some(i64::try_from(TOTAL - PAGE_SIZE * 2).unwrap())
+    );
+    assert_eq!(
+        list_item_names(&recovery),
+        (PAGE_SIZE..PAGE_SIZE * 2)
+            .map(|index| format!("template-{index:04}"))
+            .collect::<Vec<_>>(),
+    );
 }
 
 fn list_item_names(list: &serde_json::Value) -> Vec<String> {

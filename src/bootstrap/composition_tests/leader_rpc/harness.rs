@@ -609,10 +609,11 @@ impl IntegrationLeaderRpcComposition {
             ),
         );
         let resource_query = match passive_reads.as_ref() {
-            Some(passive_reads) => crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_with_resource_reads(
+            Some(passive_reads) => crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_with_resource_reads_and_clock(
                 self.db.clone(),
                 passive_reads.ports.resource_reads(),
                 authority.clone(),
+                Arc::new(klights_supervisor::SystemWallClock),
             ),
             None => crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
                 self.db.clone(),
