@@ -2,8 +2,6 @@ mod allocator;
 pub mod cli;
 mod cluster_engine;
 pub mod datastore;
-#[cfg(feature = "native-api-test-support")]
-pub mod native_api_test_support;
 pub mod paths;
 pub mod pidfile;
 pub mod shutdown;

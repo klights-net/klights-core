@@ -178,14 +178,14 @@ fn node_lifecycle_status_command_error(error: ResourceCommandError) -> NodeLifec
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub(crate) type ProjectedTokenAsyncBoundary = Arc<
     dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
         + Send
         + Sync,
 >;
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 #[derive(Clone)]
 struct ProjectedTokenIssueTestProbe {
     async_boundary: ProjectedTokenAsyncBoundary,
@@ -218,7 +218,7 @@ impl Drop for ProjectedTokenIssueTestRegistration {
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 fn projected_token_issue_test_probes()
 -> &'static std::sync::Mutex<std::collections::HashMap<String, ProjectedTokenIssueTestProbe>> {
     static PROBES: std::sync::OnceLock<
@@ -251,7 +251,7 @@ pub(crate) fn install_projected_token_issue_test_probe(
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 fn projected_token_issue_test_probe(namespace: &str) -> Option<ProjectedTokenIssueTestProbe> {
     projected_token_issue_test_probes()
         .lock()
@@ -302,9 +302,9 @@ impl LeadershipGenerationFence {
         &self,
         sign: impl FnOnce() -> T,
     ) -> Result<T, ProjectedServiceAccountTokenError> {
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         let legacy_watch = self.authority.legacy_watch_for_test();
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         let _legacy_current = legacy_watch.as_ref().map(|receiver| receiver.borrow());
         #[cfg(test)]
         let _authority_read = self
@@ -371,7 +371,7 @@ impl LocalProjectedToken {
         Box::pin(async move {
             let leadership = LeadershipGenerationFence::sample(self.authority.clone())?
                 .with_signing_fence(self.signing_fence.clone());
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             if let Some(probe) = projected_token_issue_test_probe(&self.containerd_namespace) {
                 (probe.async_boundary)().await;
             }
@@ -399,7 +399,7 @@ impl LocalProjectedToken {
                 .await;
             leadership.ensure_unchanged()?;
             let claims = claims?;
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             if let Some(probe) = projected_token_issue_test_probe(&self.containerd_namespace) {
                 probe
                     .sign_attempts

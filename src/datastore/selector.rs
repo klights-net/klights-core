@@ -67,7 +67,7 @@ impl PassiveReadPorts {
 
 /// Build test-only passive read ports directly from the SQLite destination
 /// adapter before the concrete store is erased behind `DatastoreHandle`.
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub(crate) fn sqlite_passive_read_ports(db: &sqlite::Datastore) -> PassiveReadPorts {
     let focused_reads = db.focused_read_store();
     PassiveReadPorts::new(focused_reads.clone(), focused_reads.clone(), focused_reads)
@@ -102,9 +102,7 @@ pub(crate) struct OpenedPassiveStore {
 pub(crate) async fn open_with_sink(
     request: PassiveStoreOpenRequest<'_>,
     supervisor: Arc<TaskSupervisor>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))] commit_sink: Arc<
-        dyn crate::datastore::CommitObservationSink,
-    >,
+    #[cfg(test)] commit_sink: Arc<dyn crate::datastore::CommitObservationSink>,
     outbox_codec: Arc<dyn klights_cluster_store::OutboxResponseCodec>,
 ) -> Result<OpenedPassiveStore> {
     match request {
@@ -117,7 +115,7 @@ pub(crate) async fn open_with_sink(
             .await?;
             let ds = sqlite::Datastore::new_in_memory_with_watch_and_executor_with_sink(
                 executor,
-                #[cfg(any(test, feature = "pod-repository-test-support"))]
+                #[cfg(test)]
                 commit_sink,
                 outbox_codec,
                 Arc::new(klights_supervisor::SystemWallClock),
@@ -142,7 +140,7 @@ pub(crate) async fn open_with_sink(
             let ds = sqlite::Datastore::new_persistent_paths_with_sink(
                 cluster_db_path,
                 supervisor,
-                #[cfg(any(test, feature = "pod-repository-test-support"))]
+                #[cfg(test)]
                 commit_sink,
                 outbox_codec,
                 Arc::new(klights_supervisor::SystemWallClock),
@@ -166,7 +164,7 @@ pub(crate) async fn open_with_sink(
             tracing::info!(backend = "redb", mode = "in-memory", "opening datastore");
             let ds = crate::datastore::redb::RedbDatastore::new_in_memory_with_supervisor_and_sink(
                 supervisor,
-                #[cfg(any(test, feature = "pod-repository-test-support"))]
+                #[cfg(test)]
                 commit_sink,
                 Arc::new(klights_supervisor::SystemWallClock),
             )
@@ -189,7 +187,7 @@ pub(crate) async fn open_with_sink(
             let ds = crate::datastore::redb::RedbDatastore::new_persistent_with_sink(
                 cluster_db_path,
                 supervisor,
-                #[cfg(any(test, feature = "pod-repository-test-support"))]
+                #[cfg(test)]
                 commit_sink,
                 Arc::new(klights_supervisor::SystemWallClock),
             )

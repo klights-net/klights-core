@@ -199,7 +199,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     let opened_passive = crate::datastore::selector::open_with_sink(
         passive_store_open_request(config),
         supervisor.clone(),
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         watch_commit_wiring.sink,
         crate::bootstrap::composition_adapters::outbox_response_codec_adapter::new_codec(),
     )

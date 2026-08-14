@@ -126,11 +126,7 @@ pub(crate) struct GcNonPodFinalizationAdapter {
 }
 
 impl GcNonPodFinalizationAdapter {
-    #[cfg(any(
-        test,
-        feature = "native-api-test-support",
-        feature = "pod-repository-test-support"
-    ))]
+    #[cfg(test)]
     pub(crate) fn new(db: DatastoreHandle) -> Self {
         let commands =
             super::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(

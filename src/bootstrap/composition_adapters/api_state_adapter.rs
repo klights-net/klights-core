@@ -35,11 +35,7 @@ pub(crate) struct RootNamespaceTerminationStore {
 }
 
 impl RootNamespaceTerminationStore {
-    #[cfg(any(
-        test,
-        feature = "native-api-test-support",
-        feature = "pod-repository-test-support"
-    ))]
+    #[cfg(test)]
     pub(crate) fn new(inner: DatastoreHandle) -> Arc<Self> {
         let authority = super::authority_adapter::always_leader_authority();
         let query = super::resource_query_adapter::DatastoreResourceQueryAdapter::new(

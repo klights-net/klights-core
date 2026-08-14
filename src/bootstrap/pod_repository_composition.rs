@@ -92,14 +92,14 @@ pub(crate) enum PodSchedulingMode {
     DeferredMultiNodeLeader,
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub(crate) struct PostWriteMaintenanceTracker {
     launched: std::sync::atomic::AtomicU64,
     completed: std::sync::atomic::AtomicU64,
     notify: tokio::sync::Notify,
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 impl PostWriteMaintenanceTracker {
     #[cfg(test)]
     pub(crate) fn new() -> Self {
@@ -135,7 +135,7 @@ impl PostWriteMaintenanceTracker {
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 impl klights_kubelet::pod_deletion_finalizer::PostWriteMaintenanceObserver
     for PostWriteMaintenanceTracker
 {
@@ -165,11 +165,11 @@ pub(crate) struct PodRepositoryBuildConfig {
     pub controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     #[cfg(not(test))]
     pub api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     pub(crate) scheduler_bind_gate: Option<
         Arc<crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest>,
     >,
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     pub(crate) post_write_maintenance_notify: Option<Arc<PostWriteMaintenanceTracker>>,
     #[cfg(not(test))]
     pub gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
@@ -196,7 +196,7 @@ pub(crate) struct PodRepositoryRuntimeDependencies {
     pub supervisor: Arc<TaskSupervisor>,
     pub metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
     pub wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     pub post_write_maintenance_notify: Option<Arc<PostWriteMaintenanceTracker>>,
 }
 
@@ -227,9 +227,9 @@ pub(crate) struct PodRepositoryAdapters {
     pub namespace_bootstrap: Arc<dyn klights_reconcile_api::NamespaceBootstrapSink>,
     pub namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     pub mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     pub test_api: Option<Arc<dyn klights_pod_api::PodApiMutation>>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     pub test_subresource: Option<Arc<dyn klights_pod_api::PodSubresourceMutation>>,
 }
 
@@ -242,7 +242,7 @@ struct PodRepositoryApiServices {
     scheduling: Option<Arc<dyn klights_pod_api::PodScheduling>>,
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 #[allow(dead_code)]
 pub(crate) trait PodWatchSource: Send + Sync {
     fn subscribe_pod_watch(&self) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent>;
@@ -258,7 +258,7 @@ struct RootPodRepositoryComposition {
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
     controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     scheduler_bind_gate: Option<
         Arc<crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest>,
     >,
@@ -267,7 +267,7 @@ struct RootPodRepositoryComposition {
 /// Anonymous focused handoff used only at construction boundaries.  Callers
 /// must destructure this tuple immediately and retain individual ports; no
 /// named aggregate is allowed to escape into a subsystem or fixture.
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 type PodRepositoryConstructionResult = (
     Arc<dyn klights_pod_api::PodQuery>,
     Arc<dyn klights_pod_api::PodSnapshotQuery>,
@@ -294,7 +294,7 @@ type PodRepositoryConstructionResult = (
     Option<Arc<dyn klights_pod_api::PodSubresourceMutation>>,
 );
 
-#[cfg(not(any(test, feature = "pod-repository-test-support")))]
+#[cfg(not(test))]
 type PodRepositoryConstructionResult = (
     Arc<dyn klights_pod_api::PodQuery>,
     Arc<dyn klights_pod_api::PodSnapshotQuery>,
@@ -319,11 +319,11 @@ type PodRepositoryConstructionResult = (
 #[derive(Clone)]
 struct RootPodWorkqueuePersistence {
     node_local: Option<Arc<dyn klights_node_store::PodWorkqueueStore>>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     test_rows: Arc<std::sync::Mutex<Vec<RootInMemoryPodWorkqueueEntry>>>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     test_next_id: Arc<std::sync::atomic::AtomicI64>,
 }
 
@@ -340,7 +340,7 @@ pub(crate) fn test_workqueue_persistence(
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 #[derive(Clone)]
 struct RootInMemoryPodWorkqueueEntry {
     id: i64,
@@ -353,7 +353,7 @@ struct RootInMemoryPodWorkqueueEntry {
     next_attempt_at_ms: i64,
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 fn in_memory_row_matches_token(
     row: &RootInMemoryPodWorkqueueEntry,
     token: &klights_node_store::PodWorkqueueLeaseToken,
@@ -481,9 +481,9 @@ impl WorkerPodAdapters {
             namespace_bootstrap: adapter.clone(),
             namespace_termination: adapter.clone(),
             mutation_reconcile: adapter,
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             test_api: None,
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             test_subresource: None,
         }
     }
@@ -758,11 +758,11 @@ impl PodWorkqueuePersistence for RootPodWorkqueuePersistence {
                 .await
                 .map_err(anyhow::Error::from);
         }
-        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+        #[cfg(not(test))]
         return Err(anyhow::anyhow!(
             "production Pod workqueue persistence requires node-local storage"
         ));
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         {
             let id = self
                 .test_next_id
@@ -826,11 +826,11 @@ impl PodWorkqueuePersistence for RootPodWorkqueuePersistence {
                 .await
                 .map_err(anyhow::Error::from);
         }
-        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+        #[cfg(not(test))]
         return Err(anyhow::anyhow!(
             "production Pod workqueue persistence requires node-local storage"
         ));
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         {
             let now_ms = self.wall_clock.now_ms();
             let mut rows = self.test_rows.lock().unwrap();
@@ -879,11 +879,11 @@ impl PodWorkqueuePersistence for RootPodWorkqueuePersistence {
                 .await
                 .map_err(anyhow::Error::from);
         }
-        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+        #[cfg(not(test))]
         return Err(anyhow::anyhow!(
             "production Pod workqueue persistence requires node-local storage"
         ));
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         {
             Ok(self
                 .test_rows
@@ -910,11 +910,11 @@ impl PodWorkqueuePersistence for RootPodWorkqueuePersistence {
                 .map(focused_workqueue_entry)
                 .transpose();
         }
-        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+        #[cfg(not(test))]
         return Err(anyhow::anyhow!(
             "production Pod workqueue persistence requires node-local storage"
         ));
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         {
             let mut rows = self.test_rows.lock().unwrap();
             let candidate = rows
@@ -971,11 +971,11 @@ impl PodWorkqueuePersistence for RootPodWorkqueuePersistence {
                 .await
                 .map_err(anyhow::Error::from);
         }
-        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+        #[cfg(not(test))]
         return Err(anyhow::anyhow!(
             "production Pod workqueue persistence requires node-local storage"
         ));
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         {
             let mut rows = self.test_rows.lock().unwrap();
             let before = rows.len();
@@ -1008,11 +1008,11 @@ impl PodWorkqueuePersistence for RootPodWorkqueuePersistence {
                 .await
                 .map_err(anyhow::Error::from);
         }
-        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+        #[cfg(not(test))]
         return Err(anyhow::anyhow!(
             "production Pod workqueue persistence requires node-local storage"
         ));
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         {
             let mut rows = self.test_rows.lock().unwrap();
             let Some(stored) = rows
@@ -1230,7 +1230,7 @@ impl klights_pod_api::PodSnapshotQuery for RootPodQueryWriter {
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 impl PodWatchSource for RootPodQueryWriter {
     fn subscribe_pod_watch(&self) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
         self.store.subscribe_watch()
@@ -1260,7 +1260,7 @@ pub(crate) struct RootPodStatusWriterAdapter {
     mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     supervisor: Arc<TaskSupervisor>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     post_write_maintenance_notify: Option<Arc<PostWriteMaintenanceTracker>>,
 }
 
@@ -1273,9 +1273,9 @@ impl RootPodStatusWriterAdapter {
     async fn spawn_post_write_maintenance(&self, namespace: &str) {
         let namespace_termination = self.namespace_termination.clone();
         let ns = namespace.to_string();
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         let completion = self.post_write_maintenance_notify.clone();
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         let completion_sequence = completion.as_ref().map(|tracker| tracker.launch_sequence());
         let spawn_result = self
             .supervisor
@@ -1298,14 +1298,14 @@ impl RootPodStatusWriterAdapter {
                             "post-write namespace termination reconcile failed"
                         );
                     }
-                    #[cfg(any(test, feature = "pod-repository-test-support"))]
+                    #[cfg(test)]
                     if let (Some(completion), Some(sequence)) = (completion, completion_sequence) {
                         completion.complete_sequence(sequence);
                     }
                 },
             )
             .await;
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         if spawn_result.is_err()
             && let (Some(completion), Some(sequence)) = (
                 self.post_write_maintenance_notify.as_ref(),
@@ -1314,7 +1314,7 @@ impl RootPodStatusWriterAdapter {
         {
             completion.complete_sequence(sequence);
         }
-        #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+        #[cfg(not(test))]
         let _ = spawn_result;
     }
 
@@ -1629,7 +1629,7 @@ pub(crate) struct PodDeletionFinalizerDependencies {
     pub mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     pub metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
     pub supervisor: Arc<TaskSupervisor>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     pub post_write_maintenance_observer: Option<Arc<PostWriteMaintenanceTracker>>,
     pub deferred_runtime: klights_kubelet::pod_repository::status::DeferredRuntimeReducerHandle,
 }
@@ -1674,7 +1674,7 @@ pub(crate) fn compose_pod_deletion_finalizer(
                 metrics: dependencies.metrics,
                 supervisor: dependencies.supervisor,
                 post_write_maintenance_observer: {
-                    #[cfg(any(test, feature = "pod-repository-test-support"))]
+                    #[cfg(test)]
                     {
                         dependencies
                             .post_write_maintenance_observer
@@ -1688,7 +1688,7 @@ pub(crate) fn compose_pod_deletion_finalizer(
                             })
                             .unwrap_or_default()
                     }
-                    #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+                    #[cfg(not(test))]
                     {
                         klights_kubelet::pod_deletion_finalizer::PostWriteMaintenanceObserverHandle::default()
                     }
@@ -1735,13 +1735,13 @@ impl RootPodRepositoryComposition {
         let resource_commands = match self.resource_commands.clone() {
             Some(commands) => commands,
             None => {
-                #[cfg(any(test, feature = "pod-repository-test-support"))]
+                #[cfg(test)]
                 {
                     crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
                         self.db.clone(),
                     )
                 }
-                #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+                #[cfg(not(test))]
                 panic!("production root Pod composition requires leader resource commands")
             }
         };
@@ -1764,7 +1764,7 @@ impl RootPodRepositoryComposition {
                 self.db.clone(),
                 resource_commands,
                 self.wall_clock.clone(),
-                #[cfg(any(test, feature = "pod-repository-test-support"))]
+                #[cfg(test)]
                 self.scheduler_bind_gate.clone(),
             );
         let pod_query: Arc<dyn klights_pod_api::PodQuery> = native.clone();
@@ -1840,9 +1840,9 @@ impl RootPodRepositoryComposition {
             namespace_bootstrap: pod_reconcile.clone(),
             namespace_termination: pod_reconcile.clone(),
             mutation_reconcile: pod_reconcile,
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             test_api: Some(api.clone()),
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             test_subresource: Some(subresource.clone()),
         };
         (
@@ -1856,7 +1856,7 @@ impl RootPodRepositoryComposition {
     }
 }
 
-#[cfg(not(any(test, feature = "pod-repository-test-support")))]
+#[cfg(not(test))]
 pub(crate) fn build_pod_repository_parts(
     config: PodRepositoryBuildConfig,
     leader_coordination: Option<Arc<dyn klights_leader_api::ControllerCoordination>>,
@@ -1882,7 +1882,24 @@ pub(crate) fn build_integration_pod_repository_parts(
     )
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+/// Root-private native API composition entry. The assembled API keeps the
+/// caller's deterministic request identity and shared GC coordination.
+#[cfg(test)]
+pub(crate) fn build_native_api_test_pod_repository_parts(
+    config: PodRepositoryBuildConfig,
+    leader_coordination: Option<Arc<dyn klights_leader_api::ControllerCoordination>>,
+    api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
+    gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
+) -> PodRepositoryConstructionResult {
+    build_pod_repository_parts_inner(
+        config,
+        leader_coordination,
+        None,
+        Some((api_identity, gc_coordination)),
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn build_pod_repository_parts(
     config: PodRepositoryBuildConfig,
     leader_coordination: Option<Arc<dyn klights_leader_api::ControllerCoordination>>,
@@ -1894,7 +1911,7 @@ fn build_pod_repository_parts_inner(
     config: PodRepositoryBuildConfig,
     leader_coordination: Option<Arc<dyn klights_leader_api::ControllerCoordination>>,
     resource_query_override: Option<Arc<dyn LeaderResourceQuery>>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))] test_support: Option<(
+    #[cfg(test)] test_support: Option<(
         Arc<dyn k8s_native_service::ApiIdentityGenerator>,
         Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
     )>,
@@ -1915,9 +1932,9 @@ fn build_pod_repository_parts_inner(
         controller_identity,
         #[cfg(not(test))]
         api_identity,
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         scheduler_bind_gate,
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         post_write_maintenance_notify,
         #[cfg(not(test))]
         gc_coordination,
@@ -1932,16 +1949,14 @@ fn build_pod_repository_parts_inner(
                 as Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
         )
     });
-    #[cfg(all(feature = "pod-repository-test-support", not(test)))]
-    let _ = test_support;
     let _ = scheduling_mode;
-    #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+    #[cfg(not(test))]
     let resource_query = resource_query_override
         .or_else(|| cluster_api.clone())
         .expect("production Pod repository requires a leader resource query");
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     let _ = resource_query_override;
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     let resource_query = cluster_api.clone().unwrap_or_else(|| {
         crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
             db.clone(),
@@ -1964,11 +1979,11 @@ fn build_pod_repository_parts_inner(
     let unscheduled_deletion = persistence_parts.unscheduled_deletion;
     let workqueue_persistence = RootPodWorkqueuePersistence {
         node_local: pod_workqueue_store,
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         wall_clock: wall_clock.clone(),
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         test_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         test_next_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
     };
     let workqueue = if let Some(leader_coordination) = leader_coordination {
@@ -2008,7 +2023,7 @@ fn build_pod_repository_parts_inner(
             wall_clock: Arc::new(klights_supervisor::SystemWallClock),
             controller_identity,
             api_identity,
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             scheduler_bind_gate,
         }
         .build(PodRepositoryAdapterDependencies {
@@ -2044,7 +2059,7 @@ fn build_pod_repository_parts_inner(
             supervisor,
             metrics: metrics.clone(),
             wall_clock,
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             post_write_maintenance_notify,
         },
         PodRepositoryNetworkDependencies {
@@ -2083,11 +2098,11 @@ pub(crate) fn build_worker_pod_repository_parts(
         store.clone(),
         RootPodWorkqueuePersistence {
             node_local: Some(config.pod_workqueue_store),
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             wall_clock: wall_clock.clone(),
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             test_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             test_next_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
         },
         config.supervisor.clone(),
@@ -2136,7 +2151,7 @@ pub(crate) fn build_worker_pod_repository_parts(
             supervisor: config.supervisor,
             metrics: config.metrics,
             wall_clock,
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             post_write_maintenance_notify: None,
         },
         PodRepositoryNetworkDependencies {
@@ -2185,7 +2200,7 @@ fn assemble_pod_services(
         supervisor,
         metrics,
         wall_clock,
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         post_write_maintenance_notify,
     } = runtime;
     let PodRepositoryNetworkDependencies {
@@ -2250,7 +2265,7 @@ fn assemble_pod_services(
         mutation_reconcile: mutation_reconcile.clone(),
         metrics: metrics.clone(),
         supervisor: supervisor.clone(),
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         post_write_maintenance_observer: post_write_maintenance_notify.clone(),
         deferred_runtime: deferred_runtime.clone(),
     });
@@ -2262,7 +2277,7 @@ fn assemble_pod_services(
     ));
     let pod_query: Arc<dyn klights_pod_api::PodQuery> = query_writer.clone();
     let pod_snapshot: Arc<dyn klights_pod_api::PodSnapshotQuery> = query_writer.clone();
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     let watch_source: Arc<dyn PodWatchSource> = query_writer.clone();
     let pod_update = Arc::new(RootPodMetadataWriter {
         metadata,
@@ -2273,11 +2288,11 @@ fn assemble_pod_services(
         mutation_reconcile: mutation_reconcile.clone(),
         namespace_termination: namespace_termination.clone(),
         supervisor: supervisor.clone(),
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         post_write_maintenance_notify,
     });
     let background = PodRepositoryBackground::new(workqueue.clone());
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     {
         (
             pod_query,
@@ -2305,7 +2320,7 @@ fn assemble_pod_services(
             adapters.test_subresource,
         )
     }
-    #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+    #[cfg(not(test))]
     {
         (
             pod_query,

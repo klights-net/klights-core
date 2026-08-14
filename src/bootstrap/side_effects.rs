@@ -9,11 +9,7 @@ use klights_controllers::side_effects::{
 
 /// Construct the root-selected focused ports and hand the complete immutable
 /// effect bundle to the controller-owned registration policy.
-#[cfg(any(
-    test,
-    feature = "native-api-test-support",
-    feature = "pod-repository-test-support"
-))]
+#[cfg(test)]
 pub(crate) fn default_registry(
     metrics: Arc<SideEffectMetrics>,
     services: Option<Arc<dyn klights_network_api::ServiceRouter>>,

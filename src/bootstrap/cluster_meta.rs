@@ -12,7 +12,7 @@ use anyhow::Result;
 use klights_cluster_core::{ClusterMembership, ClusterMetadata};
 
 /// Generate a new random cluster ID (UUID v4).
-#[cfg(any(test, feature = "native-api-test-support"))]
+#[cfg(test)]
 fn generate_cluster_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -27,7 +27,7 @@ use crate::datastore::backend::DatastoreBackend;
 /// `EnsureClusterMetadata` command. Joining controlplanes receive
 /// cluster state from raft, not local writes. Function retained for
 /// test helpers that exercise the direct-backend code path.
-#[cfg(any(test, feature = "native-api-test-support"))]
+#[cfg(test)]
 pub async fn ensure_cluster_metadata(db: &dyn DatastoreBackend) -> Result<()> {
     // Check if cluster_id already exists
     let existing = db

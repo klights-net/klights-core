@@ -15,14 +15,14 @@ use crate::datastore::{DatastoreHandle, ResourceListQuery};
 use k8s_native_service::AdmissionResourceStore;
 use klights_kubelet::pod_repository::store::PodStore;
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub(crate) struct SchedulerBindGateForTest {
     entered: std::sync::atomic::AtomicUsize,
     entered_notify: tokio::sync::Notify,
     release_notify: tokio::sync::Notify,
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 #[allow(dead_code)]
 impl SchedulerBindGateForTest {
     pub fn new() -> Self {
@@ -59,7 +59,7 @@ pub(crate) struct RootPodNativeAdapter {
     db: DatastoreHandle,
     event_effect: crate::bootstrap::composition_adapters::pod_event_adapter::LeaderPodEventEffect,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     scheduler_bind_gate: Option<Arc<SchedulerBindGateForTest>>,
 }
 
@@ -69,9 +69,7 @@ impl RootPodNativeAdapter {
         db: DatastoreHandle,
         resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
-        #[cfg(any(test, feature = "pod-repository-test-support"))] scheduler_bind_gate: Option<
-            Arc<SchedulerBindGateForTest>,
-        >,
+        #[cfg(test)] scheduler_bind_gate: Option<Arc<SchedulerBindGateForTest>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -81,7 +79,7 @@ impl RootPodNativeAdapter {
                     resource_commands,
                 ),
             wall_clock,
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             scheduler_bind_gate,
         })
     }
@@ -154,10 +152,10 @@ impl PodPersistence for RootPodNativeAdapter {
         &self,
         request: PodPersistenceReplaceRequest,
     ) -> PodRepositoryFuture<'_, Resource> {
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         let scheduler_bind_gate = self.scheduler_bind_gate.clone();
         Box::pin(async move {
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             if let Some(gate) = scheduler_bind_gate {
                 gate.enter_and_wait().await;
             }

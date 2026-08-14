@@ -24,13 +24,13 @@ pub(crate) struct RootControllerLeaderPort {
 }
 
 impl RootControllerLeaderPort {
-    #[cfg(any(test, feature = "native-api-test-support"))]
+    #[cfg(test)]
     pub(crate) fn new(store: DatastoreHandle) -> Self {
         let commands = Self::resource_commands_for_test(store.clone());
         Self { store, commands }
     }
 
-    #[cfg(any(test, feature = "native-api-test-support"))]
+    #[cfg(test)]
     pub(crate) fn resource_commands_for_test(
         store: DatastoreHandle,
     ) -> Arc<dyn klights_leader_api::LeaderResourceCommand> {
@@ -1288,7 +1288,7 @@ impl ControllerEffectPort for RootControllerEffectPort {
     }
 }
 
-#[cfg(any(test, feature = "native-api-test-support"))]
+#[cfg(test)]
 pub(crate) fn inject_resource_version(
     data: impl Into<Arc<serde_json::Value>>,
     resource_version: i64,

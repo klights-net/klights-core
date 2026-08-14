@@ -316,7 +316,7 @@ impl KlightsConfig {
     }
 
     /// Test-friendly default with in-memory DB.
-    #[cfg(any(test, feature = "native-api-test-support"))]
+    #[cfg(test)]
     pub fn test_default() -> Self {
         let ns = "klights-test";
         Self {

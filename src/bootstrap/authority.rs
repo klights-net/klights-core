@@ -1,16 +1,8 @@
 use std::sync::Arc;
 
-#[cfg(any(
-    test,
-    feature = "pod-repository-test-support",
-    feature = "native-api-test-support"
-))]
+#[cfg(test)]
 use std::sync::Mutex;
-#[cfg(any(
-    test,
-    feature = "pod-repository-test-support",
-    feature = "native-api-test-support"
-))]
+#[cfg(test)]
 use tokio::sync::watch;
 
 /// Small composition-time handle for the existing backend-neutral authority
@@ -19,11 +11,7 @@ use tokio::sync::watch;
 #[derive(Clone)]
 pub(crate) struct AuthorityHandle {
     authority: Arc<dyn klights_leader_api::LeaderAuthority>,
-    #[cfg(any(
-        test,
-        feature = "pod-repository-test-support",
-        feature = "native-api-test-support"
-    ))]
+    #[cfg(test)]
     legacy_watch: Option<watch::Receiver<bool>>,
 }
 
@@ -73,11 +61,7 @@ where
     fn from(authority: Arc<T>) -> Self {
         Self {
             authority: authority as Arc<dyn klights_leader_api::LeaderAuthority>,
-            #[cfg(any(
-                test,
-                feature = "pod-repository-test-support",
-                feature = "native-api-test-support"
-            ))]
+            #[cfg(test)]
             legacy_watch: None,
         }
     }
@@ -87,41 +71,25 @@ impl From<Arc<dyn klights_leader_api::LeaderAuthority>> for AuthorityHandle {
     fn from(authority: Arc<dyn klights_leader_api::LeaderAuthority>) -> Self {
         Self {
             authority,
-            #[cfg(any(
-                test,
-                feature = "pod-repository-test-support",
-                feature = "native-api-test-support"
-            ))]
+            #[cfg(test)]
             legacy_watch: None,
         }
     }
 }
 
-#[cfg(any(
-    test,
-    feature = "pod-repository-test-support",
-    feature = "native-api-test-support"
-))]
+#[cfg(test)]
 impl From<watch::Receiver<bool>> for AuthorityHandle {
     fn from(receiver: watch::Receiver<bool>) -> Self {
         let authority = Arc::new(WatchReceiverAuthority::new(receiver.clone()));
         Self {
             authority,
-            #[cfg(any(
-                test,
-                feature = "pod-repository-test-support",
-                feature = "native-api-test-support"
-            ))]
+            #[cfg(test)]
             legacy_watch: Some(receiver),
         }
     }
 }
 
-#[cfg(any(
-    test,
-    feature = "pod-repository-test-support",
-    feature = "native-api-test-support"
-))]
+#[cfg(test)]
 impl AuthorityHandle {
     pub(crate) fn legacy_watch_for_test(&self) -> Option<watch::Receiver<bool>> {
         self.legacy_watch.clone()
@@ -130,22 +98,14 @@ impl AuthorityHandle {
 
 /// Test-only compatibility input adapter for legacy fixtures. Production
 /// bootstrap supplies the backend-neutral `LeaderAuthority` directly.
-#[cfg(any(
-    test,
-    feature = "pod-repository-test-support",
-    feature = "native-api-test-support"
-))]
+#[cfg(test)]
 struct WatchReceiverAuthority {
     receiver: Mutex<watch::Receiver<bool>>,
     generation: std::sync::atomic::AtomicU64,
     issuer: klights_leader_api::AuthorityPermitIssuer,
 }
 
-#[cfg(any(
-    test,
-    feature = "pod-repository-test-support",
-    feature = "native-api-test-support"
-))]
+#[cfg(test)]
 impl WatchReceiverAuthority {
     fn new(receiver: watch::Receiver<bool>) -> Self {
         Self {
@@ -171,11 +131,7 @@ impl WatchReceiverAuthority {
     }
 }
 
-#[cfg(any(
-    test,
-    feature = "pod-repository-test-support",
-    feature = "native-api-test-support"
-))]
+#[cfg(test)]
 impl klights_leader_api::LeaderAuthority for WatchReceiverAuthority {
     fn route(&self) -> klights_leader_api::AuthorityRoute {
         let (local, generation) = self.state();

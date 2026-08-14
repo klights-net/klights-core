@@ -6,7 +6,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 use std::sync::Arc;
 
 fn snapshot_replay_floor_cursor_key(
@@ -65,13 +65,13 @@ where
         PodEndpointEffect::NotApplicable,
     ))
 }
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 use tokio::sync::broadcast;
 
 use klights_cluster_core::command::StorageCommand;
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 use klights_watch::WatchTopic;
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 use klights_watch::{WatchEvent, WatchReceiver};
 
 use super::types::{
@@ -79,18 +79,18 @@ use super::types::{
     PositionedWatchReplayRead, ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery,
     SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
 };
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 use crate::datastore::ReplicatedCreateOptions;
 use klights_cluster_core::{
     LogApplyAppliedOutboxRow, LogApplyPodCleanupIntentRow, PatchKind, Resource,
     ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
 };
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 use klights_cluster_store::StagedPostCommit;
 
 pub use klights_cluster_store::{SnapshotExclusiveFence, SnapshotMutationFence};
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub use klights_cluster_store::CommitObservationSink;
 
 /// `DatastoreBackend` is the runtime contract. Every state operation goes
@@ -102,7 +102,7 @@ pub use klights_cluster_store::CommitObservationSink;
 /// exists.
 #[async_trait]
 pub trait DatastoreBackend: Send + Sync {
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     fn commit_observation_sink(&self) -> Arc<dyn CommitObservationSink>;
     /// Atomically observe both durable allocators and their persisted mode.
     async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {
@@ -140,15 +140,15 @@ pub trait DatastoreBackend: Send + Sync {
     /// after graceful shutdown work is complete.  No-op by default.
     fn close(&self) {}
 
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     fn subscribe_watch(&self, _topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
         panic!("watch event subscription is unavailable for this datastore adapter")
     }
 
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver;
 
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     fn broadcast_watch_event(&self, pending: StagedPostCommit);
 
     /// Atomically replace Kubernetes resource tables from a full leader snapshot.
@@ -237,7 +237,7 @@ pub trait DatastoreBackend: Send + Sync {
     /// rejecting existing names. Replicated creates converge a follower cache to
     /// the leader's object identity, including delete/recreate slots where the
     /// same name now has a different UID.
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     async fn apply_replicated_create_resource(
         &self,
         api_version: &str,
@@ -508,7 +508,7 @@ pub trait DatastoreBackend: Send + Sync {
     /// best-effort creates via `create_namespace`; backends may override with a
     /// cheaper path that does not advance the observed resourceVersion counter
     /// (so RV-asserting tests stay deterministic).
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     async fn seed_namespace_for_test(&self, name: &str) {
         let _ = self
             .create_namespace(name, serde_json::json!({"metadata": {"name": name}}))
@@ -1330,7 +1330,7 @@ pub trait RawWatchReplayStore: Send + Sync {
 /// Watch-event subscription, broadcast access, and replay queries.
 #[async_trait]
 pub trait WatchStore: Send + Sync {
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     fn subscribe_watch(&self, _topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
         panic!("watch event subscription is unavailable for this datastore adapter")
     }
@@ -1465,7 +1465,7 @@ pub trait NetworkMetadataStore: Send + Sync {
 pub trait NamespaceStore: Send + Sync {
     async fn create_namespace(&self, name: &str, data: Value) -> Result<Resource>;
     async fn get_namespace(&self, name: &str) -> Result<Option<Resource>>;
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     async fn seed_namespace_for_test(&self, name: &str);
     async fn list_namespaces(
         &self,
@@ -1525,7 +1525,7 @@ pub trait ReplicationStore: Send + Sync {
         &self,
         commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<klights_cluster_store::CommittedRaftApplyReceipt>;
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     async fn apply_replicated_create_resource(
         &self,
         api_version: &str,
@@ -1581,7 +1581,7 @@ impl<T: ReplicationStore + ?Sized> ReplicationStore for std::sync::Arc<T> {
             .await
     }
 
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     async fn apply_replicated_create_resource(
         &self,
         api_version: &str,
@@ -1674,7 +1674,7 @@ pub(crate) fn root_cluster_store_error(
 }
 
 /// Test-only watch bus controls.
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub trait TestWatchStore: Send + Sync {
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver;
     fn broadcast_watch_event(&self, pending: StagedPostCommit);

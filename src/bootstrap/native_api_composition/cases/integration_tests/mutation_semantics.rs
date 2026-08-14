@@ -1,0 +1,2256 @@
+use super::*;
+
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode},
+};
+use tower::ServiceExt;
+
+async fn request(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method(method).uri(uri);
+    let body = if let Some(value) = body {
+        builder = builder.header("content-type", "application/json");
+        Body::from(serde_json::to_vec(&value).unwrap())
+    } else {
+        Body::empty()
+    };
+
+    app.clone()
+        .oneshot(builder.body(body).unwrap())
+        .await
+        .unwrap()
+}
+
+async fn request_json_with_content_type(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    content_type: &str,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    request_raw(
+        app,
+        method,
+        uri,
+        Some(content_type),
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .await
+}
+
+async fn request_raw(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    content_type: Option<&str>,
+    body: Vec<u8>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(content_type) = content_type {
+        builder = builder.header("content-type", content_type);
+    }
+    app.clone()
+        .oneshot(builder.body(Body::from(body)).unwrap())
+        .await
+        .unwrap()
+}
+
+async fn response_json(response: axum::response::Response) -> serde_json::Value {
+    serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+}
+
+async fn create_widget_crd(app: &axum::Router) {
+    let response = request(
+        app,
+        "POST",
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+        Some(json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "widgets.example.com"},
+            "spec": {
+                "group": "example.com",
+                "scope": "Namespaced",
+                "names": {
+                    "plural": "widgets",
+                    "singular": "widget",
+                    "kind": "Widget"
+                },
+                "versions": [{
+                    "name": "v1",
+                    "served": true,
+                    "storage": true,
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "type": "object",
+                            "x-kubernetes-preserve-unknown-fields": true
+                        }
+                    }
+                }]
+            }
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+async fn create_configmap(app: &axum::Router, name: &str, metadata: serde_json::Value) {
+    let response = request(
+        app,
+        "POST",
+        "/api/v1/namespaces/default/configmaps",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": metadata,
+            "data": {"key": name}
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+async fn create_secret(app: &axum::Router, name: &str, metadata: serde_json::Value) {
+    let response = request(
+        app,
+        "POST",
+        "/api/v1/namespaces/default/secrets",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": metadata,
+            "stringData": {"key": name}
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+async fn create_pod(app: &axum::Router, name: &str, metadata: serde_json::Value) {
+    let response = request(
+        app,
+        "POST",
+        "/api/v1/namespaces/default/pods",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": metadata,
+            "spec": {
+                "containers": [{
+                    "name": "main",
+                    "image": "registry.k8s.io/pause:3.10"
+                }]
+            }
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED, "create pod {name}");
+}
+
+async fn create_widget(app: &axum::Router, name: &str, metadata: serde_json::Value) {
+    let response = request(
+        app,
+        "POST",
+        "/apis/example.com/v1/namespaces/default/widgets",
+        Some(json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": metadata,
+            "spec": {"value": name}
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+async fn create_deployment(app: &axum::Router, name: &str, metadata: serde_json::Value) {
+    let response = request(
+        app,
+        "POST",
+        "/apis/apps/v1/namespaces/default/deployments",
+        Some(json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": metadata,
+            "spec": {
+                "replicas": 1,
+                "selector": {"matchLabels": {"app": name}},
+                "template": {
+                    "metadata": {"labels": {"app": name}},
+                    "spec": {
+                        "containers": [{
+                            "name": "main",
+                            "image": "registry.k8s.io/pause:3.10"
+                        }]
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let response = request(app, "GET", uri, None).await;
+    let status = response.status();
+    (status, response_json(response).await)
+}
+
+fn assert_has_resource_version(value: &serde_json::Value) {
+    assert!(
+        value
+            .pointer("/metadata/resourceVersion")
+            .and_then(|rv| rv.as_str())
+            .is_some_and(|rv| !rv.is_empty()),
+        "response must include metadata.resourceVersion: {value:?}"
+    );
+}
+
+fn assert_no_deletion_timestamp(value: &serde_json::Value) {
+    assert!(
+        value.pointer("/metadata/deletionTimestamp").is_none(),
+        "object must not have deletionTimestamp persisted: {value:?}"
+    );
+}
+
+fn assert_finalizers_include(value: &serde_json::Value, expected: &str) {
+    assert!(
+        value
+            .pointer("/metadata/finalizers")
+            .and_then(|finalizers| finalizers.as_array())
+            .is_some_and(|finalizers| finalizers
+                .iter()
+                .any(|finalizer| finalizer.as_str() == Some(expected))),
+        "object finalizers must include {expected}: {value:?}"
+    );
+}
+
+fn assert_pod_create_defaults(value: &serde_json::Value) {
+    assert_eq!(value["spec"]["serviceAccountName"], "default");
+    assert_eq!(value["spec"]["serviceAccount"], "default");
+    assert_eq!(value["spec"]["dnsPolicy"], "ClusterFirst");
+    assert_eq!(value["spec"]["schedulerName"], "default-scheduler");
+    assert_eq!(value["spec"]["terminationGracePeriodSeconds"], 30);
+    assert_eq!(value["metadata"]["generation"], 1);
+    assert_eq!(value["status"]["phase"], "Pending");
+    assert_default_service_account_projection(value);
+}
+
+fn assert_default_service_account_projection(value: &serde_json::Value) {
+    let volumes = value["spec"]["volumes"]
+        .as_array()
+        .expect("defaulted Pod must have volumes");
+    let volume = volumes
+        .iter()
+        .find(|volume| {
+            volume["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("kube-api-access-"))
+        })
+        .expect("defaulted Pod must have a kube-api-access projected volume");
+    let sources = volume["projected"]["sources"]
+        .as_array()
+        .expect("default projected sources");
+    assert!(
+        sources
+            .iter()
+            .any(|source| source.get("serviceAccountToken").is_some())
+    );
+    assert!(
+        sources
+            .iter()
+            .any(|source| source.get("configMap").is_some())
+    );
+    assert!(
+        sources
+            .iter()
+            .any(|source| source.get("downwardAPI").is_some())
+    );
+    assert!(
+        value["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .is_some_and(|mounts| mounts.iter().any(|mount| {
+                mount["mountPath"] == "/var/run/secrets/kubernetes.io/serviceaccount"
+                    && mount["readOnly"] == true
+                    && mount["name"] == volume["name"]
+            }))
+    );
+}
+
+fn item_names(list: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = list["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| {
+            item.pointer("/metadata/name")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn mutation_dry_run_create_does_not_persist_generated_crd_or_pod() {
+    let state = build_test_app_state().await;
+    let pod_repository = state.resource_store();
+    let app = state.router();
+    create_widget_crd(&app).await;
+
+    let generated = request(
+        &app,
+        "POST",
+        "/api/v1/namespaces/default/configmaps?dryRun=All",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "dry-run-cm", "namespace": "default"},
+            "data": {"key": "value"}
+        })),
+    )
+    .await;
+    assert_eq!(generated.status(), StatusCode::CREATED);
+    let generated_body = response_json(generated).await;
+    assert_eq!(generated_body["kind"], "ConfigMap");
+
+    let (status, missing) =
+        get_json(&app, "/api/v1/namespaces/default/configmaps/dry-run-cm").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing["kind"], "Status");
+
+    let crd = request(
+        &app,
+        "POST",
+        "/apis/example.com/v1/namespaces/default/widgets?dryRun=All",
+        Some(json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {"name": "dry-run-widget", "namespace": "default"},
+            "spec": {"value": "dry"}
+        })),
+    )
+    .await;
+    assert_eq!(crd.status(), StatusCode::CREATED);
+    let crd_body = response_json(crd).await;
+    assert_eq!(crd_body["kind"], "Widget");
+
+    let (status, missing) = get_json(
+        &app,
+        "/apis/example.com/v1/namespaces/default/widgets/dry-run-widget",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing["kind"], "Status");
+
+    let pod = request(
+        &app,
+        "POST",
+        "/api/v1/namespaces/default/pods?dryRun=All",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "dry-run-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "main",
+                    "image": "registry.k8s.io/pause:3.10"
+                }]
+            }
+        })),
+    )
+    .await;
+    assert_eq!(pod.status(), StatusCode::CREATED);
+    let pod_body = response_json(pod).await;
+    assert_eq!(pod_body["kind"], "Pod");
+    assert_default_service_account_projection(&pod_body);
+
+    let persisted = crate::bootstrap::native_api_composition::support::get_pod(
+        &pod_repository,
+        "default",
+        "dry-run-pod",
+    )
+    .await
+    .unwrap();
+    assert!(
+        persisted.is_none(),
+        "Pod dry-run create must not persist the Pod row"
+    );
+}
+
+#[tokio::test]
+async fn mutation_generated_apply_create_dry_run_does_not_persist() {
+    let state = build_test_app_state().await;
+    let app = state.router();
+
+    let response = request_json_with_content_type(
+        &app,
+        "PATCH",
+        "/api/v1/namespaces/default/configmaps/dry-apply-created-cm?fieldManager=klights-test&dryRun=All",
+        "application/apply-patch+yaml",
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "dry-apply-created-cm",
+                "namespace": "default"
+            },
+            "data": {"key": "dry-run"}
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "dry-run generated server-side-apply create must report 201 Created"
+    );
+    let body = response_json(response).await;
+    assert_eq!(body["metadata"]["name"], "dry-apply-created-cm");
+    assert_eq!(body["data"]["key"], "dry-run");
+
+    let (status, missing) = get_json(
+        &app,
+        "/api/v1/namespaces/default/configmaps/dry-apply-created-cm",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing["kind"], "Status");
+}
+
+#[tokio::test]
+async fn mutation_generated_update_dry_run_shapes_response_without_persisting() {
+    let state = build_test_app_state().await;
+    let app = state.router();
+
+    create_deployment(
+        &app,
+        "dry-update-deploy",
+        json!({"name": "dry-update-deploy", "namespace": "default"}),
+    )
+    .await;
+    let (status, mut deployment) = get_json(
+        &app,
+        "/apis/apps/v1/namespaces/default/deployments/dry-update-deploy",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let original_generation = deployment["metadata"]["generation"].as_i64().unwrap();
+    deployment["spec"]["replicas"] = json!(2);
+
+    let response = request(
+        &app,
+        "PUT",
+        "/apis/apps/v1/namespaces/default/deployments/dry-update-deploy?dryRun=All",
+        Some(deployment),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(
+        body["metadata"]["generation"].as_i64(),
+        Some(original_generation + 1),
+        "dry-run generated update response must include the would-be generation bump"
+    );
+    assert_eq!(body["spec"]["replicas"], json!(2));
+
+    let (status, stored) = get_json(
+        &app,
+        "/apis/apps/v1/namespaces/default/deployments/dry-update-deploy",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        stored["metadata"]["generation"].as_i64(),
+        Some(original_generation),
+        "dry-run generated update must not persist the generation bump"
+    );
+    assert_eq!(stored["spec"]["replicas"], json!(1));
+}
+
+// Migration-fidelity matrix for the dry-run return-point invariant.
+//
+// `40d4c32` regressed the generated strategy family by returning the dry-run
+// response either before field shaping (update lost the would-be generation
+// bump) or after datastore persistence (apply-create wrote the row anyway).
+// The two generated tests above pin the invariant for the generated family.
+// The two CRD tests below pin the same invariant for the CRD strategy family
+// (Task 3 migration), so a future strategy migration cannot silently slip the
+// dry-run cutoff on one family while the other keeps passing. New strategy
+// families must extend this matrix.
+
+#[tokio::test]
+async fn mutation_crd_patch_dry_run_shapes_response_without_persisting() {
+    let state = build_test_app_state().await;
+    let app = state.router();
+    create_widget_crd(&app).await;
+    create_widget(
+        &app,
+        "dry-patch-widget",
+        json!({"name": "dry-patch-widget", "namespace": "default"}),
+    )
+    .await;
+    let (status, widget) = get_json(
+        &app,
+        "/apis/example.com/v1/namespaces/default/widgets/dry-patch-widget",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let original_generation = widget["metadata"]["generation"].as_i64().unwrap();
+
+    let response = request_json_with_content_type(
+        &app,
+        "PATCH",
+        "/apis/example.com/v1/namespaces/default/widgets/dry-patch-widget?dryRun=All",
+        "application/merge-patch+json",
+        json!({"spec": {"value": "patched"}}),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "dry-run CRD patch on an existing resource must report 200 OK"
+    );
+    let body = response_json(response).await;
+    assert_eq!(
+        body["metadata"]["generation"].as_i64(),
+        Some(original_generation + 1),
+        "dry-run CRD patch response must include the would-be generation bump"
+    );
+    assert_eq!(body["spec"]["value"], json!("patched"));
+
+    let (status, stored) = get_json(
+        &app,
+        "/apis/example.com/v1/namespaces/default/widgets/dry-patch-widget",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        stored["metadata"]["generation"].as_i64(),
+        Some(original_generation),
+        "dry-run CRD patch must not persist the generation bump"
+    );
+    assert_ne!(stored["spec"]["value"], json!("patched"));
+}
+
+#[tokio::test]
+async fn mutation_crd_apply_create_dry_run_returns_created_without_persisting() {
+    let state = build_test_app_state().await;
+    let app = state.router();
+    create_widget_crd(&app).await;
+
+    let response = request_json_with_content_type(
+        &app,
+        "PATCH",
+        "/apis/example.com/v1/namespaces/default/widgets/dry-apply-created-widget?fieldManager=klights-test&dryRun=All",
+        "application/apply-patch+yaml",
+        json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "dry-apply-created-widget",
+                "namespace": "default"
+            },
+            "spec": {"value": "dry-run"}
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "dry-run CRD server-side-apply create must report 201 Created"
+    );
+    let body = response_json(response).await;
+    assert_eq!(body["metadata"]["name"], "dry-apply-created-widget");
+    assert_eq!(body["spec"]["value"], json!("dry-run"));
+
+    let (status, missing) = get_json(
+        &app,
+        "/apis/example.com/v1/namespaces/default/widgets/dry-apply-created-widget",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "dry-run CRD apply-create must not persist the resource"
+    );
+    assert_eq!(missing["kind"], "Status");
+}
+
+#[tokio::test]
+async fn mutation_delete_dry_run_does_not_mark_or_remove_generated_crd_or_pod() {
+    let state = build_test_app_state().await;
+    let pod_repository = state.resource_store();
+    let app = state.router();
+    create_widget_crd(&app).await;
+
+    create_secret(
+        &app,
+        "dry-run-secret",
+        json!({"name": "dry-run-secret", "namespace": "default"}),
+    )
+    .await;
+    create_widget(
+        &app,
+        "dry-run-widget",
+        json!({"name": "dry-run-widget", "namespace": "default"}),
+    )
+    .await;
+    create_pod(
+        &app,
+        "dry-run-pod",
+        json!({"name": "dry-run-pod", "namespace": "default"}),
+    )
+    .await;
+
+    let generated = request(
+        &app,
+        "DELETE",
+        "/api/v1/namespaces/default/secrets/dry-run-secret?dryRun=All",
+        None,
+    )
+    .await;
+    assert_eq!(generated.status(), StatusCode::OK);
+    let generated_body = response_json(generated).await;
+    assert_eq!(generated_body["kind"], "Secret");
+    assert!(
+        generated_body
+            .pointer("/metadata/deletionTimestamp")
+            .is_some()
+    );
+    assert_has_resource_version(&generated_body);
+
+    let (status, live_secret) =
+        get_json(&app, "/api/v1/namespaces/default/secrets/dry-run-secret").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_no_deletion_timestamp(&live_secret);
+
+    let crd = request(
+        &app,
+        "DELETE",
+        "/apis/example.com/v1/namespaces/default/widgets/dry-run-widget?dryRun=All",
+        None,
+    )
+    .await;
+    assert_eq!(crd.status(), StatusCode::OK);
+    let crd_body = response_json(crd).await;
+    assert_eq!(crd_body["kind"], "Status");
+    assert_eq!(crd_body["status"], "Success");
+
+    let (status, live_widget) = get_json(
+        &app,
+        "/apis/example.com/v1/namespaces/default/widgets/dry-run-widget",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_no_deletion_timestamp(&live_widget);
+
+    let pod = request(
+        &app,
+        "DELETE",
+        "/api/v1/namespaces/default/pods/dry-run-pod?dryRun=All",
+        None,
+    )
+    .await;
+    assert_eq!(pod.status(), StatusCode::OK);
+    let pod_body = response_json(pod).await;
+    assert_eq!(pod_body["kind"], "Pod");
+    assert!(pod_body.pointer("/metadata/deletionTimestamp").is_some());
+    assert_has_resource_version(&pod_body);
+
+    let live_pod = crate::bootstrap::native_api_composition::support::get_pod(
+        &pod_repository,
+        "default",
+        "dry-run-pod",
+    )
+    .await
+    .unwrap()
+    .expect("dry-run delete must leave the Pod live");
+    assert_no_deletion_timestamp(&live_pod.data);
+}
+
+#[tokio::test]
+async fn mutation_delete_returns_accepted_when_resource_is_retained() {
+    let state = build_test_app_state().await;
+    let db = state.resource_mutation().store.clone();
+    let app = state.router();
+    create_widget_crd(&app).await;
+
+    create_configmap(
+        &app,
+        "held-cm",
+        json!({
+            "name": "held-cm",
+            "namespace": "default",
+            "finalizers": ["example.com/hold"]
+        }),
+    )
+    .await;
+    create_widget(
+        &app,
+        "held-widget",
+        json!({
+            "name": "held-widget",
+            "namespace": "default",
+            "finalizers": ["example.com/hold"]
+        }),
+    )
+    .await;
+    create_pod(
+        &app,
+        "held-pod",
+        json!({"name": "held-pod", "namespace": "default"}),
+    )
+    .await;
+
+    let generated = request(
+        &app,
+        "DELETE",
+        "/api/v1/namespaces/default/configmaps/held-cm",
+        None,
+    )
+    .await;
+    assert_eq!(generated.status(), StatusCode::ACCEPTED);
+    let generated_body = response_json(generated).await;
+    assert_eq!(generated_body["kind"], "ConfigMap");
+    assert!(
+        generated_body
+            .pointer("/metadata/deletionTimestamp")
+            .is_some()
+    );
+    assert_has_resource_version(&generated_body);
+    assert!(
+        db.get_resource("v1", "ConfigMap", Some("default"), "held-cm")
+            .await
+            .unwrap()
+            .expect("finalizer-held ConfigMap must remain")
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .is_some()
+    );
+
+    let crd = request(
+        &app,
+        "DELETE",
+        "/apis/example.com/v1/namespaces/default/widgets/held-widget",
+        None,
+    )
+    .await;
+    assert_eq!(crd.status(), StatusCode::ACCEPTED);
+    let crd_body = response_json(crd).await;
+    assert_eq!(crd_body["kind"], "Widget");
+    assert!(crd_body.pointer("/metadata/deletionTimestamp").is_some());
+    assert_has_resource_version(&crd_body);
+    assert!(
+        db.get_resource("example.com/v1", "Widget", Some("default"), "held-widget")
+            .await
+            .unwrap()
+            .expect("finalizer-held custom resource must remain")
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .is_some()
+    );
+
+    let pod = request(
+        &app,
+        "DELETE",
+        "/api/v1/namespaces/default/pods/held-pod",
+        None,
+    )
+    .await;
+    assert_eq!(pod.status(), StatusCode::ACCEPTED);
+    let pod_body = response_json(pod).await;
+    assert_eq!(pod_body["kind"], "Pod");
+    assert!(pod_body.pointer("/metadata/deletionTimestamp").is_some());
+    assert_has_resource_version(&pod_body);
+    assert!(
+        db.get_resource("v1", "Pod", Some("default"), "held-pod")
+            .await
+            .unwrap()
+            .expect("actor-owned Pod delete must retain the row")
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn mutation_deletecollection_dry_run_returns_status_without_deleting_any_matching_items() {
+    let state = build_test_app_state().await;
+    let pod_repository = state.resource_store();
+    let app = state.router();
+    create_widget_crd(&app).await;
+
+    for name in ["cm-dry-1", "cm-dry-2"] {
+        create_configmap(
+            &app,
+            name,
+            json!({
+                "name": name,
+                "namespace": "default",
+                "labels": {"mutation": "dry-run"}
+            }),
+        )
+        .await;
+    }
+    for name in ["widget-dry-1", "widget-dry-2"] {
+        create_widget(
+            &app,
+            name,
+            json!({
+                "name": name,
+                "namespace": "default",
+                "labels": {"mutation": "dry-run"}
+            }),
+        )
+        .await;
+    }
+    for name in ["pod-dry-1", "pod-dry-2"] {
+        create_pod(
+            &app,
+            name,
+            json!({
+                "name": name,
+                "namespace": "default",
+                "labels": {"mutation": "dry-run"}
+            }),
+        )
+        .await;
+    }
+
+    for uri in [
+        "/api/v1/namespaces/default/configmaps?labelSelector=mutation%3Ddry-run&dryRun=All",
+        "/apis/example.com/v1/namespaces/default/widgets?labelSelector=mutation%3Ddry-run&dryRun=All",
+        "/api/v1/namespaces/default/pods?labelSelector=mutation%3Ddry-run&dryRun=All",
+    ] {
+        let response = request(&app, "DELETE", uri, None).await;
+        assert_eq!(response.status(), StatusCode::OK, "deletecollection {uri}");
+        let body = response_json(response).await;
+        assert_eq!(body["kind"], "Status");
+        assert_eq!(body["status"], "Success");
+    }
+
+    let (status, configmaps) = get_json(
+        &app,
+        "/api/v1/namespaces/default/configmaps?labelSelector=mutation%3Ddry-run",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(item_names(&configmaps), vec!["cm-dry-1", "cm-dry-2"]);
+
+    let (status, widgets) = get_json(
+        &app,
+        "/apis/example.com/v1/namespaces/default/widgets?labelSelector=mutation%3Ddry-run",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(item_names(&widgets), vec!["widget-dry-1", "widget-dry-2"]);
+
+    for name in ["widget-dry-1", "widget-dry-2"] {
+        let (status, live_widget) = get_json(
+            &app,
+            &format!("/apis/example.com/v1/namespaces/default/widgets/{name}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_no_deletion_timestamp(&live_widget);
+    }
+
+    for name in ["pod-dry-1", "pod-dry-2"] {
+        let pod = crate::bootstrap::native_api_composition::support::get_pod(
+            &pod_repository,
+            "default",
+            name,
+        )
+        .await
+        .unwrap()
+        .expect("dry-run deletecollection must leave matching Pod live");
+        assert_no_deletion_timestamp(&pod.data);
+    }
+}
+
+#[tokio::test]
+async fn mutation_crd_deletecollection_with_finalizers_marks_instead_of_hard_deleting() {
+    let state = build_test_app_state().await;
+    let db = state.resource_mutation().store.clone();
+    let app = state.router();
+    create_widget_crd(&app).await;
+
+    for name in ["held-widget-a", "held-widget-b"] {
+        create_widget(
+            &app,
+            name,
+            json!({
+                "name": name,
+                "namespace": "default",
+                "labels": {"mutation": "held-crd-collection"},
+                "finalizers": ["example.com/hold"]
+            }),
+        )
+        .await;
+    }
+
+    let response = request(
+        &app,
+        "DELETE",
+        "/apis/example.com/v1/namespaces/default/widgets?labelSelector=mutation%3Dheld-crd-collection",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "DeleteOptions",
+            "propagationPolicy": "Background"
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["kind"], "Status");
+    assert_eq!(body["status"], "Success");
+
+    for name in ["held-widget-a", "held-widget-b"] {
+        let live = db
+            .get_resource("example.com/v1", "Widget", Some("default"), name)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("CRD deletecollection hard-deleted {name}"));
+        assert!(
+            live.data.pointer("/metadata/deletionTimestamp").is_some(),
+            "CRD deletecollection must mark {name} terminating: {:?}",
+            live.data
+        );
+        assert_finalizers_include(&live.data, "example.com/hold");
+    }
+}
+
+#[tokio::test]
+async fn mutation_crd_deletecollection_precondition_conflict_leaves_items_live() {
+    let state = build_test_app_state().await;
+    let db = state.resource_mutation().store.clone();
+    let app = state.router();
+    create_widget_crd(&app).await;
+
+    for (name, uid) in [
+        ("precondition-widget-a", "live-widget-uid-a"),
+        ("precondition-widget-b", "live-widget-uid-b"),
+    ] {
+        create_widget(
+            &app,
+            name,
+            json!({
+                "name": name,
+                "namespace": "default",
+                "uid": uid,
+                "labels": {"mutation": "precondition-crd-collection"}
+            }),
+        )
+        .await;
+    }
+
+    let response = request(
+        &app,
+        "DELETE",
+        "/apis/example.com/v1/namespaces/default/widgets?labelSelector=mutation%3Dprecondition-crd-collection",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "DeleteOptions",
+            "preconditions": {"uid": "wrong-uid"}
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    for name in ["precondition-widget-a", "precondition-widget-b"] {
+        let live = db
+            .get_resource("example.com/v1", "Widget", Some("default"), name)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("precondition conflict must leave {name} live"));
+        assert!(
+            live.data.pointer("/metadata/deletionTimestamp").is_none(),
+            "precondition conflict must not mark {name} terminating"
+        );
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WidgetHookRecord {
+    hook: &'static str,
+    name: String,
+    live_exists_at_hook: bool,
+    live_marked_terminating_at_hook: bool,
+}
+
+struct RecordingWidgetSideEffect {
+    db: crate::bootstrap::native_api_composition::support::klights_cluster_datastore::test_support::ResourceTestStore,
+    records: std::sync::Arc<std::sync::Mutex<Vec<WidgetHookRecord>>>,
+}
+
+#[async_trait::async_trait]
+impl klights_controllers::side_effects::SideEffect for RecordingWidgetSideEffect {
+    fn name(&self) -> &'static str {
+        "recording-widget"
+    }
+
+    async fn apply(&self, resource: &serde_json::Value) -> anyhow::Result<()> {
+        self.record("apply", resource, &self.db).await?;
+        Ok(())
+    }
+
+    async fn apply_delete(&self, resource: &serde_json::Value) -> anyhow::Result<()> {
+        self.record("delete", resource, &self.db).await?;
+        Ok(())
+    }
+}
+
+impl RecordingWidgetSideEffect {
+    async fn record(
+        &self,
+        hook: &'static str,
+        resource: &serde_json::Value,
+        db: &crate::bootstrap::native_api_composition::support::klights_cluster_datastore::test_support::ResourceTestStore,
+    ) -> anyhow::Result<()> {
+        let api_version = resource
+            .get("apiVersion")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let kind = resource
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let namespace = resource
+            .pointer("/metadata/namespace")
+            .and_then(|value| value.as_str());
+        let name = resource
+            .pointer("/metadata/name")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let live = db.get_resource(api_version, kind, namespace, &name).await?;
+        self.records.lock().unwrap().push(WidgetHookRecord {
+            hook,
+            name,
+            live_exists_at_hook: live.is_some(),
+            live_marked_terminating_at_hook: live.as_ref().is_some_and(|resource| {
+                resource
+                    .data
+                    .pointer("/metadata/deletionTimestamp")
+                    .is_some()
+            }),
+        });
+        Ok(())
+    }
+}
+
+fn widget_hook_records(
+    records: &std::sync::Arc<std::sync::Mutex<Vec<WidgetHookRecord>>>,
+) -> Vec<WidgetHookRecord> {
+    records.lock().unwrap().clone()
+}
+
+#[tokio::test]
+async fn mutation_crd_events_fire_once_after_persisted_writes_and_never_on_dry_run() {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let hook_records = records.clone();
+    let state =
+        crate::bootstrap::native_api_composition::support::build_test_app_state_with_mutation_side_effect_factory(move |hook_db| {
+            let mut registry = klights_controllers::side_effects::SideEffectRegistry::new();
+            registry.register(
+                "example.com/v1",
+                "Widget",
+                Arc::new(RecordingWidgetSideEffect {
+                    db: hook_db,
+                    records: hook_records,
+                }),
+                klights_controllers::side_effects::ErrorPolicy::Warn,
+            );
+            Arc::new(registry)
+        })
+        .await;
+    let app = state.router();
+    create_widget_crd(&app).await;
+
+    let response = request(
+        &app,
+        "POST",
+        "/apis/example.com/v1/namespaces/default/widgets?dryRun=All",
+        Some(json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {"name": "dry-widget", "namespace": "default"},
+            "spec": {"value": "dry"}
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert!(widget_hook_records(&records).is_empty());
+
+    create_widget(
+        &app,
+        "event-widget",
+        json!({"name": "event-widget", "namespace": "default"}),
+    )
+    .await;
+    assert_eq!(
+        widget_hook_records(&records),
+        vec![WidgetHookRecord {
+            hook: "apply",
+            name: "event-widget".to_string(),
+            live_exists_at_hook: true,
+            live_marked_terminating_at_hook: false,
+        }]
+    );
+
+    let response = request(
+        &app,
+        "PUT",
+        "/apis/example.com/v1/namespaces/default/widgets/event-widget",
+        Some(json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {"name": "event-widget", "namespace": "default"},
+            "spec": {"value": "updated"}
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let after_update = widget_hook_records(&records);
+    assert_eq!(after_update.len(), 2);
+    assert_eq!(after_update[1].hook, "apply");
+    assert_eq!(after_update[1].name.as_str(), "event-widget");
+    assert!(after_update[1].live_exists_at_hook);
+
+    let response = request(
+        &app,
+        "PATCH",
+        "/apis/example.com/v1/namespaces/default/widgets/event-widget",
+        Some(json!({"spec": {"value": "patched"}})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let after_patch = widget_hook_records(&records);
+    assert_eq!(after_patch.len(), 3);
+    assert_eq!(after_patch[2].hook, "apply");
+    assert_eq!(after_patch[2].name.as_str(), "event-widget");
+    assert!(after_patch[2].live_exists_at_hook);
+
+    create_widget(
+        &app,
+        "event-held-widget",
+        json!({
+            "name": "event-held-widget",
+            "namespace": "default",
+            "labels": {"mutation": "event-collection"},
+            "finalizers": ["example.com/hold"]
+        }),
+    )
+    .await;
+    create_widget(
+        &app,
+        "event-free-widget",
+        json!({
+            "name": "event-free-widget",
+            "namespace": "default",
+            "labels": {"mutation": "event-collection"}
+        }),
+    )
+    .await;
+    assert_eq!(widget_hook_records(&records).len(), 5);
+
+    let response = request(
+        &app,
+        "DELETE",
+        "/apis/example.com/v1/namespaces/default/widgets?labelSelector=mutation%3Devent-collection",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let collection_records = widget_hook_records(&records);
+    assert!(
+        collection_records.iter().any(|record| record
+            == &WidgetHookRecord {
+                hook: "apply",
+                name: "event-held-widget".to_string(),
+                live_exists_at_hook: true,
+                live_marked_terminating_at_hook: true,
+            }),
+        "deletecollection mark event must run after deletionTimestamp is persisted: {collection_records:?}"
+    );
+    assert!(
+        collection_records.iter().any(|record| record
+            == &WidgetHookRecord {
+                hook: "delete",
+                name: "event-free-widget".to_string(),
+                live_exists_at_hook: false,
+                live_marked_terminating_at_hook: false,
+            }),
+        "deletecollection hard-delete event must run after the row is gone: {collection_records:?}"
+    );
+
+    let response = request(
+        &app,
+        "DELETE",
+        "/apis/example.com/v1/namespaces/default/widgets/event-widget",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(widget_hook_records(&records).iter().any(|record| record
+        == &WidgetHookRecord {
+            hook: "delete",
+            name: "event-widget".to_string(),
+            live_exists_at_hook: false,
+            live_marked_terminating_at_hook: false,
+        }));
+}
+
+#[tokio::test]
+async fn mutation_dry_run_does_not_enqueue_service_or_controller_side_effects() {
+    let state = build_test_app_state().await;
+    state
+        .resource_mutation()
+        .store
+        .create_resource(
+            "v1",
+            "Service",
+            Some("default"),
+            "dry-run-svc",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {"name": "dry-run-svc", "namespace": "default"},
+                "spec": {
+                    "selector": {"app": "dry-run-web"},
+                    "ports": [{"port": 80, "targetPort": 8080}]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let app = state.router();
+
+    let response = request(
+        &app,
+        "POST",
+        "/api/v1/namespaces/default/pods?dryRun=All",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "dry-run-pod-side-effects",
+                "namespace": "default",
+                "labels": {"app": "dry-run-web"}
+            },
+            "spec": {
+                "containers": [{
+                    "name": "main",
+                    "image": "registry.k8s.io/pause:3.10"
+                }]
+            },
+            "status": {"podIP": "10.42.0.77"}
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = response_json(response).await;
+    assert_eq!(body["kind"], "Pod");
+    assert_eq!(body["metadata"]["name"], "dry-run-pod-side-effects");
+
+    let queued = state
+        .controller_runtime_fixture()
+        .queued_reconcile_keys()
+        .await;
+    assert!(
+        queued.is_empty(),
+        "dry-run mutation must not enqueue side-effect reconcile keys: {queued:?}"
+    );
+}
+
+#[tokio::test]
+async fn mutation_delete_uid_precondition_conflict_is_consistent_across_paths() {
+    let state = build_test_app_state().await;
+    let pod_repository = state.resource_store();
+    let app = state.router();
+    create_widget_crd(&app).await;
+
+    create_secret(
+        &app,
+        "uid-secret",
+        json!({"name": "uid-secret", "namespace": "default", "uid": "uid-secret-live"}),
+    )
+    .await;
+    create_widget(
+        &app,
+        "uid-widget",
+        json!({"name": "uid-widget", "namespace": "default", "uid": "uid-widget-live"}),
+    )
+    .await;
+    create_pod(
+        &app,
+        "uid-pod",
+        json!({"name": "uid-pod", "namespace": "default", "uid": "uid-pod-live"}),
+    )
+    .await;
+
+    let wrong_uid_options = json!({
+        "apiVersion": "v1",
+        "kind": "DeleteOptions",
+        "preconditions": {"uid": "wrong-uid"}
+    });
+
+    let generated = request(
+        &app,
+        "DELETE",
+        "/api/v1/namespaces/default/secrets/uid-secret",
+        Some(wrong_uid_options.clone()),
+    )
+    .await;
+    assert_eq!(generated.status(), StatusCode::CONFLICT);
+    let (status, live_secret) =
+        get_json(&app, "/api/v1/namespaces/default/secrets/uid-secret").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_no_deletion_timestamp(&live_secret);
+
+    let crd = request(
+        &app,
+        "DELETE",
+        "/apis/example.com/v1/namespaces/default/widgets/uid-widget",
+        Some(wrong_uid_options.clone()),
+    )
+    .await;
+    assert_eq!(crd.status(), StatusCode::CONFLICT);
+    let (status, live_widget) = get_json(
+        &app,
+        "/apis/example.com/v1/namespaces/default/widgets/uid-widget",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_no_deletion_timestamp(&live_widget);
+
+    let pod = request(
+        &app,
+        "DELETE",
+        "/api/v1/namespaces/default/pods/uid-pod",
+        Some(wrong_uid_options),
+    )
+    .await;
+    assert_eq!(pod.status(), StatusCode::CONFLICT);
+    let live_pod = crate::bootstrap::native_api_composition::support::get_pod(
+        &pod_repository,
+        "default",
+        "uid-pod",
+    )
+    .await
+    .unwrap()
+    .expect("UID precondition conflict must leave Pod live");
+    assert_no_deletion_timestamp(&live_pod.data);
+}
+
+#[tokio::test]
+async fn mutation_delete_foreground_adds_finalizer_without_hard_deleting_non_pod_resources() {
+    let state = build_test_app_state().await;
+    let db = state.resource_mutation().store.clone();
+    let pod_repository = state.resource_store();
+    let app = state.router();
+    create_widget_crd(&app).await;
+
+    create_configmap(
+        &app,
+        "fg-cm",
+        json!({
+            "name": "fg-cm",
+            "namespace": "default",
+            "uid": "fg-cm-live",
+            "finalizers": ["example.com/hold"]
+        }),
+    )
+    .await;
+    create_widget(
+        &app,
+        "fg-widget",
+        json!({
+            "name": "fg-widget",
+            "namespace": "default",
+            "uid": "fg-widget-live",
+            "finalizers": ["example.com/hold"]
+        }),
+    )
+    .await;
+    create_pod(
+        &app,
+        "fg-pod",
+        json!({"name": "fg-pod", "namespace": "default", "uid": "fg-pod-live"}),
+    )
+    .await;
+    create_secret(
+        &app,
+        "fg-cm-child",
+        json!({
+            "name": "fg-cm-child",
+            "namespace": "default",
+            "finalizers": ["example.com/child-hold"],
+            "ownerReferences": [{
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "name": "fg-cm",
+                "uid": "fg-cm-live",
+                "blockOwnerDeletion": true
+            }]
+        }),
+    )
+    .await;
+    create_configmap(
+        &app,
+        "fg-widget-child",
+        json!({
+            "name": "fg-widget-child",
+            "namespace": "default",
+            "finalizers": ["example.com/child-hold"],
+            "ownerReferences": [{
+                "apiVersion": "example.com/v1",
+                "kind": "Widget",
+                "name": "fg-widget",
+                "uid": "fg-widget-live",
+                "blockOwnerDeletion": true
+            }]
+        }),
+    )
+    .await;
+
+    let generated = request(
+        &app,
+        "DELETE",
+        "/api/v1/namespaces/default/configmaps/fg-cm",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "DeleteOptions",
+            "propagationPolicy": "Foreground",
+            "preconditions": {"uid": "fg-cm-live"}
+        })),
+    )
+    .await;
+    assert_eq!(generated.status(), StatusCode::ACCEPTED);
+    let generated_body = response_json(generated).await;
+    assert_finalizers_include(&generated_body, "foregroundDeletion");
+    let persisted_cm = db
+        .get_resource("v1", "ConfigMap", Some("default"), "fg-cm")
+        .await
+        .unwrap()
+        .expect("foreground ConfigMap delete must retain the row");
+    assert!(
+        persisted_cm
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .is_some()
+    );
+    assert_finalizers_include(&persisted_cm.data, "foregroundDeletion");
+
+    let crd = request(
+        &app,
+        "DELETE",
+        "/apis/example.com/v1/namespaces/default/widgets/fg-widget",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "DeleteOptions",
+            "propagationPolicy": "Foreground",
+            "preconditions": {"uid": "fg-widget-live"}
+        })),
+    )
+    .await;
+    assert_eq!(crd.status(), StatusCode::ACCEPTED);
+    let crd_body = response_json(crd).await;
+    assert_finalizers_include(&crd_body, "foregroundDeletion");
+    let persisted_widget = db
+        .get_resource("example.com/v1", "Widget", Some("default"), "fg-widget")
+        .await
+        .unwrap()
+        .expect("foreground custom resource delete must retain the row");
+    assert!(
+        persisted_widget
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .is_some()
+    );
+    assert_finalizers_include(&persisted_widget.data, "foregroundDeletion");
+
+    let pod = request(
+        &app,
+        "DELETE",
+        "/api/v1/namespaces/default/pods/fg-pod",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "DeleteOptions",
+            "propagationPolicy": "Foreground",
+            "preconditions": {"uid": "fg-pod-live"}
+        })),
+    )
+    .await;
+    assert_eq!(pod.status(), StatusCode::ACCEPTED);
+    let live_pod = crate::bootstrap::native_api_composition::support::get_pod(
+        &pod_repository,
+        "default",
+        "fg-pod",
+    )
+    .await
+    .unwrap()
+    .expect("foreground Pod delete must leave actor-owned row");
+    assert!(
+        live_pod
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn mutation_create_defaults_are_persisted_for_json_and_protobuf_pod_paths() {
+    let state = build_test_app_state().await;
+    let pod_repository = state.resource_store();
+    let app = state.router();
+
+    let json_response = request(
+        &app,
+        "POST",
+        "/api/v1/namespaces/default/pods",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "defaults-json-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "main",
+                    "image": "registry.k8s.io/pause:3.10"
+                }]
+            }
+        })),
+    )
+    .await;
+    assert_eq!(json_response.status(), StatusCode::CREATED);
+    let json_body = response_json(json_response).await;
+    assert_pod_create_defaults(&json_body);
+
+    let persisted_json = crate::bootstrap::native_api_composition::support::get_pod(
+        &pod_repository,
+        "default",
+        "defaults-json-pod",
+    )
+    .await
+    .unwrap()
+    .expect("JSON-created Pod must persist");
+    assert_pod_create_defaults(&persisted_json.data);
+
+    let protobuf_pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "defaults-protobuf-pod", "namespace": "default"},
+        "spec": {
+            "containers": [{
+                "name": "main",
+                "image": "registry.k8s.io/pause:3.10"
+            }]
+        }
+    });
+    let protobuf_body = k8s_native_service::test_protobuf::encode_protobuf(&protobuf_pod).unwrap();
+    let protobuf_response = request_raw(
+        &app,
+        "POST",
+        "/api/v1/namespaces/default/pods",
+        Some("application/vnd.kubernetes.protobuf"),
+        protobuf_body,
+    )
+    .await;
+    assert_eq!(protobuf_response.status(), StatusCode::CREATED);
+    let protobuf_created = response_json(protobuf_response).await;
+    assert_pod_create_defaults(&protobuf_created);
+
+    let persisted_protobuf = crate::bootstrap::native_api_composition::support::get_pod(
+        &pod_repository,
+        "default",
+        "defaults-protobuf-pod",
+    )
+    .await
+    .unwrap()
+    .expect("protobuf-created Pod must persist");
+    assert_pod_create_defaults(&persisted_protobuf.data);
+}
+
+#[tokio::test]
+async fn duplicate_pod_create_preserves_already_exists_for_json_and_protobuf_routes() {
+    struct Case {
+        name: &'static str,
+        content_type: &'static str,
+        accept: &'static str,
+    }
+
+    let cases = [
+        Case {
+            name: "json",
+            content_type: "application/json",
+            accept: "application/json",
+        },
+        Case {
+            name: "protobuf",
+            content_type: "application/vnd.kubernetes.protobuf",
+            accept: "application/vnd.kubernetes.protobuf",
+        },
+    ];
+
+    for case in cases {
+        let state = build_test_app_state().await;
+        let app = state.router();
+        let pod_name = format!("duplicate-{}-pod", case.name);
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": pod_name, "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "main",
+                    "image": "registry.k8s.io/pause:3.10"
+                }]
+            }
+        });
+        let body = if case.content_type == "application/json" {
+            serde_json::to_vec(&pod).unwrap()
+        } else {
+            k8s_native_service::test_protobuf::encode_protobuf(&pod).unwrap()
+        };
+        let send = || {
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/namespaces/default/pods")
+                    .header("content-type", case.content_type)
+                    .header("accept", case.accept)
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+        };
+
+        let created = send().await.unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED, "{}", case.name);
+
+        let duplicate = send().await.unwrap();
+        assert_eq!(
+            duplicate.status(),
+            StatusCode::CONFLICT,
+            "{} duplicate status",
+            case.name
+        );
+        let content_type = duplicate
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = to_bytes(duplicate.into_body(), usize::MAX).await.unwrap();
+        if content_type.contains("application/vnd.kubernetes.protobuf") {
+            use k8s_native_service::test_protobuf::Message as _;
+
+            assert_eq!(&bytes[..4], b"k8s\0", "{}", case.name);
+            let envelope = k8s_native_service::test_protobuf::Unknown::decode(&bytes[4..]).unwrap();
+            let type_meta = envelope.type_meta.expect("protobuf Status type metadata");
+            assert_eq!(type_meta.api_version, "v1");
+            assert_eq!(type_meta.kind, "Status");
+            let status = k8s_native_service::test_protobuf::apimachinery::pkg::apis::meta::v1::Status::decode(
+                &*envelope.raw,
+            )
+            .unwrap();
+            assert_eq!(status.status.as_deref(), Some("Failure"));
+            assert_eq!(status.code, Some(409));
+            assert_eq!(status.reason.as_deref(), Some("AlreadyExists"));
+            let details = status.details.expect("protobuf Status.details");
+            assert_eq!(details.kind.as_deref(), Some("Pod"));
+            assert_eq!(details.name.as_deref(), Some(pod_name.as_str()));
+        } else {
+            let status: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status["apiVersion"], "v1", "{}", case.name);
+            assert_eq!(status["kind"], "Status", "{}", case.name);
+            assert_eq!(status["status"], "Failure", "{}", case.name);
+            assert_eq!(status["code"], 409, "{}", case.name);
+            assert_eq!(status["reason"], "AlreadyExists", "{}", case.name);
+            assert_eq!(status["details"]["kind"], "Pod", "{}", case.name);
+            assert_eq!(status["details"]["name"], pod_name, "{}", case.name);
+        }
+    }
+}
+
+#[tokio::test]
+async fn duplicate_generated_resource_create_preserves_already_exists_across_scope_and_format() {
+    use k8s_native_service::test_protobuf::Message as _;
+
+    let resources = [
+        (
+            "rolebinding",
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/default/rolebindings",
+            json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "RoleBinding",
+                "metadata": {"name": "duplicate-rolebinding", "namespace": "default"},
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "Role",
+                    "name": "reader"
+                },
+                "subjects": []
+            }),
+        ),
+        (
+            "runtimeclass",
+            "/apis/node.k8s.io/v1/runtimeclasses",
+            json!({
+                "apiVersion": "node.k8s.io/v1",
+                "kind": "RuntimeClass",
+                "metadata": {"name": "duplicate-runtimeclass"},
+                "handler": "runc"
+            }),
+        ),
+    ];
+    let formats = [
+        ("json", "application/json"),
+        ("protobuf", "application/vnd.kubernetes.protobuf"),
+    ];
+
+    for (resource_name, uri, resource) in resources {
+        for (format_name, content_type) in formats {
+            let state = build_test_app_state().await;
+            let app = state.router();
+            let body = if format_name == "json" {
+                serde_json::to_vec(&resource).unwrap()
+            } else {
+                k8s_native_service::test_protobuf::encode_protobuf(&resource).unwrap()
+            };
+            let send = || {
+                app.clone().oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", content_type)
+                        .header("accept", content_type)
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+            };
+
+            assert_eq!(
+                send().await.unwrap().status(),
+                StatusCode::CREATED,
+                "{resource_name}/{format_name} initial create"
+            );
+            let duplicate = send().await.unwrap();
+            assert_eq!(
+                duplicate.status(),
+                StatusCode::CONFLICT,
+                "{resource_name}/{format_name} duplicate create"
+            );
+            let bytes = to_bytes(duplicate.into_body(), usize::MAX).await.unwrap();
+            let reason = if format_name == "protobuf" {
+                let envelope =
+                    k8s_native_service::test_protobuf::Unknown::decode(&bytes[4..]).unwrap();
+                k8s_native_service::test_protobuf::apimachinery::pkg::apis::meta::v1::Status::decode(
+                    &*envelope.raw,
+                )
+                .unwrap()
+                .reason
+                .unwrap_or_default()
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            assert_eq!(
+                reason, "AlreadyExists",
+                "{resource_name}/{format_name} must preserve Kubernetes AlreadyExists"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn mutation_update_bumps_generation_only_when_spec_changes_for_generated_and_crd_paths() {
+    let state = build_test_app_state().await;
+    let app = state.router();
+    create_widget_crd(&app).await;
+
+    create_configmap(
+        &app,
+        "gen-cm",
+        json!({"name": "gen-cm", "namespace": "default"}),
+    )
+    .await;
+    let (status, mut cm) = get_json(&app, "/api/v1/namespaces/default/configmaps/gen-cm").await;
+    assert_eq!(status, StatusCode::OK);
+    let cm_generation = cm["metadata"]["generation"].clone();
+    cm["data"] = json!({"key": "changed"});
+    let cm_update = request(
+        &app,
+        "PUT",
+        "/api/v1/namespaces/default/configmaps/gen-cm",
+        Some(cm),
+    )
+    .await;
+    assert_eq!(cm_update.status(), StatusCode::OK);
+    let cm_body = response_json(cm_update).await;
+    assert_eq!(
+        cm_body["metadata"]["generation"], cm_generation,
+        "ConfigMap data updates must not bump generation"
+    );
+
+    create_deployment(
+        &app,
+        "gen-deploy",
+        json!({"name": "gen-deploy", "namespace": "default"}),
+    )
+    .await;
+    let (status, mut deployment) = get_json(
+        &app,
+        "/apis/apps/v1/namespaces/default/deployments/gen-deploy",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let deployment_generation = deployment["metadata"]["generation"].as_i64().unwrap();
+    deployment["spec"]["replicas"] = json!(2);
+    let deployment_update = request(
+        &app,
+        "PUT",
+        "/apis/apps/v1/namespaces/default/deployments/gen-deploy",
+        Some(deployment),
+    )
+    .await;
+    assert_eq!(deployment_update.status(), StatusCode::OK);
+    let deployment_body = response_json(deployment_update).await;
+    assert_eq!(
+        deployment_body["metadata"]["generation"].as_i64(),
+        Some(deployment_generation + 1),
+        "Deployment spec updates must bump generation once"
+    );
+
+    create_widget(
+        &app,
+        "gen-widget",
+        json!({"name": "gen-widget", "namespace": "default"}),
+    )
+    .await;
+    let (status, mut widget) = get_json(
+        &app,
+        "/apis/example.com/v1/namespaces/default/widgets/gen-widget",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let widget_generation = widget
+        .pointer("/metadata/generation")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(1);
+    widget["spec"] = json!({"value": "changed"});
+    let widget_update = request(
+        &app,
+        "PUT",
+        "/apis/example.com/v1/namespaces/default/widgets/gen-widget",
+        Some(widget),
+    )
+    .await;
+    assert_eq!(widget_update.status(), StatusCode::OK);
+    let widget_body = response_json(widget_update).await;
+    assert_eq!(
+        widget_body["metadata"]["generation"].as_i64(),
+        Some(widget_generation + 1),
+        "custom resource spec updates must bump generation once"
+    );
+}
+
+#[tokio::test]
+async fn mutation_patch_preserves_deletion_timestamp_and_generation_rules() {
+    let state = build_test_app_state().await;
+    let app = state.router();
+    create_widget_crd(&app).await;
+
+    create_deployment(
+        &app,
+        "patch-deploy",
+        json!({
+            "name": "patch-deploy",
+            "namespace": "default",
+            "uid": "patch-deploy-uid",
+            "finalizers": ["example.com/hold"]
+        }),
+    )
+    .await;
+    let delete_deployment = request(
+        &app,
+        "DELETE",
+        "/apis/apps/v1/namespaces/default/deployments/patch-deploy",
+        None,
+    )
+    .await;
+    assert_eq!(delete_deployment.status(), StatusCode::ACCEPTED);
+    let delete_deployment_body = response_json(delete_deployment).await;
+    let deployment_deletion_timestamp =
+        delete_deployment_body["metadata"]["deletionTimestamp"].clone();
+    let deployment_generation = delete_deployment_body["metadata"]["generation"]
+        .as_i64()
+        .unwrap();
+    let deployment_patch = request_json_with_content_type(
+        &app,
+        "PATCH",
+        "/apis/apps/v1/namespaces/default/deployments/patch-deploy",
+        "application/merge-patch+json",
+        json!({"spec": {"replicas": 3}}),
+    )
+    .await;
+    assert_eq!(deployment_patch.status(), StatusCode::OK);
+    let deployment_body = response_json(deployment_patch).await;
+    assert_eq!(
+        deployment_body["metadata"]["deletionTimestamp"],
+        deployment_deletion_timestamp
+    );
+    assert_eq!(
+        deployment_body["metadata"]["generation"].as_i64(),
+        Some(deployment_generation + 1)
+    );
+
+    create_widget(
+        &app,
+        "patch-widget",
+        json!({
+            "name": "patch-widget",
+            "namespace": "default",
+            "uid": "patch-widget-uid",
+            "finalizers": ["example.com/hold"]
+        }),
+    )
+    .await;
+    let delete_widget = request(
+        &app,
+        "DELETE",
+        "/apis/example.com/v1/namespaces/default/widgets/patch-widget",
+        None,
+    )
+    .await;
+    assert_eq!(delete_widget.status(), StatusCode::ACCEPTED);
+    let delete_widget_body = response_json(delete_widget).await;
+    let widget_deletion_timestamp = delete_widget_body["metadata"]["deletionTimestamp"].clone();
+    let widget_generation = delete_widget_body
+        .pointer("/metadata/generation")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(1);
+    let widget_patch = request_json_with_content_type(
+        &app,
+        "PATCH",
+        "/apis/example.com/v1/namespaces/default/widgets/patch-widget",
+        "application/merge-patch+json",
+        json!({"spec": {"value": "patched"}}),
+    )
+    .await;
+    assert_eq!(widget_patch.status(), StatusCode::OK);
+    let widget_body = response_json(widget_patch).await;
+    assert_eq!(
+        widget_body["metadata"]["deletionTimestamp"],
+        widget_deletion_timestamp
+    );
+    assert_eq!(
+        widget_body["metadata"]["generation"].as_i64(),
+        Some(widget_generation + 1)
+    );
+}
+
+#[tokio::test]
+async fn mutation_generated_apply_create_returns_created_status() {
+    let state = build_test_app_state().await;
+    let app = state.router();
+
+    let response = request_json_with_content_type(
+        &app,
+        "PATCH",
+        "/api/v1/namespaces/default/configmaps/apply-created-cm?fieldManager=klights-test",
+        "application/apply-patch+yaml",
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "apply-created-cm",
+                "namespace": "default"
+            },
+            "data": {"key": "created-by-apply"}
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "generated server-side-apply create must return 201 Created"
+    );
+    let body = response_json(response).await;
+    assert_eq!(body["metadata"]["name"], "apply-created-cm");
+    assert_eq!(body["data"]["key"], "created-by-apply");
+
+    let (status, stored) = get_json(
+        &app,
+        "/api/v1/namespaces/default/configmaps/apply-created-cm",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stored["metadata"]["name"], "apply-created-cm");
+}
+
+fn kubelet_client_csr_b64(node_name: &str) -> String {
+    use base64::Engine as _;
+    use rcgen::{CertificateParams, DnType, KeyPair};
+
+    let mut params = CertificateParams::default();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, format!("system:node:{node_name}"));
+    params
+        .distinguished_name
+        .push(DnType::OrganizationName, "system:nodes".to_string());
+    let key_pair = KeyPair::generate().expect("test keypair");
+    let csr_pem = params
+        .serialize_request(&key_pair)
+        .expect("test CSR")
+        .pem()
+        .expect("CSR PEM");
+    base64::engine::general_purpose::STANDARD.encode(csr_pem.as_bytes())
+}
+
+#[tokio::test]
+async fn create_certificate_signing_request_dispatches_csr_signer() {
+    let (state, signer) = crate::bootstrap::native_api_composition::support::build_test_app_state_with_csr_signer_observation().await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let worker = state
+        .controller_runtime_fixture()
+        .spawn_worker(cancel.clone())
+        .await
+        .unwrap();
+    let mut csr_watch =
+        state.subscribe_watch("certificates.k8s.io/v1", "CertificateSigningRequest");
+    let token = crate::bootstrap::native_api_composition::support::create_worker_bootstrap_token(
+        &state.resource_store(),
+    )
+    .await
+    .unwrap();
+    let response = state
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/apis/certificates.k8s.io/v1/certificatesigningrequests")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "apiVersion": "certificates.k8s.io/v1",
+                        "kind": "CertificateSigningRequest",
+                        "metadata": {"name": "node-bootstrap-csr"},
+                        "spec": {
+                            "request": kubelet_client_csr_b64("mn-worker"),
+                            "signerName": "kubernetes.io/kube-apiserver-client-kubelet",
+                            "usages": ["client auth"]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    tokio::time::timeout(std::time::Duration::from_secs(2), signer.wait_for_request())
+        .await
+        .expect("CSR signer dispatch timed out");
+    assert_eq!(signer.request_count(), 1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = csr_watch.recv().await.expect("CSR watch remains open");
+            if event.object.pointer("/status/certificate").is_some() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("signed CSR status update timed out");
+    let stored = state
+        .resource_store()
+        .get_resource(
+            "certificates.k8s.io/v1",
+            "CertificateSigningRequest",
+            None,
+            "node-bootstrap-csr",
+        )
+        .await
+        .unwrap()
+        .expect("CSR exists");
+    assert!(stored.data.pointer("/status/certificate").is_some());
+    cancel.cancel();
+    worker.join().await.unwrap();
+}
+
+fn aggregate_widgets_rule() -> serde_json::Value {
+    json!({
+        "verbs": ["get", "list"],
+        "apiGroups": ["example.klights.io"],
+        "resources": ["widgets"]
+    })
+}
+
+async fn view_has_rule(app: &axum::Router, expected: &serde_json::Value) -> bool {
+    let (status, view) =
+        get_json(app, "/apis/rbac.authorization.k8s.io/v1/clusterroles/view").await;
+    assert_eq!(status, StatusCode::OK);
+    view.get("rules")
+        .and_then(serde_json::Value::as_array)
+        .expect("view should have rules")
+        .iter()
+        .any(|rule| rule == expected)
+}
+
+#[tokio::test]
+async fn cluster_role_commands_reconcile_aggregation_immediately() {
+    let state = build_test_app_state().await;
+    state.seed_default_rbac().await.unwrap();
+    let app = state.router();
+    let rule = aggregate_widgets_rule();
+
+    let response = request(
+        &app,
+        "POST",
+        "/apis/rbac.authorization.k8s.io/v1/clusterroles",
+        Some(json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {
+                "name": "aggregate-widgets-view",
+                "labels": {"rbac.authorization.k8s.io/aggregate-to-view": "true"}
+            },
+            "rules": [rule.clone()]
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert!(view_has_rule(&app, &rule).await);
+
+    let response = request(
+        &app,
+        "PUT",
+        "/apis/rbac.authorization.k8s.io/v1/clusterroles/aggregate-widgets-view",
+        Some(json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "aggregate-widgets-view"},
+            "rules": [rule.clone()]
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!view_has_rule(&app, &rule).await);
+
+    let response = request(
+        &app,
+        "POST",
+        "/apis/rbac.authorization.k8s.io/v1/clusterroles",
+        Some(json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {
+                "name": "aggregate-widgets-view-2",
+                "labels": {"rbac.authorization.k8s.io/aggregate-to-view": "true"}
+            },
+            "rules": [rule.clone()]
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert!(view_has_rule(&app, &rule).await);
+
+    let response = request(
+        &app,
+        "DELETE",
+        "/apis/rbac.authorization.k8s.io/v1/clusterroles/aggregate-widgets-view-2",
+        None,
+    )
+    .await;
+    assert!(matches!(
+        response.status(),
+        StatusCode::OK | StatusCode::ACCEPTED
+    ));
+    assert!(!view_has_rule(&app, &rule).await);
+}
+
+#[tokio::test]
+async fn foreground_delete_returns_before_synchronous_pod_cascade() {
+    let (state, held_workqueue) =
+        crate::bootstrap::native_api_composition::support::build_test_app_state_with_held_pod_delete_workqueue().await;
+    let db = state.resource_store();
+    let owner_uid = "fg-rc-owner-uid";
+    db.create_resource(
+        "v1",
+        "ReplicationController",
+        Some("default"),
+        "fg-rc",
+        json!({
+            "apiVersion": "v1", "kind": "ReplicationController",
+            "metadata": {"name": "fg-rc", "namespace": "default", "uid": owner_uid}
+        }),
+    )
+    .await
+    .unwrap();
+    for index in 0..3 {
+        let pod_name = format!("fg-rc-pod-{index}");
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            &pod_name,
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {
+                    "name": pod_name, "namespace": "default",
+                    "uid": format!("fg-rc-pod-{index}-uid"),
+                    "ownerReferences": [{
+                        "apiVersion": "v1", "kind": "ReplicationController",
+                        "name": "fg-rc", "uid": owner_uid, "blockOwnerDeletion": true
+                    }]
+                },
+                "spec": {"containers": [{"name": "nginx", "image": "nginx"}]}
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        request(
+            &state.router(),
+            "DELETE",
+            "/api/v1/namespaces/default/replicationcontrollers/fg-rc?propagationPolicy=Foreground",
+            None,
+        ),
+    )
+    .await
+    .expect("foreground delete response should not wait for Pod cascade");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = response_json(response).await;
+    assert!(body.pointer("/metadata/deletionTimestamp").is_some());
+    for index in 0..3 {
+        let pod = db
+            .get_resource("v1", "Pod", Some("default"), &format!("fg-rc-pod-{index}"))
+            .await
+            .unwrap()
+            .expect("child Pod exists");
+        assert!(pod.data.pointer("/metadata/deletionTimestamp").is_none());
+    }
+    held_workqueue.abort();
+}

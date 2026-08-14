@@ -12,7 +12,7 @@ use klights_kubelet::unscheduled_deletion::{
 use klights_leader_api::{
     LeaderResourceCommand, ResourceCommandError, ResourceCommandRequest, ResourceCommandResult,
 };
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 use klights_pod_api::BoundPodFinalization;
 use klights_pod_api::{
     BoundPodFinalizationError, BoundPodFinalizationFuture, BoundPodFinalizationOutcome,
@@ -26,7 +26,7 @@ use klights_pod_api::{
 use klights_types::PodIdentity;
 
 use crate::datastore::DatastoreHandle;
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 use klights_kubelet::pod_repository::store::PodRepositoryWatchPersistence;
 use klights_kubelet::pod_repository::store::{ActorPodDeleteObservation, PodStore};
 
@@ -34,7 +34,7 @@ struct RootPodRepositoryPersistenceAdapter {
     db: DatastoreHandle,
     commands: Option<Arc<dyn LeaderResourceCommand>>,
     sandbox_gc_dirty: Arc<AtomicUsize>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     delete_cas_hook: Option<Arc<dyn PodDeleteCasTestHook>>,
 }
 
@@ -83,7 +83,7 @@ fn pod_command_error(
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub(crate) trait PodDeleteCasTestHook: Send + Sync {
     fn before_delete_cas<'a>(
         &'a self,
@@ -408,7 +408,7 @@ impl PodRepositoryWritePersistence for RootPodRepositoryPersistenceAdapter {
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 impl PodRepositoryWatchPersistence for RootPodRepositoryPersistenceAdapter {
     fn pod_watch_receiver(&self) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
         self.db
@@ -446,7 +446,7 @@ impl LocalBoundPodFinalizationPersistence for RootPodRepositoryPersistenceAdapte
                         return Ok(BoundPodFinalizationOutcome::Retry);
                     }
                 };
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             if let Some(hook) = &self.delete_cas_hook {
                 hook.before_delete_cas(&identity, observed_resource_version)
                     .await
@@ -521,7 +521,7 @@ impl LocalBoundPodFinalizationPersistence for RootPodRepositoryPersistenceAdapte
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 impl BoundPodFinalization for RootPodRepositoryPersistenceAdapter {
     fn finalize_bound_pod(
         &self,
@@ -599,7 +599,7 @@ impl UnscheduledPodDeletionPort for RootPodRepositoryPersistenceAdapter {
                 uid: Some(identity.uid.clone()),
                 resource_version: Some(eligible.observed_resource_version()),
             };
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             if let Some(hook) = &self.delete_cas_hook {
                 hook.before_delete_cas(identity, eligible.observed_resource_version())
                     .await
@@ -681,15 +681,13 @@ fn concrete_adapter(
     db: DatastoreHandle,
     commands: Option<Arc<dyn LeaderResourceCommand>>,
     sandbox_gc_dirty: Arc<AtomicUsize>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))] delete_cas_hook: Option<
-        Arc<dyn PodDeleteCasTestHook>,
-    >,
+    #[cfg(test)] delete_cas_hook: Option<Arc<dyn PodDeleteCasTestHook>>,
 ) -> Arc<RootPodRepositoryPersistenceAdapter> {
     Arc::new(RootPodRepositoryPersistenceAdapter {
         db,
         commands,
         sandbox_gc_dirty,
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         delete_cas_hook,
     })
 }
@@ -703,17 +701,17 @@ pub(crate) fn new_root_parts(
         db,
         None,
         sandbox_gc_dirty.clone(),
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         None,
     );
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     let store = Arc::new(PodStore::from_persistence_with_watch(
         concrete.clone(),
         concrete.clone(),
         sandbox_gc_dirty,
         Some(concrete.clone()),
     ));
-    #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+    #[cfg(not(test))]
     let store = Arc::new(PodStore::from_persistence(
         concrete.clone(),
         concrete.clone(),
@@ -736,17 +734,17 @@ pub(crate) fn new_raft_root_parts(
         db,
         Some(commands),
         sandbox_gc_dirty.clone(),
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         None,
     );
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     let store = Arc::new(PodStore::from_persistence_with_watch(
         concrete.clone(),
         concrete.clone(),
         sandbox_gc_dirty,
         Some(concrete.clone()),
     ));
-    #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+    #[cfg(not(test))]
     let store = Arc::new(PodStore::from_persistence(
         concrete.clone(),
         concrete.clone(),
@@ -785,10 +783,10 @@ pub(crate) fn new_store(db: DatastoreHandle) -> PodStore {
         db,
         None,
         sandbox_gc_dirty.clone(),
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         None,
     );
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     {
         PodStore::from_persistence_with_watch(
             concrete.clone(),
@@ -797,7 +795,7 @@ pub(crate) fn new_store(db: DatastoreHandle) -> PodStore {
             Some(concrete),
         )
     }
-    #[cfg(not(any(test, feature = "pod-repository-test-support")))]
+    #[cfg(not(test))]
     PodStore::from_persistence(concrete.clone(), concrete, sandbox_gc_dirty)
 }
 

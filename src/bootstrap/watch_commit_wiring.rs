@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 use crate::datastore::CommitObservationSink;
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 use klights_cluster_store::StagedPostCommit;
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 use klights_watch::WatchBus;
 
 pub(crate) struct WatchCommitWiring {
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     pub(crate) sink: Arc<dyn CommitObservationSink>,
     pub(crate) signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     pub(crate) wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>,
@@ -25,17 +25,11 @@ pub(crate) fn new_wiring() -> WatchCommitWiring {
         follower_progress: follower_progress.clone(),
     });
     WatchCommitWiring {
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
-        sink: Arc::new({
-            #[cfg(test)]
-            {
-                WatchCommitObservationSink::new(wakeups.clone(), hub.clone())
-            }
-            #[cfg(not(test))]
-            {
-                WatchCommitObservationSink::new(wakeups.clone())
-            }
-        }),
+        #[cfg(test)]
+        sink: Arc::new(WatchCommitObservationSink::new(
+            wakeups.clone(),
+            hub.clone(),
+        )),
         signals: hub,
         wakeups,
         follower_progress,
@@ -49,14 +43,6 @@ pub(crate) fn new_sink() -> Arc<WatchCommitObservationSink> {
         Arc::new(klights_watch::PostCommitWatchWakeup::new(hub.clone())),
         hub,
     ))
-}
-
-#[cfg(all(not(test), feature = "pod-repository-test-support"))]
-pub(crate) fn new_sink() -> Arc<WatchCommitObservationSink> {
-    let hub = Arc::new(klights_watch::WatchSignalHub::new(1024));
-    Arc::new(WatchCommitObservationSink::new(Arc::new(
-        klights_watch::PostCommitWatchWakeup::new(hub),
-    )))
 }
 
 #[cfg(test)]
@@ -77,16 +63,16 @@ pub(crate) fn subscribe(
     source.subscribe(topic)
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub(crate) struct WatchCommitObservationSink {
     wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>,
     #[cfg(test)]
     signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     bus: WatchBus,
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 impl WatchCommitObservationSink {
     #[cfg(test)]
     fn new(
@@ -95,18 +81,9 @@ impl WatchCommitObservationSink {
     ) -> Self {
         Self {
             wakeups,
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             signals,
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
-            bus: WatchBus::new(1024),
-        }
-    }
-
-    #[cfg(not(test))]
-    fn new(wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>) -> Self {
-        Self {
-            wakeups,
-            #[cfg(any(test, feature = "pod-repository-test-support"))]
+            #[cfg(test)]
             bus: WatchBus::new(1024),
         }
     }
@@ -117,7 +94,7 @@ impl WatchCommitObservationSink {
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 impl CommitObservationSink for WatchCommitObservationSink {
     fn observe(&self, observations: &[StagedPostCommit]) {
         let advances = observations
@@ -132,7 +109,7 @@ impl CommitObservationSink for WatchCommitObservationSink {
             })
             .collect::<Vec<_>>();
         self.wakeups.wake(&advances);
-        #[cfg(any(test, feature = "pod-repository-test-support"))]
+        #[cfg(test)]
         for event in observations
             .iter()
             .filter_map(crate::datastore::staged_test_event)
@@ -141,7 +118,7 @@ impl CommitObservationSink for WatchCommitObservationSink {
         }
     }
 
-    #[cfg(any(test, feature = "pod-repository-test-support"))]
+    #[cfg(test)]
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -171,7 +148,7 @@ impl klights_leader_api::PostCommitWakeup for ActivePostCommitWakeup {
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub(crate) fn publish_test_events(
     sink: &dyn CommitObservationSink,
     events: Vec<klights_watch::WatchEvent>,
@@ -183,7 +160,7 @@ pub(crate) fn publish_test_events(
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub(crate) fn subscribe_test_events(
     sink: &dyn CommitObservationSink,
     topic: klights_watch::WatchTopic,
@@ -195,7 +172,7 @@ pub(crate) fn subscribe_test_events(
         .subscribe(topic)
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub(crate) fn subscribe_test_events_many(
     sink: &dyn CommitObservationSink,
     topics: Vec<klights_watch::WatchTopic>,

@@ -30,7 +30,7 @@ pub mod node_role;
 pub(crate) mod node_store;
 pub mod observed_endpoint;
 pub(crate) mod operational_adapters;
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub(crate) mod outbox_apply_adapter;
 pub mod phases;
 pub(crate) mod pod_repository_composition;
@@ -52,6 +52,8 @@ mod leader_conversion_tests;
 #[cfg(test)]
 #[path = "tests/leader_rpc_remote.rs"]
 mod leader_rpc_remote_tests;
+#[cfg(test)]
+pub(crate) mod native_api_composition;
 #[cfg(test)]
 #[path = "tests/worker_store.rs"]
 mod worker_store_tests;

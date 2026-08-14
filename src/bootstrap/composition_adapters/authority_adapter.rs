@@ -1,13 +1,9 @@
-#[cfg(any(
-    test,
-    feature = "pod-repository-test-support",
-    feature = "native-api-test-support"
-))]
+#[cfg(test)]
 use std::sync::Arc;
 
 use klights_leader_api::NodeRoleProjection;
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub(crate) fn always_leader_watch() -> tokio::sync::watch::Receiver<bool> {
     let (tx, rx) = tokio::sync::watch::channel(true);
     // Keep the sender alive for the duration of the focused test process so
@@ -16,11 +12,7 @@ pub(crate) fn always_leader_watch() -> tokio::sync::watch::Receiver<bool> {
     rx
 }
 
-#[cfg(any(
-    test,
-    feature = "pod-repository-test-support",
-    feature = "native-api-test-support"
-))]
+#[cfg(test)]
 pub(crate) fn always_leader_authority() -> Arc<dyn klights_leader_api::LeaderAuthority> {
     let authority = crate::bootstrap::authority::AuthorityHandle::from(always_leader_watch());
     authority.authority_arc()

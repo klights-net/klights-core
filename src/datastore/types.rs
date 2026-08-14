@@ -4,17 +4,17 @@
 //! trait module stays SQL-free and a future backend implementor can build
 //! against `crate::datastore::*` without pulling in SQLite-specific code.
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 use bytes::Bytes;
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 use serde::Serialize;
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 use serde_json::Value;
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 use klights_cluster_core::Resource;
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 #[derive(Serialize)]
 struct TestWatchEnvelope<'a> {
     #[serde(rename = "type")]
@@ -22,7 +22,7 @@ struct TestWatchEnvelope<'a> {
     object: &'a Value,
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub(crate) fn with_staged_test_resource_event(
     staged: klights_cluster_store::StagedPostCommit,
     event_type: &str,
@@ -64,7 +64,7 @@ pub(crate) fn with_staged_test_resource_event(
     staged.with_test_event(event_type, resource, encoded_json)
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 fn hydrate_staged_test_resource(
     mut data: Value,
     api_version: &str,

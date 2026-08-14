@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-#[cfg(any(test, feature = "native-api-test-support"))]
+#[cfg(test)]
 use std::sync::OnceLock;
 
 fn absolute_path(path: PathBuf) -> PathBuf {
@@ -71,7 +71,7 @@ pub fn runtime_namespace() -> String {
 
 /// Per-process fallback token for direct `cargo test` invocations that do not
 /// provide the build-owned `KLIGHTS_TEST_DATA_ROOT`.
-#[cfg(any(test, feature = "native-api-test-support"))]
+#[cfg(test)]
 fn test_random_token() -> &'static str {
     static TOKEN: OnceLock<String> = OnceLock::new();
     TOKEN.get_or_init(|| {
@@ -84,14 +84,14 @@ fn test_random_token() -> &'static str {
     })
 }
 
-#[cfg(any(test, feature = "native-api-test-support"))]
+#[cfg(test)]
 fn test_run_root_path() -> PathBuf {
     std::env::var_os("KLIGHTS_TEST_DATA_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("/tmp/klights-test-run-{}", test_random_token())))
 }
 
-#[cfg(any(test, feature = "native-api-test-support"))]
+#[cfg(test)]
 fn test_path_component(raw: &str) -> String {
     use std::hash::{Hash, Hasher};
 
@@ -114,7 +114,7 @@ fn test_path_component(raw: &str) -> String {
     format!("{readable}-{:016x}", hasher.finish())
 }
 
-#[cfg(any(test, feature = "native-api-test-support"))]
+#[cfg(test)]
 fn test_case_root_path() -> PathBuf {
     let identity = std::thread::current()
         .name()
@@ -127,7 +127,7 @@ fn test_case_root_path() -> PathBuf {
 ///
 /// `build.sh` owns the run root and removes it on exit. The test case component
 /// prevents parallel tests that reuse a runtime namespace from sharing files.
-#[cfg(any(test, feature = "native-api-test-support"))]
+#[cfg(test)]
 pub fn test_data_root_path(namespace: &str) -> PathBuf {
     test_case_root_path().join(test_path_component(namespace))
 }

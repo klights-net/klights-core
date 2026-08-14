@@ -49,7 +49,7 @@ fn map_storage_mutation_error(error: anyhow::Error) -> klights_cluster_core::Sto
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 pub(crate) fn map_storage_mutation_error_for_test(
     error: anyhow::Error,
 ) -> klights_cluster_core::StorageMutationError {

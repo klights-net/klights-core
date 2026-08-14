@@ -213,7 +213,7 @@ impl LeaderOutboxDelivery for RootCommittedOutboxDelivery {
     }
 }
 
-#[cfg(any(test, feature = "pod-repository-test-support"))]
+#[cfg(test)]
 #[allow(dead_code)]
 pub(crate) fn test_resource_command(
     db: DatastoreHandle,

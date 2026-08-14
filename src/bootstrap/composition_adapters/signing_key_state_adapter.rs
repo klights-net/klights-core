@@ -28,7 +28,7 @@ impl RootServiceAccountSigningKeyState {
         Ok(Arc::new(Self { state }))
     }
 
-    #[cfg(any(test, feature = "native-api-test-support"))]
+    #[cfg(test)]
     pub(crate) fn from_pem(pem: impl Into<String>) -> Arc<Self> {
         let state = klights_cluster_datastore::signing_key_state::
             FileServiceAccountSigningKeyState::try_from_pem(pem)
@@ -36,7 +36,7 @@ impl RootServiceAccountSigningKeyState {
         Arc::new(Self { state })
     }
 
-    #[cfg(any(test, feature = "native-api-test-support"))]
+    #[cfg(test)]
     pub(crate) fn for_test() -> Arc<Self> {
         use rand_core::OsRng;
         use rsa::RsaPrivateKey;
