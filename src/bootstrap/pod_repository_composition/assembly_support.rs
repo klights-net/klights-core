@@ -89,7 +89,7 @@ pub(crate) mod support {
             ));
             let node_local = Arc::new(
                 crate::bootstrap::node_store::open_node_local(
-                    crate::datastore::backend_kind::BackendKind::Sqlite,
+                    crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
                     None,
                     supervisor.clone(),
                     "sqlite:pod-worker-composition-integration",
@@ -1356,7 +1356,7 @@ pub(crate) mod support {
             ));
             let stores = Arc::new(
                 crate::bootstrap::node_store::open_node_local(
-                    crate::datastore::backend_kind::BackendKind::Sqlite,
+                    crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
                     None,
                     supervisor.clone(),
                     "sqlite:pod-network-integration",
@@ -2013,7 +2013,7 @@ pub(crate) mod support {
             let node_local = if with_outbox || with_workqueue {
                 Some(Arc::new(
                     crate::bootstrap::node_store::open_node_local(
-                        crate::datastore::backend_kind::BackendKind::Sqlite,
+                        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
                         None,
                         supervisor.clone(),
                         "sqlite:pod-repository-outbox-integration",

@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
+use crate::bootstrap::cluster_store::backend_kind::BackendKind;
 use crate::bootstrap::node_store::NodeLocalStores;
-use crate::datastore::backend_kind::BackendKind;
 use klights_supervisor::TaskSupervisor;
 
 pub(crate) async fn open_node_local(

@@ -886,7 +886,7 @@ mod tests {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let node_db = crate::bootstrap::node_store::open_node_local(
-            crate::datastore::backend_kind::BackendKind::Sqlite,
+            crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
             "sqlite:worker-dataplane-outbox-test",

@@ -605,7 +605,7 @@ pub(crate) mod support {
         );
             let node_local = Arc::new(
                 crate::bootstrap::node_store::open_node_local(
-                    crate::datastore::backend_kind::BackendKind::Sqlite,
+                    crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
                     None,
                     supervisor.clone(),
                     "sqlite:native-api-integration-node-local",

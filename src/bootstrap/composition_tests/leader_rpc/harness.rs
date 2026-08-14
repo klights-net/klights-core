@@ -353,7 +353,7 @@ impl IntegrationLeaderRpcComposition {
     ) -> anyhow::Result<IntegrationLeaderRpcNodeLocal> {
         Ok(IntegrationLeaderRpcNodeLocal {
             stores: crate::bootstrap::node_store::open_node_local(
-                crate::datastore::backend_kind::BackendKind::Sqlite,
+                crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
                 None,
                 supervisor,
                 connection_key,

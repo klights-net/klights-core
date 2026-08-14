@@ -2370,7 +2370,7 @@ pub(crate) async fn test_node_local_store(
 ) -> std::sync::Arc<crate::bootstrap::node_store::NodeLocalStores> {
     std::sync::Arc::new(
         crate::bootstrap::node_store::open_node_local(
-            crate::datastore::backend_kind::BackendKind::Sqlite,
+            crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
             "sqlite:pod-repository-network-test",

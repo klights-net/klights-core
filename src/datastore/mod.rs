@@ -6,7 +6,6 @@
 //! with the same internal shape.
 
 pub mod backend;
-pub mod backend_kind;
 pub mod redb;
 pub(crate) mod selector;
 pub mod sqlite;

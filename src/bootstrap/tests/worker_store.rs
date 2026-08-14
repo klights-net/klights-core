@@ -149,7 +149,7 @@ async fn network_metadata_surfaces_forward_through_focused_leader_ports() {
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
         "sqlite:worker-store-focused-network-forwarding-test",
@@ -292,7 +292,7 @@ impl PodLifecycleRouteBackend for FailingPodLifecycleBackend {
 async fn failed_local_pod_route_is_not_published_by_worker_mirror() {
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
         "sqlite:worker-store-route-apply-gate-test",
@@ -367,7 +367,7 @@ async fn failed_snapshot_pod_route_retries_without_committing_reflector_or_membe
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
         "sqlite:worker-store-snapshot-apply-gate-test",
@@ -573,7 +573,7 @@ crate::bootstrap::leader_test_support::impl_unavailable_leader_pod_effects!(Hand
 async fn failed_pod_route_reconnects_and_replays_from_prior_exact_position() {
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor.clone(),
         "sqlite:worker-store-route-replay-position-test",
@@ -786,7 +786,7 @@ crate::bootstrap::leader_test_support::impl_unavailable_leader_pod_effects!(
 async fn worker_pod_get_uses_worker_cache_not_fresh_leader_state() {
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
         "sqlite:worker-store-pod-get-fresh-test",
@@ -811,7 +811,7 @@ async fn worker_pod_get_uses_worker_cache_not_fresh_leader_state() {
 async fn worker_store_pod_events_use_fresh_namespace_state_before_outbox_enqueue() {
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
         "sqlite:worker-store-event-namespace-fresh-test",
@@ -875,7 +875,7 @@ async fn worker_store_pod_events_use_fresh_namespace_state_before_outbox_enqueue
 async fn worker_pod_lists_are_constrained_to_local_node() {
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
         "sqlite:worker-store-pod-list-local-node-test",
@@ -930,7 +930,7 @@ async fn worker_list_page_preserves_continuation_metadata() {
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
         "sqlite:worker-store-pagination-test",
@@ -1021,7 +1021,7 @@ async fn worker_watch_replay_respects_resume_resource_version() {
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
         "sqlite:worker-store-watch-resume-rv-test",
@@ -1099,7 +1099,7 @@ async fn worker_scalar_watch_replay_never_synthesizes_events_from_live_list_stat
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
         "sqlite:worker-store-no-scalar-snapshot-replay-test",
@@ -1133,7 +1133,7 @@ async fn worker_watch_replay_preserves_mirrored_delete_events() {
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
         "sqlite:worker-store-watch-delete-replay-test",
@@ -1213,7 +1213,7 @@ async fn worker_watch_replay_marks_resumed_bound_pod_snapshot_changes_modified()
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
         "sqlite:worker-store-watch-resume-pod-modified-test",
@@ -1323,7 +1323,7 @@ async fn reads_cluster_objects_through_worker_cache_and_runtime_rows_from_node_l
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
         "sqlite:worker-store-test",
@@ -1395,7 +1395,7 @@ async fn watch_mirror_publishes_existing_node_pods_on_startup() {
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor.clone(),
         "sqlite:worker-store-watch-bootstrap-test",
@@ -1468,7 +1468,7 @@ async fn watch_mirror_publishes_namespace_events_on_startup() {
     let cluster_db_handle: crate::datastore::DatastoreHandle = Arc::new(cluster_db.clone());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor.clone(),
         "sqlite:worker-store-namespace-watch-bootstrap-test",
@@ -1528,7 +1528,7 @@ async fn watch_mirror_relists_after_open_time_replay_window_expiration() {
     let cluster_api = Arc::new(OpenExpiredThenRelistLeaderApi::typed_expiry());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor.clone(),
         "sqlite:worker-store-watch-open-expired-test",
@@ -1597,7 +1597,7 @@ async fn watch_mirror_unmarked_out_of_range_reconnects_without_relist() {
     let cluster_api = Arc::new(OpenExpiredThenRelistLeaderApi::unmarked_out_of_range());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor.clone(),
         "sqlite:worker-store-watch-unmarked-out-of-range-test",
@@ -1651,7 +1651,7 @@ async fn watch_mirror_repeated_expiry_backs_off_before_next_relist() {
     let cluster_api = Arc::new(OpenExpiredThenRelistLeaderApi::repeated_typed_expiry());
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor.clone(),
         "sqlite:worker-store-watch-repeated-expiry-test",
@@ -1711,7 +1711,7 @@ async fn watch_mirror_repeated_expiry_backs_off_before_next_relist() {
 async fn worker_store_requeues_node_local_pod_workqueue_failures() {
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor,
         "sqlite:worker-store-workqueue-retry-test",
@@ -1933,7 +1933,7 @@ async fn worker_store_routes_local_pod_watch_to_lifecycle_actor() {
 
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor.clone(),
         "sqlite:worker-store-terminating-pod-watch-test",
@@ -2042,7 +2042,7 @@ async fn watch_mirror_replays_pods_bound_between_initial_list_and_watch() {
     let cluster_api = Arc::new(HandoffLeaderApi);
     let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let _node_local = crate::bootstrap::node_store::open_node_local(
-        crate::datastore::backend_kind::BackendKind::Sqlite,
+        crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
         None,
         supervisor.clone(),
         "sqlite:worker-store-watch-handoff-test",

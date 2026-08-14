@@ -4,6 +4,7 @@ pub(crate) mod authority_routed_leader;
 pub(crate) mod bootstrap_token;
 pub(crate) mod certificate_bootstrap;
 pub mod cluster_meta;
+pub(crate) mod cluster_store;
 pub(crate) mod composition_adapters;
 pub mod config;
 pub(crate) mod controller_adapters;

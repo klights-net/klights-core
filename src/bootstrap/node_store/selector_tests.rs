@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::datastore::backend_kind::BackendKind;
+use crate::bootstrap::cluster_store::backend_kind::BackendKind;
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
 fn supervisor() -> Arc<TaskSupervisor> {

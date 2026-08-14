@@ -10,9 +10,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::KlightsConfig;
 use crate::bootstrap::NodeRole;
+use crate::bootstrap::cluster_store::backend_kind::BackendKind;
 use crate::bootstrap::credential_store::BootstrapCredentialStore;
 use crate::datastore::DatastoreHandle;
-use crate::datastore::backend_kind::BackendKind;
 use crate::datastore::selector::PassiveStoreOpenRequest;
 use klights_supervisor::TaskSupervisor;
 
@@ -1420,8 +1420,8 @@ async fn controlplane_join_client_identity_for_token_from_store(
 
 #[cfg(test)]
 mod tests {
+    use crate::bootstrap::cluster_store::backend_kind::BackendKind;
     use crate::bootstrap::node_role::{LeaderBootstrap, LeaderPeer, NodeRole};
-    use crate::datastore::backend_kind::BackendKind;
     use crate::datastore::selector::PassiveStoreOpenRequest;
 
     #[test]

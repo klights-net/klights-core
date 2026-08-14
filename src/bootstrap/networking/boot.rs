@@ -186,8 +186,8 @@ mod tests {
                 crate::bootstrap::config::DEFAULT_GC_INTERVAL_SECONDS,
             ),
             in_memory: true,
-            datastore_backend: crate::datastore::backend_kind::BackendKind::Sqlite,
-            node_local_backend: crate::datastore::backend_kind::BackendKind::Sqlite,
+            datastore_backend: crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
+            node_local_backend: crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
             oidc_issuer_url: None,
             oidc_client_id: None,
             oidc_username_claim: "sub".to_string(),
@@ -208,7 +208,7 @@ mod tests {
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> crate::bootstrap::node_store::NodeLocalStores {
         crate::bootstrap::node_store::open_node_local(
-            crate::datastore::backend_kind::BackendKind::Sqlite,
+            crate::bootstrap::cluster_store::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
             "sqlite:network-boot-test",

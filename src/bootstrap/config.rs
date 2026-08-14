@@ -4,7 +4,7 @@ pub const DEFAULT_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS: i64 = 0;
 pub const DEFAULT_MAX_WATCH_EVENTS: i64 = 100_000;
 pub const DEFAULT_GC_INTERVAL_SECONDS: u64 = 30;
 
-use crate::datastore::backend_kind::BackendKind;
+use crate::bootstrap::cluster_store::backend_kind::BackendKind;
 
 #[derive(Clone, Debug)]
 pub struct KlightsConfig {
@@ -70,10 +70,10 @@ pub struct KlightsConfig {
     pub in_memory: bool,
 
     /// Cluster datastore backend selection.
-    pub datastore_backend: BackendKind,
+    pub(in crate::bootstrap) datastore_backend: BackendKind,
 
     /// Node-local durability backend selection.
-    pub node_local_backend: BackendKind,
+    pub(in crate::bootstrap) node_local_backend: BackendKind,
 
     // ─── Authentication ───────────────────────────────────────────────────
     /// OIDC issuer URL. When set (along with client_id), enables OIDC token auth.
@@ -501,7 +501,7 @@ pub fn resolve_local_pod_subnet(node_subnet: Option<String>, fallback_pod_subnet
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::backend_kind::BackendKind;
+    use crate::bootstrap::cluster_store::backend_kind::BackendKind;
     use std::sync::{Mutex, MutexGuard};
 
     // Global lock to serialize env var tests (env vars are process-global)
@@ -642,13 +642,22 @@ mod tests {
     #[test]
     fn retired_database_encryption_environment_is_rejected() {
         let _guard = ConfigEnvGuard::new();
-        // SAFETY: ConfigEnvGuard serializes environment mutation in this module.
-        unsafe { std::env::set_var("KLIGHTS_DB_ENCRYPTION", "sqlcipher") };
+        for (variable, value) in [
+            ("KLIGHTS_DB_ENCRYPTION", "sqlcipher"),
+            ("KLIGHTS_DB_KEY_FILE", "/tmp/retired-key"),
+        ] {
+            clear_klights_env();
+            // SAFETY: ConfigEnvGuard serializes environment mutation in this module.
+            unsafe { std::env::set_var(variable, value) };
 
-        let error = KlightsConfig::from_env().expect_err("retired provider must fail closed");
-        assert!(error.to_string().contains("SQLite >= 3.53.4"));
-
-        clear_klights_env();
+            let error = KlightsConfig::from_env().expect_err("retired input must fail closed");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "{variable} is unsupported: klights has no maintained encryption-at-rest provider with SQLite >= 3.53.4"
+                )
+            );
+        }
     }
 
     #[test]
@@ -741,6 +750,86 @@ mod tests {
         assert_eq!(config.node_local_backend, BackendKind::Sqlite);
         assert!(config.cluster_db_path.ends_with("db/redb/cluster.redb"));
         assert!(config.node_db_path.ends_with("db/sqlite/node.db"));
+    }
+
+    #[test]
+    fn datastore_backend_environment_preserves_selection_precedence_and_paths() {
+        struct Case {
+            primary: Option<&'static str>,
+            legacy: Option<&'static str>,
+            expected: BackendKind,
+            cluster_path_suffix: &'static str,
+        }
+
+        let _guard = ConfigEnvGuard::new();
+        for case in [
+            Case {
+                primary: Some("SQLITE"),
+                legacy: Some("redb"),
+                expected: BackendKind::Sqlite,
+                cluster_path_suffix: "db/sqlite/cluster.db",
+            },
+            Case {
+                primary: Some("redb"),
+                legacy: Some("sqlite"),
+                expected: BackendKind::Redb,
+                cluster_path_suffix: "db/redb/cluster.redb",
+            },
+            Case {
+                primary: None,
+                legacy: Some("redb"),
+                expected: BackendKind::Redb,
+                cluster_path_suffix: "db/redb/cluster.redb",
+            },
+        ] {
+            clear_klights_env();
+            if let Some(value) = case.primary {
+                // SAFETY: ConfigEnvGuard serializes environment mutation in this module.
+                unsafe { std::env::set_var("KLIGHTS_DATASTORE_BACKEND", value) };
+            }
+            if let Some(value) = case.legacy {
+                // SAFETY: ConfigEnvGuard serializes environment mutation in this module.
+                unsafe { std::env::set_var("KLIGHTS_BACKEND", value) };
+            }
+
+            let config = KlightsConfig::from_env().expect("backend selection must be valid");
+            assert_eq!(config.datastore_backend, case.expected);
+            assert!(config.cluster_db_path.ends_with(case.cluster_path_suffix));
+            assert_eq!(config.node_local_backend, BackendKind::Sqlite);
+            assert!(config.node_db_path.ends_with("db/sqlite/node.db"));
+        }
+    }
+
+    #[test]
+    fn datastore_backend_environment_does_not_trim_values() {
+        let _guard = ConfigEnvGuard::new();
+        // SAFETY: ConfigEnvGuard serializes environment mutation in this module.
+        unsafe { std::env::set_var("KLIGHTS_DATASTORE_BACKEND", " redb ") };
+
+        let error = KlightsConfig::from_env().expect_err("backend values must not be trimmed");
+        assert_eq!(error.to_string(), "unsupported datastore backend ` redb `");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn datastore_backend_environment_rejects_non_unicode_primary_value() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = ConfigEnvGuard::new();
+        // SAFETY: ConfigEnvGuard serializes environment mutation in this module.
+        unsafe {
+            std::env::set_var(
+                "KLIGHTS_DATASTORE_BACKEND",
+                OsString::from_vec(vec![b'r', b'e', b'd', 0x80]),
+            )
+        };
+
+        let error = KlightsConfig::from_env().expect_err("non-Unicode backend values must fail");
+        assert_eq!(
+            error.to_string(),
+            "KLIGHTS_DATASTORE_BACKEND must be valid Unicode"
+        );
     }
 
     #[test]
