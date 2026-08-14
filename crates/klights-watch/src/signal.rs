@@ -629,7 +629,6 @@ pub mod test_support {
         use klights_cluster_store::{CommitObservationSink as _, StagedPostCommit};
 
         use super::CommitWatchFixture;
-        use crate::WatchSignalSubscribe as _;
 
         #[test]
         fn committed_fixture_preserves_topic_payload_bytes_and_signal_cursor() {
