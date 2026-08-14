@@ -8,7 +8,9 @@
 //! `DatastoreBackend` metadata methods. Node bootstrap tokens are Kubernetes
 //! `bootstrap.kubernetes.io/token` Secrets in `kube-system`.
 
+#[cfg(test)]
 use anyhow::Result;
+#[cfg(test)]
 use klights_cluster_core::{ClusterMembership, ClusterMetadata};
 
 /// Generate a new random cluster ID (UUID v4).
@@ -17,6 +19,7 @@ fn generate_cluster_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+#[cfg(test)]
 use crate::datastore::backend::DatastoreBackend;
 
 /// Initialize cluster metadata on first leader-compatible boot.
@@ -56,6 +59,7 @@ pub async fn ensure_cluster_metadata(db: &dyn DatastoreBackend) -> Result<()> {
 /// Read the current cluster metadata.
 ///
 /// Returns an error if metadata has not been initialized.
+#[cfg(test)]
 pub async fn read_cluster_metadata(db: &dyn DatastoreBackend) -> Result<ClusterMetadata> {
     let cluster_id = db
         .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
@@ -106,6 +110,7 @@ pub async fn write_cluster_membership(
     Ok(())
 }
 
+#[cfg(test)]
 pub async fn read_cluster_membership(db: &dyn DatastoreBackend) -> Result<ClusterMembership> {
     let cluster_id = db
         .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)

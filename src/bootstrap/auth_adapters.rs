@@ -5,10 +5,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::datastore::backend::DatastoreHandle;
 use klights_auth::node_policy_store::NodePolicyStore;
 use klights_auth::rbac_policy_store::RbacResourceReader;
-use klights_cluster_store::ListPageRequest;
+use klights_cluster_store::{
+    ClusterResourceRead, ResourceCollectionScope, ResourceListQuery, ResourceListRead,
+    ResourceListRequest,
+};
 use klights_controllers::csr_signer::{
     CsrIssuanceError, CsrIssuanceOutcome, CsrIssuanceRequest, CsrIssuer, IssuedCsr,
 };
@@ -21,12 +23,12 @@ use klights_pod_api::{PodGetRequest, PodListRequest, PodQuery};
 /// Root-owned bridge from bootstrap token Secrets to the API authentication
 /// policy port. The HTTP/API owner receives only the auth-domain capability.
 pub(crate) struct DatastoreBootstrapTokenAuthenticator {
-    db: DatastoreHandle,
+    resource_reads: Arc<dyn ClusterResourceRead>,
 }
 
 impl DatastoreBootstrapTokenAuthenticator {
-    pub(crate) fn new(db: DatastoreHandle) -> Self {
-        Self { db }
+    pub(crate) fn new(resource_reads: Arc<dyn ClusterResourceRead>) -> Self {
+        Self { resource_reads }
     }
 }
 
@@ -39,8 +41,11 @@ impl klights_leader_api::LeaderBootstrapTokenAuthentication
     ) -> klights_leader_api::ClusterIdentityFuture<'a, klights_leader_api::BootstrapTokenIdentity>
     {
         Box::pin(async move {
-            crate::bootstrap::bootstrap_token::validate_bootstrap_token(self.db.as_ref(), token)
-                .await
+            crate::bootstrap::bootstrap_token::validate_bootstrap_token_with_reads(
+                self.resource_reads.as_ref(),
+                token,
+            )
+            .await
         })
     }
 }
@@ -211,12 +216,12 @@ fn map_credential_operation_error(
 }
 
 pub(crate) struct DatastoreRbacResourceReader {
-    db: DatastoreHandle,
+    resource_reads: Arc<dyn ClusterResourceRead>,
 }
 
 impl DatastoreRbacResourceReader {
-    pub(crate) fn new(db: DatastoreHandle) -> Self {
-        Self { db }
+    pub(crate) fn new(resource_reads: Arc<dyn ClusterResourceRead>) -> Self {
+        Self { resource_reads }
     }
 }
 
@@ -227,19 +232,21 @@ impl RbacResourceReader for DatastoreRbacResourceReader {
         kind: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
         let list = self
-            .db
-            .list_resources_page(
+            .resource_reads
+            .list_resources(ResourceListRequest::new(
                 RBAC_API_VERSION,
                 kind,
-                None,
-                None,
-                None,
-                ListPageRequest::unbounded(),
-            )
+                ResourceCollectionScope::Cluster,
+                ResourceListQuery::all(),
+            ))
             .await
             .map_err(|error| format!("failed to list cluster RBAC resources: {error}"))?;
-        Ok(list
-            .items
+        Ok(match list {
+            ResourceListRead::Current(page) | ResourceListRead::Historical(page) => page.into_items(),
+            ResourceListRead::Expired { requested, oldest_available, .. } => return Err(format!(
+                "cluster RBAC LIST at resourceVersion {requested} expired before {oldest_available}"
+            )),
+        }
             .into_iter()
             .map(|resource| resource.data.as_ref().clone())
             .collect())
@@ -251,19 +258,21 @@ impl RbacResourceReader for DatastoreRbacResourceReader {
         kind: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
         let list = self
-            .db
-            .list_resources_page(
+            .resource_reads
+            .list_resources(ResourceListRequest::new(
                 RBAC_API_VERSION,
                 kind,
-                Some(namespace),
-                None,
-                None,
-                ListPageRequest::unbounded(),
-            )
+                ResourceCollectionScope::Namespace(namespace.to_string()),
+                ResourceListQuery::all(),
+            ))
             .await
             .map_err(|error| format!("failed to list namespaced RBAC resources: {error}"))?;
-        Ok(list
-            .items
+        Ok(match list {
+            ResourceListRead::Current(page) | ResourceListRead::Historical(page) => page.into_items(),
+            ResourceListRead::Expired { requested, oldest_available, .. } => return Err(format!(
+                "namespaced RBAC LIST at resourceVersion {requested} expired before {oldest_available}"
+            )),
+        }
             .into_iter()
             .map(|resource| resource.data.as_ref().clone())
             .collect())

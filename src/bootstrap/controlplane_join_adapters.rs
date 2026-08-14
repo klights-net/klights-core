@@ -7,12 +7,12 @@ use klights_leader_api::{
     ControlplaneJoinRegistrationFuture, ControlplaneJoinRequest, RemoteNodeMode,
 };
 
-use crate::datastore::DatastoreHandle;
 use klights_cluster_core::RaftShape;
+use klights_cluster_store::{ClusterMetadataRead, SnapshotMembership};
 use klights_replication::node::RaftNode;
 
 struct ClusterControlplaneJoinRegistration {
-    db: DatastoreHandle,
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     store: Arc<crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore>,
 }
 
@@ -94,8 +94,11 @@ impl ClusterControlplaneJoinRegistration {
             }
             None => {
                 let existing = self
-                    .db
-                    .get_resource("v1", "Node", None, &request.node_name)
+                    .resource_query
+                    .get_resource(klights_leader_api::ResourceGetRequest::try_new(
+                        klights_types::ResourceKey::new("v1", "Node", None, &request.node_name),
+                        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+                    )?)
                     .await?
                     .with_context(|| {
                         format!(
@@ -143,7 +146,7 @@ impl ClusterControlplaneJoinRegistration {
 
 struct ClusterControlplaneJoinMetadata {
     node: Arc<RaftNode>,
-    db: DatastoreHandle,
+    metadata_reads: Arc<dyn ClusterMetadataRead>,
     mutex: tokio::sync::Mutex<()>,
 }
 
@@ -164,11 +167,7 @@ impl ControlplaneJoinMetadata for ClusterControlplaneJoinMetadata {
 impl ClusterControlplaneJoinMetadata {
     async fn refresh_inner(&self, node_name: &str, as_learner: bool) -> anyhow::Result<()> {
         let _guard = self.mutex.lock().await;
-        let membership = match crate::bootstrap::cluster_meta::read_cluster_membership(
-            self.db.as_ref(),
-        )
-        .await
-        {
+        let membership = match read_membership(self.metadata_reads.as_ref()).await {
             Ok(membership) => membership,
             Err(error) => {
                 tracing::warn!(
@@ -178,9 +177,7 @@ impl ClusterControlplaneJoinMetadata {
                 return Ok(());
             }
         };
-        let latest = match crate::bootstrap::cluster_meta::read_cluster_membership(self.db.as_ref())
-            .await
-        {
+        let latest = match read_membership(self.metadata_reads.as_ref()).await {
             Ok(latest) => Some(latest),
             Err(error) => {
                 tracing::warn!(
@@ -233,7 +230,8 @@ impl ClusterControlplaneJoinMetadata {
 
 pub(crate) fn build_controlplane_join_handler(
     node: Arc<RaftNode>,
-    db: DatastoreHandle,
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    metadata_reads: Arc<dyn ClusterMetadataRead>,
     store: Arc<crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore>,
 ) -> Arc<dyn ControlplaneJoinHandler> {
     let membership = node.membership();
@@ -249,13 +247,25 @@ pub(crate) fn build_controlplane_join_handler(
             membership,
         )),
         Arc::new(ClusterControlplaneJoinRegistration {
-            db: db.clone(),
+            resource_query,
             store: store.clone(),
         }),
         Arc::new(ClusterControlplaneJoinMetadata {
             node,
-            db,
+            metadata_reads,
             mutex: tokio::sync::Mutex::new(()),
         }),
     ))
+}
+
+async fn read_membership(
+    reads: &dyn ClusterMetadataRead,
+) -> anyhow::Result<klights_cluster_core::ClusterMembership> {
+    let metadata = reads.read_cluster_metadata().await?;
+    match metadata.membership() {
+        SnapshotMembership::Present(membership) => Ok(membership.clone()),
+        SnapshotMembership::LegacyOmitted | SnapshotMembership::AuthoritativeAbsent => {
+            anyhow::bail!("cluster membership metadata unavailable")
+        }
+    }
 }

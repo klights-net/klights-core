@@ -173,6 +173,7 @@ impl crate::generic_read::GenericReadResourceInputs for ApiResourceMutationServi
                         api_version: request.api_version.to_string(),
                         kind: request.kind.to_string(),
                         namespace: request.namespace,
+                        scope: request.scope,
                         requested_resource_version,
                         send_initial_events,
                         send_bookmarks,

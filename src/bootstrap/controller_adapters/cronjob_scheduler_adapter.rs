@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::datastore::DatastoreHandle;
 use klights_controllers::ControllerDispatcher;
 use klights_controllers::cronjob_scheduler::{
     CronJobScheduler, CronJobSchedulerRuntime, CronJobSchedulerRuntimeError, CronJobWatchSession,
@@ -11,7 +10,7 @@ use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest};
 use klights_supervisor::TaskSupervisor;
 
 struct LeaderCronJobSchedulerRuntime {
-    db: DatastoreHandle,
+    resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     store: Arc<dyn klights_controllers::cronjob::CronJobStore>,
     dispatcher: Arc<ControllerDispatcher>,
     positioned_watch: klights_watch::PositionedWatchService,
@@ -27,16 +26,27 @@ impl CronJobSchedulerRuntime for LeaderCronJobSchedulerRuntime {
         &self,
     ) -> std::result::Result<Vec<klights_cluster_core::Resource>, CronJobSchedulerRuntimeError>
     {
-        self.db
-            .list_resources(
+        let listing = self
+            .resource_reads
+            .list_resources(klights_cluster_store::ResourceListRequest::new(
                 "batch/v1",
                 "CronJob",
-                None,
-                klights_cluster_store::ResourceListOptions::all(),
-            )
+                klights_cluster_store::ResourceCollectionScope::AllNamespaces,
+                klights_cluster_store::ResourceListQuery::all(),
+            ))
             .await
-            .map(|listing| listing.items)
-            .map_err(|error| CronJobSchedulerRuntimeError::query_unavailable(error.to_string()))
+            .map_err(|error| CronJobSchedulerRuntimeError::query_unavailable(error.to_string()))?;
+        match listing {
+            klights_cluster_store::ResourceListRead::Current(page)
+            | klights_cluster_store::ResourceListRead::Historical(page) => Ok(page.into_items()),
+            klights_cluster_store::ResourceListRead::Expired {
+                requested,
+                oldest_available,
+                ..
+            } => Err(CronJobSchedulerRuntimeError::query_unavailable(format!(
+                "CronJob LIST at resourceVersion {requested} expired before {oldest_available}"
+            ))),
+        }
     }
 
     async fn reconcile_cronjob(
@@ -58,34 +68,47 @@ impl CronJobSchedulerRuntime for LeaderCronJobSchedulerRuntime {
 
     async fn open_watch(&self) -> std::result::Result<CronJobWatchSession, LeaderWatchError> {
         let listing = self
-            .db
-            .list_resources(
+            .resource_reads
+            .list_resources(klights_cluster_store::ResourceListRequest::new(
                 "batch/v1",
                 "CronJob",
-                None,
-                klights_cluster_store::ResourceListOptions::all(),
-            )
+                klights_cluster_store::ResourceCollectionScope::AllNamespaces,
+                klights_cluster_store::ResourceListQuery::all(),
+            ))
             .await
             .map_err(|error| LeaderWatchError::unavailable(error.to_string()))?;
+        let page = match listing {
+            klights_cluster_store::ResourceListRead::Current(page)
+            | klights_cluster_store::ResourceListRead::Historical(page) => page,
+            klights_cluster_store::ResourceListRead::Expired {
+                requested,
+                oldest_available,
+                ..
+            } => {
+                return Err(LeaderWatchError::unavailable(format!(
+                    "CronJob LIST at resourceVersion {requested} expired before {oldest_available}"
+                )));
+            }
+        };
         let request = WatchRequest::try_new(
             "batch/v1",
             "CronJob",
             None,
             None,
             None,
-            Some(listing.resource_version),
-            listing.watch_replay_position,
+            Some(page.snapshot().resource_version()),
+            Some(page.snapshot().position()),
         )?;
         let events = self.positioned_watch.watch_resources(request).await?;
         Ok(CronJobWatchSession {
-            initial_resources: listing.items,
+            initial_resources: page.into_items(),
             events,
         })
     }
 }
 
 pub(crate) fn new_leader_scheduler(
-    db: DatastoreHandle,
+    resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     store: Arc<dyn klights_controllers::cronjob::CronJobStore>,
     positioned_watch: klights_watch::PositionedWatchService,
     dispatcher: Arc<ControllerDispatcher>,
@@ -94,7 +117,7 @@ pub(crate) fn new_leader_scheduler(
     CronJobScheduler::new(
         Arc::new(LeaderCronJobSchedulerRuntime {
             positioned_watch,
-            db,
+            resource_reads,
             store,
             dispatcher,
         }),
@@ -141,7 +164,7 @@ mod tests {
                     &passive_reads,
                     db_handle.clone(),
                 ),
-            db: db_handle,
+            resource_reads: passive_reads.resource_reads(),
             store: Arc::new(
                 crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(
                     Arc::new(db.clone()),

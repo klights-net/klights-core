@@ -80,6 +80,46 @@ pub(crate) mod support {
             Option<Arc<dyn klights_leader_api::LeaderBootstrapTokenAuthentication>>,
     }
 
+    type MutationSideEffectsFactory = Box<
+        dyn FnOnce(
+                klights_cluster_datastore::test_support::ResourceTestStore,
+            ) -> Arc<klights_controllers::side_effects::SideEffectRegistry>
+            + Send,
+    >;
+
+    struct IntegrationHarnessAssembly {
+        authorizer: Arc<dyn klights_auth::authorizer::Authorizer>,
+        pod_lifecycle_diagnostics: Option<Arc<dyn klights_pod_api::PodLifecycleDiagnosticsQuery>>,
+        signing_keys: Arc<dyn klights_leader_api::LeaderServiceAccountSigningKeyState>,
+        oidc: Option<Arc<dyn klights_auth::oidc::OidcValidator>>,
+        webhook: Option<Arc<dyn klights_auth::webhook_auth::WebhookAuthenticator>>,
+        watch_history_failure:
+            Option<klights_cluster_datastore::test_support::WatchHistoryFailureControl>,
+        mutation_side_effects_factory: Option<MutationSideEffectsFactory>,
+        service_routing_network: Option<Arc<klights_networking::Network>>,
+        audit_sink: Option<Arc<dyn k8s_native_service::audit::AuditSink>>,
+        priority_fairness: Option<Arc<k8s_native_service::priority_fairness::ApiPriorityFairness>>,
+        mount_operational_endpoints: bool,
+    }
+
+    impl IntegrationHarnessAssembly {
+        fn standard() -> Self {
+            Self {
+                authorizer: Arc::new(AllowAllAuthorizer),
+                pod_lifecycle_diagnostics: None,
+                signing_keys: crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
+                oidc: None,
+                webhook: None,
+                watch_history_failure: None,
+                mutation_side_effects_factory: None,
+                service_routing_network: None,
+                audit_sink: None,
+                priority_fairness: None,
+                mount_operational_endpoints: false,
+            }
+        }
+    }
+
     /// Opaque full-stack API fixture owned by the base integration-test package.
     #[derive(Clone)]
     pub(crate) struct NativeApiTestHarness {
@@ -110,78 +150,44 @@ pub(crate) mod support {
         pub(crate) async fn with_authorizer(
             authorizer: Arc<dyn klights_auth::authorizer::Authorizer>,
         ) -> anyhow::Result<Self> {
-            Self::assemble(
-            authorizer,
-            None,
-            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-        )
-        .await
+            Self::assemble(IntegrationHarnessAssembly {
+                authorizer,
+                ..IntegrationHarnessAssembly::standard()
+            })
+            .await
         }
 
         pub(crate) async fn with_authorizer_and_operational_endpoints(
             authorizer: Arc<dyn klights_auth::authorizer::Authorizer>,
         ) -> anyhow::Result<Self> {
-            Self::assemble(
-            authorizer,
-            None,
-            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            true,
-        )
-        .await
+            Self::assemble(IntegrationHarnessAssembly {
+                authorizer,
+                mount_operational_endpoints: true,
+                ..IntegrationHarnessAssembly::standard()
+            })
+            .await
         }
 
         pub(crate) async fn with_authorizer_and_audit_sink(
             authorizer: Arc<dyn klights_auth::authorizer::Authorizer>,
             audit_sink: Arc<dyn k8s_native_service::audit::AuditSink>,
         ) -> anyhow::Result<Self> {
-            Self::assemble(
-            authorizer,
-            None,
-            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(audit_sink),
-            None,
-            false,
-        )
-        .await
+            Self::assemble(IntegrationHarnessAssembly {
+                authorizer,
+                audit_sink: Some(audit_sink),
+                ..IntegrationHarnessAssembly::standard()
+            })
+            .await
         }
 
         pub(crate) async fn with_pod_lifecycle_diagnostics(
             diagnostics: Arc<dyn klights_pod_api::PodLifecycleDiagnosticsQuery>,
         ) -> anyhow::Result<Self> {
-            Self::assemble(
-            Arc::new(AllowAllAuthorizer),
-            Some(diagnostics),
-            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-        )
-        .await
+            Self::assemble(IntegrationHarnessAssembly {
+                pod_lifecycle_diagnostics: Some(diagnostics),
+                ..IntegrationHarnessAssembly::standard()
+            })
+            .await
         }
 
         pub(crate) async fn with_authentication_dependencies(
@@ -189,19 +195,12 @@ pub(crate) mod support {
             oidc: Option<Arc<dyn klights_auth::oidc::OidcValidator>>,
             webhook: Option<Arc<dyn klights_auth::webhook_auth::WebhookAuthenticator>>,
         ) -> anyhow::Result<Self> {
-            Self::assemble(
-                Arc::new(AllowAllAuthorizer),
-                None,
+            Self::assemble(IntegrationHarnessAssembly {
                 signing_keys,
                 oidc,
                 webhook,
-                None,
-                None,
-                None,
-                None,
-                None,
-                false,
-            )
+                ..IntegrationHarnessAssembly::standard()
+            })
             .await
         }
 
@@ -223,23 +222,13 @@ pub(crate) mod support {
             >,
         ) -> anyhow::Result<Self> {
             Self::assemble_with_options(
-            Arc::new(AllowAllAuthorizer),
-            None,
-            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            IntegrationHarnessOptions {
-                bootstrap_token_authenticator: Some(bootstrap_token_authenticator),
-                ..Default::default()
-            },
-        )
-        .await
+                IntegrationHarnessAssembly::standard(),
+                IntegrationHarnessOptions {
+                    bootstrap_token_authenticator: Some(bootstrap_token_authenticator),
+                    ..Default::default()
+                },
+            )
+            .await
         }
 
         pub(crate) async fn with_signing_key_pem(signing_key_pem: String) -> anyhow::Result<Self> {
@@ -257,69 +246,39 @@ pub(crate) mod support {
             clock: Arc<dyn klights_auth::clock::Clock>,
         ) -> anyhow::Result<Self> {
             Self::assemble_with_options(
-            Arc::new(AllowAllAuthorizer),
-            None,
-            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            IntegrationHarnessOptions {
-                auth_clock: Some(clock),
-                ..Default::default()
-            },
-        )
-        .await
+                IntegrationHarnessAssembly::standard(),
+                IntegrationHarnessOptions {
+                    auth_clock: Some(clock),
+                    ..Default::default()
+                },
+            )
+            .await
         }
 
         pub(crate) async fn with_list_cursor_clock(
             clock: Arc<dyn klights_supervisor::WallClock>,
         ) -> anyhow::Result<Self> {
             Self::assemble_with_options(
-            Arc::new(AllowAllAuthorizer),
-            None,
-            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            IntegrationHarnessOptions {
-                list_cursor_clock: Some(clock),
-                ..Default::default()
-            },
-        )
-        .await
+                IntegrationHarnessAssembly::standard(),
+                IntegrationHarnessOptions {
+                    list_cursor_clock: Some(clock),
+                    ..Default::default()
+                },
+            )
+            .await
         }
 
         pub(crate) async fn with_leader_authority() -> anyhow::Result<Self> {
             let (authority, _publisher) =
                 klights_replication::authority::WatchLeaderAuthority::channel(true, None);
             Self::assemble_with_options(
-            Arc::new(AllowAllAuthorizer),
-            None,
-            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            IntegrationHarnessOptions {
-                authority: Some(authority),
-                ..Default::default()
-            },
-        )
-        .await
+                IntegrationHarnessAssembly::standard(),
+                IntegrationHarnessOptions {
+                    authority: Some(authority),
+                    ..Default::default()
+                },
+            )
+            .await
         }
 
         pub(crate) async fn with_toggle_failing_watch_history() -> anyhow::Result<(
@@ -328,20 +287,11 @@ pub(crate) mod support {
         )> {
             let control =
                 klights_cluster_datastore::test_support::WatchHistoryFailureControl::new();
-            let harness = Self::assemble(
-            Arc::new(AllowAllAuthorizer),
-            None,
-            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
-            None,
-            None,
-            Some(control.clone()),
-            None,
-            None,
-            None,
-            None,
-            false,
-        )
-        .await?;
+            let harness = Self::assemble(IntegrationHarnessAssembly {
+                watch_history_failure: Some(control.clone()),
+                ..IntegrationHarnessAssembly::standard()
+            })
+            .await?;
             Ok((harness, control))
         }
 
@@ -354,20 +304,11 @@ pub(crate) mod support {
                 + Send
                 + 'static,
         {
-            Self::assemble(
-            Arc::new(AllowAllAuthorizer),
-            None,
-            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
-            None,
-            None,
-            None,
-            Some(Box::new(factory)),
-            None,
-            None,
-            None,
-            false,
-        )
-        .await
+            Self::assemble(IntegrationHarnessAssembly {
+                mutation_side_effects_factory: Some(Box::new(factory)),
+                ..IntegrationHarnessAssembly::standard()
+            })
+            .await
         }
 
         pub(crate) async fn with_service_routing_observation() -> anyhow::Result<(
@@ -376,20 +317,11 @@ pub(crate) mod support {
         )> {
             let (network, observation) =
                 klights_networking::test_support::mock_network_with_service_routing_observation();
-            let harness = Self::assemble(
-            Arc::new(AllowAllAuthorizer),
-            None,
-            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
-            None,
-            None,
-            None,
-            None,
-            Some(network),
-            None,
-            None,
-            false,
-        )
-        .await?;
+            let harness = Self::assemble(IntegrationHarnessAssembly {
+                service_routing_network: Some(network),
+                ..IntegrationHarnessAssembly::standard()
+            })
+            .await?;
             Ok((harness, observation))
         }
 
@@ -399,20 +331,11 @@ pub(crate) mod support {
         )> {
             let priority_fairness =
                 Arc::new(k8s_native_service::priority_fairness::ApiPriorityFairness::new());
-            let harness = Self::assemble(
-            Arc::new(AllowAllAuthorizer),
-            None,
-            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(priority_fairness.clone()),
-            false,
-        )
-        .await?;
+            let harness = Self::assemble(IntegrationHarnessAssembly {
+                priority_fairness: Some(priority_fairness.clone()),
+                ..IntegrationHarnessAssembly::standard()
+            })
+            .await?;
             Ok((harness, priority_fairness))
         }
 
@@ -420,49 +343,29 @@ pub(crate) mod support {
         -> anyhow::Result<(Self, IntegrationCsrSignerObservation)> {
             let (csr_signer, observation) = recording_csr_signer();
             let harness = Self::assemble_with_options(
-            Arc::new(AllowAllAuthorizer),
-            None,
-            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            IntegrationHarnessOptions {
-                csr_signer: Some(csr_signer),
-                ..Default::default()
-            },
-        )
-        .await?;
+                IntegrationHarnessAssembly::standard(),
+                IntegrationHarnessOptions {
+                    csr_signer: Some(csr_signer),
+                    ..Default::default()
+                },
+            )
+            .await?;
             Ok((harness, observation))
         }
 
         pub(crate) async fn with_held_pod_delete_workqueue()
         -> anyhow::Result<(Self, IntegrationHeldSupervisorTask)> {
             let harness = Self::assemble_with_options(
-            Arc::new(AllowAllAuthorizer),
-            None,
-            crate::bootstrap::composition_adapters::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            IntegrationHarnessOptions {
-                task_categories: klights_supervisor::TaskCategoryConfig {
-                    pod_delete_workqueue: 1,
+                IntegrationHarnessAssembly::standard(),
+                IntegrationHarnessOptions {
+                    task_categories: klights_supervisor::TaskCategoryConfig {
+                        pod_delete_workqueue: 1,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            },
-        )
-        .await?;
+            )
+            .await?;
             let handle = harness
                 .task_supervisor
                 .spawn_async(
@@ -474,34 +377,15 @@ pub(crate) mod support {
             Ok((harness, IntegrationHeldSupervisorTask { handle }))
         }
 
-        async fn assemble(
-            authorizer: Arc<dyn klights_auth::authorizer::Authorizer>,
-            pod_lifecycle_diagnostics: Option<
-                Arc<dyn klights_pod_api::PodLifecycleDiagnosticsQuery>,
-            >,
-            signing_keys: Arc<dyn klights_leader_api::LeaderServiceAccountSigningKeyState>,
-            oidc: Option<Arc<dyn klights_auth::oidc::OidcValidator>>,
-            webhook: Option<Arc<dyn klights_auth::webhook_auth::WebhookAuthenticator>>,
-            watch_history_failure: Option<
-                klights_cluster_datastore::test_support::WatchHistoryFailureControl,
-            >,
-            mutation_side_effects_factory: Option<
-                Box<
-                    dyn FnOnce(
-                            klights_cluster_datastore::test_support::ResourceTestStore,
-                        )
-                            -> Arc<klights_controllers::side_effects::SideEffectRegistry>
-                        + Send,
-                >,
-            >,
-            service_routing_network: Option<Arc<klights_networking::Network>>,
-            audit_sink: Option<Arc<dyn k8s_native_service::audit::AuditSink>>,
-            priority_fairness: Option<
-                Arc<k8s_native_service::priority_fairness::ApiPriorityFairness>,
-            >,
-            mount_operational_endpoints: bool,
+        async fn assemble(assembly: IntegrationHarnessAssembly) -> anyhow::Result<Self> {
+            Self::assemble_with_options(assembly, IntegrationHarnessOptions::default()).await
+        }
+
+        async fn assemble_with_options(
+            assembly: IntegrationHarnessAssembly,
+            options: IntegrationHarnessOptions,
         ) -> anyhow::Result<Self> {
-            Self::assemble_with_options(
+            let IntegrationHarnessAssembly {
                 authorizer,
                 pod_lifecycle_diagnostics,
                 signing_keys,
@@ -513,39 +397,7 @@ pub(crate) mod support {
                 audit_sink,
                 priority_fairness,
                 mount_operational_endpoints,
-                IntegrationHarnessOptions::default(),
-            )
-            .await
-        }
-
-        async fn assemble_with_options(
-            authorizer: Arc<dyn klights_auth::authorizer::Authorizer>,
-            pod_lifecycle_diagnostics: Option<
-                Arc<dyn klights_pod_api::PodLifecycleDiagnosticsQuery>,
-            >,
-            signing_keys: Arc<dyn klights_leader_api::LeaderServiceAccountSigningKeyState>,
-            oidc: Option<Arc<dyn klights_auth::oidc::OidcValidator>>,
-            webhook: Option<Arc<dyn klights_auth::webhook_auth::WebhookAuthenticator>>,
-            watch_history_failure: Option<
-                klights_cluster_datastore::test_support::WatchHistoryFailureControl,
-            >,
-            mutation_side_effects_factory: Option<
-                Box<
-                    dyn FnOnce(
-                            klights_cluster_datastore::test_support::ResourceTestStore,
-                        )
-                            -> Arc<klights_controllers::side_effects::SideEffectRegistry>
-                        + Send,
-                >,
-            >,
-            service_routing_network: Option<Arc<klights_networking::Network>>,
-            audit_sink: Option<Arc<dyn k8s_native_service::audit::AuditSink>>,
-            priority_fairness: Option<
-                Arc<k8s_native_service::priority_fairness::ApiPriorityFairness>,
-            >,
-            mount_operational_endpoints: bool,
-            options: IntegrationHarnessOptions,
-        ) -> anyhow::Result<Self> {
+            } = assembly;
             let IntegrationHarnessOptions {
                 csr_signer,
                 task_categories,
@@ -574,16 +426,19 @@ pub(crate) mod support {
                 Arc::new(klights_supervisor::SystemWallClock),
             )
             .await?;
+            let canonical_ports =
+                crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&db);
             let passive_reads = if let Some(control) = watch_history_failure {
                 let focused_reads = db.focused_read_store();
                 crate::bootstrap::cluster_store::selector::PassiveReadPorts::new(
-                focused_reads.clone(),
-                klights_cluster_datastore::test_support::toggle_failing_watch_history_for_test_support(
                     focused_reads.clone(),
-                    control,
-                ),
-                focused_reads,
-            )
+                    klights_cluster_datastore::test_support::toggle_failing_watch_history_for_test_support(
+                        focused_reads.clone(),
+                        control,
+                    ),
+                    focused_reads.clone(),
+                    focused_reads,
+                )
             } else {
                 crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&db)
             };
@@ -609,13 +464,13 @@ pub(crate) mod support {
                     nodeport_alloc.clone(),
                 );
             let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
-            let leader_rx =
-                crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch();
+            let resource_query_authority = authority.clone().unwrap_or_else(|| {
+                crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority()
+            });
             let resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery> =
                 crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_with_resource_reads_and_clock(
-                    datastore.clone(),
                     passive_reads.resource_reads(),
-                    leader_rx.clone(),
+                    resource_query_authority,
                     list_cursor_clock,
                 );
             let proposal: Arc<dyn klights_replication::proposal::RaftProposal> = Arc::new(
@@ -665,7 +520,11 @@ pub(crate) mod support {
             ));
             let gc_coordination = Arc::new(klights_controllers::ControllerCoordination::new());
             let pod_repository_config = crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
-            db: datastore.clone(),
+            resource_query: resource_query.clone(),
+            ownership_reads: canonical_ports.ownership_reads.clone(),
+            resource_reads: canonical_ports.read_ports.resource_reads(),
+            namespace_content_reads: canonical_ports.namespace_content_reads.clone(),
+            topology_reads: canonical_ports.topology_reads.clone(),
             pod_workqueue_store: Some(node_local.pod_workqueue()),
             supervisor: supervisor.clone(),
             side_effects: side_effects.clone(),
@@ -675,12 +534,10 @@ pub(crate) mod support {
             scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: Some(outbox),
             cluster_api: Some(resource_query.clone()),
-            resource_commands: None,
+            resource_commands: Some(resource_command.clone()),
             remote_delivery_required: false,
             controller_identity: controller_identity.clone(),
-            #[cfg(not(test))]
             api_identity: identity.clone(),
-            #[cfg(not(test))]
             gc_coordination: gc_coordination.clone(),
             scheduler_bind_gate: None,
             post_write_maintenance_notify: None,
@@ -745,7 +602,8 @@ pub(crate) mod support {
             side_effects.set_pod_ports(pod_query.clone(), gc_delete.clone());
             let finalizer_lifecycle = crate::bootstrap::finalizer_lifecycle_adapter::
             DatastoreFinalizerLifecycleAdapter::new_with_coordination(
-                datastore.clone(),
+                canonical_ports.read_ports.resource_reads(),
+                canonical_ports.ownership_reads.clone(),
                 resource_command.clone(),
                 gc_delete.clone(),
                 side_effects.clone(),
@@ -760,15 +618,17 @@ pub(crate) mod support {
                 metrics.clone(),
             );
             let positioned_watch = crate::bootstrap::composition_adapters::positioned_watch_adapter::datastore_positioned_watch_service(
-            &passive_reads,
-            datastore.clone(),
-            commit_watch_fixture.signal_source(),
-        );
+                &passive_reads,
+                commit_watch_fixture.signal_source(),
+            );
             let watch_signals = commit_watch_fixture.signal_source();
             let generated = crate::bootstrap::composition_adapters::generated_handler_adapter::GeneratedHandlerAdapter::new(
             crate::bootstrap::composition_adapters::generated_handler_adapter::GeneratedHandlerStorage::new(
-                datastore.clone(),
-                crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(datastore.clone()),
+                canonical_ports.read_ports.resource_reads(),
+                canonical_ports.topology_reads.clone(),
+                canonical_ports.read_ports.allocator_reads(),
+                resource_query.clone(),
+                resource_command.clone(),
             ),
             watch_signals.clone(),
             positioned_watch.clone(),
@@ -780,10 +640,12 @@ pub(crate) mod support {
             let network = service_routing_network
                 .unwrap_or_else(klights_networking::test_support::mock_network);
             let controller_leader_ports = Arc::new(
-            crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(datastore.clone()),
+            crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
+                canonical_ports.read_ports.resource_reads(), canonical_ports.ownership_reads.clone(), resource_command.clone()),
         );
             let non_pod_finalization = Arc::new(
-            crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(datastore.clone()),
+            crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new_with_commands(
+                canonical_ports.read_ports.resource_reads(), canonical_ports.ownership_reads.clone(), resource_command.clone()),
         );
             let endpoint_reconcile_fixture =
                 klights_controllers::test_support::EndpointReconcileFixture::new(
@@ -807,7 +669,7 @@ pub(crate) mod support {
             pdb_store: controller_leader_ports.clone(),
             replicationcontroller_store: controller_leader_ports.clone(),
             apiservice_store: controller_leader_ports.clone(),
-            csr_status_store: controller_leader_ports,
+            csr_status_store: controller_leader_ports.clone(),
             pod_query: api_pod_repository.clone(),
             deployment_pod_mutation: controller_pod_mutations.clone(),
             replicaset_pod_mutation: controller_pod_mutations.clone(),
@@ -846,7 +708,7 @@ pub(crate) mod support {
             });
             let hpa_controller =
                 crate::bootstrap::controller_adapters::hpa_controller_adapter::controller(
-                    datastore.clone(),
+                    controller_leader_ports.clone(),
                     api_pod_repository.clone(),
                     gc_delete.clone(),
                     controller_pod_mutations,
@@ -902,7 +764,7 @@ pub(crate) mod support {
                 Arc::new(
                     klights_auth::rbac_policy_store::ReaderBackedRbacPolicyStore::new(Arc::new(
                         crate::bootstrap::auth_adapters::DatastoreRbacResourceReader::new(
-                            datastore.clone(),
+                            canonical_ports.read_ports.resource_reads(),
                         ),
                     )),
                 );
@@ -923,7 +785,7 @@ pub(crate) mod support {
                 bootstrap_token_authenticator.unwrap_or_else(|| {
                     Arc::new(
                         crate::bootstrap::auth_adapters::DatastoreBootstrapTokenAuthenticator::new(
-                            datastore.clone(),
+                            canonical_ports.read_ports.resource_reads(),
                         ),
                     )
                 });
@@ -933,7 +795,7 @@ pub(crate) mod support {
                     db.focused_recovery_store(),
                     Arc::new(
                         crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new(
-                            datastore.clone(),
+                            canonical_ports.read_ports.resource_reads(),
                         ),
                     ),
                     supervisor.clone(),
@@ -962,25 +824,32 @@ pub(crate) mod support {
             None,
             Arc::new(
                 crate::bootstrap::composition_adapters::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
-                    datastore.clone(),
+                    resource_query.clone(),
+                    canonical_ports.read_ports.allocator_reads(),
                     watch_signals,
                     positioned_watch.clone(),
                 ),
             ),
-            crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(datastore.clone()),
-            resource_query,
+            crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new_with_commands(
+                canonical_ports.read_ports.resource_reads(),
+                canonical_ports.namespace_content_reads.clone(),
+                resource_command.clone(),
+            ),
+            resource_query.clone(),
             resource_command.clone(),
             finalizer_lifecycle,
             mutation_effects,
             crate::bootstrap::controller_adapters::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
-                datastore.clone(),
+                canonical_ports.read_ports.resource_reads(),
             ),
-            crate::bootstrap::composition_adapters::resource_admission_adapter::ResourceAdmissionAdapter::new(
+            crate::bootstrap::composition_adapters::resource_admission_adapter::ResourceAdmissionAdapter::new_with_resource_reads(
                 identity,
-                datastore.clone(),
+                canonical_ports.read_ports.resource_reads(),
             ),
             crate::bootstrap::composition_adapters::custom_resource_read_adapter::CustomResourceReadAdapter::new(
-                datastore.clone(),
+                canonical_ports.read_ports.resource_scopes(),
+                resource_query.clone(),
+                canonical_ports.read_ports.allocator_reads(),
                 commit_watch_fixture.signal_source(),
                 positioned_watch,
                 supervisor.clone(),
@@ -991,8 +860,9 @@ pub(crate) mod support {
             generated,
             Arc::new(
                 crate::bootstrap::controller_adapters::gc_delete_adapter::GcOwnerLifecycleAdapter::new_with_coordination(
-                    datastore.clone(),
-                    resource_command,
+                    canonical_ports.read_ports.resource_reads(),
+                    canonical_ports.ownership_reads.clone(),
+                    resource_command.clone(),
                     gc_delete.clone(),
                     gc_coordination,
                 ),
@@ -1001,8 +871,10 @@ pub(crate) mod support {
             crd_registry.clone(),
             crate::bootstrap::service_adapters::ApiServiceWriteAllocator::new(
                 Arc::new(
-                    crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(
-                        datastore.clone(),
+                    crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
+                        canonical_ports.read_ports.resource_reads(),
+                        canonical_ports.ownership_reads.clone(),
+                        resource_command.clone(),
                     ),
                 ),
                 service_ipam,
@@ -1035,7 +907,7 @@ pub(crate) mod support {
                         Arc::new(String::new),
                         crate::version::api_version_info(),
                         crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(
-                            datastore.clone(),
+                            canonical_ports.metadata_reads.clone(),
                         ),
                         operational_replication.as_ref().map(|replication| {
                             replication.clone()

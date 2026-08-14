@@ -3,10 +3,15 @@ use std::sync::Arc;
 use klights_cluster_core::Resource;
 use serde_json::Value;
 
+#[cfg(test)]
 use crate::datastore::DatastoreHandle;
 use k8s_native_service::ports::{
     ApiFailureEntry, ApiFailureMetrics, ApiNodeLeaseObservations, ApiNodeLeaseObservedFuture,
     ApiPodRepository,
+};
+use klights_cluster_store::{
+    ClusterResourceRead, NamespaceContentRead, NamespaceKindRequest, NamespaceRequest,
+    ResourceGetRequest,
 };
 
 fn validate_effect_authority() -> anyhow::Result<()> {
@@ -30,7 +35,10 @@ fn validate_pod_effect_authority() -> Result<(), klights_pod_api::PodRepositoryE
 }
 
 pub(crate) struct RootNamespaceTerminationStore {
-    inner: DatastoreHandle,
+    #[cfg(test)]
+    inner: Option<DatastoreHandle>,
+    resource_reads: Option<Arc<dyn ClusterResourceRead>>,
+    namespace_content_reads: Option<Arc<dyn NamespaceContentRead>>,
     commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
 }
 
@@ -53,14 +61,26 @@ impl RootNamespaceTerminationStore {
                 authority,
             ),
         );
-        Self::new_with_commands(inner, commands)
+        Arc::new(Self {
+            inner: Some(inner),
+            resource_reads: None,
+            namespace_content_reads: None,
+            commands,
+        })
     }
 
     pub(crate) fn new_with_commands(
-        inner: DatastoreHandle,
+        resource_reads: Arc<dyn ClusterResourceRead>,
+        namespace_content_reads: Arc<dyn NamespaceContentRead>,
         commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     ) -> Arc<Self> {
-        Arc::new(Self { inner, commands })
+        Arc::new(Self {
+            #[cfg(test)]
+            inner: None,
+            resource_reads: Some(resource_reads),
+            namespace_content_reads: Some(namespace_content_reads),
+            commands,
+        })
     }
 
     async fn submit_resource(
@@ -139,10 +159,19 @@ impl klights_reconcile_api::NamespaceLifecycleStore for RootNamespaceTermination
         namespace: String,
     ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Option<Resource>> {
         Box::pin(async move {
-            self.inner
-                .get_namespace(&namespace)
+            #[cfg(test)]
+            if let Some(inner) = &self.inner {
+                return inner
+                    .get_namespace(&namespace)
+                    .await
+                    .map_err(map_namespace_lifecycle_error);
+            }
+            self.resource_reads
+                .as_ref()
+                .expect("focused namespace resource reads")
+                .get_resource(ResourceGetRequest::new("v1", "Namespace", None, namespace))
                 .await
-                .map_err(map_namespace_lifecycle_error)
+                .map_err(|error| map_namespace_lifecycle_error(error.into()))
         })
     }
 
@@ -151,10 +180,22 @@ impl klights_reconcile_api::NamespaceLifecycleStore for RootNamespaceTermination
         namespace: String,
     ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Vec<Resource>> {
         Box::pin(async move {
-            self.inner
-                .list_namespace_resources_of_kind(&namespace, "Pod")
+            #[cfg(test)]
+            if let Some(inner) = &self.inner {
+                return inner
+                    .list_namespace_resources_of_kind(&namespace, "Pod")
+                    .await
+                    .map_err(map_namespace_lifecycle_error);
+            }
+            self.namespace_content_reads
+                .as_ref()
+                .expect("focused namespace content reads")
+                .list_namespace_resources_of_kind(
+                    NamespaceKindRequest::try_new(namespace, "Pod")
+                        .map_err(|error| map_namespace_lifecycle_error(error.into()))?,
+                )
                 .await
-                .map_err(map_namespace_lifecycle_error)
+                .map_err(|error| map_namespace_lifecycle_error(error.into()))
         })
     }
 
@@ -211,10 +252,22 @@ impl klights_reconcile_api::NamespaceLifecycleStore for RootNamespaceTermination
         namespace: String,
     ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Vec<Resource>> {
         Box::pin(async move {
-            self.inner
-                .list_namespace_resources_excluding_kind(&namespace, "Pod")
+            #[cfg(test)]
+            if let Some(inner) = &self.inner {
+                return inner
+                    .list_namespace_resources_excluding_kind(&namespace, "Pod")
+                    .await
+                    .map_err(map_namespace_lifecycle_error);
+            }
+            self.namespace_content_reads
+                .as_ref()
+                .expect("focused namespace content reads")
+                .list_namespace_resources_excluding_kind(
+                    NamespaceKindRequest::try_new(namespace, "Pod")
+                        .map_err(|error| map_namespace_lifecycle_error(error.into()))?,
+                )
                 .await
-                .map_err(map_namespace_lifecycle_error)
+                .map_err(|error| map_namespace_lifecycle_error(error.into()))
         })
     }
 
@@ -247,10 +300,22 @@ impl klights_reconcile_api::NamespaceLifecycleStore for RootNamespaceTermination
         namespace: String,
     ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, i64> {
         Box::pin(async move {
-            self.inner
-                .count_namespace_resources(&namespace)
+            #[cfg(test)]
+            if let Some(inner) = &self.inner {
+                return inner
+                    .count_namespace_resources(&namespace)
+                    .await
+                    .map_err(map_namespace_lifecycle_error);
+            }
+            self.namespace_content_reads
+                .as_ref()
+                .expect("focused namespace content reads")
+                .count_namespace_resources(
+                    NamespaceRequest::try_new(namespace)
+                        .map_err(|error| map_namespace_lifecycle_error(error.into()))?,
+                )
                 .await
-                .map_err(map_namespace_lifecycle_error)
+                .map_err(|error| map_namespace_lifecycle_error(error.into()))
         })
     }
 

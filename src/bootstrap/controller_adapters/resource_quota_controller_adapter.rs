@@ -1,18 +1,20 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
-use klights_cluster_store::ResourceListOptions;
+use klights_cluster_store::{
+    ClusterResourceRead, ResourceCollectionScope, ResourceListQuery, ResourceListRead,
+    ResourceListRequest,
+};
 use klights_pod_api::{PodListRequest, PodQuery};
 use serde_json::Value;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::DatastoreBackend;
 use klights_controllers::resource_quota::{
     ResourceQuotaRuntime, reconcile_resource_quotas_with_runtime,
 };
 
 struct ResourceQuotaControllerAdapter<'a> {
-    db: &'a dyn DatastoreBackend,
+    resource_reads: &'a dyn ClusterResourceRead,
     status_store: &'a dyn klights_controllers::common::ControllerStatusStore,
     pod_query: &'a dyn PodQuery,
 }
@@ -25,16 +27,30 @@ impl ResourceQuotaRuntime for ResourceQuotaControllerAdapter<'_> {
         kind: &str,
         namespace: &str,
     ) -> klights_reconcile_api::ControllerStoreResult<Vec<Resource>> {
-        self.db
-            .list_resources(
+        match self
+            .resource_reads
+            .list_resources(ResourceListRequest::new(
                 api_version,
                 kind,
-                Some(namespace),
-                ResourceListOptions::all(),
-            )
+                ResourceCollectionScope::Namespace(namespace.to_string()),
+                ResourceListQuery::all(),
+            ))
             .await
-            .map(|listing| listing.items)
-            .map_err(map_controller_store_error)
+            .map_err(|error| map_controller_store_error(error.into()))?
+        {
+            ResourceListRead::Current(page) | ResourceListRead::Historical(page) => {
+                Ok(page.into_items())
+            }
+            ResourceListRead::Expired {
+                requested,
+                oldest_available,
+                ..
+            } => Err(klights_reconcile_api::ControllerStoreError::unavailable(
+                format!(
+                    "ResourceQuota LIST at resourceVersion {requested} expired before {oldest_available}"
+                ),
+            )),
+        }
     }
 
     async fn list_namespace_pods(
@@ -71,14 +87,14 @@ impl ResourceQuotaRuntime for ResourceQuotaControllerAdapter<'_> {
 }
 
 pub async fn reconcile_resource_quotas_for_namespace(
-    db: &dyn DatastoreBackend,
+    resource_reads: &dyn ClusterResourceRead,
     status_store: &dyn klights_controllers::common::ControllerStatusStore,
     pod_query: &dyn PodQuery,
     namespace: &str,
 ) -> Result<()> {
     reconcile_resource_quotas_with_runtime(
         &ResourceQuotaControllerAdapter {
-            db,
+            resource_reads,
             status_store,
             pod_query,
         },

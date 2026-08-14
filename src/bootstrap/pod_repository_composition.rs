@@ -7,9 +7,10 @@
 //! the root `PodUpdate`/`PodStatusWriter`/deletion-finalizer wrappers, and
 //! the namespace-termination queue sink over the workqueue.
 
+#[cfg(test)]
+use crate::datastore::DatastoreHandle;
 use std::sync::Arc;
 
-use crate::datastore::DatastoreHandle;
 use klights_kubelet::pod_repository::background::PodRepositoryBackground;
 use klights_kubelet::pod_repository::delete_coordinator::PodDeleteCoordinator;
 use klights_kubelet::pod_repository::store::PodStore;
@@ -150,7 +151,11 @@ impl klights_kubelet::pod_deletion_finalizer::PostWriteMaintenanceObserver
 
 #[derive(Clone)]
 pub(crate) struct PodRepositoryBuildConfig {
-    pub db: DatastoreHandle,
+    pub resource_query: Arc<dyn LeaderResourceQuery>,
+    pub ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
+    pub resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
+    pub namespace_content_reads: Arc<dyn klights_cluster_store::NamespaceContentRead>,
+    pub topology_reads: Arc<dyn klights_cluster_store::ClusterTopologyRead>,
     pub pod_workqueue_store: Option<Arc<dyn klights_node_store::PodWorkqueueStore>>,
     pub supervisor: Arc<TaskSupervisor>,
     pub side_effects: Arc<SideEffectRegistry>,
@@ -163,7 +168,6 @@ pub(crate) struct PodRepositoryBuildConfig {
     pub resource_commands: Option<Arc<dyn klights_leader_api::LeaderResourceCommand>>,
     pub remote_delivery_required: bool,
     pub controller_identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
-    #[cfg(not(test))]
     pub api_identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
     #[cfg(test)]
     pub(crate) scheduler_bind_gate: Option<
@@ -171,7 +175,6 @@ pub(crate) struct PodRepositoryBuildConfig {
     >,
     #[cfg(test)]
     pub(crate) post_write_maintenance_notify: Option<Arc<PostWriteMaintenanceTracker>>,
-    #[cfg(not(test))]
     pub gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
 }
 
@@ -249,9 +252,12 @@ pub(crate) trait PodWatchSource: Send + Sync {
 }
 
 struct RootPodRepositoryComposition {
-    db: DatastoreHandle,
     resource_commands: Option<Arc<dyn klights_leader_api::LeaderResourceCommand>>,
     resource_query: Arc<dyn LeaderResourceQuery>,
+    resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
+    namespace_content_reads: Arc<dyn klights_cluster_store::NamespaceContentRead>,
+    topology_reads: Arc<dyn klights_cluster_store::ClusterTopologyRead>,
+    ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
     side_effects: Arc<SideEffectRegistry>,
     metrics: Arc<SideEffectMetrics>,
     gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
@@ -697,8 +703,9 @@ impl klights_pod_api::PodRepositoryWritePersistence for WorkerPodPersistence {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn new_pod_store(db: DatastoreHandle) -> PodStore {
-    crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_store(db)
+    crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_store_from_test_handle(db)
 }
 
 fn legacy_workqueue_kind(kind: PodWorkqueueKind) -> klights_node_store::PodWorkqueueKind {
@@ -1087,6 +1094,7 @@ pub(crate) struct RootPodQueryWriter {
     store: Arc<PodStore>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     outbox: Option<Arc<klights_kubelet::outbox::Outbox>>,
+    remote_delivery_required: bool,
 }
 
 impl RootPodQueryWriter {
@@ -1094,11 +1102,13 @@ impl RootPodQueryWriter {
         store: Arc<PodStore>,
         cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
         outbox: Option<Arc<klights_kubelet::outbox::Outbox>>,
+        remote_delivery_required: bool,
     ) -> Self {
         Self {
             store,
             cluster_api,
             outbox,
+            remote_delivery_required,
         }
     }
 
@@ -1123,7 +1133,12 @@ impl klights_pod_api::PodQuery for RootPodQueryWriter {
         request: klights_pod_api::PodGetRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, Option<klights_cluster_core::Resource>> {
         Box::pin(async move {
-            let pod = if let Some(cluster_api) = &self.cluster_api {
+            let pod = if self.remote_delivery_required {
+                let cluster_api = self.cluster_api.as_ref().ok_or_else(|| {
+                    PodRepositoryError::unavailable(
+                        "remote Pod query requires a leader resource client",
+                    )
+                })?;
                 let pod = cluster_api
                     .get_resource(
                         klights_leader_api::ResourceGetRequest::try_new(
@@ -1155,7 +1170,12 @@ impl klights_pod_api::PodQuery for RootPodQueryWriter {
         request: klights_pod_api::PodListRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodListResult> {
         Box::pin(async move {
-            if let Some(cluster_api) = &self.cluster_api {
+            if self.remote_delivery_required {
+                let cluster_api = self.cluster_api.as_ref().ok_or_else(|| {
+                    PodRepositoryError::unavailable(
+                        "remote Pod query requires a leader resource client",
+                    )
+                })?;
                 let list = cluster_api
                     .list_resources(
                         klights_leader_api::ResourceListRequest::try_new(
@@ -1199,7 +1219,7 @@ impl klights_pod_api::PodQuery for RootPodQueryWriter {
         request: klights_pod_api::PodOwnerListRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, Vec<klights_cluster_core::Resource>> {
         Box::pin(async move {
-            if self.cluster_api.is_some() {
+            if self.remote_delivery_required {
                 let pods = klights_pod_api::PodQuery::list_pods(
                     self,
                     klights_pod_api::PodListRequest::try_new(
@@ -1744,21 +1764,16 @@ impl RootPodRepositoryComposition {
     fn build(&self, dependencies: PodRepositoryAdapterDependencies) -> RootPodAdapterBuild {
         let resource_commands = match self.resource_commands.clone() {
             Some(commands) => commands,
-            None => {
-                #[cfg(test)]
-                {
-                    crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
-                        self.db.clone(),
-                    )
-                }
-                #[cfg(not(test))]
-                panic!("production root Pod composition requires leader resource commands")
-            }
+            None => panic!("root Pod composition requires leader resource commands"),
         };
         let pod_reconcile = Arc::new(
             crate::bootstrap::controller_adapters::pod_reconcile_adapter::PodReconcileAdapter::new_with_coordination(
                 crate::bootstrap::controller_adapters::pod_reconcile_adapter::PodReconcileStorage::new(
-                    self.db.clone(), resource_commands.clone(),
+                    self.resource_reads.clone(),
+                    self.namespace_content_reads.clone(),
+                    self.topology_reads.clone(),
+                    self.ownership_reads.clone(),
+                    resource_commands.clone(),
                 ),
                 self.side_effects.controller_dispatcher_slot(),
                 self.metrics.clone(),
@@ -1768,15 +1783,14 @@ impl RootPodRepositoryComposition {
                 self.controller_identity.clone(),
             ),
         );
-        let native =
-            crate::bootstrap::composition_adapters::pod_native_adapter::RootPodNativeAdapter::new(
-                dependencies.store.clone(),
-                self.db.clone(),
-                resource_commands,
-                self.wall_clock.clone(),
-                #[cfg(test)]
-                self.scheduler_bind_gate.clone(),
-            );
+        let native = crate::bootstrap::composition_adapters::pod_native_adapter::RootPodNativeAdapter::new_with_query(
+            dependencies.store.clone(),
+            self.resource_query.clone(),
+            resource_commands,
+            self.wall_clock.clone(),
+            #[cfg(test)]
+            self.scheduler_bind_gate.clone(),
+        );
         let pod_query: Arc<dyn klights_pod_api::PodQuery> = native.clone();
         let persistence: Arc<dyn klights_pod_api::PodPersistence> = native.clone();
         let status_persistence: Arc<dyn klights_pod_api::PodStatusPersistence> = native.clone();
@@ -1803,15 +1817,10 @@ impl RootPodRepositoryComposition {
                 deletion: deletion.clone(),
                 admission_resources: native.clone(),
                 spec_validation: native.clone(),
-                admission: crate::bootstrap::composition_adapters::resource_admission_adapter::ResourceAdmissionAdapter::new(
-                    self.api_identity.clone(),
-                    self.db.clone(),
-                ),
+                admission: crate::bootstrap::composition_adapters::resource_admission_adapter::ResourceAdmissionAdapter::new_with_resource_reads(self.api_identity.clone(), self.resource_reads.clone()),
                 resource_query: self.resource_query.clone(),
                 quota_runtime:
-                    crate::bootstrap::controller_adapters::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
-                        self.db.clone(),
-                    ),
+                    crate::bootstrap::controller_adapters::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(self.resource_reads.clone()),
                 supervisor: dependencies.supervisor.clone(),
                 gc_reconcile: pod_reconcile.clone(),
                 service_reconcile: pod_reconcile.clone(),
@@ -1866,12 +1875,14 @@ impl RootPodRepositoryComposition {
     }
 }
 
-#[cfg(not(test))]
 pub(crate) fn build_pod_repository_parts(
     config: PodRepositoryBuildConfig,
     leader_coordination: Option<Arc<dyn klights_leader_api::ControllerCoordination>>,
 ) -> PodRepositoryConstructionResult {
-    build_pod_repository_parts_inner(config, leader_coordination, None)
+    #[cfg(not(test))]
+    return build_pod_repository_parts_inner(config, leader_coordination, None);
+    #[cfg(test)]
+    build_pod_repository_parts_inner(config, leader_coordination, None, None)
 }
 
 #[cfg(test)]
@@ -1909,14 +1920,6 @@ pub(crate) fn build_native_api_test_pod_repository_parts(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn build_pod_repository_parts(
-    config: PodRepositoryBuildConfig,
-    leader_coordination: Option<Arc<dyn klights_leader_api::ControllerCoordination>>,
-) -> PodRepositoryConstructionResult {
-    build_pod_repository_parts_inner(config, leader_coordination, None, None)
-}
-
 fn build_pod_repository_parts_inner(
     config: PodRepositoryBuildConfig,
     leader_coordination: Option<Arc<dyn klights_leader_api::ControllerCoordination>>,
@@ -1927,7 +1930,11 @@ fn build_pod_repository_parts_inner(
     )>,
 ) -> PodRepositoryConstructionResult {
     let PodRepositoryBuildConfig {
-        db,
+        resource_query: focused_resource_query,
+        ownership_reads,
+        resource_reads,
+        namespace_content_reads,
+        topology_reads,
         pod_workqueue_store,
         supervisor,
         side_effects,
@@ -1940,49 +1947,31 @@ fn build_pod_repository_parts_inner(
         resource_commands,
         remote_delivery_required,
         controller_identity,
-        #[cfg(not(test))]
         api_identity,
         #[cfg(test)]
         scheduler_bind_gate,
         #[cfg(test)]
         post_write_maintenance_notify,
-        #[cfg(not(test))]
         gc_coordination,
     } = config;
     #[cfg(test)]
-    let (api_identity, gc_coordination) = test_support.unwrap_or_else(|| {
-        (
-            Arc::new(
-                crate::bootstrap::controller_adapters::system_identity_adapter::SystemIdentityGenerator,
-            ) as Arc<dyn k8s_native_service::ApiIdentityGenerator>,
-            Arc::new(klights_controllers::ControllerCoordination::new())
-                as Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
-        )
-    });
+    let (api_identity, gc_coordination) = test_support.unwrap_or((api_identity, gc_coordination));
     let _ = scheduling_mode;
-    #[cfg(not(test))]
-    let resource_query = resource_query_override
-        .or_else(|| cluster_api.clone())
-        .expect("production Pod repository requires a leader resource query");
-    #[cfg(test)]
-    let _ = resource_query_override;
-    #[cfg(test)]
-    let resource_query = cluster_api.clone().unwrap_or_else(|| {
-        crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
-            db.clone(),
-            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
-        )
-    });
+    let resource_query = if remote_delivery_required {
+        resource_query_override
+            .or_else(|| cluster_api.clone())
+            .unwrap_or(focused_resource_query)
+    } else {
+        focused_resource_query
+    };
     let wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock> =
         Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock);
     let namespace_resource_commands = resource_commands.clone();
     let persistence_parts = match resource_commands {
         Some(commands) => crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_raft_root_parts(
-            db.clone(), commands, wall_clock.clone(),
+            resource_query.clone(), ownership_reads.clone(), commands, wall_clock.clone(),
         ),
-        None => crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
-            db.clone(), wall_clock.clone(),
-        ),
+        None => panic!("production Pod repository requires leader resource commands"),
     };
     let store = persistence_parts.store.clone();
     let local_bound_finalization = persistence_parts.bound_finalization;
@@ -2024,9 +2013,12 @@ fn build_pod_repository_parts_inner(
     ));
     let (adapters, api, subresource, scheduling, metadata_persistence, status_persistence) =
         RootPodRepositoryComposition {
-            db: db.clone(),
             resource_commands: namespace_resource_commands,
             resource_query,
+            resource_reads,
+            namespace_content_reads,
+            topology_reads,
+            ownership_reads,
             side_effects: side_effects.clone(),
             metrics: metrics.clone(),
             gc_coordination,
@@ -2284,6 +2276,7 @@ fn assemble_pod_services(
         store.clone(),
         cluster_api.clone(),
         outbox.clone(),
+        remote_delivery_required,
     ));
     let pod_query: Arc<dyn klights_pod_api::PodQuery> = query_writer.clone();
     let pod_snapshot: Arc<dyn klights_pod_api::PodSnapshotQuery> = query_writer.clone();

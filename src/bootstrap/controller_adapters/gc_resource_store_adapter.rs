@@ -1,6 +1,10 @@
 use async_trait::async_trait;
 use klights_cluster_core::{Resource, ResourcePreconditions};
-use klights_cluster_store::ResourceListOptions;
+use klights_cluster_store::{
+    ClusterOwnershipRead, ClusterResourceMutation, ClusterResourceRead, OwnerNameKindRequest,
+    OwnerUidRequest, ResourceCollectionScope, ResourceGetRequest, ResourceListOptions,
+    ResourceListQuery, ResourceListRead, ResourceListRequest,
+};
 use klights_reconcile_api::ControllerStoreResult as Result;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
@@ -8,17 +12,50 @@ use crate::datastore::DatastoreBackend;
 use klights_controllers::gc::GcResourceStore;
 
 struct BorrowedGcResourceStore<'a> {
-    db: &'a dyn DatastoreBackend,
+    resource_reads: &'a dyn ClusterResourceRead,
+    resource_mutations: &'a dyn ClusterResourceMutation,
+    ownership_reads: &'a dyn ClusterOwnershipRead,
 }
 
-pub(crate) fn borrowed_store(db: &dyn DatastoreBackend) -> impl GcResourceStore + '_ {
-    BorrowedGcResourceStore { db }
+pub(crate) fn borrowed_store<'a>(
+    resource_reads: &'a dyn ClusterResourceRead,
+    resource_mutations: &'a dyn ClusterResourceMutation,
+    ownership_reads: &'a dyn ClusterOwnershipRead,
+) -> impl GcResourceStore + 'a {
+    BorrowedGcResourceStore {
+        resource_reads,
+        resource_mutations,
+        ownership_reads,
+    }
 }
 
 #[async_trait]
 impl GcResourceStore for BorrowedGcResourceStore<'_> {
     async fn list_custom_resource_definitions(&self) -> Result<Vec<Resource>> {
-        GcResourceStore::list_custom_resource_definitions(self.db).await
+        match self
+            .resource_reads
+            .list_resources(ResourceListRequest::new(
+                "apiextensions.k8s.io/v1",
+                "CustomResourceDefinition",
+                ResourceCollectionScope::Cluster,
+                ResourceListQuery::all(),
+            ))
+            .await
+            .map_err(|error| map_controller_store_error(error.into()))?
+        {
+            ResourceListRead::Current(page) | ResourceListRead::Historical(page) => {
+                Ok(page.into_items())
+            }
+            ResourceListRead::Expired {
+                requested,
+                oldest_available,
+                ..
+            } => Err(klights_reconcile_api::ControllerStoreError::unavailable(
+                format!(
+                    "CustomResourceDefinition LIST at resourceVersion {requested} expired before {oldest_available}"
+                ),
+            )),
+        }
     }
 
     async fn get_resource(
@@ -28,7 +65,15 @@ impl GcResourceStore for BorrowedGcResourceStore<'_> {
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>> {
-        GcResourceStore::get_resource(self.db, api_version, kind, namespace, name).await
+        self.resource_reads
+            .get_resource(ResourceGetRequest::new(
+                api_version,
+                kind,
+                namespace.map(ToOwned::to_owned),
+                name,
+            ))
+            .await
+            .map_err(|error| map_controller_store_error(error.into()))
     }
 
     async fn update_resource_with_preconditions(
@@ -40,16 +85,17 @@ impl GcResourceStore for BorrowedGcResourceStore<'_> {
         data: serde_json::Value,
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
-        GcResourceStore::update_resource_with_preconditions(
-            self.db,
-            api_version,
-            kind,
-            namespace,
-            name,
-            data,
-            preconditions,
-        )
-        .await
+        self.resource_mutations
+            .update_resource_with_preconditions(
+                api_version,
+                kind,
+                namespace,
+                name,
+                data,
+                preconditions,
+            )
+            .await
+            .map_err(|error| map_controller_store_error(error.into()))
     }
 
     async fn update_main_resource_with_preconditions(
@@ -61,16 +107,17 @@ impl GcResourceStore for BorrowedGcResourceStore<'_> {
         data: serde_json::Value,
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
-        GcResourceStore::update_main_resource_with_preconditions(
-            self.db,
-            api_version,
-            kind,
-            namespace,
-            name,
-            data,
-            preconditions,
-        )
-        .await
+        self.resource_mutations
+            .update_main_resource_with_preconditions(
+                api_version,
+                kind,
+                namespace,
+                name,
+                data,
+                preconditions,
+            )
+            .await
+            .map_err(|error| map_controller_store_error(error.into()))
     }
 
     async fn find_owned_resources(
@@ -78,7 +125,12 @@ impl GcResourceStore for BorrowedGcResourceStore<'_> {
         owner_uid: &str,
         namespace: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        GcResourceStore::find_owned_resources(self.db, owner_uid, namespace).await
+        let request = OwnerUidRequest::try_new(owner_uid, namespace.map(ToOwned::to_owned))
+            .map_err(|error| map_controller_store_error(error.into()))?;
+        self.ownership_reads
+            .find_owned_resources(request)
+            .await
+            .map_err(|error| map_controller_store_error(error.into()))
     }
 
     async fn find_owned_by_name_kind_empty_uid(
@@ -88,14 +140,17 @@ impl GcResourceStore for BorrowedGcResourceStore<'_> {
         owner_kind: &str,
         namespace: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        GcResourceStore::find_owned_by_name_kind_empty_uid(
-            self.db,
+        let request = OwnerNameKindRequest::try_new(
             owner_api_version,
             owner_name,
             owner_kind,
-            namespace,
+            namespace.map(ToOwned::to_owned),
         )
-        .await
+        .map_err(|error| map_controller_store_error(error.into()))?;
+        self.ownership_reads
+            .find_owned_by_name_kind_empty_uid(request)
+            .await
+            .map_err(|error| map_controller_store_error(error.into()))
     }
 }
 

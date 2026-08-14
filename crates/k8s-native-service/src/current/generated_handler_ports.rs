@@ -7,6 +7,7 @@ pub struct GeneratedWatchRequest {
     pub api_version: String,
     pub kind: String,
     pub namespace: Option<String>,
+    pub scope: klights_leader_api::ResourceListScope,
     pub requested_resource_version: i64,
     pub send_initial_events: bool,
     pub send_bookmarks: bool,

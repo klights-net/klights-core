@@ -3,12 +3,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::{DatastoreBackend, DatastoreHandle};
+use crate::datastore::DatastoreBackend;
+#[cfg(test)]
+use crate::datastore::DatastoreHandle;
 use klights_controllers::crd::{CrdRegistryReader, CrdRegistryRuntime, CrdRegistryWatchSession};
 use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest};
 
 struct LeaderCrdRegistryRuntime {
-    db: DatastoreHandle,
+    resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     positioned_watch: klights_watch::PositionedWatchService,
 }
 
@@ -40,7 +42,7 @@ impl CrdRegistryReader for LeaderCrdRegistryRuntime {
     async fn list_crd_values(
         &self,
     ) -> klights_reconcile_api::ControllerStoreResult<Vec<serde_json::Value>> {
-        CrdRegistryReader::list_crd_values(self.db.as_ref()).await
+        list_crd_values(self.resource_reads.as_ref()).await
     }
 }
 
@@ -50,28 +52,41 @@ impl CrdRegistryRuntime for LeaderCrdRegistryRuntime {
         &self,
     ) -> std::result::Result<CrdRegistryWatchSession, LeaderWatchError> {
         let listing = self
-            .db
-            .list_resources(
+            .resource_reads
+            .list_resources(klights_cluster_store::ResourceListRequest::new(
                 "apiextensions.k8s.io/v1",
                 "CustomResourceDefinition",
-                None,
-                klights_cluster_store::ResourceListOptions::all(),
-            )
+                klights_cluster_store::ResourceCollectionScope::Cluster,
+                klights_cluster_store::ResourceListQuery::all(),
+            ))
             .await
             .map_err(|error| LeaderWatchError::unavailable(error.to_string()))?;
+        let page = match listing {
+            klights_cluster_store::ResourceListRead::Current(page)
+            | klights_cluster_store::ResourceListRead::Historical(page) => page,
+            klights_cluster_store::ResourceListRead::Expired {
+                requested,
+                oldest_available,
+                ..
+            } => {
+                return Err(LeaderWatchError::unavailable(format!(
+                    "CustomResourceDefinition LIST at resourceVersion {requested} expired before {oldest_available}"
+                )));
+            }
+        };
         let request = WatchRequest::try_new(
             "apiextensions.k8s.io/v1",
             "CustomResourceDefinition",
             None,
             None,
             None,
-            Some(listing.resource_version),
-            listing.watch_replay_position,
+            Some(page.snapshot().resource_version()),
+            Some(page.snapshot().position()),
         )?;
         let events = self.positioned_watch.watch_resources(request).await?;
         Ok(CrdRegistryWatchSession {
-            initial_values: listing
-                .items
+            initial_values: page
+                .into_items()
                 .into_iter()
                 .map(|resource| Arc::unwrap_or_clone(resource.data))
                 .collect(),
@@ -81,13 +96,44 @@ impl CrdRegistryRuntime for LeaderCrdRegistryRuntime {
 }
 
 pub(crate) fn new_runtime(
-    db: DatastoreHandle,
+    resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     positioned_watch: klights_watch::PositionedWatchService,
 ) -> Arc<dyn CrdRegistryRuntime> {
     Arc::new(LeaderCrdRegistryRuntime {
-        db,
+        resource_reads,
         positioned_watch,
     })
+}
+
+async fn list_crd_values(
+    resource_reads: &dyn klights_cluster_store::ClusterResourceRead,
+) -> klights_reconcile_api::ControllerStoreResult<Vec<serde_json::Value>> {
+    match resource_reads
+        .list_resources(klights_cluster_store::ResourceListRequest::new(
+            "apiextensions.k8s.io/v1",
+            "CustomResourceDefinition",
+            klights_cluster_store::ResourceCollectionScope::Cluster,
+            klights_cluster_store::ResourceListQuery::all(),
+        ))
+        .await
+        .map_err(|error| map_controller_store_error(error.into()))?
+    {
+        klights_cluster_store::ResourceListRead::Current(page)
+        | klights_cluster_store::ResourceListRead::Historical(page) => Ok(page
+            .into_items()
+            .into_iter()
+            .map(|resource| Arc::unwrap_or_clone(resource.data))
+            .collect()),
+        klights_cluster_store::ResourceListRead::Expired {
+            requested,
+            oldest_available,
+            ..
+        } => Err(klights_reconcile_api::ControllerStoreError::unavailable(
+            format!(
+                "CustomResourceDefinition LIST at resourceVersion {requested} expired before {oldest_available}"
+            ),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -170,7 +216,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let watcher = tokio::spawn(run_crd_registry_watch_with_components(
             new_runtime(
-                handle.clone(),
+                db.focused_read_store(),
                 crate::bootstrap::composition_adapters::positioned_watch_adapter::for_test(
                     &passive_reads,
                     handle,

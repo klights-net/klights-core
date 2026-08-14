@@ -1,10 +1,12 @@
-use klights_cluster_store::ResourceListOptions;
+use klights_cluster_store::{
+    ClusterResourceRead, ClusterTopologyRead, DurableAllocatorRead, ResourceCollectionScope,
+    ResourceGetRequest, ResourceListQuery, ResourceListRead, ResourceListRequest,
+};
 use std::sync::Arc;
 
 use klights_cluster_core::Resource;
 use serde_json::Value;
 
-use crate::datastore::DatastoreHandle;
 use k8s_native_service::AppError;
 use k8s_native_service::generic_command::{
     BuiltinAdmissionDefaultsPort, GeneratedLifecyclePort, GeneratedResourceMutationPort,
@@ -30,7 +32,7 @@ pub(crate) async fn submit_node_cleanup_intents(
 }
 
 pub(crate) struct GeneratedHandlerAdapter {
-    db: DatastoreHandle,
+    resource_reads: Arc<dyn ClusterResourceRead>,
     commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     namespace_bootstrap: super::leader_bootstrap_store_adapter::LeaderBootstrapStore,
     watch_source: Arc<super::watch_stream_adapter::DatastoreWatchStreamAdapter>,
@@ -41,16 +43,28 @@ pub(crate) struct GeneratedHandlerAdapter {
 }
 
 pub(crate) struct GeneratedHandlerStorage {
-    db: DatastoreHandle,
+    resource_reads: Arc<dyn ClusterResourceRead>,
+    topology_reads: Arc<dyn ClusterTopologyRead>,
+    allocator_reads: Arc<dyn DurableAllocatorRead>,
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
 }
 
 impl GeneratedHandlerStorage {
     pub(crate) fn new(
-        db: DatastoreHandle,
+        resource_reads: Arc<dyn ClusterResourceRead>,
+        topology_reads: Arc<dyn ClusterTopologyRead>,
+        allocator_reads: Arc<dyn DurableAllocatorRead>,
+        resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
         commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     ) -> Self {
-        Self { db, commands }
+        Self {
+            resource_reads,
+            topology_reads,
+            allocator_reads,
+            resource_query,
+            commands,
+        }
     }
 }
 
@@ -64,20 +78,28 @@ impl GeneratedHandlerAdapter {
         ca_cert_path: std::path::PathBuf,
         identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Arc<Self> {
-        let GeneratedHandlerStorage { db, commands } = storage;
+        let GeneratedHandlerStorage {
+            resource_reads,
+            topology_reads,
+            allocator_reads,
+            resource_query,
+            commands,
+        } = storage;
         Arc::new(Self {
             watch_source: Arc::new(
                 super::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
-                    db.clone(),
+                    resource_query,
+                    allocator_reads,
                     watch_signals,
                     positioned_watch,
                 ),
             ),
             namespace_bootstrap: super::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
-                db.clone(),
+                resource_reads.clone(),
+                topology_reads,
                 commands.clone(),
             ),
-            db,
+            resource_reads,
             commands,
             file_process,
             task_supervisor,
@@ -90,9 +112,11 @@ impl GeneratedHandlerAdapter {
 impl BuiltinAdmissionDefaultsPort for GeneratedHandlerAdapter {
     fn ensure_namespace_active(&self, namespace: String) -> GenericCommandFuture<'_, ()> {
         Box::pin(async move {
-            let resource =
-                crate::datastore::DatastoreBackend::get_namespace(self.db.as_ref(), &namespace)
-                    .await?;
+            let resource = self
+                .resource_reads
+                .get_resource(ResourceGetRequest::new("v1", "Namespace", None, &namespace))
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))?;
             match k8s_native_service::classify_namespace(
                 &namespace,
                 resource.as_ref().map(|resource| resource.data.as_ref()),
@@ -152,8 +176,13 @@ impl k8s_native_service::ports::AdmissionResourceStore for GeneratedHandlerAdapt
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>, klights_leader_api::ResourceQueryError> {
-        self.db
-            .get_resource(api_version, kind, namespace, name)
+        self.resource_reads
+            .get_resource(ResourceGetRequest::new(
+                api_version,
+                kind,
+                namespace.map(str::to_owned),
+                name,
+            ))
             .await
             .map_err(|error| {
                 klights_leader_api::ResourceQueryError::retryable(format!(
@@ -168,10 +197,29 @@ impl k8s_native_service::ports::AdmissionResourceStore for GeneratedHandlerAdapt
         kind: &str,
         namespace: Option<&str>,
     ) -> Result<Vec<Resource>, klights_leader_api::ResourceQueryError> {
-        self.db
-            .list_resources(api_version, kind, namespace, ResourceListOptions::all())
+        self.resource_reads
+            .list_resources(ResourceListRequest::new(
+                api_version,
+                kind,
+                namespace
+                    .map(|value| ResourceCollectionScope::Namespace(value.to_owned()))
+                    .unwrap_or(ResourceCollectionScope::AllNamespaces),
+                ResourceListQuery::all(),
+            ))
             .await
-            .map(|listing| listing.items)
+            .and_then(|listing| match listing {
+                ResourceListRead::Current(page) | ResourceListRead::Historical(page) => {
+                    Ok(page.into_items())
+                }
+                ResourceListRead::Expired {
+                    requested,
+                    oldest_available,
+                    ..
+                } => Err(klights_cluster_store::ResourceReadError::Expired {
+                    requested,
+                    oldest_available,
+                }),
+            })
             .map_err(|error| {
                 klights_leader_api::ResourceQueryError::retryable(format!(
                     "admission resource list failed: {error}"
@@ -198,7 +246,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
     fn reconcile_cluster_role_aggregation(&self) -> GenericCommandFuture<'_, ()> {
         Box::pin(async move {
             klights_controllers::rbac_reconcile::reconcile_cluster_role_aggregation(
-                self.db.as_ref(),
+                &self.namespace_bootstrap,
             )
             .await
             .map_err(|error| AppError::Internal(error.to_string()))
@@ -356,6 +404,7 @@ impl GeneratedWatchPort for GeneratedHandlerAdapter {
                     api_version: &request.api_version,
                     kind: request.kind,
                     watch_namespace: request.namespace,
+                    scope: request.scope,
                     requested_rv: request.requested_resource_version,
                     send_initial_events: request.send_initial_events,
                     send_bookmarks: request.send_bookmarks,

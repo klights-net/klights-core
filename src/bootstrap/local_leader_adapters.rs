@@ -18,7 +18,6 @@ use klights_leader_api::{
 };
 
 use crate::bootstrap::authority::AuthorityHandle;
-use crate::datastore::DatastoreHandle;
 
 /// Root-local cache readiness is a concrete bootstrap capability.  The
 /// worker/cache implementation owns real readiness; a root-local leader has
@@ -32,13 +31,22 @@ impl LeaderCacheReadiness for LocalCacheReadinessAdapter {
 }
 
 pub(crate) fn new_local_outbox_side_effect_state(
-    db: DatastoreHandle,
+    resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
+    resource_mutations: Arc<dyn klights_cluster_store::ClusterResourceMutation>,
+    ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
 ) -> Arc<crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::RootOutboxSideEffectState>
 {
     Arc::new(
         crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::
-            RootOutboxSideEffectState::new(db),
+            RootOutboxSideEffectState::new(resource_reads, resource_mutations, ownership_reads),
     )
+}
+
+#[cfg(test)]
+pub(crate) fn new_local_outbox_side_effect_state_for_test(
+    db: crate::datastore::DatastoreHandle,
+) -> Arc<crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::RootOutboxSideEffectState>{
+    Arc::new(crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::RootOutboxSideEffectState::new_for_test(db))
 }
 
 /// Bootstrap-owned in-memory Node lease publisher.
@@ -318,8 +326,9 @@ impl LeadershipGenerationFence {
 
 /// Bootstrap-owned projected ServiceAccount token issuer.
 pub(crate) struct LocalProjectedToken {
-    db: DatastoreHandle,
-    pod_store: Arc<klights_kubelet::pod_repository::store::PodStore>,
+    resource_reads: Option<Arc<dyn klights_cluster_store::ClusterResourceRead>>,
+    #[cfg(test)]
+    db: Option<crate::datastore::DatastoreHandle>,
     authoring_node: String,
     containerd_namespace: String,
     signing_key_path: std::path::PathBuf,
@@ -332,20 +341,42 @@ pub(crate) struct LocalProjectedToken {
 impl LocalProjectedToken {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new<A: Into<AuthorityHandle>>(
-        db: DatastoreHandle,
+        resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
         authoring_node: String,
         containerd_namespace: String,
         signing_key_path: std::path::PathBuf,
         authority: A,
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
-        let pod_store = Arc::new(crate::bootstrap::pod_repository_composition::new_pod_store(
-            db.clone(),
-        ));
         let crypto = file_process.crypto_executor();
         Self {
-            db,
-            pod_store,
+            resource_reads: Some(resource_reads),
+            #[cfg(test)]
+            db: None,
+            authoring_node,
+            containerd_namespace,
+            signing_key_path,
+            file_process,
+            crypto,
+            authority: authority.into(),
+            signing_fence: None,
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_test<A: Into<AuthorityHandle>>(
+        db: crate::datastore::DatastoreHandle,
+        authoring_node: String,
+        containerd_namespace: String,
+        signing_key_path: std::path::PathBuf,
+        authority: A,
+        file_process: klights_supervisor::FileProcessExecutor,
+    ) -> Self {
+        let crypto = file_process.crypto_executor();
+        Self {
+            resource_reads: None,
+            db: Some(db),
             authoring_node,
             containerd_namespace,
             signing_key_path,
@@ -388,9 +419,13 @@ impl LocalProjectedToken {
             });
             leadership.ensure_unchanged()?;
             let signing_key_pem = signing_key_pem?;
-            let resources =
-                crate::bootstrap::composition_adapters::projected_token_resource_adapter::
-                    ProjectedTokenResourceAdapter::new(self.db.as_ref(), self.pod_store.as_ref());
+            #[cfg(test)]
+            let resources = match &self.db {
+                Some(db) => crate::bootstrap::composition_adapters::projected_token_resource_adapter::ProjectedTokenResourceAdapter::new_for_test(db.as_ref()),
+                None => crate::bootstrap::composition_adapters::projected_token_resource_adapter::ProjectedTokenResourceAdapter::new(self.resource_reads.as_ref().expect("focused projected-token reads").as_ref()),
+            };
+            #[cfg(not(test))]
+            let resources = crate::bootstrap::composition_adapters::projected_token_resource_adapter::ProjectedTokenResourceAdapter::new(self.resource_reads.as_ref().expect("focused projected-token reads").as_ref());
             let claims =
                 klights_auth::projected_service_account_token::authorize_projected_service_account_token(
                     &resources,

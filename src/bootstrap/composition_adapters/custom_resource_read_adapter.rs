@@ -6,7 +6,8 @@ use k8s_native_service::ports::{
 };
 
 pub(crate) struct CustomResourceReadAdapter {
-    db: crate::datastore::DatastoreHandle,
+    resource_scopes: Arc<dyn klights_cluster_store::ClusterResourceScopeRead>,
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
     positioned_watch: klights_watch::PositionedWatchService,
     watch_source: super::watch_stream_adapter::DatastoreWatchStreamAdapter,
@@ -15,57 +16,42 @@ pub(crate) struct CustomResourceReadAdapter {
 
 impl CustomResourceReadAdapter {
     pub(crate) fn new(
-        db: crate::datastore::DatastoreHandle,
+        resource_scopes: Arc<dyn klights_cluster_store::ClusterResourceScopeRead>,
+        resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+        allocator_reads: Arc<dyn klights_cluster_store::DurableAllocatorRead>,
         watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
         positioned_watch: klights_watch::PositionedWatchService,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Arc<Self> {
-        let projected_baseline = Arc::new(CrdProjectedWatchBaseline { db: db.clone() });
+        let projected_baseline = Arc::new(CrdProjectedWatchBaseline {
+            resource_scopes: resource_scopes.clone(),
+        });
         Arc::new(Self {
             positioned_watch: positioned_watch.clone(),
             watch_source: super::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
-                db.clone(),
+                resource_query.clone(),
+                allocator_reads,
                 watch_signals,
                 positioned_watch,
             ),
-            db,
+            resource_scopes,
+            resource_query,
             supervisor,
             projected_baseline,
         })
     }
 }
 
-fn datastore_target(target: &CustomResourceWatchTarget) -> klights_cluster_store::WatchTarget {
-    match target {
-        CustomResourceWatchTarget::Cluster { api_version, kind } => {
-            klights_cluster_store::WatchTarget::cluster(api_version, kind)
-        }
-        CustomResourceWatchTarget::Namespaced {
-            api_version,
-            kind,
-            namespace: None,
-        } => klights_cluster_store::WatchTarget::namespaced(api_version, kind),
-        CustomResourceWatchTarget::Namespaced {
-            api_version,
-            kind,
-            namespace: Some(namespace),
-        } => klights_cluster_store::WatchTarget::namespaced_in_namespace(
-            api_version,
-            kind,
-            namespace,
-        ),
-    }
-}
-
 fn leader_list_result(
-    list: klights_cluster_store::ResourceList,
+    list: klights_cluster_store::ResourceScopeSnapshot,
 ) -> Result<klights_leader_api::ResourceListResult, k8s_native_service::AppError> {
+    let snapshot = list.snapshot();
     klights_leader_api::ResourceListResult::try_new(
-        list.items,
-        list.resource_version,
-        list.watch_replay_position,
-        list.continue_token,
-        list.remaining_item_count,
+        list.into_items(),
+        snapshot.resource_version(),
+        Some(snapshot.position()),
+        None,
+        None,
     )
     .map_err(k8s_native_service::AppError::from)
 }
@@ -77,11 +63,20 @@ impl CustomResourceReadPort for CustomResourceReadAdapter {
         label_selector: Option<String>,
     ) -> CustomResourceReadFuture<'_, klights_leader_api::ResourceListResult> {
         Box::pin(async move {
-            let targets = targets.iter().map(datastore_target).collect::<Vec<_>>();
-            self.db
-                .list_resources_for_watch_targets(&targets, label_selector.as_deref())
+            let targets = targets
+                .iter()
+                .map(custom_target_to_durable_target)
+                .collect();
+            self.resource_scopes
+                .list_resources_for_watch_targets(
+                    klights_cluster_store::ResourceWatchTargetsRequest::try_new(
+                        targets,
+                        label_selector,
+                    )
+                    .map_err(|error| k8s_native_service::AppError::Internal(error.to_string()))?,
+                )
                 .await
-                .map_err(k8s_native_service::AppError::from)
+                .map_err(|error| k8s_native_service::AppError::Internal(error.to_string()))
                 .and_then(leader_list_result)
         })
     }
@@ -150,18 +145,25 @@ impl CustomResourceReadPort for CustomResourceReadAdapter {
         &self,
         api_version: String,
         kind: String,
-        namespace: Option<String>,
+        scope: klights_leader_api::ResourceListScope,
     ) -> CustomResourceReadFuture<'_, i64> {
         Box::pin(async move {
-            self.db
+            self.resource_query
                 .list_resources(
-                    &api_version,
-                    &kind,
-                    namespace.as_deref(),
-                    klights_cluster_store::ResourceListOptions::new(None, None, Some(1), None),
+                    klights_leader_api::ResourceListRequest::try_new(
+                        api_version,
+                        kind,
+                        scope,
+                        None,
+                        None,
+                        Some(1),
+                        None,
+                        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+                    )
+                    .map_err(k8s_native_service::AppError::from)?,
                 )
                 .await
-                .map(|list| list.resource_version)
+                .map(|list| list.resource_version())
                 .map_err(k8s_native_service::AppError::from)
         })
     }
@@ -206,7 +208,7 @@ fn custom_target_to_durable_target(
 }
 
 struct CrdProjectedWatchBaseline {
-    db: crate::datastore::DatastoreHandle,
+    resource_scopes: Arc<dyn klights_cluster_store::ClusterResourceScopeRead>,
 }
 
 impl klights_watch::ProjectedWatchBaselineRead for CrdProjectedWatchBaseline {
@@ -218,78 +220,49 @@ impl klights_watch::ProjectedWatchBaselineRead for CrdProjectedWatchBaseline {
         Result<klights_cluster_store::ResourceListRead, klights_leader_api::LeaderWatchError>,
     > {
         Box::pin(async move {
-            let targets = request
-                .targets()
-                .iter()
-                .map(durable_target_to_datastore_target)
-                .collect::<Vec<_>>();
             match self
-                .db
+                .resource_scopes
                 .snapshot_resources_at_position(
-                    &targets,
-                    request.label_selector(),
-                    None,
-                    request.position(),
+                    klights_cluster_store::ResourceSnapshotAtPositionRequest::try_new(
+                        request.targets().to_vec(),
+                        request.label_selector().map(str::to_owned),
+                        None,
+                        request.position(),
+                    )
+                    .map_err(|error| {
+                        klights_leader_api::LeaderWatchError::unavailable(error.to_string())
+                    })?,
                 )
                 .await
                 .map_err(|error| {
                     klights_leader_api::LeaderWatchError::unavailable(format!("{error:?}"))
                 })? {
-                klights_cluster_store::SnapshotAtRv::List(list) => {
-                    let snapshot = klights_cluster_store::ResourceListSnapshot::try_new(
-                        list.watch_replay_position.ok_or_else(|| {
-                            klights_leader_api::LeaderWatchError::malformed_event(
-                                "CRD positioned baseline omitted its replay position",
-                            )
-                        })?,
-                    )
-                    .map_err(|error| {
-                        klights_leader_api::LeaderWatchError::malformed_event(error.to_string())
-                    })?;
+                klights_cluster_store::ResourceSnapshotRead::Historical(list) => {
+                    let snapshot = list.snapshot();
                     let page = klights_cluster_store::ResourceListPage::try_new(
-                        list.items,
+                        list.into_items(),
                         snapshot,
                         None,
-                        list.remaining_item_count,
+                        None,
                     )
                     .map_err(|error| {
                         klights_leader_api::LeaderWatchError::malformed_event(error.to_string())
                     })?;
                     Ok(klights_cluster_store::ResourceListRead::Historical(page))
                 }
-                klights_cluster_store::SnapshotAtRv::Expired => {
+                klights_cluster_store::ResourceSnapshotRead::Expired => {
                     Ok(klights_cluster_store::ResourceListRead::Expired {
                         requested: request.position().resource_version,
                         oldest_available: request.position().resource_version.saturating_add(1),
                         replacement: None,
                     })
                 }
-                klights_cluster_store::SnapshotAtRv::Current => {
+                klights_cluster_store::ResourceSnapshotRead::Current => {
                     Err(klights_leader_api::LeaderWatchError::malformed_event(
                         "CRD positioned baseline returned an unpinned Current sentinel",
                     ))
                 }
             }
         })
-    }
-}
-
-fn durable_target_to_datastore_target(
-    target: &klights_cluster_store::DurableWatchTarget,
-) -> klights_cluster_store::WatchTarget {
-    match target.scope() {
-        klights_cluster_store::DurableWatchScope::Cluster => {
-            klights_cluster_store::WatchTarget::cluster(target.api_version(), target.kind())
-        }
-        klights_cluster_store::DurableWatchScope::Namespaced(None) => {
-            klights_cluster_store::WatchTarget::namespaced(target.api_version(), target.kind())
-        }
-        klights_cluster_store::DurableWatchScope::Namespaced(Some(namespace)) => {
-            klights_cluster_store::WatchTarget::namespaced_in_namespace(
-                target.api_version(),
-                target.kind(),
-                namespace,
-            )
-        }
     }
 }

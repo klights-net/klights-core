@@ -9,7 +9,6 @@
 use std::sync::Arc;
 
 use crate::KlightsConfig;
-use crate::datastore::DatastoreHandle;
 use anyhow::{Context as _, Result};
 use klights_leader_api::{ControllerCoordination, ControllerScope};
 use klights_supervisor::TaskSupervisor;
@@ -24,7 +23,7 @@ pub struct LeaderStart<'a> {
     /// function attempts to acquire the lease; if acquisition fails
     /// (not the raft leader), controller startup is skipped cleanly.
     pub leader_coordination: Option<Arc<dyn ControllerCoordination>>,
-    pub db_handle: &'a DatastoreHandle,
+    pub resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     pub leader_bootstrap_store: Arc<crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore>,
     pub watch_maintenance: Arc<dyn klights_cluster_store::ClusterWatchMaintenance>,
     pub positioned_watch: klights_watch::PositionedWatchService,
@@ -45,7 +44,7 @@ pub struct LeaderStart<'a> {
 #[derive(Clone)]
 struct LeaderScopedTaskContext {
     config: Arc<KlightsConfig>,
-    db_handle: DatastoreHandle,
+    resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
     leader_bootstrap_store: Arc<crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore>,
     watch_maintenance: Arc<dyn klights_cluster_store::ClusterWatchMaintenance>,
     positioned_watch: klights_watch::PositionedWatchService,
@@ -66,7 +65,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
     let LeaderStart {
         config,
         leader_coordination,
-        db_handle,
+        resource_reads,
         leader_bootstrap_store,
         watch_maintenance,
         positioned_watch,
@@ -96,7 +95,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
     let sandbox_gc_dirty_counter = pod_sandbox_gc_dirty_counter.clone();
     let leader_context = LeaderScopedTaskContext {
         config: config.clone(),
-        db_handle: db_handle.clone(),
+        resource_reads,
         leader_bootstrap_store,
         watch_maintenance,
         positioned_watch,
@@ -153,6 +152,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use crate::datastore::DatastoreHandle;
     use klights_networking::test_support::MockNetworkProvider;
     use serde_json::Value;
     use std::net::Ipv4Addr;
@@ -235,7 +235,7 @@ async fn start_leader_scoped_tasks(
 ) -> Result<()> {
     let LeaderScopedTaskContext {
         config,
-        db_handle,
+        resource_reads,
         leader_bootstrap_store,
         watch_maintenance,
         positioned_watch,
@@ -264,7 +264,7 @@ async fn start_leader_scoped_tasks(
 
     let scheduler =
         crate::bootstrap::controller_adapters::cronjob_scheduler_adapter::new_leader_scheduler(
-            db_handle.clone(),
+            resource_reads,
             cronjob_store,
             positioned_watch.clone(),
             dispatcher_for_cronjobs,

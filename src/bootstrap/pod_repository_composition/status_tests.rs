@@ -2761,6 +2761,7 @@ mod tests {
             .unwrap();
         let mut tampered: serde_json::Value = (*after_first.data).clone();
         tampered["metadata"]["annotations"]["klights.dev/sandbox-id"] = json!("sb-tampered");
+        tampered["metadata"]["resourceVersion"] = json!(snapshot.resource_version.to_string());
         let conflict = repo
             .api_mutations
             .update_pod("default", "anno-race", tampered, snapshot, false)

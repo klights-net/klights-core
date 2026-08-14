@@ -5,7 +5,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use klights_auth::bootstrap_token::BootstrapTokenScopePolicy;
 use klights_cluster_core::{Resource, ResourcePreconditions, StorageCommand};
-use klights_cluster_store::ResourceListOptions;
+use klights_cluster_store::{
+    ClusterResourceRead, ClusterTopologyRead, ResourceCollectionScope, ResourceGetRequest,
+    ResourceListQuery, ResourceListRead, ResourceListRequest,
+};
 use klights_controllers::kube_service::KubernetesBootstrapStore;
 use klights_controllers::namespace::NamespaceBootstrapStore;
 use klights_controllers::rbac_reconcile::RbacPolicyStore;
@@ -14,19 +17,26 @@ use klights_leader_api::{
 };
 use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 
-use crate::datastore::DatastoreHandle;
-
 /// Bootstrap-only read/command composition. Reads use the committed local
 /// state machine; every mutation crosses the leader command boundary and is
 /// therefore committed by Raft before it is observed locally.
 pub(crate) struct LeaderBootstrapStore {
-    reads: DatastoreHandle,
+    reads: Arc<dyn ClusterResourceRead>,
+    topology_reads: Arc<dyn ClusterTopologyRead>,
     commands: Arc<dyn LeaderResourceCommand>,
 }
 
 impl LeaderBootstrapStore {
-    pub(crate) fn new(reads: DatastoreHandle, commands: Arc<dyn LeaderResourceCommand>) -> Self {
-        Self { reads, commands }
+    pub(crate) fn new(
+        reads: Arc<dyn ClusterResourceRead>,
+        topology_reads: Arc<dyn ClusterTopologyRead>,
+        commands: Arc<dyn LeaderResourceCommand>,
+    ) -> Self {
+        Self {
+            reads,
+            topology_reads,
+            commands,
+        }
     }
 
     async fn submit(&self, command: StorageCommand) -> ControllerStoreResult<Resource> {
@@ -52,7 +62,12 @@ impl LeaderBootstrapStore {
         name: &str,
     ) -> ControllerStoreResult<Option<Resource>> {
         self.reads
-            .get_resource(api_version, kind, namespace, name)
+            .get_resource(ResourceGetRequest::new(
+                api_version,
+                kind,
+                namespace.map(str::to_string),
+                name,
+            ))
             .await
             .map_err(|error| ControllerStoreError::unavailable(format!("{error:#}")))
     }
@@ -112,7 +127,7 @@ impl klights_kubelet::node_registration::NodeRegistrationStore for LeaderBootstr
         node: &mut serde_json::Value,
     ) -> anyhow::Result<bool> {
         crate::bootstrap::composition_adapters::node_routing_metadata::stamp_from_store(
-            self.reads.as_ref(),
+            self.topology_reads.as_ref(),
             node_name,
             node,
         )
@@ -152,10 +167,27 @@ impl klights_kubelet::node_registration::NodeRegistrationStore for LeaderBootstr
 #[async_trait]
 impl klights_kubelet::node_leader_labels::NodeLeaderLabelStore for LeaderBootstrapStore {
     async fn list_nodes(&self) -> anyhow::Result<Vec<Resource>> {
-        self.reads
-            .list_resources("v1", "Node", None, ResourceListOptions::all())
+        let list = self
+            .reads
+            .list_resources(ResourceListRequest::new(
+                "v1",
+                "Node",
+                ResourceCollectionScope::Cluster,
+                ResourceListQuery::all(),
+            ))
             .await
-            .map(|list| list.items)
+            .map_err(anyhow::Error::new)?;
+        match list {
+            ResourceListRead::Current(page) => Ok(page.into_items()),
+            ResourceListRead::Historical(page) => Ok(page.into_items()),
+            ResourceListRead::Expired {
+                requested,
+                oldest_available,
+                ..
+            } => Err(anyhow::anyhow!(
+                "ClusterRole LIST at resourceVersion {requested} expired before {oldest_available}"
+            )),
+        }
     }
 
     async fn update_node_with_preconditions(
@@ -359,16 +391,28 @@ impl RbacPolicyStore for LeaderBootstrapStore {
     }
 
     async fn list_cluster_roles(&self) -> ControllerStoreResult<Vec<Resource>> {
-        self.reads
-            .list_resources(
+        let listing = self
+            .reads
+            .list_resources(ResourceListRequest::new(
                 "rbac.authorization.k8s.io/v1",
                 "ClusterRole",
-                None,
-                ResourceListOptions::all(),
-            )
+                ResourceCollectionScope::Cluster,
+                ResourceListQuery::all(),
+            ))
             .await
-            .map(|listing| listing.items)
-            .map_err(|error| ControllerStoreError::unavailable(format!("{error:#}")))
+            .map_err(|error| ControllerStoreError::unavailable(error.to_string()))?;
+        match listing {
+            ResourceListRead::Current(page) | ResourceListRead::Historical(page) => {
+                Ok(page.into_items())
+            }
+            ResourceListRead::Expired {
+                requested,
+                oldest_available,
+                ..
+            } => Err(ControllerStoreError::unavailable(format!(
+                "ClusterRole LIST at resourceVersion {requested} expired before {oldest_available}"
+            ))),
+        }
     }
 }
 

@@ -3,8 +3,12 @@ use klights_reconcile_api::{
     FinalizerLifecyclePort, FinalizerResourceTarget, FinalizerTombstoneDeleteRequest,
     FinalizerUpdateRequest,
 };
+#[cfg(test)]
+use std::sync::Arc;
 
+#[cfg(test)]
 use crate::datastore::DatastoreHandle;
+use klights_cluster_store::{ClusterOwnershipRead, ClusterResourceRead};
 
 pub(crate) struct GcOwnerLifecycleAdapter {
     gc: std::sync::Arc<super::controller_runtime_adapter::RootControllerLeaderPort>,
@@ -15,20 +19,23 @@ pub(crate) struct GcOwnerLifecycleAdapter {
 
 impl GcOwnerLifecycleAdapter {
     pub(crate) fn new_with_coordination(
-        db: DatastoreHandle,
+        resource_reads: std::sync::Arc<dyn ClusterResourceRead>,
+        ownership_reads: std::sync::Arc<dyn ClusterOwnershipRead>,
         resource_commands: std::sync::Arc<dyn klights_leader_api::LeaderResourceCommand>,
         pod_delete_sink: std::sync::Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
         coordination: std::sync::Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
     ) -> Self {
         let gc = std::sync::Arc::new(
             super::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
-                db.clone(),
+                resource_reads.clone(),
+                ownership_reads.clone(),
                 resource_commands.clone(),
             ),
         );
         Self {
             non_pod_finalization: GcNonPodFinalizationAdapter::new_with_commands(
-                db.clone(),
+                resource_reads,
+                ownership_reads,
                 resource_commands,
             ),
             gc,
@@ -132,17 +139,26 @@ impl GcNonPodFinalizationAdapter {
             super::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
                 db.clone(),
             );
-        Self::new_with_commands(db, commands)
+        Self::new_for_test_with_commands(db, commands)
     }
-
-    pub(crate) fn new_with_commands(
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_commands(
         db: DatastoreHandle,
+        commands: std::sync::Arc<dyn klights_leader_api::LeaderResourceCommand>,
+    ) -> Self {
+        Self { lifecycle: crate::bootstrap::finalizer_lifecycle_adapter::CommandFinalizerLifecycleStore::new_for_test(db, commands) }
+    }
+    pub(crate) fn new_with_commands(
+        resource_reads: std::sync::Arc<dyn ClusterResourceRead>,
+        ownership_reads: std::sync::Arc<dyn ClusterOwnershipRead>,
         commands: std::sync::Arc<dyn klights_leader_api::LeaderResourceCommand>,
     ) -> Self {
         Self {
             lifecycle:
                 crate::bootstrap::finalizer_lifecycle_adapter::CommandFinalizerLifecycleStore::new(
-                    db, commands,
+                    resource_reads,
+                    ownership_reads,
+                    commands,
                 ),
         }
     }
@@ -268,7 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_pod_port_rejects_pod_without_touching_datastore() {
-        let (db, db_handle) =
+        let (db, _db_handle) =
             crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let pod = db
             .create_resource(
@@ -289,7 +305,7 @@ mod tests {
             )
             .await
             .expect("create Pod");
-        let adapter = GcNonPodFinalizationAdapter::new(db_handle);
+        let adapter = GcNonPodFinalizationAdapter::new(Arc::new(db.clone()));
 
         let error = adapter
             .finalize_non_pod(GcNonPodFinalizationRequest {
@@ -363,7 +379,7 @@ mod tests {
 
     #[tokio::test]
     async fn ready_foreground_non_pod_finalization_is_command_routed_end_to_end() {
-        let (db, db_handle) =
+        let (db, _db_handle) =
             crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let owner = db
             .create_resource(
@@ -388,7 +404,10 @@ mod tests {
             .expect("create owner");
         let observed_rv = owner.resource_version;
         let commands = std::sync::Arc::new(RecordingCommands::default());
-        let adapter = GcNonPodFinalizationAdapter::new_with_commands(db_handle, commands.clone());
+        let adapter = GcNonPodFinalizationAdapter::new_for_test_with_commands(
+            Arc::new(db.clone()),
+            commands.clone(),
+        );
 
         let outcome = adapter
             .finalize_non_pod(GcNonPodFinalizationRequest {
@@ -403,33 +422,36 @@ mod tests {
             outcome,
             klights_reconcile_api::GcNonPodFinalizationOutcome::HardDeleted
         );
-        let submitted = commands.commands.lock().unwrap();
-        assert_eq!(
-            submitted.len(),
-            2,
-            "remove and delete must both be commands"
-        );
-        let klights_cluster_core::StorageCommand::UpdateResource {
-            expected_rv,
-            preconditions,
-            data,
-            ..
-        } = &submitted[0]
-        else {
-            panic!("first command must remove the foreground finalizer")
-        };
-        assert_eq!(*expected_rv, observed_rv);
-        assert_eq!(preconditions.uid.as_deref(), Some("foreground-owner-uid"));
-        assert_eq!(preconditions.resource_version, Some(observed_rv));
-        assert!(data.pointer("/metadata/finalizers").is_none());
-        let klights_cluster_core::StorageCommand::DeleteResourceWithTombstone {
-            preconditions, ..
-        } = &submitted[1]
-        else {
-            panic!("second command must delete the finalizer-free owner")
-        };
-        assert_eq!(preconditions.uid.as_deref(), Some("foreground-owner-uid"));
-        assert_eq!(preconditions.resource_version, Some(42));
+        {
+            let submitted = commands.commands.lock().unwrap();
+            assert_eq!(
+                submitted.len(),
+                2,
+                "remove and delete must both be commands"
+            );
+            let klights_cluster_core::StorageCommand::UpdateResource {
+                expected_rv,
+                preconditions,
+                data,
+                ..
+            } = &submitted[0]
+            else {
+                panic!("first command must remove the foreground finalizer")
+            };
+            assert_eq!(*expected_rv, observed_rv);
+            assert_eq!(preconditions.uid.as_deref(), Some("foreground-owner-uid"));
+            assert_eq!(preconditions.resource_version, Some(observed_rv));
+            assert!(data.pointer("/metadata/finalizers").is_none());
+            let klights_cluster_core::StorageCommand::DeleteResourceWithTombstone {
+                preconditions,
+                ..
+            } = &submitted[1]
+            else {
+                panic!("second command must delete the finalizer-free owner")
+            };
+            assert_eq!(preconditions.uid.as_deref(), Some("foreground-owner-uid"));
+            assert_eq!(preconditions.resource_version, Some(42));
+        }
         let passive = db
             .get_resource(
                 "v1",
@@ -453,7 +475,7 @@ mod tests {
 
     #[tokio::test]
     async fn ready_foreground_non_pod_finalization_rejects_follower_without_local_mutation() {
-        let (db, db_handle) =
+        let (db, _db_handle) =
             crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let owner = db
             .create_resource(
@@ -481,7 +503,10 @@ mod tests {
             commands: std::sync::Mutex::new(Vec::new()),
             reject_as_follower: true,
         });
-        let adapter = GcNonPodFinalizationAdapter::new_with_commands(db_handle, commands.clone());
+        let adapter = GcNonPodFinalizationAdapter::new_for_test_with_commands(
+            Arc::new(db.clone()),
+            commands.clone(),
+        );
 
         let error = adapter
             .finalize_non_pod(GcNonPodFinalizationRequest {

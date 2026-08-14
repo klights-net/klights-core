@@ -45,7 +45,6 @@ mod tests {
         let db = crate::datastore::sqlite::Datastore::new_in_memory()
             .await
             .unwrap();
-        let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
         db.create_resource(
             "discovery.k8s.io/v1",
             "EndpointSlice",
@@ -76,7 +75,7 @@ mod tests {
 
         klights_controllers::side_effects::endpoint_mirror::effect(port(
             Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(
-                db_handle,
+                Arc::new(db.clone()),
             )),
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
         ))

@@ -1,7 +1,9 @@
 //! Dataplane metadata helpers extracted from runtime.rs (R3 refactor).
 
+use crate::KlightsConfig;
 use crate::bootstrap::NodeMode;
-use crate::{KlightsConfig, datastore};
+#[cfg(test)]
+use crate::datastore;
 
 use super::leader_control_stream::runtime_epoch_ms;
 
@@ -144,6 +146,7 @@ fn node_status_external_ip(node: &serde_json::Value) -> Option<&str> {
 ///
 /// Never falls back to the internal node IP — that would advertise an
 /// unreachable address as the cross-node WireGuard endpoint.
+#[cfg(test)]
 pub async fn resolve_local_external_endpoint(
     db: &dyn datastore::DatastoreBackend,
     config: &KlightsConfig,
@@ -173,6 +176,7 @@ pub async fn resolve_local_external_endpoint(
 ///
 /// Returns `Ok(true)` when a new row was written, `Ok(false)` when one already
 /// existed.
+#[cfg(test)]
 pub async fn ensure_node_dataplane_published(
     db: &dyn datastore::DatastoreBackend,
     command: &dyn klights_leader_api::LeaderNetworkTopologyCommand,
@@ -208,6 +212,7 @@ pub async fn ensure_node_dataplane_published(
 /// Returns `Ok(true)` when metadata was published, `Ok(false)` when no external
 /// endpoint could be resolved yet (the watcher / observed-endpoint path will
 /// publish it later once an endpoint becomes known).
+#[cfg(test)]
 pub async fn publish_local_dataplane_metadata_self_heal(
     db: &dyn datastore::DatastoreBackend,
     command: &dyn klights_leader_api::LeaderNetworkTopologyCommand,
@@ -235,6 +240,48 @@ pub async fn publish_local_dataplane_metadata_self_heal(
     Ok(true)
 }
 
+pub async fn publish_local_dataplane_metadata_self_heal_with_resource_reads(
+    resource_reads: &dyn klights_cluster_store::ClusterResourceRead,
+    command: &dyn klights_leader_api::LeaderNetworkTopologyCommand,
+    config: &KlightsConfig,
+    node_mode: &NodeMode,
+    supervisor: &klights_supervisor::TaskSupervisor,
+) -> anyhow::Result<bool> {
+    let endpoint = if let Some(endpoint) = config
+        .external_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(endpoint.to_string())
+    } else {
+        resource_reads
+            .get_resource(klights_cluster_store::ResourceGetRequest::new(
+                "v1",
+                "Node",
+                None,
+                &config.node_name,
+            ))
+            .await
+            .map_err(anyhow::Error::new)?
+            .and_then(|node| node_status_external_ip(&node.data).map(str::to_string))
+    };
+    let Some(endpoint) = endpoint else {
+        return Ok(false);
+    };
+    let metadata =
+        local_dataplane_peer_metadata_with_endpoint(config, node_mode, &endpoint, supervisor)
+            .await?;
+    command
+        .register_node_dataplane(
+            crate::bootstrap::leader_conversions::topology::focused_dataplane(metadata)?,
+        )
+        .await
+        .map_err(anyhow::Error::new)?;
+    tracing::info!(node = %config.node_name, endpoint = %endpoint, "published local dataplane metadata from resolved external endpoint");
+    Ok(true)
+}
+
 pub async fn enqueue_worker_dataplane_metadata_outbox(
     outbox: Option<&klights_kubelet::node_outbox::Outbox>,
     node_name: &str,
@@ -258,11 +305,15 @@ mod tests {
     use super::*;
 
     fn test_dataplane_command(
-        db: crate::datastore::DatastoreHandle,
+        db: &crate::datastore::sqlite::Datastore,
     ) -> crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork{
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
-            db.clone(),
-            std::sync::Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db)),
+            db.focused_read_store(),
+            {
+                std::sync::Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                    std::sync::Arc::new(db.clone()),
+                ))
+            },
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         )
     }
@@ -444,7 +495,7 @@ mod tests {
 
         let published = publish_local_dataplane_metadata_self_heal(
             &db,
-            &test_dataplane_command(std::sync::Arc::new(db.clone())),
+            &test_dataplane_command(&db),
             &config,
             &NodeMode::Root,
             &supervisor,
@@ -479,7 +530,7 @@ mod tests {
 
         let wrote = ensure_node_dataplane_published(
             &db,
-            &test_dataplane_command(std::sync::Arc::new(db.clone())),
+            &test_dataplane_command(&db),
             &config,
             &NodeMode::Root,
             "198.51.100.47",
@@ -526,7 +577,7 @@ mod tests {
 
         let wrote = ensure_node_dataplane_published(
             &db,
-            &test_dataplane_command(std::sync::Arc::new(db.clone())),
+            &test_dataplane_command(&db),
             &config,
             &NodeMode::Root,
             "198.51.100.47",
@@ -562,7 +613,7 @@ mod tests {
 
         let published = publish_local_dataplane_metadata_self_heal(
             &db,
-            &test_dataplane_command(std::sync::Arc::new(db.clone())),
+            &test_dataplane_command(&db),
             &config,
             &NodeMode::Root,
             &supervisor,

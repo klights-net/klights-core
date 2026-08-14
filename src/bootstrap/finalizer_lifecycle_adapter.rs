@@ -9,8 +9,10 @@ use klights_reconcile_api::{
 use klights_cluster_core::StorageCommand;
 use klights_leader_api::{LeaderResourceCommand, ResourceCommandRequest, ResourceCommandResult};
 
+#[cfg(test)]
 use crate::datastore::DatastoreHandle;
 use klights_cluster_datastore::errors::DatastoreError;
+use klights_cluster_store::{ClusterOwnershipRead, ClusterResourceRead, ResourceGetRequest};
 
 pub(crate) struct DatastoreFinalizerLifecycleAdapter {
     lifecycle: CommandFinalizerLifecycleStore,
@@ -24,24 +26,7 @@ pub(crate) struct DatastoreFinalizerLifecycleAdapter {
 
 impl DatastoreFinalizerLifecycleAdapter {
     #[cfg(test)]
-    pub(crate) fn new(
-        db: DatastoreHandle,
-        pod_delete_sink: Arc<dyn GcPodDeleteSink>,
-        side_effects: Arc<klights_controllers::side_effects::SideEffectRegistry>,
-        metrics: Arc<klights_controllers::side_effects::SideEffectMetrics>,
-    ) -> Arc<Self> {
-        let commands = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(db.clone());
-        Self::new_with_coordination(
-            db,
-            commands,
-            pod_delete_sink,
-            side_effects,
-            metrics,
-            Arc::new(klights_controllers::ControllerCoordination::new()),
-        )
-    }
-
-    pub(crate) fn new_with_coordination(
+    pub(crate) fn new_for_test_with_coordination(
         db: DatastoreHandle,
         resource_commands: Arc<dyn LeaderResourceCommand>,
         pod_delete_sink: Arc<dyn GcPodDeleteSink>,
@@ -50,10 +35,32 @@ impl DatastoreFinalizerLifecycleAdapter {
         coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            non_pod_finalization: crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new_for_test_with_commands(db.clone(), resource_commands.clone()),
+            lifecycle: CommandFinalizerLifecycleStore::new_for_test(db, resource_commands),
+            pod_delete_sink,
+            side_effects,
+            metrics,
+            coordination,
+        })
+    }
+    pub(crate) fn new_with_coordination(
+        resource_reads: Arc<dyn ClusterResourceRead>,
+        ownership_reads: Arc<dyn ClusterOwnershipRead>,
+        resource_commands: Arc<dyn LeaderResourceCommand>,
+        pod_delete_sink: Arc<dyn GcPodDeleteSink>,
+        side_effects: Arc<klights_controllers::side_effects::SideEffectRegistry>,
+        metrics: Arc<klights_controllers::side_effects::SideEffectMetrics>,
+        coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
             non_pod_finalization: crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new_with_commands(
-                db.clone(), resource_commands.clone(),
+                resource_reads.clone(), ownership_reads.clone(),
+                resource_commands.clone(),
             ),
-            lifecycle: CommandFinalizerLifecycleStore::new(db, resource_commands),
+            lifecycle: CommandFinalizerLifecycleStore::new(
+                resource_reads, ownership_reads,
+                resource_commands,
+            ),
             pod_delete_sink,
             side_effects,
             metrics,
@@ -64,7 +71,9 @@ impl DatastoreFinalizerLifecycleAdapter {
 
 #[derive(Clone)]
 pub(crate) struct CommandFinalizerLifecycleStore {
-    db: DatastoreHandle,
+    resource_reads: Option<Arc<dyn ClusterResourceRead>>,
+    #[cfg(test)]
+    db: Option<DatastoreHandle>,
     commands: Arc<dyn LeaderResourceCommand>,
     gc: Arc<
         crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort,
@@ -72,12 +81,30 @@ pub(crate) struct CommandFinalizerLifecycleStore {
 }
 
 impl CommandFinalizerLifecycleStore {
-    pub(crate) fn new(db: DatastoreHandle, commands: Arc<dyn LeaderResourceCommand>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        db: DatastoreHandle,
+        commands: Arc<dyn LeaderResourceCommand>,
+    ) -> Self {
+        Self {
+            resource_reads: None,
+            db: Some(db.clone()),
+            gc: Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_for_test_with_commands(db, commands.clone())),
+            commands,
+        }
+    }
+    pub(crate) fn new(
+        resource_reads: Arc<dyn ClusterResourceRead>,
+        ownership_reads: Arc<dyn ClusterOwnershipRead>,
+        commands: Arc<dyn LeaderResourceCommand>,
+    ) -> Self {
         Self {
             gc: Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
-                db.clone(), commands.clone(),
+                resource_reads.clone(), ownership_reads,
+                commands.clone(),
             )),
-            db,
+            resource_reads: Some(resource_reads),
+            #[cfg(test)] db: None,
             commands,
         }
     }
@@ -212,10 +239,24 @@ impl FinalizerLifecyclePort for CommandFinalizerLifecycleStore {
     ) -> FinalizerLifecycleFuture<'_, Option<klights_cluster_core::Resource>> {
         Box::pin(async move {
             let (api_version, kind, namespace, name) = target_parts(&target);
-            self.db
-                .get_resource(api_version, kind, namespace, name)
+            #[cfg(test)]
+            if let Some(db) = &self.db {
+                return db
+                    .get_resource(api_version, kind, namespace, name)
+                    .await
+                    .map_err(lifecycle_error);
+            }
+            self.resource_reads
+                .as_ref()
+                .expect("focused finalizer resource reads")
+                .get_resource(ResourceGetRequest::new(
+                    api_version,
+                    kind,
+                    namespace.map(ToOwned::to_owned),
+                    name,
+                ))
                 .await
-                .map_err(lifecycle_error)
+                .map_err(|error| lifecycle_error(error.into()))
         })
     }
 
@@ -313,7 +354,6 @@ mod tests {
         let db = crate::datastore::sqlite::Datastore::new_in_memory()
             .await
             .unwrap();
-        let db_handle: DatastoreHandle = Arc::new(db.clone());
         db.create_resource(
             "v1",
             "Pod",
@@ -343,11 +383,29 @@ mod tests {
         .expect("create bound Pod child");
 
         let sink = Arc::new(RecordingPodDeleteSink::default());
-        let adapter = DatastoreFinalizerLifecycleAdapter::new(
+        let db_handle: DatastoreHandle = Arc::new(db.clone());
+        let authority =
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
+        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+            db_handle.clone(), authority.clone());
+        let commands = Arc::new(
+            klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
+                Arc::new(
+                    crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                        db_handle.clone(),
+                    ),
+                ),
+                query,
+                authority,
+            ),
+        );
+        let adapter = DatastoreFinalizerLifecycleAdapter::new_for_test_with_coordination(
             db_handle,
+            commands,
             sink.clone(),
             Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
             klights_controllers::side_effects::SideEffectMetrics::new(),
+            Arc::new(klights_controllers::ControllerCoordination::new()),
         );
         let owner = klights_cluster_core::Resource {
             id: 1,

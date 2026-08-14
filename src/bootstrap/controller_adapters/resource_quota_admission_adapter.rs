@@ -3,12 +3,14 @@ use klights_reconcile_api::{
 };
 
 pub(crate) struct ResourceQuotaAdmissionAdapter {
-    db: crate::datastore::DatastoreHandle,
+    resource_reads: std::sync::Arc<dyn klights_cluster_store::ClusterResourceRead>,
 }
 
 impl ResourceQuotaAdmissionAdapter {
-    pub(crate) fn new(db: crate::datastore::DatastoreHandle) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self { db })
+    pub(crate) fn new(
+        resource_reads: std::sync::Arc<dyn klights_cluster_store::ClusterResourceRead>,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { resource_reads })
     }
 }
 
@@ -20,16 +22,31 @@ impl ResourceQuotaAdmissionRuntime for ResourceQuotaAdmissionAdapter {
         namespace: &'a str,
     ) -> QuotaResourceListFuture<'a> {
         Box::pin(async move {
-            self.db
-                .list_resources(
+            match self
+                .resource_reads
+                .list_resources(klights_cluster_store::ResourceListRequest::new(
                     api_version,
                     kind,
-                    Some(namespace),
-                    klights_cluster_store::ResourceListOptions::all(),
-                )
+                    klights_cluster_store::ResourceCollectionScope::Namespace(
+                        namespace.to_string(),
+                    ),
+                    klights_cluster_store::ResourceListQuery::all(),
+                ))
                 .await
-                .map(|list| list.items)
-                .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))
+                .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))?
+            {
+                klights_cluster_store::ResourceListRead::Current(page)
+                | klights_cluster_store::ResourceListRead::Historical(page) => {
+                    Ok(page.into_items())
+                }
+                klights_cluster_store::ResourceListRead::Expired {
+                    requested,
+                    oldest_available,
+                    ..
+                } => Err(ReconcileSinkError::unavailable(format!(
+                    "{api_version}/{kind} LIST at resourceVersion {requested} expired before {oldest_available}"
+                ))),
+            }
         })
     }
 

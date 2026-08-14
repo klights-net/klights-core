@@ -233,6 +233,7 @@ pub struct GenericReadWatchRequest {
     pub api_version: &'static str,
     pub kind: &'static str,
     pub namespace: Option<String>,
+    pub scope: ResourceListScope,
     pub query: ListQuery,
     pub headers: HeaderMap,
     pub wall_clock: Arc<dyn klights_auth::clock::Clock>,
@@ -381,6 +382,16 @@ pub async fn list_inner<S: GenericReadState + 'static>(
         query.field_selector.as_deref(),
         namespaced,
     )?;
+    let collection_scope = match (namespaced, namespace.clone()) {
+        (true, Some(namespace)) => ResourceListScope::Namespace(namespace),
+        (true, None) => ResourceListScope::AllNamespaces,
+        (false, None) => ResourceListScope::Cluster,
+        (false, Some(_)) => {
+            return Err(AppError::BadRequest(
+                "cluster-scoped LIST route must not carry a namespace".to_string(),
+            ));
+        }
+    };
     if query.watch.as_deref() == Some("true") {
         query.validate_send_initial_events_watch()?;
         return state
@@ -389,6 +400,7 @@ pub async fn list_inner<S: GenericReadState + 'static>(
                 api_version,
                 kind,
                 namespace,
+                scope: collection_scope,
                 query,
                 headers,
                 wall_clock: state.read_operational().wall_clock(),
@@ -402,16 +414,6 @@ pub async fn list_inner<S: GenericReadState + 'static>(
             AppError::Internal("operation time is outside the supported timestamp range".into())
         })?;
     let normalized_limit = query.normalized_limit()?;
-    let collection_scope = match (namespaced, namespace.clone()) {
-        (true, Some(namespace)) => ResourceListScope::Namespace(namespace),
-        (true, None) => ResourceListScope::AllNamespaces,
-        (false, None) => ResourceListScope::Cluster,
-        (false, Some(_)) => {
-            return Err(AppError::BadRequest(
-                "cluster-scoped LIST route must not carry a namespace".to_string(),
-            ));
-        }
-    };
     let (continue_token, continuation_mode) =
         process_generic_list_continue_token(query.continue_token.clone())?;
     let resource_version_match = match query.resolve_resource_version_match(

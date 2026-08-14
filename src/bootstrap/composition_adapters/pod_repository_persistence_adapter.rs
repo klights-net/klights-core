@@ -25,13 +25,11 @@ use klights_pod_api::{
 };
 use klights_types::PodIdentity;
 
-use crate::datastore::DatastoreHandle;
-#[cfg(test)]
-use klights_kubelet::pod_repository::store::PodRepositoryWatchPersistence;
 use klights_kubelet::pod_repository::store::{ActorPodDeleteObservation, PodStore};
 
 struct RootPodRepositoryPersistenceAdapter {
-    db: DatastoreHandle,
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
     commands: Option<Arc<dyn LeaderResourceCommand>>,
     sandbox_gc_dirty: Arc<AtomicUsize>,
     #[cfg(test)]
@@ -145,10 +143,33 @@ impl PodRepositoryReadPersistence for RootPodRepositoryPersistenceAdapter {
         request: PodRepositoryGetRequest,
     ) -> PodRepositoryFuture<'_, Option<klights_cluster_core::Resource>> {
         Box::pin(async move {
-            self.db
-                .get_resource("v1", "Pod", Some(&request.namespace), &request.name)
+            self.resource_query
+                .get_resource(
+                    klights_leader_api::ResourceGetRequest::try_new(
+                        klights_types::ResourceKey::new(
+                            "v1",
+                            "Pod",
+                            Some(request.namespace.clone()),
+                            request.name.clone(),
+                        ),
+                        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+                    )
+                    .map_err(|error| {
+                        pod_persistence_error(
+                            anyhow::Error::msg(error.to_string()),
+                            &request.namespace,
+                            &request.name,
+                        )
+                    })?,
+                )
                 .await
-                .map_err(|error| pod_persistence_error(error, &request.namespace, &request.name))
+                .map_err(|error| {
+                    pod_persistence_error(
+                        anyhow::Error::msg(error.to_string()),
+                        &request.namespace,
+                        &request.name,
+                    )
+                })
         })
     }
 
@@ -158,31 +179,46 @@ impl PodRepositoryReadPersistence for RootPodRepositoryPersistenceAdapter {
     ) -> PodRepositoryFuture<'_, PodListResult> {
         Box::pin(async move {
             let list = self
-                .db
+                .resource_query
                 .list_resources(
-                    "v1",
-                    "Pod",
-                    request.namespace.as_deref(),
-                    klights_cluster_store::ResourceListOptions::new(
-                        request.label_selector.as_deref(),
-                        request.field_selector.as_deref(),
+                    klights_leader_api::ResourceListRequest::try_new(
+                        "v1",
+                        "Pod",
+                        request
+                            .namespace
+                            .clone()
+                            .map(klights_leader_api::ResourceListScope::Namespace)
+                            .unwrap_or(klights_leader_api::ResourceListScope::AllNamespaces),
+                        request.label_selector.clone(),
+                        request.field_selector.clone(),
                         request.limit,
-                        request.continue_token.as_deref(),
-                    ),
+                        request.continue_token.clone(),
+                        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+                    )
+                    .map_err(|error| {
+                        pod_persistence_error(
+                            anyhow::Error::msg(error.to_string()),
+                            request.namespace.as_deref().unwrap_or_default(),
+                            "Pod list",
+                        )
+                    })?,
                 )
                 .await
                 .map_err(|error| {
                     pod_persistence_error(
-                        error,
+                        anyhow::Error::msg(error.to_string()),
                         request.namespace.as_deref().unwrap_or_default(),
                         "Pod list",
                     )
                 })?;
+            let resource_version = list.resource_version();
+            let continue_token = list.continue_token().map(str::to_owned);
+            let remaining_item_count = list.remaining_item_count();
             PodListResult::try_new(
-                list.items,
-                list.resource_version,
-                list.continue_token,
-                list.remaining_item_count,
+                list.into_items(),
+                resource_version,
+                continue_token,
+                remaining_item_count,
             )
         })
     }
@@ -192,35 +228,43 @@ impl PodRepositoryReadPersistence for RootPodRepositoryPersistenceAdapter {
         request: PodSnapshotListRequest,
     ) -> PodRepositoryFuture<'_, PodSnapshotListOutcome> {
         Box::pin(async move {
-            let list = request.list;
-            let snapshot = self
-                .db
-                .snapshot_resources_at_rv(
-                    "v1",
-                    "Pod",
-                    list.namespace(),
-                    klights_cluster_store::ResourceListOptions::new(
-                        list.label_selector(),
-                        list.field_selector(),
-                        list.limit(),
-                        list.continue_token(),
-                    ),
+            let list = &request.list;
+            let query = klights_leader_api::ResourceListRequest::try_new(
+                "v1",
+                "Pod",
+                list.namespace()
+                    .map(|value| klights_leader_api::ResourceListScope::Namespace(value.to_owned()))
+                    .unwrap_or(klights_leader_api::ResourceListScope::AllNamespaces),
+                list.label_selector().map(str::to_owned),
+                list.field_selector().map(str::to_owned),
+                list.limit(),
+                list.continue_token().map(str::to_owned),
+                klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+            )
+            .map_err(|error| PodRepositoryError::unavailable(error.to_string()))?
+            .with_resource_version_match(
+                klights_leader_api::ResourceListResourceVersionMatch::Exact(
                     request.snapshot_resource_version,
-                )
-                .await
-                .map_err(|error| PodRepositoryError::unavailable(error.to_string()))?;
-            Ok(match snapshot {
-                klights_cluster_store::SnapshotAtRv::List(list) => {
-                    PodSnapshotListOutcome::List(PodListResult::try_new(
-                        list.items,
-                        list.resource_version,
-                        list.continue_token,
-                        list.remaining_item_count,
-                    )?)
+                ),
+            )
+            .map_err(|error| PodRepositoryError::unavailable(error.to_string()))?;
+            match self.resource_query.list_resources(query).await {
+                Ok(list) => {
+                    let resource_version = list.resource_version();
+                    let continue_token = list.continue_token().map(str::to_owned);
+                    let remaining_item_count = list.remaining_item_count();
+                    Ok(PodSnapshotListOutcome::List(PodListResult::try_new(
+                        list.into_items(),
+                        resource_version,
+                        continue_token,
+                        remaining_item_count,
+                    )?))
                 }
-                klights_cluster_store::SnapshotAtRv::Current => PodSnapshotListOutcome::Current,
-                klights_cluster_store::SnapshotAtRv::Expired => PodSnapshotListOutcome::Expired,
-            })
+                Err(klights_leader_api::ResourceQueryError::NotFound { .. }) => {
+                    Ok(PodSnapshotListOutcome::Current)
+                }
+                Err(error) => Err(PodRepositoryError::unavailable(error.to_string())),
+            }
         })
     }
 
@@ -229,15 +273,32 @@ impl PodRepositoryReadPersistence for RootPodRepositoryPersistenceAdapter {
         request: PodRepositoryOwnerListRequest,
     ) -> PodRepositoryFuture<'_, Vec<klights_cluster_core::Resource>> {
         Box::pin(async move {
-            self.db
+            let owned = self
+                .ownership_reads
                 .list_resources_by_owner_uid(
-                    "v1",
-                    "Pod",
-                    Some(&request.namespace),
-                    &request.owner_uid,
+                    klights_cluster_store::OwnedKindRequest::try_new(
+                        "v1",
+                        "Pod",
+                        Some(request.namespace.clone()),
+                        request.owner_uid.clone(),
+                    )
+                    .map_err(|error| {
+                        pod_persistence_error(
+                            anyhow::Error::msg(error.to_string()),
+                            &request.namespace,
+                            "Pod owner list",
+                        )
+                    })?,
                 )
                 .await
-                .map_err(|error| pod_persistence_error(error, &request.namespace, "Pod owner list"))
+                .map_err(|error| {
+                    pod_persistence_error(
+                        anyhow::Error::msg(error.to_string()),
+                        &request.namespace,
+                        "Pod owner list",
+                    )
+                })?;
+            Ok(owned)
         })
     }
 }
@@ -263,16 +324,9 @@ impl PodRepositoryWritePersistence for RootPodRepositoryPersistenceAdapter {
                     )
                     .await;
             }
-            self.db
-                .create_resource(
-                    "v1",
-                    "Pod",
-                    Some(&request.namespace),
-                    &request.name,
-                    request.body,
-                )
-                .await
-                .map_err(|error| pod_persistence_error(error, &request.namespace, &request.name))
+            Err(PodRepositoryError::unavailable(
+                "root Pod create requires leader resource commands",
+            ))
         })
     }
 
@@ -299,17 +353,9 @@ impl PodRepositoryWritePersistence for RootPodRepositoryPersistenceAdapter {
                     )
                     .await;
             }
-            self.db
-                .update_resource_with_preconditions(
-                    "v1",
-                    "Pod",
-                    Some(&request.namespace),
-                    &request.name,
-                    request.body,
-                    request.preconditions,
-                )
-                .await
-                .map_err(|error| pod_persistence_error(error, &request.namespace, &request.name))
+            Err(PodRepositoryError::unavailable(
+                "root Pod replace requires leader resource commands",
+            ))
         })
     }
 
@@ -340,20 +386,9 @@ impl PodRepositoryWritePersistence for RootPodRepositoryPersistenceAdapter {
                     .await
                     .map(Some);
             }
-            self.db
-                .patch_resource_latest_with_preconditions(
-                    "v1",
-                    "Pod",
-                    Some(&request.namespace),
-                    &request.name,
-                    crate::datastore::ResourcePatchRequest::new(
-                        request.patch_kind,
-                        request.patch,
-                        request.preconditions,
-                    ),
-                )
-                .await
-                .map_err(|error| pod_persistence_error(error, &request.namespace, &request.name))
+            Err(PodRepositoryError::unavailable(
+                "root Pod patch requires leader resource commands",
+            ))
         })
     }
 
@@ -380,17 +415,9 @@ impl PodRepositoryWritePersistence for RootPodRepositoryPersistenceAdapter {
                     )
                     .await;
             }
-            self.db
-                .update_status_only_with_preconditions(
-                    "v1",
-                    "Pod",
-                    Some(&request.namespace),
-                    &request.name,
-                    request.status,
-                    request.preconditions,
-                )
-                .await
-                .map_err(|error| pod_persistence_error(error, &request.namespace, &request.name))
+            Err(PodRepositoryError::unavailable(
+                "root Pod status requires leader resource commands",
+            ))
         })
     }
 
@@ -408,14 +435,6 @@ impl PodRepositoryWritePersistence for RootPodRepositoryPersistenceAdapter {
     }
 }
 
-#[cfg(test)]
-impl PodRepositoryWatchPersistence for RootPodRepositoryPersistenceAdapter {
-    fn pod_watch_receiver(&self) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
-        self.db
-            .subscribe_watch(klights_watch::WatchTopic::new("v1", "Pod"))
-    }
-}
-
 impl LocalBoundPodFinalizationPersistence for RootPodRepositoryPersistenceAdapter {
     fn finalize_bound_pod(
         &self,
@@ -424,8 +443,19 @@ impl LocalBoundPodFinalizationPersistence for RootPodRepositoryPersistenceAdapte
         Box::pin(async move {
             let identity = request.into_identity();
             let current = self
-                .db
-                .get_resource("v1", "Pod", Some(&identity.namespace), &identity.name)
+                .resource_query
+                .get_resource(
+                    klights_leader_api::ResourceGetRequest::try_new(
+                        klights_types::ResourceKey::new(
+                            "v1",
+                            "Pod",
+                            Some(identity.namespace.clone()),
+                            identity.name.clone(),
+                        ),
+                        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+                    )
+                    .map_err(|error| BoundPodFinalizationError::unavailable(error.to_string()))?,
+                )
                 .await
                 .map_err(|error| BoundPodFinalizationError::unavailable(error.to_string()))?;
             let observed_resource_version =
@@ -485,38 +515,9 @@ impl LocalBoundPodFinalizationPersistence for RootPodRepositoryPersistenceAdapte
                     Err(error) => Err(BoundPodFinalizationError::unavailable(error.to_string())),
                 };
             }
-            match self
-                .db
-                .delete_resource_with_preconditions(
-                    "v1",
-                    "Pod",
-                    Some(&identity.namespace),
-                    &identity.name,
-                    preconditions,
-                )
-                .await
-            {
-                Ok(()) => {
-                    self.sandbox_gc_dirty.fetch_add(1, Ordering::Release);
-                    Ok(BoundPodFinalizationOutcome::Removed)
-                }
-                Err(error) if klights_cluster_datastore::errors::is_conflict_error(&error) => {
-                    Ok(BoundPodFinalizationOutcome::Retry)
-                }
-                Err(error)
-                    if error
-                        .downcast_ref::<klights_cluster_datastore::errors::DatastoreError>()
-                        .is_some_and(|error| {
-                            matches!(
-                                error,
-                                klights_cluster_datastore::errors::DatastoreError::NotFound { .. }
-                            )
-                        }) =>
-                {
-                    Ok(BoundPodFinalizationOutcome::IdentityChanged)
-                }
-                Err(error) => Err(BoundPodFinalizationError::unavailable(error.to_string())),
-            }
+            Err(BoundPodFinalizationError::unavailable(
+                "actor Pod finalization requires leader resource commands",
+            ))
         })
     }
 }
@@ -548,14 +549,27 @@ impl UnscheduledPodDeletionPort for RootPodRepositoryPersistenceAdapter {
     ) -> UnscheduledPodDeletionPortFuture<'a, Option<UnscheduledPodDeletionObservation>> {
         Box::pin(async move {
             Self::validate_delete_lease()?;
-            let Some(resource) = self
-                .db
-                .get_resource("v1", "Pod", Some(&identity.namespace), &identity.name)
+            let resource = self
+                .resource_query
+                .get_resource(
+                    klights_leader_api::ResourceGetRequest::try_new(
+                        klights_types::ResourceKey::new(
+                            "v1",
+                            "Pod",
+                            Some(identity.namespace.clone()),
+                            identity.name.clone(),
+                        ),
+                        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+                    )
+                    .map_err(|error| {
+                        klights_pod_api::UnscheduledPodDeletionError::unavailable(error.to_string())
+                    })?,
+                )
                 .await
                 .map_err(|error| {
                     klights_pod_api::UnscheduledPodDeletionError::unavailable(error.to_string())
-                })?
-            else {
+                })?;
+            let Some(resource) = resource else {
                 return Ok(None);
             };
             let node_name = resource
@@ -639,52 +653,23 @@ impl UnscheduledPodDeletionPort for RootPodRepositoryPersistenceAdapter {
                     )),
                 };
             }
-            match self
-                .db
-                .delete_resource_with_preconditions(
-                    "v1",
-                    "Pod",
-                    Some(&identity.namespace),
-                    &identity.name,
-                    preconditions,
-                )
-                .await
-            {
-                Ok(()) => {
-                    self.sandbox_gc_dirty.fetch_add(1, Ordering::Release);
-                    Ok(UnscheduledPodDeleteCasOutcome::Removed)
-                }
-                Err(error) if klights_cluster_datastore::errors::is_conflict_error(&error) => {
-                    Ok(UnscheduledPodDeleteCasOutcome::Conflict)
-                }
-                Err(error)
-                    if error
-                        .downcast_ref::<klights_cluster_datastore::errors::DatastoreError>()
-                        .is_some_and(|error| {
-                            matches!(
-                                error,
-                                klights_cluster_datastore::errors::DatastoreError::NotFound { .. }
-                            )
-                        }) =>
-                {
-                    Ok(UnscheduledPodDeleteCasOutcome::Gone)
-                }
-                Err(error) => Err(klights_pod_api::UnscheduledPodDeletionError::unavailable(
-                    error.to_string(),
-                )),
-            }
+            Err(klights_pod_api::UnscheduledPodDeletionError::unavailable(
+                "unscheduled Pod deletion requires leader resource commands",
+            ))
         })
     }
 }
 
 fn concrete_adapter(
-    db: DatastoreHandle,
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
     commands: Option<Arc<dyn LeaderResourceCommand>>,
     sandbox_gc_dirty: Arc<AtomicUsize>,
     #[cfg(test)] delete_cas_hook: Option<Arc<dyn PodDeleteCasTestHook>>,
 ) -> Arc<RootPodRepositoryPersistenceAdapter> {
     Arc::new(RootPodRepositoryPersistenceAdapter {
-        db,
+        resource_query,
+        ownership_reads,
         commands,
         sandbox_gc_dirty,
         #[cfg(test)]
@@ -692,59 +677,21 @@ fn concrete_adapter(
     })
 }
 
-pub(crate) fn new_root_parts(
-    db: DatastoreHandle,
-    _wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
-) -> RootPodRepositoryPersistenceParts {
-    let sandbox_gc_dirty = Arc::new(AtomicUsize::new(1));
-    let concrete = concrete_adapter(
-        db,
-        None,
-        sandbox_gc_dirty.clone(),
-        #[cfg(test)]
-        None,
-    );
-    #[cfg(test)]
-    let store = Arc::new(PodStore::from_persistence_with_watch(
-        concrete.clone(),
-        concrete.clone(),
-        sandbox_gc_dirty,
-        Some(concrete.clone()),
-    ));
-    #[cfg(not(test))]
-    let store = Arc::new(PodStore::from_persistence(
-        concrete.clone(),
-        concrete.clone(),
-        sandbox_gc_dirty,
-    ));
-    RootPodRepositoryPersistenceParts {
-        store,
-        bound_finalization: concrete.clone(),
-        unscheduled_deletion: Arc::new(UnscheduledPodDeletionService::new(concrete.clone())),
-    }
-}
-
 pub(crate) fn new_raft_root_parts(
-    db: DatastoreHandle,
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
     commands: Arc<dyn LeaderResourceCommand>,
     _wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
 ) -> RootPodRepositoryPersistenceParts {
     let sandbox_gc_dirty = Arc::new(AtomicUsize::new(1));
     let concrete = concrete_adapter(
-        db,
+        resource_query,
+        ownership_reads,
         Some(commands),
         sandbox_gc_dirty.clone(),
         #[cfg(test)]
         None,
     );
-    #[cfg(test)]
-    let store = Arc::new(PodStore::from_persistence_with_watch(
-        concrete.clone(),
-        concrete.clone(),
-        sandbox_gc_dirty,
-        Some(concrete.clone()),
-    ));
-    #[cfg(not(test))]
     let store = Arc::new(PodStore::from_persistence(
         concrete.clone(),
         concrete.clone(),
@@ -758,17 +705,34 @@ pub(crate) fn new_raft_root_parts(
 }
 
 #[cfg(test)]
+pub(crate) fn new_root_parts(
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
+    commands: Arc<dyn LeaderResourceCommand>,
+    wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+) -> RootPodRepositoryPersistenceParts {
+    new_raft_root_parts(resource_query, ownership_reads, commands, wall_clock)
+}
+
+#[cfg(test)]
 pub(crate) fn new_root_parts_with_delete_cas_hook(
-    db: DatastoreHandle,
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
+    commands: Arc<dyn LeaderResourceCommand>,
     delete_cas_hook: Arc<dyn PodDeleteCasTestHook>,
 ) -> RootPodRepositoryPersistenceParts {
     let sandbox_gc_dirty = Arc::new(AtomicUsize::new(1));
-    let concrete = concrete_adapter(db, None, sandbox_gc_dirty.clone(), Some(delete_cas_hook));
-    let store = Arc::new(PodStore::from_persistence_with_watch(
+    let concrete = concrete_adapter(
+        resource_query,
+        ownership_reads,
+        Some(commands),
+        sandbox_gc_dirty.clone(),
+        Some(delete_cas_hook),
+    );
+    let store = Arc::new(PodStore::from_persistence(
         concrete.clone(),
         concrete.clone(),
         sandbox_gc_dirty,
-        Some(concrete.clone()),
     ));
     RootPodRepositoryPersistenceParts {
         store,
@@ -777,25 +741,132 @@ pub(crate) fn new_root_parts_with_delete_cas_hook(
     }
 }
 
-pub(crate) fn new_store(db: DatastoreHandle) -> PodStore {
+/// Narrow test-only bridge for fixtures that deliberately exercise the
+/// root's historical in-memory handle. Production construction never takes a
+/// broad backend; this bridge is kept beside the one consumer type it serves.
+#[cfg(test)]
+pub(crate) fn new_root_parts_from_test_handle(
+    db: crate::datastore::DatastoreHandle,
+    wall_clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+) -> RootPodRepositoryPersistenceParts {
+    let authority = crate::bootstrap::authority::AuthorityHandle::from(
+        crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+    );
+    let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+        db.clone(), authority.clone(),
+    );
+    let commands: Arc<dyn LeaderResourceCommand> = Arc::new(
+        klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
+            Arc::new(
+                crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()),
+            ),
+            query.clone(),
+            authority.authority_arc(),
+        ),
+    );
+    new_root_parts(
+        query,
+        Arc::new(TestOwnershipReads { db }),
+        commands,
+        wall_clock,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn new_store_from_test_handle(db: crate::datastore::DatastoreHandle) -> PodStore {
+    let authority = crate::bootstrap::authority::AuthorityHandle::from(
+        crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+    );
+    let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+        db.clone(), authority.clone(),
+    );
+    let commands: Arc<dyn LeaderResourceCommand> = Arc::new(
+        klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
+            Arc::new(
+                crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()),
+            ),
+            query.clone(),
+            authority.authority_arc(),
+        ),
+    );
+    new_store(query, Arc::new(TestOwnershipReads { db }), commands)
+}
+
+#[cfg(test)]
+struct TestOwnershipReads {
+    db: crate::datastore::DatastoreHandle,
+}
+
+#[cfg(test)]
+impl klights_cluster_store::ClusterOwnershipRead for TestOwnershipReads {
+    fn find_owned_resources(
+        &self,
+        request: klights_cluster_store::OwnerUidRequest,
+    ) -> klights_cluster_store::OwnershipReadFuture<'_, Vec<klights_cluster_core::Resource>> {
+        Box::pin(async move {
+            self.db
+                .find_owned_resources(request.owner_uid(), request.namespace())
+                .await
+                .map_err(|error| {
+                    klights_cluster_store::ResourceReadError::retryable(error.to_string())
+                })
+        })
+    }
+
+    fn list_resources_by_owner_uid(
+        &self,
+        request: klights_cluster_store::OwnedKindRequest,
+    ) -> klights_cluster_store::OwnershipReadFuture<'_, Vec<klights_cluster_core::Resource>> {
+        Box::pin(async move {
+            self.db
+                .list_resources_by_owner_uid(
+                    request.api_version(),
+                    request.kind(),
+                    request.namespace(),
+                    request.owner_uid(),
+                )
+                .await
+                .map_err(|error| {
+                    klights_cluster_store::ResourceReadError::retryable(error.to_string())
+                })
+        })
+    }
+
+    fn find_owned_by_name_kind_empty_uid(
+        &self,
+        request: klights_cluster_store::OwnerNameKindRequest,
+    ) -> klights_cluster_store::OwnershipReadFuture<'_, Vec<klights_cluster_core::Resource>> {
+        Box::pin(async move {
+            self.db
+                .find_owned_by_name_kind_empty_uid(
+                    request.owner_api_version(),
+                    request.owner_name(),
+                    request.owner_kind(),
+                    request.namespace(),
+                )
+                .await
+                .map_err(|error| {
+                    klights_cluster_store::ResourceReadError::retryable(error.to_string())
+                })
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn new_store(
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
+    commands: Arc<dyn LeaderResourceCommand>,
+) -> PodStore {
     let sandbox_gc_dirty = Arc::new(AtomicUsize::new(1));
     let concrete = concrete_adapter(
-        db,
-        None,
+        resource_query,
+        ownership_reads,
+        Some(commands),
         sandbox_gc_dirty.clone(),
         #[cfg(test)]
         None,
     );
-    #[cfg(test)]
-    {
-        PodStore::from_persistence_with_watch(
-            concrete.clone(),
-            concrete.clone(),
-            sandbox_gc_dirty,
-            Some(concrete),
-        )
-    }
-    #[cfg(not(test))]
     PodStore::from_persistence(concrete.clone(), concrete, sandbox_gc_dirty)
 }
 
@@ -816,11 +887,29 @@ mod tests {
     };
     use klights_types::PodIdentity;
 
-    use super::{new_raft_root_parts, pod_persistence_error};
+    use super::{RootPodRepositoryPersistenceParts, new_raft_root_parts, pod_persistence_error};
 
     struct RecordingResourceCommands {
         commands: Mutex<Vec<StorageCommand>>,
         disposition: CommandDisposition,
+    }
+
+    fn persistence_parts(
+        db: &crate::datastore::sqlite::Datastore,
+        commands: Arc<dyn LeaderResourceCommand>,
+    ) -> RootPodRepositoryPersistenceParts {
+        let passive = db.focused_read_store();
+        let authority =
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
+        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+            passive.clone(), authority,
+        );
+        new_raft_root_parts(
+            query,
+            passive,
+            commands,
+            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
+        )
     }
 
     #[derive(Clone, Copy)]
@@ -882,11 +971,7 @@ mod tests {
             commands: Mutex::new(Vec::new()),
             disposition: CommandDisposition::Ack,
         });
-        let parts = new_raft_root_parts(
-            Arc::new(db.clone()),
-            commands.clone(),
-            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
-        );
+        let parts = persistence_parts(&db, commands.clone());
 
         let outcome = parts
             .bound_finalization
@@ -955,11 +1040,7 @@ mod tests {
             commands: Mutex::new(Vec::new()),
             disposition: CommandDisposition::Ack,
         });
-        let parts = new_raft_root_parts(
-            Arc::new(db.clone()),
-            commands.clone(),
-            Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
-        );
+        let parts = persistence_parts(&db, commands.clone());
 
         let outcome = parts
             .unscheduled_deletion
@@ -1031,11 +1112,7 @@ mod tests {
                 commands: Mutex::new(Vec::new()),
                 disposition,
             });
-            let parts = new_raft_root_parts(
-                Arc::new(db.clone()),
-                commands.clone(),
-                Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
-            );
+            let parts = persistence_parts(&db, commands.clone());
 
             let result = parts
                 .unscheduled_deletion

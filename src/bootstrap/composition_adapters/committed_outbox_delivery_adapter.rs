@@ -13,21 +13,47 @@ use klights_leader_api::{
 };
 use tokio::sync::OnceCell;
 
-use crate::datastore::{DatastoreHandle, Resource};
+use crate::datastore::Resource;
 use klights_cluster_core::command::StorageCommand;
+use klights_cluster_store::{ClusterOwnershipRead, ClusterResourceMutation, ClusterResourceRead};
 use klights_controllers::ControllerDispatcher;
 
 pub(crate) struct RootOutboxSideEffectState {
-    db: DatastoreHandle,
+    #[cfg(test)]
+    db: Option<crate::datastore::DatastoreHandle>,
+    resource_reads: Option<Arc<dyn ClusterResourceRead>>,
+    resource_mutations: Option<Arc<dyn ClusterResourceMutation>>,
+    ownership_reads: Option<Arc<dyn ClusterOwnershipRead>>,
     controller_dispatcher: OnceCell<Arc<ControllerDispatcher>>,
     non_pod_finalization: OnceCell<Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>>,
     namespace_termination: OnceCell<Arc<dyn klights_reconcile_api::NamespaceTerminationSink>>,
 }
 
 impl RootOutboxSideEffectState {
-    pub(crate) fn new(db: DatastoreHandle) -> Self {
+    pub(crate) fn new(
+        resource_reads: Arc<dyn ClusterResourceRead>,
+        resource_mutations: Arc<dyn ClusterResourceMutation>,
+        ownership_reads: Arc<dyn ClusterOwnershipRead>,
+    ) -> Self {
         Self {
-            db,
+            #[cfg(test)]
+            db: None,
+            resource_reads: Some(resource_reads),
+            resource_mutations: Some(resource_mutations),
+            ownership_reads: Some(ownership_reads),
+            controller_dispatcher: OnceCell::new(),
+            non_pod_finalization: OnceCell::new(),
+            namespace_termination: OnceCell::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(db: crate::datastore::DatastoreHandle) -> Self {
+        Self {
+            db: Some(db),
+            resource_reads: None,
+            resource_mutations: None,
+            ownership_reads: None,
             controller_dispatcher: OnceCell::new(),
             non_pod_finalization: OnceCell::new(),
             namespace_termination: OnceCell::new(),
@@ -167,6 +193,14 @@ impl RootCommittedOutboxDelivery {
         } else {
             None
         };
+        #[cfg(test)]
+        if let Some(db) = &self.side_effects.db {
+            return crate::bootstrap::controller_adapters::applied_pod_side_effect_adapter::handle_applied_pod_side_effects_for_test(
+                klights_controllers::side_effects::applied_pod::AppliedPodSideEffectSinks::new(
+                    Some(controller_dispatcher.as_ref() as &dyn klights_reconcile_api::ControllerReconcileSink), Some(controller_dispatcher.as_ref() as &dyn klights_reconcile_api::ServiceReconcileSink), gc_pod_delete_sink, self.side_effects.non_pod_finalization.get().map(Arc::as_ref), self.side_effects.namespace_termination.get().map(Arc::as_ref), controller_dispatcher.gc_coordination(),
+                ), command, resource, pod_endpoint_effect, db.clone(),
+            ).await.map_err(|error| klights_leader_api::OutboxDeliveryError::unavailable(error.to_string()));
+        }
         crate::bootstrap::controller_adapters::applied_pod_side_effect_adapter::handle_applied_pod_side_effects(
             klights_controllers::side_effects::applied_pod::AppliedPodSideEffectSinks::new(
                 Some(controller_dispatcher.as_ref()
@@ -187,7 +221,9 @@ impl RootCommittedOutboxDelivery {
             command,
             resource,
             pod_endpoint_effect,
-            self.side_effects.db.as_ref(),
+            self.side_effects.resource_reads.as_ref().expect("focused outbox resource reads").as_ref(),
+            self.side_effects.resource_mutations.as_ref().expect("focused outbox resource mutations").as_ref(),
+            self.side_effects.ownership_reads.as_ref().expect("focused outbox ownership reads").as_ref(),
         )
         .await
         .map_err(|error| klights_leader_api::OutboxDeliveryError::unavailable(error.to_string()))
@@ -214,16 +250,15 @@ impl LeaderOutboxDelivery for RootCommittedOutboxDelivery {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) fn test_resource_command(
-    db: DatastoreHandle,
+    db: crate::datastore::DatastoreHandle,
     authority: &crate::bootstrap::authority::AuthorityHandle,
 ) -> Arc<dyn klights_leader_api::LeaderResourceCommand> {
     let proposal: Arc<dyn klights_replication::proposal::RaftProposal> =
         Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()));
     let resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery> = Arc::new(
         crate::bootstrap::outbox_apply_adapter::BackendResourceQueryFixture::new(
-            db,
+            db.clone(),
             authority
                 .legacy_watch_for_test()
                 .expect("test authority retains its source watch"),
@@ -240,7 +275,7 @@ pub(crate) fn test_resource_command(
 
 #[cfg(test)]
 pub(crate) fn test_outbox_delivery(
-    db: DatastoreHandle,
+    db: crate::datastore::DatastoreHandle,
     authority: &crate::bootstrap::authority::AuthorityHandle,
     side_effects: Arc<RootOutboxSideEffectState>,
     local_node: String,
@@ -249,7 +284,7 @@ pub(crate) fn test_outbox_delivery(
         Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()));
     let resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery> = Arc::new(
         crate::bootstrap::outbox_apply_adapter::BackendResourceQueryFixture::new(
-            db,
+            db.clone(),
             authority
                 .legacy_watch_for_test()
                 .expect("test authority retains its source watch"),

@@ -333,13 +333,12 @@ impl DatastoreResourceQueryAdapter {
     /// decoded typed cursors and the root injects the clock that defines a
     /// pinned pagination session's bounded lifetime.
     pub(crate) fn new_with_resource_reads_and_clock<A: Into<AuthorityHandle>>(
-        db: DatastoreHandle,
         resource_reads: Arc<dyn ClusterResourceRead>,
         authority: A,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            db: Some(db),
+            db: None,
             resource_reads: Some(resource_reads),
             authority: authority.into(),
             wall_clock,

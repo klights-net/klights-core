@@ -78,6 +78,7 @@ pub(in crate::current) async fn list_namespaces(
             api_version: "v1",
             kind: "Namespace".to_string(),
             watch_namespace: None,
+            scope: klights_leader_api::ResourceListScope::Cluster,
             requested_rv,
             send_initial_events,
             send_bookmarks,

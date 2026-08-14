@@ -10,7 +10,6 @@ use anyhow::Context;
 use crate::bootstrap::phases;
 use crate::bootstrap::worker_store_adapter::start_worker_store_adapter;
 use crate::bootstrap::{CliFlags, NodeRole};
-use crate::datastore;
 
 pub use super::init::cleanup::run_cleanup_with_flags;
 use super::init::dataplane::*;
@@ -228,12 +227,20 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         node_ip: &node_ip,
     })
     .await?;
-    let db_handle = ds.db_handle;
+    let resource_reads = ds.resource_reads;
+    let resource_scopes = ds.resource_scopes;
+    let ownership_reads = ds.ownership_reads;
+    let namespace_content_reads = ds.namespace_content_reads;
+    let topology_reads = ds.topology_reads;
+    let allocator_reads = ds.allocator_reads;
+    let resource_mutations = ds.resource_mutations;
+    let topology_mutations = ds.topology_mutations;
+    let metadata_reads = ds.metadata_reads;
+    let lifecycle = ds.lifecycle;
     let watch_signals = ds.watch_signals;
     let positioned_watch = ds.positioned_watch;
     let local_resource_query = ds.local_resource_query;
     let network_topology_command = ds.network_topology_command;
-    let db: &dyn datastore::DatastoreBackend = &*db_handle;
     let leader_resource_query = ds.leader_resource_query;
     let leader_watch = ds.leader_watch;
     let leader_cache_readiness = ds.leader_cache_readiness;
@@ -309,8 +316,8 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         // on a leader restart). Without this, a leader booted without
         // KLIGHTS_EXTERNAL_ENDPOINT never writes its node_dataplane row and the
         // cross-node WireGuard tunnel never forms.
-        let published = publish_local_dataplane_metadata_self_heal(
-            db,
+        let published = publish_local_dataplane_metadata_self_heal_with_resource_reads(
+            resource_reads.as_ref(),
             network_topology_command.as_ref(),
             &config,
             &node_mode,
@@ -397,7 +404,15 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         leader_coordination: controller_coordination.clone(),
         member_feature_probe,
         skip_seed_bootstrap: ds.skip_seed_bootstrap,
-        db_handle: &db_handle,
+        resource_reads: resource_reads.clone(),
+        resource_scopes: resource_scopes.clone(),
+        ownership_reads: ownership_reads.clone(),
+        namespace_content_reads: namespace_content_reads.clone(),
+        topology_reads: topology_reads.clone(),
+        allocator_reads: allocator_reads.clone(),
+        resource_mutations: resource_mutations.clone(),
+        topology_mutations: topology_mutations.clone(),
+        metadata_reads: metadata_reads.clone(),
         watch_signals: watch_signals.clone(),
         positioned_watch: positioned_watch.clone(),
         local_resource_query: local_resource_query.clone(),
@@ -407,7 +422,6 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         pod_slot_events: node_local.pod_slot_events(),
         worker_store_adapter: worker_store_adapter.clone(),
         kubelet_uses_worker_store_adapter,
-        db,
         leader_resource_query: leader_resource_query.clone(),
         leader_watch: leader_watch.clone(),
         leader_cache_readiness: leader_cache_readiness.clone(),
@@ -469,7 +483,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     phases::leader::start(phases::leader::LeaderStart {
         config: &config,
         leader_coordination: controller_coordination,
-        db_handle: &db_handle,
+        resource_reads: resource_reads.clone(),
         leader_bootstrap_store,
         watch_maintenance: leader_watch_maintenance.clone(),
         positioned_watch,
@@ -502,7 +516,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         cni_rpc_token,
         cni_rpc_handle,
         controlplane_leader_control_stream_handle,
-        db_handle,
+        lifecycle,
         shutdown_token,
         supervisor: task_supervisor.clone(),
         grpc_transport_policy,
@@ -846,7 +860,7 @@ mod tests {
         );
         let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
         let command = crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
-            db_handle.clone(),
+            db.focused_read_store(),
             Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db_handle)),
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         );

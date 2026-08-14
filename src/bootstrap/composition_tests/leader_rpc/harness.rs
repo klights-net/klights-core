@@ -328,7 +328,7 @@ impl IntegrationLeaderRpcComposition {
             crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()),
         );
         let network = Arc::new(
-            crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
+            crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new_for_test(
                 db,
                 proposal,
                 authority,
@@ -460,7 +460,7 @@ impl IntegrationLeaderRpcComposition {
         klights_replication::ReplicationService::new_with_ports(
             metadata,
             Arc::new(
-                crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new(
+                crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new_for_test(
                     self.db.clone(),
                 ),
             ),
@@ -477,7 +477,7 @@ impl IntegrationLeaderRpcComposition {
         klights_replication::ReplicationService::new_with_ports_and_progress(
             Arc::new(IntegrationLeaderRpcMetadataRead { current_rv }),
             Arc::new(
-                crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new(
+                crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new_for_test(
                     self.db.clone(),
                 ),
             ),
@@ -595,14 +595,14 @@ impl IntegrationLeaderRpcComposition {
             crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(self.db.clone()),
         );
         let network = Arc::new(
-            crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
+            crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new_for_test(
                 self.db.clone(),
                 proposal.clone(),
                 authority.clone(),
             ),
         );
         let pod_cleanup = Arc::new(
-            crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup::new(
+            crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup::new_for_test(
                 self.db.clone(),
                 proposal,
                 authority.clone(),
@@ -610,7 +610,6 @@ impl IntegrationLeaderRpcComposition {
         );
         let resource_query = match passive_reads.as_ref() {
             Some(passive_reads) => crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_with_resource_reads_and_clock(
-                self.db.clone(),
                 passive_reads.ports.resource_reads(),
                 authority.clone(),
                 Arc::new(klights_supervisor::SystemWallClock),
@@ -623,7 +622,7 @@ impl IntegrationLeaderRpcComposition {
         let authority_handle =
             crate::bootstrap::authority::AuthorityHandle::from(authority.clone());
         let side_effects =
-            crate::bootstrap::local_leader_adapters::new_local_outbox_side_effect_state(
+            crate::bootstrap::local_leader_adapters::new_local_outbox_side_effect_state_for_test(
                 self.db.clone(),
             );
         if let Some(dispatcher) = controller_dispatcher {
@@ -653,7 +652,7 @@ impl IntegrationLeaderRpcComposition {
             ),
         );
         let local_projected_token = Arc::new(
-            crate::bootstrap::local_leader_adapters::LocalProjectedTokenAdapter::new(
+            crate::bootstrap::local_leader_adapters::LocalProjectedTokenAdapter::new_for_test(
                 self.db.clone(),
                 "grpc-test".to_string(),
                 crate::paths::runtime_namespace(),

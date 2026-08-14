@@ -64,12 +64,12 @@ pub(crate) fn port(
 mod adapter_tests {
     #[tokio::test]
     async fn test_pdb_reconcile_name() {
-        let (_db, db_handle) =
+        let (db, _db_handle) =
             crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
         let effect = klights_controllers::side_effects::pdb::effect(super::port(
-            std::sync::Arc::new(
-                crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(db_handle),
-            ),
+            std::sync::Arc::new(crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new(
+                std::sync::Arc::new(db.clone()),
+            )),
             klights_controllers::side_effects::PodSideEffectPortsSlot::new(),
         ));
         assert_eq!(effect.name(), "pdb_reconcile");

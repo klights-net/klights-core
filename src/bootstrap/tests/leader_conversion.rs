@@ -13,7 +13,7 @@ use klights_leader_api::{
 };
 
 fn test_outbox_delivery(
-    db: crate::datastore::DatastoreHandle,
+    db: &crate::datastore::sqlite::Datastore,
     local_node: &str,
 ) -> (
     Arc<crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::RootCommittedOutboxDelivery>,
@@ -22,11 +22,15 @@ fn test_outbox_delivery(
     let authority = crate::bootstrap::authority::AuthorityHandle::from(
         crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
     );
-    let side_effects =
-        crate::bootstrap::local_leader_adapters::new_local_outbox_side_effect_state(db.clone());
+    let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(db);
+    let side_effects = crate::bootstrap::local_leader_adapters::new_local_outbox_side_effect_state(
+        ports.read_ports.resource_reads(),
+        ports.resource_mutations.clone(),
+        ports.ownership_reads.clone(),
+    );
     let delivery = crate::bootstrap::composition_adapters::
         committed_outbox_delivery_adapter::test_outbox_delivery(
-            db,
+            Arc::new(db.clone()),
             &authority,
             side_effects.clone(),
             local_node.to_string(),
@@ -57,26 +61,26 @@ async fn deliver_test_outbox(
 }
 
 fn test_network_port(
-    db: crate::datastore::DatastoreHandle,
+    db: &crate::datastore::sqlite::Datastore,
 ) -> Arc<crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork>
 {
     Arc::new(
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
-            db.clone(),
-            Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db)),
+            db.focused_read_store(),
+            Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(Arc::new(db.clone()))),
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         ),
     )
 }
 
 fn test_cleanup_port(
-    db: crate::datastore::DatastoreHandle,
+    db: &crate::datastore::sqlite::Datastore,
 ) -> Arc<crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup>
 {
     Arc::new(
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup::new(
-            db.clone(),
-            Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db)),
+            crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(db).pod_cleanup,
+            Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(Arc::new(db.clone()))),
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         ),
     )
@@ -241,7 +245,8 @@ async fn cronjob_job_create_routes_exact_raft_command_without_passive_mutation()
         reject_as_follower: false,
     });
     let port = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
-        Arc::new(passive.clone()),
+        passive.focused_read_store(),
+        passive.focused_read_store(),
         commands.clone(),
     );
     let job = cronjob_job();
@@ -289,7 +294,8 @@ async fn cronjob_job_create_follower_rejection_preserves_passive_store() {
         reject_as_follower: true,
     });
     let port = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
-        Arc::new(passive.clone()),
+        passive.focused_read_store(),
+        passive.focused_read_store(),
         commands,
     );
 
@@ -331,7 +337,8 @@ async fn cronjob_job_delete_and_status_preserve_strict_uid_rv_preconditions() {
         reject_as_follower: false,
     });
     let port = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
-        Arc::new(passive),
+        passive.focused_read_store(),
+        passive.focused_read_store(),
         commands.clone(),
     );
 
@@ -395,12 +402,13 @@ async fn seed_bootstrap_mutation_uses_command_port_without_passive_write() {
     let passive = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
-    let passive_handle: crate::datastore::DatastoreHandle = Arc::new(passive.clone());
+    let _passive_handle: crate::datastore::DatastoreHandle = Arc::new(passive.clone());
     let commands = Arc::new(RecordingBootstrapCommands {
         commands: std::sync::Mutex::new(Vec::new()),
     });
     let store = crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
-        passive_handle,
+        passive.focused_read_store(),
+        passive.focused_read_store(),
         commands.clone(),
     );
 
@@ -938,7 +946,7 @@ async fn cleanup_intent_ack_is_idempotent_and_never_touches_same_name_pod_row() 
     .unwrap();
 
     for _ in 0..2 {
-        test_cleanup_port(Arc::new(db.clone()))
+        test_cleanup_port(&db)
             .acknowledge_pod_cleanup_intent(ack.clone())
             .await
             .expect("missing cleanup intent acknowledgement is idempotent");
@@ -977,7 +985,7 @@ async fn local_client_apply_outbox_is_idempotent_and_uid_bound() {
     )
     .await
     .expect("create pod");
-    let (delivery, side_effects) = test_outbox_delivery(Arc::new(db.clone()), "node-a");
+    let (delivery, side_effects) = test_outbox_delivery(&db, "node-a");
     side_effects.set_controller_dispatcher(
         crate::bootstrap::controller_adapters::controller_runtime_adapter::dispatcher_for_test(
             &db,
@@ -1100,7 +1108,7 @@ async fn local_client_apply_outbox_returns_committed_resource_version() {
     )
     .await
     .expect("create pod");
-    let (delivery, side_effects) = test_outbox_delivery(Arc::new(db.clone()), "node-a");
+    let (delivery, side_effects) = test_outbox_delivery(&db, "node-a");
     side_effects.set_controller_dispatcher(
         crate::bootstrap::controller_adapters::controller_runtime_adapter::dispatcher_for_test(
             &db,
@@ -1209,7 +1217,7 @@ async fn local_client_pod_delete_outbox_reconciles_terminating_namespace() {
         .await
         .expect("create terminating pod");
 
-    let (delivery, side_effects) = test_outbox_delivery(Arc::new(db.clone()), "worker-a");
+    let (delivery, side_effects) = test_outbox_delivery(&db, "worker-a");
     side_effects.set_namespace_termination(
             crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationReconciler::new(
                 crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(Arc::new(db.clone())),
@@ -1319,7 +1327,7 @@ async fn local_client_pod_delete_outbox_finalizes_ready_foreground_owner() {
         .await
         .expect("create foreground child");
 
-    let (delivery, side_effects) = test_outbox_delivery(Arc::new(db.clone()), "worker-a");
+    let (delivery, side_effects) = test_outbox_delivery(&db, "worker-a");
     side_effects.set_non_pod_finalization(Arc::new(
         crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
             Arc::new(db.clone()),
@@ -1377,7 +1385,7 @@ async fn local_client_serves_network_metadata_without_calling_forwarder() {
     let db = crate::datastore::sqlite::Datastore::new_in_memory()
         .await
         .unwrap();
-    let network = test_network_port(Arc::new(db.clone()));
+    let network = test_network_port(&db);
 
     let subnet = network
         .allocate_node_subnet(

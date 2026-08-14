@@ -13,7 +13,6 @@ use crate::bootstrap::NodeRole;
 use crate::bootstrap::cluster_store::backend_kind::BackendKind;
 use crate::bootstrap::cluster_store::selector::PassiveStoreOpenRequest;
 use crate::bootstrap::credential_store::BootstrapCredentialStore;
-use crate::datastore::DatastoreHandle;
 use klights_supervisor::TaskSupervisor;
 
 #[derive(Debug, thiserror::Error)]
@@ -89,7 +88,16 @@ pub struct OpenLeaderArgs<'a> {
 }
 
 pub struct DatastorePhase {
-    pub db_handle: DatastoreHandle,
+    pub resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
+    pub resource_scopes: Arc<dyn klights_cluster_store::ClusterResourceScopeRead>,
+    pub ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
+    pub namespace_content_reads: Arc<dyn klights_cluster_store::NamespaceContentRead>,
+    pub topology_reads: Arc<dyn klights_cluster_store::ClusterTopologyRead>,
+    pub allocator_reads: Arc<dyn klights_cluster_store::DurableAllocatorRead>,
+    pub resource_mutations: Arc<dyn klights_cluster_store::ClusterResourceMutation>,
+    pub topology_mutations: Arc<dyn klights_cluster_store::ClusterTopologyMutation>,
+    pub lifecycle: Arc<dyn klights_cluster_store::BackendLifecycleStore>,
+    pub metadata_reads: Arc<dyn klights_cluster_store::ClusterMetadataRead>,
     pub watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     pub positioned_watch: klights_watch::PositionedWatchService,
     pub local_resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
@@ -205,12 +213,24 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     )
     .await
     .context("Failed to open datastore")?;
-    let passive_backend = opened_passive.backend;
-    let passive_read_ports = opened_passive.read_ports;
-    let committed_apply = opened_passive.committed_apply;
-    let sqlite_recovery = opened_passive
-        .sqlite_recovery
-        .context("Raft-enabled SQLite datastore did not provide its recovery port")?;
+    let crate::bootstrap::cluster_store::selector::OpenedPassiveStore {
+        read_ports: passive_read_ports,
+        ownership_reads: passive_ownership_reads,
+        namespace_content_reads: passive_namespace_content_reads,
+        topology_reads: passive_topology_reads,
+        watch_maintenance: passive_watch_maintenance,
+        pod_cleanup: passive_pod_cleanup,
+        applied_outbox: passive_applied_outbox,
+        metadata_mutations: passive_metadata_mutations,
+        resource_mutations: passive_resource_mutations,
+        topology_mutations: passive_topology_mutations,
+        committed_apply,
+        snapshot_capture,
+        snapshot_persistence,
+        metadata_reads: replication_metadata,
+        lifecycle,
+        ..
+    } = opened_passive;
 
     // T1.6: joining controlplanes get their initial cluster.db
     // contents from raft (install_snapshot or AppendEntries from index 0
@@ -295,7 +315,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     // (quorum = 1). Workers do not enter this composition path and route
     // writes through the outbox/leader proxy.
     let member_feature_probe;
-    let (raft_node, db_handle, local_services, leader_proxy, leader_watch_maintenance) = match (
+    let (raft_node, local_services, leader_proxy, leader_watch_maintenance) = match (
         role,
         leader_node_local.as_ref(),
     ) {
@@ -379,35 +399,33 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             let raft_network =
                 klights_replication::grpc_network::GrpcRaftNetwork::new(raft_factory);
             let materializer = Arc::new(
-                crate::bootstrap::composition_adapters::cluster_store_replication_adapter::DatastoreRaftCommitMaterializer::new(passive_backend.clone()),
+                crate::bootstrap::composition_adapters::cluster_store_replication_adapter::DatastoreRaftCommitMaterializer::new(passive_metadata_mutations.clone(), passive_applied_outbox.clone()),
             );
             let allocator = passive_read_ports.allocator_reads();
-            let lifecycle = Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(
-                passive_backend.clone(),
-            ));
+            let raft_lifecycle = lifecycle.clone();
             let state_machine_stores =
                 klights_replication::state_machine::RaftStateMachineStorePorts::new(
                     Arc::new(
                         klights_replication::committed_apply::ObservedCommittedRaftApply::new(
-                            committed_apply,
+                            committed_apply.clone(),
                             watch_commit_wiring.wakeups.clone(),
                         ),
                     ),
                     Arc::new(
                         klights_replication::snapshot::RaftSnapshotRestoreAdapter::new(
-                            sqlite_recovery.clone(),
+                            snapshot_persistence.clone(),
                             supervisor.clone(),
                         ),
                     ),
-                    lifecycle.clone(),
+                    raft_lifecycle.clone(),
                     materializer.clone(),
                 );
             let raft_stores = klights_replication::node::RaftStorePorts::new(
                 materializer,
                 state_machine_stores,
-                sqlite_recovery.clone(),
+                snapshot_capture.clone(),
                 allocator,
-                lifecycle,
+                raft_lifecycle,
             );
             let raft = Arc::new(
                 klights_replication::node::RaftNode::start_with_network(
@@ -436,23 +454,20 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 );
             }
             let embedded_proposal = raft.proposal();
-            let db_handle: DatastoreHandle = passive_backend.clone();
             let positioned_watch =
                 crate::bootstrap::composition_adapters::positioned_watch_adapter::datastore_positioned_watch_service(
                     &passive_read_ports,
-                    db_handle.clone(),
                     watch_commit_wiring.signals.clone(),
                 );
             let local_resource_query = crate::bootstrap::composition_adapters::
                 resource_query_adapter::DatastoreResourceQueryAdapter::new_with_resource_reads_and_clock(
-                    db_handle.clone(),
                     passive_read_ports.resource_reads(),
                     leader_authority.clone(),
                     Arc::new(klights_supervisor::SystemWallClock),
                 );
             let local_network = Arc::new(
                 crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
-                    passive_backend.clone(),
+                    passive_topology_reads.clone(),
                     embedded_proposal.clone(),
                     leader_authority.clone(),
                 ),
@@ -460,14 +475,14 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             let leader_watch_maintenance: Arc<dyn klights_cluster_store::ClusterWatchMaintenance> =
                 Arc::new(
                     crate::bootstrap::composition_adapters::leader_maintenance_adapter::ClusterStoreLeaderMaintenance::new(
-                        passive_backend.clone(),
+                        passive_read_ports.allocator_reads(), passive_watch_maintenance.clone(), passive_metadata_mutations.clone(),
                         embedded_proposal.clone(),
                         leader_authority.clone(),
                     ),
                 );
             let local_pod_cleanup = Arc::new(
                 crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup::new(
-                    passive_backend.clone(),
+                    passive_pod_cleanup.clone(),
                     embedded_proposal.clone(),
                     leader_authority.clone(),
                 ),
@@ -480,7 +495,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             );
             let local_projected_token = Arc::new(
                 crate::bootstrap::local_leader_adapters::LocalProjectedTokenAdapter::new(
-                    db_handle.clone(),
+                    passive_read_ports.resource_reads(),
                     config.node_name.clone(),
                     config.containerd_namespace.clone(),
                     runtime_paths.service_account_signing_key(),
@@ -496,7 +511,9 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             );
             let local_side_effects =
                 crate::bootstrap::local_leader_adapters::new_local_outbox_side_effect_state(
-                    db_handle.clone(),
+                    passive_read_ports.resource_reads(),
+                    passive_resource_mutations.clone(),
+                    passive_ownership_reads.clone(),
                 );
             let local_cache_readiness =
                 Arc::new(crate::bootstrap::local_leader_adapters::LocalCacheReadinessAdapter);
@@ -578,7 +595,8 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             let leader_proxy = Arc::new(leader_proxy_builder);
             let seed_bootstrap_store =
                 crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
-                    db_handle.clone(),
+                    passive_read_ports.resource_reads(),
+                    passive_topology_reads.clone(),
                     leader_proxy.clone(),
                 );
             // Seed branch: no --leader on Controlplane (or any
@@ -638,7 +656,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 // Its seed metadata already exists, so retrying these writes
                 // here would turn the fail-closed gate into a cold-start
                 // deadlock before the replication server can start.
-                let needs_seed_metadata = db_handle
+                let needs_seed_metadata = passive_metadata_mutations
                     .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
                     .await
                     .context("Failed to inspect restored cluster identity")?
@@ -1006,7 +1024,6 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             }
             (
                 Some(raft),
-                db_handle,
                 (
                     local_side_effects,
                     local_resource_query,
@@ -1052,21 +1069,21 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         leader_proxy.clone();
     let leader_bootstrap_store = Arc::new(
         crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
-            db_handle.clone(),
+            passive_read_ports.resource_reads(),
+            passive_topology_reads.clone(),
             resource_commands.clone(),
         ),
     );
     let node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal> =
         leader_proxy.clone();
-    let replication_metadata: Arc<dyn klights_cluster_store::ClusterMetadataRead> = sqlite_recovery;
     let replication_bootstrap_tokens = Arc::new(
         crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new(
-            db_handle.clone(),
+            passive_read_ports.resource_reads(),
         ),
     );
     let replication_service = Some(Arc::new(
         klights_replication::ReplicationService::new_with_ports_and_progress(
-            replication_metadata,
+            replication_metadata.clone(),
             replication_bootstrap_tokens,
             supervisor.clone(),
             watch_commit_wiring.follower_progress.clone(),
@@ -1130,7 +1147,16 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     let skip_seed_bootstrap = is_joining_controlplane;
 
     Ok(DatastorePhase {
-        db_handle,
+        resource_reads: passive_read_ports.resource_reads(),
+        resource_scopes: passive_read_ports.resource_scopes(),
+        ownership_reads: passive_ownership_reads,
+        namespace_content_reads: passive_namespace_content_reads,
+        topology_reads: passive_topology_reads,
+        allocator_reads: passive_read_ports.allocator_reads(),
+        resource_mutations: passive_resource_mutations,
+        topology_mutations: passive_topology_mutations,
+        lifecycle,
+        metadata_reads: replication_metadata,
         watch_signals: watch_commit_wiring.signals,
         positioned_watch,
         local_resource_query,

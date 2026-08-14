@@ -39,7 +39,7 @@ pub trait WatchStreamSource: Send + Sync {
         &'a self,
         api_version: &'a str,
         kind: &'a str,
-        namespace: Option<&'a str>,
+        scope: klights_leader_api::ResourceListScope,
         label_selector: Option<&'a str>,
         field_selector: Option<&'a str>,
         limit: Option<i64>,
@@ -69,7 +69,7 @@ where
         &'a self,
         api_version: &'a str,
         kind: &'a str,
-        namespace: Option<&'a str>,
+        scope: klights_leader_api::ResourceListScope,
         label_selector: Option<&'a str>,
         field_selector: Option<&'a str>,
         limit: Option<i64>,
@@ -77,7 +77,7 @@ where
         self.as_ref().list_watch_resources(
             api_version,
             kind,
-            namespace,
+            scope,
             label_selector,
             field_selector,
             limit,
@@ -596,6 +596,7 @@ pub(crate) struct PeriodicBookmarkContext<'a, S: WatchStreamSource + ?Sized> {
     pub api_version: &'a str,
     pub kind: &'a str,
     pub watch_namespace: Option<&'a str>,
+    pub scope: klights_leader_api::ResourceListScope,
     pub label_selector: Option<&'a str>,
     pub field_selector: Option<&'a str>,
     pub requested_rv: i64,
@@ -632,6 +633,7 @@ pub(crate) async fn resolve_periodic_bookmark_rv<S: WatchStreamSource + ?Sized>(
         api_version,
         kind,
         watch_namespace,
+        scope,
         label_selector,
         field_selector,
         requested_rv,
@@ -660,7 +662,7 @@ pub(crate) async fn resolve_periodic_bookmark_rv<S: WatchStreamSource + ?Sized>(
     }
     if rv <= 0 && !has_scope_filter {
         rv = db
-            .list_watch_resources(api_version, kind, watch_namespace, None, None, Some(1))
+            .list_watch_resources(api_version, kind, scope, None, None, Some(1))
             .await
             .map(|list| list.resource_version())
             .unwrap_or(0);
@@ -716,6 +718,7 @@ pub struct LabelSelectorWatchStreamRequest<'a, S: WatchStreamSource> {
     pub api_version: &'a str,
     pub kind: String,
     pub watch_namespace: Option<String>,
+    pub scope: klights_leader_api::ResourceListScope,
     pub requested_rv: i64,
     pub send_initial_events: bool,
     pub send_bookmarks: bool,
@@ -738,6 +741,7 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
         api_version,
         kind,
         watch_namespace,
+        scope,
         requested_rv,
         send_initial_events,
         send_bookmarks,
@@ -770,7 +774,7 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
             .list_watch_resources(
                 &api_version,
                 &kind,
-                watch_namespace.as_deref(),
+                scope.clone(),
                 label_selector.as_deref(),
                 field_selector.as_deref(),
                 None,
@@ -919,6 +923,7 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
                         api_version: &api_version,
                         kind: &kind,
                         watch_namespace: watch_namespace.as_deref(),
+                        scope: scope.clone(),
                         label_selector: label_selector.as_deref(),
                         field_selector: field_selector.as_deref(),
                         requested_rv,
@@ -1109,6 +1114,7 @@ mod tests {
             api_version: "v1",
             kind: "ConfigMap".to_string(),
             watch_namespace: None,
+            scope: klights_leader_api::ResourceListScope::AllNamespaces,
             requested_rv: 0,
             send_initial_events: false,
             send_bookmarks: false,
@@ -1154,6 +1160,7 @@ mod tests {
             api_version: "v1",
             kind: "ConfigMap".to_string(),
             watch_namespace: None,
+            scope: klights_leader_api::ResourceListScope::AllNamespaces,
             requested_rv: 0,
             send_initial_events: false,
             send_bookmarks: false,

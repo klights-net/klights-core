@@ -1,4 +1,10 @@
-use klights_cluster_store::ResourceListOptions;
+#[cfg(test)]
+use crate::datastore::DatastoreHandle;
+use klights_cluster_store::{
+    ClusterOwnershipRead, ClusterResourceRead, OwnerNameKindRequest, OwnerUidRequest,
+    ResourceCollectionScope, ResourceGetRequest, ResourceListQuery, ResourceListRead,
+    ResourceListRequest,
+};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,7 +14,6 @@ use klights_cluster_core::{
 use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult as Result};
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::DatastoreHandle;
 use klights_controllers::{
     ControllerEffectPort, ControllerNetworkPort, ControllerReconcilePort, ControllerResourceQuery,
 };
@@ -20,7 +25,10 @@ fn validate_controller_effect() -> Result<()> {
 }
 
 pub(crate) struct RootControllerLeaderPort {
-    store: DatastoreHandle,
+    #[cfg(test)]
+    store: Option<DatastoreHandle>,
+    resource_reads: Option<Arc<dyn ClusterResourceRead>>,
+    ownership_reads: Option<Arc<dyn ClusterOwnershipRead>>,
     commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
 }
 
@@ -28,7 +36,7 @@ impl RootControllerLeaderPort {
     #[cfg(test)]
     pub(crate) fn new(store: DatastoreHandle) -> Self {
         let commands = Self::resource_commands_for_test(store.clone());
-        Self { store, commands }
+        Self::new_for_test_with_commands(store, commands)
     }
 
     #[cfg(test)]
@@ -37,25 +45,186 @@ impl RootControllerLeaderPort {
     ) -> Arc<dyn klights_leader_api::LeaderResourceCommand> {
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
-        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
-            store.clone(),
-            authority.clone(),
-        );
-        let proposal = Arc::new(
-            crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(store.clone()),
-        );
+        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(store.clone(), authority.clone());
         Arc::new(
             klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
-                proposal, query, authority,
+                Arc::new(
+                    crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(store),
+                ),
+                query,
+                authority,
             ),
         )
     }
 
-    pub(crate) fn new_with_commands(
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_commands(
         store: DatastoreHandle,
         commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     ) -> Self {
-        Self { store, commands }
+        Self {
+            store: Some(store),
+            resource_reads: None,
+            ownership_reads: None,
+            commands,
+        }
+    }
+    pub(crate) fn new_with_commands(
+        resource_reads: Arc<dyn ClusterResourceRead>,
+        ownership_reads: Arc<dyn ClusterOwnershipRead>,
+        commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
+    ) -> Self {
+        Self {
+            #[cfg(test)]
+            store: None,
+            resource_reads: Some(resource_reads),
+            ownership_reads: Some(ownership_reads),
+            commands,
+        }
+    }
+
+    async fn read_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Resource>> {
+        #[cfg(test)]
+        if let Some(store) = &self.store {
+            return store
+                .get_resource(api_version, kind, namespace, name)
+                .await
+                .map_err(map_controller_store_error);
+        }
+        self.resource_reads
+            .as_ref()
+            .expect("focused controller resource reads")
+            .get_resource(ResourceGetRequest::new(
+                api_version,
+                kind,
+                namespace.map(ToOwned::to_owned),
+                name,
+            ))
+            .await
+            .map_err(|error| map_controller_store_error(error.into()))
+    }
+
+    async fn list_resources(
+        &self,
+        api_version: &str,
+        kind: &str,
+        scope: ResourceCollectionScope,
+        label_selector: Option<&str>,
+    ) -> Result<Vec<Resource>> {
+        #[cfg(test)]
+        if let Some(store) = &self.store {
+            let namespace = match &scope {
+                ResourceCollectionScope::Namespace(namespace) => Some(namespace.as_str()),
+                _ => None,
+            };
+            return store
+                .list_resources(
+                    api_version,
+                    kind,
+                    namespace,
+                    klights_cluster_store::ResourceListOptions::new(
+                        label_selector,
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .await
+                .map(|list| list.items)
+                .map_err(map_controller_store_error);
+        }
+        match self
+            .resource_reads
+            .as_ref()
+            .expect("focused controller resource reads")
+            .list_resources(ResourceListRequest::new(
+                api_version,
+                kind,
+                scope,
+                ResourceListQuery::try_new_borrowed(
+                    label_selector,
+                    None,
+                    None,
+                    None,
+                    klights_cluster_store::ResourceVersionMatch::Any,
+                )
+                .map_err(|error| map_controller_store_error(error.into()))?,
+            ))
+            .await
+            .map_err(|error| map_controller_store_error(error.into()))?
+        {
+            ResourceListRead::Current(page) | ResourceListRead::Historical(page) => {
+                Ok(page.into_items())
+            }
+            ResourceListRead::Expired {
+                requested,
+                oldest_available,
+                ..
+            } => Err(klights_reconcile_api::ControllerStoreError::unavailable(
+                format!("LIST at resourceVersion {requested} expired before {oldest_available}"),
+            )),
+        }
+    }
+
+    async fn read_owned(&self, uid: &str, namespace: Option<&str>) -> Result<Vec<Resource>> {
+        #[cfg(test)]
+        if let Some(store) = &self.store {
+            return klights_controllers::gc::GcResourceStore::find_owned_resources(
+                store.as_ref(),
+                uid,
+                namespace,
+            )
+            .await;
+        }
+        self.ownership_reads
+            .as_ref()
+            .expect("focused controller ownership reads")
+            .find_owned_resources(
+                OwnerUidRequest::try_new(uid, namespace.map(ToOwned::to_owned))
+                    .map_err(|error| map_controller_store_error(error.into()))?,
+            )
+            .await
+            .map_err(|error| map_controller_store_error(error.into()))
+    }
+
+    async fn read_owned_empty_uid(
+        &self,
+        api_version: &str,
+        name: &str,
+        kind: &str,
+        namespace: Option<&str>,
+    ) -> Result<Vec<Resource>> {
+        #[cfg(test)]
+        if let Some(store) = &self.store {
+            return klights_controllers::gc::GcResourceStore::find_owned_by_name_kind_empty_uid(
+                store.as_ref(),
+                api_version,
+                name,
+                kind,
+                namespace,
+            )
+            .await;
+        }
+        self.ownership_reads
+            .as_ref()
+            .expect("focused controller ownership reads")
+            .find_owned_by_name_kind_empty_uid(
+                OwnerNameKindRequest::try_new(
+                    api_version,
+                    name,
+                    kind,
+                    namespace.map(ToOwned::to_owned),
+                )
+                .map_err(|error| map_controller_store_error(error.into()))?,
+            )
+            .await
+            .map_err(|error| map_controller_store_error(error.into()))
     }
 
     async fn submit_resource(&self, command: StorageCommand) -> Result<Resource> {
@@ -118,8 +287,7 @@ impl ControllerResourceQuery for RootControllerLeaderPort {
         namespace: Option<&str>,
         name: &str,
     ) -> std::result::Result<Option<Resource>, klights_leader_api::ResourceQueryError> {
-        self.store
-            .get_resource(api_version, kind, namespace, name)
+        self.read_resource(api_version, kind, namespace, name)
             .await
             .map_err(|error| {
                 klights_leader_api::ResourceQueryError::retryable(format!(
@@ -133,8 +301,7 @@ impl ControllerResourceQuery for RootControllerLeaderPort {
         namespace: &str,
     ) -> std::result::Result<bool, klights_leader_api::ResourceQueryError> {
         Ok(self
-            .store
-            .get_namespace(namespace)
+            .read_resource("v1", "Namespace", None, namespace)
             .await
             .map_err(|error| {
                 klights_leader_api::ResourceQueryError::retryable(format!(
@@ -154,8 +321,11 @@ impl ControllerResourceQuery for RootControllerLeaderPort {
 #[async_trait]
 impl klights_controllers::gc::GcResourceStore for RootControllerLeaderPort {
     async fn list_custom_resource_definitions(&self) -> Result<Vec<Resource>> {
-        klights_controllers::gc::GcResourceStore::list_custom_resource_definitions(
-            self.store.as_ref(),
+        self.list_resources(
+            "apiextensions.k8s.io/v1",
+            "CustomResourceDefinition",
+            ResourceCollectionScope::Cluster,
+            None,
         )
         .await
     }
@@ -167,14 +337,7 @@ impl klights_controllers::gc::GcResourceStore for RootControllerLeaderPort {
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>> {
-        klights_controllers::gc::GcResourceStore::get_resource(
-            self.store.as_ref(),
-            api_version,
-            kind,
-            namespace,
-            name,
-        )
-        .await
+        self.read_resource(api_version, kind, namespace, name).await
     }
 
     async fn update_resource_with_preconditions(
@@ -228,12 +391,7 @@ impl klights_controllers::gc::GcResourceStore for RootControllerLeaderPort {
         owner_uid: &str,
         namespace: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        klights_controllers::gc::GcResourceStore::find_owned_resources(
-            self.store.as_ref(),
-            owner_uid,
-            namespace,
-        )
-        .await
+        self.read_owned(owner_uid, namespace).await
     }
 
     async fn find_owned_by_name_kind_empty_uid(
@@ -243,26 +401,16 @@ impl klights_controllers::gc::GcResourceStore for RootControllerLeaderPort {
         owner_kind: &str,
         namespace: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        klights_controllers::gc::GcResourceStore::find_owned_by_name_kind_empty_uid(
-            self.store.as_ref(),
-            owner_api_version,
-            owner_name,
-            owner_kind,
-            namespace,
-        )
-        .await
+        self.read_owned_empty_uid(owner_api_version, owner_name, owner_kind, namespace)
+            .await
     }
 }
 
 #[async_trait]
 impl klights_controllers::replicaset::ReplicaSetStore for RootControllerLeaderPort {
     async fn get_replicaset(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        klights_controllers::replicaset::ReplicaSetStore::get_replicaset(
-            self.store.as_ref(),
-            namespace,
-            name,
-        )
-        .await
+        self.read_resource("apps/v1", "ReplicaSet", Some(namespace), name)
+            .await
     }
 
     async fn update_replicaset_status(
@@ -288,12 +436,8 @@ impl klights_controllers::replicaset::ReplicaSetStore for RootControllerLeaderPo
 #[async_trait]
 impl klights_controllers::deployment::DeploymentFinalizeStore for RootControllerLeaderPort {
     async fn get_deployment(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        klights_controllers::deployment::DeploymentFinalizeStore::get_deployment(
-            self.store.as_ref(),
-            namespace,
-            name,
-        )
-        .await
+        self.read_resource("apps/v1", "Deployment", Some(namespace), name)
+            .await
     }
 
     async fn patch_deployment_revision(
@@ -333,9 +477,11 @@ impl klights_controllers::deployment::DeploymentFinalizeStore for RootController
 #[async_trait]
 impl klights_controllers::deployment::DeploymentStore for RootControllerLeaderPort {
     async fn list_replicasets(&self, namespace: &str) -> Result<Vec<Resource>> {
-        klights_controllers::deployment::DeploymentStore::list_replicasets(
-            self.store.as_ref(),
-            namespace,
+        self.list_resources(
+            "apps/v1",
+            "ReplicaSet",
+            ResourceCollectionScope::Namespace(namespace.to_string()),
+            None,
         )
         .await
     }
@@ -402,12 +548,8 @@ impl klights_controllers::deployment::DeploymentStore for RootControllerLeaderPo
 #[async_trait]
 impl klights_controllers::statefulset::StatefulSetStore for RootControllerLeaderPort {
     async fn get_statefulset(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        klights_controllers::statefulset::StatefulSetStore::get_statefulset(
-            self.store.as_ref(),
-            namespace,
-            name,
-        )
-        .await
+        self.read_resource("apps/v1", "StatefulSet", Some(namespace), name)
+            .await
     }
 
     async fn update_statefulset_status(
@@ -433,9 +575,11 @@ impl klights_controllers::statefulset::StatefulSetStore for RootControllerLeader
 #[async_trait]
 impl klights_controllers::daemonset::DaemonSetStore for RootControllerLeaderPort {
     async fn list_controller_revisions(&self, namespace: &str) -> Result<Vec<Resource>> {
-        klights_controllers::daemonset::DaemonSetStore::list_controller_revisions(
-            self.store.as_ref(),
-            namespace,
+        self.list_resources(
+            "apps/v1",
+            "ControllerRevision",
+            ResourceCollectionScope::Namespace(namespace.to_string()),
+            None,
         )
         .await
     }
@@ -458,7 +602,8 @@ impl klights_controllers::daemonset::DaemonSetStore for RootControllerLeaderPort
     }
 
     async fn list_nodes(&self) -> Result<Vec<Resource>> {
-        klights_controllers::daemonset::DaemonSetStore::list_nodes(self.store.as_ref()).await
+        self.list_resources("v1", "Node", ResourceCollectionScope::Cluster, None)
+            .await
     }
 
     async fn update_daemonset_status(
@@ -484,7 +629,8 @@ impl klights_controllers::daemonset::DaemonSetStore for RootControllerLeaderPort
 #[async_trait]
 impl klights_controllers::job::JobStore for RootControllerLeaderPort {
     async fn get_job(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        klights_controllers::job::JobStore::get_job(self.store.as_ref(), namespace, name).await
+        self.read_resource("batch/v1", "Job", Some(namespace), name)
+            .await
     }
 
     async fn update_job_status(
@@ -510,17 +656,18 @@ impl klights_controllers::job::JobStore for RootControllerLeaderPort {
 #[async_trait]
 impl klights_controllers::service::ServiceReconcileStore for RootControllerLeaderPort {
     async fn list_services(&self) -> Result<Vec<Resource>> {
-        klights_controllers::service::ServiceReconcileStore::list_services(self.store.as_ref())
-            .await
+        self.list_resources(
+            "v1",
+            "Service",
+            ResourceCollectionScope::AllNamespaces,
+            None,
+        )
+        .await
     }
 
     async fn get_service(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        klights_controllers::service::ServiceReconcileStore::get_service(
-            self.store.as_ref(),
-            namespace,
-            name,
-        )
-        .await
+        self.read_resource("v1", "Service", Some(namespace), name)
+            .await
     }
 
     async fn update_service(
@@ -548,11 +695,16 @@ impl klights_controllers::service::ServiceReconcileStore for RootControllerLeade
 #[async_trait]
 impl klights_controllers::endpoints::EndpointReconcileStore for RootControllerLeaderPort {
     async fn endpoint_namespace_is_terminating(&self, namespace: &str) -> Result<bool> {
-        klights_controllers::endpoints::EndpointReconcileStore::endpoint_namespace_is_terminating(
-            self.store.as_ref(),
-            namespace,
-        )
-        .await
+        Ok(self
+            .read_resource("v1", "Namespace", None, namespace)
+            .await?
+            .is_some_and(|resource| {
+                resource
+                    .data
+                    .pointer("/metadata/deletionTimestamp")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+            }))
     }
 
     async fn get_resource(
@@ -562,14 +714,7 @@ impl klights_controllers::endpoints::EndpointReconcileStore for RootControllerLe
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>> {
-        klights_controllers::endpoints::EndpointReconcileStore::get_resource(
-            self.store.as_ref(),
-            api_version,
-            kind,
-            namespace,
-            name,
-        )
-        .await
+        self.read_resource(api_version, kind, namespace, name).await
     }
 
     async fn list_service_endpoint_slices(
@@ -577,10 +722,11 @@ impl klights_controllers::endpoints::EndpointReconcileStore for RootControllerLe
         namespace: &str,
         service_name: &str,
     ) -> Result<Vec<Resource>> {
-        klights_controllers::endpoints::EndpointReconcileStore::list_service_endpoint_slices(
-            self.store.as_ref(),
-            namespace,
-            service_name,
+        self.list_resources(
+            "discovery.k8s.io/v1",
+            "EndpointSlice",
+            ResourceCollectionScope::Namespace(namespace.to_string()),
+            Some(&format!("kubernetes.io/service-name={service_name}")),
         )
         .await
     }
@@ -662,14 +808,7 @@ impl klights_controllers::common::ControllerStatusStore for RootControllerLeader
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>> {
-        klights_controllers::common::ControllerStatusStore::get_status_resource(
-            self.store.as_ref(),
-            api_version,
-            kind,
-            namespace,
-            name,
-        )
-        .await
+        self.read_resource(api_version, kind, namespace, name).await
     }
 
     async fn update_status(
@@ -701,29 +840,20 @@ impl klights_controllers::common::ControllerStatusStore for RootControllerLeader
         resource: &Resource,
         reason: &'static str,
     ) {
-        klights_controllers::common::ControllerStatusStore::log_noop_status_write(
-            self.store.as_ref(),
-            operation,
-            resource,
-            reason,
-        );
+        tracing::debug!(operation, resource = %resource.name, reason, "controller status write was a no-op");
     }
 }
 
 #[async_trait]
 impl klights_controllers::cronjob::CronJobStore for RootControllerLeaderPort {
     async fn get_cronjob(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        self.store
-            .get_resource("batch/v1", "CronJob", Some(namespace), name)
+        self.read_resource("batch/v1", "CronJob", Some(namespace), name)
             .await
-            .map_err(map_controller_store_error)
     }
 
     async fn get_job(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        self.store
-            .get_resource("batch/v1", "Job", Some(namespace), name)
+        self.read_resource("batch/v1", "Job", Some(namespace), name)
             .await
-            .map_err(map_controller_store_error)
     }
 
     async fn create_job(
@@ -744,16 +874,13 @@ impl klights_controllers::cronjob::CronJobStore for RootControllerLeaderPort {
     }
 
     async fn list_jobs(&self, namespace: &str) -> Result<Vec<Resource>> {
-        self.store
-            .list_resources(
-                "batch/v1",
-                "Job",
-                Some(namespace),
-                ResourceListOptions::all(),
-            )
-            .await
-            .map(|listing| listing.items)
-            .map_err(map_controller_store_error)
+        self.list_resources(
+            "batch/v1",
+            "Job",
+            ResourceCollectionScope::Namespace(namespace.to_string()),
+            None,
+        )
+        .await
     }
 
     async fn delete_job(
@@ -778,15 +905,23 @@ impl klights_controllers::cronjob::CronJobStore for RootControllerLeaderPort {
 #[async_trait]
 impl klights_controllers::pvc::PvcStore for RootControllerLeaderPort {
     async fn get_pvc(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        klights_controllers::pvc::PvcStore::get_pvc(self.store.as_ref(), namespace, name).await
+        self.read_resource("v1", "PersistentVolumeClaim", Some(namespace), name)
+            .await
     }
 
     async fn list_persistent_volumes(&self) -> Result<Vec<Resource>> {
-        klights_controllers::pvc::PvcStore::list_persistent_volumes(self.store.as_ref()).await
+        self.list_resources(
+            "v1",
+            "PersistentVolume",
+            ResourceCollectionScope::Cluster,
+            None,
+        )
+        .await
     }
 
     async fn get_persistent_volume(&self, name: &str) -> Result<Option<Resource>> {
-        klights_controllers::pvc::PvcStore::get_persistent_volume(self.store.as_ref(), name).await
+        self.read_resource("v1", "PersistentVolume", None, name)
+            .await
     }
 
     async fn create_persistent_volume(
@@ -829,7 +964,13 @@ impl klights_controllers::pvc::PvcStore for RootControllerLeaderPort {
 #[async_trait]
 impl klights_controllers::pdb::PdbStore for RootControllerLeaderPort {
     async fn list_pdbs(&self, namespace: &str) -> Result<Vec<Resource>> {
-        klights_controllers::pdb::PdbStore::list_pdbs(self.store.as_ref(), namespace).await
+        self.list_resources(
+            "policy/v1",
+            "PodDisruptionBudget",
+            ResourceCollectionScope::Namespace(namespace.to_string()),
+            None,
+        )
+        .await
     }
 }
 
@@ -842,18 +983,16 @@ impl klights_controllers::replicationcontroller::ReplicationControllerStore
         namespace: &str,
         name: &str,
     ) -> Result<Option<Resource>> {
-        klights_controllers::replicationcontroller::ReplicationControllerStore::get_replication_controller(
-            self.store.as_ref(),
-            namespace,
-            name,
-        )
-        .await
+        self.read_resource("v1", "ReplicationController", Some(namespace), name)
+            .await
     }
 
     async fn list_resource_quotas(&self, namespace: &str) -> Result<Vec<Resource>> {
-        klights_controllers::replicationcontroller::ReplicationControllerStore::list_resource_quotas(
-            self.store.as_ref(),
-            namespace,
+        self.list_resources(
+            "v1",
+            "ResourceQuota",
+            ResourceCollectionScope::Namespace(namespace.to_string()),
+            None,
         )
         .await
     }
@@ -881,17 +1020,15 @@ impl klights_controllers::replicationcontroller::ReplicationControllerStore
 #[async_trait]
 impl klights_controllers::apiservice::ApiServiceStore for RootControllerLeaderPort {
     async fn get_apiservice(&self, name: &str) -> Result<Option<Resource>> {
-        klights_controllers::apiservice::ApiServiceStore::get_apiservice(self.store.as_ref(), name)
+        self.read_resource("apiregistration.k8s.io/v1", "APIService", None, name)
             .await
     }
 
     async fn service_exists(&self, namespace: &str, name: &str) -> Result<bool> {
-        klights_controllers::apiservice::ApiServiceStore::service_exists(
-            self.store.as_ref(),
-            namespace,
-            name,
-        )
-        .await
+        Ok(self
+            .read_resource("v1", "Service", Some(namespace), name)
+            .await?
+            .is_some())
     }
 
     async fn list_endpoint_slices(
@@ -899,21 +1036,18 @@ impl klights_controllers::apiservice::ApiServiceStore for RootControllerLeaderPo
         namespace: &str,
         service_name: &str,
     ) -> Result<Vec<Resource>> {
-        klights_controllers::apiservice::ApiServiceStore::list_endpoint_slices(
-            self.store.as_ref(),
-            namespace,
-            service_name,
+        self.list_resources(
+            "discovery.k8s.io/v1",
+            "EndpointSlice",
+            ResourceCollectionScope::Namespace(namespace.to_string()),
+            Some(&format!("kubernetes.io/service-name={service_name}")),
         )
         .await
     }
 
     async fn get_endpoints(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        klights_controllers::apiservice::ApiServiceStore::get_endpoints(
-            self.store.as_ref(),
-            namespace,
-            name,
-        )
-        .await
+        self.read_resource("v1", "Endpoints", Some(namespace), name)
+            .await
     }
 
     async fn update_apiservice_status(
@@ -939,7 +1073,13 @@ impl klights_controllers::apiservice::ApiServiceStore for RootControllerLeaderPo
 #[async_trait]
 impl klights_controllers::csr_signer::CsrStatusStore for RootControllerLeaderPort {
     async fn get_csr(&self, name: &str) -> Result<Option<Resource>> {
-        klights_controllers::csr_signer::CsrStatusStore::get_csr(self.store.as_ref(), name).await
+        self.read_resource(
+            "certificates.k8s.io/v1",
+            "CertificateSigningRequest",
+            None,
+            name,
+        )
+        .await
     }
 
     async fn update_csr_status(
@@ -1321,6 +1461,11 @@ fn runtime_dependencies_for_test(
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
+    let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
+        db_handle.clone(),
+        crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+    );
+    let resource_commands = RootControllerLeaderPort::resource_commands_for_test(db_handle.clone());
     let (
         pod_query,
         _pod_snapshot,
@@ -1347,7 +1492,11 @@ fn runtime_dependencies_for_test(
         test_subresource,
     ) = crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
         crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
-            db: db_handle.clone(),
+            resource_query,
+            ownership_reads: db.focused_read_store(),
+            resource_reads: db.focused_read_store(),
+            namespace_content_reads: db.focused_read_store(),
+            topology_reads: db.focused_read_store(),
             pod_workqueue_store: None,
             supervisor,
             side_effects: Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
@@ -1357,11 +1506,13 @@ fn runtime_dependencies_for_test(
             scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
-            resource_commands: None,
+            resource_commands: Some(resource_commands),
             remote_delivery_required: false,
             controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
+            api_identity: Arc::new(k8s_native_service::test_support::admission::DeterministicApiIdentity::default()),
             scheduler_bind_gate: None,
             post_write_maintenance_notify: None,
+            gc_coordination: Arc::new(klights_controllers::ControllerCoordination::new()),
         },
         None,
     );

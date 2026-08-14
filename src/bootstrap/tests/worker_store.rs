@@ -48,14 +48,14 @@ fn worker_store_from_local(
     let proposal =
         Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()));
     let network = Arc::new(
-        crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
+        crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new_for_test(
             db.clone(),
             proposal.clone(),
             authority.clone(),
         ),
     );
     let cleanup = Arc::new(
-        crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup::new(
+        crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup::new_for_test(
             db.clone(),
             proposal,
             authority.clone(),

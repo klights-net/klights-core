@@ -24,7 +24,7 @@ pub struct ServeArgs<'a> {
     pub cni_rpc_token: CancellationToken,
     pub cni_rpc_handle: SupervisedJoinHandle<()>,
     pub controlplane_leader_control_stream_handle: Option<SupervisedJoinHandle<()>>,
-    pub db_handle: crate::datastore::DatastoreHandle,
+    pub lifecycle: Arc<dyn klights_cluster_store::BackendLifecycleStore>,
     pub shutdown_token: CancellationToken,
     pub supervisor: Arc<TaskSupervisor>,
     pub grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
@@ -45,7 +45,7 @@ pub async fn serve(args: ServeArgs<'_>) -> Result<()> {
         cni_rpc_token,
         cni_rpc_handle,
         controlplane_leader_control_stream_handle,
-        db_handle,
+        lifecycle,
         shutdown_token,
         supervisor,
         grpc_transport_policy,
@@ -93,7 +93,7 @@ pub async fn serve(args: ServeArgs<'_>) -> Result<()> {
     // Soft shutdown
     tracing::info!("Starting soft shutdown — leaving pods and networking intact");
     shutdown_token.cancel();
-    db_handle.close();
+    lifecycle.close();
 
     let timeout = std::time::Duration::from_secs(10);
 

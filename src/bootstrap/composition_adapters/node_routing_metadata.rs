@@ -1,13 +1,11 @@
 use anyhow::Result;
 
-use crate::datastore::DatastoreBackend;
-
 pub(crate) async fn stamp_from_store(
-    db: &dyn DatastoreBackend,
+    topology_reads: &dyn klights_cluster_store::ClusterTopologyRead,
     node_name: &str,
     node: &mut serde_json::Value,
 ) -> Result<bool> {
-    stamp_from_store_impl(db, node_name, node).await
+    stamp_from_store_impl(topology_reads, node_name, node).await
 }
 
 pub(crate) async fn stamp_from_worker_store(
@@ -41,15 +39,25 @@ pub(crate) async fn stamp_from_worker_store(
 }
 
 async fn stamp_from_store_impl(
-    db: &dyn DatastoreBackend,
+    topology_reads: &dyn klights_cluster_store::ClusterTopologyRead,
     node_name: &str,
     node: &mut serde_json::Value,
 ) -> Result<bool> {
     let mut changed = false;
-    if let Some(subnet) = db.get_node_subnet(node_name).await? {
-        changed |= klights_cluster_core::set_node_pod_cidr(node, &subnet.subnet.to_string());
+    if let Some(subnet) = topology_reads
+        .get_node_subnet(klights_cluster_store::NodeTopologyRequest::try_new(
+            node_name,
+        )?)
+        .await?
+    {
+        changed |= klights_cluster_core::set_node_pod_cidr(node, &subnet.subnet().to_string());
     }
-    if let Some(metadata) = db.get_node_dataplane(node_name).await? {
+    if let Some(metadata) = topology_reads
+        .get_node_dataplane(klights_cluster_store::NodeTopologyRequest::try_new(
+            node_name,
+        )?)
+        .await?
+    {
         changed |= klights_types::set_node_dataplane_annotations(
             node,
             &metadata.endpoint.to_string(),

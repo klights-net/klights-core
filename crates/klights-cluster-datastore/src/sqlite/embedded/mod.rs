@@ -761,7 +761,6 @@ impl Datastore {
                     serde_json::from_slice(&live_data).map_err(serde_to_sqlite_error)?;
                 let mut effective_preconditions = preconditions.clone();
                 let mut pod_metadata_rebased_against_latest = false;
-                let mut status_rebased_against_latest = false;
                 if !apply_against_latest
                     && operation == klights_cluster_core::OutboxOperation::PodMetadata.as_str()
                     && api_version == "v1"
@@ -814,23 +813,6 @@ impl Datastore {
                     effective_preconditions.resource_version = preconditions
                         .resource_version
                         .or_else(|| (expected_rv > 0).then_some(expected_rv));
-                    if let Some(expected) = effective_preconditions.resource_version
-                        && expected != live_rv
-                        && klights_types::has_builtin_status_subresource(&api_version, &kind)
-                        && let Some(base) = Self::resource_snapshot_for_key_at_rv_in_tx(
-                            tx,
-                            &api_version,
-                            &kind,
-                            namespace.as_deref(),
-                            &name,
-                            expected,
-                        )?
-                        && metadata_uid(&base) == Some(live_uid.as_str())
-                        && resource_client_owned_state_equal(&base, &live)
-                    {
-                        effective_preconditions.resource_version = Some(live_rv);
-                        status_rebased_against_latest = data.get("status") == base.get("status");
-                    }
                     validate_resource_preconditions(
                         &effective_preconditions,
                         Some(&live_uid),
@@ -842,7 +824,6 @@ impl Datastore {
                 ensure_metadata_identity(&mut data, namespace.as_deref(), &name);
                 ensure_pod_status_ip_arrays(&mut data, &api_version, &kind);
                 if preserve_status
-                    || status_rebased_against_latest
                     || operation == klights_cluster_core::OutboxOperation::PodMetadata.as_str()
                 {
                     klights_types::preserve_status_subresource_on_main_update(

@@ -1291,6 +1291,7 @@ mod tests {
         tampered["metadata"]["labels"] = json!({"app": "tamper"});
         let mut stale_request = stale.clone();
         stale_request.resource_version = 1;
+        tampered["metadata"]["resourceVersion"] = json!(stale_request.resource_version.to_string());
         let conflict = repo
             .api_mutations
             .update_pod("default", "or-race", tampered, stale_request, false)

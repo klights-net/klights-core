@@ -817,6 +817,14 @@ async fn list_cr_inner(
             .transpose()
             .map_err(|err| AppError::BadRequest(format!("Invalid label selector: {err}")))?;
         let watch_ns = ns.map(str::to_string);
+        let watch_scope = if is_cluster_scope {
+            klights_leader_api::ResourceListScope::Cluster
+        } else {
+            watch_ns
+                .clone()
+                .map(klights_leader_api::ResourceListScope::Namespace)
+                .unwrap_or(klights_leader_api::ResourceListScope::AllNamespaces)
+        };
         let conversion_for_watch = conversion.clone();
         let group_for_watch = group.to_string();
         let plural_for_watch = plural.to_string();
@@ -1077,7 +1085,7 @@ async fn list_cr_inner(
                                     .current_collection_resource_version(
                                         av.clone(),
                                         kind.clone(),
-                                        watch_ns.clone(),
+                                        watch_scope.clone(),
                                     )
                                     .await
                                     .unwrap_or(0);

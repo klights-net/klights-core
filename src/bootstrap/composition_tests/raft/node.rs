@@ -1247,6 +1247,10 @@ mod tests {
                 value: "seed-cluster".into(),
             },
             StorageCommand::SetKlightsMeta {
+                key: klights_cluster_store::LEADER_EPOCH_META_KEY.into(),
+                value: "0".into(),
+            },
+            StorageCommand::SetKlightsMeta {
                 key: klights_cluster_store::RAFT_TERM_META_KEY.into(),
                 value: "0".into(),
             },
@@ -2211,6 +2215,7 @@ mod tests {
             .unwrap();
         for (key, value) in [
             (klights_cluster_store::CLUSTER_ID_META_KEY, "cluster-a"),
+            (klights_cluster_store::LEADER_EPOCH_META_KEY, "0"),
             (
                 klights_cluster_store::RAFT_VOTERS_META_KEY,
                 "[\"mn-controlplane1\"]",

@@ -11,7 +11,6 @@ pub mod sqlite;
 
 #[cfg(test)]
 pub use backend::CommitObservationSink;
-pub(crate) use backend::DatastoreBackendLifecyclePort;
 #[cfg(test)]
 pub use backend::TestWatchStore;
 pub use backend::{

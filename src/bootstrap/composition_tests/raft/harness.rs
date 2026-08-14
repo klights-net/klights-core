@@ -1,8 +1,7 @@
 //! Focused root composition for Raft integration tests.
 
+use crate::datastore::backend::DatastoreBackendLifecyclePort;
 use std::sync::Arc;
-
-use crate::datastore::DatastoreHandle as IntegrationDatastoreHandle;
 
 /// Opaque feature-gated capability for the root's exact Raft composition.
 ///
@@ -19,6 +18,10 @@ impl IntegrationRaftComposition {
         Self { db }
     }
 
+    fn passive(&self) -> crate::bootstrap::cluster_store::selector::OpenedPassiveStore {
+        crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(self.db.as_ref())
+    }
+
     pub fn store_ports(&self) -> klights_replication::node::RaftStorePorts {
         crate::bootstrap::composition_adapters::cluster_store_replication_adapter::raft_store_ports_for_test(
             self.db.clone(),
@@ -29,16 +32,14 @@ impl IntegrationRaftComposition {
         &self,
         node: Arc<klights_replication::node::RaftNode>,
     ) -> Arc<dyn klights_leader_api::LeaderResourceCommand> {
-        let db: IntegrationDatastoreHandle = self.db.clone();
+        let ports = self.passive();
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
-        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
-            db, authority.clone(),
-        );
+        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(ports.read_ports.resource_reads(), authority.clone());
         Arc::new(
             klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                 node.proposal(),
-                query,
+                query.clone(),
                 authority,
             ),
         )
@@ -47,9 +48,12 @@ impl IntegrationRaftComposition {
     pub fn commit_materializer(
         &self,
     ) -> Arc<dyn klights_replication::materializer::RaftCommitMaterializer> {
-        let db: IntegrationDatastoreHandle = self.db.clone();
+        let passive = Arc::new(self.db.canonical_embedded_for_test_support());
         Arc::new(
-            crate::bootstrap::composition_adapters::cluster_store_replication_adapter::DatastoreRaftCommitMaterializer::new(db),
+            crate::bootstrap::composition_adapters::cluster_store_replication_adapter::DatastoreRaftCommitMaterializer::new(
+                passive.clone(),
+                passive,
+            ),
         )
     }
 
@@ -74,9 +78,7 @@ impl IntegrationRaftComposition {
         let snapshot_builder = klights_replication::snapshot::SqliteRaftSnapshotBuilder::new(
             self.db.focused_recovery_store(),
             self.db.focused_read_store(),
-            Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(
-                self.db.clone(),
-            )),
+            Arc::new(DatastoreBackendLifecyclePort::new(self.db.clone())),
             snapshot_applied_state,
             supervisor,
         );
@@ -95,30 +97,29 @@ impl IntegrationRaftComposition {
         &self,
         node: Arc<klights_replication::node::RaftNode>,
     ) -> Arc<dyn klights_leader_api::ControlplaneJoinHandler> {
-        let db: IntegrationDatastoreHandle = self.db.clone();
-        let authority =
-            crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
+        let ports = self.passive();
+        let authority = crate::bootstrap::authority::AuthorityHandle::from(
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+        );
         let query =
-            crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
-                db.clone(), authority.clone(),
-            );
-        let commands = Arc::new(
-            klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
-                Arc::new(
-                    crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()),
-                ),
-                query,
-                authority,
-            ),
+            crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(ports.read_ports.resource_reads(), authority.clone());
+        let db: crate::datastore::DatastoreHandle = self.db.clone();
+        let commands = crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::test_resource_command(
+            db,
+            &authority,
         );
         let store = Arc::new(
             crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
-                db.clone(),
+                ports.read_ports.resource_reads(),
+                ports.topology_reads.clone(),
                 commands,
             ),
         );
         crate::bootstrap::controlplane_join_adapters::build_controlplane_join_handler(
-            node, db, store,
+            node,
+            query,
+            ports.metadata_reads,
+            store,
         )
     }
 
@@ -126,28 +127,30 @@ impl IntegrationRaftComposition {
         &self,
         node: Arc<klights_replication::node::RaftNode>,
     ) -> Arc<dyn klights_leader_api::ControlplaneJoinHandler> {
-        let db: IntegrationDatastoreHandle = self.db.clone();
+        let ports = self.passive();
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
         let query =
-            crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
-                db.clone(), authority.clone(),
-            );
+            crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(ports.read_ports.resource_reads(), authority.clone());
         let commands = Arc::new(
             klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                 node.proposal(),
-                query,
+                query.clone(),
                 authority,
             ),
         );
         let store = Arc::new(
             crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
-                db.clone(),
+                ports.read_ports.resource_reads(),
+                ports.topology_reads.clone(),
                 commands,
             ),
         );
         crate::bootstrap::controlplane_join_adapters::build_controlplane_join_handler(
-            node, db, store,
+            node,
+            query,
+            ports.metadata_reads,
+            store,
         )
     }
 
@@ -158,21 +161,20 @@ impl IntegrationRaftComposition {
         name: &str,
         body: serde_json::Value,
     ) -> anyhow::Result<klights_cluster_core::Resource> {
-        let db: IntegrationDatastoreHandle = self.db.clone();
+        let ports = self.passive();
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
-        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
-            db.clone(), authority.clone(),
-        );
+        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(ports.read_ports.resource_reads(), authority.clone());
         let commands = Arc::new(
             klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                 node.proposal(),
-                query,
+                query.clone(),
                 authority,
             ),
         );
         let parts = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_raft_root_parts(
-            self.db.clone(),
+            query.clone(),
+            ports.ownership_reads,
             commands,
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
@@ -186,12 +188,10 @@ impl IntegrationRaftComposition {
         uid: &str,
         resource_version: i64,
     ) -> klights_reconcile_api::ControllerStoreResult<()> {
-        let db: IntegrationDatastoreHandle = self.db.clone();
+        let ports = self.passive();
         let authority =
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority();
-        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new(
-            db.clone(), authority.clone(),
-        );
+        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(ports.read_ports.resource_reads(), authority.clone());
         let commands = Arc::new(
             klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
                 node.proposal(),
@@ -200,7 +200,7 @@ impl IntegrationRaftComposition {
             ),
         );
         let port = crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
-            db, commands,
+            ports.read_ports.resource_reads(), ports.ownership_reads, commands,
         );
         klights_controllers::csr_signer::CsrStatusStore::update_csr_status(
             &port,
@@ -219,8 +219,10 @@ impl IntegrationRaftComposition {
     ) -> anyhow::Result<()> {
         let identity =
             crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity();
+        let ports = self.passive();
         let store = crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
-            self.db.clone(),
+            ports.read_ports.resource_reads(),
+            ports.topology_reads,
             self.resource_commands(node),
         );
         klights_controllers::namespace::create_default_service_account_at(
@@ -246,9 +248,10 @@ impl IntegrationRaftComposition {
         namespace: &str,
         namespace_uid: &str,
     ) -> anyhow::Result<bool> {
-        let db: IntegrationDatastoreHandle = self.db.clone();
+        let ports = self.passive();
         let store = crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new_with_commands(
-            db,
+            ports.read_ports.resource_reads(),
+            ports.namespace_content_reads,
             self.resource_commands(node),
         );
         let outcome = k8s_native_service::reconcile_namespace_termination_for_uid_with_outcome_at(

@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::DatastoreHandle;
+use klights_cluster_store::ClusterTopologyMutation;
 use klights_controllers::node_subnet::{
     NodeReadinessPublishFuture, NodeReadinessPublishResult, NodeReadinessPublisher,
     PeerDataplaneHealth, PeerSyncOutcome, PeerTopologyProjection, PeerTopologyProjectionFuture,
 };
 
 pub struct DatastorePeerTopologyProjection {
-    db: DatastoreHandle,
+    topology_mutations: Arc<dyn ClusterTopologyMutation>,
     my_node_name: String,
     cluster_cidr: String,
     authority: Option<Arc<dyn klights_leader_api::LeaderAuthority>>,
@@ -16,13 +16,13 @@ pub struct DatastorePeerTopologyProjection {
 
 impl DatastorePeerTopologyProjection {
     pub fn new(
-        db: DatastoreHandle,
+        topology_mutations: Arc<dyn ClusterTopologyMutation>,
         my_node_name: String,
         cluster_cidr: String,
         authority: Option<Arc<dyn klights_leader_api::LeaderAuthority>>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            db,
+            topology_mutations,
             my_node_name,
             cluster_cidr,
             authority,
@@ -51,10 +51,10 @@ impl PeerTopologyProjection for DatastorePeerTopologyProjection {
 
             match event.event_type() {
                 klights_leader_api::WatchEventType::Deleted => {
-                    self.db
+                    self.topology_mutations
                         .delete_node_subnet(peer_name)
                         .await
-                        .map_err(map_controller_store_error)?;
+                        .map_err(|error| map_controller_store_error(error.into()))?;
                 }
                 klights_leader_api::WatchEventType::Added
                 | klights_leader_api::WatchEventType::Modified => {
@@ -64,24 +64,24 @@ impl PeerTopologyProjection for DatastorePeerTopologyProjection {
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|timestamp| !timestamp.is_empty())
                     {
-                        self.db
+                        self.topology_mutations
                             .delete_node_subnet(peer_name)
                             .await
-                            .map_err(map_controller_store_error)?;
+                            .map_err(|error| map_controller_store_error(error.into()))?;
                         return Ok(());
                     }
                     if let Some(node_ip) = klights_controllers::node_subnet::node_dataplane_ip(node)
                     {
-                        self.db
+                        self.topology_mutations
                             .allocate_node_subnet(peer_name, &self.cluster_cidr, &node_ip)
                             .await
-                            .map_err(map_controller_store_error)?;
+                            .map_err(|error| map_controller_store_error(error.into()))?;
                         let (mode, hostport_range) =
                             klights_controllers::node_subnet::project_node_peer_attributes(node);
-                        self.db
+                        self.topology_mutations
                             .update_node_peer_attributes(peer_name, mode, hostport_range)
                             .await
-                            .map_err(map_controller_store_error)?;
+                            .map_err(|error| map_controller_store_error(error.into()))?;
                     }
                 }
                 klights_leader_api::WatchEventType::Bookmark

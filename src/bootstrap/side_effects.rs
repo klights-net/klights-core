@@ -32,7 +32,7 @@ pub(crate) fn default_registry(
             authority,
         ),
     );
-    default_registry_with_commands(
+    default_registry_for_test_handle(
         metrics,
         services,
         task_supervisor,
@@ -46,31 +46,67 @@ pub(crate) fn default_registry_with_commands(
     metrics: Arc<SideEffectMetrics>,
     services: Option<Arc<dyn klights_network_api::ServiceRouter>>,
     task_supervisor: Option<Arc<klights_supervisor::TaskSupervisor>>,
-    db: crate::datastore::DatastoreHandle,
-    resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
-    identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
-) -> SideEffectRegistry {
-    let pod_slot = PodSideEffectPortsSlot::new();
-    let controller_slot = ControllerDispatcherSlot::new();
-    let controller_store = Arc::new(
+    resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
+    ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
+    namespace_content_reads: Arc<dyn klights_cluster_store::NamespaceContentRead>,
+) -> DefaultRegistryCore {
+    DefaultRegistryCore {
+        metrics,
+        services,
+        task_supervisor,
+        resource_reads,
+        ownership_reads,
+        namespace_content_reads,
+    }
+}
+
+pub(crate) struct DefaultRegistryCore {
+    metrics: Arc<SideEffectMetrics>,
+    services: Option<Arc<dyn klights_network_api::ServiceRouter>>,
+    task_supervisor: Option<Arc<klights_supervisor::TaskSupervisor>>,
+    resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
+    ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
+    namespace_content_reads: Arc<dyn klights_cluster_store::NamespaceContentRead>,
+}
+
+impl DefaultRegistryCore {
+    pub(crate) fn attach_service_account_defaults(
+        self,
+        topology_reads: Arc<dyn klights_cluster_store::ClusterTopologyRead>,
+        resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
+        identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
+    ) -> SideEffectRegistry {
+        let Self {
+            metrics,
+            services,
+            task_supervisor,
+            resource_reads,
+            ownership_reads,
+            namespace_content_reads,
+        } = self;
+        let pod_slot = PodSideEffectPortsSlot::new();
+        let controller_slot = ControllerDispatcherSlot::new();
+        let controller_store = Arc::new(
         crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
-            db.clone(),
+            resource_reads.clone(),
+            ownership_reads.clone(),
             resource_commands.clone(),
         ),
     );
-    let namespace_store = crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new_with_commands(
-        db.clone(),
+        let namespace_store = crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new_with_commands(
+        resource_reads.clone(),
+        namespace_content_reads.clone(),
         resource_commands.clone(),
     );
-    let namespace_reconciliation =
+        let namespace_reconciliation =
         crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationReconciler::new(namespace_store, metrics);
-    let effects = DefaultSideEffects::new(
+        let effects = DefaultSideEffects::new(
         klights_controllers::side_effects::apiservice::effect(
-            crate::bootstrap::controller_adapters::apiservice_side_effect_adapter::port(db.clone()),
+            crate::bootstrap::controller_adapters::apiservice_side_effect_adapter::port(resource_reads.clone()),
             controller_slot.clone(),
         ),
         klights_controllers::side_effects::daemonset_node::effect(
-            crate::bootstrap::controller_adapters::daemonset_node_side_effect_adapter::port(db.clone()),
+            crate::bootstrap::controller_adapters::daemonset_node_side_effect_adapter::port(resource_reads.clone()),
             controller_slot.clone(),
         ),
         klights_controllers::side_effects::endpoint_mirror::effect(
@@ -78,11 +114,11 @@ pub(crate) fn default_registry_with_commands(
         ),
         klights_controllers::side_effects::endpoint_slice_sync::effect(services),
         klights_controllers::side_effects::hpa::effect(
-            crate::bootstrap::controller_adapters::hpa_side_effect_adapter::port(db.clone()),
+            crate::bootstrap::controller_adapters::hpa_side_effect_adapter::port(resource_reads.clone()),
             controller_slot.clone(),
         ),
         klights_controllers::side_effects::job::effect(
-            crate::bootstrap::controller_adapters::job_side_effect_adapter::port(db.clone()),
+            crate::bootstrap::controller_adapters::job_side_effect_adapter::port(resource_reads.clone()),
             controller_slot.clone(),
         ),
         klights_controllers::side_effects::namespace_termination::effect(namespace_reconciliation),
@@ -90,7 +126,7 @@ pub(crate) fn default_registry_with_commands(
             pod_slot.clone(),
             task_supervisor,
             Some(crate::bootstrap::controller_adapters::node_taint_manager_side_effect_adapter::port(
-                db.clone(),
+                resource_reads.clone(),
             )),
         ),
         klights_controllers::side_effects::pdb::effect(crate::bootstrap::controller_adapters::pdb_side_effect_adapter::port(
@@ -99,22 +135,59 @@ pub(crate) fn default_registry_with_commands(
         )),
         klights_controllers::side_effects::resource_quota::effect(
             crate::bootstrap::controller_adapters::resource_quota_side_effect_adapter::port(
-                db.clone(),
+                resource_reads.clone(),
                 controller_store,
                 pod_slot.clone(),
             ),
         ),
         klights_controllers::side_effects::service_account_defaults::effect(
             crate::bootstrap::controller_adapters::service_account_defaults_side_effect_adapter::port(
-                db.clone(),
+                resource_reads.clone(),
+                topology_reads,
                 resource_commands,
                 identity,
             ),
         ),
         klights_controllers::side_effects::workload_pod::effect(
-            crate::bootstrap::controller_adapters::workload_pod_side_effect_adapter::port(db),
+            crate::bootstrap::controller_adapters::workload_pod_side_effect_adapter::port(resource_reads),
             controller_slot.clone(),
         ),
+    );
+        klights_controllers::side_effects::default_registry(effects, pod_slot, controller_slot)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn default_registry_for_test_handle(
+    metrics: Arc<SideEffectMetrics>,
+    services: Option<Arc<dyn klights_network_api::ServiceRouter>>,
+    task_supervisor: Option<Arc<klights_supervisor::TaskSupervisor>>,
+    db: crate::datastore::DatastoreHandle,
+    resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
+    identity: Arc<dyn klights_controllers::ControllerIdentityGenerator>,
+) -> SideEffectRegistry {
+    let pod_slot = PodSideEffectPortsSlot::new();
+    let controller_slot = ControllerDispatcherSlot::new();
+    let controller_store = Arc::new(
+        crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_for_test_with_commands(
+            db.clone(), resource_commands.clone(),
+        ),
+    );
+    let namespace_store = crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(db.clone());
+    let namespace_reconciliation = crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationReconciler::new(namespace_store, metrics);
+    let effects = DefaultSideEffects::new(
+        klights_controllers::side_effects::apiservice::effect(crate::bootstrap::controller_adapters::apiservice_side_effect_adapter::port_for_test(db.clone()), controller_slot.clone()),
+        klights_controllers::side_effects::daemonset_node::effect(crate::bootstrap::controller_adapters::daemonset_node_side_effect_adapter::port_for_test(db.clone()), controller_slot.clone()),
+        klights_controllers::side_effects::endpoint_mirror::effect(crate::bootstrap::controller_adapters::endpoint_mirror_side_effect_adapter::port(controller_store.clone(), identity.clone())),
+        klights_controllers::side_effects::endpoint_slice_sync::effect(services),
+        klights_controllers::side_effects::hpa::effect(crate::bootstrap::controller_adapters::hpa_side_effect_adapter::port_for_test(db.clone()), controller_slot.clone()),
+        klights_controllers::side_effects::job::effect(crate::bootstrap::controller_adapters::job_side_effect_adapter::port_for_test(db.clone()), controller_slot.clone()),
+        klights_controllers::side_effects::namespace_termination::effect(namespace_reconciliation),
+        klights_controllers::side_effects::node_taint_manager::effect(pod_slot.clone(), task_supervisor, Some(crate::bootstrap::controller_adapters::node_taint_manager_side_effect_adapter::port_for_test(db.clone()))),
+        klights_controllers::side_effects::pdb::effect(crate::bootstrap::controller_adapters::pdb_side_effect_adapter::port(controller_store.clone(), pod_slot.clone())),
+        klights_controllers::side_effects::resource_quota::effect(crate::bootstrap::controller_adapters::resource_quota_side_effect_adapter::port_for_test(db.clone(), controller_store, pod_slot.clone())),
+        klights_controllers::side_effects::service_account_defaults::effect(crate::bootstrap::controller_adapters::service_account_defaults_side_effect_adapter::port_for_test(db.clone(), resource_commands, identity)),
+        klights_controllers::side_effects::workload_pod::effect(crate::bootstrap::controller_adapters::workload_pod_side_effect_adapter::port_for_test(db), controller_slot.clone()),
     );
     klights_controllers::side_effects::default_registry(effects, pod_slot, controller_slot)
 }

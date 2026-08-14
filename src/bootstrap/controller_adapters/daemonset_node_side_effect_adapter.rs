@@ -1,29 +1,76 @@
-use klights_cluster_store::ResourceListOptions;
+use klights_cluster_store::{
+    ClusterResourceRead, ResourceCollectionScope, ResourceListQuery, ResourceListRead,
+    ResourceListRequest,
+};
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
 
+#[cfg(test)]
 use crate::datastore::DatastoreHandle;
 use klights_controllers::side_effects::daemonset_node::DaemonSetNodeSideEffectStore;
 
 struct RootDaemonSetNodeSideEffectStore {
-    db: DatastoreHandle,
+    resource_reads: Arc<dyn ClusterResourceRead>,
 }
 
 #[async_trait]
 impl DaemonSetNodeSideEffectStore for RootDaemonSetNodeSideEffectStore {
     async fn list_daemonsets(&self) -> Result<Vec<Resource>> {
-        self.db
-            .list_resources("apps/v1", "DaemonSet", None, ResourceListOptions::all())
-            .await
-            .map(|listing| listing.items)
+        match self
+            .resource_reads
+            .list_resources(ResourceListRequest::new(
+                "apps/v1",
+                "DaemonSet",
+                ResourceCollectionScope::AllNamespaces,
+                ResourceListQuery::all(),
+            ))
+            .await?
+        {
+            ResourceListRead::Current(page) | ResourceListRead::Historical(page) => {
+                Ok(page.into_items())
+            }
+            ResourceListRead::Expired {
+                requested,
+                oldest_available,
+                ..
+            } => anyhow::bail!(
+                "DaemonSet LIST at resourceVersion {requested} expired before {oldest_available}"
+            ),
+        }
     }
 }
 
-pub(crate) fn port(db: DatastoreHandle) -> Arc<dyn DaemonSetNodeSideEffectStore> {
-    Arc::new(RootDaemonSetNodeSideEffectStore { db })
+pub(crate) fn port(
+    resource_reads: Arc<dyn ClusterResourceRead>,
+) -> Arc<dyn DaemonSetNodeSideEffectStore> {
+    Arc::new(RootDaemonSetNodeSideEffectStore { resource_reads })
+}
+
+#[cfg(test)]
+struct DirectDaemonSetNodeSideEffectStore {
+    db: DatastoreHandle,
+}
+#[cfg(test)]
+#[async_trait]
+impl DaemonSetNodeSideEffectStore for DirectDaemonSetNodeSideEffectStore {
+    async fn list_daemonsets(&self) -> Result<Vec<Resource>> {
+        self.db
+            .list_resources(
+                "apps/v1",
+                "DaemonSet",
+                None,
+                klights_cluster_store::ResourceListOptions::all(),
+            )
+            .await
+            .map(|page| page.items)
+    }
+}
+#[cfg(test)]
+pub(crate) fn port_for_test(db: DatastoreHandle) -> Arc<dyn DaemonSetNodeSideEffectStore> {
+    Arc::new(DirectDaemonSetNodeSideEffectStore { db })
 }
 
 #[cfg(test)]
@@ -36,7 +83,7 @@ mod tests {
         let db = crate::datastore::sqlite::Datastore::new_in_memory()
             .await
             .unwrap();
-        let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
+        let _db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
         let dispatcher = Arc::new(
             crate::bootstrap::composition_tests::recording_reconcile_sink::recording_reconcile_sink(
             ),
@@ -79,7 +126,7 @@ mod tests {
         .unwrap();
 
         let effect = klights_controllers::side_effects::daemonset_node::effect(
-            port(db_handle.clone()),
+            port(db.focused_read_store()),
             slot,
         );
         effect.apply(&node.data).await.unwrap();

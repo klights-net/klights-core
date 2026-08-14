@@ -16,6 +16,8 @@ use klights_replication::proposal::{RaftProposal, RaftProposalEffect};
 
 use crate::datastore::DatastoreBackend;
 
+const TEST_RESOURCE_COMMAND_OPERATION: &str = "test-resource-command";
+
 pub(crate) struct BackendProposalFixture {
     backend: Arc<dyn DatastoreBackend>,
 }
@@ -115,10 +117,13 @@ impl BackendProposalFixture {
         command: StorageCommand,
     ) -> anyhow::Result<klights_cluster_store::StorageCommandResult> {
         let return_key = command_return_key(&command);
-        let operation = klights_replication::proposal::derive_operation_label(&command);
         let commit = self
             .backend
-            .build_log_apply_commit_for_command(command, operation.as_str(), "test-proposer")
+            .build_log_apply_commit_for_command(
+                command,
+                TEST_RESOURCE_COMMAND_OPERATION,
+                "test-proposer",
+            )
             .await
             .map_err(
                 crate::bootstrap::composition_adapters::cluster_store_replication_adapter::map_storage_mutation_error_for_test,

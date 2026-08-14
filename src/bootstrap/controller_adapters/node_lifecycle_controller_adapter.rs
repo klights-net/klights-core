@@ -1,11 +1,13 @@
-use klights_cluster_store::ResourceListOptions;
+use klights_cluster_store::{
+    ClusterResourceRead, ResourceCollectionScope, ResourceListQuery, ResourceListRead,
+    ResourceListRequest,
+};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::bootstrap::controller_adapters::controller_store_error_adapter::map_controller_store_error;
-use crate::datastore::{DatastoreBackend, DatastoreHandle};
 use klights_cluster_core::Resource;
 use klights_controllers::node_lifecycle::{
     NodeLifecyclePodStore, NodeLifecycleStore, NodeLostPodLifecycleSink,
@@ -15,62 +17,66 @@ use klights_kubelet::pod_lifecycle_router::{
     OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
 };
 
-trait DatastoreNodeLifecycleAccess {
-    fn datastore(&self) -> &dyn DatastoreBackend;
-}
-
-impl DatastoreNodeLifecycleAccess for DatastoreHandle {
-    fn datastore(&self) -> &dyn DatastoreBackend {
-        self.as_ref()
-    }
-}
-
-impl DatastoreNodeLifecycleAccess for &dyn DatastoreBackend {
-    fn datastore(&self) -> &dyn DatastoreBackend {
-        *self
-    }
-}
-
-struct DatastoreNodeLifecycleStore<T> {
-    inner: T,
-}
-
-impl<T> DatastoreNodeLifecycleStore<T> {
-    fn new(inner: T) -> Self {
-        Self { inner }
-    }
+struct DatastoreNodeLifecycleStore {
+    resource_reads: Arc<dyn ClusterResourceRead>,
 }
 
 #[async_trait]
-impl<T> NodeLifecycleStore for DatastoreNodeLifecycleStore<T>
-where
-    T: DatastoreNodeLifecycleAccess + Send + Sync,
-{
+impl NodeLifecycleStore for DatastoreNodeLifecycleStore {
     async fn list_nodes(&self) -> klights_reconcile_api::ControllerStoreResult<Vec<Resource>> {
-        Ok(self
-            .inner
-            .datastore()
-            .list_resources("v1", "Node", None, ResourceListOptions::all())
+        match self
+            .resource_reads
+            .list_resources(ResourceListRequest::new(
+                "v1",
+                "Node",
+                ResourceCollectionScope::Cluster,
+                ResourceListQuery::all(),
+            ))
             .await
-            .map_err(map_controller_store_error)?
-            .items)
+            .map_err(|error| map_controller_store_error(error.into()))?
+        {
+            ResourceListRead::Current(page) | ResourceListRead::Historical(page) => {
+                Ok(page.into_items())
+            }
+            ResourceListRead::Expired {
+                requested,
+                oldest_available,
+                ..
+            } => Err(klights_reconcile_api::ControllerStoreError::unavailable(
+                format!(
+                    "Node LIST at resourceVersion {requested} expired before {oldest_available}"
+                ),
+            )),
+        }
     }
 
     async fn list_node_leases(
         &self,
     ) -> klights_reconcile_api::ControllerStoreResult<Vec<Resource>> {
-        Ok(self
-            .inner
-            .datastore()
-            .list_resources(
+        match self
+            .resource_reads
+            .list_resources(ResourceListRequest::new(
                 "coordination.k8s.io/v1",
                 "Lease",
-                Some("kube-node-lease"),
-                ResourceListOptions::all(),
-            )
+                ResourceCollectionScope::Namespace("kube-node-lease".to_string()),
+                ResourceListQuery::all(),
+            ))
             .await
-            .map_err(map_controller_store_error)?
-            .items)
+            .map_err(|error| map_controller_store_error(error.into()))?
+        {
+            ResourceListRead::Current(page) | ResourceListRead::Historical(page) => {
+                Ok(page.into_items())
+            }
+            ResourceListRead::Expired {
+                requested,
+                oldest_available,
+                ..
+            } => Err(klights_reconcile_api::ControllerStoreError::unavailable(
+                format!(
+                    "Lease LIST at resourceVersion {requested} expired before {oldest_available}"
+                ),
+            )),
+        }
     }
 }
 
@@ -98,7 +104,7 @@ impl NodeLostPodLifecycleSink for NodeLostPodLifecycleAdapter {
 }
 
 pub(crate) struct NodeLifecycleControllerDependencies {
-    pub(crate) store: DatastoreHandle,
+    pub(crate) resource_reads: Arc<dyn ClusterResourceRead>,
     pub(crate) pods: Arc<dyn NodeLifecyclePodStore>,
     pub(crate) pod_mutations: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     pub(crate) pod_lifecycle: Arc<PodLifecycleRouter>,
@@ -115,7 +121,7 @@ pub(crate) async fn run(
     cancel: CancellationToken,
 ) {
     let NodeLifecycleControllerDependencies {
-        store,
+        resource_reads,
         pods,
         pod_mutations,
         pod_lifecycle,
@@ -126,7 +132,7 @@ pub(crate) async fn run(
         coordination,
         pod_eviction_grace,
     } = dependencies;
-    let store = DatastoreNodeLifecycleStore::new(store);
+    let store = DatastoreNodeLifecycleStore { resource_reads };
     let pod_lifecycle = NodeLostPodLifecycleAdapter {
         inner: pod_lifecycle,
     };

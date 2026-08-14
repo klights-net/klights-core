@@ -15,11 +15,14 @@ use klights_reconcile_api::{
 };
 use klights_types::PodIdentity;
 
-use crate::datastore::DatastoreHandle;
+use klights_cluster_store::{
+    ClusterOwnershipRead, ClusterResourceRead, ClusterTopologyRead, NamespaceContentRead,
+    ResourceGetRequest,
+};
 use klights_controllers::side_effects::ControllerDispatcherSlot;
 
 pub(crate) struct PodReconcileAdapter {
-    db: DatastoreHandle,
+    resource_reads: std::sync::Arc<dyn ClusterResourceRead>,
     controller_store: std::sync::Arc<super::controller_runtime_adapter::RootControllerLeaderPort>,
     namespace_bootstrap: crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore,
     namespace_lifecycle: std::sync::Arc<dyn klights_reconcile_api::NamespaceLifecycleStore>,
@@ -34,47 +37,32 @@ pub(crate) struct PodReconcileAdapter {
 }
 
 pub(crate) struct PodReconcileStorage {
-    db: DatastoreHandle,
+    resource_reads: std::sync::Arc<dyn ClusterResourceRead>,
+    namespace_content_reads: std::sync::Arc<dyn NamespaceContentRead>,
+    topology_reads: std::sync::Arc<dyn ClusterTopologyRead>,
+    ownership_reads: std::sync::Arc<dyn ClusterOwnershipRead>,
     resource_commands: std::sync::Arc<dyn klights_leader_api::LeaderResourceCommand>,
 }
 
 impl PodReconcileStorage {
     pub(crate) fn new(
-        db: DatastoreHandle,
+        resource_reads: std::sync::Arc<dyn ClusterResourceRead>,
+        namespace_content_reads: std::sync::Arc<dyn NamespaceContentRead>,
+        topology_reads: std::sync::Arc<dyn ClusterTopologyRead>,
+        ownership_reads: std::sync::Arc<dyn ClusterOwnershipRead>,
         resource_commands: std::sync::Arc<dyn klights_leader_api::LeaderResourceCommand>,
     ) -> Self {
         Self {
-            db,
+            resource_reads,
+            namespace_content_reads,
+            topology_reads,
+            ownership_reads,
             resource_commands,
         }
     }
 }
 
 impl PodReconcileAdapter {
-    #[cfg(test)]
-    pub(crate) fn new(
-        db: DatastoreHandle,
-        dispatcher: ControllerDispatcherSlot,
-        metrics: std::sync::Arc<klights_controllers::side_effects::SideEffectMetrics>,
-        side_effects: std::sync::Arc<klights_controllers::side_effects::SideEffectRegistry>,
-        pod_reader: std::sync::Arc<dyn klights_pod_api::PodQuery>,
-        identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
-    ) -> Self {
-        let resource_commands =
-            super::controller_runtime_adapter::RootControllerLeaderPort::resource_commands_for_test(
-                db.clone(),
-            );
-        Self::new_with_coordination(
-            PodReconcileStorage::new(db, resource_commands),
-            dispatcher,
-            metrics,
-            side_effects,
-            pod_reader,
-            std::sync::Arc::new(klights_controllers::ControllerCoordination::new()),
-            identity,
-        )
-    }
-
     pub(crate) fn new_with_coordination(
         storage: PodReconcileStorage,
         dispatcher: ControllerDispatcherSlot,
@@ -85,29 +73,34 @@ impl PodReconcileAdapter {
         identity: std::sync::Arc<dyn klights_controllers::ControllerIdentityGenerator>,
     ) -> Self {
         let PodReconcileStorage {
-            db,
+            resource_reads,
+            namespace_content_reads,
+            topology_reads,
+            ownership_reads,
             resource_commands,
         } = storage;
         let controller_store = std::sync::Arc::new(
             super::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
-                db.clone(),
+                resource_reads.clone(),
+                ownership_reads.clone(),
                 resource_commands.clone(),
             ),
         );
         Self {
             non_pod_finalization: crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new_with_commands(
-                db.clone(), resource_commands.clone(),
+                resource_reads.clone(), ownership_reads.clone(),
+                resource_commands.clone(),
             ),
             namespace_lifecycle: crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new_with_commands(
-                db.clone(),
+                resource_reads.clone(), namespace_content_reads,
                 resource_commands.clone(),
             ),
             namespace_bootstrap: crate::bootstrap::composition_adapters::leader_bootstrap_store_adapter::LeaderBootstrapStore::new(
-                db.clone(),
+                resource_reads.clone(), topology_reads,
                 resource_commands,
             ),
             controller_store,
-            db,
+            resource_reads,
             dispatcher,
             metrics,
             side_effects,
@@ -150,29 +143,32 @@ impl PodMutationReconcileSink for PodReconcileAdapter {
                     }
                 }
                 PodMutationReconcileRequest::ServicesAfterUpdate { previous, updated } => {
+                    let service_store = crate::bootstrap::controller_adapters::service_pod_side_effect_adapter::borrowed_store(self.resource_reads.as_ref());
                     klights_controllers::side_effects::service_pod::enqueue_services_after_pod_update(
                         &previous.data,
                         &updated.data,
-                        self.db.as_ref(),
+                        &service_store,
                         &self.dispatcher,
                     )
                     .await
                     .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))?;
                 }
                 PodMutationReconcileRequest::ServicesAfterDelete { deleted } => {
+                    let service_store = crate::bootstrap::controller_adapters::service_pod_side_effect_adapter::borrowed_store(self.resource_reads.as_ref());
                     klights_controllers::side_effects::service_pod::enqueue_services_after_pod_delete(
                         &deleted.data,
-                        self.db.as_ref(),
+                        &service_store,
                         &self.dispatcher,
                     )
                     .await
                     .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))?;
                 }
                 PodMutationReconcileRequest::StatusChanged { previous, updated } => {
+                    let service_store = crate::bootstrap::controller_adapters::service_pod_side_effect_adapter::borrowed_store(self.resource_reads.as_ref());
                     klights_controllers::side_effects::service_pod::enqueue_services_after_pod_update(
                         &previous.data,
                         &updated.data,
-                        self.db.as_ref(),
+                        &service_store,
                         &self.dispatcher,
                     )
                     .await
@@ -196,13 +192,13 @@ impl PodMutationReconcileSink for PodReconcileAdapter {
                             && let Some(replica_set) =
                                 controller_owner_name(&updated.data, "apps/v1", "ReplicaSet")
                             && let Some(replica_set) = self
-                                .db
-                                .get_resource(
+                                .resource_reads
+                                .get_resource(ResourceGetRequest::new(
                                     "apps/v1",
                                     "ReplicaSet",
-                                    Some(namespace),
+                                    Some(namespace.to_string()),
                                     &replica_set,
-                                )
+                                ))
                                 .await
                                 .map_err(|error| {
                                     ReconcileSinkError::unavailable(error.to_string())
@@ -511,9 +507,10 @@ impl PvcReconcileSink for PersistentVolumeReconcileAdapter<'_> {
 impl PodServiceReconcileSink for PodReconcileAdapter {
     fn enqueue_after_pod_create(&self, pod: Resource) -> ReconcileSinkFuture<'_> {
         Box::pin(async move {
+            let service_store = crate::bootstrap::controller_adapters::service_pod_side_effect_adapter::borrowed_store(self.resource_reads.as_ref());
             klights_controllers::side_effects::service_pod::enqueue_services_after_pod_create(
                 &pod.data,
-                self.db.as_ref(),
+                &service_store,
                 &self.dispatcher,
             )
             .await
@@ -527,10 +524,11 @@ impl PodServiceReconcileSink for PodReconcileAdapter {
         updated: Resource,
     ) -> ReconcileSinkFuture<'_> {
         Box::pin(async move {
+            let service_store = crate::bootstrap::controller_adapters::service_pod_side_effect_adapter::borrowed_store(self.resource_reads.as_ref());
             klights_controllers::side_effects::service_pod::enqueue_services_after_pod_update(
                 &previous.data,
                 &updated.data,
-                self.db.as_ref(),
+                &service_store,
                 &self.dispatcher,
             )
             .await

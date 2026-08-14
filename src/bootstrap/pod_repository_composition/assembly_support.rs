@@ -325,6 +325,8 @@ pub(crate) mod support {
     -> anyhow::Result<WorkerFinalizationDeliveryOutcome> {
         let sqlite = crate::datastore::sqlite::Datastore::new_in_memory().await?;
         let db: crate::datastore::DatastoreHandle = Arc::new(sqlite.clone());
+        let _ports =
+            crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&sqlite);
         db.create_resource(
             "v1",
             "Pod",
@@ -422,6 +424,7 @@ pub(crate) mod support {
     -> anyhow::Result<WorkerFinalizationRaceOutcome> {
         let sqlite = crate::datastore::sqlite::Datastore::new_in_memory().await?;
         let db: crate::datastore::DatastoreHandle = Arc::new(sqlite.clone());
+        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&sqlite);
         let created = db
             .create_resource(
                 "v1",
@@ -461,7 +464,7 @@ pub(crate) mod support {
                 Arc::new(
                     crate::bootstrap::composition_adapters::
                         committed_outbox_delivery_adapter::RootOutboxSideEffectState::new(
-                        db.clone(),
+                        ports.read_ports.resource_reads(), ports.resource_mutations.clone(), ports.ownership_reads.clone(),
                     ),
                 ),
                 "worker-1".to_string(),
@@ -650,6 +653,72 @@ pub(crate) mod support {
         }
     }
 
+    type DeleteObservation = Arc<tokio::sync::Mutex<Option<(bool, bool)>>>;
+
+    struct PodRepositoryScenarioOptions {
+        remote_delivery_required: bool,
+        with_dispatcher: bool,
+        with_outbox: bool,
+        with_workqueue: bool,
+        scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode,
+        scheduler_bind_gate: Option<Arc<crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest>>,
+        delete_observation: Option<DeleteObservation>,
+    }
+
+    impl PodRepositoryScenarioOptions {
+        fn inline() -> Self {
+            Self {
+                remote_delivery_required: false,
+                with_dispatcher: false,
+                with_outbox: false,
+                with_workqueue: false,
+                scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+                scheduler_bind_gate: None,
+                delete_observation: None,
+            }
+        }
+
+        fn deferred_leader() -> Self {
+            Self {
+                scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+                ..Self::inline()
+            }
+        }
+
+        fn with_remote_delivery(mut self) -> Self {
+            self.remote_delivery_required = true;
+            self
+        }
+
+        fn with_dispatcher(mut self) -> Self {
+            self.with_dispatcher = true;
+            self
+        }
+
+        fn with_outbox(mut self) -> Self {
+            self.with_outbox = true;
+            self
+        }
+
+        fn with_workqueue(mut self) -> Self {
+            self.with_workqueue = true;
+            self
+        }
+
+        fn with_scheduler_bind_gate(
+            mut self,
+            scheduler_bind_gate: Arc<crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest>,
+        ) -> Self {
+            self.scheduler_bind_gate = Some(scheduler_bind_gate);
+            self
+        }
+
+        fn with_delete_observation(mut self, delete_observation: DeleteObservation) -> Self {
+            self.delete_observation = Some(delete_observation);
+            self
+        }
+    }
+
     /// Private lifetime owner for one integration scenario.
     ///
     /// Public tests receive a suite-specific handle below.  Keeping this owner
@@ -678,7 +747,7 @@ pub(crate) mod support {
             Option<Arc<klights_controllers::test_support::RecordingReconcileSink>>,
         node_local: Option<Arc<crate::bootstrap::node_store::NodeLocalStores>>,
         outbox_delivery: Option<Arc<dyn klights_leader_api::LeaderOutboxDelivery>>,
-        delete_observation: Option<Arc<tokio::sync::Mutex<Option<(bool, bool)>>>>,
+        delete_observation: Option<DeleteObservation>,
         post_write_maintenance_notify:
             Arc<crate::bootstrap::pod_repository_composition::PostWriteMaintenanceTracker>,
     }
@@ -731,12 +800,14 @@ pub(crate) mod support {
 
     struct IntegrationPodWatchFixtureSource {
         db: crate::datastore::DatastoreHandle,
-        source: Arc<dyn crate::bootstrap::pod_repository_composition::PodWatchSource>,
     }
 
     impl klights_watch::test_support::WatchFixtureSource for IntegrationPodWatchFixtureSource {
         fn subscribe(&self) -> tokio::sync::broadcast::Receiver<klights_watch::WatchEvent> {
-            self.source.subscribe_pod_watch()
+            crate::datastore::DatastoreBackend::subscribe_watch(
+                self.db.as_ref(),
+                klights_watch::WatchTopic::new("v1", "Pod"),
+            )
         }
 
         fn pod_events_since(
@@ -800,7 +871,7 @@ pub(crate) mod support {
             .resource
             .expect("delete race Pod create persists");
         let pause = repo._sqlite.install_resource_mutation_pause(
-            IntegrationResourceMutationPauseOperation::PatchLatest,
+            IntegrationResourceMutationPauseOperation::BuildPatchCommand,
             "v1",
             "Pod",
             Some("default"),
@@ -1444,8 +1515,29 @@ pub(crate) mod support {
                 .await
                 .expect("Pod store integration fixture");
             let datastore: crate::datastore::DatastoreHandle = Arc::new(sqlite.clone());
+            let ports =
+                crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&sqlite);
+            let authority =
+                crate::bootstrap::composition_adapters::authority_adapter::always_leader_authority(
+                );
+            let resource_query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+                ports.read_ports.resource_reads(), authority.clone(),
+            );
+            let commands = Arc::new(
+                klights_replication::leader_api::EmbeddedLeaderResourceCommand::new(
+                    Arc::new(
+                        crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                            datastore.clone(),
+                        ),
+                    ),
+                    resource_query.clone(),
+                    authority,
+                ),
+            );
             let persistence = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
-                datastore.clone(),
+                resource_query,
+                ports.ownership_reads,
+                commands,
                 Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             );
             Self {
@@ -1624,7 +1716,8 @@ pub(crate) mod support {
         let sqlite = crate::datastore::sqlite::Datastore::new_in_memory()
             .await
             .expect("delete CAS race datastore");
-        let inner: crate::datastore::DatastoreHandle = Arc::new(sqlite);
+        let inner: crate::datastore::DatastoreHandle = Arc::new(sqlite.clone());
+        let ports = crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&sqlite);
         let raced = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hook = Arc::new(IntegrationPodDeleteCasRaceHook {
             inner: inner.clone(),
@@ -1633,10 +1726,18 @@ pub(crate) mod support {
             raced: raced.clone(),
         });
         let datastore: crate::datastore::DatastoreHandle = inner;
+        let authority = crate::bootstrap::authority::AuthorityHandle::from(
+            crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
+        );
+        let query = crate::bootstrap::composition_adapters::resource_query_adapter::DatastoreResourceQueryAdapter::new_focused_for_test(
+            ports.read_ports.resource_reads(), authority.clone(),
+        );
+        let commands = crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::test_resource_command(
+            datastore.clone(), &authority,
+        );
         let persistence = crate::bootstrap::composition_adapters::
             pod_repository_persistence_adapter::new_root_parts_with_delete_cas_hook(
-                datastore.clone(),
-                hook,
+                query, ports.ownership_reads, commands, hook,
             );
         (persistence, datastore, raced)
     }
@@ -1766,43 +1867,17 @@ pub(crate) mod support {
         }
 
         pub async fn new_inline() -> Self {
-            Self::new_exact(
-                None,
-                false,
-                false,
-                false,
-                false,
-                crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
-                None,
-                None,
-            )
-            .await
+            Self::new_exact(None, PodRepositoryScenarioOptions::inline()).await
         }
 
         pub async fn new_deferred_leader() -> Self {
-            Self::new_exact(
-                None,
-                false,
-                false,
-                false,
-                false,
-                crate::bootstrap::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
-                None,
-                None,
-            )
-            .await
+            Self::new_exact(None, PodRepositoryScenarioOptions::deferred_leader()).await
         }
 
         pub async fn new_deferred_leader_with_node_outbox() -> Self {
             Self::new_exact(
                 None,
-                false,
-                false,
-                true,
-                false,
-                crate::bootstrap::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
-                None,
-                None,
+                PodRepositoryScenarioOptions::deferred_leader().with_outbox(),
             )
             .await
         }
@@ -1813,13 +1888,8 @@ pub(crate) mod support {
             );
             let fixture = Self::new_exact(
                 None,
-                false,
-                false,
-                false,
-                false,
-                crate::bootstrap::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
-                Some(gate.clone()),
-                None,
+                PodRepositoryScenarioOptions::deferred_leader()
+                    .with_scheduler_bind_gate(gate.clone()),
             )
             .await;
             (fixture, IntegrationSchedulerBindGate { gate })
@@ -1830,58 +1900,19 @@ pub(crate) mod support {
         ) -> Self {
             Self::new_exact(
                 Some(resource_query),
-                true,
-                false,
-                false,
-                false,
-                crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
-                None,
-                None,
+                PodRepositoryScenarioOptions::inline().with_remote_delivery(),
             )
             .await
         }
 
         pub async fn new_with_node_outbox() -> Self {
-            Self::new_exact(
-                None,
-                false,
-                false,
-                true,
-                false,
-                crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
-                None,
-                None,
-            )
-            .await
-        }
-
-        #[allow(dead_code)]
-        pub async fn new_cluster_backed_with_node_outbox(
-            resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
-        ) -> Self {
-            Self::new_exact(
-                Some(resource_query),
-                true,
-                false,
-                true,
-                false,
-                crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
-                None,
-                None,
-            )
-            .await
+            Self::new_exact(None, PodRepositoryScenarioOptions::inline().with_outbox()).await
         }
 
         pub async fn new_with_status_dispatcher() -> Self {
             Self::new_exact(
                 None,
-                false,
-                true,
-                false,
-                false,
-                crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
-                None,
-                None,
+                PodRepositoryScenarioOptions::inline().with_dispatcher(),
             )
             .await
         }
@@ -1889,13 +1920,7 @@ pub(crate) mod support {
         pub async fn new_with_gc_workqueue() -> Self {
             Self::new_exact(
                 None,
-                false,
-                false,
-                false,
-                true,
-                crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
-                None,
-                None,
+                PodRepositoryScenarioOptions::inline().with_workqueue(),
             )
             .await
         }
@@ -1904,30 +1929,24 @@ pub(crate) mod support {
             let observation = Arc::new(tokio::sync::Mutex::new(None));
             Self::new_exact(
                 None,
-                false,
-                false,
-                false,
-                false,
-                crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
-                None,
-                Some(observation),
+                PodRepositoryScenarioOptions::inline().with_delete_observation(observation),
             )
             .await
         }
 
         async fn new_exact(
             repository_cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
-            remote_delivery_required: bool,
-            with_dispatcher: bool,
-            with_outbox: bool,
-            with_workqueue: bool,
-            scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode,
-            scheduler_bind_gate: Option<Arc<crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest>>,
-            delete_observation: Option<Arc<tokio::sync::Mutex<Option<(bool, bool)>>>>,
+            options: PodRepositoryScenarioOptions,
         ) -> Self {
-            Self::new_exact_on(
-                None,
-                repository_cluster_api,
+            Self::new_exact_on(None, repository_cluster_api, options).await
+        }
+
+        async fn new_exact_on(
+            sqlite: Option<crate::datastore::sqlite::Datastore>,
+            repository_cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
+            options: PodRepositoryScenarioOptions,
+        ) -> Self {
+            let PodRepositoryScenarioOptions {
                 remote_delivery_required,
                 with_dispatcher,
                 with_outbox,
@@ -1935,21 +1954,7 @@ pub(crate) mod support {
                 scheduling_mode,
                 scheduler_bind_gate,
                 delete_observation,
-            )
-            .await
-        }
-
-        async fn new_exact_on(
-            sqlite: Option<crate::datastore::sqlite::Datastore>,
-            repository_cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
-            remote_delivery_required: bool,
-            with_dispatcher: bool,
-            with_outbox: bool,
-            with_workqueue: bool,
-            scheduling_mode: crate::bootstrap::pod_repository_composition::PodSchedulingMode,
-            scheduler_bind_gate: Option<Arc<crate::bootstrap::composition_adapters::pod_native_adapter::SchedulerBindGateForTest>>,
-            delete_observation: Option<Arc<tokio::sync::Mutex<Option<(bool, bool)>>>>,
-        ) -> Self {
+            } = options;
             let sqlite = match sqlite {
                 Some(sqlite) => sqlite,
                 None => crate::datastore::sqlite::Datastore::new_in_memory()
@@ -1957,6 +1962,8 @@ pub(crate) mod support {
                     .expect("Pod repository integration composition"),
             };
             let db: crate::datastore::DatastoreHandle = Arc::new(sqlite.clone());
+            let ports =
+                crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&sqlite);
             let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
                 klights_supervisor::TaskCategoryConfig::default(),
             ));
@@ -1973,11 +1980,13 @@ pub(crate) mod support {
                     db.clone(),
                     &authority,
                     crate::bootstrap::local_leader_adapters::new_local_outbox_side_effect_state(
-                        db.clone(),
+                        ports.read_ports.resource_reads(), ports.resource_mutations.clone(), ports.ownership_reads.clone(),
                     ),
                     "pod-repository-composition".to_string(),
                 );
-            let native_resource_query = repository_cluster_api.clone().unwrap_or(local_query);
+            let native_resource_query = repository_cluster_api
+                .clone()
+                .unwrap_or_else(|| local_query.clone());
             let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
             let controller_dispatcher = with_dispatcher.then(|| {
                 Arc::new(klights_controllers::test_support::RecordingReconcileSink::default())
@@ -2060,14 +2069,18 @@ pub(crate) mod support {
                 _api,
                 subresource,
                 scheduling,
-                watch_source,
+                _watch_source,
                 bound_pod_finalization,
                 deferred_runtime,
                 test_api,
                 _test_subresource,
             ) = crate::bootstrap::pod_repository_composition::build_integration_pod_repository_parts(
                 crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
-                    db: db.clone(),
+                    resource_query: local_query.clone(),
+                    ownership_reads: ports.ownership_reads.clone(),
+                    resource_reads: ports.read_ports.resource_reads(),
+                    namespace_content_reads: ports.namespace_content_reads.clone(),
+                    topology_reads: ports.topology_reads.clone(),
                     pod_workqueue_store: with_workqueue.then(|| node_local.as_ref().expect("GC workqueue fixture").pod_workqueue()),
                     supervisor: supervisor.clone(),
                     side_effects: side_effects.clone(),
@@ -2081,14 +2094,10 @@ pub(crate) mod support {
                     scheduling_mode,
                     outbox,
                     cluster_api: repository_cluster_api,
-                    resource_commands: None,
+                    resource_commands: Some(crate::bootstrap::composition_adapters::committed_outbox_delivery_adapter::test_resource_command(db.clone(), &authority)),
                     remote_delivery_required,
                     controller_identity: crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
-                    #[cfg(not(test))]
-                    api_identity: Arc::new(
-                        crate::bootstrap::controller_adapters::system_identity_adapter::SystemIdentityGenerator,
-                    ),
-                    #[cfg(not(test))]
+                    api_identity: Arc::new(k8s_native_service::test_support::admission::DeterministicApiIdentity::default()),
                     gc_coordination: Arc::new(klights_controllers::ControllerCoordination::new()),
                     scheduler_bind_gate,
                     post_write_maintenance_notify: Some(post_write_maintenance_notify.clone()),
@@ -2107,10 +2116,7 @@ pub(crate) mod support {
                     Arc::new(IntegrationPodFixturePersistence { db: db.clone() }),
                 ),
                 watch_ports: klights_watch::test_support::WatchFixturePorts::new(Arc::new(
-                    IntegrationPodWatchFixtureSource {
-                        db: db.clone(),
-                        source: watch_source.clone(),
-                    },
+                    IntegrationPodWatchFixtureSource { db: db.clone() },
                 )),
                 status_ports: klights_kubelet::test_support::pod_status::PodStatusTestPorts::new(
                     pod_status_writer,
@@ -3548,13 +3554,9 @@ pub(crate) mod support {
             Some(Arc::new(BoundFinalizationHostileLeaderQuery {
                 pod: incidental_remote,
             })),
-            false,
-            true,
-            true,
-            false,
-            crate::bootstrap::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
-            None,
-            None,
+            PodRepositoryScenarioOptions::inline()
+                .with_dispatcher()
+                .with_outbox(),
         )
         .await;
         repository

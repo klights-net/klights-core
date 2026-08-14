@@ -33,6 +33,13 @@ mod tests {
             .as_millis() as i64
     }
 
+    fn test_persistence(
+        db: crate::datastore::DatastoreHandle,
+        clock: Arc<dyn klights_kubelet::runtime_clock::RuntimeClock>,
+    ) -> crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::RootPodRepositoryPersistenceParts{
+        crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts_from_test_handle(db, clock)
+    }
+
     fn pod_delete_target_payload(target_node: Option<&str>) -> Value {
         let mut payload = serde_json::Map::new();
         if let Some(target_node) = target_node.filter(|node| !node.trim().is_empty()) {
@@ -470,10 +477,7 @@ mod tests {
         std::sync::Arc<crate::bootstrap::node_store::NodeLocalStores>,
     ) {
         let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-        let persistence = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
-            db.clone(),
-            clock.clone(),
-        );
+        let persistence = test_persistence(db.clone(), clock.clone());
         let store = persistence.store;
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
@@ -598,8 +602,8 @@ mod tests {
         Arc<Notify>,
     ) {
         let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-        let persistence = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
-            db,
+        let persistence = test_persistence(
+            db.clone(),
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
         let config = klights_supervisor::TaskCategoryConfig {
@@ -886,7 +890,7 @@ mod tests {
     #[tokio::test]
     async fn leadership_gain_discovers_terminating_unbound_pod_without_local_queue_row() {
         let (_ds, db) = crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-        let persistence = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
+        let persistence = test_persistence(
             db.clone(),
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
@@ -1070,7 +1074,7 @@ mod tests {
     async fn stale_lease_cannot_delete_unscheduled_pod_after_demote_promote_aba() {
         let (_datastore, db) =
             crate::datastore::sqlite::Datastore::new_in_memory_with_handle().await;
-        let persistence = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
+        let persistence = test_persistence(
             db.clone(),
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
@@ -1288,7 +1292,7 @@ mod tests {
             .await
             .expect("durable workqueue reminder should wake the actor without a live watch event");
 
-        let finalization = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
+        let finalization = test_persistence(
             db.clone(),
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
@@ -2032,7 +2036,7 @@ mod tests {
             .await
             .expect("running worker must consume durable intent and wake its actor");
 
-        let finalization = crate::bootstrap::composition_adapters::pod_repository_persistence_adapter::new_root_parts(
+        let finalization = test_persistence(
             db.clone(),
             Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
         );
@@ -2105,16 +2109,47 @@ mod tests {
     #[tokio::test]
     async fn namespace_termination_enqueues_uid_bound_delete_for_unscheduled_pod() {
         let (workqueue, db, _node_local) = test_workqueue().await;
-        workqueue.set_namespace_termination_sink(Arc::new(
-            crate::bootstrap::controller_adapters::pod_reconcile_adapter::PodReconcileAdapter::new(
-                db.clone(),
-                klights_controllers::side_effects::ControllerDispatcherSlot::new(),
-                SideEffectMetrics::new(),
-                Arc::new(klights_controllers::side_effects::SideEffectRegistry::new()),
-                Arc::new(crate::bootstrap::pod_repository_composition::new_pod_store(db.clone())),
-                crate::bootstrap::controller_adapters::system_identity_adapter::deterministic_controller_identity(),
-            ),
-        ));
+        struct DirectNamespaceTermination {
+            store: Arc<crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore>,
+            metrics: Arc<SideEffectMetrics>,
+        }
+        impl klights_reconcile_api::NamespaceTerminationSink for DirectNamespaceTermination {
+            fn reconcile_namespace_termination(
+                &self,
+                request: klights_reconcile_api::NamespaceTerminationRequest,
+            ) -> klights_reconcile_api::NamespaceTerminationFuture<'_> {
+                Box::pin(async move {
+                    let uid = request.expected_uid.ok_or_else(|| {
+                        klights_reconcile_api::ReconcileSinkError::unavailable(
+                            "namespace test request requires UID",
+                        )
+                    })?;
+                    k8s_native_service::reconcile_namespace_termination_for_uid_with_outcome_at(
+                        self.store.as_ref(),
+                        &request.namespace,
+                        &uid,
+                        self.metrics.as_ref(),
+                        klights_supervisor::SystemWallClock::now_utc(),
+                    )
+                    .await
+                    .map(|outcome| match outcome {
+                        k8s_native_service::NamespaceTerminationOutcome::Finalized => {
+                            klights_reconcile_api::NamespaceTerminationOutcome::Finalized
+                        }
+                        k8s_native_service::NamespaceTerminationOutcome::StillPending => {
+                            klights_reconcile_api::NamespaceTerminationOutcome::StillPending
+                        }
+                    })
+                    .map_err(|error| {
+                        klights_reconcile_api::ReconcileSinkError::unavailable(format!("{error:?}"))
+                    })
+                })
+            }
+        }
+        workqueue.set_namespace_termination_sink(Arc::new(DirectNamespaceTermination {
+            store: crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new(db.clone()),
+            metrics: SideEffectMetrics::new(),
+        }));
         db.create_namespace(
             "terminating-ns",
             json!({

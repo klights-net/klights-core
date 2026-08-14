@@ -1,23 +1,27 @@
-use klights_cluster_store::ResourceListOptions;
 use std::sync::Arc;
 
 use klights_cluster_core::Resource;
 use serde_json::Value;
 
-use crate::datastore::DatastoreHandle;
 use k8s_native_service::admission::{
     AdmissionDependencyError, AdmissionEngine, AdmissionQuery, AdmissionResource,
     AdmissionWebhookClient, ReqwestAdmissionWebhookClient, ServiceWebhookTargetResolver,
     WebhookTargetResolver,
 };
+use klights_cluster_store::{
+    ClusterResourceRead, ResourceCollectionScope, ResourceGetRequest, ResourceListQuery,
+    ResourceListRead, ResourceListRequest,
+};
 
 pub(crate) struct DatastoreAdmissionQuery {
-    db: DatastoreHandle,
+    resource_reads: Arc<dyn ClusterResourceRead>,
 }
 
 impl DatastoreAdmissionQuery {
-    pub(crate) fn new(db: DatastoreHandle) -> Arc<Self> {
-        Arc::new(Self { db })
+    pub(crate) fn new_with_resource_reads(
+        resource_reads: Arc<dyn ClusterResourceRead>,
+    ) -> Arc<Self> {
+        Arc::new(Self { resource_reads })
     }
 }
 
@@ -41,16 +45,16 @@ impl AdmissionQuery for DatastoreAdmissionQuery {
         namespace: Option<&str>,
         name: &str,
     ) -> std::result::Result<Option<AdmissionResource>, AdmissionDependencyError> {
-        crate::datastore::DatastoreBackend::get_resource(
-            self.db.as_ref(),
-            api_version,
-            kind,
-            namespace,
-            name,
-        )
-        .await
-        .map(|resource| resource.map(admission_resource))
-        .map_err(dependency_error)
+        self.resource_reads
+            .get_resource(ResourceGetRequest::new(
+                api_version,
+                kind,
+                namespace.map(ToOwned::to_owned),
+                name,
+            ))
+            .await
+            .map(|resource| resource.map(admission_resource))
+            .map_err(dependency_error)
     }
 
     async fn list_resources(
@@ -60,16 +64,39 @@ impl AdmissionQuery for DatastoreAdmissionQuery {
         namespace: Option<&str>,
         label_selector: Option<&str>,
     ) -> std::result::Result<Vec<AdmissionResource>, AdmissionDependencyError> {
-        crate::datastore::DatastoreBackend::list_resources(
-            self.db.as_ref(),
-            api_version,
-            kind,
-            namespace,
-            ResourceListOptions::new(label_selector, None, None, None),
-        )
-        .await
-        .map(|page| page.items.into_iter().map(admission_resource).collect())
-        .map_err(dependency_error)
+        match self
+            .resource_reads
+            .list_resources(ResourceListRequest::new(
+                api_version,
+                kind,
+                namespace.map_or(ResourceCollectionScope::AllNamespaces, |namespace| {
+                    ResourceCollectionScope::Namespace(namespace.to_string())
+                }),
+                ResourceListQuery::try_new_borrowed(
+                    label_selector,
+                    None,
+                    None,
+                    None,
+                    klights_cluster_store::ResourceVersionMatch::Any,
+                )
+                .map_err(dependency_error)?,
+            ))
+            .await
+            .map_err(dependency_error)?
+        {
+            ResourceListRead::Current(page) | ResourceListRead::Historical(page) => Ok(page
+                .into_items()
+                .into_iter()
+                .map(admission_resource)
+                .collect()),
+            ResourceListRead::Expired {
+                requested,
+                oldest_available,
+                ..
+            } => Err(AdmissionDependencyError::new(format!(
+                "LIST at resourceVersion {requested} expired before {oldest_available}"
+            ))),
+        }
     }
 }
 
@@ -81,11 +108,12 @@ pub(crate) struct ResourceAdmissionAdapter {
 }
 
 impl ResourceAdmissionAdapter {
-    pub(crate) fn new(
+    pub(crate) fn new_with_resource_reads(
         identity: Arc<dyn k8s_native_service::ApiIdentityGenerator>,
-        db: DatastoreHandle,
+        resource_reads: Arc<dyn ClusterResourceRead>,
     ) -> Arc<Self> {
-        let query: Arc<dyn AdmissionQuery> = DatastoreAdmissionQuery::new(db);
+        let query: Arc<dyn AdmissionQuery> =
+            DatastoreAdmissionQuery::new_with_resource_reads(resource_reads);
         let target_resolver: Arc<dyn WebhookTargetResolver> =
             ServiceWebhookTargetResolver::new(Arc::clone(&query));
         let webhook_client: Arc<dyn AdmissionWebhookClient> = ReqwestAdmissionWebhookClient::new();

@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
-use klights_cluster_store::ResourceListOptions;
 use klights_pod_api::{
     PodControlPlaneEventRequest, PodControlPlaneEventSink, PodGetRequest, PodListRequest,
     PodListResult, PodMetadataPatchRequest, PodPersistence, PodPersistenceCreateRequest,
@@ -12,7 +11,6 @@ use klights_pod_api::{
     PodSpecValidation, PodStatusPersistence, PodStatusWriteRequest,
 };
 
-use crate::datastore::DatastoreHandle;
 use k8s_native_service::AdmissionResourceStore;
 use klights_kubelet::pod_repository::store::PodStore;
 
@@ -57,7 +55,7 @@ impl SchedulerBindGateForTest {
 
 pub(crate) struct RootPodNativeAdapter {
     store: Arc<PodStore>,
-    db: DatastoreHandle,
+    query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     event_effect: crate::bootstrap::composition_adapters::pod_event_adapter::LeaderPodEventEffect,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
     #[cfg(test)]
@@ -65,16 +63,16 @@ pub(crate) struct RootPodNativeAdapter {
 }
 
 impl RootPodNativeAdapter {
-    pub(crate) fn new(
+    pub(crate) fn new_with_query(
         store: Arc<PodStore>,
-        db: DatastoreHandle,
+        query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
         resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
         #[cfg(test)] scheduler_bind_gate: Option<Arc<SchedulerBindGateForTest>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
-            db,
+            query,
             event_effect:
                 crate::bootstrap::composition_adapters::pod_event_adapter::LeaderPodEventEffect::new(
                     resource_commands,
@@ -220,9 +218,10 @@ impl PodSpecValidation for RootPodNativeAdapter {
 impl PodControlPlaneEventSink for RootPodNativeAdapter {
     fn emit_pod_event(&self, request: PodControlPlaneEventRequest) -> PodRepositoryFuture<'_, ()> {
         Box::pin(async move {
-            let adapter = crate::bootstrap::composition_adapters::pod_event_adapter::DatastorePodEventAdapter::new(
-                self.db.as_ref(),
-            );
+            let adapter =
+                crate::bootstrap::composition_adapters::pod_event_adapter::LeaderPodEventQuery::new(
+                    self.query.as_ref(),
+                );
             klights_kubelet::pod_events::emit_control_plane_pod_event(
                 &adapter,
                 &self.event_effect,
@@ -252,8 +251,21 @@ impl AdmissionResourceStore for RootPodNativeAdapter {
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>, klights_leader_api::ResourceQueryError> {
-        self.db
-            .get_resource(api_version, kind, namespace, name)
+        self.query
+            .get_resource(
+                klights_leader_api::ResourceGetRequest::try_new(
+                    klights_types::ResourceKey::new(
+                        api_version,
+                        kind,
+                        namespace.map(str::to_owned),
+                        name,
+                    ),
+                    klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+                )
+                .map_err(|error| {
+                    klights_leader_api::ResourceQueryError::retryable(error.to_string())
+                })?,
+            )
             .await
             .map_err(|error| {
                 klights_leader_api::ResourceQueryError::retryable(format!(
@@ -268,10 +280,28 @@ impl AdmissionResourceStore for RootPodNativeAdapter {
         kind: &str,
         namespace: Option<&str>,
     ) -> Result<Vec<Resource>, klights_leader_api::ResourceQueryError> {
-        self.db
-            .list_resources(api_version, kind, namespace, ResourceListOptions::all())
+        self.query
+            .list_resources(
+                klights_leader_api::ResourceListRequest::try_new(
+                    api_version,
+                    kind,
+                    namespace
+                        .map(|value| {
+                            klights_leader_api::ResourceListScope::Namespace(value.to_owned())
+                        })
+                        .unwrap_or(klights_leader_api::ResourceListScope::AllNamespaces),
+                    None,
+                    None,
+                    None,
+                    None,
+                    klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+                )
+                .map_err(|error| {
+                    klights_leader_api::ResourceQueryError::retryable(error.to_string())
+                })?,
+            )
             .await
-            .map(|list| list.items)
+            .map(|list| list.into_items())
             .map_err(|error| {
                 klights_leader_api::ResourceQueryError::retryable(format!(
                     "Pod admission resource list failed: {error}"

@@ -222,10 +222,11 @@ mod tests {
     ) -> Arc<
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork,
     >{
+        let reads = db.focused_read_store();
         let db: crate::datastore::DatastoreHandle = Arc::new(db);
         Arc::new(
             crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
-                db.clone(),
+                reads,
                 Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db)),
                 crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
             ),

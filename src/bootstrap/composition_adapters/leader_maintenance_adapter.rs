@@ -11,22 +11,49 @@ use klights_cluster_core::command::StorageCommand;
 use klights_replication::proposal::RaftProposal;
 
 use crate::bootstrap::authority::AuthorityHandle;
-use crate::datastore::DatastoreHandle;
-
 pub(crate) struct ClusterStoreLeaderMaintenance {
-    db: DatastoreHandle,
+    allocator: Arc<dyn klights_cluster_store::DurableAllocatorRead>,
+    watch_maintenance: Arc<dyn klights_cluster_store::ClusterWatchMaintenance>,
+    #[cfg(test)]
+    outbox: Option<Arc<dyn klights_cluster_store::AppliedOutboxLedger>>,
+    metadata: Arc<dyn klights_cluster_store::ClusterMetadataMutation>,
     proposal: Arc<dyn RaftProposal>,
     authority: AuthorityHandle,
 }
 
 impl ClusterStoreLeaderMaintenance {
     pub(crate) fn new<A: Into<AuthorityHandle>>(
-        db: DatastoreHandle,
+        allocator: Arc<dyn klights_cluster_store::DurableAllocatorRead>,
+        watch_maintenance: Arc<dyn klights_cluster_store::ClusterWatchMaintenance>,
+        metadata: Arc<dyn klights_cluster_store::ClusterMetadataMutation>,
         proposal: Arc<dyn RaftProposal>,
         authority: A,
     ) -> Self {
         Self {
-            db,
+            allocator,
+            watch_maintenance,
+            #[cfg(test)]
+            outbox: None,
+            metadata,
+            proposal,
+            authority: authority.into(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test<A: Into<AuthorityHandle>>(
+        allocator: Arc<dyn klights_cluster_store::DurableAllocatorRead>,
+        watch_maintenance: Arc<dyn klights_cluster_store::ClusterWatchMaintenance>,
+        outbox: Arc<dyn klights_cluster_store::AppliedOutboxLedger>,
+        metadata: Arc<dyn klights_cluster_store::ClusterMetadataMutation>,
+        proposal: Arc<dyn RaftProposal>,
+        authority: A,
+    ) -> Self {
+        Self {
+            allocator,
+            watch_maintenance,
+            outbox: Some(outbox),
+            metadata,
             proposal,
             authority: authority.into(),
         }
@@ -47,7 +74,12 @@ impl ClusterStoreLeaderMaintenance {
     async fn gc_applied_outbox(&self, now_ms: i64, ttl_ms: i64) -> anyhow::Result<usize> {
         self.require_leader()?;
         let cutoff_ms = now_ms.saturating_sub(ttl_ms);
-        let prunable = self.db.applied_outbox_gc_prunable_count(cutoff_ms).await?;
+        let Some(outbox) = self.outbox.as_ref() else {
+            return Err(anyhow::anyhow!(
+                "test GC maintenance requires an applied-outbox ledger"
+            ));
+        };
+        let prunable = outbox.applied_outbox_gc_prunable_count(cutoff_ms).await?;
         if prunable == 0 {
             return Ok(0);
         }
@@ -66,10 +98,19 @@ impl klights_cluster_store::ClusterWatchMaintenance for ClusterStoreLeaderMainte
     ) -> klights_cluster_store::ClusterStoreResult<i64> {
         self.require_leader()?;
         let before = self
-            .db
-            .get_current_resource_version()
+            .allocator
+            .read_allocator_state()
             .await
-            .map_err(crate::datastore::backend::root_cluster_store_error)?;
+            .map_err(|error| {
+                klights_cluster_store::ClusterStoreError::adapter_failure_boxed(
+                    klights_cluster_store::ClusterStoreErrorKind::Persistence,
+                    klights_cluster_store::PersistenceBackend::Root,
+                    "leader maintenance allocator read",
+                    Box::new(error),
+                )
+            })?
+            .position()
+            .resource_version;
         let new_rv = before.saturating_add(1).max(min_rv.saturating_add(1));
         self.proposal
             .propose_command(StorageCommand::AdvanceResourceVersion { min_rv, new_rv })
@@ -82,10 +123,18 @@ impl klights_cluster_store::ClusterWatchMaintenance for ClusterStoreLeaderMainte
                     error.into_boxed_dyn_error(),
                 )
             })?;
-        self.db
-            .get_current_resource_version()
+        self.allocator
+            .read_allocator_state()
             .await
-            .map_err(crate::datastore::backend::root_cluster_store_error)
+            .map(|state| state.position().resource_version)
+            .map_err(|error| {
+                klights_cluster_store::ClusterStoreError::adapter_failure_boxed(
+                    klights_cluster_store::ClusterStoreErrorKind::Persistence,
+                    klights_cluster_store::PersistenceBackend::Root,
+                    "leader maintenance allocator read",
+                    Box::new(error),
+                )
+            })
             .or(Ok(new_rv))
     }
 
@@ -94,10 +143,9 @@ impl klights_cluster_store::ClusterWatchMaintenance for ClusterStoreLeaderMainte
         max_rows: i64,
         batch_cap: i64,
     ) -> klights_cluster_store::ClusterStoreResult<usize> {
-        self.db
+        self.watch_maintenance
             .watch_events_gc_prunable_count(max_rows, batch_cap)
             .await
-            .map_err(crate::datastore::backend::root_cluster_store_error)
     }
 
     async fn gc_watch_events(
@@ -107,10 +155,9 @@ impl klights_cluster_store::ClusterWatchMaintenance for ClusterStoreLeaderMainte
     ) -> klights_cluster_store::ClusterStoreResult<usize> {
         self.require_leader()?;
         let prunable = self
-            .db
+            .watch_maintenance
             .watch_events_gc_prunable_count(max_rows, batch_cap)
-            .await
-            .map_err(crate::datastore::backend::root_cluster_store_error)?;
+            .await?;
         if prunable == 0 {
             return Ok(0);
         }
@@ -138,10 +185,7 @@ impl klights_cluster_store::ClusterMetadataMutation for ClusterStoreLeaderMainte
         &self,
         key: &str,
     ) -> klights_cluster_store::ClusterStoreResult<Option<String>> {
-        self.db
-            .get_klights_meta(key)
-            .await
-            .map_err(crate::datastore::backend::root_cluster_store_error)
+        self.metadata.get_klights_meta(key).await
     }
 
     async fn set_klights_meta(
@@ -171,6 +215,7 @@ impl klights_cluster_store::ClusterMetadataMutation for ClusterStoreLeaderMainte
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use async_trait::async_trait;
     use klights_cluster_core::{
         LogApplyAppliedOutboxRow, OutboxApplyError, OutboxApplyOutcome, OutboxStreamWatermark,
@@ -222,15 +267,20 @@ mod tests {
         let db = crate::datastore::sqlite::Datastore::new_in_memory()
             .await
             .unwrap();
-        let handle: DatastoreHandle = Arc::new(db.clone());
+        let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
         let proposal = Arc::new(RecordingApplyingProposal {
-            inner: crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
-                handle.clone(),
-            ),
+            inner: crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db_handle),
             commands: Default::default(),
         });
-        let adapter =
-            ClusterStoreLeaderMaintenance::new(handle, proposal.clone(), authority(is_leader));
+        let passive = Arc::new(db.canonical_embedded_for_test_support());
+        let adapter = ClusterStoreLeaderMaintenance::new_for_test(
+            passive.focused_read_store(),
+            passive.clone(),
+            passive.clone(),
+            passive,
+            proposal.clone(),
+            authority(is_leader),
+        );
         (db, proposal, adapter)
     }
 

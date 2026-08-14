@@ -3,11 +3,11 @@ use std::sync::Arc;
 use klights_leader_api::LeaderWatchError;
 
 use crate::bootstrap::cluster_store::selector::PassiveReadPorts;
-use crate::datastore::{DatastoreBackend, DatastoreHandle};
+#[cfg(test)]
+use crate::datastore::DatastoreHandle;
 
 pub(crate) fn datastore_positioned_watch_service(
     passive_reads: &PassiveReadPorts,
-    db: DatastoreHandle,
     watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
 ) -> klights_watch::PositionedWatchService {
     klights_watch::PositionedWatchService::new(
@@ -15,7 +15,9 @@ pub(crate) fn datastore_positioned_watch_service(
         passive_reads.history_reads(),
         passive_reads.allocator_reads(),
         watch_signals,
-        Arc::new(DatastoreWatchScopes { db }),
+        Arc::new(DatastoreWatchScopes {
+            resource_scopes: passive_reads.resource_scopes(),
+        }),
     )
 }
 
@@ -26,17 +28,16 @@ pub(crate) fn for_test(
 ) -> klights_watch::PositionedWatchService {
     datastore_positioned_watch_service(
         passive_reads,
-        db.clone(),
         crate::bootstrap::watch_commit_wiring::test_signal_source(&db),
     )
 }
 
 struct DatastoreWatchScopes {
-    db: DatastoreHandle,
+    resource_scopes: Arc<dyn klights_cluster_store::ClusterResourceScopeRead>,
 }
 
 pub(crate) async fn datastore_watch_resource_scope(
-    db: &dyn DatastoreBackend,
+    resource_scopes: &dyn klights_cluster_store::ClusterResourceScopeRead,
     api_version: &str,
     kind: &str,
 ) -> Result<klights_watch::WatchResourceScope, LeaderWatchError> {
@@ -56,20 +57,15 @@ pub(crate) async fn datastore_watch_resource_scope(
             format!("custom resource apiVersion {api_version:?} must contain group/version"),
         ));
     };
-    let crds = db
-        .list_resources(
-            "apiextensions.k8s.io/v1",
-            "CustomResourceDefinition",
-            None,
-            klights_cluster_store::ResourceListOptions::all(),
-        )
+    let crds = resource_scopes
+        .list_cluster_resources()
         .await
         .map_err(|error| {
             LeaderWatchError::unavailable(format!(
                 "failed to resolve custom resource watch scope: {error:#}"
             ))
         })?;
-    for crd in crds.items {
+    for crd in crds {
         let spec = crd.data.get("spec").unwrap_or(&serde_json::Value::Null);
         if spec.get("group").and_then(serde_json::Value::as_str) != Some(group)
             || spec
@@ -117,7 +113,7 @@ impl klights_watch::WatchScopeResolver for DatastoreWatchScopes {
     ) -> futures::future::BoxFuture<'a, Result<klights_watch::WatchResourceScope, LeaderWatchError>>
     {
         Box::pin(datastore_watch_resource_scope(
-            self.db.as_ref(),
+            self.resource_scopes.as_ref(),
             api_version,
             kind,
         ))

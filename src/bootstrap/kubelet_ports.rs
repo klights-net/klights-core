@@ -233,19 +233,19 @@ impl NodeHeartbeatEventSource for DatastorePodWatchSource {
 }
 pub(crate) struct RootPodEventSink {
     outbox: Option<Arc<klights_kubelet::node_outbox::Outbox>>,
-    datastore: crate::datastore::DatastoreHandle,
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
 impl RootPodEventSink {
     pub fn new(
         outbox: Option<Arc<klights_kubelet::node_outbox::Outbox>>,
-        datastore: crate::datastore::DatastoreHandle,
+        resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Self {
         Self {
             outbox,
-            datastore,
+            resource_query,
             wall_clock,
         }
     }
@@ -270,8 +270,8 @@ impl klights_kubelet::runtime::events::PodEventSink for RootPodEventSink {
             },
         });
         let query =
-            crate::bootstrap::composition_adapters::pod_event_adapter::DatastorePodEventAdapter::new(
-                self.datastore.as_ref(),
+            crate::bootstrap::composition_adapters::pod_event_adapter::LeaderPodEventQuery::new(
+                self.resource_query.as_ref(),
             );
         klights_kubelet::pod_events::emit_pod_event_with_outbox(
             &query,

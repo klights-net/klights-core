@@ -1,21 +1,23 @@
-use crate::datastore::DatastoreHandle;
 use k8s_native_service::watch::{WatchSourceListFuture, WatchSourceWaitFuture, WatchStreamSource};
-use klights_cluster_store::ResourceListOptions;
+use klights_cluster_store::DurableAllocatorRead;
 
 pub(crate) struct DatastoreWatchStreamAdapter {
-    db: DatastoreHandle,
+    resource_query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    allocator_reads: std::sync::Arc<dyn DurableAllocatorRead>,
     signals: std::sync::Arc<dyn klights_watch::WatchSignalSubscribe>,
     positioned_watch: klights_watch::PositionedWatchService,
 }
 
 impl DatastoreWatchStreamAdapter {
     pub(crate) fn new(
-        db: DatastoreHandle,
+        resource_query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
+        allocator_reads: std::sync::Arc<dyn DurableAllocatorRead>,
         signals: std::sync::Arc<dyn klights_watch::WatchSignalSubscribe>,
         positioned_watch: klights_watch::PositionedWatchService,
     ) -> Self {
         Self {
-            db,
+            resource_query,
+            allocator_reads,
             signals,
             positioned_watch,
         }
@@ -31,7 +33,7 @@ impl WatchStreamSource for DatastoreWatchStreamAdapter {
         task_supervisor: &'a klights_supervisor::TaskSupervisor,
     ) -> WatchSourceWaitFuture<'a> {
         Box::pin(wait_until_fresh(
-            &self.db,
+            self.allocator_reads.as_ref(),
             self.signals.as_ref(),
             target_rv,
             klights_watch::WatchTopic::new(api_version, kind),
@@ -43,31 +45,23 @@ impl WatchStreamSource for DatastoreWatchStreamAdapter {
         &'a self,
         api_version: &'a str,
         kind: &'a str,
-        namespace: Option<&'a str>,
+        scope: klights_leader_api::ResourceListScope,
         label_selector: Option<&'a str>,
         field_selector: Option<&'a str>,
         limit: Option<i64>,
     ) -> WatchSourceListFuture<'a> {
         Box::pin(async move {
-            let list = self
-                .db
-                .list_resources(
-                    api_version,
-                    kind,
-                    namespace,
-                    ResourceListOptions::new(label_selector, field_selector, limit, None),
-                )
-                .await
-                .map_err(|error| {
-                    klights_leader_api::ResourceQueryError::query_failed(error.to_string())
-                })?;
-            klights_leader_api::ResourceListResult::try_new(
-                list.items,
-                list.resource_version,
-                list.watch_replay_position,
-                list.continue_token,
-                list.remaining_item_count,
-            )
+            let request = klights_leader_api::ResourceListRequest::try_new(
+                api_version,
+                kind,
+                scope,
+                label_selector.map(str::to_owned),
+                field_selector.map(str::to_owned),
+                limit,
+                None,
+                klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+            )?;
+            self.resource_query.list_resources(request).await
         })
     }
 
@@ -83,7 +77,7 @@ impl WatchStreamSource for DatastoreWatchStreamAdapter {
 }
 
 async fn wait_until_fresh(
-    db: &DatastoreHandle,
+    allocator_reads: &dyn DurableAllocatorRead,
     signals: &dyn klights_watch::WatchSignalSubscribe,
     target_rv: i64,
     topic: klights_watch::WatchTopic,
@@ -93,7 +87,13 @@ async fn wait_until_fresh(
         return;
     }
     let mut fresh_rx = crate::bootstrap::watch_commit_wiring::subscribe(signals, topic);
-    if db.get_current_resource_version().await.unwrap_or(0) >= target_rv {
+    if allocator_reads
+        .read_allocator_state()
+        .await
+        .map(|state| state.position().resource_version)
+        .unwrap_or(0)
+        >= target_rv
+    {
         return;
     }
     let sleep = task_supervisor.sleep(
@@ -117,7 +117,13 @@ async fn wait_until_fresh(
                     }
                 }
                 Err(klights_watch::WatchSignalReceiveError::Lagged(_)) => {
-                    if db.get_current_resource_version().await.unwrap_or(0) >= target_rv {
+                    if allocator_reads
+                        .read_allocator_state()
+                        .await
+                        .map(|state| state.position().resource_version)
+                        .unwrap_or(0)
+                        >= target_rv
+                    {
                         return;
                     }
                 }

@@ -1630,16 +1630,19 @@ impl<T: DurableRecoveryStore + ?Sized> DurableRecoveryStore for std::sync::Arc<T
     }
 }
 
+#[cfg(test)]
 pub(crate) struct DatastoreBackendLifecyclePort {
     db: std::sync::Arc<dyn DatastoreBackend>,
 }
 
+#[cfg(test)]
 impl DatastoreBackendLifecyclePort {
     pub(crate) fn new(db: std::sync::Arc<dyn DatastoreBackend>) -> Self {
         Self { db }
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl klights_cluster_store::BackendLifecycleStore for DatastoreBackendLifecyclePort {
     async fn acquire_snapshot_exclusive_fence(

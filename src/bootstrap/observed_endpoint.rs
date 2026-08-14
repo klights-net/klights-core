@@ -3,11 +3,13 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use klights_cluster_store::ResourceListOptions;
+use klights_cluster_store::{
+    ClusterResourceRead, ResourceCollectionScope, ResourceGetRequest, ResourceListQuery,
+    ResourceListRead, ResourceListRequest,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::bootstrap::NodeMode;
-use crate::datastore::DatastoreHandle;
 use klights_leader_api::{JoinRole, PeerEndpoint, node_external_ip, peer_endpoint_from_node};
 use klights_leader_rpc::client::{GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient};
 use klights_network_api::GRPC_PORT_ANNOTATION;
@@ -40,7 +42,7 @@ impl LeaderPeerEndpointObserverDeps {
 }
 
 pub(crate) async fn start_leader_peer_endpoint_observer(
-    db: DatastoreHandle,
+    resource_reads: Arc<dyn ClusterResourceRead>,
     watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     deps: LeaderPeerEndpointObserverDeps,
     supervisor: Arc<TaskSupervisor>,
@@ -60,7 +62,7 @@ pub(crate) async fn start_leader_peer_endpoint_observer(
             "leader_peer_observed_endpoint_watcher",
             async move {
                 run_leader_peer_endpoint_observer(
-                    db,
+                    resource_reads,
                     watch_signals,
                     deps,
                     client_identity,
@@ -76,7 +78,7 @@ pub(crate) async fn start_leader_peer_endpoint_observer(
 }
 
 async fn run_leader_peer_endpoint_observer(
-    db: DatastoreHandle,
+    resource_reads: Arc<dyn ClusterResourceRead>,
     watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     deps: LeaderPeerEndpointObserverDeps,
     client_identity: ClientIdentity,
@@ -89,7 +91,7 @@ async fn run_leader_peer_endpoint_observer(
     // is nothing left to observe. The previous early-return skipped the publish
     // entirely, leaving node_dataplane empty and the WireGuard tunnel unformed.
     if ensure_published_if_local_has_external_ip(
-        db.as_ref(),
+        resource_reads.as_ref(),
         deps.network_command.as_ref(),
         &deps.config,
         &deps.node_mode,
@@ -101,7 +103,7 @@ async fn run_leader_peer_endpoint_observer(
     }
 
     if let Err(err) = observe_from_existing_nodes(
-        db.as_ref(),
+        resource_reads.as_ref(),
         &deps,
         &client_identity,
         supervisor.clone(),
@@ -129,7 +131,7 @@ async fn run_leader_peer_endpoint_observer(
                     Err(klights_watch::WatchSignalReceiveError::Closed) => return,
                 }
                 if ensure_published_if_local_has_external_ip(
-                    db.as_ref(),
+                    resource_reads.as_ref(),
                     deps.network_command.as_ref(),
                     &deps.config,
                     &deps.node_mode,
@@ -140,7 +142,7 @@ async fn run_leader_peer_endpoint_observer(
                     return;
                 }
                 if let Err(err) = observe_from_existing_nodes(
-                    db.as_ref(),
+                    resource_reads.as_ref(),
                     &deps,
                     &client_identity,
                     supervisor.clone(),
@@ -159,16 +161,25 @@ async fn run_leader_peer_endpoint_observer(
 }
 
 async fn observe_from_existing_nodes(
-    db: &dyn crate::datastore::DatastoreBackend,
+    resource_reads: &dyn ClusterResourceRead,
     deps: &LeaderPeerEndpointObserverDeps,
     client_identity: &ClientIdentity,
     supervisor: Arc<TaskSupervisor>,
     grpc_transport_policy: klights_leader_rpc::transport_policy::SharedGrpcTransportPolicy,
 ) -> Result<()> {
-    let nodes = db
-        .list_resources("v1", "Node", None, ResourceListOptions::all())
-        .await?;
-    for node in nodes.items {
+    let nodes = match resource_reads
+        .list_resources(ResourceListRequest::new(
+            "v1",
+            "Node",
+            ResourceCollectionScope::Cluster,
+            ResourceListQuery::all(),
+        ))
+        .await?
+    {
+        ResourceListRead::Current(page) | ResourceListRead::Historical(page) => page.into_items(),
+        ResourceListRead::Expired { .. } => Vec::new(),
+    };
+    for node in nodes {
         let Some(peer) = peer_endpoint_from_node(
             &node.data,
             &deps.config.node_name,
@@ -178,7 +189,7 @@ async fn observe_from_existing_nodes(
             continue;
         };
         if observe_from_peer(
-            db,
+            resource_reads,
             deps,
             client_identity,
             supervisor.clone(),
@@ -194,7 +205,7 @@ async fn observe_from_existing_nodes(
 }
 
 async fn observe_from_peer(
-    db: &dyn crate::datastore::DatastoreBackend,
+    resource_reads: &dyn ClusterResourceRead,
     deps: &LeaderPeerEndpointObserverDeps,
     client_identity: &ClientIdentity,
     supervisor: Arc<TaskSupervisor>,
@@ -236,12 +247,11 @@ async fn observe_from_peer(
         .await?;
         // Now that we know our reachable endpoint, publish dataplane metadata so
         // peers can configure the WireGuard tunnel back to us.
-        crate::bootstrap::init::dataplane::ensure_node_dataplane_published(
-            db,
+        crate::bootstrap::init::dataplane::publish_local_dataplane_metadata_self_heal_with_resource_reads(
+            resource_reads,
             deps.network_command.as_ref(),
             &deps.config,
             &deps.node_mode,
-            &endpoint_ip,
             supervisor.as_ref(),
         )
         .await?;
@@ -251,10 +261,13 @@ async fn observe_from_peer(
 }
 
 async fn local_node_external_ip(
-    db: &dyn crate::datastore::DatastoreBackend,
+    resource_reads: &dyn ClusterResourceRead,
     node_name: &str,
 ) -> Result<Option<String>> {
-    let Some(node) = db.get_resource("v1", "Node", None, node_name).await? else {
+    let Some(node) = resource_reads
+        .get_resource(ResourceGetRequest::new("v1", "Node", None, node_name))
+        .await?
+    else {
         return Ok(None);
     };
     Ok(node_external_ip(&node.data).map(str::to_string))
@@ -266,20 +279,19 @@ async fn local_node_external_ip(
 /// Returns `false` when no ExternalIP is present yet, signalling the caller to
 /// keep observing peers.
 async fn ensure_published_if_local_has_external_ip(
-    db: &dyn crate::datastore::DatastoreBackend,
+    resource_reads: &dyn ClusterResourceRead,
     network_command: &dyn klights_leader_api::LeaderNetworkTopologyCommand,
     config: &crate::KlightsConfig,
     node_mode: &NodeMode,
     supervisor: &TaskSupervisor,
 ) -> bool {
-    match local_node_external_ip(db, &config.node_name).await {
-        Ok(Some(external_ip)) => {
-            if let Err(err) = crate::bootstrap::init::dataplane::ensure_node_dataplane_published(
-                db,
+    match local_node_external_ip(resource_reads, &config.node_name).await {
+        Ok(Some(_external_ip)) => {
+            if let Err(err) = crate::bootstrap::init::dataplane::publish_local_dataplane_metadata_self_heal_with_resource_reads(
+                resource_reads,
                 network_command,
                 config,
                 node_mode,
-                &external_ip,
                 supervisor,
             )
             .await
@@ -354,11 +366,15 @@ mod tests {
     use serde_json::json;
 
     fn test_dataplane_command(
-        db: crate::datastore::DatastoreHandle,
+        db: &crate::datastore::sqlite::Datastore,
     ) -> crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork{
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
-            db.clone(),
-            Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db)),
+            db.focused_read_store(),
+            {
+                Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
+                    Arc::new(db.clone()),
+                ))
+            },
             crate::bootstrap::composition_adapters::authority_adapter::always_leader_watch(),
         )
     }
@@ -389,8 +405,8 @@ mod tests {
         .unwrap();
 
         let done = super::ensure_published_if_local_has_external_ip(
-            &db,
-            &test_dataplane_command(Arc::new(db.clone())),
+            db.focused_read_store().as_ref(),
+            &test_dataplane_command(&db),
             &config,
             &NodeMode::Root,
             &supervisor,
@@ -435,8 +451,8 @@ mod tests {
         .unwrap();
 
         let done = super::ensure_published_if_local_has_external_ip(
-            &db,
-            &test_dataplane_command(Arc::new(db.clone())),
+            db.focused_read_store().as_ref(),
+            &test_dataplane_command(&db),
             &config,
             &NodeMode::Root,
             &supervisor,

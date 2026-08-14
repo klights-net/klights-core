@@ -1227,6 +1227,8 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
         .unwrap();
     let passive_reads =
         crate::bootstrap::cluster_store::selector::sqlite_passive_read_ports(&concrete_db);
+    let opened =
+        crate::bootstrap::cluster_store::selector::sqlite_opened_passive_store(&concrete_db);
     let db: crate::datastore::DatastoreHandle = Arc::new(concrete_db);
     let (tx, rx) = watch::channel(true); // simulate seed cp1
     let authority = crate::bootstrap::authority::AuthorityHandle::from(rx.clone());
@@ -1235,7 +1237,7 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
         Arc::new(crate::bootstrap::local_leader_adapters::LocalCacheReadinessAdapter);
     let local_projected_token = Arc::new(
         crate::bootstrap::local_leader_adapters::LocalProjectedTokenAdapter::new(
-            db.clone(),
+            opened.read_ports.resource_reads(),
             "cp1".to_string(),
             "klights".to_string(),
             crate::paths::service_account_signing_key_path("klights"),
@@ -1247,14 +1249,14 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
         Arc::new(crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db.clone()));
     let network = Arc::new(
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderNetwork::new(
-            db.clone(),
+            opened.topology_reads.clone(),
             proposal.clone(),
             rx.clone(),
         ),
     );
     let pod_cleanup = Arc::new(
         crate::bootstrap::composition_adapters::leader_topology_cleanup_adapter::ClusterStoreLeaderPodCleanup::new(
-            db.clone(),
+            opened.pod_cleanup.clone(),
             proposal,
             rx.clone(),
         ),
@@ -1272,7 +1274,11 @@ async fn bootstrap_style_proxy_composition_dispatches_correctly() {
         ),
     );
     let local_side_effects =
-        crate::bootstrap::local_leader_adapters::new_local_outbox_side_effect_state(db.clone());
+        crate::bootstrap::local_leader_adapters::new_local_outbox_side_effect_state(
+            opened.read_ports.resource_reads(),
+            opened.resource_mutations.clone(),
+            opened.ownership_reads.clone(),
+        );
     let local_outbox_delivery = crate::bootstrap::composition_adapters::
         committed_outbox_delivery_adapter::test_outbox_delivery(
             db.clone(),

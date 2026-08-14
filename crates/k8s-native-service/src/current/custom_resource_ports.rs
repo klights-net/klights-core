@@ -87,7 +87,7 @@ pub trait CustomResourceReadPort: Send + Sync {
         &self,
         api_version: String,
         kind: String,
-        namespace: Option<String>,
+        scope: klights_leader_api::ResourceListScope,
     ) -> CustomResourceReadFuture<'_, i64>;
 }
 

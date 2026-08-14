@@ -9,7 +9,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::KlightsConfig;
 use crate::bootstrap::{CliFlags, NodeMode};
-use crate::datastore::DatastoreHandle;
 use klights_kubelet::cri::CriClient;
 use klights_kubelet::cri::SharedCriClient;
 use klights_supervisor::{SupervisedJoinHandle, TaskSupervisor};
@@ -63,7 +62,15 @@ pub struct BootstrapRunArgs<'a> {
     /// Service, ServiceCIDR) are skipped because the catch-up stream
     /// delivered the seed's state into the local cluster.db.
     pub skip_seed_bootstrap: bool,
-    pub db_handle: &'a DatastoreHandle,
+    pub resource_reads: Arc<dyn klights_cluster_store::ClusterResourceRead>,
+    pub resource_scopes: Arc<dyn klights_cluster_store::ClusterResourceScopeRead>,
+    pub ownership_reads: Arc<dyn klights_cluster_store::ClusterOwnershipRead>,
+    pub namespace_content_reads: Arc<dyn klights_cluster_store::NamespaceContentRead>,
+    pub topology_reads: Arc<dyn klights_cluster_store::ClusterTopologyRead>,
+    pub allocator_reads: Arc<dyn klights_cluster_store::DurableAllocatorRead>,
+    pub resource_mutations: Arc<dyn klights_cluster_store::ClusterResourceMutation>,
+    pub topology_mutations: Arc<dyn klights_cluster_store::ClusterTopologyMutation>,
+    pub metadata_reads: Arc<dyn klights_cluster_store::ClusterMetadataRead>,
     pub watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     pub positioned_watch: klights_watch::PositionedWatchService,
     pub local_resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
@@ -73,7 +80,6 @@ pub struct BootstrapRunArgs<'a> {
     pub pod_slot_events: Arc<dyn klights_node_store::PodSlotAdmissionEventSource>,
     pub worker_store_adapter: Option<Arc<klights_kubelet::worker_store::WorkerStoreAdapter>>,
     pub kubelet_uses_worker_store_adapter: bool,
-    pub db: &'a dyn crate::datastore::DatastoreBackend,
     pub leader_resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     pub leader_watch: Arc<dyn klights_leader_api::LeaderWatch>,
     pub leader_cache_readiness: Arc<dyn klights_leader_api::LeaderCacheReadiness>,
@@ -305,7 +311,15 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         node_ip,
         leader_coordination,
         skip_seed_bootstrap,
-        db_handle,
+        resource_reads,
+        resource_scopes,
+        ownership_reads,
+        namespace_content_reads,
+        topology_reads,
+        allocator_reads,
+        resource_mutations,
+        topology_mutations,
+        metadata_reads,
         watch_signals,
         positioned_watch,
         local_resource_query,
@@ -315,7 +329,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         pod_slot_events,
         worker_store_adapter,
         kubelet_uses_worker_store_adapter,
-        db,
         leader_resource_query,
         leader_watch,
         leader_cache_readiness,
@@ -427,14 +440,23 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let service_ipam = Arc::new(klights_controllers::service::ServiceIpam::new(
         &config.service_cidr,
     ));
-    klights_controllers::service::rebuild_service_ipam_from_services(db, &service_ipam)
-        .await
-        .context("Failed to rebuild Service ClusterIP allocator")?;
+    let service_reconcile_store = crate::bootstrap::controller_adapters::service_reconcile_adapter::FocusedServiceReconcileStore::new(
+        resource_reads.clone(), resource_mutations.clone(),
+    );
+    klights_controllers::service::rebuild_service_ipam_from_services(
+        &service_reconcile_store,
+        &service_ipam,
+    )
+    .await
+    .context("Failed to rebuild Service ClusterIP allocator")?;
     let nodeport_alloc: Arc<klights_controllers::service::NodePortAllocator> =
         Arc::new(klights_controllers::service::NodePortAllocator::new());
-    klights_controllers::service::rebuild_nodeport_allocator_from_services(db, &nodeport_alloc)
-        .await
-        .context("Failed to rebuild NodePort allocator")?;
+    klights_controllers::service::rebuild_nodeport_allocator_from_services(
+        &service_reconcile_store,
+        &nodeport_alloc,
+    )
+    .await
+    .context("Failed to rebuild NodePort allocator")?;
 
     // Load CA cert/key for CSR signing (supervised file I/O)
     let csr_issuer: Option<std::sync::Arc<dyn klights_controllers::csr_signer::CsrIssuer>> = {
@@ -509,7 +531,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let metrics = klights_controllers::side_effects::SideEffectMetrics::new();
     let namespace_lifecycle_store =
         crate::bootstrap::composition_adapters::api_state_adapter::RootNamespaceTerminationStore::new_with_commands(
-            db_handle.clone(),
+            resource_reads.clone(),
+            namespace_content_reads.clone(),
             resource_commands.clone(),
         );
     local_side_effects.set_namespace_termination(
@@ -523,14 +546,19 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             metrics.clone(),
             Some(services.clone()),
             Some(supervisor.clone()),
-            db_handle.clone(),
+            resource_reads.clone(),
+            ownership_reads.clone(),
+            namespace_content_reads.clone(),
+        )
+        .attach_service_account_defaults(
+            topology_reads.clone(),
             resource_commands.clone(),
             controller_identity.clone(),
         ),
     );
     let non_pod_finalization: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort> = Arc::new(
         crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new_with_commands(
-            db_handle.clone(), resource_commands.clone(),
+            resource_reads.clone(), ownership_reads.clone(), resource_commands.clone(),
         ),
     );
     let controller_coordination = Arc::new(klights_controllers::ControllerCoordination::new());
@@ -589,7 +617,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     } else {
         crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
             crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
-                db: db_handle.clone(),
+                resource_query: local_resource_query.clone(),
+                ownership_reads: ownership_reads.clone(),
+                resource_reads: resource_reads.clone(),
+                namespace_content_reads: namespace_content_reads.clone(),
+                topology_reads: topology_reads.clone(),
                 pod_workqueue_store: Some(pod_workqueue_store.clone()),
                 supervisor: supervisor.clone(),
                 side_effects: side_effects.clone(),
@@ -602,13 +634,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 resource_commands: Some(resource_commands.clone()),
                 remote_delivery_required: false,
                 controller_identity: controller_identity.clone(),
-                #[cfg(not(test))]
                 api_identity: api_identity.clone(),
                 #[cfg(test)]
                 scheduler_bind_gate: None,
                 #[cfg(test)]
                 post_write_maintenance_notify: None,
-                #[cfg(not(test))]
                 gc_coordination: controller_coordination.clone(),
             },
             leader_coordination.clone(),
@@ -695,7 +725,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             } else {
                 Arc::new(crate::bootstrap::kubelet_ports::RootPodEventSink::new(
                     Some(outbox_runtime.clone()),
-                    db_handle.clone(),
+                    local_resource_query.clone(),
                     Arc::new(klights_supervisor::SystemWallClock),
                 ))
             },
@@ -759,7 +789,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             ..,
         ) = crate::bootstrap::pod_repository_composition::build_pod_repository_parts(
             crate::bootstrap::pod_repository_composition::PodRepositoryBuildConfig {
-                db: db_handle.clone(),
+                resource_query: local_resource_query.clone(),
+                ownership_reads: ownership_reads.clone(),
+                resource_reads: resource_reads.clone(),
+                namespace_content_reads: namespace_content_reads.clone(),
+                topology_reads: topology_reads.clone(),
                 pod_workqueue_store: Some(pod_workqueue_store.clone()),
                 supervisor: supervisor.clone(),
                 side_effects: side_effects.clone(),
@@ -772,13 +806,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 resource_commands: Some(resource_commands.clone()),
                 remote_delivery_required: false,
                 controller_identity: controller_identity.clone(),
-                #[cfg(not(test))]
                 api_identity: api_identity.clone(),
                 #[cfg(test)]
                 scheduler_bind_gate: None,
                 #[cfg(test)]
                 post_write_maintenance_notify: None,
-                #[cfg(not(test))]
                 gc_coordination: controller_coordination.clone(),
             },
             leader_coordination.clone(),
@@ -849,7 +881,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         ));
     let controller_leader_ports = Arc::new(
         crate::bootstrap::controller_adapters::controller_runtime_adapter::RootControllerLeaderPort::new_with_commands(
-            db_handle.clone(),
+            resource_reads.clone(),
+            ownership_reads.clone(),
             resource_commands.clone(),
         ),
     );
@@ -893,7 +926,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         node_name: Arc::from(config.node_name.as_str()),
     };
     let hpa_controller = crate::bootstrap::controller_adapters::hpa_controller_adapter::controller(
-        db_handle.clone(),
+        controller_leader_ports.clone(),
         api_pod_repository.clone(),
         controller_gc_delete.clone(),
         controller_pod_mutations,
@@ -997,7 +1030,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         std::sync::Arc::new(
             klights_auth::rbac_policy_store::ReaderBackedRbacPolicyStore::new(std::sync::Arc::new(
                 crate::bootstrap::auth_adapters::DatastoreRbacResourceReader::new(
-                    db_handle.clone(),
+                    resource_reads.clone(),
                 ),
             )),
         );
@@ -1011,7 +1044,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         klights_kubelet::node_api::port_forward::local_node_port_forward(supervisor.clone());
     let finalizer_lifecycle =
         crate::bootstrap::finalizer_lifecycle_adapter::DatastoreFinalizerLifecycleAdapter::new_with_coordination(
-            db_handle.clone(),
+            resource_reads.clone(),
+            ownership_reads.clone(),
             resource_commands.clone(),
             controller_gc_delete.clone(),
             side_effects.clone(),
@@ -1024,14 +1058,19 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     );
     let gc_owner_lifecycle =
         crate::bootstrap::controller_adapters::gc_delete_adapter::GcOwnerLifecycleAdapter::new_with_coordination(
-            db_handle.clone(),
+            resource_reads.clone(),
+            ownership_reads.clone(),
             resource_commands.clone(),
             controller_gc_delete.clone(),
             controller_coordination.clone(),
         );
     let generated_handler_adapter = crate::bootstrap::composition_adapters::generated_handler_adapter::GeneratedHandlerAdapter::new(
         crate::bootstrap::composition_adapters::generated_handler_adapter::GeneratedHandlerStorage::new(
-            db_handle.clone(), resource_commands.clone(),
+            resource_reads.clone(),
+            topology_reads.clone(),
+            allocator_reads.clone(),
+            local_resource_query.clone(),
+            resource_commands.clone(),
         ),
         watch_signals.clone(),
         positioned_watch.clone(),
@@ -1074,7 +1113,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     ));
 
     let node_lifecycle_start_resource_version = if has_leader_coordination {
-        db.get_current_resource_version().await.unwrap_or(0)
+        allocator_reads
+            .read_allocator_state()
+            .await
+            .map(|state| state.position().resource_version)
+            .unwrap_or(0)
     } else {
         0
     };
@@ -1139,7 +1182,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 Arc::new(klights_kubelet::runtime_clock::SystemRuntimeClock),
             ));
         match crate::bootstrap::observed_endpoint::start_leader_peer_endpoint_observer(
-            db_handle.clone(),
+            resource_reads.clone(),
             watch_signals.clone(),
             crate::bootstrap::observed_endpoint::LeaderPeerEndpointObserverDeps::new(
                 endpoint_query,
@@ -1366,7 +1409,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             api_pod_repository.clone(),
             controller_pod_port.clone(),
             controller_gc_delete.clone(),
-            &crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new_with_commands(db_handle.clone(), resource_commands.clone()),
+            &crate::bootstrap::controller_adapters::gc_delete_adapter::GcNonPodFinalizationAdapter::new_with_commands(resource_reads.clone(), ownership_reads.clone(), resource_commands.clone()),
             controller_coordination.as_ref(),
             controller_identity.as_ref(),
             crate::bootstrap::controller_adapters::coredns_bootstrap_adapter::CoreDnsBootstrapConfig {
@@ -1379,22 +1422,33 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .await
         .context("Failed to bootstrap CoreDNS")?;
     }
-    klights_controllers::service::rebuild_service_ipam_from_services(db, service_ipam.as_ref())
-        .await
-        .context("Failed to rebuild Service ClusterIP allocator after bootstrap services")?;
-    klights_controllers::service::rebuild_nodeport_allocator_from_services(db, &nodeport_alloc)
-        .await
-        .context("Failed to rebuild NodePort allocator after bootstrap services")?;
+    klights_controllers::service::rebuild_service_ipam_from_services(
+        &service_reconcile_store,
+        service_ipam.as_ref(),
+    )
+    .await
+    .context("Failed to rebuild Service ClusterIP allocator after bootstrap services")?;
+    klights_controllers::service::rebuild_nodeport_allocator_from_services(
+        &service_reconcile_store,
+        &nodeport_alloc,
+    )
+    .await
+    .context("Failed to rebuild NodePort allocator after bootstrap services")?;
 
-    klights_controllers::crd::load_existing_crds(db, &crd_registry)
+    let crd_initial_reader =
+        crate::bootstrap::controller_adapters::crd_registry_adapter::new_runtime(
+            resource_reads.clone(),
+            positioned_watch.clone(),
+        );
+    klights_controllers::crd::load_existing_crds(crd_initial_reader.as_ref(), &crd_registry)
         .await
         .context("Failed to load existing CRDs")?;
 
     let crd_registry_watch_handle = {
-        let dbh = db_handle.clone();
+        let resource_reads = resource_reads.clone();
         let registry = crd_registry.clone();
         let crd_runtime = crate::bootstrap::controller_adapters::crd_registry_adapter::new_runtime(
-            dbh,
+            resource_reads,
             positioned_watch.clone(),
         );
         let cancel = shutdown_token.clone();
@@ -1434,7 +1488,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             };
         let volume_events = Arc::new(
             crate::bootstrap::pod_watch_handler_adapter::LeaderPersistentVolumeEventHandler::new(
-                db_handle.clone(),
+                resource_reads.clone(),
+                ownership_reads.clone(),
                 resource_commands.clone(),
                 is_leader_rx.clone(),
                 ctx.local_execution().file_process,
@@ -1509,7 +1564,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let watch = leader_watch.clone();
         let projection =
             crate::bootstrap::controller_adapters::node_subnet_controller_adapter::DatastorePeerTopologyProjection::new(
-                db_handle.clone(),
+                topology_mutations.clone(),
                 config.node_name.clone(),
                 config.cluster_cidr.clone(),
                 Some(leader_authority.clone()),
@@ -1567,7 +1622,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let node_lifecycle_status_for_task = node_lifecycle_status.clone();
         let node_lifecycle_watch: Arc<dyn klights_leader_api::LeaderWatch> =
             Arc::new(positioned_watch.clone());
-        let node_lifecycle_db = db_handle.clone();
+        let node_lifecycle_resource_reads = resource_reads.clone();
         let node_lifecycle_pod_repository = controller_pod_port.clone();
         let node_lifecycle_pod_mutations = pod_mutation_reconcile.clone();
         let node_lifecycle_pod_router = pod_lifecycle_router.clone();
@@ -1585,7 +1640,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     async move {
                         crate::bootstrap::controller_adapters::node_lifecycle_controller_adapter::run(
                             crate::bootstrap::controller_adapters::node_lifecycle_controller_adapter::NodeLifecycleControllerDependencies {
-                                store: node_lifecycle_db,
+                                resource_reads: node_lifecycle_resource_reads,
                                 pods: node_lifecycle_pod_repository,
                                 pod_mutations: node_lifecycle_pod_mutations,
                                 pod_lifecycle: node_lifecycle_pod_router,
@@ -1685,16 +1740,15 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         ),
         rbac_policy_store,
         Arc::new(
-            crate::bootstrap::auth_adapters::DatastoreBootstrapTokenAuthenticator::new(
-                db_handle.clone(),
-            ),
+            crate::bootstrap::auth_adapters::DatastoreBootstrapTokenAuthenticator::new(resource_reads.clone()),
         ),
         oidc_authenticator,
         webhook_authenticator,
         cluster_ca_pem.map(Arc::new),
         Arc::new(
             crate::bootstrap::composition_adapters::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
-                db_handle.clone(),
+                local_resource_query.clone(),
+                allocator_reads.clone(),
                 watch_signals.clone(),
                 positioned_watch.clone(),
             ),
@@ -1704,15 +1758,15 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         resource_commands.clone(),
         finalizer_lifecycle,
         mutation_effects,
-        crate::bootstrap::controller_adapters::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
-            db_handle.clone(),
-        ),
-        crate::bootstrap::composition_adapters::resource_admission_adapter::ResourceAdmissionAdapter::new(
+        crate::bootstrap::controller_adapters::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(resource_reads.clone()),
+        crate::bootstrap::composition_adapters::resource_admission_adapter::ResourceAdmissionAdapter::new_with_resource_reads(
             api_identity,
-            db_handle.clone(),
+            resource_reads.clone(),
         ),
         crate::bootstrap::composition_adapters::custom_resource_read_adapter::CustomResourceReadAdapter::new(
-            db_handle.clone(),
+            resource_scopes.clone(),
+            local_resource_query.clone(),
+            allocator_reads.clone(),
             watch_signals.clone(),
             positioned_watch.clone(),
             supervisor.clone(),
@@ -1787,7 +1841,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             Arc::new(move || operational_metrics.render_prometheus()),
             crate::version::api_version_info(),
             crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(
-                db_handle.clone(),
+                metadata_reads.clone(),
             ),
             replication_service_for_router.as_ref().map(|replication| {
                 replication.clone() as Arc<dyn klights_leader_api::LeaderFollowerDiagnostics>
@@ -1816,7 +1870,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 let handler =
                     crate::bootstrap::controlplane_join_adapters::build_controlplane_join_handler(
                         rn.clone(),
-                        db_handle.clone(),
+                        local_resource_query.clone(),
+                        metadata_reads.clone(),
                         leader_bootstrap_store.clone(),
                     );
                 (Some(router), Some(handler))

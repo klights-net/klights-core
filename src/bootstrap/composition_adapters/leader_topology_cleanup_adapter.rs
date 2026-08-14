@@ -21,26 +21,35 @@ use crate::bootstrap::authority::AuthorityHandle;
 use crate::bootstrap::leader_conversions::topology::{
     focused_dataplane, focused_node_subnet, node_subnet_allocation_is_exhausted,
 };
-use crate::datastore::{DatastoreHandle, Resource};
+use crate::datastore::Resource;
 use klights_replication::proposal::RaftProposal;
 
 pub(crate) struct ClusterStoreLeaderNetwork {
-    db: DatastoreHandle,
+    topology_reads: Arc<dyn klights_cluster_store::ClusterTopologyRead>,
     proposal: Arc<dyn RaftProposal>,
     authority: AuthorityHandle,
 }
 
 impl ClusterStoreLeaderNetwork {
     pub(crate) fn new<A: Into<AuthorityHandle>>(
-        db: DatastoreHandle,
+        topology_reads: Arc<dyn klights_cluster_store::ClusterTopologyRead>,
         proposal: Arc<dyn RaftProposal>,
         authority: A,
     ) -> Self {
         Self {
-            db,
+            topology_reads,
             proposal,
             authority: authority.into(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test<A: Into<AuthorityHandle>>(
+        db: crate::datastore::DatastoreHandle,
+        proposal: Arc<dyn RaftProposal>,
+        authority: A,
+    ) -> Self {
+        Self::new(Arc::new(DirectTopologyReads { db }), proposal, authority)
     }
 
     fn require_leader(&self) -> Result<(), NetworkTopologyError> {
@@ -48,6 +57,62 @@ impl ClusterStoreLeaderNetwork {
             .local_permit()
             .map(|_| ())
             .map_err(|_| NetworkTopologyError::NotLeader)
+    }
+}
+
+#[cfg(test)]
+struct DirectTopologyReads {
+    db: crate::datastore::DatastoreHandle,
+}
+
+#[cfg(test)]
+impl klights_cluster_store::ClusterTopologyRead for DirectTopologyReads {
+    fn get_node_dataplane(
+        &self,
+        request: klights_cluster_store::NodeTopologyRequest,
+    ) -> klights_cluster_store::ClusterTopologyFuture<
+        '_,
+        Option<klights_cluster_store::DataplanePeerMetadata>,
+    > {
+        Box::pin(async move {
+            self.db
+                .get_node_dataplane(request.node_name().as_str())
+                .await
+                .map_err(|error| {
+                    klights_cluster_store::ClusterTopologyReadError::retryable(error.to_string())
+                })
+        })
+    }
+
+    fn get_node_subnet(
+        &self,
+        request: klights_cluster_store::NodeTopologyRequest,
+    ) -> klights_cluster_store::ClusterTopologyFuture<
+        '_,
+        Option<klights_cluster_store::StoredNodeSubnet>,
+    > {
+        Box::pin(async move {
+            self.db
+                .get_node_subnet(request.node_name().as_str())
+                .await
+                .map_err(|error| {
+                    klights_cluster_store::ClusterTopologyReadError::retryable(error.to_string())
+                })
+        })
+    }
+
+    fn list_peer_subnets(
+        &self,
+        request: klights_cluster_store::PeerTopologyRequest,
+    ) -> klights_cluster_store::ClusterTopologyFuture<
+        '_,
+        Vec<klights_cluster_store::StoredNodeSubnet>,
+    > {
+        Box::pin(async move {
+            self.db.list_peer_subnets(request).await.map_err(|error| {
+                klights_cluster_store::ClusterTopologyReadError::retryable(error.to_string())
+            })
+        })
     }
 }
 
@@ -78,8 +143,12 @@ impl LeaderNodeSubnetAllocation for ClusterStoreLeaderNetwork {
                     }
                 })?;
             let subnet = self
-                .db
-                .get_node_subnet(&node_name)
+                .topology_reads
+                .get_node_subnet(
+                    klights_cluster_store::NodeTopologyRequest::try_new(&node_name).map_err(
+                        |error| NodeSubnetAllocationError::allocation_failed(error.to_string()),
+                    )?,
+                )
                 .await
                 .map_err(|error| NodeSubnetAllocationError::allocation_failed(error.to_string()))?
                 .map(focused_node_subnet)
@@ -99,8 +168,11 @@ impl LeaderNetworkTopologyQuery for ClusterStoreLeaderNetwork {
             self.require_leader()?;
             let node_name = request.into_node_name();
             let subnet = self
-                .db
-                .get_node_subnet(&node_name)
+                .topology_reads
+                .get_node_subnet(
+                    klights_cluster_store::NodeTopologyRequest::try_new(&node_name)
+                        .map_err(|error| NetworkTopologyError::query_failed(error.to_string()))?,
+                )
                 .await
                 .map_err(|error| NetworkTopologyError::query_failed(error.to_string()))?
                 .map(focused_node_subnet)
@@ -117,7 +189,7 @@ impl LeaderNetworkTopologyQuery for ClusterStoreLeaderNetwork {
             self.require_leader()?;
             let node_name = request.into_node_name();
             let subnets = self
-                .db
+                .topology_reads
                 .list_peer_subnets(
                     klights_cluster_store::PeerTopologyRequest::excluding(&node_name)
                         .map_err(|error| NetworkTopologyError::query_failed(error.to_string()))?,
@@ -139,8 +211,11 @@ impl LeaderNetworkTopologyQuery for ClusterStoreLeaderNetwork {
             self.require_leader()?;
             let node_name = request.into_node_name();
             let metadata = self
-                .db
-                .get_node_dataplane(&node_name)
+                .topology_reads
+                .get_node_dataplane(
+                    klights_cluster_store::NodeTopologyRequest::try_new(&node_name)
+                        .map_err(|error| NetworkTopologyError::query_failed(error.to_string()))?,
+                )
                 .await
                 .map_err(|error| NetworkTopologyError::query_failed(error.to_string()))?
                 .map(focused_dataplane)
@@ -193,22 +268,31 @@ pub(crate) fn focused_pod_cleanup_intent(
 }
 
 pub(crate) struct ClusterStoreLeaderPodCleanup {
-    db: DatastoreHandle,
+    pod_cleanup: Arc<dyn klights_cluster_store::ClusterPodCleanupStore>,
     proposal: Arc<dyn RaftProposal>,
     authority: AuthorityHandle,
 }
 
 impl ClusterStoreLeaderPodCleanup {
     pub(crate) fn new<A: Into<AuthorityHandle>>(
-        db: DatastoreHandle,
+        pod_cleanup: Arc<dyn klights_cluster_store::ClusterPodCleanupStore>,
         proposal: Arc<dyn RaftProposal>,
         authority: A,
     ) -> Self {
         Self {
-            db,
+            pod_cleanup,
             proposal,
             authority: authority.into(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test<A: Into<AuthorityHandle>>(
+        db: crate::datastore::DatastoreHandle,
+        proposal: Arc<dyn RaftProposal>,
+        authority: A,
+    ) -> Self {
+        Self::new(Arc::new(DirectPodCleanupStore { db }), proposal, authority)
     }
 
     fn require_leader(&self) -> Result<(), PodCleanupIntentError> {
@@ -219,6 +303,68 @@ impl ClusterStoreLeaderPodCleanup {
     }
 }
 
+#[cfg(test)]
+struct DirectPodCleanupStore {
+    db: crate::datastore::DatastoreHandle,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl klights_cluster_store::ClusterPodCleanupStore for DirectPodCleanupStore {
+    async fn move_pod_to_cleanup_intent(
+        &self,
+        node_name: &str,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        reason: &str,
+    ) -> klights_cluster_store::ClusterStoreResult<()> {
+        self.db
+            .move_pod_to_cleanup_intent(node_name, namespace, pod_name, pod_uid, reason)
+            .await
+            .map_err(|error| {
+                klights_cluster_store::ClusterStoreError::persistence(error.to_string())
+            })
+    }
+    async fn list_pod_cleanup_intents_for_node(
+        &self,
+        node_name: &str,
+    ) -> klights_cluster_store::ClusterStoreResult<Vec<StoredPodCleanupIntent>> {
+        self.db
+            .list_pod_cleanup_intents_for_node(node_name)
+            .await
+            .map_err(|error| {
+                klights_cluster_store::ClusterStoreError::persistence(error.to_string())
+            })
+    }
+    async fn delete_pod_cleanup_intent(
+        &self,
+        node_name: &str,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        reason: &str,
+    ) -> klights_cluster_store::ClusterStoreResult<()> {
+        self.db
+            .delete_pod_cleanup_intent(node_name, namespace, pod_name, pod_uid, reason)
+            .await
+            .map_err(|error| {
+                klights_cluster_store::ClusterStoreError::persistence(error.to_string())
+            })
+    }
+    async fn delete_pod_cleanup_intents_for_node(
+        &self,
+        node_name: &str,
+    ) -> klights_cluster_store::ClusterStoreResult<()> {
+        self.db
+            .delete_pod_cleanup_intents_for_node(node_name)
+            .await
+            .map_err(|error| {
+                klights_cluster_store::ClusterStoreError::persistence(error.to_string())
+            })
+    }
+}
+
 impl LeaderPodCleanupIntents for ClusterStoreLeaderPodCleanup {
     fn list_pod_cleanup_intents(
         &self,
@@ -226,7 +372,7 @@ impl LeaderPodCleanupIntents for ClusterStoreLeaderPodCleanup {
     ) -> PodCleanupIntentFuture<'_, Vec<PodCleanupIntent>> {
         Box::pin(async move {
             self.require_leader()?;
-            self.db
+            self.pod_cleanup
                 .list_pod_cleanup_intents_for_node(request.node_name())
                 .await
                 .map_err(|error| PodCleanupIntentError::unavailable(error.to_string()))?
@@ -308,15 +454,16 @@ mod tests {
         let db = crate::datastore::sqlite::Datastore::new_in_memory()
             .await
             .unwrap();
-        let handle: DatastoreHandle = Arc::new(db.clone());
+        let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
         let proposal = Arc::new(RecordingApplyingProposal {
-            inner: crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(
-                handle.clone(),
-            ),
+            inner: crate::bootstrap::outbox_apply_adapter::BackendProposalFixture::new(db_handle),
             commands: Default::default(),
         });
-        let adapter =
-            ClusterStoreLeaderNetwork::new(handle, proposal.clone(), authority(is_leader));
+        let adapter = ClusterStoreLeaderNetwork::new(
+            db.focused_read_store(),
+            proposal.clone(),
+            authority(is_leader),
+        );
         (db, proposal, adapter)
     }
 
